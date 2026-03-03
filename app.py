@@ -11,14 +11,20 @@ TV_SECRET = os.getenv("TV_WEBHOOK_SECRET")
 
 watches = {}
 
-def post_to_discord(payload):
-    try:
-        r = requests.post(DISCORD_WEBHOOK, json=payload, timeout=10)
-        print("Discord status:", r.status_code)
-        if r.status_code >= 300:
-            print("Discord response:", r.text[:500])
-    except Exception as e:
-        print("Discord post error:", str(e))
+@app.route("/tv", methods=["POST"])
+def tv_webhook():
+    data = request.get_json(force=True)
+
+    if data.get("secret") != TV_SECRET:
+        return jsonify({"error": "Unauthorized"}), 403
+
+    ticker = data["ticker"]
+    close = float(data["close"])
+
+    payload = {"content": f"TEST {ticker} close={close}"}
+
+    status, body = post_to_discord(payload)
+    return jsonify({"ok": True, "discord_status": status, "discord_body": body})
 
 def tp_checker(watch_id):
     while True:
