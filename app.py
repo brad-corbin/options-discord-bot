@@ -66,7 +66,8 @@ def health():
 
 @app.route("/tv", methods=["POST"])
 def tv_webhook():
-    data = request.json
+    data = request.get_json(force=True)
+print("Incoming data:", data)
 
     if data.get("secret") != TV_SECRET:
         return jsonify({"error": "Unauthorized"}), 403
