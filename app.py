@@ -14,9 +14,29 @@ watches = {}
 
 
 def post_to_discord(payload):
-    """Send message to Discord and return status for debugging."""
-    r = requests.post(DISCORD_WEBHOOK, json=payload, timeout=10)
-    return r.status_code, (r.text[:200] if r.text else "")
+    """Send message to Discord and handle rate limits safely."""
+    try:
+        r = requests.post(DISCORD_WEBHOOK, json=payload, timeout=10)
+
+        # Success
+        if r.status_code == 204:
+            return r.status_code, ""
+
+        # Rate limited
+        if r.status_code == 429:
+            try:
+                retry_after = r.json().get("retry_after", 2)
+            except Exception:
+                retry_after = 2
+
+            time.sleep(float(retry_after))
+            r2 = requests.post(DISCORD_WEBHOOK, json=payload, timeout=10)
+            return r2.status_code, (r2.text[:200] if r2.text else "")
+
+        return r.status_code, (r.text[:200] if r.text else "")
+
+    except Exception as e:
+        return 500, str(e)
 
 
 def tp_checker(watch_id):
