@@ -12,7 +12,13 @@ TV_SECRET = os.getenv("TV_WEBHOOK_SECRET")
 watches = {}
 
 def post_to_discord(payload):
-    requests.post(DISCORD_WEBHOOK, json=payload)
+    try:
+        r = requests.post(DISCORD_WEBHOOK, json=payload, timeout=10)
+        print("Discord status:", r.status_code)
+        if r.status_code >= 300:
+            print("Discord response:", r.text[:500])
+    except Exception as e:
+        print("Discord post error:", str(e))
 
 def tp_checker(watch_id):
     while True:
