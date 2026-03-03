@@ -66,8 +66,12 @@ def tp_checker(watch_id):
             watch["max_tp_hit"] = highest_hit
             gain_pct = ((current - entry) / entry) * 100
 
+            today = time.strftime("%Y-%m-%d")
+            same_day = (today == watch.get("entry_date"))
+            exit_note = " (Exit 100% per plan)" if (highest_hit == 1 and same_day) else ""
+
             payload = {
-                "content": f"✅ TP{highest_hit} HIT — {watch['ticker']} Bull Call Spread",
+                "content": f"✅ TP{highest_hit} HIT{exit_note} — {watch['ticker']} Bull Call Spread",
                 "embeds": [
                     {
                         "fields": [
@@ -75,6 +79,7 @@ def tp_checker(watch_id):
                             {"name": "Entry MID", "value": f"{entry:.2f}", "inline": True},
                             {"name": "Current MID", "value": f"{current:.2f}", "inline": True},
                             {"name": "Gain %", "value": f"{gain_pct:.1f}%", "inline": True},
+                            {"name": "Entry Date", "value": watch.get("entry_date", ""), "inline": True},
                         ]
                     }
                 ],
@@ -103,9 +108,11 @@ def tv_webhook():
     entry_mid = round(close * 0.01, 2)  # mock pricing
     width = 1.0
 
-    tp1 = entry_mid * 1.30
-    tp2 = entry_mid * 1.50
-    tp3 = width * 0.95
+    # TP rules: 30% and 50% of risk (risk = entry debit), TP3 = max profit (width)
+    risk = entry_mid
+    tp1 = entry_mid + (risk * 0.30)
+    tp2 = entry_mid + (risk * 0.50)
+    tp3 = width
 
     watch_id = f"{ticker}_{int(time.time())}"
 
@@ -118,6 +125,8 @@ def tv_webhook():
         "tp2": tp2,
         "tp3": tp3,
         "max_tp_hit": 0,
+        "entry_ts": time.time(),
+        "entry_date": time.strftime("%Y-%m-%d"),
     }
 
     threading.Thread(target=tp_checker, args=(watch_id,), daemon=True).start()
@@ -129,9 +138,11 @@ def tv_webhook():
                 "fields": [
                     {"name": "Close", "value": str(close), "inline": True},
                     {"name": "Entry MID (Mock)", "value": f"{entry_mid:.2f}", "inline": True},
-                    {"name": "TP1 (+30%)", "value": f"{tp1:.2f}", "inline": True},
-                    {"name": "TP2 (+50%)", "value": f"{tp2:.2f}", "inline": True},
-                    {"name": "TP3 (~Max)", "value": f"{tp3:.2f}", "inline": True},
+                    {"name": "Risk (Debit)", "value": f"{risk:.2f}", "inline": True},
+                    {"name": "Width", "value": f"{width:.2f}", "inline": True},
+                    {"name": "TP1 (+30% risk)", "value": f"{tp1:.2f}", "inline": True},
+                    {"name": "TP2 (+50% risk)", "value": f"{tp2:.2f}", "inline": True},
+                    {"name": "TP3 (Max)", "value": f"{tp3:.2f}", "inline": True},
                 ]
             }
         ],
