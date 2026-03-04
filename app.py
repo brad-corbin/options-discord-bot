@@ -89,8 +89,9 @@ def md_get(url, params=None):
 
     data = r.json()
 
-    print("MARKETDATA URL:", url)
-    print("MARKETDATA RESPONSE:", data)
+    # Debug output to Render logs
+    print("MARKETDATA URL:", url, flush=True)
+    print("MARKETDATA RESPONSE:", data, flush=True)
 
     return data
 
