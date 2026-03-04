@@ -31,13 +31,23 @@ SCAN_SECRET = os.getenv("SCAN_SECRET", "").strip()
 
 BOT_URL = os.getenv("BOT_URL", "").strip()
 
-# User prefs / rules
+# ----------------------------
+# USER PREFS / RULES
+# ----------------------------
 MAX_SPREAD_WIDTH = float(os.getenv("MAX_SPREAD_WIDTH", "5") or 5)               # $5 max width
 MAX_DEBIT_PCT_WIDTH = float(os.getenv("MAX_DEBIT_PCT_WIDTH", "0.70") or 0.70)   # debit <= 70% width
 LIQ_WARN_MIN_OI = int(os.getenv("LIQ_WARN_MIN_OI", "500") or 500)               # warn if OI < 500
 LIQ_WARN_BA = float(os.getenv("LIQ_WARN_BA", "0.30") or 0.30)                   # warn if bid/ask > .30
+
 SCAN_MAX_DTE = int(os.getenv("SCAN_MAX_DTE", "7") or 7)                         # scan out to 7 DTE
 DEFAULT_MAX_POSTS_PER_SCAN = int(os.getenv("MAX_POSTS_PER_SCAN", "6") or 6)     # cap messages per scan
+
+# NEW: decouple expected move horizon from expiration DTE
+EXPECTED_MOVE_DTE = int(os.getenv("EXPECTED_MOVE_DTE", "5") or 5)               # expected move horizon (days)
+TRADE_TARGET_DTE = int(os.getenv("TRADE_TARGET_DTE", "5") or 5)                 # choose expiration closest to this DTE
+
+# Optional: also post a separate detailed trade message (0/1). Default off.
+POST_SEPARATE_TRADE_MESSAGE = (os.getenv("POST_SEPARATE_TRADE_MESSAGE", "0") or "0").strip() in ("1", "true", "True", "YES", "yes")
 
 # In-memory snapshots (Render can restart & forget these)
 prev_oi_snapshot = {}  # key: (ticker, exp, right, strike) -> oi
@@ -80,7 +90,7 @@ def clamp(v, lo, hi):
 
 
 # ----------------------------
-# TELEGRAM SENDER (FIXED)
+# TELEGRAM SENDER
 # - returns (status_code, body_text)
 # - NO parse_mode to avoid Markdown failures
 # ----------------------------
@@ -187,7 +197,8 @@ def get_spot(ticker: str) -> float:
 def get_options_chain(ticker: str, max_dte: int = 7):
     """
     MarketData chain response is columnar arrays.
-    Normalize into list[dict] and choose nearest expiration <= max_dte if possible.
+    Normalize into list[dict] and choose expiration closest to TRADE_TARGET_DTE,
+    preferring expirations <= max_dte if available.
     """
     data = md_get(f"https://api.marketdata.app/v1/options/chain/{ticker}/")
 
@@ -210,7 +221,7 @@ def get_options_chain(ticker: str, max_dte: int = 7):
     side = col("side", "")
     strike = col("strike", None)
     expiration = col("expiration", None)  # epoch seconds
-    dte = col("dte", None)
+    # dte column exists but can be missing/inconsistent; we compute DTE ourselves
 
     openInterest = col("openInterest", 0)
     volume = col("volume", 0)
@@ -240,7 +251,6 @@ def get_options_chain(ticker: str, max_dte: int = 7):
             "right": right,
             "strike": as_float(strike[i], None),
             "expiration": exp_date,
-            "dte": as_int(dte[i], None),
 
             "openInterest": as_int(openInterest[i], 0),
             "volume": as_int(volume[i], 0),
@@ -254,6 +264,7 @@ def get_options_chain(ticker: str, max_dte: int = 7):
             "mid": as_float(mid[i], None),
         })
 
+    # group by expiration
     exp_map = {}
     for c in contracts:
         exp = c.get("expiration")
@@ -263,22 +274,29 @@ def get_options_chain(ticker: str, max_dte: int = 7):
     if not exp_map:
         raise RuntimeError("No expirations found in chain response")
 
-    # pick closest by min dte
-    exp_candidates = []
-    for exp, rows in exp_map.items():
-        dtes = [r.get("dte") for r in rows if isinstance(r.get("dte"), int)]
-        min_d = min(dtes) if dtes else 999999
-        exp_candidates.append((min_d, exp))
+    # compute DTE for each expiration deterministically
+    today_utc = datetime.now(timezone.utc).date()
+    exp_dte = {}
+    for exp in exp_map.keys():
+        try:
+            exp_dt = datetime.fromisoformat(exp).date()
+            exp_dte[exp] = max((exp_dt - today_utc).days, 0)
+        except Exception:
+            exp_dte[exp] = 999999
 
-    exp_candidates.sort(key=lambda x: x[0])
+    # Prefer expirations <= max_dte; choose closest to TRADE_TARGET_DTE
+    candidates = [(abs(d - TRADE_TARGET_DTE), d, exp) for exp, d in exp_dte.items() if d <= max_dte]
+    if not candidates:
+        candidates = [(abs(d - TRADE_TARGET_DTE), d, exp) for exp, d in exp_dte.items()]
 
-    chosen_exp = None
-    for min_d, exp in exp_candidates:
-        if min_d <= max_dte:
-            chosen_exp = exp
-            break
-    if chosen_exp is None:
-        chosen_exp = exp_candidates[0][1]
+    candidates.sort(key=lambda x: (x[0], x[1]))
+    chosen_exp = candidates[0][2]
+    chosen_dte = exp_dte.get(chosen_exp, None)
+
+    # attach computed dte to contracts for convenience (optional)
+    if isinstance(chosen_dte, int):
+        for c in exp_map[chosen_exp]:
+            c["dte"] = chosen_dte
 
     return chosen_exp, exp_map[chosen_exp]
 
@@ -402,7 +420,7 @@ def risk_rating(spot, call_wall, put_wall, net_gex, inc, oi_score):
 
 
 # ----------------------------
-# UPGRADE 3: BIG ALPHA
+# BIG ALPHA
 # ----------------------------
 def big_alpha_score(spot, call_wall, put_wall, net_gex, oi_score, risk_label, emove, inc):
     score = 50
@@ -516,7 +534,7 @@ def strike_targets_and_confidence(spot, emove, call_wall, put_wall, net_gex, inc
 
 
 # ----------------------------
-# LIQUIDITY WARNINGS (Upgrade 2)
+# LIQUIDITY WARNINGS
 # ----------------------------
 def find_contract(contracts, right, strike):
     right = (right or "").lower()
@@ -549,6 +567,9 @@ def liquidity_warnings_for_trade(contracts, trade):
         right_guess = "call"
     elif "put" in ttype:
         right_guess = "put"
+    else:
+        # your engine uses type "credit"/"debit"; infer from direction later if needed
+        pass
 
     short_k = trade.get("short")
     long_k = trade.get("long")
@@ -583,11 +604,11 @@ def liquidity_warnings_for_trade(contracts, trade):
 
 
 # ----------------------------
-# MESSAGE BUILDERS (FIXED: extra_lines passed in)
+# MESSAGE BUILDERS
 # ----------------------------
 def build_scan_message(
     ticker, spot, exp, dte, call_wall, put_wall, net_gex, emove,
-    oi_note, risk_label, risk_notes, alpha_score, direction, extra_lines
+    emove_dte, oi_note, risk_label, risk_notes, alpha_score, direction, extra_lines
 ):
     gex_regime = "Positive Gamma / Range Favored" if net_gex >= 0 else "Negative Gamma / Trend Favored"
     gex_bar = gex_graphic(net_gex)
@@ -603,7 +624,7 @@ def build_scan_message(
         f"Exp: {exp} | DTE: {max(dte,1)}",
         f"Spot: {spot:.2f}",
         f"Auto Direction: {direction.upper()}",
-        f"Expected Move ({max(dte,1)}D): ±{emove:.2f}",
+        f"Expected Move ({max(emove_dte,1)}D): ±{emove:.2f}",
         *extra_lines,
         walls_line,
         f"GEX: {gex_regime}",
@@ -680,6 +701,9 @@ def debug():
         "LIQ_WARN_BA": LIQ_WARN_BA,
         "SCAN_MAX_DTE": SCAN_MAX_DTE,
         "DEFAULT_MAX_POSTS_PER_SCAN": DEFAULT_MAX_POSTS_PER_SCAN,
+        "EXPECTED_MOVE_DTE": EXPECTED_MOVE_DTE,
+        "TRADE_TARGET_DTE": TRADE_TARGET_DTE,
+        "POST_SEPARATE_TRADE_MESSAGE": POST_SEPARATE_TRADE_MESSAGE,
     })
 
 
@@ -690,7 +714,7 @@ def tgtest():
     return jsonify({"telegram_status": st, "telegram_body": body})
 
 
-# FIXED TV ROUTE (no debug_lines, correct indentation, correct return keys)
+# TradingView webhook
 @app.route("/tv", methods=["POST"])
 def tv_webhook():
     data = request.get_json(force=True, silent=True) or {}
@@ -745,7 +769,7 @@ def scan_watchlist():
             oi_score, oi_note = oi_change_score(ticker, exp, contracts)
 
             # ----------------------------
-            # Upgrade 1: AUTO DIRECTION
+            # AUTO DIRECTION
             # ----------------------------
             direction = "bull"
             if call_wall is not None and put_wall is not None:
@@ -756,7 +780,7 @@ def scan_watchlist():
                     direction = "bear"
 
             # ----------------------------
-            # ATM IV estimate
+            # ATM IV estimate (from nearby strikes)
             # ----------------------------
             near = sorted(
                 [c for c in contracts if c.get("strike") is not None],
@@ -770,7 +794,9 @@ def scan_watchlist():
                     ivs.append(iv_f)
 
             atm_iv = (sum(ivs) / len(ivs)) if ivs else 0.30
-            emove = expected_move_from_iv(spot, atm_iv, max(dte, 1))
+
+            # ✅ Expected move horizon is now independent of chain DTE
+            emove = expected_move_from_iv(spot, atm_iv, max(EXPECTED_MOVE_DTE, 1))
 
             targets = strike_targets_and_confidence(spot, emove, call_wall, put_wall, net_gex, inc, oi_score)
             bull_zone = f"{spot:.2f} → {targets['bull_upper']:.2f}"
@@ -804,7 +830,81 @@ def scan_watchlist():
                 continue
 
             # ----------------------------
-            # 1) Send scan card to Telegram (FIXED)
+            # TRADE ENGINE (embed into scan card)
+            # ----------------------------
+            trade_lines = []
+            trade_for_optional_post = None
+
+            try:
+                options_data = {
+                    "strike": [c.get("strike") for c in contracts],
+                    "side": [c.get("right") for c in contracts],  # 'call'/'put'
+                    "bid": [c.get("bid") for c in contracts],
+                    "ask": [c.get("ask") for c in contracts],
+                    "mid": [c.get("mid") for c in contracts],     # ✅ pass mid when available
+                    "openInterest": [c.get("openInterest") for c in contracts],
+                    "iv": [c.get("iv") for c in contracts],
+                    "dte": [dte for _ in contracts],
+                }
+
+                rec = recommend_from_marketdata(
+                    marketdata_json=options_data,
+                    direction=direction,
+                    dte=dte,
+                    spot=spot,
+                )
+
+                if isinstance(rec, dict) and rec.get("ok"):
+                    trade = rec.get("trade") or {}
+                    trade_for_optional_post = trade
+
+                    # Liquidity warnings (your rules)
+                    liq_warns = liquidity_warnings_for_trade(contracts, trade)
+
+                    # Rule warnings
+                    width = as_float(trade.get("width"), None)
+                    price = as_float(trade.get("price"), None)
+
+                    if width is not None and width > MAX_SPREAD_WIDTH:
+                        liq_warns.append(f"Rule warn: width {width:g} > max {MAX_SPREAD_WIDTH:g}")
+
+                    if width is not None and price is not None and price > (MAX_DEBIT_PCT_WIDTH * width):
+                        liq_warns.append(
+                            f"Rule warn: price {price:.2f} > {MAX_DEBIT_PCT_WIDTH:.0%} of width ({(MAX_DEBIT_PCT_WIDTH*width):.2f})"
+                        )
+
+                    ttype = (trade.get("type") or "").upper()  # CREDIT / DEBIT
+                    short_k = trade.get("short")
+                    long_k = trade.get("long")
+                    pr = trade.get("price")
+                    ror = trade.get("RoR")
+
+                    # Make it more readable in the scan card
+                    trade_lines.append("🧠 Trade Suggestion:")
+                    trade_lines.append(f"{ttype} spread | Short {short_k} / Long {long_k}")
+                    if isinstance(pr, (int, float)):
+                        trade_lines.append(f"Price: {pr:.2f} | RoR: {ror:.2f}" if isinstance(ror, (int, float)) else f"Price: {pr:.2f}")
+                    else:
+                        trade_lines.append(f"Price: {pr} | RoR: {ror}" if ror is not None else f"Price: {pr}")
+
+                    if liq_warns:
+                        trade_lines.append("⚠️ " + "; ".join(liq_warns[:3]))
+
+                else:
+                    reason = rec.get("reason") if isinstance(rec, dict) else None
+                    trade_lines.append("🧠 Trade Suggestion: —")
+                    if reason:
+                        trade_lines.append(f"Reason: {reason}")
+
+            except Exception as e:
+                trade_lines.append("🧠 Trade Suggestion: —")
+                trade_lines.append(f"Reason: engine error ({type(e).__name__})")
+
+            if trade_lines:
+                extra_lines.extend([""] + trade_lines)
+
+            # ----------------------------
+            # Send scan card to Telegram
             # ----------------------------
             scan_text = build_scan_message(
                 ticker=ticker,
@@ -815,6 +915,7 @@ def scan_watchlist():
                 put_wall=put_wall,
                 net_gex=net_gex,
                 emove=emove,
+                emove_dte=EXPECTED_MOVE_DTE,
                 oi_note=oi_note,
                 risk_label=risk_label,
                 risk_notes=risk_notes,
@@ -830,58 +931,18 @@ def scan_watchlist():
             else:
                 debug_lines.append(f"{ticker}: telegram scan failed ({st}) {body[:120]}")
 
-            # ----------------------------
-            # 2) TRADE ENGINE
-            # ----------------------------
-            options_data = {
-                "strike": [c.get("strike") for c in contracts],
-                "side": [c.get("right") for c in contracts],  # 'call'/'put'
-                "bid": [c.get("bid") for c in contracts],
-                "ask": [c.get("ask") for c in contracts],
-                "openInterest": [c.get("openInterest") for c in contracts],
-                "iv": [c.get("iv") for c in contracts],
-                "dte": [dte for _ in contracts],
-            }
-
-            try:
-                rec = recommend_from_marketdata(
-                    marketdata_json=options_data,
-                    direction=direction,   # variable, not string
-                    dte=dte,
-                    spot=spot,
-                )
-
-                if isinstance(rec, dict) and rec.get("ok"):
-                    trade = rec.get("trade") or {}
-
-                    # Upgrade 2: Liquidity warnings
-                    liq_warns = liquidity_warnings_for_trade(contracts, trade)
-
-                    # Safety checks: width/debit rules
-                    width = as_float(trade.get("width"), None)
-                    price = as_float(trade.get("price"), None)
-
-                    if width is not None and width > MAX_SPREAD_WIDTH:
-                        liq_warns.append(f"Rule warn: width {width:g} > max {MAX_SPREAD_WIDTH:g}")
-
-                    # Only applies to debit-ish pricing, but we warn anyway if it violates
-                    if width is not None and price is not None and price > (MAX_DEBIT_PCT_WIDTH * width):
-                        liq_warns.append(
-                            f"Rule warn: price {price:.2f} > {MAX_DEBIT_PCT_WIDTH:.0%} of width ({(MAX_DEBIT_PCT_WIDTH*width):.2f})"
-                        )
-
-                    trade_text = build_trade_engine_text(ticker, direction, trade, liq_warns)
+            # Optional: send a separate detailed trade message (off by default)
+            if POST_SEPARATE_TRADE_MESSAGE and isinstance(trade_for_optional_post, dict) and trade_for_optional_post:
+                try:
+                    liq_warns2 = liquidity_warnings_for_trade(contracts, trade_for_optional_post)
+                    trade_text = build_trade_engine_text(ticker, direction, trade_for_optional_post, liq_warns2)
                     st2, body2 = post_to_telegram(trade_text)
                     if st2 == 200:
-                        debug_lines.append(f"{ticker}: posted trade engine (200)")
+                        debug_lines.append(f"{ticker}: posted separate trade message (200)")
                     else:
-                        debug_lines.append(f"{ticker}: telegram trade failed ({st2}) {body2[:120]}")
-
-                else:
-                    debug_lines.append(f"{ticker}: trade engine no rec (ok=false)")
-
-            except Exception as e:
-                debug_lines.append(f"{ticker}: trade engine error {type(e).__name__}: {str(e)[:140]}")
+                        debug_lines.append(f"{ticker}: separate trade failed ({st2}) {body2[:120]}")
+                except Exception as e:
+                    debug_lines.append(f"{ticker}: separate trade error {type(e).__name__}: {str(e)[:120]}")
 
             time.sleep(0.25)
 
