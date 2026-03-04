@@ -114,7 +114,101 @@ def get_expirations(ticker: str):
             continue
         out.append(str(e)[:10])
     return sorted(set(out))
+def get_options_chain(ticker: str, max_dte: int = 7):
+    """
+    2-step:
+    1) Fetch expirations list
+    2) Pick expiration closest to TRADE_TARGET_DTE (prefer <= max_dte)
+    3) Fetch chain for that chosen expiration
+    """
+    ticker = (ticker or "").strip().upper()
+    target = int(os.getenv("TRADE_TARGET_DTE", str(TRADE_TARGET_DTE)) or TRADE_TARGET_DTE)
 
+    expirations = get_expirations(ticker)
+    today_utc = datetime.now(timezone.utc).date()
+
+    scored = []
+    for exp in expirations:
+        try:
+            exp_dt = datetime.fromisoformat(exp).date()
+            dte = max((exp_dt - today_utc).days, 0)
+            scored.append((abs(dte - target), dte, exp))
+        except Exception:
+            continue
+
+    if not scored:
+        raise RuntimeError(f"No usable expirations for {ticker}")
+
+    within = [x for x in scored if x[1] <= max_dte]
+    use = within if within else scored
+    use.sort(key=lambda x: (x[0], x[1]))
+    chosen_exp = use[0][2]
+    chosen_dte = use[0][1]
+
+    params = {"expiration": chosen_exp}
+
+    # Optional: weekly-only
+    if (os.getenv("MD_WEEKLY_ONLY", "0") or "0").strip().lower() in ("1", "true", "yes", "y"):
+        params["weekly"] = "true"
+
+    data = md_get(f"https://api.marketdata.app/v1/options/chain/{ticker}/", params=params)
+
+    if not isinstance(data, dict) or data.get("s") != "ok":
+        raise RuntimeError(f"Bad options chain response for {ticker}: {str(data)[:180]}")
+
+    sym_list = data.get("optionSymbol") or []
+    if not isinstance(sym_list, list) or len(sym_list) == 0:
+        raise RuntimeError("Unexpected chain format: optionSymbol missing/empty")
+
+    n = len(sym_list)
+
+    def col(name, default=None):
+        v = data.get(name, default)
+        if isinstance(v, list):
+            return v
+        return [default] * n
+
+    optionSymbol = col("optionSymbol", "")
+    side = col("side", "")
+    strike = col("strike", None)
+
+    openInterest = col("openInterest", 0)
+    volume = col("volume", 0)
+    iv = col("iv", None)
+    gamma = col("gamma", None)
+    delta = col("delta", None)
+    bid = col("bid", None)
+    ask = col("ask", None)
+    mid = col("mid", None)
+
+    contracts = []
+    for i in range(n):
+        right = (side[i] or "").lower().strip()
+        if right in ("c", "call"):
+            right = "call"
+        elif right in ("p", "put"):
+            right = "put"
+
+        contracts.append({
+            "optionSymbol": optionSymbol[i],
+            "right": right,
+            "strike": as_float(strike[i], None),
+            "expiration": chosen_exp,
+            "dte": chosen_dte,
+
+            "openInterest": as_int(openInterest[i], 0),
+            "volume": as_int(volume[i], 0),
+
+            "iv": as_float(iv[i], None),
+            "gamma": as_float(gamma[i], 0.0),
+            "delta": as_float(delta[i], None),
+
+            "bid": as_float(bid[i], None),
+            "ask": as_float(ask[i], None),
+            "mid": as_float(mid[i], None),
+        })
+
+    return chosen_exp, contracts
 # ----------------------------
 # TELEGRAM SENDER
 # - returns (status_code, body_text)
@@ -705,16 +799,20 @@ def tv_webhook():
 
         rec = recommend_from_marketdata(
             marketdata_json=options_data,
-            direction=direction,   # forced bull
+            direction=direction,
             dte=dte,
             spot=spot,
-            net_gex=net_gex,
-            prefer="debit",        # your preference
         )
 
         trade_lines = []
         if isinstance(rec, dict) and rec.get("ok"):
             trade = rec.get("trade") or {}
+            # Prefer DEBIT: if engine picked credit and a debit alternative exists, use it
+            if (trade.get("type") or "").lower() != "debit":
+                alt = rec.get("best_debit_alt")
+            if isinstance(alt, dict) and (alt.get("type") or "").lower() == "debit":
+                trade = alt
+            
             liq_warns = liquidity_warnings_for_trade(contracts, trade)
 
             ttype = (trade.get("type") or "").upper()
@@ -780,25 +878,24 @@ def tv_webhook():
 @app.route("/exp_debug/<ticker>", methods=["GET"])
 def exp_debug(ticker):
     ticker = (ticker or "").strip().upper()
-    exp, contracts = get_options_chain(ticker, max_dte=9999)
-
-    # Build expirations list from contracts (get_options_chain already normalizes exp date)
-    exps = sorted({c.get("expiration") for c in contracts if c.get("expiration")})
+    exps = get_expirations(ticker)
     today = datetime.now(timezone.utc).date()
 
     rows = []
-    for e in exps[:25]:
+    for e in exps[:50]:
         try:
-            d = (datetime.fromisoformat(e).date() - today).days
+            d = max((datetime.fromisoformat(e).date() - today).days, 0)
         except Exception:
             d = None
         rows.append({"exp": e, "dte": d})
 
     return jsonify({
         "ticker": ticker,
-        "count_unique_exps_in_chain": len(exps),
-        "first_25": rows,
-        "note": "If you do NOT see any expirations with DTE around 0-10 for SPY, MarketData isn't returning weeklies in this endpoint/plan.",
+        "count_unique_exps": len(exps),
+        "first_50": rows,
+        "md_weekly_only": os.getenv("MD_WEEKLY_ONLY", "0"),
+        "trade_target_dte": TRADE_TARGET_DTE,
+        "scan_max_dte": SCAN_MAX_DTE,
     })
 
 @app.route("/scan", methods=["POST"])
@@ -917,8 +1014,6 @@ def scan_watchlist():
                     direction=direction,
                     dte=dte,
                     spot=spot,
-                    net_gex=net_gex,   # ✅ adds regime awareness
-                    prefer="debit",    # ✅ your preference
                 )
 
                 if isinstance(rec, dict) and rec.get("ok"):
