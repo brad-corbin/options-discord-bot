@@ -20,6 +20,7 @@ def first_val(x, default=None):
         return x[0]
     return x
 
+
 def as_float(x, default=0.0):
     v = first_val(x, default)
     try:
@@ -27,12 +28,14 @@ def as_float(x, default=0.0):
     except Exception:
         return float(default)
 
+
 def as_int(x, default=0):
     v = first_val(x, default)
     try:
         return int(v)
     except Exception:
         return int(default)
+
 
 # ---------- ENV VARS (set in Render) ----------
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
@@ -51,13 +54,17 @@ prev_oi_snapshot = {}  # key: (ticker, exp, right, strike) -> oi
 # ---------- DEBUG ----------
 @app.route("/debug", methods=["GET"])
 def debug():
-    return jsonify({
-        "DISCORD_WEBHOOK_set": bool(DISCORD_WEBHOOK_URL),
-        "MARKETDATA_TOKEN_set": bool(MARKETDATA_TOKEN),
-        "WATCHLIST_len": len([t for t in (WATCHLIST.split(",") if WATCHLIST else []) if t.strip()]),
-        "BOT_URL_set": bool(BOT_URL),
-        "SCAN_SECRET_set": bool(SCAN_SECRET),
-    })
+    return jsonify(
+        {
+            "DISCORD_WEBHOOK_set": bool(DISCORD_WEBHOOK_URL),
+            "MARKETDATA_TOKEN_set": bool(MARKETDATA_TOKEN),
+            "WATCHLIST_len": len(
+                [t for t in (WATCHLIST.split(",") if WATCHLIST else []) if t.strip()]
+            ),
+            "BOT_URL_set": bool(BOT_URL),
+            "SCAN_SECRET_set": bool(SCAN_SECRET),
+        }
+    )
 
 
 # ---------- DISCORD ----------
@@ -103,6 +110,7 @@ def post_to_discord(payload, max_retries=5):
 # ---------- MARKETDATA ----------
 def md_headers():
     return {"Authorization": f"Bearer {MARKETDATA_TOKEN}"}
+
 
 def md_get(url, params=None):
     if not MARKETDATA_TOKEN:
@@ -203,26 +211,29 @@ def get_options_chain(ticker: str, max_dte: int = 7):
 
         # Convert expiration epoch -> YYYY-MM-DD
         # (epoch is in seconds, UTC)
-        exp_date = datetime.fromtimestamp(exp_epoch, tz=timezone.utc).date().isoformat() if exp_epoch else None
+        exp_date = (
+            datetime.fromtimestamp(exp_epoch, tz=timezone.utc).date().isoformat()
+            if exp_epoch
+            else None
+        )
 
-        contracts.append({
-            "optionSymbol": optionSymbol[i],
-            "right": (side[i] or "").lower(),     # 'call' / 'put'
-            "strike": as_float(strike[i], None),
-            "expiration": exp_date,
-            "dte": as_int(dte[i], None),
-
-            "openInterest": as_int(openInterest[i], 0),
-            "volume": as_int(volume[i], 0),
-
-            "iv": as_float(iv[i], None),
-            "gamma": as_float(gamma[i], 0.0),
-            "delta": as_float(delta[i], None),
-
-            "bid": as_float(bid[i], None),
-            "ask": as_float(ask[i], None),
-            "mid": as_float(mid[i], None),
-        })
+        contracts.append(
+            {
+                "optionSymbol": optionSymbol[i],
+                "right": (side[i] or "").lower(),  # 'call' / 'put'
+                "strike": as_float(strike[i], None),
+                "expiration": exp_date,
+                "dte": as_int(dte[i], None),
+                "openInterest": as_int(openInterest[i], 0),
+                "volume": as_int(volume[i], 0),
+                "iv": as_float(iv[i], None),
+                "gamma": as_float(gamma[i], 0.0),
+                "delta": as_float(delta[i], None),
+                "bid": as_float(bid[i], None),
+                "ask": as_float(ask[i], None),
+                "mid": as_float(mid[i], None),
+            }
+        )
 
     # Group by expiration
     exp_map = {}
@@ -300,10 +311,10 @@ def compute_walls_and_gex(ticker: str, spot: float, exp: str, contracts: list):
 
         if right in ("call", "c"):
             call_oi[strike] = call_oi.get(strike, 0) + oi
-            net_gex += oi * gamma * (spot ** 2) * 100.0
+            net_gex += oi * gamma * (spot**2) * 100.0
         elif right in ("put", "p"):
             put_oi[strike] = put_oi.get(strike, 0) + oi
-            net_gex -= oi * gamma * (spot ** 2) * 100.0
+            net_gex -= oi * gamma * (spot**2) * 100.0
 
     call_wall = max(call_oi.items(), key=lambda kv: kv[1])[0] if call_oi else None
     put_wall = max(put_oi.items(), key=lambda kv: kv[1])[0] if put_oi else None
@@ -393,7 +404,9 @@ def risk_rating(spot, call_wall, put_wall, net_gex, inc, oi_score):
     return "🔴 High", " | ".join(notes)
 
 
-def build_discord_card(ticker, spot, exp, dte, call_wall, put_wall, net_gex, emove, oi_note, risk_label, risk_notes):
+def build_discord_card(
+    ticker, spot, exp, dte, call_wall, put_wall, net_gex, emove, oi_note, risk_label, risk_notes
+):
     gex_regime = "Positive Gamma / Range Favored" if net_gex >= 0 else "Negative Gamma / Trend Favored"
 
     if call_wall is not None and put_wall is not None:
@@ -489,57 +502,61 @@ def scan_watchlist():
 
             ivs = []
             for c in near:
-                iv = c.get("iv")
-                iv_f = as_float(iv, None)
+                iv_f = as_float(c.get("iv"), None)
                 if iv_f is not None and iv_f > 0:
                     ivs.append(iv_f)
 
             atm_iv = (sum(ivs) / len(ivs)) if ivs else 0.30
-            emove = expected_move_from_iv(spot, atm_iv, max(dte, 1)) 
+            emove = expected_move_from_iv(spot, atm_iv, max(dte, 1))
+
             # ----- TRADE ENGINE -----
             options_data = {
-             "strike": [c.get("strike") for c in contracts],
-             "side": [c.get("right") for c in contracts],
-             "bid": [c.get("bid") for c in contracts],
-             "ask": [c.get("ask") for c in contracts],
-             "openInterest": [c.get("openInterest") for c in contracts],
-             "iv": [c.get("iv") for c in contracts],
-             "dte": [dte for _ in contracts]
+                "strike": [c.get("strike") for c in contracts],
+                "side": [c.get("right") for c in contracts],  # 'call'/'put'
+                "bid": [c.get("bid") for c in contracts],
+                "ask": [c.get("ask") for c in contracts],
+                "openInterest": [c.get("openInterest") for c in contracts],
+                "iv": [c.get("iv") for c in contracts],
+                "dte": [dte for _ in contracts],
             }
 
-             rec = recommend_from_marketdata(
-                 marketdata_json=options_data,
-                 direction="bull",
-                 dte=dte,
-                 spot=spot
-            )
+            try:
+                rec = recommend_from_marketdata(
+                    marketdata_json=options_data,
+                    direction="bull",
+                    dte=dte,
+                    spot=spot,
+                )
 
-            if rec["ok"]:
-                trade = rec["trade"]
+                if isinstance(rec, dict) and rec.get("ok"):
+                    trade = rec["trade"]
 
-               trade_message = f"""
-            TRADE ENGINE SIGNAL — {ticker}
+                    trade_message = f"""TRADE ENGINE SIGNAL — {ticker}
 
-            Suggested {trade['type'].upper()} SPREAD
+Suggested {trade['type'].upper()} SPREAD
 
-            Short Strike: {trade['short']}
-            Long Strike: {trade['long']}
+Short Strike: {trade['short']}
+Long Strike:  {trade['long']}
 
-            Width: {trade['width']}
-            Price: {trade['price']:.2f}
+Width: {trade['width']}
+Price: {trade['price']:.2f}
 
-            Max Profit: {trade['maxProfit']:.2f}
-            Max Loss: {trade['maxLoss']:.2f}
+Max Profit: {trade['maxProfit']:.2f}
+Max Loss:   {trade['maxLoss']:.2f}
 
-            Return on Risk: {trade['RoR']:.2f}
+Return on Risk: {trade['RoR']:.2f}
 
-            Warnings: {", ".join(trade['warnings']) if trade['warnings'] else "None"}
+Warnings: {", ".join(trade.get('warnings') or []) if (trade.get('warnings') is not None and len(trade.get('warnings')) > 0) else "None"}"""
+
+                    post_to_discord({"content": f"```{trade_message}```"})
+                else:
+                    debug_lines.append(f"{ticker}: trade_engine skipped (rec not ok)")
             except Exception as e:
-                debug_lines.append(f"{ticker}: ERROR {type(e).__name__}: {e}")
-                continue
-"""
+                debug_lines.append(
+                    f"{ticker}: TRADE_ENGINE_ERROR {type(e).__name__}: {str(e)[:140]}"
+                )
 
-    post_to_discord({"content": f"```{trade_message}```"})
+            # Risk AFTER trade engine is fine
             risk_label, risk_notes = risk_rating(spot, call_wall, put_wall, net_gex, inc, oi_score)
 
             # Trade-worthy filters
@@ -580,12 +597,14 @@ def scan_watchlist():
         except Exception as e:
             debug_lines.append(f"{ticker}: error {str(e)[:140]}")
 
-    return jsonify({
-        "status": "ok",
-        "posted": results_posted,
-        "tickers": len(tickers),
-        "debug": debug_lines[:100],
-    })
+    return jsonify(
+        {
+            "status": "ok",
+            "posted": results_posted,
+            "tickers": len(tickers),
+            "debug": debug_lines[:100],
+        }
+    )
 
 
 if __name__ == "__main__":
