@@ -786,9 +786,12 @@ def scan_watchlist():
                     alpha_score=alpha,
                     direction=direction,
                 )
-                st, body = post_to_discord(payload)
+                
+                text = payload.get("content", "")
+                st = post_to_telegram(text)
                 results_posted += 1
-                debug_lines.append(f"{ticker}: posted scan card ({st})")
+                debug_lines.append(f"{ticker}: posted telegram scan card ({st})")
+                
                 if body:
                     debug_lines.append(f"{ticker}: discord_body {body[:120]}")
 
