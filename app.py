@@ -859,6 +859,29 @@ def tv_webhook():
         st, body = post_to_telegram(text)
         return jsonify({"status": "error", "telegram_status": st, "telegram_body": body}), 200
 
+@app.route("/exp_debug/<ticker>", methods=["GET"])
+def exp_debug(ticker):
+    ticker = (ticker or "").strip().upper()
+    exp, contracts = get_options_chain(ticker, max_dte=9999)
+
+    # Build expirations list from contracts (get_options_chain already normalizes exp date)
+    exps = sorted({c.get("expiration") for c in contracts if c.get("expiration")})
+    today = datetime.now(timezone.utc).date()
+
+    rows = []
+    for e in exps[:25]:
+        try:
+            d = (datetime.fromisoformat(e).date() - today).days
+        except Exception:
+            d = None
+        rows.append({"exp": e, "dte": d})
+
+    return jsonify({
+        "ticker": ticker,
+        "count_unique_exps_in_chain": len(exps),
+        "first_25": rows,
+        "note": "If you do NOT see any expirations with DTE around 0-10 for SPY, MarketData isn't returning weeklies in this endpoint/plan.",
+    })
 
 @app.route("/scan", methods=["POST"])
 def scan_watchlist():
