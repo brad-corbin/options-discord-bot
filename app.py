@@ -76,9 +76,16 @@ def md_headers():
 def md_get(url, params=None):
     if not MARKETDATA_TOKEN:
         raise RuntimeError("MARKETDATA_TOKEN not set")
+
     r = requests.get(url, headers=md_headers(), params=params or {}, timeout=25)
     r.raise_for_status()
-    return r.json()
+
+    data = r.json()
+
+    print("MARKETDATA URL:", url)
+    print("MARKETDATA RESPONSE:", data)
+
+    return data
 
 
 def get_spot(ticker: str) -> float:
