@@ -46,7 +46,233 @@ def as_int(x, default=0):
 
 def clamp(v, lo, hi):
     return max(lo, min(hi, v))
+# ---------- TRADE RULES ----------
+DTE_MIN = 2
+DTE_MAX = 5
+MAX_WIDTH = 5.0
+MAX_DEBIT_PCT_WIDTH = 0.70      # debit must be <= 70% of width
+CREDIT_BETTER_THRESHOLD = 0.05  # credit must be 5% better RoR than debit to prefer it
+WARN_OI_LT = 500
+WARN_BIDASK_GT = 0.30
 
+
+def _leg_warn(leg_side: str, strike: float, bid: float, ask: float, oi: int) -> list:
+    w = []
+    if oi is not None and oi < WARN_OI_LT:
+        w.append(f"Low OI {leg_side.upper()} {strike:g} (OI={oi})")
+    if bid is not None and ask is not None and (ask - bid) > WARN_BIDASK_GT:
+        w.append(f"Wide bid/ask {leg_side.upper()} {strike:g} ({bid:.2f}/{ask:.2f})")
+    return w
+
+
+def _build_maps(options_data: dict):
+    """
+    options_data keys expected:
+      strike[], side[] ('call'/'put'), bid[], ask[], openInterest[]
+    Returns map[(side, strike)] -> {bid, ask, oi}
+    """
+    strikes = options_data.get("strike", []) or []
+    sides = options_data.get("side", []) or []
+    bids = options_data.get("bid", []) or []
+    asks = options_data.get("ask", []) or []
+    ois = options_data.get("openInterest", []) or []
+
+    m = {}
+    uniq_strikes = set()
+
+    n = min(len(strikes), len(sides), len(bids), len(asks), len(ois))
+    for i in range(n):
+        s = as_float(strikes[i], None)
+        if s is None:
+            continue
+        side = (sides[i] or "").lower().strip()   # 'call'/'put'
+        if side not in ("call", "put"):
+            continue
+
+        bid = as_float(bids[i], None)
+        ask = as_float(asks[i], None)
+        oi = as_int(ois[i], 0)
+
+        # if missing bid/ask, skip
+        if bid is None or ask is None:
+            continue
+
+        m[(side, s)] = {"bid": bid, "ask": ask, "oi": oi}
+        uniq_strikes.add(s)
+
+    return m, sorted(uniq_strikes)
+
+
+def _ror_credit(credit: float, width: float) -> float:
+    max_loss = max(width - credit, 1e-9)
+    return credit / max_loss
+
+
+def _ror_debit(debit: float, width: float) -> float:
+    max_profit = max(width - debit, 0.0)
+    max_loss = max(debit, 1e-9)
+    return max_profit / max_loss
+
+
+def pick_best_spread(options_data: dict, spot: float, direction: str):
+    """
+    Returns:
+      {"ok": True, "trade": {...}} or {"ok": False, "error": "..."}
+    Trade shape:
+      {
+        "type": "credit" or "debit",
+        "structure": "bull_put_credit" / "bull_call_debit" / "bear_call_credit" / "bear_put_debit",
+        "short": strike, "long": strike,
+        "width": width, "price": credit_or_debit,
+        "maxProfit": ..., "maxLoss": ...,
+        "RoR": ...,
+        "warnings": [...]
+      }
+    """
+    direction = (direction or "bull").lower().strip()
+    if direction not in ("bull", "bear"):
+        direction = "bull"
+
+    m, strikes = _build_maps(options_data)
+    if not strikes:
+        return {"ok": False, "error": "No usable strike/bid/ask data"}
+
+    inc = strike_increment(strikes)
+
+    # width steps allowed up to MAX_WIDTH (e.g., 1,2,5 etc based on increment)
+    max_steps = int(round(MAX_WIDTH / inc)) if inc > 0 else 5
+    max_steps = max(1, min(max_steps, 10))
+
+    # Candidate builders
+    candidates_credit = []
+    candidates_debit = []
+
+    def add_credit(structure, side, short_k, long_k):
+        s_leg = m.get((side, short_k))
+        l_leg = m.get((side, long_k))
+        if not s_leg or not l_leg:
+            return
+
+        # conservative fill: short at bid, long at ask
+        credit = s_leg["bid"] - l_leg["ask"]
+        if credit <= 0:
+            return
+
+        width = abs(short_k - long_k)
+        if width <= 0 or width - credit <= 0:
+            return
+
+        warnings = []
+        warnings += _leg_warn(side, short_k, s_leg["bid"], s_leg["ask"], s_leg["oi"])
+        warnings += _leg_warn(side, long_k, l_leg["bid"], l_leg["ask"], l_leg["oi"])
+
+        trade = {
+            "type": "credit",
+            "structure": structure,
+            "short": float(short_k),
+            "long": float(long_k),
+            "width": float(width),
+            "price": float(credit),
+            "maxProfit": float(credit),
+            "maxLoss": float(width - credit),
+            "RoR": float(_ror_credit(credit, width)),
+            "warnings": warnings,
+        }
+        candidates_credit.append(trade)
+
+    def add_debit(structure, side, long_k, short_k):
+        l_leg = m.get((side, long_k))
+        s_leg = m.get((side, short_k))
+        if not l_leg or not s_leg:
+            return
+
+        # conservative fill: buy at ask, sell at bid
+        debit = l_leg["ask"] - s_leg["bid"]
+        if debit <= 0:
+            return
+
+        width = abs(short_k - long_k)
+        if width <= 0:
+            return
+
+        # debit rule: <= 70% width
+        if debit > (MAX_DEBIT_PCT_WIDTH * width):
+            return
+
+        warnings = []
+        warnings += _leg_warn(side, long_k, l_leg["bid"], l_leg["ask"], l_leg["oi"])
+        warnings += _leg_warn(side, short_k, s_leg["bid"], s_leg["ask"], s_leg["oi"])
+
+        trade = {
+            "type": "debit",
+            "structure": structure,
+            "short": float(short_k),
+            "long": float(long_k),
+            "width": float(width),
+            "price": float(debit),
+            "maxProfit": float(max(width - debit, 0.0)),
+            "maxLoss": float(debit),
+            "RoR": float(_ror_debit(debit, width)),
+            "warnings": warnings,
+        }
+        candidates_debit.append(trade)
+
+    # Focus strikes around spot (keeps runtime small)
+    # We'll evaluate strikes within ±2*MAX_WIDTH of spot
+    lo = spot - (2 * MAX_WIDTH)
+    hi = spot + (2 * MAX_WIDTH)
+    focus = [k for k in strikes if lo <= k <= hi]
+    if len(focus) < 6:
+        focus = strikes  # fallback
+
+    # Generate candidates based on direction
+    for k in focus:
+        for step in range(1, max_steps + 1):
+            w = inc * step
+
+            if direction == "bull":
+                # Bull Put Credit: short put below/near spot, long lower
+                short_k = k
+                long_k = k - w
+                if short_k <= spot and long_k > 0:
+                    add_credit("bull_put_credit", "put", short_k, long_k)
+
+                # Bull Call Debit: long call near/above spot, short higher
+                long_k = k
+                short_k = k + w
+                if long_k >= spot - inc and short_k > long_k:
+                    add_debit("bull_call_debit", "call", long_k, short_k)
+
+            else:
+                # Bear Call Credit: short call above/near spot, long higher
+                short_k = k
+                long_k = k + w
+                if short_k >= spot and long_k > short_k:
+                    add_credit("bear_call_credit", "call", short_k, long_k)
+
+                # Bear Put Debit: long put near/below spot, short lower
+                long_k = k
+                short_k = k - w
+                if long_k <= spot + inc and short_k > 0:
+                    add_debit("bear_put_debit", "put", long_k, short_k)
+
+    if not candidates_credit and not candidates_debit:
+        return {"ok": False, "error": "No spreads met rules (width/debit/liquidity)"}
+
+    best_credit = max(candidates_credit, key=lambda t: t["RoR"]) if candidates_credit else None
+    best_debit = max(candidates_debit, key=lambda t: t["RoR"]) if candidates_debit else None
+
+    # Decide: prefer credit if >= 5% better RoR than debit
+    chosen = None
+    if best_credit and best_debit:
+        if best_credit["RoR"] >= best_debit["RoR"] * (1.0 + CREDIT_BETTER_THRESHOLD):
+            chosen = best_credit
+        else:
+            chosen = best_debit
+    else:
+        chosen = best_credit or best_debit
+
+    return {"ok": True, "trade": chosen}
 def strike_targets_and_confidence(spot, emove, call_wall, put_wall, net_gex, inc, oi_score):
     # Expected move zones
     bull_upper = spot + emove
@@ -899,7 +1125,7 @@ def scan_watchlist():
                             )
 
                         trade_payload = build_trade_engine_message(ticker, direction, trade, liq_warns)
-                        st2, body2 = post_to_discord(trade_payload)
+                        st2, body2 = post_to_telegram(trade_payload["content"])
                         debug_lines.append(f"{ticker}: posted trade engine ({st2})")
                         if body2:
                             debug_lines.append(f"{ticker}: trade_engine_body {body2[:120]}")
