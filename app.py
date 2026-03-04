@@ -148,51 +148,112 @@ def get_spot(ticker: str) -> float:
 
 def get_options_chain(ticker: str, max_dte: int = 7):
     """
-    Attempts to pull options chain from:
-      https://api.marketdata.app/v1/options/chain/{ticker}/
-
-    This endpoint format can vary by account. We normalize best-effort into a list.
-    If your chain endpoint differs, paste one MARKETDATA RESPONSE for chain and
-    I’ll adjust this function precisely.
+    MarketData chain response is columnar arrays, like:
+      strike: [...],
+      side: [...],
+      openInterest: [...],
+      iv: [...],
+      gamma: [...],
+      expiration: [epoch,...],
+      dte: [...]
+    We normalize into a list of dict contracts.
+    Then we pick the nearest expiration <= max_dte if possible,
+    otherwise we pick the smallest dte available.
     """
     data = md_get(f"https://api.marketdata.app/v1/options/chain/{ticker}/")
 
-    contracts = None
-    if isinstance(data, dict):
-        if isinstance(data.get("contracts"), list):
-            contracts = data["contracts"]
-        elif isinstance(data.get("data"), list):
-            contracts = data["data"]
+    if not isinstance(data, dict) or data.get("s") != "ok":
+        raise RuntimeError(f"Bad options chain response for {ticker}: {str(data)[:120]}")
 
-    if not contracts:
-        raise RuntimeError("Unexpected chain response format (no contracts list).")
+    # How many rows?
+    sym_list = data.get("optionSymbol") or []
+    if not isinstance(sym_list, list) or len(sym_list) == 0:
+        raise RuntimeError("Unexpected chain format: optionSymbol missing/empty")
 
-    now = datetime.now(timezone.utc)
-    exp_to_contracts = {}
+    n = len(sym_list)
 
+    def col(name, default=None):
+        v = data.get(name, default)
+        # columns are lists; if missing, create a list of defaults
+        if isinstance(v, list):
+            return v
+        return [default] * n
+
+    optionSymbol = col("optionSymbol", "")
+    side = col("side", "")
+    strike = col("strike", None)
+    expiration = col("expiration", None)  # epoch seconds
+    dte = col("dte", None)
+
+    openInterest = col("openInterest", 0)
+    volume = col("volume", 0)
+    iv = col("iv", None)
+    gamma = col("gamma", None)
+    delta = col("delta", None)
+    bid = col("bid", None)
+    ask = col("ask", None)
+    mid = col("mid", None)
+
+    # Build normalized contracts
+    contracts = []
+    for i in range(n):
+        exp_epoch = expiration[i]
+        exp_epoch = as_int(exp_epoch, 0)
+
+        # Convert expiration epoch -> YYYY-MM-DD
+        # (epoch is in seconds, UTC)
+        exp_date = datetime.fromtimestamp(exp_epoch, tz=timezone.utc).date().isoformat() if exp_epoch else None
+
+        contracts.append({
+            "optionSymbol": optionSymbol[i],
+            "right": (side[i] or "").lower(),     # 'call' / 'put'
+            "strike": as_float(strike[i], None),
+            "expiration": exp_date,
+            "dte": as_int(dte[i], None),
+
+            "openInterest": as_int(openInterest[i], 0),
+            "volume": as_int(volume[i], 0),
+
+            "iv": as_float(iv[i], None),
+            "gamma": as_float(gamma[i], 0.0),
+            "delta": as_float(delta[i], None),
+
+            "bid": as_float(bid[i], None),
+            "ask": as_float(ask[i], None),
+            "mid": as_float(mid[i], None),
+        })
+
+    # Group by expiration
+    exp_map = {}
     for c in contracts:
-        exp = c.get("expiration") or c.get("exp")
+        exp = c.get("expiration")
         if not exp:
             continue
+        exp_map.setdefault(exp, []).append(c)
 
-        try:
-            exp_dt = datetime.fromisoformat(exp).replace(tzinfo=timezone.utc)
-        except Exception:
-            continue
+    if not exp_map:
+        raise RuntimeError("No expirations found in chain response")
 
-        dte = (exp_dt.date() - now.date()).days
-        if 0 <= dte <= max_dte:
-            exp_to_contracts.setdefault(exp, []).append(c)
+    # Choose expiration:
+    # 1) any exp where min dte <= max_dte
+    # 2) otherwise, smallest dte overall
+    exp_candidates = []
+    for exp, rows in exp_map.items():
+        dtes = [r.get("dte") for r in rows if isinstance(r.get("dte"), int)]
+        min_d = min(dtes) if dtes else 999999
+        exp_candidates.append((min_d, exp))
 
-    # if none within window, take soonest available
-    if not exp_to_contracts:
-        for c in contracts:
-            exp = c.get("expiration") or c.get("exp")
-            if exp:
-                exp_to_contracts.setdefault(exp, []).append(c)
+    exp_candidates.sort(key=lambda x: x[0])  # smallest dte first
 
-    chosen_exp = sorted(exp_to_contracts.keys())[0]
-    return chosen_exp, exp_to_contracts[chosen_exp]
+    chosen_exp = None
+    for min_d, exp in exp_candidates:
+        if min_d <= max_dte:
+            chosen_exp = exp
+            break
+    if chosen_exp is None:
+        chosen_exp = exp_candidates[0][1]
+
+    return chosen_exp, exp_map[chosen_exp]
 
 
 def strike_increment(strikes):
