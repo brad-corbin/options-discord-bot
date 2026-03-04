@@ -499,10 +499,10 @@ def scan_watchlist():
             if call_wall and put_wall:
                 mid = (call_wall + put_wall) / 2
 
-                if spot > mid:
-                    direction = "bull"
-                    elif spot < mid:
-                    direction = "bear"
+            if spot > mid:
+                direction = "bull"
+                elif spot < mid:
+                direction = "bear"
             
             # ATM IV estimate (unwrap lists!)
             near = sorted(
@@ -533,7 +533,7 @@ def scan_watchlist():
             try:
                 rec = recommend_from_marketdata(
                     marketdata_json=options_data,
-                    direction="direction",
+                    direction=direction,
                     dte=dte,
                     spot=spot,
                 )
