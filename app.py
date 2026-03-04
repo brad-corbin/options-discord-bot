@@ -87,7 +87,33 @@ def as_int(x, default=0):
 
 def clamp(v, lo, hi):
     return max(lo, min(hi, v))
+def get_expirations(ticker: str):
+    """
+    Fetch all expiration dates for a ticker from MarketData.
+    Response fields (per docs): s, expirations, updated
+    """
+    params = {}
 
+    # Optional: request weeklies only if you want
+    if (os.getenv("MD_WEEKLY_ONLY", "0") or "0").strip().lower() in ("1", "true", "yes", "y"):
+        params["weekly"] = "true"
+
+    data = md_get(f"https://api.marketdata.app/v1/options/expirations/{ticker}/", params=params)
+
+    if not isinstance(data, dict) or data.get("s") != "ok":
+        raise RuntimeError(f"Bad expirations response for {ticker}: {str(data)[:180]}")
+
+    exps = data.get("expirations") or []
+    if not isinstance(exps, list) or not exps:
+        raise RuntimeError(f"No expirations returned for {ticker}: {str(data)[:180]}")
+
+    # normalize to YYYY-MM-DD strings
+    out = []
+    for e in exps:
+        if e is None:
+            continue
+        out.append(str(e)[:10])
+    return sorted(set(out))
 
 # ----------------------------
 # TELEGRAM SENDER
@@ -192,163 +218,6 @@ def get_spot(ticker: str) -> float:
         return ask_
 
     raise RuntimeError(f"Could not parse spot quote for {ticker}")
-
-
-def get_options_chain(ticker: str, max_dte: int = 7):
-    """
-    MarketData chain response is columnar arrays.
-    Normalize into list[dict] and choose expiration closest to TRADE_TARGET_DTE,
-    preferring expirations <= max_dte if available.
-    """
-def get_options_chain(ticker: str, max_dte: int = 7):
-    """
-    MarketData chain response is columnar arrays.
-    Normalize into list[dict] and choose expiration closest to TRADE_TARGET_DTE,
-    preferring expirations <= max_dte if available.
-
-    If MD_WEEKLY_ONLY=1, requests weekly expirations from MarketData.
-    """
-
-    # ----------------------------
-    # Request params
-    # ----------------------------
-    params = {}
-
-    # Force weeklies if enabled
-    if (os.getenv("MD_WEEKLY_ONLY", "0") or "0").strip().lower() in ("1", "true", "yes", "y"):
-        params["weekly"] = "true"
-
-    data = md_get(f"https://api.marketdata.app/v1/options/chain/{ticker}/", params=params)
-
-    if not isinstance(data, dict) or data.get("s") != "ok":
-        raise RuntimeError(f"Bad options chain response for {ticker}: {str(data)[:180]}")
-
-    sym_list = data.get("optionSymbol") or []
-    if not isinstance(sym_list, list) or len(sym_list) == 0:
-        raise RuntimeError("Unexpected chain format: optionSymbol missing/empty")
-
-    n = len(sym_list)
-
-    def col(name, default=None):
-        v = data.get(name, default)
-        if isinstance(v, list):
-            return v
-        return [default] * n
-
-    optionSymbol = col("optionSymbol", "")
-    side = col("side", "")
-    strike = col("strike", None)
-    expiration = col("expiration", None)  # epoch seconds
-    dte_col = col("dte", None)            # sometimes present; we will still compute our own
-
-    openInterest = col("openInterest", 0)
-    volume = col("volume", 0)
-    iv = col("iv", None)
-    gamma = col("gamma", None)
-    delta = col("delta", None)
-    bid = col("bid", None)
-    ask = col("ask", None)
-    mid = col("mid", None)
-
-    # ----------------------------
-    # Normalize contracts
-    # ----------------------------
-    contracts = []
-    today_utc = datetime.now(timezone.utc).date()
-
-    for i in range(n):
-        exp_epoch = as_int(expiration[i], 0)
-
-        if exp_epoch:
-            exp_dt = datetime.fromtimestamp(exp_epoch, tz=timezone.utc).date()
-            exp_date = exp_dt.isoformat()
-            dte_calc = max((exp_dt - today_utc).days, 0)
-        else:
-            exp_date = None
-            dte_calc = None
-
-        right = (side[i] or "").lower().strip()
-        if right in ("c", "call"):
-            right = "call"
-        elif right in ("p", "put"):
-            right = "put"
-
-        # prefer our computed dte; fall back to API column if needed
-        dte_val = dte_calc if isinstance(dte_calc, int) else as_int(dte_col[i], None)
-
-        contracts.append({
-            "optionSymbol": optionSymbol[i],
-            "right": right,
-            "strike": as_float(strike[i], None),
-            "expiration": exp_date,
-            "dte": dte_val,
-
-            "openInterest": as_int(openInterest[i], 0),
-            "volume": as_int(volume[i], 0),
-
-            "iv": as_float(iv[i], None),
-            "gamma": as_float(gamma[i], 0.0),
-            "delta": as_float(delta[i], None),
-
-            "bid": as_float(bid[i], None),
-            "ask": as_float(ask[i], None),
-            "mid": as_float(mid[i], None),
-        })
-
-    # ----------------------------
-    # Group by expiration
-    # ----------------------------
-    exp_map = {}
-    exp_dte = {}
-
-    for c in contracts:
-        exp = c.get("expiration")
-        if not exp:
-            continue
-        exp_map.setdefault(exp, []).append(c)
-
-    if not exp_map:
-        raise RuntimeError("No expirations found in chain response")
-
-    # Compute DTE per expiration robustly
-    for exp in exp_map.keys():
-        # Use min dte across that expiry’s contracts as a sanity check
-        dtes = [r.get("dte") for r in exp_map[exp] if isinstance(r.get("dte"), int)]
-        if dtes:
-            exp_dte[exp] = min(dtes)
-        else:
-            try:
-                exp_dt = datetime.fromisoformat(exp).date()
-                exp_dte[exp] = max((exp_dt - today_utc).days, 0)
-            except Exception:
-                exp_dte[exp] = 999999
-
-    # ----------------------------
-    # Choose expiration:
-    # 1) Prefer expirations <= max_dte
-    # 2) Choose closest to TRADE_TARGET_DTE
-    # 3) Tie-breaker: smaller DTE
-    # ----------------------------
-    target = int(os.getenv("TRADE_TARGET_DTE", "3") or 3)
-
-    within = [(abs(d - target), d, exp) for exp, d in exp_dte.items() if d <= max_dte]
-    if within:
-        within.sort(key=lambda x: (x[0], x[1]))
-        chosen_exp = within[0][2]
-    else:
-        allc = [(abs(d - target), d, exp) for exp, d in exp_dte.items()]
-        allc.sort(key=lambda x: (x[0], x[1]))
-        chosen_exp = allc[0][2]
-
-    chosen_dte = exp_dte.get(chosen_exp)
-
-    # Attach chosen DTE to each contract (useful downstream)
-    if isinstance(chosen_dte, int):
-        for c in exp_map[chosen_exp]:
-            c["dte"] = chosen_dte
-
-    return chosen_exp, exp_map[chosen_exp]
-
 
 # ----------------------------
 # CORE METRICS
