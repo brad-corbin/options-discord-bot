@@ -1,42 +1,70 @@
 import os
 import time
 import math
-import threading
 from datetime import datetime, timezone
 
 import requests
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
-@app.route("/debug", methods=["GET"])
-def debug():
-    # DON'T print the token; only whether it exists
-    return jsonify({
-        "MARKETDATA_TOKEN_set": bool(os.getenv("MARKETDATA_TOKEN")),
-        "DISCORD_WEBHOOK_set": bool(os.getenv("DISCORD_WEBHOOK_URL")),
-        "WATCHLIST_len": len((os.getenv("WATCHLIST") or "").split(",")) if os.getenv("WATCHLIST") else 0
-    })
-# ---------- ENV VARS (set these in Render) ----------
+
+# ---------- HELPERS ----------
+def first_val(x, default=None):
+    """MarketData often returns [value]. Unwrap lists safely."""
+    if x is None:
+        return default
+    if isinstance(x, list):
+        if len(x) == 0:
+            return default
+        return x[0]
+    return x
+
+def as_float(x, default=0.0):
+    v = first_val(x, default)
+    try:
+        return float(v)
+    except Exception:
+        return float(default)
+
+def as_int(x, default=0):
+    v = first_val(x, default)
+    try:
+        return int(v)
+    except Exception:
+        return int(default)
+
+# ---------- ENV VARS (set in Render) ----------
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 TV_WEBHOOK_SECRET = os.getenv("TV_WEBHOOK_SECRET", "").strip()
 
-MARKETDATA_TOKEN = os.getenv("MARKETDATA_TOKEN", "").strip()  # from marketdata.app
-WATCHLIST = os.getenv("WATCHLIST", "").strip()  # comma-separated tickers
-SCAN_SECRET = os.getenv("SCAN_SECRET", "").strip()  # secret you call /scan with
+MARKETDATA_TOKEN = os.getenv("MARKETDATA_TOKEN", "").strip()
+WATCHLIST = os.getenv("WATCHLIST", "").strip()
+SCAN_SECRET = os.getenv("SCAN_SECRET", "").strip()
 
-# Optional: base url for your own service (nice for debugging / actions)
 BOT_URL = os.getenv("BOT_URL", "").strip()
 
-# In-memory snapshots (note: free Render can restart and forget these)
+# In-memory snapshots (Render free can restart and forget these)
 prev_oi_snapshot = {}  # key: (ticker, exp, right, strike) -> oi
+
+
+# ---------- DEBUG ----------
+@app.route("/debug", methods=["GET"])
+def debug():
+    return jsonify({
+        "DISCORD_WEBHOOK_set": bool(DISCORD_WEBHOOK_URL),
+        "MARKETDATA_TOKEN_set": bool(MARKETDATA_TOKEN),
+        "WATCHLIST_len": len([t for t in (WATCHLIST.split(",") if WATCHLIST else []) if t.strip()]),
+        "BOT_URL_set": bool(BOT_URL),
+        "SCAN_SECRET_set": bool(SCAN_SECRET),
+    })
 
 
 # ---------- DISCORD ----------
 def post_to_discord(payload, max_retries=5):
     """
-    Discord webhook:
-      - Success is 204 No Content (sometimes 200)
-      - On 429, response JSON includes retry_after (seconds)
+    Discord webhooks:
+      - Success: 204 No Content (sometimes 200)
+      - 429: response JSON may contain retry_after
     """
     if not DISCORD_WEBHOOK_URL:
         return 400, "DISCORD_WEBHOOK_URL not set"
@@ -49,36 +77,31 @@ def post_to_discord(payload, max_retries=5):
             if r.status_code in (200, 204):
                 return r.status_code, ""
 
-            # Rate limited
             if r.status_code == 429:
                 try:
-                    retry_after = float(r.json().get("retry_after", 2))
+                    retry_after = as_float(r.json().get("retry_after"), 2.0)
                 except Exception:
                     retry_after = 2.0
 
-                # Add small cushion + exponential backoff
+                # small cushion + mild backoff
                 sleep_s = retry_after + min(2.0 * attempt, 6.0)
                 time.sleep(sleep_s)
                 last_err = f"429 rate limited; slept {sleep_s:.2f}s"
                 continue
 
-            # Other error
             last_err = (r.text[:300] if r.text else f"HTTP {r.status_code}")
-            # brief backoff to avoid hammering
-            time.sleep(min(1.5 * (attempt + 1), 6))
+            time.sleep(min(1.5 * (attempt + 1), 6.0))
+
         except Exception as e:
             last_err = str(e)
-            time.sleep(min(1.5 * (attempt + 1), 6))
+            time.sleep(min(1.5 * (attempt + 1), 6.0))
 
     return 500, f"Discord post failed after retries: {last_err}"
 
 
-# ---------- MARKETDATA (REST) ----------
+# ---------- MARKETDATA ----------
 def md_headers():
-    # MarketData supports Bearer tokens via Authorization header
-    # If this ever fails, you can fall back to token= query param (less secure).
     return {"Authorization": f"Bearer {MARKETDATA_TOKEN}"}
-
 
 def md_get(url, params=None):
     if not MARKETDATA_TOKEN:
@@ -86,71 +109,83 @@ def md_get(url, params=None):
 
     r = requests.get(url, headers=md_headers(), params=params or {}, timeout=25)
     r.raise_for_status()
-
     data = r.json()
 
-    # Debug output to Render logs
+    # Debug to Render logs
     print("MARKETDATA URL:", url, flush=True)
+    # NOTE: This can be big — keep it on while debugging, then you can remove
     print("MARKETDATA RESPONSE:", data, flush=True)
 
     return data
 
 
 def get_spot(ticker: str) -> float:
-    # Quotes endpoint (stocks)
-    # Example: https://api.marketdata.app/v1/stocks/quotes/SPY/
+    """
+    MarketData quotes often return arrays like:
+      last: [680.33], mid: [679.75], bid: [679.71], ask: [679.79]
+    """
     data = md_get(f"https://api.marketdata.app/v1/stocks/quotes/{ticker}/")
-    # MarketData responses often wrap arrays; handle common shapes safely
-    # Try the common fields:
-    for key in ("last", "price", "mid"):
-        if isinstance(data, dict) and key in data and data[key] is not None:
-            return float(data[key])
-    # Fallback: try typical array response format { "last": [..] }
-    if isinstance(data, dict):
-        if "last" in data and isinstance(data["last"], list) and data["last"]:
-            return float(data["last"][0])
+
+    # prefer last, else mid, else bid, else ask
+    last_ = as_float(data.get("last"), 0.0)
+    if last_ > 0:
+        return last_
+
+    mid_ = as_float(data.get("mid"), 0.0)
+    if mid_ > 0:
+        return mid_
+
+    bid_ = as_float(data.get("bid"), 0.0)
+    if bid_ > 0:
+        return bid_
+
+    ask_ = as_float(data.get("ask"), 0.0)
+    if ask_ > 0:
+        return ask_
+
     raise RuntimeError(f"Could not parse spot quote for {ticker}")
 
 
 def get_options_chain(ticker: str, max_dte: int = 7):
     """
-    Pull an options chain and pick the nearest expiration <= max_dte.
-    NOTE: MarketData has multiple options endpoints. This function expects
-    that the chain payload includes: expiration, strike, right (call/put),
-    openInterest, volume, iv, gamma, delta, bid, ask.
+    Attempts to pull options chain from:
+      https://api.marketdata.app/v1/options/chain/{ticker}/
+
+    This endpoint format can vary by account. We normalize best-effort into a list.
+    If your chain endpoint differs, paste one MARKETDATA RESPONSE for chain and
+    I’ll adjust this function precisely.
     """
-    # Many MarketData installs provide an "options chain" endpoint.
-    # If your account uses a different path, we’ll adapt quickly after you confirm.
-    #
-    # Try a commonly used chain endpoint:
-    #   https://api.marketdata.app/v1/options/chain/{ticker}/
     data = md_get(f"https://api.marketdata.app/v1/options/chain/{ticker}/")
 
-    # Normalize into list of contracts (best-effort)
-    contracts = data.get("contracts") if isinstance(data, dict) else None
-    if contracts is None and isinstance(data, dict) and "data" in data:
-        contracts = data["data"]
-    if not contracts or not isinstance(contracts, list):
+    contracts = None
+    if isinstance(data, dict):
+        if isinstance(data.get("contracts"), list):
+            contracts = data["contracts"]
+        elif isinstance(data.get("data"), list):
+            contracts = data["data"]
+
+    if not contracts:
         raise RuntimeError("Unexpected chain response format (no contracts list).")
 
-    # Pick expirations within DTE
     now = datetime.now(timezone.utc)
     exp_to_contracts = {}
+
     for c in contracts:
         exp = c.get("expiration") or c.get("exp")
         if not exp:
             continue
-        # exp might be "YYYY-MM-DD"
+
         try:
             exp_dt = datetime.fromisoformat(exp).replace(tzinfo=timezone.utc)
         except Exception:
             continue
+
         dte = (exp_dt.date() - now.date()).days
         if 0 <= dte <= max_dte:
             exp_to_contracts.setdefault(exp, []).append(c)
 
+    # if none within window, take soonest available
     if not exp_to_contracts:
-        # If none in 0-7, just take soonest available
         for c in contracts:
             exp = c.get("expiration") or c.get("exp")
             if exp:
@@ -164,13 +199,12 @@ def strike_increment(strikes):
     strikes = sorted(set(float(x) for x in strikes))
     if len(strikes) < 2:
         return 1.0
-    diffs = [round(strikes[i+1] - strikes[i], 4) for i in range(len(strikes)-1)]
+    diffs = [round(strikes[i + 1] - strikes[i], 4) for i in range(len(strikes) - 1)]
     diffs = [d for d in diffs if d > 0]
     return min(diffs) if diffs else 1.0
 
 
 def expected_move_from_iv(spot: float, iv: float, dte: int) -> float:
-    # Expected move ~ S * IV * sqrt(T)
     T = max(dte, 1) / 365.0
     return spot * iv * math.sqrt(T)
 
@@ -178,15 +212,14 @@ def expected_move_from_iv(spot: float, iv: float, dte: int) -> float:
 def compute_walls_and_gex(ticker: str, spot: float, exp: str, contracts: list):
     """
     Walls:
-      - Call Wall: strike with max call OI
-      - Put Wall: strike with max put OI
-    GEX:
-      - Approx net gamma exposure using OI*gamma*S^2*100; calls positive, puts negative
+      - Call Wall = strike with max call OI
+      - Put Wall  = strike with max put OI
+    Net GEX (very rough):
+      oi * gamma * S^2 * 100; calls positive, puts negative
     """
     call_oi = {}
     put_oi = {}
     strikes = []
-
     net_gex = 0.0
 
     for c in contracts:
@@ -194,22 +227,15 @@ def compute_walls_and_gex(ticker: str, spot: float, exp: str, contracts: list):
         strike = c.get("strike")
         if strike is None:
             continue
-        strike = float(strike)
+
+        strike = as_float(strike, None)
+        if strike is None:
+            continue
         strikes.append(strike)
 
-        oi = c.get("openInterest") or c.get("open_interest") or 0
-        try:
-            oi = int(oi)
-        except Exception:
-            oi = 0
+        oi = as_int(c.get("openInterest") or c.get("open_interest"), 0)
+        gamma = as_float(c.get("gamma"), 0.0)
 
-        gamma = c.get("gamma")
-        try:
-            gamma = float(gamma) if gamma is not None else 0.0
-        except Exception:
-            gamma = 0.0
-
-        # Wall calc
         if right in ("call", "c"):
             call_oi[strike] = call_oi.get(strike, 0) + oi
             net_gex += oi * gamma * (spot ** 2) * 100.0
@@ -219,7 +245,6 @@ def compute_walls_and_gex(ticker: str, spot: float, exp: str, contracts: list):
 
     call_wall = max(call_oi.items(), key=lambda kv: kv[1])[0] if call_oi else None
     put_wall = max(put_oi.items(), key=lambda kv: kv[1])[0] if put_oi else None
-
     inc = strike_increment(strikes) if strikes else 1.0
 
     return call_wall, put_wall, net_gex, inc
@@ -227,58 +252,55 @@ def compute_walls_and_gex(ticker: str, spot: float, exp: str, contracts: list):
 
 def oi_change_score(ticker: str, exp: str, contracts: list):
     """
-    Computes a simple OI delta score vs the previous snapshot stored in memory.
+    Simple OI delta score vs in-memory snapshot.
     Returns: (score, biggest_change_str)
     """
     global prev_oi_snapshot
 
     total_abs_change = 0
-    biggest = (0, "")  # (abs_change, label)
+    biggest_abs = 0
+    biggest_label = "—"
 
     for c in contracts:
         right = (c.get("right") or c.get("type") or "").lower()
         strike = c.get("strike")
         if strike is None:
             continue
-        strike = float(strike)
 
-        oi = c.get("openInterest") or c.get("open_interest") or 0
-        try:
-            oi = int(oi)
-        except Exception:
-            oi = 0
+        strike = as_float(strike, None)
+        if strike is None:
+            continue
+
+        oi = as_int(c.get("openInterest") or c.get("open_interest"), 0)
 
         k = (ticker, exp, right, strike)
-        prev = prev_oi_snapshot.get(k, None)
+        prev = prev_oi_snapshot.get(k)
+
         if prev is not None:
             delta = oi - prev
             absd = abs(delta)
             total_abs_change += absd
-            if absd > biggest[0]:
-                biggest = (absd, f"{right.upper()} {strike:g} ΔOI {delta:+d}")
+
+            if absd > biggest_abs:
+                biggest_abs = absd
+                biggest_label = f"{right.upper()} {strike:g} ΔOI {delta:+d}"
+
         prev_oi_snapshot[k] = oi
 
-    return total_abs_change, (biggest[1] if biggest[0] else "—")
+    return total_abs_change, biggest_label
 
 
 def risk_rating(spot, call_wall, put_wall, net_gex, inc, oi_score):
-    """
-    Simple heuristic (you can tune later):
-      - Lower risk if positive gamma AND price is inside walls
-      - Higher risk if near/through walls or negative gamma
-      - Higher risk if big OI shifts (can mean positioning change)
-    """
     if call_wall is None or put_wall is None:
         return "⚪ Unknown", "Walls not available"
 
     dist_call = abs(call_wall - spot)
     dist_put = abs(spot - put_wall)
-    near_wall = min(dist_call, dist_put)
+    near_wall_dist = min(dist_call, dist_put)
 
     notes = []
     score = 0
 
-    # Gamma regime
     if net_gex >= 0:
         score += 1
         notes.append("Positive Gamma (range-favored)")
@@ -286,15 +308,13 @@ def risk_rating(spot, call_wall, put_wall, net_gex, inc, oi_score):
         score -= 1
         notes.append("Negative Gamma (trend/vol risk)")
 
-    # Near wall?
-    if near_wall <= (2 * inc):
+    if near_wall_dist <= (2 * inc):
         score -= 1
         notes.append("Near a major wall")
     else:
         score += 1
         notes.append("Not hugging walls")
 
-    # OI shifts
     if oi_score > 50000:
         score -= 1
         notes.append("Large OI shift")
@@ -311,43 +331,28 @@ def risk_rating(spot, call_wall, put_wall, net_gex, inc, oi_score):
     return "🔴 High", " | ".join(notes)
 
 
-def choose_spread_width(inc):
-    """
-    Your preference:
-      - Suggest $1 spreads when available
-      - Show $2.50 when it exists
-    """
-    # If chain increments show $1, use $1 by default
-    if inc <= 1.01:
-        return 1.0, 2.5
-    # If $2.50 increments exist, use it
-    if abs(inc - 2.5) < 0.01:
-        return 2.5, None
-    # Fallback: use the detected increment
-    return inc, None
-
-
 def build_discord_card(ticker, spot, exp, dte, call_wall, put_wall, net_gex, emove, oi_note, risk_label, risk_notes):
     gex_regime = "Positive Gamma / Range Favored" if net_gex >= 0 else "Negative Gamma / Trend Favored"
-    zero_g = "—"
-    if call_wall and put_wall:
-        zero_g = f"{(call_wall + put_wall)/2:.0f}"
+
+    if call_wall is not None and put_wall is not None:
+        zero_g = f"{(call_wall + put_wall) / 2:.0f}"
+        walls_line = f"Walls: Call {call_wall:g} | Put {put_wall:g} | ZeroG {zero_g} (est.)"
+    else:
+        walls_line = "Walls: —"
 
     lines = [
         f"🚨 WATCHLIST SCAN — {ticker}",
         "",
         f"Spot: {spot:.2f}",
-        f"Expected Move ({dte}D): ±{emove:.2f}",
-        f"Walls: Call {call_wall:g} | Put {put_wall:g} | ZeroG {zero_g} (est.)",
+        f"Expected Move ({max(dte,1)}D): ±{emove:.2f}",
+        walls_line,
         f"Regime: {gex_regime}",
         f"OI Signal: {oi_note}",
         f"Risk: {risk_label}",
         f"Notes: {risk_notes}",
     ]
 
-    return {
-        "content": "```" + "\n".join(lines) + "```"
-    }
+    return {"content": "```" + "\n".join(lines) + "```"}
 
 
 # ---------- ROUTES ----------
@@ -358,28 +363,33 @@ def health():
 
 @app.route("/tv", methods=["POST"])
 def tv_webhook():
-    # TradingView sometimes sends text/plain
     data = request.get_json(force=True, silent=True) or {}
 
     if TV_WEBHOOK_SECRET and data.get("secret") != TV_WEBHOOK_SECRET:
         return jsonify({"error": "Unauthorized"}), 403
 
     ticker = (data.get("ticker") or "UNKNOWN").upper()
-    close = float(data.get("close") or 0)
+    close = as_float(data.get("close"), 0.0)
 
-    # V1: just post the raw signal cleanly. (We’ll swap to real option pricing once Schwab/MarketData logic is ready.)
     payload = {
-        "content": f"```📢 TradingView Signal\nTicker: {ticker}\nClose: {close:.2f}\nTime: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n```"
+        "content": (
+            "```📢 TradingView Signal\n"
+            f"Ticker: {ticker}\n"
+            f"Close: {close:.2f}\n"
+            f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            "```"
+        )
     }
+
     st, body = post_to_discord(payload)
     return jsonify({"status": "received", "discord_status": st, "discord_body": body})
 
 
 @app.route("/scan", methods=["POST"])
 def scan_watchlist():
-    # Secure it
     data = request.get_json(force=True, silent=True) or {}
     supplied = (data.get("secret") or request.headers.get("X-Scan-Secret") or "").strip()
+
     if SCAN_SECRET and supplied != SCAN_SECRET:
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -387,15 +397,21 @@ def scan_watchlist():
     if not tickers:
         return jsonify({"error": "WATCHLIST env var empty"}), 400
 
+    # Prevent Discord spam (and 429s)
+    MAX_POSTS_PER_SCAN = as_int(data.get("max_posts"), 6)
+
     results_posted = 0
-    debug = []
+    debug_lines = []
 
     for ticker in tickers:
+        if results_posted >= MAX_POSTS_PER_SCAN:
+            debug_lines.append(f"Stopped early (max_posts={MAX_POSTS_PER_SCAN})")
+            break
+
         try:
             spot = get_spot(ticker)
             exp, contracts = get_options_chain(ticker, max_dte=7)
 
-            # DTE
             exp_dt = datetime.fromisoformat(exp).date()
             dte = (exp_dt - datetime.now(timezone.utc).date()).days
             dte = max(dte, 0)
@@ -403,33 +419,31 @@ def scan_watchlist():
             call_wall, put_wall, net_gex, inc = compute_walls_and_gex(ticker, spot, exp, contracts)
             oi_score, oi_note = oi_change_score(ticker, exp, contracts)
 
-            # Expected move: try ATM IV from nearest-to-spot options (fallback to 0.30 if missing)
-            # Pick a few contracts nearest spot and average their IV
+            # ATM IV estimate (unwrap lists!)
             near = sorted(
                 [c for c in contracts if c.get("strike") is not None],
-                key=lambda c: abs(float(c.get("strike")) - spot),
+                key=lambda c: abs(as_float(c.get("strike"), 0.0) - spot),
             )[:10]
+
             ivs = []
             for c in near:
                 iv = c.get("iv")
-                try:
-                    if iv is not None:
-                        ivs.append(float(iv))
-                except Exception:
-                    pass
-            atm_iv = sum(ivs) / len(ivs) if ivs else 0.30
-            emove = expected_move_from_iv(spot, atm_iv, dte if dte else 1)
+                iv_f = as_float(iv, None)
+                if iv_f is not None and iv_f > 0:
+                    ivs.append(iv_f)
+
+            atm_iv = (sum(ivs) / len(ivs)) if ivs else 0.30
+            emove = expected_move_from_iv(spot, atm_iv, max(dte, 1))
 
             risk_label, risk_notes = risk_rating(spot, call_wall, put_wall, net_gex, inc, oi_score)
 
-            # “Trade worthy” logic (your request):
-            # - price near call/put wall OR big OI changes OR GEX regime noteworthy
+            # Trade-worthy filters
             near_wall = False
             if call_wall is not None and put_wall is not None:
                 near_wall = min(abs(call_wall - spot), abs(spot - put_wall)) <= (2 * inc)
 
             big_oi = oi_score > 15000
-            notable_gex = abs(net_gex) > 0  # always present; you can tighten later
+            notable_gex = abs(net_gex) > 1e9  # threshold to avoid "always true"; tune later
 
             trade_worthy = near_wall or big_oi or notable_gex
 
@@ -438,9 +452,9 @@ def scan_watchlist():
                     ticker=ticker,
                     spot=spot,
                     exp=exp,
-                    dte=dte if dte else 1,
-                    call_wall=call_wall or 0,
-                    put_wall=put_wall or 0,
+                    dte=max(dte, 1),
+                    call_wall=call_wall,
+                    put_wall=put_wall,
                     net_gex=net_gex,
                     emove=emove,
                     oi_note=oi_note,
@@ -449,26 +463,25 @@ def scan_watchlist():
                 )
                 st, body = post_to_discord(payload)
                 results_posted += 1
-                debug.append(f"{ticker}: posted ({st})")
+                debug_lines.append(f"{ticker}: posted ({st})")
+                if body:
+                    debug_lines.append(f"{ticker}: discord_body {body[:120]}")
             else:
-                debug.append(f"{ticker}: skipped (not trade-worthy)")
+                debug_lines.append(f"{ticker}: skipped")
 
-            # Gentle pacing to avoid Discord/global limits
-            time.sleep(0.4)
+            # light pacing
+            time.sleep(0.25)
 
         except Exception as e:
-            debug.append(f"{ticker}: error {str(e)[:120]}")
-            # keep going
+            debug_lines.append(f"{ticker}: error {str(e)[:140]}")
 
-    summary = {
+    return jsonify({
         "status": "ok",
         "posted": results_posted,
         "tickers": len(tickers),
-        "debug": debug[:50],
-    }
-    return jsonify(summary)
+        "debug": debug_lines[:100],
+    })
 
 
 if __name__ == "__main__":
-    # Render binds externally; keep 10000 since you used it
     app.run(host="0.0.0.0", port=10000)
