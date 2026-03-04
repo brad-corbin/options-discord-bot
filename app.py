@@ -200,7 +200,7 @@ def get_options_chain(ticker: str, max_dte: int = 7):
     Normalize into list[dict] and choose expiration closest to TRADE_TARGET_DTE,
     preferring expirations <= max_dte if available.
     """
-        params = {}
+    params = {}
 
     # If set, request weekly expirations from MarketData
     if (os.getenv("MD_WEEKLY_ONLY", "0") or "0").strip().lower() in ("1", "true", "yes", "y"):
