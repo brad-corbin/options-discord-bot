@@ -3,9 +3,9 @@ name: Watchlist Scan
 on:
   schedule:
     # GitHub schedules are UTC
-    - cron: "45 15 * * 1-5"   # 9:45am Central
-    - cron: "30 18 * * 1-5"   # 12:30pm Central
-    - cron: "30 21 * * 1-5"   # 3:30pm Central
+    - cron: "00 15 * * 1-5"   # 9:45am Central
+    - cron: "15 17 * * 1-5"   # 12:30pm Central
+    - cron: "00 20 * * 1-5"   # 3:30pm Central
   workflow_dispatch:
 
 jobs:
