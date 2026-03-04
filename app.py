@@ -86,6 +86,7 @@ def debug():
         "LIQ_WARN_BA": LIQ_WARN_BA,
         "SCAN_MAX_DTE": SCAN_MAX_DTE,
     })
+
 def post_to_telegram(text: str, max_retries: int = 4):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return 400, "TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set"
