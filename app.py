@@ -717,23 +717,147 @@ def tgtest():
 # TradingView webhook
 @app.route("/tv", methods=["POST"])
 def tv_webhook():
-    data = request.get_json(force=True, silent=True) or {}
+    # Accept JSON (preferred) but also tolerate plain text
+    data = request.get_json(silent=True) or {}
+    raw_text = (request.get_data(as_text=True) or "").strip()
 
-    if TV_WEBHOOK_SECRET and data.get("secret") != TV_WEBHOOK_SECRET:
-        return jsonify({"error": "Unauthorized"}), 403
+    # Secret check (JSON only for safety)
+    if TV_WEBHOOK_SECRET:
+        if not isinstance(data, dict) or data.get("secret") != TV_WEBHOOK_SECRET:
+            return jsonify({"error": "Unauthorized"}), 403
 
-    ticker = (data.get("ticker") or "UNKNOWN").upper()
+    # Pull fields from JSON
+    ticker = (data.get("ticker") or "").strip().upper()
     close = as_float(data.get("close"), 0.0)
+    tv_time = (data.get("time") or "").strip()
 
-    text = (
-        "📢 TradingView Signal\n"
-        f"Ticker: {ticker}\n"
-        f"Close: {close:.2f}\n"
-        f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-    )
+    if not ticker:
+        # If TradingView didn't send JSON, forward raw so you can see what came in
+        text = "📢 TradingView Signal (raw)\n" + (raw_text or "No ticker provided")
+        st, body = post_to_telegram(text)
+        return jsonify({"status": "received_raw", "telegram_status": st, "telegram_body": body})
 
-    st, body = post_to_telegram(text)
-    return jsonify({"status": "received", "telegram_status": st, "telegram_body": body})
+    # FORCE bullish trade suggestion based on price in JSON
+    direction = "bull"
+    spot = close if close > 0 else get_spot(ticker)  # use JSON close if present, else live spot
+
+    try:
+        exp, contracts = get_options_chain(ticker, max_dte=SCAN_MAX_DTE)
+
+        exp_dt = datetime.fromisoformat(exp).date()
+        dte = (exp_dt - datetime.now(timezone.utc).date()).days
+        dte = max(dte, 0)
+
+        call_wall, put_wall, net_gex, inc = compute_walls_and_gex(spot, contracts)
+        oi_score, oi_note = oi_change_score(ticker, exp, contracts)
+
+        # ATM IV estimate from nearby strikes
+        near = sorted(
+            [c for c in contracts if c.get("strike") is not None],
+            key=lambda c: abs(as_float(c.get("strike"), 0.0) - spot),
+        )[:10]
+
+        ivs = []
+        for c in near:
+            iv_f = as_float(c.get("iv"), None)
+            if iv_f is not None and iv_f > 0:
+                ivs.append(iv_f)
+
+        atm_iv = (sum(ivs) / len(ivs)) if ivs else 0.30
+        emove = expected_move_from_iv(spot, atm_iv, max(EXPECTED_MOVE_DTE, 1))
+
+        targets = strike_targets_and_confidence(spot, emove, call_wall, put_wall, net_gex, inc, oi_score)
+        bull_zone = f"{spot:.2f} → {targets['bull_upper']:.2f}"
+        bear_zone = f"{spot:.2f} → {targets['bear_lower']:.2f}"
+
+        risk_label, risk_notes = risk_rating(spot, call_wall, put_wall, net_gex, inc, oi_score)
+        alpha = big_alpha_score(spot, call_wall, put_wall, net_gex, oi_score, risk_label, emove, inc)
+
+        # Build options_data for engine
+        options_data = {
+            "strike": [c.get("strike") for c in contracts],
+            "side": [c.get("right") for c in contracts],  # call/put
+            "bid": [c.get("bid") for c in contracts],
+            "ask": [c.get("ask") for c in contracts],
+            "mid": [c.get("mid") for c in contracts],
+            "openInterest": [c.get("openInterest") for c in contracts],
+            "iv": [c.get("iv") for c in contracts],
+            "dte": [dte for _ in contracts],
+        }
+
+        rec = recommend_from_marketdata(
+            marketdata_json=options_data,
+            direction=direction,   # forced bull
+            dte=dte,
+            spot=spot,
+            net_gex=net_gex,
+            prefer="debit",        # your preference
+        )
+
+        trade_lines = []
+        if isinstance(rec, dict) and rec.get("ok"):
+            trade = rec.get("trade") or {}
+            liq_warns = liquidity_warnings_for_trade(contracts, trade)
+
+            ttype = (trade.get("type") or "").upper()
+            short_k = trade.get("short")
+            long_k = trade.get("long")
+            pr = trade.get("price")
+            ror = trade.get("RoR")
+
+            trade_lines.append("🧠 Trade Suggestion (BULL):")
+            trade_lines.append(f"{ttype} spread | Short {short_k} / Long {long_k}")
+            if isinstance(pr, (int, float)):
+                trade_lines.append(f"Price: {pr:.2f}" + (f" | RoR: {ror:.2f}" if isinstance(ror, (int, float)) else ""))
+            else:
+                trade_lines.append(f"Price: {pr}" + (f" | RoR: {ror}" if ror is not None else ""))
+
+            if liq_warns:
+                trade_lines.append("⚠️ " + "; ".join(liq_warns[:3]))
+        else:
+            reason = rec.get("reason") if isinstance(rec, dict) else None
+            trade_lines.append("🧠 Trade Suggestion (BULL): —")
+            if reason:
+                trade_lines.append(f"Reason: {reason}")
+
+        # Compose final Telegram message
+        lines = [
+            "📢 TradingView Signal → Bullish Trade",
+            f"Ticker: {ticker}",
+            f"TV Close: {spot:.2f}",
+            f"TV Time: {tv_time}" if tv_time else None,
+            f"Exp: {exp} | DTE: {max(dte,1)}",
+            f"Expected Move ({max(EXPECTED_MOVE_DTE,1)}D): ±{emove:.2f}",
+            f"Bull Zone: {bull_zone}",
+            f"Bear Zone: {bear_zone}",
+            f"Regime: {targets['regime']}",
+            f"Confidence: {targets['confidence']}/100",
+            f"Confidence Notes: {targets['notes']}",
+            f"Walls: Call {call_wall:g} | Put {put_wall:g} | ZeroG {((call_wall+put_wall)/2):.0f} (est.)" if call_wall is not None and put_wall is not None else "Walls: —",
+            f"OI Signal: {oi_note}",
+            f"Risk: {risk_label}",
+            f"Notes: {risk_notes}",
+            f"Big Alpha: {alpha}/100",
+            "",
+            *trade_lines,
+            "",
+            "— Not financial advice —",
+        ]
+
+        text = "\n".join([x for x in lines if x is not None])
+        st, body = post_to_telegram(text)
+        return jsonify({"status": "received", "telegram_status": st, "telegram_body": body})
+
+    except Exception as e:
+        text = (
+            "📢 TradingView Signal → Bullish Trade\n"
+            f"Ticker: {ticker}\n"
+            f"TV Close: {spot:.2f}\n"
+            f"Error: {type(e).__name__}: {str(e)[:200]}\n"
+            "— Not financial advice —"
+        )
+        st, body = post_to_telegram(text)
+        return jsonify({"status": "error", "telegram_status": st, "telegram_body": body}), 200
 
 
 @app.route("/scan", methods=["POST"])
