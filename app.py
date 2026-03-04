@@ -493,7 +493,17 @@ def scan_watchlist():
 
             call_wall, put_wall, net_gex, inc = compute_walls_and_gex(ticker, spot, exp, contracts)
             oi_score, oi_note = oi_change_score(ticker, exp, contracts)
+            # ----- AUTO DIRECTION -----
+            direction = "bull"
 
+            if call_wall and put_wall:
+                mid = (call_wall + put_wall) / 2
+
+                if spot > mid:
+                    direction = "bull"
+                    elif spot < mid:
+                    direction = "bear"
+            
             # ATM IV estimate (unwrap lists!)
             near = sorted(
                 [c for c in contracts if c.get("strike") is not None],
@@ -523,7 +533,7 @@ def scan_watchlist():
             try:
                 rec = recommend_from_marketdata(
                     marketdata_json=options_data,
-                    direction="bull",
+                    direction="direction",
                     dte=dte,
                     spot=spot,
                 )
