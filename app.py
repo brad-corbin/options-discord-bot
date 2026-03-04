@@ -852,6 +852,8 @@ def scan_watchlist():
                     direction=direction,
                     dte=dte,
                     spot=spot,
+                    net_gex=net_gex,   # ✅ adds regime awareness
+                    prefer="debit",    # ✅ your preference
                 )
 
                 if isinstance(rec, dict) and rec.get("ok"):
