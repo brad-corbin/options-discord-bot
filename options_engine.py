@@ -3,9 +3,9 @@ import math
 from typing import Dict, Any, List, Tuple, Optional
 
 def implied_move(underlying_price: float, iv: float, dte: int) -> float:
-    return underlying_price * iv * math.sqrt(dte / 365.0)
+    return underlying_price * iv * math.sqrt(max(dte, 1) / 365.0)
 
-def leg_warnings(bid: float, ask: float, oi: int, warn_oi=500, warn_spread=0.30) -> List[str]:
+def leg_warnings(bid: Optional[float], ask: Optional[float], oi: Optional[int], warn_oi=500, warn_spread=0.30) -> List[str]:
     warnings = []
     if oi is not None and oi < warn_oi:
         warnings.append(f"Low OI (<{warn_oi})")
@@ -36,58 +36,84 @@ def choose_credit_if_better(ror_debit: Optional[float], ror_credit: Optional[flo
 def nearest_strike(strikes: List[float], target: float) -> float:
     return min(strikes, key=lambda x: abs(x - target))
 
-def target_short_strike(spot: float, move: float, direction: str, k_sigma: float=0.8) -> float:
+def target_short_strike(spot: float, move: float, direction: str, k_sigma: float = 0.8) -> float:
     if direction == "bull":
         return spot - k_sigma * move
     if direction == "bear":
         return spot + k_sigma * move
     raise ValueError("direction must be 'bull' or 'bear'")
 
+def _safe_get(lst: Any, i: int, default=None):
+    if not isinstance(lst, list):
+        return default
+    if i < 0 or i >= len(lst):
+        return default
+    v = lst[i]
+    return default if v is None else v
+
 def build_quotes_by_strike(marketdata_json: Dict[str, Any], side: str) -> Dict[float, Dict[str, Any]]:
-    strikes = marketdata_json["strike"]
-    sides = marketdata_json["side"]
-    mids = marketdata_json.get("mid", [])
-    bids = marketdata_json.get("bid", [])
-    asks = marketdata_json.get("ask", [])
-    ois  = marketdata_json.get("openInterest", [])
+    strikes = marketdata_json.get("strike", [])
+    sides   = marketdata_json.get("side", [])
+    mids    = marketdata_json.get("mid", None)   # may be missing
+    bids    = marketdata_json.get("bid", [])
+    asks    = marketdata_json.get("ask", [])
+    ois     = marketdata_json.get("openInterest", [])
 
     out: Dict[float, Dict[str, Any]] = {}
 
-    for i in range(len(strikes)):
+    n = min(len(strikes), len(sides), len(bids), len(asks))
+    if n <= 0:
+        return out
+
+    for i in range(n):
         if sides[i] != side:
             continue
 
-        k = float(strikes[i])
-        bid = float(bids[i]) if bids[i] is not None else None
-        ask = float(asks[i]) if asks[i] is not None else None
-        mid = float(mids[i]) if mids[i] is not None else None
-        oi  = int(ois[i]) if (i < len(ois) and ois[i] is not None) else None
+        k_raw = strikes[i]
+        if k_raw is None:
+            continue
+        k = float(k_raw)
 
+        bid = _safe_get(bids, i, None)
+        ask = _safe_get(asks, i, None)
+        mid = _safe_get(mids, i, None) if isinstance(mids, list) else None
+        oi  = _safe_get(ois, i, None)
+        oi  = int(oi) if oi is not None else None
+
+        bid = float(bid) if bid is not None else None
+        ask = float(ask) if ask is not None else None
+        mid = float(mid) if mid is not None else None
+
+        # If mid not provided, compute from bid/ask
         if mid is None and bid is not None and ask is not None:
             mid = (bid + ask) / 2.0
 
+        # If still no mid, skip (cannot price spread)
         if mid is None:
             continue
 
-        warnings = leg_warnings(bid or 0.0, ask or 0.0, oi or 0)
+        warnings = leg_warnings(bid, ask, oi)
         out[k] = {"strike": k, "mid": mid, "bid": bid, "ask": ask, "oi": oi, "warnings": warnings}
 
     return out
 
 def pick_atm_iv(marketdata_json: Dict[str, Any], spot: float, side: str) -> Optional[float]:
-    strikes = marketdata_json["strike"]
-    sides = marketdata_json["side"]
-    ivs = marketdata_json.get("iv")
+    strikes = marketdata_json.get("strike", [])
+    sides   = marketdata_json.get("side", [])
+    ivs     = marketdata_json.get("iv", None)
 
-    if not ivs:
+    if not isinstance(ivs, list) or not ivs:
         return None
 
-    idxs = [i for i in range(len(strikes)) if sides[i] == side and ivs[i] is not None]
+    idxs = [i for i in range(min(len(strikes), len(sides), len(ivs))) if sides[i] == side and ivs[i] is not None]
     if not idxs:
         return None
 
     best_i = min(idxs, key=lambda i: abs(float(strikes[i]) - spot))
-    return float(ivs[best_i])
+    try:
+        return float(ivs[best_i])
+    except Exception:
+        return None
 
 def build_vertical_candidates(
     quotes_by_strike: Dict[float, Dict[str, Any]],
@@ -103,6 +129,9 @@ def build_vertical_candidates(
     tgt = target_short_strike(spot, move, direction, k_sigma=0.8)
 
     strikes = sorted(quotes_by_strike.keys())
+    if not strikes:
+        return move, []
+
     short_k = nearest_strike(strikes, tgt)
 
     widths = [1, 2, 3, 4, 5]
@@ -129,9 +158,14 @@ def build_vertical_candidates(
         if credit_mid > 0:
             mp, ml, ror = vertical_metrics(w, credit=credit_mid)
             out.append({
-                "type": "credit", "direction": direction,
-                "short": short_k, "long": long_k, "width": float(w),
-                "price": float(credit_mid), "maxProfit": float(mp), "maxLoss": float(ml),
+                "type": "credit",
+                "direction": direction,
+                "short": short_k,
+                "long": long_k,
+                "width": float(w),
+                "price": float(credit_mid),
+                "maxProfit": float(mp),
+                "maxLoss": float(ml),
                 "RoR": float(ror) if ror is not None else None,
                 "warnings": short_q["warnings"] + long_q["warnings"],
             })
@@ -139,9 +173,14 @@ def build_vertical_candidates(
         if debit_mid > 0 and debit_mid <= (max_debit_pct * w):
             mp, ml, ror = vertical_metrics(w, debit=debit_mid)
             out.append({
-                "type": "debit", "direction": direction,
-                "short": short_k, "long": long_k, "width": float(w),
-                "price": float(debit_mid), "maxProfit": float(mp), "maxLoss": float(ml),
+                "type": "debit",
+                "direction": direction,
+                "short": short_k,
+                "long": long_k,
+                "width": float(w),
+                "price": float(debit_mid),
+                "maxProfit": float(mp),
+                "maxLoss": float(ml),
                 "RoR": float(ror) if ror is not None else None,
                 "warnings": short_q["warnings"] + long_q["warnings"],
             })
@@ -149,8 +188,8 @@ def build_vertical_candidates(
     return move, out
 
 def pick_best_trade(cands: List[Dict[str, Any]], credit_edge: float = 0.05):
-    debit = [c for c in cands if c["type"] == "debit" and c["RoR"] is not None]
-    credit = [c for c in cands if c["type"] == "credit" and c["RoR"] is not None]
+    debit = [c for c in cands if c["type"] == "debit" and c.get("RoR") is not None]
+    credit = [c for c in cands if c["type"] == "credit" and c.get("RoR") is not None]
 
     best_debit = max(debit, key=lambda c: (c["RoR"], -c["price"]), default=None)
     best_credit = max(credit, key=lambda c: c["RoR"], default=None)
@@ -172,7 +211,7 @@ def recommend_from_marketdata(
     quotes_by_strike = build_quotes_by_strike(marketdata_json, side=side)
 
     if not quotes_by_strike:
-        return {"ok": False, "reason": f"No usable {side} quotes (missing mids?)"}
+        return {"ok": False, "reason": f"No usable {side} quotes (need bid/ask or mid)"}
 
     iv = pick_atm_iv(marketdata_json, spot=spot, side=side)
     if iv is None:
