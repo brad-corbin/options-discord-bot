@@ -496,7 +496,49 @@ def scan_watchlist():
 
             atm_iv = (sum(ivs) / len(ivs)) if ivs else 0.30
             emove = expected_move_from_iv(spot, atm_iv, max(dte, 1))
+# ----- TRADE ENGINE -----
+from options_engine import recommend_from_marketdata
 
+options_data = {
+    "strike": [c.get("strike") for c in contracts],
+    "side": [c.get("right") for c in contracts],
+    "bid": [c.get("bid") for c in contracts],
+    "ask": [c.get("ask") for c in contracts],
+    "openInterest": [c.get("openInterest") for c in contracts],
+    "iv": [c.get("iv") for c in contracts],
+    "dte": [dte for _ in contracts]
+}
+
+rec = recommend_from_marketdata(
+    marketdata_json=options_data,
+    direction="bull",
+    dte=dte,
+    spot=spot
+)
+
+if rec["ok"]:
+    trade = rec["trade"]
+
+    trade_message = f"""
+TRADE ENGINE SIGNAL — {ticker}
+
+Suggested {trade['type'].upper()} SPREAD
+
+Short Strike: {trade['short']}
+Long Strike: {trade['long']}
+
+Width: {trade['width']}
+Price: {trade['price']:.2f}
+
+Max Profit: {trade['maxProfit']:.2f}
+Max Loss: {trade['maxLoss']:.2f}
+
+Return on Risk: {trade['RoR']:.2f}
+
+Warnings: {", ".join(trade['warnings']) if trade['warnings'] else "None"}
+"""
+
+    post_to_discord({"content": f"```{trade_message}```"})
             risk_label, risk_notes = risk_rating(spot, call_wall, put_wall, net_gex, inc, oi_score)
 
             # Trade-worthy filters
