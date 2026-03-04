@@ -4,7 +4,7 @@
 from options_engine import recommend_from_marketdata
 
 import os
-import time
+import timef
 import math
 from datetime import datetime, timezone
 
@@ -200,8 +200,13 @@ def get_options_chain(ticker: str, max_dte: int = 7):
     Normalize into list[dict] and choose expiration closest to TRADE_TARGET_DTE,
     preferring expirations <= max_dte if available.
     """
-    data = md_get(f"https://api.marketdata.app/v1/options/chain/{ticker}/")
+        params = {}
 
+    # If set, request weekly expirations from MarketData
+    if (os.getenv("MD_WEEKLY_ONLY", "0") or "0").strip().lower() in ("1", "true", "yes", "y"):
+        params["weekly"] = "true"
+
+    data = md_get(f"https://api.marketdata.app/v1/options/chain/{ticker}/", params=params)
     if not isinstance(data, dict) or data.get("s") != "ok":
         raise RuntimeError(f"Bad options chain response for {ticker}: {str(data)[:180]}")
 
