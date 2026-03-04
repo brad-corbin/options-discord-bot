@@ -1,417 +1,613 @@
 # options_engine.py
 # NOTE: Educational/demo code. Not financial advice. Use at your own risk.
+#
+# UPGRADED ENGINE v2 — Full rewrite
+# Key fixes:
+#   - Correct bull/bear × debit/credit × call/put mapping
+#   - Delta-gated short strike selection
+#   - IV rank/percentile awareness
+#   - Skew-informed direction bias
+#   - Dynamic strike increments (handles SPY, SPX, high-price stocks)
+#   - Probability of profit estimate (delta-based)
+#   - Minimum quality filters (credit % of width, debit RoR floor)
+#   - RoR ranking normalized by width
+#   - Position sizing: max-$ risk + 2% account cap → contract count
+#   - Confidence gating: suppresses low-conviction trades
 
 import math
-from typing import Dict, Any, List, Tuple, Optional
+from collections import Counter
+from typing import Any, Dict, List, Optional, Tuple
 
-# ----------------------------
-# CONFIG / TUNING (edit as desired)
-# ----------------------------
-DEFAULT_WARN_OI = 500
-DEFAULT_WARN_BA = 0.30
+# ─────────────────────────────────────────────────────────
+# TUNABLES
+# ─────────────────────────────────────────────────────────
+IV_HIGH_FOR_CREDIT    = 0.45
+IV_LOW_FOR_DEBIT      = 0.22
+IVR_HIGH_FOR_CREDIT   = 50      # IV rank above this → credit bias
+IVR_LOW_FOR_DEBIT     = 30      # IV rank below this → debit bias
 
-# Strategy selection thresholds
-IV_HIGH_FOR_CREDIT = 0.45      # above this, credit spreads tend to be favored
-IV_LOW_FOR_DEBIT = 0.22        # below this, debit spreads tend to be favored
-NEG_GAMMA_PREFERS_DEBIT = True # negative gamma -> debit bias
-POS_GAMMA_PREFERS_CREDIT = True# positive gamma -> credit bias
+K_SIGMA_CREDIT        = 1.20    # short strike 1.2 sigma OTM for credits
+K_SIGMA_DEBIT_OTM     = 0.80    # short (protective) leg for debits
 
-# Strike selection
-K_SIGMA = 0.8                  # target short strike at ~0.8 * 1-sigma move
+MAX_SHORT_DELTA_CREDIT = 0.38
+MAX_SHORT_DELTA_DEBIT  = 0.55
 
-# Trade selection weighting
-# (Used only for ranking candidates within the chosen strategy)
-ROR_WEIGHT = 1.0
-PRICE_WEIGHT = 0.05            # small tie-breaker preference (cheaper debit / bigger credit)
+MIN_CREDIT_PCT_WIDTH   = 0.15   # credit must be ≥15% of width
+MIN_DEBIT_ROR          = 0.25   # debit RoR floor
+MIN_CONFIDENCE         = 40
 
-# ----------------------------
+ROR_WEIGHT             = 1.0
+WIDTH_BONUS_WEIGHT     = 0.10
+POP_WEIGHT             = 0.20
+PRICE_WEIGHT           = 0.05
+
+DEFAULT_ACCOUNT_SIZE   = 100_000.0
+DEFAULT_MAX_RISK_PCT   = 0.02
+DEFAULT_MAX_RISK_USD   = 500.0
+
+DEFAULT_WARN_OI        = 500
+DEFAULT_WARN_BA        = 0.30
+
+
+# ─────────────────────────────────────────────────────────
 # CORE MATH
-# ----------------------------
-def implied_move(underlying_price: float, iv: float, dte: int) -> float:
-    """1-sigma implied move based on annualized IV and time."""
-    return underlying_price * iv * math.sqrt(max(dte, 1) / 365.0)
+# ─────────────────────────────────────────────────────────
 
-def vertical_metrics(width: float, debit: float = None, credit: float = None) -> Tuple[float, float, Optional[float]]:
-    """
-    Returns (max_profit, max_loss, return_on_risk).
-    For debit: max_loss = debit, max_profit = width - debit
-    For credit: max_profit = credit, max_loss = width - credit
-    """
+def implied_move(spot: float, iv: float, dte: int) -> float:
+    return spot * iv * math.sqrt(max(dte, 1) / 365.0)
+
+
+def vertical_metrics(width, debit=None, credit=None):
     if debit is not None:
-        max_profit = width - debit
-        max_loss = debit
-        ror = (max_profit / max_loss) if max_loss > 0 else None
-        return max_profit, max_loss, ror
-
+        mp, ml = width - debit, debit
+        return mp, ml, (mp / ml if ml > 0 else None)
     if credit is not None:
-        max_profit = credit
-        max_loss = width - credit
-        ror = (max_profit / max_loss) if max_loss > 0 else None
-        return max_profit, max_loss, ror
-
+        mp, ml = credit, width - credit
+        return mp, ml, (mp / ml if ml > 0 else None)
     raise ValueError("Provide debit or credit")
 
-# ----------------------------
-# HELPERS
-# ----------------------------
-def _safe_get(lst: Any, i: int, default=None):
-    if not isinstance(lst, list):
-        return default
-    if i < 0 or i >= len(lst):
-        return default
-    v = lst[i]
-    return default if v is None else v
 
-def leg_warnings(
-    bid: Optional[float],
-    ask: Optional[float],
-    oi: Optional[int],
-    warn_oi: int = DEFAULT_WARN_OI,
-    warn_spread: float = DEFAULT_WARN_BA,
-) -> List[str]:
-    warnings = []
+def delta_to_pop(delta: Optional[float], spread_type: str) -> Optional[float]:
+    if delta is None:
+        return None
+    d = abs(delta)
+    return round(1.0 - d if spread_type == "credit" else d, 3)
+
+
+def compute_iv_rank(iv_current, iv_52w_high, iv_52w_low) -> Optional[float]:
+    if None in (iv_52w_high, iv_52w_low):
+        return None
+    rng = iv_52w_high - iv_52w_low
+    if rng <= 0:
+        return None
+    return round(min(max((iv_current - iv_52w_low) / rng * 100.0, 0), 100), 1)
+
+
+def skew_score(call_iv: Optional[float], put_iv: Optional[float]) -> Tuple[float, str]:
+    if call_iv is None or put_iv is None:
+        return 0.0, "neutral"
+    skew = put_iv - call_iv
+    if skew > 0.03:
+        return skew, "bear_skew"
+    if skew < -0.03:
+        return skew, "bull_skew"
+    return skew, "neutral"
+
+
+def position_size_contracts(
+    max_loss_per_contract: float,
+    account_size:  float = DEFAULT_ACCOUNT_SIZE,
+    max_risk_pct:  float = DEFAULT_MAX_RISK_PCT,
+    max_risk_usd:  float = DEFAULT_MAX_RISK_USD,
+) -> Tuple[int, float, str]:
+    if max_loss_per_contract <= 0:
+        return 1, 0.0, "Could not compute sizing"
+    budget_pct = account_size * max_risk_pct
+    budget     = min(budget_pct, max_risk_usd)
+    contracts  = max(1, int(budget / max_loss_per_contract))
+    actual     = contracts * max_loss_per_contract
+    note = (f"${actual:.0f} risk | {contracts} contract(s) "
+            f"[2% cap=${budget_pct:.0f}, hard cap=${max_risk_usd:.0f}]")
+    return contracts, actual, note
+
+
+# ─────────────────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────────────────
+
+def normalize_side(x) -> str:
+    s = (str(x) if x is not None else "").strip().lower()
+    return "call" if s in ("c", "call") else "put" if s in ("p", "put") else s
+
+
+def _sg(lst, i, default=None):
+    if not isinstance(lst, list) or i < 0 or i >= len(lst):
+        return default
+    return default if lst[i] is None else lst[i]
+
+
+def leg_warnings(bid, ask, oi, warn_oi=DEFAULT_WARN_OI, warn_ba=DEFAULT_WARN_BA):
+    w = []
     if oi is not None and oi < warn_oi:
-        warnings.append(f"Low OI (<{warn_oi})")
-    if bid is not None and ask is not None and (ask - bid) > warn_spread:
-        warnings.append(f"Wide B/A (>{warn_spread:.2f})")
-    return warnings
+        w.append(f"Low OI (<{warn_oi})")
+    if bid is not None and ask is not None and (ask - bid) > warn_ba:
+        w.append(f"Wide B/A ({ask - bid:.2f})")
+    return w
+
 
 def nearest_strike(strikes: List[float], target: float) -> float:
     return min(strikes, key=lambda x: abs(x - target))
 
-def target_short_strike(spot: float, move: float, direction: str, k_sigma: float = K_SIGMA) -> float:
-    """
-    For bull spreads, short strike is below spot.
-    For bear spreads, short strike is above spot.
-    """
-    if direction == "bull":
-        return spot - k_sigma * move
-    if direction == "bear":
-        return spot + k_sigma * move
-    raise ValueError("direction must be 'bull' or 'bear'")
 
-def normalize_side(x: Any) -> str:
-    """Normalize 'c'/'p'/'call'/'put' to 'call'/'put'."""
-    s = (str(x) if x is not None else "").strip().lower()
-    if s in ("c", "call"):
-        return "call"
-    if s in ("p", "put"):
-        return "put"
-    return s
+def detect_increment(strikes: List[float]) -> float:
+    s = sorted(set(strikes))
+    if len(s) < 2:
+        return 1.0
+    diffs = [round(s[i+1] - s[i], 4) for i in range(len(s)-1) if s[i+1] > s[i]]
+    if not diffs:
+        return 1.0
+    counts = Counter(round(d, 2) for d in diffs)
+    return counts.most_common(1)[0][0]
 
-# ----------------------------
+
+# ─────────────────────────────────────────────────────────
 # DATA BUILDERS
-# ----------------------------
-def build_quotes_by_strike(marketdata_json: Dict[str, Any], side: str) -> Dict[float, Dict[str, Any]]:
-    """
-    Build dict strike -> {mid,bid,ask,oi,warnings} for a given side ('call' or 'put').
+# ─────────────────────────────────────────────────────────
 
-    Robust if 'mid' missing (uses (bid+ask)/2 when possible).
-    """
-    strikes = marketdata_json.get("strike", [])
-    sides   = marketdata_json.get("side", [])
-    mids    = marketdata_json.get("mid", None)
-    bids    = marketdata_json.get("bid", [])
-    asks    = marketdata_json.get("ask", [])
-    ois     = marketdata_json.get("openInterest", [])
+def build_quotes(md: Dict, side: str) -> Dict[float, Dict]:
+    strikes = md.get("strike", [])
+    sides   = md.get("side", [])
+    bids    = md.get("bid", [])
+    asks    = md.get("ask", [])
+    mids    = md.get("mid", None)
+    ois     = md.get("openInterest", [])
+    deltas  = md.get("delta", None)
+    ivs     = md.get("iv", None)
 
-    out: Dict[float, Dict[str, Any]] = {}
-
-    # Use minimum common length; mid may be missing
+    out = {}
     n = min(len(strikes), len(sides), len(bids), len(asks))
-    if n <= 0:
-        return out
-
     for i in range(n):
-        if normalize_side(sides[i]) != side:
+        if normalize_side(_sg(sides, i)) != side:
             continue
-
-        k_raw = strikes[i]
-        if k_raw is None:
+        kr = _sg(strikes, i)
+        if kr is None:
             continue
-        k = float(k_raw)
+        k = float(kr)
 
-        bid = _safe_get(bids, i, None)
-        ask = _safe_get(asks, i, None)
-        mid = _safe_get(mids, i, None) if isinstance(mids, list) else None
-        oi  = _safe_get(ois, i, None)
-        oi  = int(oi) if oi is not None else None
+        bid = _sg(bids,   i, None)
+        ask = _sg(asks,   i, None)
+        mid = _sg(mids,   i, None) if isinstance(mids, list) else None
+        oi  = _sg(ois,    i, None)
+        d   = _sg(deltas, i, None) if isinstance(deltas, list) else None
+        iv  = _sg(ivs,    i, None) if isinstance(ivs,    list) else None
 
         bid = float(bid) if bid is not None else None
         ask = float(ask) if ask is not None else None
         mid = float(mid) if mid is not None else None
+        oi  = int(oi)    if oi  is not None else None
+        d   = float(d)   if d   is not None else None
+        iv  = float(iv)  if iv  is not None else None
 
         if mid is None and bid is not None and ask is not None:
             mid = (bid + ask) / 2.0
-
         if mid is None:
             continue
 
-        warnings = leg_warnings(bid, ask, oi)
-        out[k] = {
-            "strike": k,
-            "mid": mid,
-            "bid": bid,
-            "ask": ask,
-            "oi": oi,
-            "warnings": warnings,
-        }
-
+        out[k] = {"strike": k, "mid": mid, "bid": bid, "ask": ask,
+                  "oi": oi, "delta": d, "iv": iv,
+                  "warnings": leg_warnings(bid, ask, oi)}
     return out
 
-def pick_atm_iv(marketdata_json: Dict[str, Any], spot: float, side: str) -> Optional[float]:
-    """
-    Pick IV from the strike closest to spot for the given side.
-    """
-    strikes = marketdata_json.get("strike", [])
-    sides   = marketdata_json.get("side", [])
-    ivs     = marketdata_json.get("iv", None)
 
-    if not isinstance(ivs, list) or not ivs:
+def pick_atm_iv(md: Dict, spot: float, side: str) -> Optional[float]:
+    strikes = md.get("strike", [])
+    sides   = md.get("side", [])
+    ivs     = md.get("iv", None)
+    if not isinstance(ivs, list):
         return None
-
     n = min(len(strikes), len(sides), len(ivs))
-    idxs = [i for i in range(n) if normalize_side(sides[i]) == side and ivs[i] is not None]
+    idxs = [i for i in range(n)
+            if normalize_side(_sg(sides, i)) == side and _sg(ivs, i) is not None]
     if not idxs:
         return None
-
-    best_i = min(idxs, key=lambda i: abs(float(strikes[i]) - spot))
+    bi = min(idxs, key=lambda i: abs(float(strikes[i]) - spot))
     try:
-        return float(ivs[best_i])
+        return float(ivs[bi])
     except Exception:
         return None
 
-# ----------------------------
-# STRATEGY SELECTOR
-# ----------------------------
-def choose_spread_type(
-    direction: str,
-    iv_atm: float,
-    net_gex: Optional[float] = None,
-    prefer: str = "debit",
-) -> str:
-    """
-    Returns "debit" or "credit".
 
-    Heuristics:
-    - User preference default: debit
-    - Negative gamma (net_gex < 0) -> debit bias
-    - Positive gamma (net_gex > 0) -> credit bias
-    - Very high IV -> credit
-    - Very low IV -> debit
+# ─────────────────────────────────────────────────────────
+# DIRECTION BIAS  (replaces naïve midpoint check)
+# ─────────────────────────────────────────────────────────
+
+def compute_direction_bias(
+    spot, call_wall, put_wall, net_gex, skew_bias, iv_rank=None
+) -> Tuple[str, int, str]:
+    """
+    Multi-factor direction score.
+    Returns (direction, confidence_0_to_100, notes).
+    """
+    score = 0
+    notes = []
+
+    if call_wall is not None and put_wall is not None:
+        wall_mid = (call_wall + put_wall) / 2.0
+        dist_pct = (spot - wall_mid) / wall_mid * 100.0
+        if dist_pct > 0.5:
+            score += 2
+            notes.append(f"Above wall mid (+{dist_pct:.1f}%)")
+        elif dist_pct < -0.5:
+            score -= 2
+            notes.append(f"Below wall mid ({dist_pct:.1f}%)")
+        else:
+            notes.append("Pinned at wall mid")
+
+        if abs(call_wall - spot) < abs(spot - put_wall):
+            score -= 1
+            notes.append("Near call wall (resistance)")
+        else:
+            score += 1
+            notes.append("Near put wall (support)")
+
+    if net_gex >= 0:
+        notes.append("+GEX (range-bound)")
+    else:
+        score += (1 if score >= 0 else -1)   # amplify trend direction
+        notes.append("-GEX (trending)")
+
+    if skew_bias == "bull_skew":
+        score += 2
+        notes.append("Call IV premium → bull skew")
+    elif skew_bias == "bear_skew":
+        score -= 2
+        notes.append("Put IV premium → bear skew")
+
+    if iv_rank is not None and iv_rank > 70:
+        notes.append(f"High IVR {iv_rank:.0f} (lower directional edge)")
+
+    direction  = "bull" if score >= 0 else "bear"
+    raw_conf   = min(abs(score), 5)
+    confidence = 35 + int(raw_conf * 10)
+    return direction, confidence, " | ".join(notes)
+
+
+# ─────────────────────────────────────────────────────────
+# STRATEGY SELECTOR
+# ─────────────────────────────────────────────────────────
+
+def choose_spread_type(
+    direction, iv_atm, iv_rank=None, net_gex=None, skew_bias="neutral", prefer="debit"
+) -> Tuple[str, str]:
+    """
+    Returns (spread_type, option_side).
+
+    Correct convention:
+      bull debit  → call spread  (buy lower call, sell higher call)
+      bull credit → put spread   (sell lower put, buy even-lower put)
+      bear debit  → put spread   (buy higher put, sell lower put)
+      bear credit → call spread  (sell higher call, buy even-higher call)
     """
     prefer = (prefer or "debit").strip().lower()
-    if prefer not in ("debit", "credit"):
-        prefer = "debit"
+    stype = prefer
 
-    # IV overrides (strong signals)
-    if iv_atm is not None:
+    if iv_rank is not None:
+        if iv_rank >= IVR_HIGH_FOR_CREDIT:
+            stype = "credit"
+        elif iv_rank <= IVR_LOW_FOR_DEBIT:
+            stype = "debit"
+    elif iv_atm is not None:
         if iv_atm >= IV_HIGH_FOR_CREDIT:
-            return "credit"
-        if iv_atm <= IV_LOW_FOR_DEBIT:
-            return "debit"
+            stype = "credit"
+        elif iv_atm <= IV_LOW_FOR_DEBIT:
+            stype = "debit"
 
-    # Gamma regime preference
-    if net_gex is not None:
-        if net_gex < 0 and NEG_GAMMA_PREFERS_DEBIT:
-            return "debit"
-        if net_gex > 0 and POS_GAMMA_PREFERS_CREDIT:
-            return "credit"
+    # GEX refinement when IV rank is neutral
+    if net_gex is not None and iv_rank is not None and 30 < iv_rank < 60:
+        stype = "credit" if net_gex >= 0 else "debit"
 
-    return prefer
+    # Skew alignment
+    if skew_bias == "bear_skew" and direction == "bear":
+        stype = "credit"
+    elif skew_bias == "bull_skew" and direction == "bull":
+        stype = "credit"
 
-# ----------------------------
+    side = ("call" if stype == "debit" else "put") if direction == "bull" \
+           else ("put" if stype == "debit" else "call")
+
+    return stype, side
+
+
+# ─────────────────────────────────────────────────────────
 # CANDIDATE GENERATION
-# ----------------------------
-def build_vertical_candidates(
-    quotes_by_strike: Dict[float, Dict[str, Any]],
-    spot: float,
-    iv: float,
-    dte: int,
-    direction: str,
-    max_width: float = 5.0,
-    max_debit_pct: float = 0.70,
-) -> Tuple[float, List[Dict[str, Any]]]:
+# ─────────────────────────────────────────────────────────
 
-    move = implied_move(spot, iv, dte)
-    tgt = target_short_strike(spot, move, direction, k_sigma=K_SIGMA)
+def build_candidates(
+    quotes, spot, iv, dte, direction, spread_type,
+    max_width=10.0, max_debit_pct=0.60,
+    min_credit_pct=MIN_CREDIT_PCT_WIDTH, min_debit_ror=MIN_DEBIT_ROR,
+) -> Tuple[float, List[Dict]]:
 
-    strikes = sorted(quotes_by_strike.keys())
+    move    = implied_move(spot, iv, dte)
+    strikes = sorted(quotes.keys())
     if not strikes:
         return move, []
 
-    short_k = nearest_strike(strikes, tgt)
+    inc       = detect_increment(strikes)
+    max_steps = max(1, int(round(max_width / inc)))
+    out       = []
 
-    widths = [1, 2, 3, 4, 5]
-    out: List[Dict[str, Any]] = []
-
-    for w in widths:
-        if w > max_width:
-            continue
-
+    if spread_type == "credit":
+        k_sigma = K_SIGMA_CREDIT
+        # Short strike: OTM by k_sigma * move
         if direction == "bull":
-            long_k = short_k - w
+            tgt = spot - k_sigma * move
         else:
-            long_k = short_k + w
+            tgt = spot + k_sigma * move
 
-        if long_k not in quotes_by_strike:
-            continue
+        short_k = nearest_strike(strikes, tgt)
+        short_q = quotes.get(short_k)
+        if not short_q:
+            return move, []
 
-        short_q = quotes_by_strike[short_k]
-        long_q  = quotes_by_strike[long_k]
+        # Delta gate: walk outward if too close to ATM
+        if short_q.get("delta") is not None:
+            for k in sorted(strikes, key=lambda x: abs(x - tgt)):
+                q = quotes.get(k)
+                if q and q.get("delta") is not None:
+                    if abs(q["delta"]) <= MAX_SHORT_DELTA_CREDIT:
+                        short_k, short_q = k, q
+                        break
 
-        credit_mid = short_q["mid"] - long_q["mid"]
-        debit_mid  = long_q["mid"] - short_q["mid"]
+        for steps in range(1, max_steps + 1):
+            w      = round(steps * inc, 4)
+            long_k = (short_k - w) if direction == "bull" else (short_k + w)
+            long_k = nearest_strike(strikes, long_k)
+            long_q = quotes.get(long_k)
+            if not long_q:
+                continue
 
-        # CREDIT candidate
-        if credit_mid > 0:
-            mp, ml, ror = vertical_metrics(w, credit=credit_mid)
+            credit = short_q["mid"] - long_q["mid"]
+            if credit < min_credit_pct * w or credit <= 0:
+                continue
+
+            mp, ml, ror = vertical_metrics(w, credit=credit)
+            if ror is None:
+                continue
+
+            pop = delta_to_pop(short_q.get("delta"), "credit")
             out.append({
-                "type": "credit",
-                "direction": direction,
-                "short": short_k,
-                "long": long_k,
-                "width": float(w),
-                "price": float(credit_mid),
-                "maxProfit": float(mp),
-                "maxLoss": float(ml),
-                "RoR": float(ror) if ror is not None else None,
+                "type": "credit", "direction": direction,
+                "short": short_k, "long": long_k,
+                "side":  "put" if direction == "bull" else "call",
+                "width": float(w), "price": float(credit),
+                "maxProfit": float(mp), "maxLoss": float(ml),
+                "RoR": float(ror), "pop": pop,
                 "warnings": short_q["warnings"] + long_q["warnings"],
             })
 
-        # DEBIT candidate
-        if debit_mid > 0 and debit_mid <= (max_debit_pct * w):
-            mp, ml, ror = vertical_metrics(w, debit=debit_mid)
+    else:  # debit
+        # Long leg near ATM, short leg further OTM (protective)
+        long_k = nearest_strike(strikes, spot)
+        long_q = quotes.get(long_k)
+        if not long_q:
+            return move, []
+
+        for steps in range(1, max_steps + 1):
+            w       = round(steps * inc, 4)
+            short_k = (long_k + w) if direction == "bull" else (long_k - w)
+            short_k = nearest_strike(strikes, short_k)
+            short_q = quotes.get(short_k)
+            if not short_q or short_k == long_k:
+                continue
+
+            debit = long_q["mid"] - short_q["mid"]
+            if debit <= 0 or debit > max_debit_pct * w:
+                continue
+
+            mp, ml, ror = vertical_metrics(w, debit=debit)
+            if ror is None or ror < min_debit_ror:
+                continue
+
+            pop = delta_to_pop(long_q.get("delta"), "debit")
             out.append({
-                "type": "debit",
-                "direction": direction,
-                "short": short_k,
-                "long": long_k,
-                "width": float(w),
-                "price": float(debit_mid),
-                "maxProfit": float(mp),
-                "maxLoss": float(ml),
-                "RoR": float(ror) if ror is not None else None,
-                "warnings": short_q["warnings"] + long_q["warnings"],
+                "type": "debit", "direction": direction,
+                "short": short_k, "long": long_k,
+                "side":  "call" if direction == "bull" else "put",
+                "width": float(w), "price": float(debit),
+                "maxProfit": float(mp), "maxLoss": float(ml),
+                "RoR": float(ror), "pop": pop,
+                "warnings": long_q["warnings"] + short_q["warnings"],
             })
 
     return move, out
 
-# ----------------------------
-# RANKING / SELECTION
-# ----------------------------
-def _rank_key(c: Dict[str, Any]) -> Tuple[float, float]:
-    """
-    Higher is better.
-    - Primary: RoR (Return on Risk)
-    - Secondary: for debit prefer cheaper (lower price), for credit prefer larger credit (higher price)
-    """
-    ror = c.get("RoR")
-    ror_v = float(ror) if isinstance(ror, (int, float)) else -1e9
 
-    price = c.get("price")
-    price_v = float(price) if isinstance(price, (int, float)) else 0.0
+# ─────────────────────────────────────────────────────────
+# RANKING
+# ─────────────────────────────────────────────────────────
 
-    if c.get("type") == "debit":
-        # cheaper debit is better for tie-breaks
-        tie = -price_v
-    else:
-        # higher credit is better for tie-breaks
-        tie = price_v
+def _rank_key(c: Dict) -> float:
+    ror   = float(c.get("RoR")   or 0)
+    width = float(c.get("width") or 1)
+    pop   = float(c.get("pop")   or 0.5)
+    price = float(c.get("price") or 0)
+    ror_n = ror / max(width, 1.0)
+    tie   = -price if c.get("type") == "debit" else price
+    return (ROR_WEIGHT * ror_n
+            + WIDTH_BONUS_WEIGHT * width
+            + POP_WEIGHT * pop
+            + PRICE_WEIGHT * tie)
 
-    return (ROR_WEIGHT * ror_v, PRICE_WEIGHT * tie)
 
-def pick_best_trade(
-    cands: List[Dict[str, Any]],
-    preferred_type: str = "debit",
-) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
-    """
-    Returns (best_trade, best_alt_other_type)
-    - Always prefers preferred_type if it exists.
-    - If none exist, falls back to the other type.
-    """
-    preferred_type = (preferred_type or "debit").lower().strip()
-    if preferred_type not in ("debit", "credit"):
-        preferred_type = "debit"
-
-    debit = [c for c in cands if c.get("type") == "debit" and c.get("RoR") is not None]
+def pick_best(cands, preferred_type="debit"):
+    pt = (preferred_type or "debit").lower()
+    debit  = [c for c in cands if c.get("type") == "debit"  and c.get("RoR") is not None]
     credit = [c for c in cands if c.get("type") == "credit" and c.get("RoR") is not None]
+    bd = max(debit,  key=_rank_key, default=None)
+    bc = max(credit, key=_rank_key, default=None)
+    return (bd or bc, bc) if pt == "debit" else (bc or bd, bd)
 
-    best_debit = max(debit, key=_rank_key, default=None)
-    best_credit = max(credit, key=_rank_key, default=None)
 
-    if preferred_type == "debit":
-        return (best_debit or best_credit), best_credit
+# ─────────────────────────────────────────────────────────
+# CONFIDENCE SCORE
+# ─────────────────────────────────────────────────────────
+
+def trade_confidence_score(trade, direction_conf, iv_rank, skew_bias, net_gex) -> Tuple[int, List[str]]:
+    score   = direction_conf
+    reasons = []
+    ror     = trade.get("RoR")   or 0
+    pop     = trade.get("pop")   or 0
+    stype   = trade.get("type",  "")
+    tdir    = trade.get("direction", "")
+
+    if ror >= 0.50:
+        score += 10; reasons.append(f"Strong RoR {ror:.2f}")
+    elif ror >= 0.25:
+        score += 5;  reasons.append(f"OK RoR {ror:.2f}")
     else:
-        return (best_credit or best_debit), best_debit
+        score -= 5;  reasons.append(f"Weak RoR {ror:.2f}")
 
-# ----------------------------
+    if pop >= 0.65:
+        score += 10; reasons.append(f"High POP {pop:.0%}")
+    elif pop >= 0.50:
+        score += 5;  reasons.append(f"Moderate POP {pop:.0%}")
+
+    if iv_rank is not None:
+        if stype == "credit" and iv_rank >= IVR_HIGH_FOR_CREDIT:
+            score += 10; reasons.append(f"IVR {iv_rank:.0f} supports credit")
+        elif stype == "debit" and iv_rank <= IVR_LOW_FOR_DEBIT:
+            score += 10; reasons.append(f"IVR {iv_rank:.0f} supports debit")
+        elif stype == "credit" and iv_rank < IVR_LOW_FOR_DEBIT:
+            score -= 15; reasons.append(f"Low IVR {iv_rank:.0f} — bad for credit")
+        elif stype == "debit" and iv_rank > IVR_HIGH_FOR_CREDIT:
+            score -= 10; reasons.append(f"High IVR {iv_rank:.0f} — vol crush risk on debit")
+
+    if (skew_bias == "bear_skew" and tdir == "bear") or (skew_bias == "bull_skew" and tdir == "bull"):
+        score += 5; reasons.append("Skew aligned")
+    elif skew_bias != "neutral":
+        score -= 5; reasons.append("Skew opposes trade")
+
+    wc = len(trade.get("warnings") or [])
+    if wc:
+        score -= wc * 5; reasons.append(f"{wc} liquidity warning(s)")
+
+    return int(min(max(score, 0), 100)), reasons
+
+
+# ─────────────────────────────────────────────────────────
 # PUBLIC API
-# ----------------------------
+# ─────────────────────────────────────────────────────────
+
 def recommend_from_marketdata(
-    marketdata_json: Dict[str, Any],
-    direction: str,  # 'bull' or 'bear'
-    dte: int,
-    spot: float,
-    net_gex: Optional[float] = None,   # optional: pass from app.py for smarter selection
-    prefer: str = "debit",             # default user preference
+    marketdata_json:  Dict[str, Any],
+    direction:        str,
+    dte:              int,
+    spot:             float,
+    net_gex:          Optional[float] = None,
+    iv_rank:          Optional[float] = None,
+    iv_52w_high:      Optional[float] = None,
+    iv_52w_low:       Optional[float] = None,
+    prefer:           str             = "debit",
+    account_size:     float           = DEFAULT_ACCOUNT_SIZE,
+    max_risk_pct:     float           = DEFAULT_MAX_RISK_PCT,
+    max_risk_usd:     float           = DEFAULT_MAX_RISK_USD,
+    min_confidence:   int             = MIN_CONFIDENCE,
 ) -> Dict[str, Any]:
     """
-    Recommends a vertical spread that fits your rules.
-    - Bulls: put spreads (bull put credit or bull put debit depending on choice)
-    - Bears: call spreads (bear call credit or bear call debit depending on choice)
-
-    NOTE: In practice, "bull debit put" and "bear debit call" are less common than debit call/put
-    in the same direction. Here we keep your original framework (bull->puts, bear->calls)
-    and simply choose debit vs credit based on regime/IV.
+    Main entry point. Returns full trade recommendation with position sizing,
+    confidence scoring, skew analysis, and IV rank-aware spread selection.
     """
     direction = (direction or "").strip().lower()
     if direction not in ("bull", "bear"):
         return {"ok": False, "reason": "direction must be 'bull' or 'bear'"}
 
-    side = "put" if direction == "bull" else "call"
-    quotes_by_strike = build_quotes_by_strike(marketdata_json, side=side)
+    call_iv = pick_atm_iv(marketdata_json, spot, "call")
+    put_iv  = pick_atm_iv(marketdata_json, spot, "put")
+    iv_atm  = put_iv or call_iv
+    if iv_atm is None:
+        return {"ok": False, "reason": "No IV found in chain data"}
 
-    if not quotes_by_strike:
-        return {"ok": False, "reason": f"No usable {side} quotes (need bid/ask or mid)"}
+    if iv_rank is None and iv_52w_high is not None and iv_52w_low is not None:
+        iv_rank = compute_iv_rank(iv_atm, iv_52w_high, iv_52w_low)
 
-    iv = pick_atm_iv(marketdata_json, spot=spot, side=side)
-    if iv is None:
-        return {"ok": False, "reason": "No IV found in response (expected key: 'iv')"}
+    skew_val, skew_bias = skew_score(call_iv, put_iv)
 
-    move, cands = build_vertical_candidates(
-        quotes_by_strike=quotes_by_strike,
-        spot=spot,
-        iv=iv,
-        dte=dte,
-        direction=direction,
-        max_width=float(marketdata_json.get("max_width", 5.0)) if marketdata_json.get("max_width") is not None else 5.0,
-        max_debit_pct=float(marketdata_json.get("max_debit_pct", 0.70)) if marketdata_json.get("max_debit_pct") is not None else 0.70,
+    call_wall = marketdata_json.get("_call_wall")
+    put_wall  = marketdata_json.get("_put_wall")
+    gex       = net_gex or 0.0
+
+    dir_str, dir_conf, dir_notes = compute_direction_bias(
+        spot, call_wall, put_wall, gex, skew_bias, iv_rank
+    )
+
+    direction_conflict = (direction != dir_str)
+
+    stype, side = choose_spread_type(
+        direction, iv_atm, iv_rank, net_gex, skew_bias, prefer
+    )
+
+    quotes = build_quotes(marketdata_json, side)
+    if not quotes:
+        return {"ok": False, "reason": f"No usable {side} quotes"}
+
+    move, cands = build_candidates(
+        quotes, spot, iv_atm, dte, direction, stype,
+        max_width     = float(marketdata_json.get("max_width",    10.0)),
+        max_debit_pct = float(marketdata_json.get("max_debit_pct", 0.60)),
     )
 
     if not cands:
-        return {"ok": False, "reason": "No vertical candidates generated (missing strikes/quotes)"}
+        return {
+            "ok": False,
+            "reason": f"No valid {stype} {side} candidates (check strike range / delta / quality filters)",
+            "iv_atm": iv_atm, "iv_rank": iv_rank,
+            "skew_bias": skew_bias, "spread_type": stype, "side": side,
+        }
 
-    preferred_type = choose_spread_type(
-        direction=direction,
-        iv_atm=iv,
-        net_gex=net_gex,
-        prefer=prefer,
+    best, alt = pick_best(cands, preferred_type=stype)
+    if not best:
+        return {"ok": False, "reason": "No spreads passed ranking"}
+
+    confidence, conf_reasons = trade_confidence_score(
+        best, dir_conf, iv_rank, skew_bias, gex
     )
 
-    best, alt_other = pick_best_trade(cands, preferred_type=preferred_type)
-    if not best:
-        return {"ok": False, "reason": "No spreads matched rules"}
+    if confidence < min_confidence:
+        return {
+            "ok": False,
+            "reason": f"Confidence {confidence}/100 below threshold {min_confidence}",
+            "confidence": confidence, "conf_reasons": conf_reasons,
+            "iv_rank": iv_rank, "skew_bias": skew_bias,
+            "direction_bias": dir_str, "dir_notes": dir_notes,
+        }
+
+    ml_per_contract = best.get("maxLoss", 0) * 100
+    contracts, dollar_risk, sizing_note = position_size_contracts(
+        ml_per_contract, account_size, max_risk_pct, max_risk_usd
+    )
 
     return {
-        "ok": True,
-        "direction": direction,
-        "dte": dte,
-        "spot": spot,
-        "iv_atm": iv,
+        "ok":                  True,
+        "direction":           direction,
+        "direction_bias":      dir_str,
+        "direction_conflict":  direction_conflict,
+        "dir_notes":           dir_notes,
+        "dte":                 dte,
+        "spot":                spot,
+        "iv_atm":              iv_atm,
+        "iv_rank":             iv_rank,
+        "skew_val":            round(skew_val, 4),
+        "skew_bias":           skew_bias,
         "implied_move_1sigma": move,
-        "preferred_spread_type": preferred_type,  # "debit" or "credit"
-        "trade": best,
-        "best_alt_other_type": alt_other,
-        "candidate_count": len(cands),
+        "spread_type":         stype,
+        "side":                side,
+        "confidence":          confidence,
+        "conf_reasons":        conf_reasons,
+        "trade":               best,
+        "best_alt":            alt,
+        "candidate_count":     len(cands),
+        "contracts_suggested": contracts,
+        "dollar_risk":         dollar_risk,
+        "sizing_note":         sizing_note,
     }
