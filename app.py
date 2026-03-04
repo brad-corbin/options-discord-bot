@@ -969,7 +969,11 @@ def tv_webhook():
         )
     }
 
-    st, body = post_to_discord(payload)
+    text = payload.get("content", "")
+    st, body = post_to_telegram(text)
+    debug_lines.append(f"{ticker}: telegram ({st})")
+    if body:
+    debug_lines.append(f"{ticker}: telegram_body {body[:160]}")
     return jsonify({"status": "received", "discord_status": st, "discord_body": body})
 
 @app.route("/scan", methods=["POST"])
