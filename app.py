@@ -47,6 +47,58 @@ def as_int(x, default=0):
 def clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
+def strike_targets_and_confidence(spot, emove, call_wall, put_wall, net_gex, inc, oi_score):
+    # Expected move zones
+    bull_upper = spot + emove
+    bear_lower = spot - emove
+
+    # Regime-based confidence
+    score = 50
+
+    # Gamma regime
+    if net_gex >= 0:
+        score += 10   # range-favored tends to behave more “contained”
+        regime = "+Gamma / Range"
+    else:
+        score -= 10
+        regime = "-Gamma / Trend"
+
+    # Distance to walls (safer if not pinned right at wall)
+    notes = []
+    if call_wall and put_wall:
+        dist_call = abs(call_wall - spot)
+        dist_put = abs(spot - put_wall)
+        near = min(dist_call, dist_put)
+        if near <= 2 * inc:
+            score -= 10
+            notes.append("Near wall")
+        else:
+            score += 5
+            notes.append("Not pinned")
+    else:
+        regime = regime + " (no walls)"
+
+    # OI churn penalty
+    if oi_score > 50000:
+        score -= 15
+        notes.append("Huge OI shift")
+    elif oi_score > 15000:
+        score -= 5
+        notes.append("Moderate OI shift")
+    else:
+        score += 5
+        notes.append("OI stable")
+
+    score = max(0, min(100, score))
+
+    return {
+        "bull_upper": bull_upper,
+        "bear_lower": bear_lower,
+        "regime": regime,
+        "confidence": score,
+        "notes": ", ".join(notes) if notes else "—"
+    }
+
 # ----------------------------
 # ENV VARS (set in Render)
 # ----------------------------
@@ -613,6 +665,7 @@ def build_discord_card(
         f"Spot: {spot:.2f}",
         f"Auto Direction: {direction.upper()}",
         f"Expected Move ({max(dte,1)}D): ±{emove:.2f}",
+        *extra_lines,
         walls_line,
         f"GEX: {gex_regime}",
         f"GEX Bar: {gex_bar}",
@@ -754,7 +807,20 @@ def scan_watchlist():
 
             atm_iv = (sum(ivs) / len(ivs)) if ivs else 0.30
             emove = expected_move_from_iv(spot, atm_iv, max(dte, 1))
+            targets = strike_targets_and_confidence(spot, emove, call_wall, put_wall, net_gex, inc, oi_score)
 
+            bull_zone = f"{spot:.2f} → {targets['bull_upper']:.2f}"
+            bear_zone = f"{spot:.2f} → {targets['bear_lower']:.2f}"
+
+            extra_lines = [
+            f"Expected Move: ±{emove:.2f}",
+            f"Bull Zone: {bull_zone}",
+            f"Bear Zone: {bear_zone}",
+            f"Regime: {targets['regime']}",
+            f"Confidence: {targets['confidence']}/100",
+            f"Confidence Notes: {targets['notes']}",
+            ]
+            
             # Risk + Big Alpha
             risk_label, risk_notes = risk_rating(spot, call_wall, put_wall, net_gex, inc, oi_score)
             alpha = big_alpha_score(spot, call_wall, put_wall, net_gex, oi_score, risk_label, emove, inc)
