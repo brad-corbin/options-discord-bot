@@ -12,7 +12,9 @@ import requests
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
-
+# ---------- TELEGRAM ----------
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 # ----------------------------
 # HELPERS
 # ----------------------------
@@ -84,7 +86,31 @@ def debug():
         "LIQ_WARN_BA": LIQ_WARN_BA,
         "SCAN_MAX_DTE": SCAN_MAX_DTE,
     })
+def post_to_telegram(text: str, max_retries: int = 4):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return 400, "TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set"
 
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "Markdown",  # you can switch to "HTML" if preferred
+        "disable_web_page_preview": True,
+    }
+
+    last_err = ""
+    for attempt in range(max_retries):
+        try:
+            r = requests.post(url, json=payload, timeout=20)
+            if r.status_code == 200:
+                return 200, ""
+            last_err = r.text[:300] if r.text else f"HTTP {r.status_code}"
+            time.sleep(min(1.5 * (attempt + 1), 6.0))
+        except Exception as e:
+            last_err = str(e)
+            time.sleep(min(1.5 * (attempt + 1), 6.0))
+
+    return 500, f"Telegram post failed after retries: {last_err}"
 # ----------------------------
 # DISCORD
 # ----------------------------
