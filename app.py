@@ -197,21 +197,69 @@ def clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
 
-def gex_bar(net_gex: float, width: int = 21) -> str:
-    center = width // 2
-    mag    = abs(net_gex)
-    steps  = 0 if mag <= 0 else int(clamp(round(math.log10(1 + mag / 1e8) * 3), 0, center))
-    bar    = ["·"] * width
-    bar[center] = "|"
-    if net_gex > 0 and steps:
-        for i in range(center + 1, min(width, center + 1 + steps)):
-            bar[i] = "█"
-        bar[min(width - 1, center + steps)] = "▶"
-    elif net_gex < 0 and steps:
-        for i in range(center - 1, max(-1, center - 1 - steps), -1):
-            bar[i] = "█"
-        bar[max(0, center - steps)] = "◀"
-    return "".join(bar)
+def gex_summary(net_gex: float, contracts: list, spot: float) -> tuple[str, str, float | None]:
+    """
+    Returns (regime_line, magnitude_str, flip_level).
+    
+    GEX GUIDE FOR TRADERS:
+    - Positive GEX + High magnitude = dealers are LONG gamma = they BUY dips, SELL rips
+      → Market gets pinned, low volatility, range-bound. Sell spreads / iron condors.
+    - Negative GEX + High magnitude = dealers are SHORT gamma = they SELL dips, BUY rips  
+      → Market trends / whips violently. Directional spreads, wider stops, expect moves.
+    - Gamma Flip Level = price where regime CHANGES. Crossing it = behavior shift.
+      → Above flip = positive gamma (calm). Below flip = negative gamma (volatile).
+    - Low magnitude (< $500M) = GEX signal is weak, don't weight it heavily.
+    """
+    # Magnitude label
+    mag = abs(net_gex)
+    if mag >= 1e9:
+        mag_str = f"${mag/1e9:.1f}B"
+    elif mag >= 1e6:
+        mag_str = f"${mag/1e6:.0f}M"
+    else:
+        mag_str = f"${mag:.0f}"
+
+    # Signal strength
+    if mag >= 2e9:
+        strength = "Strong"
+    elif mag >= 500e6:
+        strength = "Moderate"
+    else:
+        strength = "Weak"
+
+    # Regime
+    regime = "Positive" if net_gex >= 0 else "Negative"
+    behavior = "range-bound / pin risk" if net_gex >= 0 else "trending / volatile"
+
+    # Gamma flip: strike where net GEX crosses zero
+    # Approximate by finding strike with smallest absolute net GEX contribution
+    strike_gex = {}
+    for c in contracts:
+        right  = (c.get("right") or "").lower()
+        strike = as_float(c.get("strike"), None)
+        if strike is None:
+            continue
+        oi    = as_int(c.get("openInterest"), 0)
+        gamma = as_float(c.get("gamma"), 0.0)
+        contrib = oi * gamma * (spot ** 2) * 100
+        if right == "call":
+            strike_gex[strike] = strike_gex.get(strike, 0) + contrib
+        elif right == "put":
+            strike_gex[strike] = strike_gex.get(strike, 0) - contrib
+
+    flip_level = None
+    if strike_gex:
+        # Find strike closest to zero net GEX
+        flip_level = min(strike_gex.keys(), key=lambda k: abs(strike_gex[k]))
+
+    flip_str = f"{flip_level:g}" if flip_level else "—"
+
+    regime_line = (
+        f"GEX: {regime} ({strength}) | {mag_str} | Flip: {flip_str}\n"
+        f"  → {behavior}"
+    )
+
+    return regime_line, mag_str, flip_level
 
 
 # ─────────────────────────────────────────────────────────
@@ -455,23 +503,42 @@ def alpha_score(spot, call_wall, put_wall, net_gex, oi_score, risk_label, emove,
 def build_scan_message(
     ticker, spot, exp, dte, call_wall, put_wall, net_gex, emove,
     oi_note, risk_label, risk_notes, a_score, direction,
-    iv_rank, skew_bias, skew_val, trade_lines
+    iv_rank, skew_bias, skew_val, trade_lines, contracts
 ) -> str:
 
     walls = (f"Walls: Call {call_wall:g} | Put {put_wall:g} | ZeroG ~{(call_wall+put_wall)/2:.0f}"
              if call_wall and put_wall else "Walls: —")
 
-    ivr_str  = f"{iv_rank:.0f}/100" if iv_rank is not None else "—"
-    gex_str  = "Positive (range)" if net_gex >= 0 else "Negative (trending)"
-    skew_str = f"{skew_bias} ({skew_val:+.3f})"
+    ivr_str  = f"{iv_rank:.0f}/100" if iv_rank is not None else "— (not yet available)"
+
+    # Skew interpretation
+    if skew_bias == "bull_skew":
+        skew_note = "calls pricier → bullish flow"
+    elif skew_bias == "bear_skew":
+        skew_note = "puts pricier → protective demand"
+    else:
+        skew_note = "balanced"
+    skew_str = f"{skew_bias} ({skew_val:+.3f}) — {skew_note}"
+
+    # GEX summary (replaces broken ASCII bar)
+    gex_line, _, flip_level = gex_summary(net_gex, contracts, spot)
+
+    # Flip level warning
+    flip_warn = ""
+    if flip_level is not None and call_wall is not None and put_wall is not None:
+        dist_to_flip = abs(spot - flip_level)
+        inc = abs(call_wall - put_wall) / 10 or 1.0
+        if dist_to_flip <= 2 * inc:
+            flip_warn = f"⚠️ Spot near Gamma Flip ({flip_level:g}) — regime change risk"
 
     lines = [
         f"🚨 SCAN — {ticker}",
         f"Direction: {direction.upper()} | DTE: {max(dte,1)} ({exp})",
         f"Spot: {spot:.2f} | E-Move ±{emove:.2f}",
-        f"IV Rank: {ivr_str} | Skew: {skew_str}",
-        f"GEX: {gex_str}",
-        f"GEX Bar: {gex_bar(net_gex)}",
+        f"IV Rank: {ivr_str}",
+        f"Skew: {skew_str}",
+        gex_line,
+        flip_warn if flip_warn else None,
         walls,
         f"OI Signal: {oi_note}",
         f"Risk: {risk_label} — {risk_notes}",
@@ -480,7 +547,7 @@ def build_scan_message(
     ]
     lines += trade_lines
     lines += ["", "— Not financial advice —"]
-    return "\n".join(lines)
+    return "\n".join(l for l in lines if l is not None)
 
 
 def build_trade_lines(rec: dict, ticker: str) -> list:
@@ -612,23 +679,24 @@ def scan_ticker(ticker: str) -> dict:
         trade_lines = build_trade_lines(rec, ticker)
 
         msg = build_scan_message(
-            ticker     = ticker,
-            spot       = spot,
-            exp        = exp,
-            dte        = dte,
-            call_wall  = call_wall,
-            put_wall   = put_wall,
-            net_gex    = net_gex,
-            emove      = emove,
-            oi_note    = oi_note,
-            risk_label = risk_label,
-            risk_notes = risk_notes,
-            a_score    = a_score,
-            direction  = direction,
-            iv_rank    = iv_rank,
-            skew_bias  = skew_bias,
-            skew_val   = skew_val,
-            trade_lines= trade_lines,
+        ticker     = ticker,
+        spot       = spot,
+        exp        = exp,
+        dte        = dte,
+        call_wall  = call_wall,
+        put_wall   = put_wall,
+        net_gex    = net_gex,
+        emove      = emove,
+        oi_note    = oi_note,
+        risk_label = risk_label,
+        risk_notes = risk_notes,
+        a_score    = a_score,
+        direction  = direction,
+        iv_rank    = iv_rank,
+        skew_bias  = skew_bias,
+        skew_val   = skew_val,
+        trade_lines= trade_lines,
+        contracts  = contracts,   # ← new
         )
 
         st, body = post_to_telegram(msg)
