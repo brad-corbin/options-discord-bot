@@ -497,7 +497,6 @@ def scan_watchlist():
             atm_iv = (sum(ivs) / len(ivs)) if ivs else 0.30
             emove = expected_move_from_iv(spot, atm_iv, max(dte, 1))
 # ----- TRADE ENGINE -----
-from options_engine import recommend_from_marketdata
 
 options_data = {
     "strike": [c.get("strike") for c in contracts],
