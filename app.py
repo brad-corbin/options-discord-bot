@@ -8,7 +8,14 @@ import requests
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
-
+@app.route("/debug", methods=["GET"])
+def debug():
+    # DON'T print the token; only whether it exists
+    return jsonify({
+        "MARKETDATA_TOKEN_set": bool(os.getenv("MARKETDATA_TOKEN")),
+        "DISCORD_WEBHOOK_set": bool(os.getenv("DISCORD_WEBHOOK_URL")),
+        "WATCHLIST_len": len((os.getenv("WATCHLIST") or "").split(",")) if os.getenv("WATCHLIST") else 0
+    })
 # ---------- ENV VARS (set these in Render) ----------
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 TV_WEBHOOK_SECRET = os.getenv("TV_WEBHOOK_SECRET", "").strip()
