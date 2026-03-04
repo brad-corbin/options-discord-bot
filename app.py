@@ -27,44 +27,42 @@ watches = {}
 # ============================================================
 # Discord posting with rate limit handling
 # ============================================================
-def post_to_discord(payload, max_retries=3):
-    """
-    Discord webhooks return:
-      - 204 No Content on success
-      - 429 if rate limited with 'retry_after' in JSON
-    """
+def post_to_discord(payload, max_retries=5):
+    """Post to Discord webhook with retry + rate limit protection."""
+    
     if not DISCORD_WEBHOOK:
         return 400, "DISCORD_WEBHOOK_URL not set"
 
-    for attempt in range(max_retries + 1):
-        try:
-            r = requests.post(DISCORD_WEBHOOK, json=payload, timeout=15)
+    last_err = "unknown"
 
-            # success
+    for attempt in range(1, max_retries + 1):
+        try:
+            r = requests.post(DISCORD_WEBHOOK, json=payload, timeout=10)
+
+            # Success
             if r.status_code in (200, 204):
                 return r.status_code, ""
 
-            # rate limited
+            # Discord rate limit
             if r.status_code == 429:
                 try:
                     retry_after = float(r.json().get("retry_after", 2))
                 except Exception:
-                    retry_after = 2.0
+                    retry_after = 2
 
-                # small cushion
-                time.sleep(retry_after + 0.25)
+                last_err = f"429 rate limited retry_after={retry_after}"
+                time.sleep(retry_after)
                 continue
 
-            # other error
-            return r.status_code, (r.text[:500] if r.text else "")
+            # Other error
+            last_err = f"{r.status_code} {r.text[:200] if r.text else ''}"
+            time.sleep(1)
 
         except Exception as e:
-            # backoff for network blips
-            time.sleep(1.5 * (attempt + 1))
             last_err = str(e)
+            time.sleep(1)
 
     return 500, f"Discord post failed after retries: {last_err}"
-
 
 # ============================================================
 # Helpers: formatting + “next-level” scoring (mock data for now)
