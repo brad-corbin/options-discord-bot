@@ -58,7 +58,7 @@ def _finnhub_get(endpoint: str, params: dict) -> Optional[dict]:
 # IV RANK & PERCENTILE
 # ─────────────────────────────────────────────────────────
 
-def get_iv_rank_from_candles(ticker: str, iv_current: float) -> Tuple[Optional[float], Optional[float]]:
+def get_iv_rank_from_candles(ticker: str, iv_current: float) -> Tuple[Optional[float], Optional[float], Optional[float]]:
     """
     Computes IV rank and IV percentile using 1 year of daily stock candles
     from MarketData.app to estimate historical volatility range.
@@ -129,13 +129,16 @@ def get_iv_rank_from_candles(ticker: str, iv_current: float) -> Tuple[Optional[f
         below = sum(1 for v in rv_series if v < iv_current)
         iv_pct = round(below / len(rv_series) * 100, 1)
 
-        result = (iv_rank, iv_pct)
+        # HV20 = most recent 20-day realized vol
+        hv20 = rv_series[-1] if rv_series else None
+
+        result = (iv_rank, iv_pct, hv20)
         _cache_set(cache_key, result)
         return result
 
     except Exception as e:
         log.warning(f"IV rank candles error for {ticker}: {e}")
-        return None, None
+        return None, None, None
 
 
 # ─────────────────────────────────────────────────────────
