@@ -1242,7 +1242,7 @@ def tv_webhook():
     else:
         strength_label = "⚠️ Weak — indicators mixed"
 
-    # Build and post TV signal context first
+    # Build TV signal context message
     prefix_lines = [
         f"📢 TV Signal — {ticker} ({bias.upper()})",
         f"Close: {close:.2f} | Time: {tv_time}" if tv_time else f"Close: {close:.2f}",
@@ -1252,20 +1252,24 @@ def tv_webhook():
         "",
     ]
     prefix = "\n".join(prefix_lines)
-    post_to_telegram(prefix)
 
-    # Now run full scan pipeline and post trade card
-    # Force direction to match TV bias so engine aligns with your signal
-    result = scan_ticker(ticker, force_direction=bias)
+    # Run everything in background — respond to TradingView immediately
+    def run_tv_scan():
+        try:
+            post_to_telegram(prefix)
+            scan_ticker(ticker, force_direction=bias)
+        except Exception as e:
+            log.error(f"TV scan error for {ticker}: {e}")
 
+    threading.Thread(target=run_tv_scan, daemon=True).start()
+
+    # Return immediately to TradingView (within 3 seconds)
     return jsonify({
-        "status":   "received",
-        "ticker":   ticker,
-        "bias":     bias,
-        "aligned":  f"{aligned}/{max_aligned}",
-        "strength": strength_pct,
-        "result":   result,
-    })
+        "status":  "accepted",
+        "ticker":  ticker,
+        "bias":    bias,
+        "aligned": f"{aligned}/{max_aligned}",
+    }), 200
 
 @app.route("/scan", methods=["POST"])
 def scan_watchlist():
