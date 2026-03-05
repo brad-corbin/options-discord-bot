@@ -1250,7 +1250,7 @@ def tv_webhook():
     prefix_lines = [
         f"📢 TV Signal — {ticker} ({bias.upper()})",
         f"Close: {close:.2f} | Time: {tv_time}" if tv_time else f"Close: {close:.2f}",
-        f"Signal Strength: {strength_label} ({aligned}/{max_aligned} aligned)",
+        f"Signal Strength: {strength_label}" if max_aligned == 0 else f"Signal Strength: {strength_label} ({aligned}/{max_aligned} aligned)",
         "",
         *indicator_lines,
         "",
@@ -1263,7 +1263,9 @@ def tv_webhook():
             post_to_telegram(prefix)
             scan_ticker(ticker, force_direction=bias)
         except Exception as e:
+            import traceback
             log.error(f"TV scan error for {ticker}: {e}")
+            log.error(traceback.format_exc())
 
     threading.Thread(target=run_tv_scan, daemon=True).start()
 
