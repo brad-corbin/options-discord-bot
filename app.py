@@ -1042,32 +1042,94 @@ def exp_debug(ticker):
 # TradingView webhook — autonomous + TV-triggered running in parallel
 @app.route("/tv", methods=["POST"])
 def tv_webhook():
-    data = request.get_json(silent=True) or {}
+    data    = request.get_json(silent=True) or {}
+    raw     = (request.get_data(as_text=True) or "").strip()
 
     if TV_WEBHOOK_SECRET:
         if data.get("secret") != TV_WEBHOOK_SECRET:
             return jsonify({"error": "Unauthorized"}), 403
 
     ticker   = (data.get("ticker") or "").strip().upper()
-    close    = as_float(data.get("close"), 0.0)
+    close    = as_float(data.get("close"),    0.0)
     tv_time  = (data.get("time") or "").strip()
-    tv_dir   = (data.get("direction") or "bull").strip().lower()   # TV can send direction hint
+    bias     = (data.get("bias") or "bull").strip().lower()
+
+    # Enriched indicator values from Pine Script
+    rsi       = as_float(data.get("rsi"),      None)
+    vwap      = as_float(data.get("vwap"),     None)
+    ema_fast  = as_float(data.get("ema_fast"), None)
+    ema_slow  = as_float(data.get("ema_slow"), None)
+    vol_ratio = as_float(data.get("vol_ratio"),None)
+    high      = as_float(data.get("high"),     None)
+    low       = as_float(data.get("low"),      None)
+    volume    = as_float(data.get("volume"),   None)
 
     if not ticker:
-        st, body = post_to_telegram("📢 TradingView signal received (no ticker)")
+        st, body = post_to_telegram("📢 TV signal received (no ticker)")
         return jsonify({"status": "received_raw", "tg_status": st})
 
-    log.info(f"TV signal: {ticker} close={close} dir={tv_dir}")
+    log.info(f"TV signal: {ticker} close={close} bias={bias} rsi={rsi}")
 
+    # Build indicator context string for Telegram
+    indicator_lines = []
+    if rsi is not None:
+        rsi_note = "oversold 🟢" if rsi < 35 else "overbought 🔴" if rsi > 65 else "neutral"
+        indicator_lines.append(f"RSI: {rsi:.1f} ({rsi_note})")
+    if vwap is not None and close > 0:
+        vwap_note = "above VWAP 🟢" if close > vwap else "below VWAP 🔴"
+        indicator_lines.append(f"VWAP: {vwap:.2f} — {vwap_note}")
+    if ema_fast is not None and ema_slow is not None:
+        ema_note = "bullish cross 🟢" if ema_fast > ema_slow else "bearish cross 🔴"
+        indicator_lines.append(f"EMA 9/21: {ema_fast:.2f} / {ema_slow:.2f} — {ema_note}")
+    if vol_ratio is not None:
+        vol_note = "🔥 spike" if vol_ratio >= 2.0 else "elevated" if vol_ratio >= 1.5 else "normal"
+        indicator_lines.append(f"Volume: {vol_ratio:.1f}x avg ({vol_note})")
+
+    # Signal strength score (0-4 indicators aligned)
+    aligned = 0
+    if rsi is not None:
+        aligned += 1 if (bias == "bull" and rsi > 50) or (bias == "bear" and rsi < 50) else 0
+    if vwap is not None and close > 0:
+        aligned += 1 if (bias == "bull" and close > vwap) or (bias == "bear" and close < vwap) else 0
+    if ema_fast is not None and ema_slow is not None:
+        aligned += 1 if (bias == "bull" and ema_fast > ema_slow) or (bias == "bear" and ema_fast < ema_slow) else 0
+    if vol_ratio is not None:
+        aligned += 1 if vol_ratio >= 1.5 else 0
+
+    max_aligned   = sum([rsi is not None, vwap is not None,
+                         ema_fast is not None, vol_ratio is not None])
+    strength_pct  = int(aligned / max_aligned * 100) if max_aligned > 0 else 50
+    if strength_pct >= 75:
+        strength_label = "💪 Strong"
+    elif strength_pct >= 50:
+        strength_label = "👍 Moderate"
+    else:
+        strength_label = "⚠️ Weak — indicators mixed"
+
+    # Run full scan pipeline
     result = scan_ticker(ticker)
 
-    return jsonify({
-        "status":  "received",
-        "ticker":  ticker,
-        "tv_time": tv_time,
-        "result":  result,
-    })
+    # Build TV-specific prefix message
+    prefix_lines = [
+        f"📢 TV Signal — {ticker} ({bias.upper()})",
+        f"Close: {close:.2f} | Time: {tv_time}" if tv_time else f"Close: {close:.2f}",
+        f"Signal Strength: {strength_label} ({aligned}/{max_aligned} aligned)",
+        "",
+        *indicator_lines,
+        "",
+    ]
 
+    prefix = "\n".join(prefix_lines)
+    st, body = post_to_telegram(prefix)
+
+    return jsonify({
+        "status":   "received",
+        "ticker":   ticker,
+        "bias":     bias,
+        "aligned":  f"{aligned}/{max_aligned}",
+        "strength": strength_pct,
+        "result":   result,
+    })
 
 @app.route("/scan", methods=["POST"])
 def scan_watchlist():
