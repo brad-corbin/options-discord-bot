@@ -588,32 +588,64 @@ def build_trade_lines(rec: dict, ticker: str) -> list:
             lines.append(f"Confidence: {conf}/100")
         return lines
 
-    trade   = rec.get("trade") or {}
-    stype   = (trade.get("type") or "").upper()
-    side    = (trade.get("side") or rec.get("side") or "").upper()
-    short_k = trade.get("short")
-    long_k  = trade.get("long")
-    price   = trade.get("price")
-    ror     = trade.get("RoR")
-    pop     = trade.get("pop")
-    mp      = trade.get("maxProfit")
-    ml      = trade.get("maxLoss")
-    warns   = trade.get("warnings") or []
+    trade      = rec.get("trade") or {}
+    stype      = (trade.get("type")      or "").upper()
+    side       = (trade.get("side")      or rec.get("side") or "").upper()
+    short_k    = trade.get("short")
+    long_k     = trade.get("long")
+    price      = trade.get("price")
+    ror        = trade.get("RoR")
+    pop        = trade.get("pop")
+    mp         = trade.get("maxProfit")
+    ml         = trade.get("maxLoss")
+    long_delta = trade.get("long_delta")
+    itm_amount = trade.get("itm_amount")
+    cost_pct   = trade.get("cost_pct")
+    warns      = trade.get("warnings") or []
 
-    contracts = rec.get("contracts_suggested", 1)
-    dollar_r  = rec.get("dollar_risk", 0)
-    sizing    = rec.get("sizing_note", "")
-    conf      = rec.get("confidence", "—")
-    conf_r    = rec.get("conf_reasons") or []
+    contracts  = rec.get("contracts_suggested", 1)
+    dollar_r   = rec.get("dollar_risk", 0)
+    conf       = rec.get("confidence", "—")
+    conf_r     = rec.get("conf_reasons") or []
+
+    # ITM label
+    delta_str = f"δ{long_delta:.2f}" if isinstance(long_delta, float) else ""
+    itm_str   = f"${itm_amount:.2f} ITM" if isinstance(itm_amount, float) else ""
+    itm_label = f" ({delta_str}, {itm_str})" if (delta_str or itm_str) else ""
+
+    # Cost % check
+    cost_ok  = isinstance(cost_pct, float) and cost_pct <= 70
+    cost_str = f"{cost_pct:.0f}% of width {'✅' if cost_ok else '⚠️'}" if isinstance(cost_pct, float) else ""
+
+    # Profit targets (calculated off $ risked = debit paid × 100 × contracts)
+    dollar_risked = (price or 0) * 100 * contracts
+    pt_lines = []
+    if isinstance(price, float) and isinstance(ml, float) and dollar_risked > 0:
+        t25  = round(price + ml * 0.25, 2)
+        t35  = round(price + ml * 0.35, 2)
+        t40  = round(price + ml * 0.40, 2)
+        t50  = round(price + ml * 0.50, 2)
+        g25  = round(dollar_risked * 0.25 * contracts, 0)
+        g35  = round(dollar_risked * 0.35 * contracts, 0)
+        g50  = round(dollar_risked * 0.50 * contracts, 0)
+
+        pt_lines = [
+            "📊 Profit Targets (off $ risked):",
+            f"  Same Day  → 25%: +${g25:.0f} (sell at {t25:.2f})",
+            f"  Next Day  → 35%: +${g35:.0f} (sell at {t35:.2f})",
+            f"  Deep ITM  → 50%: +${g50:.0f} (sell at {t50:.2f})",
+        ]
 
     lines = [
         f"🧠 Trade: {stype} {side} SPREAD",
-        f"Short: {short_k} | Long: {long_k}",
-        f"Price: {price:.2f} | RoR: {ror:.2f}" if isinstance(price, float) and isinstance(ror, float) else f"Price: {price} | RoR: {ror}",
-        f"Max Profit: {mp:.2f} | Max Loss: {ml:.2f}" if isinstance(mp, float) else "",
+        f"Long: {long_k}{itm_label} | Short: {short_k}",
+        f"Width: ${trade.get('width', '?')} | Cost: ${price:.2f} ({cost_str})" if isinstance(price, float) else f"Cost: {price}",
+        f"Max Profit: ${mp:.2f} | Max Loss: ${ml:.2f}" if isinstance(mp, float) else "",
         f"POP: {pop:.0%}" if isinstance(pop, float) else "",
-        f"Confidence: {conf}/100 ({', '.join(conf_r[:3])})" if conf_r else f"Confidence: {conf}/100",
+        f"Confidence: {conf}/100 ({', '.join(conf_r[:2])})" if conf_r else f"Confidence: {conf}/100",
         f"Size: {contracts} contract(s) | ${dollar_r:.0f} risk",
+        "",
+        *pt_lines,
     ]
 
     if warns:
