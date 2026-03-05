@@ -1044,8 +1044,7 @@ def scan_ticker(ticker: str, force_direction: str = None) -> dict:
             spot            = spot,
             net_gex         = net_gex,
             iv_rank         = iv_rank,
-            prefer_type     = "debit" 
-                if force_direction else "debit"
+            prefer_type = force_direction or "debit"
             account_size    = ACCOUNT_SIZE,
             max_risk_pct    = MAX_RISK_PCT,
             max_risk_usd    = MAX_RISK_USD,
