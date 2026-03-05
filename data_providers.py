@@ -146,25 +146,17 @@ def get_iv_rank_from_candles(ticker: str, iv_current: float) -> Tuple[Optional[f
 # ─────────────────────────────────────────────────────────
 
 def get_earnings_warning(ticker: str, within_days: int = 5) -> Tuple[bool, Optional[str]]:
-    """
-    Returns (has_earnings_soon, warning_message).
-
-    Checks if ticker has earnings announcement within `within_days` calendar days.
-    Uses Finnhub earnings calendar endpoint.
-    """
     cache_key = f"earnings:{ticker}"
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
 
+    # If Finnhub token not set, skip entirely
+    if not FINNHUB_TOKEN:
+        return False, None
+
     today    = datetime.now(timezone.utc).date()
     end_date = today + timedelta(days=within_days)
-
-    data = _finnhub_get("calendar/earnings", {
-        "symbol": today.strftime("%Y-%m-%d"),
-        "from":   today.strftime("%Y-%m-%d"),
-        "to":     end_date.strftime("%Y-%m-%d"),
-    })
 
     # Fix: correct param name
     data = _finnhub_get("calendar/earnings", {
@@ -175,6 +167,11 @@ def get_earnings_warning(ticker: str, within_days: int = 5) -> Tuple[bool, Optio
 
     has_earnings  = False
     warning_msg   = None
+
+    if data is None:
+        # Cache failure to avoid hammering Finnhub on every scan
+        _cache_set(cache_key, (False, None))
+        return False, None
 
     if isinstance(data, dict):
         earnings_list = data.get("earningsCalendar") or []
