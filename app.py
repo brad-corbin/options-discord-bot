@@ -1055,17 +1055,24 @@ def scan_ticker(ticker: str, force_direction: str = None) -> dict:
         if rec.get("ok"):
             trade = rec.get("trade") or {}
             if is_duplicate_trade(ticker, direction, trade.get("short"), trade.get("long")):
-            side      = (trade.get("side") or "").upper()
-            short_k   = trade.get("short")
-            long_k    = trade.get("long")
-            stype     = (trade.get("type") or "debit").upper()
-            dup_label = f"{ticker}: {stype} {direction.upper()} {side} {long_k}/{short_k}"
+                side      = (trade.get("side") or "").upper()
+                short_k   = trade.get("short")
+                long_k    = trade.get("long")
+                stype     = (trade.get("type") or "debit").upper()
+                dup_label = f"{ticker}: {stype} {direction.upper()} {side} {long_k}/{short_k}"
+                return {
+                    "ticker":     ticker,
+                    "skipped":    "duplicate trade in TTL window",
+                    "posted":     False,
+                    "dup_detail": dup_label,
+                }
+
+        # Only post a card if the engine found a valid trade
+        if not rec.get("ok"):
+            reason = rec.get("reason", "no valid trade")
             return {
-                "ticker":     ticker,
-                "skipped":    "duplicate trade in TTL window",
-                "posted":     False,
-                "dup_detail": dup_label,
-            }
+                "ticker":  ticker,
+                "posted":  False,
 
         # Only post a card if the engine found a valid trade
         if not rec.get("ok"):
