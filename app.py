@@ -684,6 +684,9 @@ def scan_ticker(ticker: str) -> dict:
         atm_iv = atm_iv_from_contracts(contracts, spot)
         emove  = spot * atm_iv * math.sqrt(max(EXPECTED_MOVE_DTE, 1) / 365.0)
 
+        # Compute IV rank using MarketData candles
+        from data_providers import get_iv_rank_from_candles
+        iv_rank, iv_pct = get_iv_rank_from_candles(ticker, atm_iv)
         
         # Skew
         md_payload = {
