@@ -1049,7 +1049,7 @@ def scan_ticker(ticker: str, force_direction: str = None) -> dict:
             max_risk_pct    = MAX_RISK_PCT,
             max_risk_usd    = MAX_RISK_USD,
             min_confidence  = MIN_CONFIDENCE_TO_POST,
-        )
+            )
 
         # Dedup check
         if rec.get("ok"):
