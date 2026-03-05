@@ -282,7 +282,7 @@ def gex_summary(net_gex: float, contracts: list, spot: float) -> tuple[str, str,
                 if dist < best_dist:
                     best_dist = dist
                     flip_level = k
-
+    flip_str = f"{flip_level:.2f}" if flip_level is not None else "—"
     regime_line = (
         f"GEX: {regime} ({strength}) | {mag_str} | Flip: {flip_str}\n"
         f"  → {behavior}"
