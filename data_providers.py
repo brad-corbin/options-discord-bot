@@ -45,7 +45,7 @@ def _finnhub_get(endpoint: str, params: dict) -> Optional[dict]:
         r = requests.get(
             f"{FINNHUB_BASE}/{endpoint}",
             params=params,
-            timeout=10,
+            timeout=4,  # fail fast — don't block scan pipeline
         )
         r.raise_for_status()
         return r.json()
