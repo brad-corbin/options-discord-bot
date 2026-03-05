@@ -1036,6 +1036,7 @@ def scan_ticker(ticker: str, force_direction: str = None) -> dict:
             }
 
         # Engine
+        log.info(f"{ticker}: calling engine — direction={direction} force={force_direction} spot={spot}")
         rec = recommend_from_marketdata(
             marketdata_json = md_payload,
             direction       = direction,
@@ -1049,7 +1050,8 @@ def scan_ticker(ticker: str, force_direction: str = None) -> dict:
             max_risk_usd    = MAX_RISK_USD,
             min_confidence  = MIN_CONFIDENCE_TO_POST,
             )
-
+        log.info(f"{ticker}: engine returned ok={rec.get('ok')} reason={rec.get('reason')}")
+        
         # Dedup check
         if rec.get("ok"):
             trade = rec.get("trade") or {}
