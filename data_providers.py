@@ -13,6 +13,7 @@ log = logging.getLogger(__name__)
 
 FINNHUB_TOKEN = os.getenv("FINNHUB_TOKEN", "").strip()
 FINNHUB_BASE  = "https://finnhub.io/api/v1"
+MARKETDATA_TOKEN = os.getenv("MARKETDATA_TOKEN", "").strip()
 
 # Cache to avoid hammering Finnhub on every scan
 # key: ticker → (value, timestamp)
