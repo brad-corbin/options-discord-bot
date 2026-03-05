@@ -665,6 +665,7 @@ def recommend_from_marketdata(
         "conf_reasons":        conf_reasons,
         "trade":               best,
         "best_alt":            alt,
+        "all_candidates":      cands,   # ← add this
         "candidate_count":     len(cands),
         "contracts_suggested": contracts,
         "dollar_risk":         dollar_risk,
