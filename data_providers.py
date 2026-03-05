@@ -20,6 +20,13 @@ MARKETDATA_TOKEN = os.getenv("MARKETDATA_TOKEN", "").strip()
 _cache: dict = {}
 CACHE_TTL = 3600  # 1 hour
 
+def as_float(val, default=None):
+    try:
+        if val is None:
+            return default
+        return float(val)
+    except Exception:
+        return default
 
 def _cache_get(key: str):
     entry = _cache.get(key)
