@@ -192,9 +192,6 @@ def first_val(x, default=None):
 def as_float(x, default=0.0):
     v = first_val(x, default)
     try:
-        def as_float(x, default=0.0):
-    v = first_val(x, default)
-    try:
         return float(v) if v is not None else default
     except Exception:
         return default
