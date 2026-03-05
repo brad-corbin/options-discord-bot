@@ -1233,13 +1233,18 @@ def tv_webhook():
 
     max_aligned   = sum([rsi is not None, vwap is not None,
                          ema_fast is not None, vol_ratio is not None])
-    strength_pct  = int(aligned / max_aligned * 100) if max_aligned > 0 else 50
-    if strength_pct >= 75:
-        strength_label = "💪 Strong"
-    elif strength_pct >= 50:
-        strength_label = "👍 Moderate"
-    else:
-        strength_label = "⚠️ Weak — indicators mixed"
+    strength_pct  = int(aligned / max_aligned * 100) if max_aligned > 0 else 75
+    # If no indicators sent (Marcipher alert), assume strong signal
+    # since Marcipher dual-condition is already high quality
+    if max_aligned == 0:
+            # Marcipher alert — no indicator data but high quality signal
+            strength_label = "💪 Strong (Marcipher dual-condition)"
+        elif strength_pct >= 75:
+            strength_label = "💪 Strong"
+        elif strength_pct >= 50:
+            strength_label = "👍 Moderate"
+        else:
+            strength_label = "⚠️ Weak — indicators mixed"
 
     # Build TV signal context message
     prefix_lines = [
