@@ -387,11 +387,39 @@ def build_candidates(
             })
 
     else:  # debit
-        # Long leg near ATM, short leg further OTM (protective)
-        long_k = nearest_strike(strikes, spot)
+        # Long leg ITM by $2+ (<$200 spot) or $3+ (≥$200 spot)
+        itm_depth = 3.0 if spot >= 200 else 2.0
+
+        if direction == "bull":
+            # Bull call debit: long leg is ITM → strike BELOW spot by itm_depth
+            itm_target = spot - itm_depth
+        else:
+            # Bear put debit: long leg is ITM → strike ABOVE spot by itm_depth
+            itm_target = spot + itm_depth
+
+        long_k = nearest_strike(strikes, itm_target)
         long_q = quotes.get(long_k)
         if not long_q:
             return move, []
+
+        # Verify it's actually ITM (not just nearest)
+        if direction == "bull" and long_k > spot:
+            # Walked OTM — find next strike below spot
+            itm_strikes = [k for k in strikes if k < spot]
+            if not itm_strikes:
+                return move, []
+            long_k = max(itm_strikes)
+            long_q = quotes.get(long_k)
+            if not long_q:
+                return move, []
+        elif direction == "bear" and long_k < spot:
+            itm_strikes = [k for k in strikes if k > spot]
+            if not itm_strikes:
+                return move, []
+            long_k = min(itm_strikes)
+            long_q = quotes.get(long_k)
+            if not long_q:
+                return move, []
 
         for steps in range(1, max_steps + 1):
             w       = round(steps * inc, 4)
@@ -402,22 +430,33 @@ def build_candidates(
                 continue
 
             debit = long_q["mid"] - short_q["mid"]
-            if debit <= 0 or debit > max_debit_pct * w:
+            if debit <= 0 or debit > 0.70 * w:
                 continue
 
             mp, ml, ror = vertical_metrics(w, debit=debit)
             if ror is None or ror < min_debit_ror:
                 continue
 
-            pop = delta_to_pop(long_q.get("delta"), "debit")
+            pop       = delta_to_pop(long_q.get("delta"), "debit")
+            long_delta = long_q.get("delta")
+            itm_amount = abs(spot - long_k)
+            cost_pct   = round(debit / w * 100, 1)
             out.append({
-                "type": "debit", "direction": direction,
-                "short": short_k, "long": long_k,
-                "side":  "call" if direction == "bull" else "put",
-                "width": float(w), "price": float(debit),
-                "maxProfit": float(mp), "maxLoss": float(ml),
-                "RoR": float(ror), "pop": pop,
-                "warnings": long_q["warnings"] + short_q["warnings"],
+                "type":       "debit",
+                "direction":  direction,
+                "short":      short_k,
+                "long":       long_k,
+                "side":       "call" if direction == "bull" else "put",
+                "width":      float(w),
+                "price":      float(debit),
+                "maxProfit":  float(mp),
+                "maxLoss":    float(ml),
+                "RoR":        float(ror),
+                "pop":        pop,
+                "long_delta": long_delta,
+                "itm_amount": round(itm_amount, 2),
+                "cost_pct":   cost_pct,
+                "warnings":   long_q["warnings"] + short_q["warnings"],
             })
 
     return move, out
