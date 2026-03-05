@@ -1027,7 +1027,7 @@ def scan_ticker(ticker: str, force_direction: str = None) -> dict:
         big_oi      = oi_score > 15000
         notable_gex = abs(net_gex) > 1e9
 
-        if not (near_wall or big_oi or notable_gex or dir_conf >= 55):
+        if not force_direction and not (near_wall or big_oi or notable_gex or dir_conf >= 55):
             return {
                 "ticker":    ticker,
                 "skipped":   "not trade-worthy",
