@@ -13,6 +13,14 @@
 #   - Duplicate trade prevention via Redis (or in-memory set)
 #   - Cleaner message formatting with structured sections
 #   - net_gex passed through to options_engine for regime-aware selection
+from telegram_commands import (
+    handle_command,
+    register_webhook,
+    is_paused,
+    get_confidence_gate,
+    set_last_scan,
+    get_state,
+)
 
 import os
 import time
@@ -20,6 +28,7 @@ import math
 import json
 import hashlib
 import logging
+import threading
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from data_providers import enrich_ticker
@@ -44,6 +53,8 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 app = Flask(__name__)
+# Register Telegram webhook on startup
+_tg_webhook_secret = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
 
 # ─────────────────────────────────────────────────────────
 # ENV VARS
@@ -313,7 +324,39 @@ def post_to_telegram(text: str, max_retries: int = 4) -> tuple[int, str]:
         time.sleep(min(1.5 * (attempt + 1), 6.0))
     return 500, f"Telegram failed: {last_err}"
 
+@app.route("/telegram_webhook/<secret>", methods=["POST"])
+def telegram_webhook(secret):
+    # Verify secret
+    if secret != os.getenv("TELEGRAM_WEBHOOK_SECRET", ""):
+        return jsonify({"error": "Unauthorized"}), 403
 
+    data    = request.get_json(silent=True) or {}
+    message = data.get("message") or data.get("edited_message") or {}
+    
+    if not message:
+        return jsonify({"ok": True})
+
+    text    = message.get("text", "")
+    chat_id = str(message.get("chat", {}).get("id", ""))
+    user_id = str(message.get("from", {}).get("id", ""))
+
+    if not text.startswith("/"):
+        return jsonify({"ok": True})
+
+    tickers = [t.strip().upper() for t in WATCHLIST.split(",") if t.strip()]
+
+    def run_command():
+        handle_command(
+            user_id      = user_id,
+            chat_id      = chat_id,
+            text         = text,
+            scan_fn      = scan_ticker,
+            full_scan_fn = lambda: scan_watchlist_internal(tickers),
+            watchlist    = tickers,
+        )
+
+    threading.Thread(target=run_command, daemon=True).start()
+    return jsonify({"ok": True})
 # ─────────────────────────────────────────────────────────
 # MARKETDATA API
 # ─────────────────────────────────────────────────────────
@@ -835,7 +878,81 @@ def build_trade_lines(rec: dict, ticker: str) -> list:
 
     return [l for l in lines if l is not None]
 
+def scan_watchlist_internal(tickers: list, max_posts: int = 6):
+    """
+    Internal scan runner — same logic as /scan route
+    but callable directly from Telegram commands.
+    """
+    if is_paused():
+        post_to_telegram("⏸ Scan skipped — bot is paused.")
+        return
 
+    results  = []
+    posted   = 0
+
+    bull_no_trade    = []
+    bear_no_trade    = []
+    neutral_skipped  = []
+    suppressed       = []
+    duplicates       = []
+    earnings_flagged = []
+
+    with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as executor:
+        futures = {executor.submit(scan_ticker, t): t for t in tickers}
+        for future in as_completed(futures):
+            if posted >= max_posts:
+                future.cancel()
+                continue
+            res = future.result()
+            results.append(res)
+
+            ticker  = res.get("ticker", "?")
+            skipped = res.get("skipped", "")
+            error   = res.get("error", "")
+
+            if res.get("posted"):
+                posted += 1
+            elif "duplicate" in skipped.lower():
+                duplicates.append(ticker)
+            elif "not trade-worthy" in skipped.lower():
+                direction = res.get("direction", "neutral")
+                if direction == "bull":
+                    bull_no_trade.append(ticker)
+                elif direction == "bear":
+                    bear_no_trade.append(ticker)
+                else:
+                    neutral_skipped.append(ticker)
+            elif "suppressed" in skipped.lower() or "confidence" in error.lower():
+                suppressed.append(ticker)
+            elif error:
+                neutral_skipped.append(ticker)
+
+            if res.get("has_earnings"):
+                earnings_flagged.append(ticker)
+
+    # Summary message
+    summary_lines = [
+        f"📋 WATCHLIST SUMMARY — {datetime.now(timezone.utc).strftime('%H:%M UTC')}",
+        f"Scanned: {len(tickers)} tickers | Trade cards sent: {posted}",
+        "",
+    ]
+    if earnings_flagged:
+        summary_lines.append(f"🚨 EARNINGS THIS WEEK: {', '.join(sorted(earnings_flagged))}")
+    if bull_no_trade:
+        summary_lines.append(f"🟢 BULL (no setup): {', '.join(sorted(bull_no_trade))}")
+    if bear_no_trade:
+        summary_lines.append(f"🔴 BEAR (no setup): {', '.join(sorted(bear_no_trade))}")
+    if neutral_skipped:
+        summary_lines.append(f"⚪ NEUTRAL / ERROR: {', '.join(sorted(neutral_skipped))}")
+    if suppressed:
+        summary_lines.append(f"🟡 LOW CONFIDENCE: {', '.join(sorted(suppressed))}")
+    if duplicates:
+        summary_lines.append(f"🔁 DUPLICATE (skipped): {', '.join(sorted(duplicates))}")
+
+    summary_lines += ["", "— Not financial advice —"]
+    post_to_telegram("\n".join(summary_lines))
+    set_last_scan(posted, len(tickers))
+    
 # ─────────────────────────────────────────────────────────
 # SINGLE-TICKER SCAN WORKER  (called in parallel)
 # ─────────────────────────────────────────────────────────
@@ -1143,6 +1260,9 @@ def scan_watchlist():
     if not tickers:
         return jsonify({"error": "WATCHLIST empty"}), 400
 
+    if is_paused():
+        return jsonify({"status": "paused", "message": "Bot is paused — use /resume in Telegram"})
+
     max_posts = as_int(data.get("max_posts"), DEFAULT_MAX_POSTS)
     results   = []
     posted    = 0
@@ -1220,6 +1340,8 @@ def scan_watchlist():
 
     st, body = post_to_telegram(summary_text)
     log.info(f"Scan complete: {posted}/{len(tickers)} trade cards posted")
+    set_last_scan(posted, len(tickers))
+    log.info(f"Scan complete: {posted}/{len(tickers)} posted")
 
     return jsonify({
         "status":  "ok",
@@ -1228,6 +1350,12 @@ def scan_watchlist():
         "results": results,
     })
 
+# Register Telegram webhook on startup
+with app.app_context():
+    _tg_ws = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
+    _bot_url = BOT_URL
+    if _tg_ws and _bot_url:
+        register_webhook(_bot_url, _tg_ws)
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
