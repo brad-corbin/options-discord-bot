@@ -193,9 +193,12 @@ def build_quotes(md: Dict, side: str) -> Dict[float, Dict]:
         if mid is None:
             continue
 
+        vol = _sg(marketdata_json.get("volume", []), i, None) if False else None
+        # volume is passed separately — handled in build_quotes call
         out[k] = {"strike": k, "mid": mid, "bid": bid, "ask": ask,
                   "oi": oi, "delta": d, "iv": iv,
-                  "warnings": leg_warnings(bid, ask, oi)}
+                  "warnings": leg_warnings(bid, ask, oi),
+                  "volume": None}  # populated by build_quotes_with_volume
     return out
 
 
