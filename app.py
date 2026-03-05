@@ -682,7 +682,12 @@ def scan_ticker(ticker: str) -> dict:
         notable_gex = abs(net_gex) > 1e9
 
         if not (near_wall or big_oi or notable_gex or dir_conf >= 55):
-            return {"ticker": ticker, "skipped": "not trade-worthy", "posted": False}
+            return {
+                "ticker":    ticker,
+                "skipped":   "not trade-worthy",
+                "posted":    False,
+                "direction": direction,
+            }
 
         # Engine
         rec = recommend_from_marketdata(
@@ -836,20 +841,71 @@ def scan_watchlist():
     results   = []
     posted    = 0
 
+    # Buckets for summary message
+    bull_no_trade   = []
+    bear_no_trade   = []
+    neutral_skipped = []
+    suppressed      = []
+    duplicates      = []
+
     log.info(f"Scan started: {len(tickers)} tickers, {SCAN_WORKERS} workers")
 
     with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as executor:
         futures = {executor.submit(scan_ticker, t): t for t in tickers}
         for future in as_completed(futures):
-            if posted >= max_posts:
-                future.cancel()
-                continue
             res = future.result()
             results.append(res)
+
+            ticker  = res.get("ticker", "?")
+            skipped = res.get("skipped", "")
+            error   = res.get("error", "")
+
             if res.get("posted"):
                 posted += 1
 
-    log.info(f"Scan complete: {posted}/{len(tickers)} posted")
+            elif "duplicate" in skipped.lower():
+                duplicates.append(ticker)
+
+            elif "not trade-worthy" in skipped.lower():
+                # Still want to show direction
+                direction = res.get("direction", "neutral")
+                if direction == "bull":
+                    bull_no_trade.append(ticker)
+                elif direction == "bear":
+                    bear_no_trade.append(ticker)
+                else:
+                    neutral_skipped.append(ticker)
+
+            elif "suppressed" in skipped.lower() or "confidence" in error.lower():
+                suppressed.append(ticker)
+
+            elif error:
+                neutral_skipped.append(ticker)
+
+    # Build and send summary message
+    summary_lines = [
+        f"📋 WATCHLIST SUMMARY — {datetime.now(timezone.utc).strftime('%H:%M UTC')}",
+        f"Scanned: {len(tickers)} tickers | Trade cards sent: {posted}",
+        "",
+    ]
+
+    if bull_no_trade:
+        summary_lines.append(f"🟢 BULL (no setup): {', '.join(sorted(bull_no_trade))}")
+    if bear_no_trade:
+        summary_lines.append(f"🔴 BEAR (no setup): {', '.join(sorted(bear_no_trade))}")
+    if neutral_skipped:
+        summary_lines.append(f"⚪ NEUTRAL / ERROR: {', '.join(sorted(neutral_skipped))}")
+    if suppressed:
+        summary_lines.append(f"🟡 LOW CONFIDENCE: {', '.join(sorted(suppressed))}")
+    if duplicates:
+        summary_lines.append(f"🔁 DUPLICATE (skipped): {', '.join(sorted(duplicates))}")
+
+    summary_lines += ["", "— Not financial advice —"]
+    summary_text = "\n".join(summary_lines)
+
+    st, body = post_to_telegram(summary_text)
+    log.info(f"Scan complete: {posted}/{len(tickers)} trade cards posted")
+
     return jsonify({
         "status":  "ok",
         "posted":  posted,
