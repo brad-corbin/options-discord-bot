@@ -302,7 +302,7 @@ def choose_spread_type(
         ratio = iv_atm / hv20
         if ratio >= 1.30 and prefer == "debit":
             stype = "credit"   # IV rich vs realized → sell premium
-        elif ratio <= 0.85:
+        elif ratio <= 0.75:
             stype = "debit"    # IV cheap vs realized → buy premium
 
     if iv_rank is not None:
