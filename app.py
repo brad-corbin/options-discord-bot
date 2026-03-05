@@ -1067,14 +1067,7 @@ def scan_ticker(ticker: str, force_direction: str = None) -> dict:
                     "dup_detail": dup_label,
                 }
 
-        # Only post a card if the engine found a valid trade
-        if not rec.get("ok"):
-            reason = rec.get("reason", "no valid trade")
-            return {
-                "ticker":  ticker,
-                "posted":  False,
-
-        # Only post a card if the engine found a valid trade
+       # Only post a card if the engine found a valid trade
         if not rec.get("ok"):
             reason = rec.get("reason", "no valid trade")
             return {
@@ -1084,7 +1077,7 @@ def scan_ticker(ticker: str, force_direction: str = None) -> dict:
                 "direction": direction,
             }
 
-        ttrade_lines = build_trade_lines(rec, ticker)
+        trade_lines = build_trade_lines(rec, ticker)
 
         # Add volume/flow signal
         if rec.get("ok"):
