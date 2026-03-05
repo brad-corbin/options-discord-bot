@@ -709,36 +709,46 @@ def scan_ticker(ticker: str) -> dict:
             trade = rec.get("trade") or {}
             if is_duplicate_trade(ticker, direction, trade.get("short"), trade.get("long")):
                 return {"ticker": ticker, "skipped": "duplicate trade in TTL window", "posted": False}
+        # Only post a card if the engine found a valid trade
+        if not rec.get("ok"):
+            reason = rec.get("reason", "no valid trade")
+            return {
+                "ticker":    ticker,
+                "posted":    False,
+                "skipped":   f"suppressed — {reason}",
+                "direction": direction,
+            }
 
         trade_lines = build_trade_lines(rec, ticker)
 
         msg = build_scan_message(
-        ticker     = ticker,
-        spot       = spot,
-        exp        = exp,
-        dte        = dte,
-        call_wall  = call_wall,
-        put_wall   = put_wall,
-        net_gex    = net_gex,
-        emove      = emove,
-        oi_note    = oi_note,
-        risk_label = risk_label,
-        risk_notes = risk_notes,
-        a_score    = a_score,
-        direction  = direction,
-        iv_rank    = iv_rank,
-        skew_bias  = skew_bias,
-        skew_val   = skew_val,
-        trade_lines= trade_lines,
-        contracts  = contracts,   # ← new
+            ticker     = ticker,
+            spot       = spot,
+            exp        = exp,
+            dte        = dte,
+            call_wall  = call_wall,
+            put_wall   = put_wall,
+            net_gex    = net_gex,
+            emove      = emove,
+            oi_note    = oi_note,
+            risk_label = risk_label,
+            risk_notes = risk_notes,
+            a_score    = a_score,
+            direction  = direction,
+            iv_rank    = iv_rank,
+            skew_bias  = skew_bias,
+            skew_val   = skew_val,
+            trade_lines= trade_lines,
+            contracts  = contracts,
         )
 
         st, body = post_to_telegram(msg)
-        if st == 200 and rec.get("ok"):
+        if st == 200:
             trade = rec.get("trade") or {}
             mark_trade_sent(ticker, direction, trade.get("short"), trade.get("long"))
 
         return {"ticker": ticker, "posted": st == 200, "tg_status": st, "tg_body": body[:120]}
+
 
     except Exception as e:
         log.error(f"scan_ticker({ticker}): {type(e).__name__}: {e}")
