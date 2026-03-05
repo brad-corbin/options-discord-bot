@@ -551,10 +551,27 @@ def recommend_from_marketdata(
     if not quotes:
         return {"ok": False, "reason": f"No usable {side} quotes"}
 
+    # Dynamically loosen quality filters for lower-priced tickers
+    # (fewer strikes, lower absolute premium = harder to meet fixed thresholds)
+    if spot < 50:
+        adj_min_credit_pct = 0.08   # 8% floor (vs 15% default)
+        adj_min_debit_ror  = 0.15   # 15% RoR floor (vs 25% default)
+        adj_max_debit_pct  = 0.75   # allow slightly more expensive debits
+    elif spot < 100:
+        adj_min_credit_pct = 0.10   # 10% floor
+        adj_min_debit_ror  = 0.20   # 20% RoR floor
+        adj_max_debit_pct  = 0.70
+    else:
+        adj_min_credit_pct = MIN_CREDIT_PCT_WIDTH   # default 15%
+        adj_min_debit_ror  = MIN_DEBIT_ROR          # default 25%
+        adj_max_debit_pct  = float(marketdata_json.get("max_debit_pct", 0.60))
+
     move, cands = build_candidates(
         quotes, spot, iv_atm, dte, direction, stype,
-        max_width     = float(marketdata_json.get("max_width",    10.0)),
-        max_debit_pct = float(marketdata_json.get("max_debit_pct", 0.60)),
+        max_width      = float(marketdata_json.get("max_width", 10.0)),
+        max_debit_pct  = adj_max_debit_pct,
+        min_credit_pct = adj_min_credit_pct,
+        min_debit_ror  = adj_min_debit_ror,
     )
 
     if not cands:
