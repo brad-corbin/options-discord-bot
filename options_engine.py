@@ -32,7 +32,8 @@ K_SIGMA_DEBIT_OTM     = 0.80    # short (protective) leg for debits
 MAX_SHORT_DELTA_CREDIT = 0.38
 MAX_SHORT_DELTA_DEBIT  = 0.55
 
-MIN_CREDIT_PCT_WIDTH   = 0.15   # credit must be ≥15% of width
+MIN_CREDIT_PCT_WIDTH   = 0.25   # minimum 20% of width as credit
+MIN_CREDIT_ABSOLUTE    = 0.30   # minimum $0.25 credit regardless of width
 MIN_DEBIT_ROR          = 0.25   # debit RoR floor
 MIN_CONFIDENCE         = 40
 
@@ -280,7 +281,7 @@ def compute_direction_bias(
 # ─────────────────────────────────────────────────────────
 
 def choose_spread_type(
-    direction, iv_atm, iv_rank=None, net_gex=None, skew_bias="neutral", prefer="debit"
+    direction, iv_atm, iv_rank=None, net_gex=None, skew_bias="neutral", prefer="debit", hv20=None
 ) -> Tuple[str, str]:
     """
     Returns (spread_type, option_side).
@@ -293,6 +294,16 @@ def choose_spread_type(
     """
     prefer = (prefer or "debit").strip().lower()
     stype = prefer
+
+    stype = prefer
+
+    # HV20 ratio — strongest signal, checked first
+    if hv20 is not None and hv20 > 0 and iv_atm is not None:
+        ratio = iv_atm / hv20
+        if ratio >= 1.30 and prefer == "debit":
+            stype = "credit"   # IV rich vs realized → sell premium
+        elif ratio <= 0.85:
+            stype = "debit"    # IV cheap vs realized → buy premium
 
     if iv_rank is not None:
         if iv_rank >= IVR_HIGH_FOR_CREDIT:
@@ -371,7 +382,9 @@ def build_candidates(
                 continue
 
             credit = short_q["mid"] - long_q["mid"]
-            if credit < min_credit_pct * w or credit <= 0:
+            if credit < min_credit_pct * w:
+                continue
+            if credit < MIN_CREDIT_ABSOLUTE:
                 continue
 
             mp, ml, ror = vertical_metrics(w, credit=credit)
@@ -681,7 +694,8 @@ def recommend_from_marketdata(
     direction_conflict = (direction != dir_str)
 
     stype, side = choose_spread_type(
-        direction, iv_atm, iv_rank, net_gex, skew_bias, prefer
+        direction, iv_atm, iv_rank, net_gex, skew_bias, prefer,
+        hv20=marketdata_json.get("hv20"),
     )
 
     quotes = build_quotes(marketdata_json, side)
