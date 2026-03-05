@@ -476,6 +476,101 @@ def atm_iv_from_contracts(contracts: list, spot: float) -> float:
     ivs = [as_float(c.get("iv"), None) for c in near if c.get("iv") is not None and as_float(c.get("iv"), 0) > 0]
     return sum(ivs) / len(ivs) if ivs else 0.30
 
+def compute_flow_signal(contracts: list, trade: dict, spot: float) -> list:
+    """
+    Analyzes options volume vs open interest for the specific spread legs
+    and overall chain to detect unusual flow.
+
+    Returns list of strings to append to trade card.
+    """
+    if not trade or not contracts:
+        return []
+
+    short_k    = trade.get("short")
+    long_k     = trade.get("long")
+    trade_side = (trade.get("side") or "").lower()  # call or put
+
+    # Aggregate chain-level volume
+    total_call_vol = 0
+    total_put_vol  = 0
+    total_call_oi  = 0
+    total_put_oi   = 0
+
+    leg_data = {}  # strike → {vol, oi, ratio}
+
+    for c in contracts:
+        right  = (c.get("right") or "").lower()
+        strike = as_float(c.get("strike"), None)
+        if strike is None:
+            continue
+
+        vol = as_int(c.get("volume"), 0)
+        oi  = as_int(c.get("openInterest"), 0)
+
+        if right == "call":
+            total_call_vol += vol
+            total_call_oi  += oi
+        elif right == "put":
+            total_put_vol += vol
+            total_put_oi  += oi
+
+        if strike in (short_k, long_k) and right == trade_side:
+            ratio = round(vol / oi, 3) if oi > 0 else 0
+            leg_data[strike] = {
+                "vol":   vol,
+                "oi":    oi,
+                "ratio": ratio,
+            }
+
+    lines = ["📊 Flow Signal:"]
+
+    # Leg-level analysis
+    for label, k in [("Long", long_k), ("Short", short_k)]:
+        d = leg_data.get(k)
+        if not d:
+            continue
+
+        vol, oi, ratio = d["vol"], d["oi"], d["ratio"]
+
+        if ratio >= 1.0:
+            flag = "🔥🔥 VERY unusual"
+        elif ratio >= 0.50:
+            flag = "🔥 Unusual"
+        elif ratio >= 0.15:
+            flag = "⚡ Notable"
+        else:
+            flag = ""
+
+        vol_str = f"{vol:,}" if vol else "—"
+        oi_str  = f"{oi:,}"  if oi  else "—"
+        ratio_str = f"{ratio:.2f}" if ratio else "—"
+
+        flag_str = f" {flag}" if flag else ""
+        lines.append(
+            f"  {label} {k} {trade_side.upper()}: "
+            f"Vol {vol_str} | OI {oi_str} | V/OI {ratio_str}{flag_str}"
+        )
+
+    # Chain-level put/call volume ratio
+    if total_call_vol > 0 and total_put_vol > 0:
+        pc_ratio = round(total_put_vol / total_call_vol, 2)
+        if pc_ratio >= 1.5:
+            chain_note = f"P/C Vol Ratio: {pc_ratio} 🐻 Heavy put flow"
+        elif pc_ratio <= 0.67:
+            chain_note = f"P/C Vol Ratio: {pc_ratio} 🐂 Heavy call flow"
+        else:
+            chain_note = f"P/C Vol Ratio: {pc_ratio} — balanced"
+        lines.append(f"  Chain: {chain_note}")
+
+    # Unusual flow summary
+    unusual_legs = [
+        k for k, d in leg_data.items()
+        if d["ratio"] >= 0.50
+    ]
+    if unusual_legs:
+        lines.append(f"  ⚠️ Unusual flow on: {', '.join(str(k) for k in unusual_legs)}")
+
+    return lines if len(lines) > 1 else []
 
 def risk_rating(spot, call_wall, put_wall, net_gex, inc, oi_score) -> tuple:
     if call_wall is None or put_wall is None:
@@ -760,7 +855,13 @@ def scan_ticker(ticker: str) -> dict:
                 "direction": direction,
             }
 
-        trade_lines = build_trade_lines(rec, ticker)
+        ttrade_lines = build_trade_lines(rec, ticker)
+
+        # Add volume/flow signal
+        if rec.get("ok"):
+            flow_lines = compute_flow_signal(contracts, rec.get("trade") or {}, spot)
+            if flow_lines:
+                trade_lines = trade_lines + [""] + flow_lines
 
         # Prepend earnings warning to trade lines if applicable
         if has_earnings and earnings_warn:
