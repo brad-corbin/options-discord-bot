@@ -798,9 +798,11 @@ def build_trade_lines(rec: dict, ticker: str) -> list:
     ror        = trade.get("RoR")
     warns      = trade.get("warnings") or []
 
-    delta_str = f"δ{long_delta:.2f}" if isinstance(long_delta, float) else ""
-    itm_str   = f"${itm_amount:.2f} ITM" if isinstance(itm_amount, float) else ""
-    itm_label = f" ({delta_str}, {itm_str})" if (delta_str or itm_str) else ""
+    delta_str  = f"δ{long_delta:.2f}" if isinstance(long_delta, float) else ""
+    itm_str    = f"${itm_amount:.2f} ITM" if isinstance(itm_amount, float) else ""
+    itm_label  = f" ({delta_str}, {itm_str})" if (delta_str or itm_str) else ""
+    short_itm  = trade.get("short_itm")
+    short_label = f" (${short_itm:.2f} ITM)" if isinstance(short_itm, float) else ""
     cost_ok   = isinstance(cost_pct, float) and cost_pct <= 70
     cost_str  = f"{cost_pct:.0f}% {'✅' if cost_ok else '⚠️'}" if isinstance(cost_pct, float) else ""
 
@@ -823,7 +825,7 @@ def build_trade_lines(rec: dict, ticker: str) -> list:
 
     lines = [
         f"🧠 Trade: {stype} {side} SPREAD",
-        f"Long: {best_long}{itm_label} | Short: {best_short}",
+        f"Long: {best_long}{itm_label} | Short: {best_short}{short_label}",
         f"Width: ${trade.get('width','?')} | Cost: ${price:.2f} ({cost_str})" if isinstance(price, float) else "",
         f"Max Profit: ${mp:.2f} | Max Loss: ${ml:.2f}" if isinstance(mp, float) else "",
         f"POP: {pop:.0%}" if isinstance(pop, float) else "",
@@ -957,7 +959,7 @@ def scan_watchlist_internal(tickers: list, max_posts: int = 6):
 # SINGLE-TICKER SCAN WORKER  (called in parallel)
 # ─────────────────────────────────────────────────────────
 
-def scan_ticker(ticker: str) -> dict:
+def scan_ticker(ticker: str, force_direction: str = None) -> dict:
     """
     Full pipeline for a single ticker.
     Returns a result dict with 'posted', 'skipped', 'error' keys.
@@ -1010,6 +1012,12 @@ def scan_ticker(ticker: str) -> dict:
         direction, dir_conf, dir_notes = compute_direction_bias(
             spot, call_wall, put_wall, net_gex, skew_bias, iv_rank
         )
+
+        # Override direction if forced by TV alert
+        if force_direction and force_direction in ("bull", "bear"):
+            direction = force_direction
+            dir_conf  = max(dir_conf, 60)  # boost confidence since TV signal confirmed
+            log.info(f"{ticker}: direction forced to {direction} by TV alert")
 
         # Risk / alpha
         risk_label, risk_notes = risk_rating(spot, call_wall, put_wall, net_gex, inc, oi_score)
@@ -1234,10 +1242,7 @@ def tv_webhook():
     else:
         strength_label = "⚠️ Weak — indicators mixed"
 
-    # Run full scan pipeline
-    result = scan_ticker(ticker)
-
-    # Build TV-specific prefix message
+    # Build and post TV signal context first
     prefix_lines = [
         f"📢 TV Signal — {ticker} ({bias.upper()})",
         f"Close: {close:.2f} | Time: {tv_time}" if tv_time else f"Close: {close:.2f}",
@@ -1246,9 +1251,12 @@ def tv_webhook():
         *indicator_lines,
         "",
     ]
-
     prefix = "\n".join(prefix_lines)
-    st, body = post_to_telegram(prefix)
+    post_to_telegram(prefix)
+
+    # Now run full scan pipeline and post trade card
+    # Force direction to match TV bias so engine aligns with your signal
+    result = scan_ticker(ticker, force_direction=bias)
 
     return jsonify({
         "status":   "received",
