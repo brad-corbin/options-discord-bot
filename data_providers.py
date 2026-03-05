@@ -57,62 +57,84 @@ def _finnhub_get(endpoint: str, params: dict) -> Optional[dict]:
 # IV RANK & PERCENTILE
 # ─────────────────────────────────────────────────────────
 
-def get_iv_rank(ticker: str) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+def get_iv_rank_from_candles(ticker: str, iv_current: float) -> Tuple[Optional[float], Optional[float]]:
     """
-    Returns (iv_current, iv_rank, iv_percentile) for a ticker.
+    Computes IV rank and IV percentile using 1 year of daily stock candles
+    from MarketData.app to estimate historical volatility range.
 
-    IV Rank   = where current IV sits in 52-week high/low range (0-100)
-    IV Pct    = % of days in past year where IV was below current IV (0-100)
+    Since MarketData doesn't provide historical IV, we use a 30-day rolling
+    realized volatility as a proxy for the IV history, then compare current
+    ATM IV against that range.
 
-    Uses Finnhub option sentiment endpoint which provides:
-    - impliedVolatility (current ATM IV)
-    - No direct IVR — we compute from historical IV via stock candles + VIX proxy
-
-    For single stocks we use Finnhub's historical IV endpoint.
+    Returns (iv_rank, iv_percentile).
     """
-    cache_key = f"ivrank:{ticker}"
+    cache_key = f"ivrank_candles:{ticker}"
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
 
-    # Finnhub historical IV (requires premium) — use option metrics instead
-    data = _finnhub_get("stock/option-chain", {"symbol": ticker})
+    if not MARKETDATA_TOKEN:
+        return None, None
 
-    # Fallback: use Finnhub stock metric for 52w high/low of IV
-    metric_data = _finnhub_get("stock/metric", {
-        "symbol": ticker,
-        "metric": "all"
-    })
+    try:
+        today     = datetime.now(timezone.utc).date()
+        from_date = (today - timedelta(days=365)).strftime("%Y-%m-%d")
+        to_date   = today.strftime("%Y-%m-%d")
 
-    iv_current    = None
-    iv_rank       = None
-    iv_percentile = None
+        r = requests.get(
+            f"https://api.marketdata.app/v1/stocks/candles/D/{ticker}/",
+            headers={"Authorization": f"Bearer {MARKETDATA_TOKEN}"},
+            params={"from": from_date, "to": to_date},
+            timeout=15,
+        )
+        r.raise_for_status()
+        data = r.json()
 
-    if isinstance(metric_data, dict):
-        m = metric_data.get("metric") or {}
+        closes = data.get("c") or []
+        if len(closes) < 30:
+            return None, None
 
-        # Finnhub provides these fields on most tickers
-        iv_current = m.get("52WeekIV") or m.get("currentIV")
+        # Compute 30-day rolling realized volatility (annualized)
+        import math
+        rv_series = []
+        for i in range(30, len(closes)):
+            window = closes[i-30:i]
+            if len(window) < 2:
+                continue
+            returns = [math.log(window[j] / window[j-1])
+                      for j in range(1, len(window))
+                      if window[j-1] > 0]
+            if not returns:
+                continue
+            mean_r = sum(returns) / len(returns)
+            variance = sum((r - mean_r) ** 2 for r in returns) / len(returns)
+            rv = math.sqrt(variance * 252)
+            rv_series.append(rv)
 
-        iv_52w_high = m.get("52WeekIVHigh")
-        iv_52w_low  = m.get("52WeekIVLow")
+        if len(rv_series) < 10:
+            return None, None
 
-        if iv_current and iv_52w_high and iv_52w_low:
-            rng = iv_52w_high - iv_52w_low
-            if rng > 0:
-                iv_rank = round(
-                    min(max((iv_current - iv_52w_low) / rng * 100, 0), 100), 1
-                )
+        rv_min = min(rv_series)
+        rv_max = max(rv_series)
+        rng    = rv_max - rv_min
 
-    # If metric endpoint didn't return IV data, try option sentiment
-    if iv_current is None:
-        sentiment = _finnhub_get("stock/option-sentiment", {"symbol": ticker})
-        if isinstance(sentiment, dict):
-            iv_current = sentiment.get("impliedVolatility")
+        if rng <= 0:
+            return None, None
 
-    result = (iv_current, iv_rank, iv_percentile)
-    _cache_set(cache_key, result)
-    return result
+        # IV rank: where does current IV sit vs historical RV range
+        iv_rank = round(min(max((iv_current - rv_min) / rng * 100, 0), 100), 1)
+
+        # IV percentile: % of days where RV was below current IV
+        below = sum(1 for v in rv_series if v < iv_current)
+        iv_pct = round(below / len(rv_series) * 100, 1)
+
+        result = (iv_rank, iv_pct)
+        _cache_set(cache_key, result)
+        return result
+
+    except Exception as e:
+        log.warning(f"IV rank candles error for {ticker}: {e}")
+        return None, None
 
 
 # ─────────────────────────────────────────────────────────
@@ -197,19 +219,15 @@ def get_earnings_warning(ticker: str, within_days: int = 5) -> Tuple[bool, Optio
 
 def enrich_ticker(ticker: str) -> dict:
     """
-    Single entry point that returns all Finnhub data for a ticker.
-    Designed to be called once per ticker per scan.
-
-    Returns:
-    {
-        "iv_current":    float | None,
-        "iv_rank":       float | None,   # 0-100
-        "iv_percentile": float | None,   # 0-100
-        "has_earnings":  bool,
-        "earnings_warn": str | None,
-    }
+    Single entry point for all enrichment data.
+    Uses MarketData.app for IV rank, Finnhub only for earnings.
     """
-    iv_current, iv_rank, iv_pct = get_iv_rank(ticker)
+    # IV rank via MarketData candles (no Finnhub needed)
+    iv_current = None   # will be filled from chain in app.py
+    iv_rank    = None
+    iv_pct     = None
+
+    # Earnings via Finnhub (free tier supports this)
     has_earnings, earnings_warn = get_earnings_warning(ticker)
 
     return {
