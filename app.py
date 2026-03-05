@@ -248,11 +248,40 @@ def gex_summary(net_gex: float, contracts: list, spot: float) -> tuple[str, str,
             strike_gex[strike] = strike_gex.get(strike, 0) - contrib
 
     flip_level = None
-    if strike_gex:
-        # Find strike closest to zero net GEX
-        flip_level = min(strike_gex.keys(), key=lambda k: abs(strike_gex[k]))
+    if strike_gex and len(strike_gex) >= 3:
+        # Find the strike where cumulative GEX crosses zero
+        # Sort strikes and walk cumulative sum to find sign change
+        sorted_strikes = sorted(strike_gex.keys())
+        cumulative = 0.0
+        prev_strike = None
+        for k in sorted_strikes:
+            cumulative += strike_gex[k]
+            if prev_strike is not None:
+                # Sign change detected → flip is between prev and current
+                prev_cum = cumulative - strike_gex[k]
+                if (prev_cum >= 0 and cumulative < 0) or (prev_cum < 0 and cumulative >= 0):
+                    # Interpolate: weight by magnitude
+                    total = abs(prev_cum) + abs(cumulative)
+                    if total > 0:
+                        flip_level = round(
+                            (prev_strike * abs(cumulative) + k * abs(prev_cum)) / total, 2
+                        )
+                    else:
+                        flip_level = k
+                    break
+            prev_strike = k
 
-    flip_str = f"{flip_level:g}" if flip_level else "—"
+        # Fallback: if no zero crossing found, use strike nearest to spot
+        # with smallest absolute cumulative GEX
+        if flip_level is None:
+            running = 0.0
+            best_dist = float("inf")
+            for k in sorted_strikes:
+                running += strike_gex[k]
+                dist = abs(running)
+                if dist < best_dist:
+                    best_dist = dist
+                    flip_level = k
 
     regime_line = (
         f"GEX: {regime} ({strength}) | {mag_str} | Flip: {flip_str}\n"
@@ -584,7 +613,7 @@ def build_trade_lines(rec: dict, ticker: str) -> list:
         f"Max Profit: {mp:.2f} | Max Loss: {ml:.2f}" if isinstance(mp, float) else "",
         f"POP: {pop:.0%}" if isinstance(pop, float) else "",
         f"Confidence: {conf}/100 ({', '.join(conf_r[:3])})" if conf_r else f"Confidence: {conf}/100",
-        f"Size: {contracts} contract(s) | {sizing}",
+        f"Size: {contracts} contract(s) | ${dollar_r:.0f} risk",
     ]
 
     if warns:
