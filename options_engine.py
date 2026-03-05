@@ -389,21 +389,116 @@ def build_candidates(
                 "warnings": short_q["warnings"] + long_q["warnings"],
             })
 
-    else:  # debit
-        # Long leg ITM by $2+ (<$200 spot) or $3+ (≥$200 spot)
-        itm_depth = 3.0 if spot >= 200 else 2.0
+    else:  # debit — BOTH legs ITM
+        itm_depth_long  = 3.0 if spot >= 200 else 2.0
+        itm_depth_short = 2.0  # short leg minimum ITM depth
 
         if direction == "bull":
-            # Bull call debit: long leg is ITM → strike BELOW spot by itm_depth
-            itm_target = spot - itm_depth
-        else:
-            # Bear put debit: long leg is ITM → strike ABOVE spot by itm_depth
-            itm_target = spot + itm_depth
+            # Bull call debit: both legs ITM = both BELOW spot
+            # Long leg: deeper ITM (further below spot)
+            # Short leg: less deep ITM (closer to spot but still below)
+            long_target  = spot - itm_depth_long
+            short_target = spot - itm_depth_short
 
-        long_k = nearest_strike(strikes, itm_target)
-        long_q = quotes.get(long_k)
-        if not long_q:
-            return move, []
+            # Get all ITM call strikes (below spot for calls = ITM)
+            itm_strikes = sorted([k for k in strikes if k < spot], reverse=True)
+            if len(itm_strikes) < 2:
+                return move, []
+
+            # Long leg = deepest ITM strike nearest to target
+            long_k = nearest_strike(itm_strikes, long_target)
+            long_q = quotes.get(long_k)
+            if not long_q:
+                return move, []
+
+            # Short leg = less deep ITM, must be between long_k and spot
+            short_candidates = [k for k in itm_strikes if k > long_k and k < spot]
+            if not short_candidates:
+                return move, []
+
+        else:  # bear
+            # Bear put debit: both legs ITM = both ABOVE spot
+            # Long leg: deeper ITM (further above spot)
+            # Short leg: less deep ITM (closer to spot but still above)
+            long_target  = spot + itm_depth_long
+            short_target = spot + itm_depth_short
+
+            # Get all ITM put strikes (above spot for puts = ITM)
+            itm_strikes = sorted([k for k in strikes if k > spot])
+            if len(itm_strikes) < 2:
+                return move, []
+
+            # Long leg = deepest ITM strike nearest to target
+            long_k = nearest_strike(itm_strikes, long_target)
+            long_q = quotes.get(long_k)
+            if not long_q:
+                return move, []
+
+            # Short leg = less deep ITM, must be between long_k and spot
+            short_candidates = [k for k in itm_strikes if k < long_k and k > spot]
+            if not short_candidates:
+                return move, []
+
+        # Build width candidates from short leg options
+        out = []
+        for short_k in short_candidates:
+            short_q = quotes.get(short_k)
+            if not short_q:
+                continue
+
+            w = abs(long_k - short_k)
+            if w <= 0:
+                continue
+
+            # Debit = cost to enter
+            long_mid  = as_float(long_q.get("mid"),  0)
+            short_mid = as_float(short_q.get("mid"), 0)
+            debit     = long_mid - short_mid
+
+            if debit <= 0:
+                continue
+
+            # 70% cost rule — hard limit
+            if debit > 0.70 * w:
+                continue
+
+            mp  = w - debit
+            ml  = debit
+            ror = round(mp / ml, 4) if ml > 0 else 0
+
+            # Minimum RoR gate (adjusted for lower-priced tickers)
+            min_ror = adj_min_debit_ror if 'adj_min_debit_ror' in dir() else MIN_DEBIT_ROR
+            if ror < min_ror:
+                continue
+
+            pop        = delta_to_pop(long_q.get("delta"), "debit")
+            long_delta = long_q.get("delta")
+            itm_amount = abs(spot - long_k)
+            cost_pct   = round(debit / w * 100, 1)
+
+            # ITM depth of short leg
+            short_itm  = abs(spot - short_k)
+
+            out.append({
+                "type":        "debit",
+                "direction":   direction,
+                "short":       short_k,
+                "long":        long_k,
+                "side":        "call" if direction == "bull" else "put",
+                "width":       float(w),
+                "price":       float(debit),
+                "maxProfit":   float(mp),
+                "maxLoss":     float(ml),
+                "RoR":         float(ror),
+                "pop":         pop,
+                "long_delta":  long_delta,
+                "itm_amount":  round(itm_amount, 2),
+                "short_itm":   round(short_itm, 2),
+                "cost_pct":    cost_pct,
+                "warnings":    long_q["warnings"] + short_q["warnings"],
+            })
+
+        return move, out
 
         # Verify it's actually ITM (not just nearest)
         if direction == "bull" and long_k > spot:
