@@ -628,13 +628,35 @@ def alpha_score(spot, call_wall, put_wall, net_gex, oi_score, risk_label, emove,
 def build_scan_message(
     ticker, spot, exp, dte, call_wall, put_wall, net_gex, emove,
     oi_note, risk_label, risk_notes, a_score, direction,
-    iv_rank, skew_bias, skew_val, trade_lines, contracts
+    iv_rank, skew_bias, skew_val, trade_lines, contracts,
+    hv20=None, atm_iv=None,
 ) -> str:
 
     walls = (f"Walls: Call {call_wall:g} | Put {put_wall:g} | ZeroG ~{(call_wall+put_wall)/2:.0f}"
              if call_wall and put_wall else "Walls: —")
 
     ivr_str  = f"{iv_rank:.0f}/100" if iv_rank is not None else "— (not yet available)"
+
+    ivr_str = f"{iv_rank:.0f}/100" if iv_rank is not None else "— (not yet available)"
+
+    # HV20 vs IV analysis
+    hv_line = None
+    if hv20 is not None and atm_iv is not None and hv20 > 0:
+        ratio = round(atm_iv / hv20, 2)
+        if ratio >= 1.30:
+            hv_signal = "🔴 IV rich — credit favored"
+        elif ratio <= 0.90:
+            hv_signal = "🟢 IV cheap — debit favored"
+        else:
+            hv_signal = "⚪ IV fair — neutral"
+        hv_line = (
+            f"IV vs HV20: IV {atm_iv:.2f} | "
+            f"HV20 {hv20:.2f} | "
+            f"Ratio {ratio} {hv_signal}"
+        )
+        
+    # HV20 vs IV ratio
+    hv20 = locals().get("hv20")  # passed via extra context
 
     # Skew interpretation
     if skew_bias == "bull_skew":
@@ -661,6 +683,7 @@ def build_scan_message(
         f"Direction: {direction.upper()} | DTE: {max(dte,1)} ({exp})",
         f"Spot: {spot:.2f} | E-Move ±{emove:.2f}",
         f"IV Rank: {ivr_str}",
+        hv_line if hv_line else None,
         f"Skew: {skew_str}",
         gex_line,
         flip_warn if flip_warn else None,
@@ -842,9 +865,9 @@ def scan_ticker(ticker: str) -> dict:
         atm_iv = atm_iv_from_contracts(contracts, spot)
         emove  = spot * atm_iv * math.sqrt(max(EXPECTED_MOVE_DTE, 1) / 365.0)
 
-        # Compute IV rank using MarketData candles
+        # Compute IV rank + HV20 using MarketData candles
         from data_providers import get_iv_rank_from_candles
-        iv_rank, iv_pct = get_iv_rank_from_candles(ticker, atm_iv)
+        iv_rank, iv_pct, hv20 = get_iv_rank_from_candles(ticker, atm_iv)
         
         # Skew
         md_payload = {
@@ -949,6 +972,8 @@ def scan_ticker(ticker: str) -> dict:
             skew_val   = skew_val,
             trade_lines= trade_lines,
             contracts  = contracts,
+            hv20       = hv20,
+            atm_iv     = atm_iv,
         )
 
         st, body = post_to_telegram(msg)
