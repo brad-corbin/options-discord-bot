@@ -298,12 +298,12 @@ def choose_spread_type(
     stype = prefer
 
     # HV20 ratio — strongest signal, checked first
-    if hv20 is not None and hv20 > 0 and iv_atm is not None:
+    if hv20 is not None and hv20 > 0 and iv_atm is not None and prefer != "debit_only":
         ratio = iv_atm / hv20
         if ratio >= 1.30 and prefer == "debit":
-            stype = "credit"   # IV rich vs realized → sell premium
-        elif ratio <= 0.75:
-            stype = "debit"    # IV cheap vs realized → buy premium
+            stype = "credit"
+        elif ratio <= 0.85:
+            stype = "debit"
 
     if iv_rank is not None:
         if iv_rank >= IVR_HIGH_FOR_CREDIT:
