@@ -22,6 +22,7 @@ import hashlib
 import logging
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from data_providers import enrich_ticker
 
 import requests
 from flask import Flask, request, jsonify
@@ -665,6 +666,13 @@ def scan_ticker(ticker: str) -> dict:
     """
     try:
         spot             = get_spot(ticker)
+
+        # Enrich with Finnhub data (IV rank + earnings check)
+        enrichment   = enrich_ticker(ticker)
+        iv_rank      = enrichment.get("iv_rank")
+        has_earnings = enrichment.get("has_earnings", False)
+        earnings_warn = enrichment.get("earnings_warn")
+
         exp, contracts   = get_options_chain(ticker, max_dte=SCAN_MAX_DTE)
         exp_dt           = datetime.fromisoformat(exp).date()
         dte              = max((exp_dt - datetime.now(timezone.utc).date()).days, 0)
@@ -676,9 +684,7 @@ def scan_ticker(ticker: str) -> dict:
         atm_iv = atm_iv_from_contracts(contracts, spot)
         emove  = spot * atm_iv * math.sqrt(max(EXPECTED_MOVE_DTE, 1) / 365.0)
 
-        # IV rank (from MarketData 52-week high/low if available — wire in as needed)
-        iv_rank = None   # extend here: fetch md_get iv history and pass to compute_iv_rank()
-
+        
         # Skew
         md_payload = {
             "strike":        [c.get("strike")       for c in contracts],
@@ -752,6 +758,10 @@ def scan_ticker(ticker: str) -> dict:
             }
 
         trade_lines = build_trade_lines(rec, ticker)
+
+        # Prepend earnings warning to trade lines if applicable
+        if has_earnings and earnings_warn:
+            trade_lines = [earnings_warn, ""] + trade_lines
 
         msg = build_scan_message(
             ticker     = ticker,
@@ -889,6 +899,7 @@ def scan_watchlist():
     neutral_skipped = []
     suppressed      = []
     duplicates      = []
+    earnings_flagged = []
 
     log.info(f"Scan started: {len(tickers)} tickers, {SCAN_WORKERS} workers")
 
@@ -923,13 +934,19 @@ def scan_watchlist():
 
             elif error:
                 neutral_skipped.append(ticker)
-
+            # Track earnings flags
+            if res.get("has_earnings"):
+                earnings_flagged.append(ticker)
+                
     # Build and send summary message
     summary_lines = [
         f"📋 WATCHLIST SUMMARY — {datetime.now(timezone.utc).strftime('%H:%M UTC')}",
         f"Scanned: {len(tickers)} tickers | Trade cards sent: {posted}",
         "",
     ]
+
+    if earnings_flagged:
+        summary_lines.append(f"🚨 EARNINGS THIS WEEK: {', '.join(sorted(earnings_flagged))}")
 
     if bull_no_trade:
         summary_lines.append(f"🟢 BULL (no setup): {', '.join(sorted(bull_no_trade))}")
@@ -941,7 +958,9 @@ def scan_watchlist():
         summary_lines.append(f"🟡 LOW CONFIDENCE: {', '.join(sorted(suppressed))}")
     if duplicates:
         summary_lines.append(f"🔁 DUPLICATE (skipped): {', '.join(sorted(duplicates))}")
-
+    if earnings_flagged:
+        summary_lines.append(f"🚨 EARNINGS THIS WEEK: {', '.join(sorted(earnings_flagged))}")
+        
     summary_lines += ["", "— Not financial advice —"]
     summary_text = "\n".join(summary_lines)
 
