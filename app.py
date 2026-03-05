@@ -685,46 +685,69 @@ def build_trade_lines(rec: dict, ticker: str) -> list:
         return lines
 
     trade      = rec.get("trade") or {}
-    stype      = (trade.get("type")      or "").upper()
-    side       = (trade.get("side")      or rec.get("side") or "").upper()
-    short_k    = trade.get("short")
-    long_k     = trade.get("long")
-    price      = trade.get("price")
-    ror        = trade.get("RoR")
-    pop        = trade.get("pop")
-    mp         = trade.get("maxProfit")
-    ml         = trade.get("maxLoss")
+    stype      = (trade.get("type") or "").upper()
+    side       = (trade.get("side") or rec.get("side") or "").upper()
+    all_cands  = rec.get("all_candidates") or []
+    spot       = rec.get("spot") or 0
+
+    conf       = rec.get("confidence", "—")
+    conf_r     = rec.get("conf_reasons") or []
+    contracts  = rec.get("contracts_suggested", 1)
+    dollar_r   = rec.get("dollar_risk", 0)
+
+    # Filter candidates to same type and side as best trade
+    best_type = (trade.get("type") or "").lower()
+    best_side = (trade.get("side") or "").lower()
+    same_type_cands = [
+        c for c in all_cands
+        if (c.get("type") or "").lower() == best_type
+        and (c.get("side") or "").lower() == best_side
+        and c.get("RoR") is not None
+    ]
+
+    # Sort by width, deduplicate widths, take top 3
+    seen_widths = set()
+    ladder = []
+    for c in sorted(same_type_cands, key=lambda x: x.get("width", 0)):
+        w = c.get("width")
+        if w not in seen_widths:
+            seen_widths.add(w)
+            ladder.append(c)
+        if len(ladder) >= 3:
+            break
+
+    # If we have less than 2 candidates just show single trade
+    show_ladder = len(ladder) >= 2
+
+    # Header
+    best_long  = trade.get("long")
+    best_short = trade.get("short")
     long_delta = trade.get("long_delta")
     itm_amount = trade.get("itm_amount")
     cost_pct   = trade.get("cost_pct")
+    pop        = trade.get("pop")
+    price      = trade.get("price")
+    ml         = trade.get("maxLoss")
+    mp         = trade.get("maxProfit")
+    ror        = trade.get("RoR")
     warns      = trade.get("warnings") or []
 
-    contracts  = rec.get("contracts_suggested", 1)
-    dollar_r   = rec.get("dollar_risk", 0)
-    conf       = rec.get("confidence", "—")
-    conf_r     = rec.get("conf_reasons") or []
-
-    # ITM label
     delta_str = f"δ{long_delta:.2f}" if isinstance(long_delta, float) else ""
     itm_str   = f"${itm_amount:.2f} ITM" if isinstance(itm_amount, float) else ""
     itm_label = f" ({delta_str}, {itm_str})" if (delta_str or itm_str) else ""
+    cost_ok   = isinstance(cost_pct, float) and cost_pct <= 70
+    cost_str  = f"{cost_pct:.0f}% {'✅' if cost_ok else '⚠️'}" if isinstance(cost_pct, float) else ""
 
-    # Cost % check
-    cost_ok  = isinstance(cost_pct, float) and cost_pct <= 70
-    cost_str = f"{cost_pct:.0f}% of width {'✅' if cost_ok else '⚠️'}" if isinstance(cost_pct, float) else ""
-
-    # Profit targets (calculated off $ risked = debit paid × 100 × contracts)
+    # Profit targets for best trade
     dollar_risked = (price or 0) * 100 * contracts
     pt_lines = []
     if isinstance(price, float) and isinstance(ml, float) and dollar_risked > 0:
-        t25  = round(price + ml * 0.25, 2)
-        t35  = round(price + ml * 0.35, 2)
-        t40  = round(price + ml * 0.40, 2)
-        t50  = round(price + ml * 0.50, 2)
-        g25  = round(dollar_risked * 0.25 * contracts, 0)
-        g35  = round(dollar_risked * 0.35 * contracts, 0)
-        g50  = round(dollar_risked * 0.50 * contracts, 0)
-
+        t25 = round(price + ml * 0.25, 2)
+        t35 = round(price + ml * 0.35, 2)
+        t50 = round(price + ml * 0.50, 2)
+        g25 = round(dollar_risked * 0.25, 0)
+        g35 = round(dollar_risked * 0.35, 0)
+        g50 = round(dollar_risked * 0.50, 0)
         pt_lines = [
             "📊 Profit Targets (off $ risked):",
             f"  Same Day  → 25%: +${g25:.0f} (sell at {t25:.2f})",
@@ -734,8 +757,8 @@ def build_trade_lines(rec: dict, ticker: str) -> list:
 
     lines = [
         f"🧠 Trade: {stype} {side} SPREAD",
-        f"Long: {long_k}{itm_label} | Short: {short_k}",
-        f"Width: ${trade.get('width', '?')} | Cost: ${price:.2f} ({cost_str})" if isinstance(price, float) else f"Cost: {price}",
+        f"Long: {best_long}{itm_label} | Short: {best_short}",
+        f"Width: ${trade.get('width','?')} | Cost: ${price:.2f} ({cost_str})" if isinstance(price, float) else "",
         f"Max Profit: ${mp:.2f} | Max Loss: ${ml:.2f}" if isinstance(mp, float) else "",
         f"POP: {pop:.0%}" if isinstance(pop, float) else "",
         f"Confidence: {conf}/100 ({', '.join(conf_r[:2])})" if conf_r else f"Confidence: {conf}/100",
@@ -747,7 +770,47 @@ def build_trade_lines(rec: dict, ticker: str) -> list:
     if warns:
         lines.append("⚠️ " + "; ".join(str(w) for w in warns[:3]))
 
-    return [l for l in lines if l]
+    # Multi-strike ladder
+    if show_ladder:
+        lines.append("")
+        lines.append("📐 Width Ladder:")
+        lines.append("─────────────────")
+        for c in ladder:
+            w      = c.get("width")
+            cp     = c.get("price")
+            cr     = c.get("RoR")
+            cpop   = c.get("pop")
+            clong  = c.get("long")
+            cshort = c.get("short")
+            cml    = c.get("maxLoss")
+            cpct   = round(cp / w * 100, 0) if w and cp else None
+
+            is_best = (clong == best_long and cshort == best_short)
+            star    = " ⭐ BEST" if is_best else ""
+
+            pct_str  = f"{cpct:.0f}% {'✅' if cpct and cpct <= 70 else '⚠️'}" if cpct else ""
+            ror_str  = f"{cr:.2f}" if isinstance(cr, float) else "—"
+            pop_str  = f"{cpop:.0%}" if isinstance(cpop, float) else "—"
+
+            # Per-width profit targets
+            w_risked = (cp or 0) * 100 * contracts
+            pt25 = round(w_risked * 0.25, 0) if w_risked else 0
+            pt35 = round(w_risked * 0.35, 0) if w_risked else 0
+            sell25 = round((cp or 0) + (cml or 0) * 0.25, 2)
+            sell35 = round((cp or 0) + (cml or 0) * 0.35, 2)
+
+            lines.append(
+                f"${w:.0f} wide | ${cp:.2f} ({pct_str}) | "
+                f"RoR {ror_str} | POP {pop_str}{star}"
+            )
+            lines.append(
+                f"  {clong} / {cshort} | "
+                f"PT25: +${pt25:.0f} | PT35: +${pt35:.0f} "
+                f"(sell {sell25:.2f} / {sell35:.2f})"
+            )
+        lines.append("─────────────────")
+
+    return [l for l in lines if l is not None]
 
 
 # ─────────────────────────────────────────────────────────
