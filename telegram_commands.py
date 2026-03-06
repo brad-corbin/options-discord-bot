@@ -1,6 +1,8 @@
 # telegram_commands.py
 # Telegram command interface for Omega 3000 Bot
 # NOTE: Educational/demo code. Not financial advice. Use at your own risk.
+#
+# v3 UPGRADE: Added /check TICKER command for on-demand trade analysis
 
 import os
 import logging
@@ -72,10 +74,6 @@ def send_reply(chat_id: str, text: str):
 
 
 def register_webhook(bot_url: str, webhook_secret: str):
-    """
-    Registers this bot's /telegram_webhook endpoint with Telegram.
-    Call once on startup.
-    """
     if not TELEGRAM_BOT_TOKEN or not bot_url:
         log.warning("Cannot register webhook — BOT_URL or TOKEN missing")
         return
@@ -102,6 +100,7 @@ def handle_command(
     text:      str,
     scan_fn,          # scan_ticker function from app.py
     full_scan_fn,     # scan_watchlist logic from app.py
+    check_fn,         # check_ticker function from app.py (v3)
     watchlist: list,
 ) -> None:
     """
@@ -118,9 +117,48 @@ def handle_command(
     args  = parts[1:] if len(parts) > 1 else []
 
     # ─────────────────────────────────────
+    # /check TICKER [bull|bear] — on-demand trade analysis (v3 engine)
+    # ─────────────────────────────────────
+    if cmd in ("/check", "/check@omegabot"):
+        if not args:
+            send_reply(chat_id,
+                "Usage: /check AAPL\n"
+                "       /check SPY bull\n\n"
+                "Analyzes any ticker and returns a trade card\n"
+                "if it meets your rules, or explains why not."
+            )
+            return
+
+        ticker = args[0].upper()
+        direction = args[1].lower() if len(args) > 1 else "bull"
+
+        if direction not in ("bull", "bear"):
+            send_reply(chat_id, f"⚠️ Direction must be 'bull' or 'bear', got '{direction}'")
+            return
+
+        send_reply(chat_id, f"🔍 Checking {ticker} ({direction})...")
+
+        def run_check():
+            try:
+                result = check_fn(ticker, direction)
+                # check_fn posts the trade card directly to telegram
+                if not result.get("posted") and not result.get("ok"):
+                    reason = result.get("reason") or result.get("error") or "no valid setup"
+                    conf = result.get("confidence")
+                    msg = f"❌ {ticker} — {reason}"
+                    if conf is not None:
+                        msg += f"\nConfidence: {conf}/100"
+                    send_reply(chat_id, msg)
+            except Exception as e:
+                log.error(f"/check {ticker}: {e}")
+                send_reply(chat_id, f"⚠️ Error checking {ticker}: {type(e).__name__}")
+
+        threading.Thread(target=run_check, daemon=True).start()
+
+    # ─────────────────────────────────────
     # /scan [TICKER]
     # ─────────────────────────────────────
-    if cmd in ("/scan", "/scan@omegabot"):
+    elif cmd in ("/scan", "/scan@omegabot"):
         if args:
             ticker = args[0].upper()
             send_reply(chat_id, f"🔍 Scanning {ticker}...")
@@ -224,7 +262,9 @@ def handle_command(
     elif cmd in ("/help", "/help@omegabot", "/start"):
         msg = (
             "🤖 Omega 3000 Commands:\n\n"
-            "/scan AAPL — scan single ticker\n"
+            "/check AAPL — analyze any ticker (v3 engine)\n"
+            "/check SPY bull — with direction hint\n"
+            "/scan AAPL — scan single ticker (legacy)\n"
             "/scan — run full watchlist scan\n"
             "/status — bot health and last scan info\n"
             "/watchlist — show all tickers\n"
