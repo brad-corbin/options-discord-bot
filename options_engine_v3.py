@@ -1,664 +1,282 @@
-# options_engine_v3.py
+# telegram_commands.py
+# Telegram command interface for Omega 3000 Bot
 # NOTE: Educational/demo code. Not financial advice. Use at your own risk.
 #
-# Brad's Options Engine v3 — Rule-based ITM Debit Spread Builder
-#
-# This engine is purpose-built for one strategy:
-#   Bull ITM call debit spreads, both legs in the money,
-#   cost ≤ 70% of width, 1-5 DTE, specific exit targets.
-#
-# It does NOT try to be a general-purpose spread recommender.
-# Every function serves Brad's specific trading rules.
+# v3 UPGRADE: Added /check TICKER command for on-demand trade analysis
 
-import math
-from typing import Any, Dict, List, Optional, Tuple
-from trading_rules import *
+import os
+import logging
+import threading
+from datetime import datetime, timezone
+from typing import Optional
+
+import requests
+
+log = logging.getLogger(__name__)
+
+TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN",  "").strip()
+TELEGRAM_ADMIN_IDS  = [
+    x.strip() for x in
+    os.getenv("TELEGRAM_ADMIN_IDS", "").split(",")
+    if x.strip()
+]
+
+# Runtime state (stored in memory, survives within a session)
+_state = {
+    "paused":          False,
+    "confidence_gate": int(os.getenv("MIN_CONFIDENCE_TO_POST", "40") or 40),
+    "last_scan_time":  None,
+    "scan_count":      0,
+    "start_time":      datetime.now(timezone.utc),
+}
 
 
-# ─────────────────────────────────────────────────────────
-# HELPERS
-# ─────────────────────────────────────────────────────────
+def get_state() -> dict:
+    return _state
 
-def as_float(x, default=0.0):
-    """Safely convert to float."""
-    if x is None:
-        return default
-    if isinstance(x, list):
-        x = x[0] if x else default
+
+def set_last_scan(posted: int, total: int):
+    _state["last_scan_time"] = datetime.now(timezone.utc)
+    _state["scan_count"] += 1
+    _state["last_scan_posted"] = posted
+    _state["last_scan_total"]  = total
+
+
+def is_paused() -> bool:
+    return _state.get("paused", False)
+
+
+def get_confidence_gate() -> int:
+    return _state.get("confidence_gate", 40)
+
+
+def is_authorized(user_id: str) -> bool:
+    if not TELEGRAM_ADMIN_IDS:
+        return True   # no whitelist = anyone can use (open mode)
+    return str(user_id) in TELEGRAM_ADMIN_IDS
+
+
+def send_reply(chat_id: str, text: str):
+    if not TELEGRAM_BOT_TOKEN:
+        return
     try:
-        return float(x) if x is not None else default
-    except (ValueError, TypeError):
-        return default
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={
+                "chat_id":                  chat_id,
+                "text":                     text,
+                "disable_web_page_preview": True,
+            },
+            timeout=10,
+        )
+    except Exception as e:
+        log.warning(f"send_reply error: {e}")
 
 
-def as_int(x, default=0):
-    """Safely convert to int."""
-    if x is None:
-        return int(default)
-    if isinstance(x, list):
-        x = x[0] if x else default
+def register_webhook(bot_url: str, webhook_secret: str):
+    if not TELEGRAM_BOT_TOKEN or not bot_url:
+        log.warning("Cannot register webhook — BOT_URL or TOKEN missing")
+        return
+
+    webhook_url = f"{bot_url.rstrip('/')}/telegram_webhook/{webhook_secret}"
     try:
-        return int(x) if x is not None else int(default)
-    except (ValueError, TypeError):
-        return int(default)
-
-
-def detect_available_widths(strikes: List[float], spot: float) -> List[float]:
-    """
-    Detect what strike increments are available for this chain.
-    Returns list of widths from WIDTH_PREFERENCE that are achievable.
-    """
-    itm_strikes = sorted([k for k in strikes if k < spot])
-    if len(itm_strikes) < 2:
-        return []
-
-    # Find actual increments between consecutive ITM strikes
-    increments = set()
-    for i in range(len(itm_strikes) - 1):
-        diff = round(itm_strikes[i + 1] - itm_strikes[i], 2)
-        if diff > 0:
-            increments.add(diff)
-
-    # Filter WIDTH_PREFERENCE to what's actually achievable
-    available = []
-    for w in WIDTH_PREFERENCE:
-        # Width is achievable if it's a multiple of any available increment
-        for inc in increments:
-            if abs(w / inc - round(w / inc)) < 0.01:
-                available.append(w)
-                break
-
-    # Exclude $0.50 widths
-    if NO_HALF_DOLLAR_WIDTHS:
-        available = [w for w in available if abs(w - 0.50) > 0.01]
-
-    return available
-
-
-# ─────────────────────────────────────────────────────────
-# CHAIN DATA BUILDER
-# ─────────────────────────────────────────────────────────
-
-def build_call_quotes(contracts: List[Dict], spot: float) -> Dict[float, Dict]:
-    """
-    Build a strike→quote lookup for ITM call options only.
-    Filters to calls that are in the money (strike < spot).
-    """
-    quotes = {}
-    for c in contracts:
-        right = (c.get("right") or "").lower()
-        if right != "call":
-            continue
-
-        strike = as_float(c.get("strike"), None)
-        if strike is None or strike >= spot:
-            continue  # OTM or ATM — skip
-
-        bid = as_float(c.get("bid"), None)
-        ask = as_float(c.get("ask"), None)
-        mid = as_float(c.get("mid"), None)
-        oi  = as_int(c.get("openInterest"), 0)
-        vol = as_int(c.get("volume"), 0)
-        delta = as_float(c.get("delta"), None)
-        iv  = as_float(c.get("iv"), None)
-        theta = as_float(c.get("theta"), None)
-        vega = as_float(c.get("vega"), None)
-
-        if mid is None and bid is not None and ask is not None:
-            mid = (bid + ask) / 2.0
-        if mid is None or mid <= 0:
-            continue
-
-        # Leg-level warnings
-        warnings = []
-        if oi is not None and oi < MIN_OPEN_INTEREST:
-            warnings.append(f"Low OI ({oi})")
-        if bid is not None and ask is not None and (ask - bid) > MAX_BID_ASK_SPREAD:
-            warnings.append(f"Wide B/A (${ask - bid:.2f})")
-
-        quotes[strike] = {
-            "strike": strike,
-            "mid": mid,
-            "bid": bid,
-            "ask": ask,
-            "oi": oi,
-            "volume": vol,
-            "delta": delta,
-            "iv": iv,
-            "theta": theta,
-            "vega": vega,
-            "itm_amount": round(spot - strike, 2),
-            "warnings": warnings,
-        }
-
-    return quotes
-
-
-# ─────────────────────────────────────────────────────────
-# SPREAD CANDIDATE BUILDER
-# ─────────────────────────────────────────────────────────
-
-def build_itm_debit_spreads(
-    quotes: Dict[float, Dict],
-    spot: float,
-    available_widths: List[float],
-) -> List[Dict]:
-    """
-    Build all valid ITM bull call debit spread candidates.
-
-    Rules enforced:
-      - Both legs ITM (both strikes below spot)
-      - Debit ≤ 70% of width
-      - Debit ≥ 20% of width (sanity check)
-      - Width must be from available_widths list
-    """
-    candidates = []
-    itm_strikes = sorted([k for k in quotes.keys()], reverse=True)  # highest first (closest to ATM)
-
-    if len(itm_strikes) < 2:
-        return candidates
-
-    for long_k in itm_strikes:
-        long_q = quotes[long_k]
-
-        for width in available_widths:
-            short_k = round(long_k + width, 2)
-
-            # Short strike must also be ITM (below spot)
-            if short_k >= spot:
-                continue
-
-            short_q = quotes.get(short_k)
-            if short_q is None:
-                continue
-
-            # Debit = long mid - short mid (you pay more for the deeper ITM leg)
-            debit = round(long_q["mid"] - short_q["mid"], 4)
-
-            if debit <= 0:
-                continue
-
-            # Cost filters
-            cost_pct = debit / width
-            if cost_pct > MAX_COST_PCT_OF_WIDTH:
-                continue
-            if cost_pct < MIN_COST_PCT_OF_WIDTH:
-                continue
-
-            # Compute metrics
-            max_profit = round(width - debit, 4)
-            max_loss = debit
-            ror = round(max_profit / max_loss, 4) if max_loss > 0 else 0
-
-            # Net greeks (long - short)
-            net_theta = None
-            net_vega = None
-            if long_q.get("theta") is not None and short_q.get("theta") is not None:
-                net_theta = round(long_q["theta"] - short_q["theta"], 4)
-            if long_q.get("vega") is not None and short_q.get("vega") is not None:
-                net_vega = round(long_q["vega"] - short_q["vega"], 4)
-
-            # Exit targets
-            same_day_target = round(debit * (1 + SAME_DAY_EXIT_PCT), 2)
-            next_day_target = round(debit * (1 + NEXT_DAY_EXIT_PCT), 2)
-            extended_target = round(debit * (1 + EXTENDED_HOLD_EXIT_PCT), 2)
-
-            # Combine warnings from both legs
-            all_warnings = long_q["warnings"] + short_q["warnings"]
-
-            candidates.append({
-                "long":          long_k,
-                "short":         short_k,
-                "width":         width,
-                "debit":         round(debit, 2),
-                "cost_pct":      round(cost_pct * 100, 1),
-                "max_profit":    round(max_profit, 2),
-                "max_loss":      round(max_loss, 2),
-                "ror":           ror,
-                "long_itm":      long_q["itm_amount"],
-                "short_itm":     short_q["itm_amount"],
-                "long_delta":    long_q.get("delta"),
-                "short_delta":   short_q.get("delta"),
-                "long_oi":       long_q.get("oi"),
-                "short_oi":      short_q.get("oi"),
-                "net_theta":     net_theta,
-                "net_vega":      net_vega,
-                "same_day_exit": same_day_target,
-                "next_day_exit": next_day_target,
-                "extended_exit": extended_target,
-                "warnings":      all_warnings,
-            })
-
-    return candidates
-
-
-# ─────────────────────────────────────────────────────────
-# RANKING
-# ─────────────────────────────────────────────────────────
-
-def rank_candidates(candidates: List[Dict]) -> List[Dict]:
-    """
-    Rank spread candidates. Best spread = highest RoR with
-    tightest width (prefer $1 > $2.50 > $5).
-
-    Ranking score:
-      - RoR (higher = better)
-      - Width bonus (tighter = better)
-      - Liquidity penalty (warnings = worse)
-    """
-    def score(c):
-        ror = c.get("ror", 0)
-        width = c.get("width", 5)
-
-        # Prefer tighter widths: $1 gets +0.3, $2.50 gets +0.1, $5 gets 0
-        width_bonus = 0.3 if width <= 1.0 else 0.1 if width <= 2.5 else 0
-
-        # Penalty for warnings
-        warn_penalty = len(c.get("warnings", [])) * 0.1
-
-        return ror + width_bonus - warn_penalty
-
-    return sorted(candidates, key=score, reverse=True)
-
-
-# ─────────────────────────────────────────────────────────
-# POSITION SIZING
-# ─────────────────────────────────────────────────────────
-
-def compute_position_size(
-    debit: float,
-    tier: str = "1",
-) -> Tuple[int, float, str]:
-    """
-    Compute number of contracts based on risk rules.
-
-    Returns (contracts, total_risk_dollars, sizing_note).
-    """
-    cost_per_contract = debit * 100
-
-    if cost_per_contract <= 0:
-        return 1, 0, "Could not compute sizing"
-
-    # Max contracts from dollar limit
-    max_from_dollars = int(MAX_RISK_PER_TRADE_USD / cost_per_contract)
-
-    # Max contracts from account % limit
-    max_from_pct = int((ACCOUNT_SIZE * MAX_RISK_PCT_ACCOUNT) / cost_per_contract)
-
-    # Take the smaller of the two
-    contracts = max(1, min(max_from_dollars, max_from_pct, MAX_CONTRACTS))
-
-    # Apply tier multiplier
-    multiplier = TIER1_SIZE_MULTIPLIER if tier == "1" else TIER2_SIZE_MULTIPLIER
-    contracts = max(1, int(contracts * multiplier))
-
-    total_risk = contracts * cost_per_contract
-
-    note = (f"{contracts} contract(s) × ${debit:.2f} = ${total_risk:.0f} risk "
-            f"[max ${MAX_RISK_PER_TRADE_USD:.0f}, {MAX_RISK_PCT_ACCOUNT:.0%} acct]")
-
-    return contracts, total_risk, note
-
-
-# ─────────────────────────────────────────────────────────
-# STOP LOSS LOGIC
-# ─────────────────────────────────────────────────────────
-
-def compute_stop_loss(
-    ticker: str,
-    debit: float,
-) -> Tuple[Optional[float], str]:
-    """
-    Compute stop loss level if applicable.
-    Only high-volume tickers get stop losses.
-    """
-    if USE_STOP_LOSS_ALL or ticker.upper() in HIGH_VOLUME_TICKERS:
-        stop_price = round(debit * (1 - STOP_LOSS_PCT), 2)
-        return stop_price, f"Stop at ${stop_price:.2f} ({STOP_LOSS_PCT:.0%} loss)"
-    else:
-        return None, "No stop (low-vol ticker — manage manually)"
-
-
-# ─────────────────────────────────────────────────────────
-# CONFIDENCE SCORING
-# ─────────────────────────────────────────────────────────
-
-def compute_confidence(
-    webhook_data: Dict,
-    trade: Dict,
-    has_earnings: bool = False,
-    has_dividend: bool = False,
-) -> Tuple[int, List[str]]:
-    """
-    Score trade confidence from 0-100 based on webhook signal data
-    and trade quality metrics.
-    """
-    score = 30  # base score — signal fired so there's some confidence
-    reasons = []
-
-    # Signal tier
-    tier = webhook_data.get("tier", "2")
-    if tier == "1":
-        score += CONFIDENCE_BOOSTS["tier_1"]
-        reasons.append(f"T1 signal (+{CONFIDENCE_BOOSTS['tier_1']})")
-    else:
-        score += CONFIDENCE_BOOSTS["tier_2"]
-        reasons.append(f"T2 signal (+{CONFIDENCE_BOOSTS['tier_2']})")
-
-    # Trend confirmation
-    if webhook_data.get("htf_confirmed"):
-        score += CONFIDENCE_BOOSTS["htf_confirmed"]
-        reasons.append("1H trend confirmed")
-    elif webhook_data.get("htf_converging"):
-        score += CONFIDENCE_BOOSTS["htf_converging"]
-        reasons.append("1H trend converging")
-    else:
-        score += CONFIDENCE_PENALTIES["htf_diverging"]
-        reasons.append("1H trend diverging")
-
-    # Daily trend
-    if webhook_data.get("daily_bull"):
-        score += CONFIDENCE_BOOSTS["daily_bull"]
-        reasons.append("Daily trend bullish")
-    else:
-        score += CONFIDENCE_PENALTIES.get("daily_bear", 0)
-        reasons.append("Daily trend bearish")
-
-    # RSI+MFI
-    if webhook_data.get("rsi_mfi_bull"):
-        score += CONFIDENCE_BOOSTS["rsi_mfi_bull"]
-        reasons.append("RSI+MFI buying")
-
-    # VWAP
-    if webhook_data.get("above_vwap"):
-        score += CONFIDENCE_BOOSTS["above_vwap"]
-        reasons.append("Above VWAP")
-
-    # Wave trend zone
-    wt2 = as_float(webhook_data.get("wt2"), 0)
-    if wt2 < -30:
-        score += CONFIDENCE_BOOSTS["wave_oversold"]
-        reasons.append("Wave oversold")
-    elif wt2 > 60:
-        score += CONFIDENCE_PENALTIES["wave_overbought"]
-        reasons.append("Wave overbought")
-
-    # Trade quality
-    ror = trade.get("ror", 0)
-    if ror >= 0.50:
-        score += 5
-        reasons.append(f"Strong RoR ({ror:.2f})")
-
-    # Liquidity warnings
-    warn_count = len(trade.get("warnings", []))
-    if warn_count:
-        score += warn_count * CONFIDENCE_PENALTIES.get("low_oi", -5)
-        reasons.append(f"{warn_count} liquidity warning(s)")
-
-    # Deal-breakers
-    if has_earnings:
-        score += CONFIDENCE_PENALTIES["earnings_week"]
-        reasons.append("EARNINGS WEEK — BLOCKED")
-
-    if has_dividend:
-        score += CONFIDENCE_PENALTIES["dividend_in_dte"]
-        reasons.append("DIVIDEND IN DTE — BLOCKED")
-
-    score = max(0, min(100, score))
-    return score, reasons
-
-
-# ─────────────────────────────────────────────────────────
-# PUBLIC API — MAIN ENTRY POINT
-# ─────────────────────────────────────────────────────────
-
-def recommend_trade(
-    ticker: str,
-    spot: float,
-    contracts: List[Dict],
-    dte: int,
-    expiration: str,
-    webhook_data: Dict = None,
-    has_earnings: bool = False,
-    has_dividend: bool = False,
-) -> Dict[str, Any]:
-    """
-    Main entry point. Given a ticker's option chain and signal data,
-    returns a complete trade recommendation or rejection with reason.
-
-    This enforces ALL of Brad's trading rules.
-    """
-    webhook_data = webhook_data or {}
-    result = {"ok": False, "ticker": ticker, "spot": spot, "dte": dte, "exp": expiration}
-
-    # ── Rule: Direction must be bull ──
-    bias = webhook_data.get("bias", "bull")
-    if bias != "bull":
-        result["reason"] = f"Direction '{bias}' not allowed — bull only"
-        return result
-
-    # ── Rule: DTE must be 1-5 ──
-    if dte < MIN_DTE or dte > MAX_DTE:
-        result["reason"] = f"DTE {dte} outside {MIN_DTE}-{MAX_DTE} range"
-        return result
-
-    # ── Rule: No earnings week ──
-    if NO_EARNINGS_WEEK and has_earnings:
-        result["reason"] = "Earnings this week — trade blocked"
-        result["deal_breaker"] = "earnings"
-        return result
-
-    # ── Rule: No dividend in DTE ──
-    if NO_DIVIDEND_IN_DTE and has_dividend:
-        result["reason"] = "Dividend ex-date within DTE — trade blocked"
-        result["deal_breaker"] = "dividend"
-        return result
-
-    # ── Build ITM call quotes ──
-    quotes = build_call_quotes(contracts, spot)
-    if len(quotes) < 2:
-        result["reason"] = f"Not enough ITM call strikes (need 2, found {len(quotes)})"
-        return result
-
-    # ── Detect available widths ──
-    available_widths = detect_available_widths(list(quotes.keys()), spot)
-    if not available_widths:
-        result["reason"] = "No valid widths available from strike increments"
-        return result
-
-    # ── Build spread candidates ──
-    candidates = build_itm_debit_spreads(quotes, spot, available_widths)
-    if not candidates:
-        result["reason"] = (
-            f"No valid ITM debit spreads found "
-            f"(widths tried: {available_widths}, "
-            f"cost cap: {MAX_COST_PCT_OF_WIDTH:.0%}, "
-            f"ITM strikes: {len(quotes)})"
+        r = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook",
+            json={"url": webhook_url},
+            timeout=10,
         )
-        return result
-
-    # ── Rank and pick best ──
-    ranked = rank_candidates(candidates)
-    best = ranked[0]
-
-    # ── Build width ladder (top candidate per width) ──
-    ladder = []
-    seen_widths = set()
-    for c in ranked:
-        w = c["width"]
-        if w not in seen_widths:
-            seen_widths.add(w)
-            ladder.append(c)
-
-    # ── Position sizing ──
-    tier = webhook_data.get("tier", "2")
-    num_contracts, total_risk, sizing_note = compute_position_size(best["debit"], tier)
-
-    # ── Stop loss ──
-    stop_price, stop_note = compute_stop_loss(ticker, best["debit"])
-
-    # ── Confidence scoring ──
-    confidence, conf_reasons = compute_confidence(
-        webhook_data, best, has_earnings, has_dividend
-    )
-
-    if confidence < MIN_CONFIDENCE_TO_TRADE:
-        result["reason"] = f"Confidence {confidence}/100 below {MIN_CONFIDENCE_TO_TRADE} threshold"
-        result["confidence"] = confidence
-        result["conf_reasons"] = conf_reasons
-        return result
-
-    # ── Build exit targets for position ──
-    exits = {
-        "same_day": {
-            "target_pct": f"{SAME_DAY_EXIT_PCT:.0%}",
-            "sell_at": best["same_day_exit"],
-            "profit_per_contract": round((best["same_day_exit"] - best["debit"]) * 100, 2),
-            "profit_total": round((best["same_day_exit"] - best["debit"]) * 100 * num_contracts, 2),
-        },
-        "next_day": {
-            "target_pct": f"{NEXT_DAY_EXIT_PCT:.0%}",
-            "sell_at": best["next_day_exit"],
-            "profit_per_contract": round((best["next_day_exit"] - best["debit"]) * 100, 2),
-            "profit_total": round((best["next_day_exit"] - best["debit"]) * 100 * num_contracts, 2),
-        },
-        "extended": {
-            "target_pct": f"{EXTENDED_HOLD_EXIT_PCT:.0%}",
-            "sell_at": best["extended_exit"],
-            "profit_per_contract": round((best["extended_exit"] - best["debit"]) * 100, 2),
-            "profit_total": round((best["extended_exit"] - best["debit"]) * 100 * num_contracts, 2),
-        },
-    }
-
-    # ── Success ──
-    return {
-        "ok":               True,
-        "ticker":           ticker,
-        "spot":             spot,
-        "dte":              dte,
-        "exp":              expiration,
-        "direction":        "bull",
-        "spread_type":      "debit",
-        "side":             "call",
-
-        "trade":            best,
-        "ladder":           ladder,
-        "candidate_count":  len(candidates),
-
-        "contracts":        num_contracts,
-        "total_risk":       total_risk,
-        "sizing_note":      sizing_note,
-
-        "stop_price":       stop_price,
-        "stop_note":        stop_note,
-
-        "exits":            exits,
-
-        "confidence":       confidence,
-        "conf_reasons":     conf_reasons,
-
-        "tier":             tier,
-        "webhook_data":     webhook_data,
-    }
+        data = r.json()
+        if data.get("ok"):
+            log.info(f"Telegram webhook registered: {webhook_url}")
+        else:
+            log.warning(f"Webhook registration failed: {data}")
+    except Exception as e:
+        log.warning(f"Webhook registration error: {e}")
 
 
-# ─────────────────────────────────────────────────────────
-# TRADE CARD FORMATTER (Telegram message)
-# ─────────────────────────────────────────────────────────
-
-def format_trade_card(rec: Dict) -> str:
+def handle_command(
+    user_id:   str,
+    chat_id:   str,
+    text:      str,
+    scan_fn,          # scan_ticker function from app.py
+    full_scan_fn,     # scan_watchlist logic from app.py
+    check_fn,         # check_ticker function from app.py (v3)
+    watchlist: list,
+) -> None:
     """
-    Format a trade recommendation into a clean Telegram message.
+    Parse and execute a Telegram command.
+    Runs in a background thread to avoid blocking the webhook response.
     """
-    if not rec.get("ok"):
-        reason = rec.get("reason", "Unknown")
-        conf = rec.get("confidence")
-        lines = [
-            f"❌ {rec.get('ticker', '?')} — NO TRADE",
-            f"Reason: {reason}",
-        ]
-        if conf is not None:
-            lines.append(f"Confidence: {conf}/100")
-        lines.append("")
-        lines.append("— Not financial advice —")
-        return "\n".join(lines)
+    if not is_authorized(user_id):
+        send_reply(chat_id, "⛔ You are not authorized to use this bot.")
+        return
 
-    trade = rec["trade"]
-    exits = rec["exits"]
-    ticker = rec["ticker"]
-    tier = rec.get("tier", "?")
-    conf = rec.get("confidence", 0)
+    text  = (text or "").strip()
+    parts = text.split()
+    cmd   = parts[0].lower() if parts else ""
+    args  = parts[1:] if len(parts) > 1 else []
 
-    # Header
-    tier_emoji = "🥇" if tier == "1" else "🥈"
-    lines = [
-        f"{tier_emoji} {ticker} — BULL CALL DEBIT SPREAD",
-        f"Signal: Tier {tier} | Confidence: {conf}/100",
-        f"Spot: ${rec['spot']:.2f} | DTE: {rec['dte']} ({rec['exp']})",
-        "",
-    ]
-
-    # Trade details
-    lines += [
-        f"Long:  ${trade['long']} (${trade['long_itm']:.2f} ITM)",
-        f"Short: ${trade['short']} (${trade['short_itm']:.2f} ITM)",
-        f"Width: ${trade['width']:.2f} | Cost: ${trade['debit']:.2f} ({trade['cost_pct']:.0f}%)",
-        f"Max Profit: ${trade['max_profit']:.2f} | RoR: {trade['ror']:.0%}",
-        "",
-    ]
-
-    # Greeks if available
-    if trade.get("net_theta") is not None:
-        lines.append(
-            f"Theta: ${trade['net_theta']:.3f}/day | "
-            f"Vega: ${trade.get('net_vega', 0):.3f}/pt"
-        )
-        lines.append("")
-
-    # Position sizing
-    lines += [
-        f"Size: {rec['contracts']} contract(s) | ${rec['total_risk']:.0f} risk",
-        rec["sizing_note"],
-        "",
-    ]
-
-    # Exit targets
-    lines += [
-        "📊 Exit Targets:",
-        f"  Same Day (30%): sell at ${exits['same_day']['sell_at']:.2f} → +${exits['same_day']['profit_total']:.0f}",
-        f"  Next Day (35%): sell at ${exits['next_day']['sell_at']:.2f} → +${exits['next_day']['profit_total']:.0f}",
-        f"  Extended (50%): sell at ${exits['extended']['sell_at']:.2f} → +${exits['extended']['profit_total']:.0f}",
-        "",
-    ]
-
-    # Stop loss
-    if rec.get("stop_price"):
-        lines.append(f"🛑 Stop: ${rec['stop_price']:.2f} ({rec['stop_note']})")
-    else:
-        lines.append(f"🛑 {rec['stop_note']}")
-    lines.append("")
-
-    # Width ladder
-    ladder = rec.get("ladder", [])
-    if len(ladder) > 1:
-        lines.append("📐 Width Options:")
-        for c in ladder:
-            star = " ⭐" if c["long"] == trade["long"] and c["short"] == trade["short"] else ""
-            lines.append(
-                f"  ${c['width']:.2f}w | ${c['debit']:.2f} ({c['cost_pct']:.0f}%) | "
-                f"RoR {c['ror']:.0%} | {c['long']}/{c['short']}{star}"
+    # ─────────────────────────────────────
+    # /check TICKER [bull|bear] — on-demand trade analysis (v3 engine)
+    # ─────────────────────────────────────
+    if cmd in ("/check", "/check@omegabot"):
+        if not args:
+            send_reply(chat_id,
+                "Usage: /check AAPL\n"
+                "       /check SPY bull\n\n"
+                "Analyzes any ticker and returns a trade card\n"
+                "if it meets your rules, or explains why not."
             )
-        lines.append("")
+            return
 
-    # Warnings
-    if trade.get("warnings"):
-        lines.append("⚠️ " + "; ".join(trade["warnings"][:3]))
-        lines.append("")
+        ticker = args[0].upper()
+        direction = args[1].lower() if len(args) > 1 else "bull"
 
-    # Confidence breakdown (first 3 reasons)
-    if rec.get("conf_reasons"):
-        lines.append("🧠 " + " | ".join(rec["conf_reasons"][:3]))
-        lines.append("")
+        if direction not in ("bull", "bear"):
+            send_reply(chat_id, f"⚠️ Direction must be 'bull' or 'bear', got '{direction}'")
+            return
 
-    lines.append("— Not financial advice —")
-    return "\n".join(lines)
+        send_reply(chat_id, f"🔍 Checking {ticker} ({direction})...")
+
+        def run_check():
+            try:
+                result = check_fn(ticker, direction)
+                # check_fn posts the trade card directly to telegram
+                if not result.get("posted") and not result.get("ok"):
+                    reason = result.get("reason") or result.get("error") or "no valid setup"
+                    conf = result.get("confidence")
+                    msg = f"❌ {ticker} — {reason}"
+                    if conf is not None:
+                        msg += f"\nConfidence: {conf}/100"
+                    send_reply(chat_id, msg)
+            except Exception as e:
+                log.error(f"/check {ticker}: {e}")
+                send_reply(chat_id, f"⚠️ Error checking {ticker}: {type(e).__name__}")
+
+        threading.Thread(target=run_check, daemon=True).start()
+
+    # ─────────────────────────────────────
+    # /scan [TICKER]
+    # ─────────────────────────────────────
+    elif cmd in ("/scan", "/scan@omegabot"):
+        if args:
+            ticker = args[0].upper()
+            send_reply(chat_id, f"🔍 Scanning {ticker}...")
+            result = scan_fn(ticker)
+            if result.get("posted"):
+                send_reply(chat_id, f"✅ {ticker} scan card posted above.")
+            else:
+                reason = result.get("skipped") or result.get("error") or "no setup found"
+                send_reply(chat_id, f"ℹ️ {ticker}: {reason}")
+        else:
+            if is_paused():
+                send_reply(chat_id, "⏸ Bot is paused. Use /resume first.")
+                return
+            send_reply(chat_id, f"🔍 Scanning full watchlist ({len(watchlist)} tickers)...")
+            def run_scan():
+                full_scan_fn()
+            threading.Thread(target=run_scan, daemon=True).start()
+
+    # ─────────────────────────────────────
+    # /status
+    # ─────────────────────────────────────
+    elif cmd in ("/status", "/status@omegabot"):
+        uptime     = datetime.now(timezone.utc) - _state["start_time"]
+        uptime_str = f"{int(uptime.total_seconds() // 3600)}h {int((uptime.total_seconds() % 3600) // 60)}m"
+
+        last_scan = _state.get("last_scan_time")
+        if last_scan:
+            mins_ago  = int((datetime.now(timezone.utc) - last_scan).total_seconds() / 60)
+            scan_str  = f"{mins_ago}m ago ({_state.get('last_scan_posted',0)}/{_state.get('last_scan_total',0)} posted)"
+        else:
+            scan_str = "No scan run yet"
+
+        paused_str = "⏸ PAUSED" if _state["paused"] else "▶️ Running"
+        conf_str   = str(_state["confidence_gate"])
+
+        msg = (
+            f"🤖 Omega 3000 Status\n"
+            f"State: {paused_str}\n"
+            f"Uptime: {uptime_str}\n"
+            f"Last Scan: {scan_str}\n"
+            f"Total Scans: {_state['scan_count']}\n"
+            f"Confidence Gate: {conf_str}/100\n"
+            f"Watchlist: {len(watchlist)} tickers\n"
+            f"Admins: {len(TELEGRAM_ADMIN_IDS)} authorized"
+        )
+        send_reply(chat_id, msg)
+
+    # ─────────────────────────────────────
+    # /watchlist
+    # ─────────────────────────────────────
+    elif cmd in ("/watchlist", "/watchlist@omegabot"):
+        if not watchlist:
+            send_reply(chat_id, "⚠️ Watchlist is empty.")
+            return
+        chunks = [watchlist[i:i+20] for i in range(0, len(watchlist), 20)]
+        for i, chunk in enumerate(chunks):
+            msg = f"📋 Watchlist ({i*20+1}–{i*20+len(chunk)}):\n"
+            msg += ", ".join(chunk)
+            send_reply(chat_id, msg)
+
+    # ─────────────────────────────────────
+    # /confidence [value]
+    # ─────────────────────────────────────
+    elif cmd in ("/confidence", "/confidence@omegabot"):
+        if not args:
+            send_reply(chat_id,
+                f"Current confidence gate: {_state['confidence_gate']}/100\n"
+                f"Usage: /confidence 60"
+            )
+            return
+        try:
+            val = int(args[0])
+            if not 0 <= val <= 100:
+                raise ValueError
+            old = _state["confidence_gate"]
+            _state["confidence_gate"] = val
+            send_reply(chat_id,
+                f"✅ Confidence gate updated: {old} → {val}/100\n"
+                f"Trades below {val}/100 will be suppressed."
+            )
+        except ValueError:
+            send_reply(chat_id, "⚠️ Usage: /confidence 60 (must be 0–100)")
+
+    # ─────────────────────────────────────
+    # /pause
+    # ─────────────────────────────────────
+    elif cmd in ("/pause", "/pause@omegabot"):
+        _state["paused"] = True
+        send_reply(chat_id, "⏸ Bot paused. Scheduled scans will be skipped. Use /resume to restart.")
+
+    # ─────────────────────────────────────
+    # /resume
+    # ─────────────────────────────────────
+    elif cmd in ("/resume", "/resume@omegabot"):
+        _state["paused"] = False
+        send_reply(chat_id, "▶️ Bot resumed. Scheduled scans will run normally.")
+
+    # ─────────────────────────────────────
+    # /help
+    # ─────────────────────────────────────
+    elif cmd in ("/help", "/help@omegabot", "/start"):
+        msg = (
+            "🤖 Omega 3000 Commands:\n\n"
+            "/check AAPL — analyze any ticker (v3 engine)\n"
+            "/check SPY bull — with direction hint\n"
+            "/scan AAPL — scan single ticker (legacy)\n"
+            "/scan — run full watchlist scan\n"
+            "/status — bot health and last scan info\n"
+            "/watchlist — show all tickers\n"
+            "/confidence 60 — set minimum confidence gate\n"
+            "/pause — pause scheduled scans\n"
+            "/resume — resume scheduled scans\n"
+            "/help — show this message\n\n"
+            "— Not financial advice —"
+        )
+        send_reply(chat_id, msg)
+
+    else:
+        send_reply(chat_id,
+            f"❓ Unknown command: {cmd}\nType /help for available commands."
+        )
