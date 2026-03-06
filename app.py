@@ -191,79 +191,103 @@ def get_expirations(ticker: str) -> list:
         raise RuntimeError(f"Bad expirations for {ticker}")
     return sorted(set(str(e)[:10] for e in (data.get("expirations") or []) if e))
 
-def get_options_chain(ticker: str) -> tuple:
+def get_options_chain(ticker: str) -> list:
     """
-    Fetch the best expiration (closest to TARGET_DTE within MIN_DTE–MAX_DTE)
-    and return (expiration_str, dte, contracts_list).
+    Fetch multiple expirations within MIN_DTE–MAX_DTE range.
+    Returns list of (expiration_str, dte, contracts_list) tuples,
+    sorted by DTE (nearest first).
+
+    Pulls up to MAX_EXPIRATIONS_TO_PULL chains to balance
+    coverage vs API credit usage.
     """
+    from trading_rules import MAX_EXPIRATIONS_TO_PULL
+
     ticker = ticker.strip().upper()
     exps   = get_expirations(ticker)
     today  = datetime.now(timezone.utc).date()
 
-    scored = []
+    # Find all expirations within range, sorted by DTE
+    valid_exps = []
     for exp in exps:
         try:
             dte = max((datetime.fromisoformat(exp).date() - today).days, 0)
             if MIN_DTE <= dte <= MAX_DTE:
-                scored.append((abs(dte - TARGET_DTE), dte, exp))
+                valid_exps.append((dte, exp))
         except Exception:
             continue
 
-    if not scored:
-        # Fallback: closest to TARGET_DTE even if outside range
+    valid_exps.sort(key=lambda x: x[0])
+
+    if not valid_exps:
+        # Fallback: grab the nearest expiration regardless of range
         for exp in exps:
             try:
                 dte = max((datetime.fromisoformat(exp).date() - today).days, 0)
-                scored.append((abs(dte - TARGET_DTE), dte, exp))
+                valid_exps.append((dte, exp))
             except Exception:
                 continue
+        valid_exps.sort(key=lambda x: x[0])
 
-    if not scored:
+    if not valid_exps:
         raise RuntimeError(f"No usable expirations for {ticker}")
 
-    scored.sort()
-    chosen_exp, chosen_dte = scored[0][2], scored[0][1]
+    # Limit how many we pull to conserve API credits
+    exps_to_fetch = valid_exps[:MAX_EXPIRATIONS_TO_PULL]
 
-    data = md_get(
-        f"https://api.marketdata.app/v1/options/chain/{ticker}/",
-        {"expiration": chosen_exp},
-    )
-    if not isinstance(data, dict) or data.get("s") != "ok":
-        raise RuntimeError(f"Bad chain for {ticker}")
+    results = []
+    for dte, exp in exps_to_fetch:
+        try:
+            data = md_get(
+                f"https://api.marketdata.app/v1/options/chain/{ticker}/",
+                {"expiration": exp},
+            )
+            if not isinstance(data, dict) or data.get("s") != "ok":
+                continue
 
-    sym_list = data.get("optionSymbol") or []
-    if not sym_list:
-        raise RuntimeError(f"Empty chain for {ticker}")
+            sym_list = data.get("optionSymbol") or []
+            if not sym_list:
+                continue
 
-    n = len(sym_list)
-    def col(name, default=None):
-        v = data.get(name, default)
-        return v if isinstance(v, list) else [default] * n
+            n = len(sym_list)
+            def col(name, default=None):
+                v = data.get(name, default)
+                return v if isinstance(v, list) else [default] * n
 
-    contracts = []
-    sides = col("side", "")
-    for i in range(n):
-        right = (sides[i] or "").lower().strip()
-        right = "call" if right in ("c", "call") else "put" if right in ("p", "put") else right
-        contracts.append({
-            "optionSymbol": col("optionSymbol", "")[i],
-            "right":        right,
-            "strike":       as_float(col("strike",       None)[i], None),
-            "expiration":   chosen_exp,
-            "dte":          chosen_dte,
-            "openInterest": as_int(col("openInterest",  0)[i], 0),
-            "volume":       as_int(col("volume",         0)[i], 0),
-            "iv":           as_float(col("iv",          None)[i], None),
-            "gamma":        as_float(col("gamma",        0.0)[i], 0.0),
-            "delta":        as_float(col("delta",       None)[i], None),
-            "theta":        as_float(col("theta",       None)[i], None),
-            "vega":         as_float(col("vega",        None)[i], None),
-            "bid":          as_float(col("bid",         None)[i], None),
-            "ask":          as_float(col("ask",         None)[i], None),
-            "mid":          as_float(col("mid",         None)[i], None),
-        })
+            contracts = []
+            sides = col("side", "")
+            for i in range(n):
+                right = (sides[i] or "").lower().strip()
+                right = "call" if right in ("c", "call") else "put" if right in ("p", "put") else right
+                contracts.append({
+                    "optionSymbol": col("optionSymbol", "")[i],
+                    "right":        right,
+                    "strike":       as_float(col("strike",       None)[i], None),
+                    "expiration":   exp,
+                    "dte":          dte,
+                    "openInterest": as_int(col("openInterest",  0)[i], 0),
+                    "volume":       as_int(col("volume",         0)[i], 0),
+                    "iv":           as_float(col("iv",          None)[i], None),
+                    "gamma":        as_float(col("gamma",        0.0)[i], 0.0),
+                    "delta":        as_float(col("delta",       None)[i], None),
+                    "theta":        as_float(col("theta",       None)[i], None),
+                    "vega":         as_float(col("vega",        None)[i], None),
+                    "bid":          as_float(col("bid",         None)[i], None),
+                    "ask":          as_float(col("ask",         None)[i], None),
+                    "mid":          as_float(col("mid",         None)[i], None),
+                })
 
-    return chosen_exp, chosen_dte, contracts
+            if contracts:
+                results.append((exp, dte, contracts))
+                log.info(f"{ticker}: fetched {len(contracts)} contracts for {exp} (DTE {dte})")
+
+        except Exception as e:
+            log.warning(f"{ticker}: failed to fetch chain for {exp}: {e}")
+            continue
+
+    if not results:
+        raise RuntimeError(f"No valid chains fetched for {ticker}")
+
+    return results
 
 
 # ─────────────────────────────────────────────────────────
@@ -277,6 +301,7 @@ def check_ticker(
 ) -> dict:
     """
     Full v3 pipeline: fetch data → check rules → build spread → post card.
+    Now scans MULTIPLE expirations and picks the best trade across all of them.
     Used by both /check command and /tv webhook.
     Returns result dict with 'ok', 'posted', 'reason' keys.
     """
@@ -286,45 +311,80 @@ def check_ticker(
     try:
         # Fetch market data
         spot = get_spot(ticker)
-        exp, dte, contracts = get_options_chain(ticker)
+        chains = get_options_chain(ticker)  # list of (exp, dte, contracts)
 
         # Enrichment: earnings + IV
         enrichment = enrich_ticker(ticker)
         has_earnings = enrichment.get("has_earnings", False)
         earnings_warn = enrichment.get("earnings_warn")
+        has_dividend = False  # TODO: Add dividend API check
 
-        # Check dividend (simple: skip if ex-div in DTE window)
-        # TODO: Add dividend API check here
-        has_dividend = False
+        log.info(f"check_ticker({ticker}): spot={spot} expirations={len(chains)} "
+                 f"earnings={has_earnings}")
 
-        log.info(f"check_ticker({ticker}): spot={spot} exp={exp} dte={dte} "
-                 f"contracts={len(contracts)} earnings={has_earnings}")
+        # Run v3 engine on EACH expiration, collect all valid recommendations
+        all_recs = []
+        all_reasons = []
 
-        # Run v3 engine
-        rec = recommend_trade(
-            ticker=ticker,
-            spot=spot,
-            contracts=contracts,
-            dte=dte,
-            expiration=exp,
-            webhook_data=webhook_data,
-            has_earnings=has_earnings,
-            has_dividend=has_dividend,
-        )
+        for exp, dte, contracts in chains:
+            rec = recommend_trade(
+                ticker=ticker,
+                spot=spot,
+                contracts=contracts,
+                dte=dte,
+                expiration=exp,
+                webhook_data=webhook_data,
+                has_earnings=has_earnings,
+                has_dividend=has_dividend,
+            )
 
-        # If no trade, return the reason
-        if not rec.get("ok"):
-            log.info(f"check_ticker({ticker}): no trade — {rec.get('reason')}")
+            if rec.get("ok"):
+                all_recs.append(rec)
+                log.info(f"  {exp} (DTE {dte}): ✅ trade found — "
+                         f"${rec['trade']['debit']:.2f} on ${rec['trade']['width']} wide, "
+                         f"RoR {rec['trade']['ror']:.0%}")
+            else:
+                reason = rec.get("reason", "unknown")
+                all_reasons.append(f"DTE {dte} ({exp}): {reason}")
+                log.info(f"  {exp} (DTE {dte}): ❌ {reason}")
+
+        # If no valid trades across any expiration
+        if not all_recs:
+            combined_reason = "No valid spreads across any expiration"
+            if all_reasons:
+                combined_reason += "\n" + "\n".join(all_reasons[:4])
             return {
                 "ticker":     ticker,
                 "ok":         False,
                 "posted":     False,
-                "reason":     rec.get("reason"),
-                "confidence": rec.get("confidence"),
+                "reason":     combined_reason,
+                "confidence": all_recs[0].get("confidence") if all_recs else None,
             }
 
+        # Pick the best trade across all expirations
+        # Ranking: highest RoR, prefer tighter width, prefer DTE closer to TARGET_DTE
+        def rec_score(r):
+            trade = r.get("trade", {})
+            ror = trade.get("ror", 0)
+            width = trade.get("width", 5)
+            dte = r.get("dte", 5)
+            width_bonus = 0.3 if width <= 1.0 else 0.1 if width <= 2.5 else 0
+            dte_bonus = 0.1 * (1.0 / (1 + abs(dte - TARGET_DTE)))
+            return ror + width_bonus + dte_bonus
+
+        all_recs.sort(key=rec_score, reverse=True)
+        best_rec = all_recs[0]
+
+        # Collect the best trade from each OTHER expiration for the ladder
+        other_exps = []
+        seen_exps = {best_rec.get("exp")}
+        for r in all_recs[1:]:
+            if r.get("exp") not in seen_exps:
+                seen_exps.add(r.get("exp"))
+                other_exps.append(r)
+
         # Dedup check
-        trade = rec.get("trade", {})
+        trade = best_rec.get("trade", {})
         if is_duplicate_trade(ticker, direction, trade.get("short"), trade.get("long")):
             return {
                 "ticker": ticker,
@@ -333,8 +393,20 @@ def check_ticker(
                 "reason": "Duplicate trade in dedup window",
             }
 
-        # Format and post trade card
-        card = format_trade_card(rec)
+        # Format trade card
+        card = format_trade_card(best_rec)
+
+        # Add multi-expiration comparison if we have alternatives
+        if other_exps:
+            alt_lines = ["\n📅 Other Expirations:"]
+            for r in other_exps[:3]:
+                t = r.get("trade", {})
+                alt_lines.append(
+                    f"  DTE {r['dte']} ({r['exp']}): "
+                    f"${t['debit']:.2f} on ${t['width']} wide | "
+                    f"RoR {t['ror']:.0%} | {t['long']}/{t['short']}"
+                )
+            card += "\n".join(alt_lines)
 
         # Prepend earnings warning if applicable
         if has_earnings and earnings_warn:
@@ -350,8 +422,9 @@ def check_ticker(
             "ok":         True,
             "posted":     st == 200,
             "tg_status":  st,
-            "confidence": rec.get("confidence"),
+            "confidence": best_rec.get("confidence"),
             "trade":      trade,
+            "expirations_checked": len(chains),
         }
 
     except Exception as e:
