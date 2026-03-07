@@ -498,6 +498,7 @@ def telegram_webhook(secret):
            check_fn     = check_ticker,
            watchlist    = tickers,
            get_spot_fn  = get_spot,       # ← NEW (Phase 2A)
+           md_get_fn    = md_get,         # ← NEW (Phase 2B)
        )
 
 
@@ -674,6 +675,29 @@ def scan_watchlist():
 
     return jsonify({"status": "accepted", "tickers": len(tickers)})
 
+# ─────────────────────────────────────────────────────────
+# HOLDINGS SENTIMENT SCAN (cron endpoint for daily scheduled scan)
+# ─────────────────────────────────────────────────────────
+
+@app.route("/holdings_scan", methods=["POST"])
+def holdings_scan():
+    data     = request.get_json(force=True, silent=True) or {}
+    supplied = (data.get("secret") or request.headers.get("X-Scan-Secret") or "").strip()
+
+    if SCAN_SECRET and supplied != SCAN_SECRET:
+        return jsonify({"error": "Unauthorized"}), 403
+
+    def run_scan():
+        try:
+            from sentiment_report import generate_sentiment_report
+            report = generate_sentiment_report(md_get)
+            post_to_telegram(report)
+        except Exception as e:
+            log.error(f"Holdings scan error: {e}")
+            post_to_telegram(f"⚠️ Holdings scan failed: {type(e).__name__}")
+
+    threading.Thread(target=run_scan, daemon=True).start()
+    return jsonify({"status": "accepted"})
 
 # ─────────────────────────────────────────────────────────
 # STARTUP
