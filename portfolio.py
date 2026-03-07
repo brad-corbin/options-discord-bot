@@ -6,6 +6,13 @@
 #   - P/L calculation engine
 #   - Wheel cycle tracking
 #
+# v3.2 — Multi-account support:
+#   - All functions accept account="brad" kwarg
+#   - Storage keys prefixed: {account}:portfolio:holdings, etc.
+#   - Day trade P/L logging
+#   - Mutual fund / ETF lump balance tracking
+#   - One-time migration helper for existing data
+#
 # Uses the same store_get/store_set pattern from app.py.
 # All data is JSON-serialized in Redis (or in-memory fallback).
 
@@ -17,15 +24,32 @@ from typing import Optional
 log = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────
-# KEYS
+# KEYS (v3.2: all prefixed by account)
 # ─────────────────────────────────────────────────────────
-KEY_HOLDINGS        = "portfolio:holdings"
-KEY_OPTIONS         = "portfolio:options"
-KEY_OPTIONS_COUNTER = "portfolio:options:counter"
-KEY_SETTINGS        = "portfolio:settings"
 
-def _wheel_key(ticker: str) -> str:
-    return f"portfolio:wheel:{ticker.upper()}"
+def _key_holdings(account: str = "brad") -> str:
+    return f"{account}:portfolio:holdings"
+
+def _key_options(account: str = "brad") -> str:
+    return f"{account}:portfolio:options"
+
+def _key_options_counter(account: str = "brad") -> str:
+    return f"{account}:portfolio:options:counter"
+
+def _key_settings(account: str = "brad") -> str:
+    return f"{account}:portfolio:settings"
+
+def _key_daytrades(account: str = "brad") -> str:
+    return f"{account}:portfolio:daytrades"
+
+def _key_mutualfunds(account: str = "brad") -> str:
+    return f"{account}:portfolio:mutualfunds"
+
+# Legacy keys (pre-v3.2, no account prefix)
+_LEGACY_KEY_HOLDINGS        = "portfolio:holdings"
+_LEGACY_KEY_OPTIONS         = "portfolio:options"
+_LEGACY_KEY_OPTIONS_COUNTER = "portfolio:options:counter"
+_LEGACY_KEY_SETTINGS        = "portfolio:settings"
 
 
 # ─────────────────────────────────────────────────────────
@@ -52,9 +76,6 @@ def _get(key: str):
 def _set(key: str, value: str, ttl: int = 0):
     if _store_set is None:
         raise RuntimeError("Portfolio store not initialized — call portfolio.init_store()")
-    _set_raw(key, value, ttl)
-
-def _set_raw(key: str, value: str, ttl: int = 0):
     _store_set(key, value, ttl)
 
 
@@ -78,12 +99,13 @@ def _save_json(key: str, data, ttl: int = 0):
 def _today_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-def _next_option_id() -> str:
+def _next_option_id(account: str = "brad") -> str:
     """Auto-increment option ID: opt_001, opt_002, ..."""
-    raw = _get(KEY_OPTIONS_COUNTER)
+    key = _key_options_counter(account)
+    raw = _get(key)
     n = int(raw) if raw else 0
     n += 1
-    _set(KEY_OPTIONS_COUNTER, str(n))
+    _set(key, str(n))
     return f"opt_{n:03d}"
 
 
@@ -91,22 +113,23 @@ def _next_option_id() -> str:
 # HOLDINGS CRUD
 # ═══════════════════════════════════════════════════════════
 
-def get_all_holdings() -> dict:
+def get_all_holdings(account: str = "brad") -> dict:
     """Return full holdings dict. Keys are uppercase tickers."""
-    return _load_json(KEY_HOLDINGS, {})
+    return _load_json(_key_holdings(account), {})
 
-def get_holding(ticker: str) -> Optional[dict]:
-    h = get_all_holdings()
+def get_holding(ticker: str, account: str = "brad") -> Optional[dict]:
+    h = get_all_holdings(account=account)
     return h.get(ticker.upper())
 
 def add_holding(ticker: str, shares: int, cost_basis: float,
-                tag: str = None, notes: str = "") -> dict:
+                tag: str = None, notes: str = "",
+                account: str = "brad") -> dict:
     """
     Add shares to a holding. If ticker already exists, average the cost basis.
     Returns the updated holding dict.
     """
     ticker = ticker.upper()
-    h = get_all_holdings()
+    h = get_all_holdings(account=account)
 
     if ticker in h:
         existing = h[ticker]
@@ -131,18 +154,19 @@ def add_holding(ticker: str, shares: int, cost_basis: float,
             "notes":      notes,
         }
 
-    _save_json(KEY_HOLDINGS, h)
-    log.info(f"Holdings: added {shares}sh {ticker} @{cost_basis}")
+    _save_json(_key_holdings(account), h)
+    log.info(f"Holdings [{account}]: added {shares}sh {ticker} @{cost_basis}")
     return h[ticker]
 
 
-def remove_holding(ticker: str, shares: int = None) -> dict:
+def remove_holding(ticker: str, shares: int = None,
+                   account: str = "brad") -> dict:
     """
     Remove shares (or all if shares=None) from a holding.
     Returns {"removed": True/False, "remaining": int, "holding": dict or None}
     """
     ticker = ticker.upper()
-    h = get_all_holdings()
+    h = get_all_holdings(account=account)
 
     if ticker not in h:
         return {"removed": False, "remaining": 0, "holding": None,
@@ -154,14 +178,14 @@ def remove_holding(ticker: str, shares: int = None) -> dict:
         # Full removal
         removed_shares = existing["shares"]
         del h[ticker]
-        _save_json(KEY_HOLDINGS, h)
-        log.info(f"Holdings: removed ALL {removed_shares}sh {ticker}")
+        _save_json(_key_holdings(account), h)
+        log.info(f"Holdings [{account}]: removed ALL {removed_shares}sh {ticker}")
         return {"removed": True, "remaining": 0, "holding": None}
     else:
         existing["shares"] -= shares
         h[ticker] = existing
-        _save_json(KEY_HOLDINGS, h)
-        log.info(f"Holdings: removed {shares}sh {ticker}, {existing['shares']} remaining")
+        _save_json(_key_holdings(account), h)
+        log.info(f"Holdings [{account}]: removed {shares}sh {ticker}, {existing['shares']} remaining")
         return {"removed": True, "remaining": existing["shares"], "holding": existing}
 
 
@@ -169,18 +193,18 @@ def remove_holding(ticker: str, shares: int = None) -> dict:
 # OPTIONS CRUD
 # ═══════════════════════════════════════════════════════════
 
-def get_all_options() -> list:
-    return _load_json(KEY_OPTIONS, [])
+def get_all_options(account: str = "brad") -> list:
+    return _load_json(_key_options(account), [])
 
-def get_open_options() -> list:
-    return [o for o in get_all_options() if o.get("status") == "open"]
+def get_open_options(account: str = "brad") -> list:
+    return [o for o in get_all_options(account=account) if o.get("status") == "open"]
 
-def get_options_for_ticker(ticker: str) -> list:
+def get_options_for_ticker(ticker: str, account: str = "brad") -> list:
     ticker = ticker.upper()
-    return [o for o in get_all_options() if o.get("ticker") == ticker]
+    return [o for o in get_all_options(account=account) if o.get("ticker") == ticker]
 
-def get_option_by_id(opt_id: str) -> Optional[dict]:
-    for o in get_all_options():
+def get_option_by_id(opt_id: str, account: str = "brad") -> Optional[dict]:
+    for o in get_all_options(account=account):
         if o.get("id") == opt_id:
             return o
     return None
@@ -188,15 +212,16 @@ def get_option_by_id(opt_id: str) -> Optional[dict]:
 
 def add_option(ticker: str, opt_type: str, direction: str,
                strike: float, exp: str, premium: float,
-               contracts: int = 1, notes: str = "") -> dict:
+               contracts: int = 1, notes: str = "",
+               account: str = "brad") -> dict:
     """
     Record a new options position.
     opt_type: "covered_call", "csp", "debit_spread"
     direction: "buy" or "sell"
     Returns the new option dict.
     """
-    opts = get_all_options()
-    opt_id = _next_option_id()
+    opts = get_all_options(account=account)
+    opt_id = _next_option_id(account=account)
 
     new_opt = {
         "id":            opt_id,
@@ -215,18 +240,19 @@ def add_option(ticker: str, opt_type: str, direction: str,
     }
 
     opts.append(new_opt)
-    _save_json(KEY_OPTIONS, opts)
-    log.info(f"Options: opened {opt_id} — {direction} {opt_type} {ticker} "
+    _save_json(_key_options(account), opts)
+    log.info(f"Options [{account}]: opened {opt_id} — {direction} {opt_type} {ticker} "
              f"${strike} exp {exp} @${premium} x{contracts}")
     return new_opt
 
 
-def close_option(opt_id: str, close_premium: float) -> dict:
+def close_option(opt_id: str, close_premium: float,
+                 account: str = "brad") -> dict:
     """
     Close an option by buying/selling it back at close_premium.
     Returns the updated option dict or error dict.
     """
-    opts = get_all_options()
+    opts = get_all_options(account=account)
     for o in opts:
         if o["id"] == opt_id:
             if o["status"] != "open":
@@ -234,15 +260,15 @@ def close_option(opt_id: str, close_premium: float) -> dict:
             o["status"]        = "closed"
             o["close_date"]    = _today_str()
             o["close_premium"] = round(close_premium, 2)
-            _save_json(KEY_OPTIONS, opts)
-            log.info(f"Options: closed {opt_id} @${close_premium}")
+            _save_json(_key_options(account), opts)
+            log.info(f"Options [{account}]: closed {opt_id} @${close_premium}")
             return o
     return {"error": f"{opt_id} not found"}
 
 
-def expire_option(opt_id: str) -> dict:
+def expire_option(opt_id: str, account: str = "brad") -> dict:
     """Mark option as expired worthless (full premium kept for sells)."""
-    opts = get_all_options()
+    opts = get_all_options(account=account)
     for o in opts:
         if o["id"] == opt_id:
             if o["status"] != "open":
@@ -250,20 +276,20 @@ def expire_option(opt_id: str) -> dict:
             o["status"]        = "expired"
             o["close_date"]    = _today_str()
             o["close_premium"] = 0.0
-            _save_json(KEY_OPTIONS, opts)
-            log.info(f"Options: expired {opt_id}")
+            _save_json(_key_options(account), opts)
+            log.info(f"Options [{account}]: expired {opt_id}")
             return o
     return {"error": f"{opt_id} not found"}
 
 
-def assign_option(opt_id: str) -> dict:
+def assign_option(opt_id: str, account: str = "brad") -> dict:
     """
     Mark option as assigned.
     - CSP assigned → auto-add shares to holdings at strike price
     - Covered call assigned → auto-remove shares from holdings
     Returns result dict with action taken.
     """
-    opts = get_all_options()
+    opts = get_all_options(account=account)
     for o in opts:
         if o["id"] == opt_id:
             if o["status"] != "open":
@@ -272,7 +298,7 @@ def assign_option(opt_id: str) -> dict:
             o["status"]        = "assigned"
             o["close_date"]    = _today_str()
             o["close_premium"] = 0.0  # assigned, no buyback
-            _save_json(KEY_OPTIONS, opts)
+            _save_json(_key_options(account), opts)
 
             ticker    = o["ticker"]
             contracts = o["contracts"]
@@ -284,15 +310,16 @@ def assign_option(opt_id: str) -> dict:
             if o["type"] == "csp":
                 # Assigned on CSP → you buy 100 shares per contract at strike
                 add_holding(ticker, shares, strike, tag="wheel",
-                            notes=f"Assigned from {opt_id}")
+                            notes=f"Assigned from {opt_id}",
+                            account=account)
                 action = f"Added {shares}sh {ticker} @${strike}"
-                log.info(f"Options: {opt_id} CSP assigned → {action}")
+                log.info(f"Options [{account}]: {opt_id} CSP assigned → {action}")
 
             elif o["type"] == "covered_call":
                 # Called away → remove shares
-                remove_holding(ticker, shares)
+                remove_holding(ticker, shares, account=account)
                 action = f"Removed {shares}sh {ticker} (called away @${strike})"
-                log.info(f"Options: {opt_id} CC assigned → {action}")
+                log.info(f"Options [{account}]: {opt_id} CC assigned → {action}")
 
             return {"option": o, "action": action}
 
@@ -326,17 +353,18 @@ def calc_option_pnl(opt: dict) -> float:
     return round(pnl, 2)
 
 
-def calc_ticker_options_income(ticker: str) -> float:
+def calc_ticker_options_income(ticker: str, account: str = "brad") -> float:
     """Sum of realized P/L from all closed options on a ticker."""
     ticker = ticker.upper()
     total = 0.0
-    for o in get_all_options():
+    for o in get_all_options(account=account):
         if o.get("ticker") == ticker and o.get("status") in ("closed", "expired", "assigned"):
             total += calc_option_pnl(o)
     return round(total, 2)
 
 
-def calc_holding_pnl(ticker: str, current_price: float) -> dict:
+def calc_holding_pnl(ticker: str, current_price: float,
+                     account: str = "brad") -> dict:
     """
     Full P/L for a single holding:
       - Unrealized share P/L
@@ -344,7 +372,7 @@ def calc_holding_pnl(ticker: str, current_price: float) -> dict:
       - Combined total + return %
     """
     ticker = ticker.upper()
-    holding = get_holding(ticker)
+    holding = get_holding(ticker, account=account)
     if not holding:
         return {"error": f"{ticker} not in holdings"}
 
@@ -352,7 +380,7 @@ def calc_holding_pnl(ticker: str, current_price: float) -> dict:
     cost_basis = holding["cost_basis"]
 
     unrealized = round((current_price - cost_basis) * shares, 2)
-    opt_income = calc_ticker_options_income(ticker)
+    opt_income = calc_ticker_options_income(ticker, account=account)
     total_pnl  = round(unrealized + opt_income, 2)
     invested   = cost_basis * shares
     return_pct = round((total_pnl / invested) * 100, 2) if invested > 0 else 0.0
@@ -369,7 +397,8 @@ def calc_holding_pnl(ticker: str, current_price: float) -> dict:
     }
 
 
-def calc_open_options_pnl(current_mids: dict = None) -> float:
+def calc_open_options_pnl(current_mids: dict = None,
+                          account: str = "brad") -> float:
     """
     Unrealized P/L on open options.
     current_mids: {"opt_001": 0.45, "opt_002": 1.20, ...}
@@ -379,7 +408,7 @@ def calc_open_options_pnl(current_mids: dict = None) -> float:
         return 0.0
 
     total = 0.0
-    for o in get_open_options():
+    for o in get_open_options(account=account):
         mid = current_mids.get(o["id"])
         if mid is None:
             continue
@@ -397,13 +426,13 @@ def calc_open_options_pnl(current_mids: dict = None) -> float:
     return round(total, 2)
 
 
-def calc_portfolio_summary(price_map: dict) -> dict:
+def calc_portfolio_summary(price_map: dict, account: str = "brad") -> dict:
     """
     Full portfolio summary.
     price_map: {"AAPL": 192.30, "GOOGL": 299.47, ...}
     Returns aggregate P/L data.
     """
-    holdings     = get_all_holdings()
+    holdings     = get_all_holdings(account=account)
     total_unrealized = 0.0
     total_opt_income = 0.0
     holding_details  = []
@@ -413,7 +442,7 @@ def calc_portfolio_summary(price_map: dict) -> dict:
         if price is None:
             continue
 
-        pnl = calc_holding_pnl(ticker, price)
+        pnl = calc_holding_pnl(ticker, price, account=account)
         if "error" in pnl:
             continue
 
@@ -429,7 +458,7 @@ def calc_portfolio_summary(price_map: dict) -> dict:
         "total_opt_income":  round(total_opt_income, 2),
         "combined_pnl":      combined,
         "num_holdings":      len(holdings),
-        "num_open_options":  len(get_open_options()),
+        "num_open_options":  len(get_open_options(account=account)),
     }
 
 
@@ -437,22 +466,22 @@ def calc_portfolio_summary(price_map: dict) -> dict:
 # WHEEL TRACKING
 # ═══════════════════════════════════════════════════════════
 
-def get_wheel_history(ticker: str) -> list:
+def get_wheel_history(ticker: str, account: str = "brad") -> list:
     """Get all options positions for a ticker (the full wheel cycle history)."""
     ticker = ticker.upper()
-    positions = get_options_for_ticker(ticker)
+    positions = get_options_for_ticker(ticker, account=account)
     # Sort by open_date ascending
     positions.sort(key=lambda o: o.get("open_date", ""))
     return positions
 
 
-def calc_wheel_pnl(ticker: str) -> dict:
+def calc_wheel_pnl(ticker: str, account: str = "brad") -> dict:
     """
     Total wheel P/L for a ticker = sum of all premiums collected/lost
     across all CSPs and covered calls (closed + expired + assigned).
     """
     ticker = ticker.upper()
-    history = get_wheel_history(ticker)
+    history = get_wheel_history(ticker, account=account)
     total_premium = 0.0
     rounds = 0
 
@@ -470,3 +499,186 @@ def calc_wheel_pnl(ticker: str) -> dict:
         "open_positions": len(open_positions),
         "history":        history,
     }
+
+
+# ═══════════════════════════════════════════════════════════
+# DAY TRADE P/L LOG (v3.2)
+# ═══════════════════════════════════════════════════════════
+
+def add_daytrade(amount: float, note: str = "",
+                 account: str = "brad") -> dict:
+    """
+    Log a day trade net P/L entry.
+
+    Args:
+        amount:  Net P/L for the day (positive or negative)
+        note:    Optional note (e.g. "SPY scalps")
+        account: "brad" or "mom"
+
+    Returns the entry dict that was stored.
+    """
+    key = _key_daytrades(account)
+    trades = _load_json(key, [])
+
+    entry = {
+        "date":   _today_str(),
+        "time":   datetime.now(timezone.utc).strftime("%H:%M UTC"),
+        "amount": round(amount, 2),
+        "note":   note,
+    }
+
+    trades.append(entry)
+    _save_json(key, trades)
+    log.info(f"Daytrade [{account}]: logged ${amount:+,.2f} on {entry['date']}")
+    return entry
+
+
+def get_daytrades(account: str = "brad") -> list:
+    """
+    Get all day trade entries for an account.
+    Returns list of dicts sorted by date (oldest first).
+    """
+    key = _key_daytrades(account)
+    trades = _load_json(key, [])
+    return sorted(trades, key=lambda t: t.get("date", ""))
+
+
+# ═══════════════════════════════════════════════════════════
+# MUTUAL FUND / ETF LUMP BALANCE TRACKER (v3.2)
+# ═══════════════════════════════════════════════════════════
+#
+# Stores a single lump record per account:
+#   - cost_basis:    total amount originally invested
+#   - current_value: last-updated market value
+#   - last_updated:  date of last value update
+#   - history:       list of {date, value} snapshots for P/L over time
+#
+# Commands:
+#   /fund set 50000           → set original cost basis
+#   /fund update 54200        → update current market value (adds snapshot)
+#   /fund                     → show current P/L
+#   /fund history             → show value over time
+
+def get_mutual_fund(account: str = "brad") -> dict:
+    """
+    Get the mutual fund / ETF lump balance for an account.
+    Returns dict with cost_basis, current_value, last_updated, history.
+    """
+    key = _key_mutualfunds(account)
+    return _load_json(key, {
+        "cost_basis":    0.0,
+        "current_value": 0.0,
+        "last_updated":  None,
+        "history":       [],
+    })
+
+
+def set_mutual_fund_basis(cost_basis: float, account: str = "brad") -> dict:
+    """
+    Set (or reset) the original cost basis for mutual funds.
+    This is the total amount invested across all mutual funds / ETFs.
+    """
+    key = _key_mutualfunds(account)
+    fund = get_mutual_fund(account=account)
+    fund["cost_basis"] = round(cost_basis, 2)
+    if not fund.get("last_updated"):
+        fund["last_updated"] = _today_str()
+    _save_json(key, fund)
+    log.info(f"MutualFund [{account}]: set cost basis to ${cost_basis:,.2f}")
+    return fund
+
+
+def update_mutual_fund_value(current_value: float,
+                             account: str = "brad") -> dict:
+    """
+    Update the current market value and record a history snapshot.
+    Call this periodically (weekly, monthly) to track P/L over time.
+    """
+    key = _key_mutualfunds(account)
+    fund = get_mutual_fund(account=account)
+
+    today = _today_str()
+    fund["current_value"] = round(current_value, 2)
+    fund["last_updated"]  = today
+
+    # Add snapshot to history
+    fund.setdefault("history", [])
+    fund["history"].append({
+        "date":  today,
+        "value": round(current_value, 2),
+    })
+
+    _save_json(key, fund)
+    log.info(f"MutualFund [{account}]: updated value to ${current_value:,.2f}")
+    return fund
+
+
+def calc_mutual_fund_pnl(account: str = "brad") -> dict:
+    """
+    Calculate P/L for the mutual fund lump balance.
+    Returns dict with cost_basis, current_value, pnl, return_pct.
+    """
+    fund = get_mutual_fund(account=account)
+    cost    = fund.get("cost_basis", 0)
+    current = fund.get("current_value", 0)
+    pnl     = round(current - cost, 2)
+    pct     = round((pnl / cost) * 100, 2) if cost > 0 else 0.0
+
+    return {
+        "cost_basis":    cost,
+        "current_value": current,
+        "pnl":           pnl,
+        "return_pct":    pct,
+        "last_updated":  fund.get("last_updated"),
+        "num_snapshots": len(fund.get("history", [])),
+    }
+
+
+# ═══════════════════════════════════════════════════════════
+# DATA MIGRATION (one-time, v3.2)
+# ═══════════════════════════════════════════════════════════
+
+def migrate_to_multi_account() -> int:
+    """
+    ONE-TIME MIGRATION: Copy all existing (unprefixed) portfolio data
+    to brad:-prefixed keys so the multi-account system picks them up.
+
+    Run this once from a Python shell or temporary /migrate command:
+        import portfolio
+        portfolio.init_store(store_get, store_set)
+        portfolio.migrate_to_multi_account()
+
+    Safe to run multiple times — it only copies, never deletes originals.
+    """
+    migrated = 0
+
+    # Holdings
+    raw = _get(_LEGACY_KEY_HOLDINGS)
+    if raw:
+        _set(_key_holdings("brad"), raw)
+        log.info(f"Migrated {_LEGACY_KEY_HOLDINGS} → {_key_holdings('brad')}")
+        migrated += 1
+
+    # Options list
+    raw = _get(_LEGACY_KEY_OPTIONS)
+    if raw:
+        _set(_key_options("brad"), raw)
+        log.info(f"Migrated {_LEGACY_KEY_OPTIONS} → {_key_options('brad')}")
+        migrated += 1
+
+    # Options counter
+    raw = _get(_LEGACY_KEY_OPTIONS_COUNTER)
+    if raw:
+        _set(_key_options_counter("brad"), raw)
+        log.info(f"Migrated {_LEGACY_KEY_OPTIONS_COUNTER} → {_key_options_counter('brad')}")
+        migrated += 1
+
+    # Settings
+    raw = _get(_LEGACY_KEY_SETTINGS)
+    if raw:
+        _set(_key_settings("brad"), raw)
+        log.info(f"Migrated {_LEGACY_KEY_SETTINGS} → {_key_settings('brad')}")
+        migrated += 1
+
+    log.info(f"Migration complete: {migrated} keys copied to brad: prefix")
+    return migrated
