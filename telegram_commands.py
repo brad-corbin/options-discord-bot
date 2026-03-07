@@ -7,7 +7,7 @@
 #   /hold, /sell, /close, /expire, /assign, /options, /wheel
 # v3.2 UPGRADE: Multi-account portfolio support:
 #   --mom flag on portfolio commands → targets mom's account
-#   /daytrade +1234 or -1234 → log daily P/L
+#   /cash 12345 → update cash balance for P/L tracking
 #   Portfolio replies route to private channels
 
 import os
@@ -272,15 +272,16 @@ def handle_command(
         return
 
     # ─────────────────────────────────────
-    # /daytrade — Log daily P/L (v3.2)
+    # /cash — Cash balance & account P/L (v3.3)
     # ─────────────────────────────────────
-    if cmd in ("/daytrade", "/daytrade@omegabot"):
+    if cmd in ("/cash", "/cash@omegabot"):
         account, clean_args = _parse_account_flag(args)
-        from holdings_commands import handle_daytrade
+        from holdings_commands import handle_cash
+        _spot = get_spot_fn or _no_spot
         p_reply = _portfolio_reply(account)
         threading.Thread(
             target=_safe_run,
-            args=(handle_daytrade, clean_args, p_reply, None, chat_id, account),
+            args=(handle_cash, clean_args, p_reply, _spot, chat_id, account),
             daemon=True,
         ).start()
         return
@@ -475,12 +476,12 @@ def handle_command(
             "/hold list — show all holdings + P/L\n"
             "/holdings — sentiment scan (EMA/VWAP/Vol)\n"
             "/portfolio — full dashboard (fundamentals + P/L)\n"
-            "\n── Day Trading ──\n"
-            "/daytrade +1234 — log daily P/L\n"
-            "/daytrade -500 — log a loss\n"
-            "/daytrade +800 --mom — log for mom\n"
-            "/daytrade summary — this month's totals\n"
-            "/daytrade history — last 30 entries\n"
+            "\n── Cash & Account P/L ──\n"
+            "/cash deposit 50000 — set total deposited\n"
+            "/cash deposit +5000 — add a new deposit\n"
+            "/cash 12345 — update cash balance\n"
+            "/cash — show full account P/L breakdown\n"
+            "/cash history — balance snapshots\n"
             "\n── Mutual Funds / ETFs ──\n"
             "/fund — show current P/L\n"
             "/fund set 50000 — set total invested\n"
@@ -538,7 +539,7 @@ def _safe_run(handler_fn, args, reply_fn, extra_arg, chat_id, account="brad"):
       handle_hold(args, send_fn, get_spot_fn, account="brad")
       handle_sell(args, send_fn, account="brad")
       handle_close(args, send_fn, account="brad")
-      handle_daytrade(args, send_fn, account="brad")
+      handle_cash(args, send_fn, get_spot_fn, account="brad")
       etc.
     """
     try:
