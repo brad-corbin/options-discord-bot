@@ -8,6 +8,8 @@
 #   - Bullish / Neutral / Bearish bucketing
 #   - P/L overlay from portfolio data layer
 #
+# v3.2 — Multi-account support via account parameter
+#
 # Uses md_get from app.py (passed in at call time to avoid circular imports).
 # Designed to run on-demand (/holdings) or scheduled (cron at 2 PM ET).
 
@@ -295,17 +297,20 @@ def analyze_ticker(ticker: str, md_get: Callable) -> dict:
 # FULL PORTFOLIO SENTIMENT REPORT
 # ─────────────────────────────────────────────────────────
 
-def generate_sentiment_report(md_get: Callable, get_spot: Callable = None) -> str:
+def generate_sentiment_report(md_get: Callable, get_spot: Callable = None,
+                              account: str = "brad") -> str:
     """
-    Run sentiment analysis on ALL holdings.
+    Run sentiment analysis on ALL holdings for a given account.
     Returns formatted Telegram message string.
 
     md_get:   MarketData API getter (from app.py)
     get_spot: optional spot price fetcher — if None, uses prices from analysis
+    account:  "brad" or "mom"
     """
-    holdings = get_all_holdings()
+    holdings = get_all_holdings(account=account)
     if not holdings:
-        return "📊 No holdings to analyze. Use /hold add TICKER SHARES @PRICE"
+        acct_label = "👩 Mom" if account == "mom" else "📁 Brad"
+        return f"📊 {acct_label} — No holdings to analyze. Use /hold add TICKER SHARES @PRICE"
 
     # Analyze each holding
     bullish  = []
@@ -327,7 +332,7 @@ def generate_sentiment_report(md_get: Callable, get_spot: Callable = None) -> st
             price_map[ticker] = price
 
         # Calculate P/L for this holding
-        pnl_data = calc_holding_pnl(ticker, price) if price else None
+        pnl_data = calc_holding_pnl(ticker, price, account=account) if price else None
 
         entry = _format_holding_line(ticker, analysis, pnl_data, holdings[ticker])
 
@@ -340,8 +345,9 @@ def generate_sentiment_report(md_get: Callable, get_spot: Callable = None) -> st
             neutral.append(entry)
 
     # Build report
+    acct_label = "👩 Mom" if account == "mom" else "📁 Brad"
     now_str = datetime.now(timezone.utc).strftime("%I:%M %p UTC")
-    lines = [f"📊 HOLDINGS SENTIMENT — {now_str}\n"]
+    lines = [f"📊 {acct_label} — HOLDINGS SENTIMENT — {now_str}\n"]
 
     if bullish:
         lines.append("🟢 BULLISH:")
@@ -366,14 +372,14 @@ def generate_sentiment_report(md_get: Callable, get_spot: Callable = None) -> st
     total_unrealized = 0.0
     total_opt_income = 0.0
     for ticker, price in price_map.items():
-        pnl = calc_holding_pnl(ticker, price)
+        pnl = calc_holding_pnl(ticker, price, account=account)
         if "error" not in pnl:
             total_unrealized += pnl["unrealized"]
             total_opt_income += pnl["opt_income"]
 
     combined = total_unrealized + total_opt_income
 
-    open_opts = get_open_options()
+    open_opts = get_open_options(account=account)
     if open_opts:
         lines.append(f"Open Options: {len(open_opts)} positions")
 
