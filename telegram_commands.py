@@ -205,6 +205,16 @@ def handle_command(
         ).start()
         return
 
+    if cmd in ("/portfolio", "/portfolio@omegabot"):
+        from holdings_commands import handle_portfolio
+        _md = md_get_fn or _no_md_get
+        threading.Thread(
+            target=_safe_run,
+            args=(handle_portfolio, args, reply, _md, chat_id),
+            daemon=True,
+        ).start()
+        return
+
     # ─────────────────────────────────────
     # /check TICKER [bull|bear] — on-demand trade analysis (v3 engine)
     # ─────────────────────────────────────
@@ -374,6 +384,7 @@ def handle_command(
             "/hold remove AAPL 50 — partial sale\n"
             "/hold list — show all holdings + P/L\n"
             "/holdings — sentiment scan (EMA/VWAP/Vol)\n"
+            "/portfolio — full dashboard (fundamentals + P/L)\n"
             "\n── Options ──\n"
             "/sell put AAPL 180 2026-03-21 2.35 — sell CSP\n"
             "/sell call AAPL 195 2026-03-21 1.80 — sell CC\n"
