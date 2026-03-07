@@ -26,6 +26,7 @@ import json
 import hashlib
 import logging
 import threading
+import portfolio
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -488,15 +489,17 @@ def telegram_webhook(secret):
     tickers = [t.strip().upper() for t in WATCHLIST.split(",") if t.strip()]
 
     def run_command():
-        handle_command(
-            user_id      = user_id,
-            chat_id      = chat_id,
-            text         = text,
-            scan_fn      = lambda t: check_ticker(t),  # /scan now uses v3 too
-            full_scan_fn = lambda: scan_watchlist_internal(tickers),
-            check_fn     = check_ticker,
-            watchlist    = tickers,
-        )
+       handle_command(
+           user_id      = user_id,
+           chat_id      = chat_id,
+           text         = text,
+           scan_fn      = lambda t: check_ticker(t),
+           full_scan_fn = lambda: scan_watchlist_internal(tickers),
+           check_fn     = check_ticker,
+           watchlist    = tickers,
+           get_spot_fn  = get_spot,       # ← NEW (Phase 2A)
+       )
+
 
     threading.Thread(target=run_command, daemon=True).start()
     return jsonify({"ok": True})
@@ -681,6 +684,9 @@ with app.app_context():
     if _tg_ws and BOT_URL:
         register_webhook(BOT_URL, _tg_ws)
 
+    # Phase 2A — Wire portfolio to the same Redis store
+    portfolio.init_store(store_get, store_set)
+    
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
