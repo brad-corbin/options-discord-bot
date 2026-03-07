@@ -28,6 +28,9 @@ from portfolio import (
     calc_holding_pnl,
     calc_portfolio_summary,
     calc_ticker_options_income,
+    get_cash_data,
+    calc_account_pnl,
+    calc_mutual_fund_pnl,
 )
 
 log = logging.getLogger(__name__)
@@ -483,6 +486,37 @@ def generate_dashboard(md_get: Callable, account: str = "brad") -> list:
         lines2.append(f"  Return: {_fmt_pct((combined / total_invested) * 100)}")
     if open_opts:
         lines2.append(f"  Open Options: {len(open_opts)}")
+
+    # Cash balance & account-level P/L (if configured)
+    cash_data = get_cash_data(account=account)
+    if cash_data.get("total_deposited", 0) > 0:
+        # Build price map from results for calc_account_pnl
+        price_map = {r["ticker"]: r["price"] for r in results if r.get("price")}
+        acct_pnl = calc_account_pnl(price_map, account=account)
+
+        real_emoji = "🟢" if acct_pnl["realized_pnl"] >= 0 else "🔴"
+        total_emoji = "🟢" if acct_pnl["total_pnl"] >= 0 else "🔴"
+
+        lines2.append("")
+        lines2.append("💵 ACCOUNT OVERVIEW\n")
+        lines2.append(f"  Deposited: ${acct_pnl['total_deposited']:,.0f}")
+        lines2.append(f"  Cash: ${acct_pnl['cash_balance']:,.0f}")
+        lines2.append(f"  Account Value: ${acct_pnl['account_value']:,.0f}")
+        lines2.append(f"  {real_emoji} Realized P/L: {_fmt_money(acct_pnl['realized_pnl'])}")
+        lines2.append(f"  {total_emoji} Total P/L: {_fmt_money(acct_pnl['total_pnl'])} ({_fmt_pct(acct_pnl['return_pct'])})")
+
+    # Mutual fund P/L (if configured)
+    try:
+        fund_pnl = calc_mutual_fund_pnl(account=account)
+        if fund_pnl.get("cost_basis", 0) > 0:
+            fund_emoji = "🟢" if fund_pnl["pnl"] >= 0 else "🔴"
+            lines2.append("")
+            lines2.append("💼 MUTUAL FUNDS / ETFs\n")
+            lines2.append(f"  Invested: ${fund_pnl['cost_basis']:,.0f}")
+            lines2.append(f"  Value: ${fund_pnl['current_value']:,.0f}")
+            lines2.append(f"  {fund_emoji} P/L: {_fmt_money(fund_pnl['pnl'])} ({_fmt_pct(fund_pnl['return_pct'])})")
+    except Exception:
+        pass  # fund not configured
 
     messages.append("\n".join(lines2))
 
