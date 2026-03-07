@@ -3,6 +3,8 @@
 # NOTE: Educational/demo code. Not financial advice. Use at your own risk.
 #
 # v3 UPGRADE: Added /check TICKER command for on-demand trade analysis
+# v3.1 UPGRADE (Phase 2A): Added portfolio commands:
+#   /hold, /sell, /close, /expire, /assign, /options, /wheel
 
 import os
 import logging
@@ -102,10 +104,14 @@ def handle_command(
     full_scan_fn,     # scan_watchlist logic from app.py
     check_fn,         # check_ticker function from app.py (v3)
     watchlist: list,
+    get_spot_fn=None, # get_spot function from app.py (Phase 2A)
 ) -> None:
     """
     Parse and execute a Telegram command.
     Runs in a background thread to avoid blocking the webhook response.
+
+    Phase 2A adds get_spot_fn for live price lookups in portfolio commands.
+    It's optional so existing callers don't break.
     """
     if not is_authorized(user_id):
         send_reply(chat_id, "⛔ You are not authorized to use this bot.")
@@ -115,6 +121,77 @@ def handle_command(
     parts = text.split()
     cmd   = parts[0].lower() if parts else ""
     args  = parts[1:] if len(parts) > 1 else []
+
+    # Helper: send to this chat
+    reply = lambda msg: send_reply(chat_id, msg)
+
+    # ─────────────────────────────────────
+    # PHASE 2A — PORTFOLIO COMMANDS
+    # ─────────────────────────────────────
+
+    if cmd in ("/hold", "/hold@omegabot"):
+        from holdings_commands import handle_hold
+        _spot = get_spot_fn or _no_spot
+        threading.Thread(
+            target=_safe_run,
+            args=(handle_hold, args, reply, _spot, chat_id),
+            daemon=True,
+        ).start()
+        return
+
+    if cmd in ("/sell", "/sell@omegabot"):
+        from holdings_commands import handle_sell
+        threading.Thread(
+            target=_safe_run,
+            args=(handle_sell, args, reply, None, chat_id),
+            daemon=True,
+        ).start()
+        return
+
+    if cmd in ("/close", "/close@omegabot"):
+        from holdings_commands import handle_close
+        threading.Thread(
+            target=_safe_run,
+            args=(handle_close, args, reply, None, chat_id),
+            daemon=True,
+        ).start()
+        return
+
+    if cmd in ("/expire", "/expire@omegabot"):
+        from holdings_commands import handle_expire
+        threading.Thread(
+            target=_safe_run,
+            args=(handle_expire, args, reply, None, chat_id),
+            daemon=True,
+        ).start()
+        return
+
+    if cmd in ("/assign", "/assign@omegabot"):
+        from holdings_commands import handle_assign
+        threading.Thread(
+            target=_safe_run,
+            args=(handle_assign, args, reply, None, chat_id),
+            daemon=True,
+        ).start()
+        return
+
+    if cmd in ("/options", "/options@omegabot"):
+        from holdings_commands import handle_options
+        threading.Thread(
+            target=_safe_run,
+            args=(handle_options, args, reply, None, chat_id),
+            daemon=True,
+        ).start()
+        return
+
+    if cmd in ("/wheel", "/wheel@omegabot"):
+        from holdings_commands import handle_wheel
+        threading.Thread(
+            target=_safe_run,
+            args=(handle_wheel, args, reply, None, chat_id),
+            daemon=True,
+        ).start()
+        return
 
     # ─────────────────────────────────────
     # /check TICKER [bull|bear] — on-demand trade analysis (v3 engine)
@@ -194,6 +271,16 @@ def handle_command(
         paused_str = "⏸ PAUSED" if _state["paused"] else "▶️ Running"
         conf_str   = str(_state["confidence_gate"])
 
+        # Phase 2A: Add portfolio stats to /status
+        holdings_count = 0
+        open_opts_count = 0
+        try:
+            from portfolio import get_all_holdings, get_open_options
+            holdings_count = len(get_all_holdings())
+            open_opts_count = len(get_open_options())
+        except Exception:
+            pass  # portfolio not initialized yet — no problem
+
         msg = (
             f"🤖 Omega 3000 Status\n"
             f"State: {paused_str}\n"
@@ -202,6 +289,7 @@ def handle_command(
             f"Total Scans: {_state['scan_count']}\n"
             f"Confidence Gate: {conf_str}/100\n"
             f"Watchlist: {len(watchlist)} tickers\n"
+            f"Holdings: {holdings_count} | Open Options: {open_opts_count}\n"
             f"Admins: {len(TELEGRAM_ADMIN_IDS)} authorized"
         )
         send_reply(chat_id, msg)
@@ -262,13 +350,32 @@ def handle_command(
     elif cmd in ("/help", "/help@omegabot", "/start"):
         msg = (
             "🤖 Omega 3000 Commands:\n\n"
+            "── Analysis ──\n"
             "/check AAPL — analyze any ticker (v3 engine)\n"
             "/check SPY bull — with direction hint\n"
-            "/scan AAPL — scan single ticker (legacy)\n"
+            "/scan AAPL — scan single ticker\n"
             "/scan — run full watchlist scan\n"
-            "/status — bot health and last scan info\n"
+            "\n── Portfolio ──\n"
+            "/hold add AAPL 100 @185.50 — add shares\n"
+            "/hold add AAPL 100 @185.50 #wheel — with tag\n"
+            "/hold remove AAPL — remove all shares\n"
+            "/hold remove AAPL 50 — partial sale\n"
+            "/hold list — show all holdings + P/L\n"
+            "\n── Options ──\n"
+            "/sell put AAPL 180 2026-03-21 2.35 — sell CSP\n"
+            "/sell call AAPL 195 2026-03-21 1.80 — sell CC\n"
+            "/close opt_001 0.15 — buy back option\n"
+            "/expire opt_001 — mark expired worthless\n"
+            "/assign opt_001 — mark assigned (auto-updates holdings)\n"
+            "/options — show open options\n"
+            "/options history — show closed P/L\n"
+            "\n── Wheel ──\n"
+            "/wheel AAPL — wheel history for ticker\n"
+            "/wheel — all wheel tickers summary\n"
+            "\n── Settings ──\n"
+            "/status — bot health + portfolio stats\n"
             "/watchlist — show all tickers\n"
-            "/confidence 60 — set minimum confidence gate\n"
+            "/confidence 60 — set min confidence gate\n"
             "/pause — pause scheduled scans\n"
             "/resume — resume scheduled scans\n"
             "/help — show this message\n\n"
@@ -280,3 +387,32 @@ def handle_command(
         send_reply(chat_id,
             f"❓ Unknown command: {cmd}\nType /help for available commands."
         )
+
+
+# ─────────────────────────────────────────────────────────
+# INTERNAL HELPERS (Phase 2A)
+# ─────────────────────────────────────────────────────────
+
+def _no_spot(ticker: str) -> float:
+    """Placeholder when get_spot_fn not provided."""
+    raise RuntimeError("Price lookup not available — get_spot_fn not wired")
+
+
+def _safe_run(handler_fn, args, reply_fn, extra_arg, chat_id):
+    """
+    Wrapper to run a holdings_commands handler in a thread with error handling.
+    Handlers have different signatures:
+      handle_hold(args, send_fn, get_spot_fn)
+      handle_sell(args, send_fn)
+      handle_close(args, send_fn)
+      etc.
+    We pass extra_arg only if the handler accepts it (hold needs get_spot_fn).
+    """
+    try:
+        if extra_arg is not None:
+            handler_fn(args, reply_fn, extra_arg)
+        else:
+            handler_fn(args, reply_fn)
+    except Exception as e:
+        log.error(f"Portfolio command error: {type(e).__name__}: {e}")
+        send_reply(chat_id, f"⚠️ Error: {type(e).__name__}: {str(e)[:120]}")
