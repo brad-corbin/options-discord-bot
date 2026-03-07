@@ -15,7 +15,7 @@
 #   - --mom flag on any portfolio command targets mom's account
 #   - Trade alerts (/tv, /scan) stay on the main channel
 #   - Scheduled holdings scans post BOTH portfolios to their channels
-#   - /daytrade command for logging daily P/L
+#   - /cash command for cash balance & realized P/L tracking
 
 from telegram_commands import (
     handle_command,
