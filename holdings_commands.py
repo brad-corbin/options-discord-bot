@@ -10,7 +10,7 @@
 #
 # v3.2 — Multi-account support:
 #   - All handlers accept account="brad"|"mom" kwarg
-#   - /daytrade command for logging daily P/L
+#   - /cash command for cash balance & realized P/L tracking
 #   - Account label shown in responses so you know which portfolio
 #
 # Each handler receives (args, send_fn, [extra], account="brad")
@@ -35,8 +35,10 @@ from portfolio import (
     calc_ticker_options_income,
     calc_portfolio_summary,
     calc_wheel_pnl,
-    add_daytrade,
-    get_daytrades,
+    get_cash_data,
+    set_total_deposited,
+    update_cash_balance,
+    calc_account_pnl,
     get_mutual_fund,
     set_mutual_fund_basis,
     update_mutual_fund_value,
@@ -617,136 +619,161 @@ def handle_portfolio(args: list, send_fn, md_get_fn, account: str = "brad"):
 
 
 # ═══════════════════════════════════════════════════════════
-# /daytrade COMMAND (v3.2 — Daily P/L Tracker)
+# /cash COMMAND (v3.3 — Cash Balance & Account P/L)
 # ═══════════════════════════════════════════════════════════
 
-def handle_daytrade(args: list, send_fn, account: str = "brad"):
+def handle_cash(args: list, send_fn, get_spot_fn, account: str = "brad"):
     """
-    /daytrade +1234       → log today's P/L as +$1,234
-    /daytrade -500        → log today's P/L as -$500
-    /daytrade +800 --mom  → log for mom's account (--mom already stripped by caller)
-    /daytrade summary     → this month's running total
-    /daytrade history     → last 30 entries
+    /cash                    → show full account P/L breakdown
+    /cash 12345              → update current cash balance
+    /cash deposit 50000      → set total deposited (initial setup)
+    /cash deposit +5000      → add to deposits (wired in more money)
+    /cash history            → show balance snapshots over time
     """
     if not args:
-        send_fn(
-            "Usage:\n"
-            "  /daytrade +1234 — log daily P/L\n"
-            "  /daytrade -500 — log a loss\n"
-            "  /daytrade summary — this month's totals\n"
-            "  /daytrade history — last 30 entries\n"
-            "  Add --mom for mom's account"
-        )
+        _cash_show(send_fn, get_spot_fn, account)
         return
 
     sub = args[0].lower()
 
-    if sub == "summary":
-        _daytrade_summary(send_fn, account)
+    if sub == "deposit":
+        if len(args) < 2:
+            send_fn(
+                "Usage:\n"
+                "  /cash deposit 50000 — set total amount deposited\n"
+                "  /cash deposit +5000 — add a new deposit"
+            )
+            return
+        raw = args[1].replace(",", "").replace("$", "")
+        is_add = raw.startswith("+")
+        try:
+            amount = float(raw)
+        except ValueError:
+            send_fn(f"Bad amount: {args[1]}")
+            return
+
+        if is_add:
+            data = set_total_deposited(amount, add=True, account=account)
+            send_fn(
+                f"✅ {_acct_label(account)} — Deposit added: {_fmt_money(amount)}\n"
+                f"Total deposited: ${data['total_deposited']:,.2f}"
+            )
+        else:
+            data = set_total_deposited(amount, add=False, account=account)
+            send_fn(
+                f"✅ {_acct_label(account)} — Total deposited set: ${data['total_deposited']:,.2f}"
+            )
         return
 
     if sub == "history":
-        _daytrade_history(send_fn, account)
+        _cash_history(send_fn, account)
         return
 
-    # Parse the P/L amount
-    pnl_str = args[0]
+    # If it's a number, treat it as cash balance update
+    raw = args[0].replace(",", "").replace("$", "")
     try:
-        amount = float(pnl_str.replace(",", "").replace("$", ""))
+        balance = float(raw)
     except ValueError:
-        send_fn(f"Bad amount: {pnl_str} — use +1234 or -500")
+        send_fn(
+            "Usage:\n"
+            "  /cash 12345 — update cash balance\n"
+            "  /cash deposit 50000 — set total deposited\n"
+            "  /cash deposit +5000 — add a deposit\n"
+            "  /cash history — balance snapshots\n"
+            "  /cash — show full account P/L"
+        )
         return
 
-    # Optional note from remaining args
-    note = " ".join(args[1:]).strip() if len(args) > 1 else ""
-
-    entry = add_daytrade(amount, note=note, account=account)
-
-    emoji = "🟢" if amount >= 0 else "🔴"
-    msg = f"{emoji} {_acct_label(account)} — Day Trade logged: {_fmt_money(amount)}"
-    if note:
-        msg += f"\nNote: {note}"
-    msg += f"\nDate: {entry['date']}"
-
-    # Show running month total
-    from datetime import datetime, timezone
-    month_key = datetime.now(timezone.utc).strftime("%Y-%m")
-    all_trades = get_daytrades(account=account)
-    month_total = sum(
-        t["amount"] for t in all_trades
-        if t.get("date", "").startswith(month_key)
+    data = update_cash_balance(balance, account=account)
+    send_fn(
+        f"✅ {_acct_label(account)} — Cash balance updated: ${balance:,.2f}\n"
+        f"Use /cash to see full account P/L breakdown"
     )
-    msg += f"\nMonth total: {_fmt_money(month_total)}"
-
-    send_fn(msg)
 
 
-def _daytrade_summary(send_fn, account: str = "brad"):
-    """Show this month's day trading P/L summary."""
-    from datetime import datetime, timezone
+def _cash_show(send_fn, get_spot_fn, account: str = "brad"):
+    """Show full account P/L breakdown: deposits, cash, holdings, realized vs unrealized."""
+    cash_data = get_cash_data(account=account)
 
-    all_trades = get_daytrades(account=account)
-    if not all_trades:
-        send_fn(f"📈 {_acct_label(account)} — No day trades logged yet.")
+    if cash_data.get("total_deposited", 0) == 0 and cash_data.get("cash_balance", 0) == 0:
+        send_fn(
+            f"💰 {_acct_label(account)} — No cash data yet.\n\n"
+            f"Step 1: /cash deposit 50000\n"
+            f"  (total cash you've put into the account)\n\n"
+            f"Step 2: /cash 12345\n"
+            f"  (current cash balance from your broker)\n\n"
+            f"The bot computes realized P/L automatically\n"
+            f"from the difference."
+        )
         return
 
-    now = datetime.now(timezone.utc)
-    month_key = now.strftime("%Y-%m")
-    month_name = now.strftime("%B %Y")
+    # Fetch live prices for all holdings
+    holdings = get_all_holdings(account=account)
+    price_map = {}
+    for ticker in holdings:
+        try:
+            price_map[ticker] = get_spot_fn(ticker)
+        except Exception as e:
+            log.warning(f"Cash P/L: price fetch failed for {ticker}: {e}")
 
-    month_trades = [t for t in all_trades if t.get("date", "").startswith(month_key)]
+    pnl = calc_account_pnl(price_map, account=account)
 
-    if not month_trades:
-        send_fn(f"📈 {_acct_label(account)} — No day trades in {month_name}.")
-        return
+    # Format the breakdown
+    dep_emoji = "💰"
+    total_emoji = "🟢" if pnl["total_pnl"] >= 0 else "🔴"
+    real_emoji = "🟢" if pnl["realized_pnl"] >= 0 else "🔴"
+    unreal_emoji = "🟢" if pnl["unrealized_pnl"] >= 0 else "🔴"
+    last = pnl["last_updated"] or "never"
 
-    total = sum(t["amount"] for t in month_trades)
-    wins = sum(1 for t in month_trades if t["amount"] > 0)
-    losses = sum(1 for t in month_trades if t["amount"] < 0)
-    best = max(t["amount"] for t in month_trades)
-    worst = min(t["amount"] for t in month_trades)
-    avg = total / len(month_trades)
+    # Missing tickers (no price)
+    missing = [t for t in holdings if t not in price_map]
 
     lines = [
-        f"📈 {_acct_label(account)} — DAY TRADE SUMMARY — {month_name}\n",
-        f"Total P/L: {_fmt_money(total)} {_pnl_emoji(total)}",
-        f"Trading days: {len(month_trades)}",
-        f"Win/Loss: {wins}W / {losses}L",
-        f"Best day: {_fmt_money(best)}",
-        f"Worst day: {_fmt_money(worst)}",
-        f"Average: {_fmt_money(avg)}",
+        f"{dep_emoji} {_acct_label(account)} — ACCOUNT P/L\n",
+        f"Total Deposited:  ${pnl['total_deposited']:,.2f}",
+        f"Cash Balance:     ${pnl['cash_balance']:,.2f}",
+        f"Holdings Cost:    ${pnl['holdings_cost']:,.2f}",
+        f"Holdings Value:   ${pnl['holdings_value']:,.2f}",
+        f"Account Value:    ${pnl['account_value']:,.2f}",
+        "",
+        f"{unreal_emoji} Unrealized P/L:  {_fmt_money(pnl['unrealized_pnl'])}",
+        f"  (current share prices vs purchase prices)",
+        f"{real_emoji} Realized P/L:    {_fmt_money(pnl['realized_pnl'])}",
+        f"  (day trades, closed options, dividends, etc.)",
+        f"{total_emoji} Total P/L:       {_fmt_money(pnl['total_pnl'])} ({_fmt_pct(pnl['return_pct'])})",
+        "",
+        f"Last cash update: {last}",
     ]
 
-    # All-time total
-    all_time = sum(t["amount"] for t in all_trades)
-    lines.append(f"\nAll-time P/L: {_fmt_money(all_time)} ({len(all_trades)} entries)")
+    if missing:
+        lines.append(f"⚠️ No price data: {', '.join(missing)}")
 
     send_fn("\n".join(lines))
 
 
-def _daytrade_history(send_fn, account: str = "brad"):
-    """Show last 30 day trade entries."""
-    all_trades = get_daytrades(account=account)
-    if not all_trades:
-        send_fn(f"📈 {_acct_label(account)} — No day trades logged yet.")
+def _cash_history(send_fn, account: str = "brad"):
+    """Show cash balance snapshots over time."""
+    data = get_cash_data(account=account)
+    history = data.get("history", [])
+    deposited = data.get("total_deposited", 0)
+
+    if not history:
+        send_fn(f"💰 {_acct_label(account)} — No cash history yet. Use /cash BALANCE to start tracking.")
         return
 
-    # Most recent first
-    recent = sorted(all_trades, key=lambda t: t.get("date", ""), reverse=True)[:30]
+    recent = history[-20:]
 
-    lines = [f"📈 {_acct_label(account)} — DAY TRADE HISTORY (last {len(recent)})\n"]
+    lines = [
+        f"💰 {_acct_label(account)} — CASH BALANCE HISTORY\n",
+        f"Total deposited: ${deposited:,.2f}\n",
+    ]
 
-    running = 0.0
-    # Show oldest first for running total to make sense
-    for t in reversed(recent):
-        running += t["amount"]
-        note_str = f"  {t['note']}" if t.get("note") else ""
-        lines.append(
-            f"{t['date']}  {_fmt_money(t['amount'])} {_pnl_emoji(t['amount'])}"
-            f"  (cum: {_fmt_money(running)}){note_str}"
-        )
+    for snap in recent:
+        cash = snap["cash"]
+        lines.append(f"{snap['date']}  ${cash:,.2f}")
 
-    lines.append(f"\nRunning total: {_fmt_money(running)}")
+    if len(history) > 20:
+        lines.append(f"\n(showing last 20 of {len(history)} snapshots)")
 
     send_fn("\n".join(lines))
 
