@@ -5,6 +5,10 @@
 # v3 UPGRADE: Added /check TICKER command for on-demand trade analysis
 # v3.1 UPGRADE (Phase 2A): Added portfolio commands:
 #   /hold, /sell, /close, /expire, /assign, /options, /wheel
+# v3.2 UPGRADE: Multi-account portfolio support:
+#   --mom flag on portfolio commands → targets mom's account
+#   /daytrade +1234 or -1234 → log daily P/L
+#   Portfolio replies route to private channels
 
 import os
 import logging
@@ -96,6 +100,26 @@ def register_webhook(bot_url: str, webhook_secret: str):
         log.warning(f"Webhook registration error: {e}")
 
 
+# ─────────────────────────────────────────────────────────
+# ACCOUNT FLAG PARSING (v3.2)
+# ─────────────────────────────────────────────────────────
+
+def _parse_account_flag(args: list) -> tuple:
+    """
+    Check for --mom flag in args list.
+    Returns (account, cleaned_args) where account is "brad" or "mom".
+
+    Examples:
+      ["add", "AAPL", "100", "@185", "--mom"] → ("mom", ["add", "AAPL", "100", "@185"])
+      ["add", "AAPL", "100", "@185"]          → ("brad", ["add", "AAPL", "100", "@185"])
+      ["--mom", "add", "AAPL", "100", "@185"] → ("mom", ["add", "AAPL", "100", "@185"])
+    """
+    cleaned = [a for a in args if a.lower() != "--mom"]
+    has_mom = len(cleaned) < len(args)
+    account = "mom" if has_mom else "brad"
+    return account, cleaned
+
+
 def handle_command(
     user_id:   str,
     chat_id:   str,
@@ -106,14 +130,16 @@ def handle_command(
     watchlist: list,
     get_spot_fn=None, # get_spot function from app.py (Phase 2A)
     md_get_fn=None,   # md_get function from app.py (Phase 2B)
+    post_fn=None,     # post_to_telegram from app.py (v3.2)
+    get_portfolio_chat_id_fn=None,  # get_portfolio_chat_id from app.py (v3.2)
 ) -> None:
     """
     Parse and execute a Telegram command.
     Runs in a background thread to avoid blocking the webhook response.
 
-    Phase 2A adds get_spot_fn for live price lookups in portfolio commands.
-    Phase 2B adds md_get_fn for sentiment analysis (candle/quote data).
-    Both optional so existing callers don't break.
+    v3.2 adds:
+      post_fn(text, chat_id=None)     — post to a specific channel
+      get_portfolio_chat_id_fn(acct)   — get private channel ID for an account
     """
     if not is_authorized(user_id):
         send_reply(chat_id, "⛔ You are not authorized to use this bot.")
@@ -124,93 +150,151 @@ def handle_command(
     cmd   = parts[0].lower() if parts else ""
     args  = parts[1:] if len(parts) > 1 else []
 
-    # Helper: send to this chat
+    # Helper: send to the chat the command came from (default)
     reply = lambda msg: send_reply(chat_id, msg)
 
+    # v3.2 — Helper to build a reply function that targets the private portfolio channel
+    def _portfolio_reply(account: str):
+        """
+        Returns a send function that posts to the correct private channel.
+        Falls back to the chat the command came from if channel not configured.
+        """
+        if post_fn and get_portfolio_chat_id_fn:
+            target_chat = get_portfolio_chat_id_fn(account)
+            if target_chat:
+                return lambda msg: post_fn(msg, chat_id=target_chat)
+        return reply
+
     # ─────────────────────────────────────
-    # PHASE 2A — PORTFOLIO COMMANDS
+    # PHASE 2A — PORTFOLIO COMMANDS (v3.2: with --mom support)
     # ─────────────────────────────────────
 
     if cmd in ("/hold", "/hold@omegabot"):
+        account, clean_args = _parse_account_flag(args)
         from holdings_commands import handle_hold
         _spot = get_spot_fn or _no_spot
+        p_reply = _portfolio_reply(account)
         threading.Thread(
             target=_safe_run,
-            args=(handle_hold, args, reply, _spot, chat_id),
+            args=(handle_hold, clean_args, p_reply, _spot, chat_id, account),
             daemon=True,
         ).start()
         return
 
     if cmd in ("/sell", "/sell@omegabot"):
+        account, clean_args = _parse_account_flag(args)
         from holdings_commands import handle_sell
+        p_reply = _portfolio_reply(account)
         threading.Thread(
             target=_safe_run,
-            args=(handle_sell, args, reply, None, chat_id),
+            args=(handle_sell, clean_args, p_reply, None, chat_id, account),
             daemon=True,
         ).start()
         return
 
     if cmd in ("/close", "/close@omegabot"):
+        account, clean_args = _parse_account_flag(args)
         from holdings_commands import handle_close
+        p_reply = _portfolio_reply(account)
         threading.Thread(
             target=_safe_run,
-            args=(handle_close, args, reply, None, chat_id),
+            args=(handle_close, clean_args, p_reply, None, chat_id, account),
             daemon=True,
         ).start()
         return
 
     if cmd in ("/expire", "/expire@omegabot"):
+        account, clean_args = _parse_account_flag(args)
         from holdings_commands import handle_expire
+        p_reply = _portfolio_reply(account)
         threading.Thread(
             target=_safe_run,
-            args=(handle_expire, args, reply, None, chat_id),
+            args=(handle_expire, clean_args, p_reply, None, chat_id, account),
             daemon=True,
         ).start()
         return
 
     if cmd in ("/assign", "/assign@omegabot"):
+        account, clean_args = _parse_account_flag(args)
         from holdings_commands import handle_assign
+        p_reply = _portfolio_reply(account)
         threading.Thread(
             target=_safe_run,
-            args=(handle_assign, args, reply, None, chat_id),
+            args=(handle_assign, clean_args, p_reply, None, chat_id, account),
             daemon=True,
         ).start()
         return
 
     if cmd in ("/options", "/options@omegabot"):
+        account, clean_args = _parse_account_flag(args)
         from holdings_commands import handle_options
+        p_reply = _portfolio_reply(account)
         threading.Thread(
             target=_safe_run,
-            args=(handle_options, args, reply, None, chat_id),
+            args=(handle_options, clean_args, p_reply, None, chat_id, account),
             daemon=True,
         ).start()
         return
 
     if cmd in ("/wheel", "/wheel@omegabot"):
+        account, clean_args = _parse_account_flag(args)
         from holdings_commands import handle_wheel
+        p_reply = _portfolio_reply(account)
         threading.Thread(
             target=_safe_run,
-            args=(handle_wheel, args, reply, None, chat_id),
+            args=(handle_wheel, clean_args, p_reply, None, chat_id, account),
             daemon=True,
         ).start()
         return
 
     if cmd in ("/holdings", "/holdings@omegabot"):
+        account, clean_args = _parse_account_flag(args)
         from holdings_commands import handle_holdings
         _md = md_get_fn or _no_md_get
+        p_reply = _portfolio_reply(account)
         threading.Thread(
             target=_safe_run,
-            args=(handle_holdings, args, reply, _md, chat_id),
+            args=(handle_holdings, clean_args, p_reply, _md, chat_id, account),
             daemon=True,
         ).start()
         return
 
     if cmd in ("/portfolio", "/portfolio@omegabot"):
+        account, clean_args = _parse_account_flag(args)
         from holdings_commands import handle_portfolio
         _md = md_get_fn or _no_md_get
+        p_reply = _portfolio_reply(account)
         threading.Thread(
             target=_safe_run,
-            args=(handle_portfolio, args, reply, _md, chat_id),
+            args=(handle_portfolio, clean_args, p_reply, _md, chat_id, account),
+            daemon=True,
+        ).start()
+        return
+
+    # ─────────────────────────────────────
+    # /daytrade — Log daily P/L (v3.2)
+    # ─────────────────────────────────────
+    if cmd in ("/daytrade", "/daytrade@omegabot"):
+        account, clean_args = _parse_account_flag(args)
+        from holdings_commands import handle_daytrade
+        p_reply = _portfolio_reply(account)
+        threading.Thread(
+            target=_safe_run,
+            args=(handle_daytrade, clean_args, p_reply, None, chat_id, account),
+            daemon=True,
+        ).start()
+        return
+
+    # ─────────────────────────────────────
+    # /fund — Mutual Fund / ETF balance tracker (v3.2)
+    # ─────────────────────────────────────
+    if cmd in ("/fund", "/fund@omegabot"):
+        account, clean_args = _parse_account_flag(args)
+        from holdings_commands import handle_fund
+        p_reply = _portfolio_reply(account)
+        threading.Thread(
+            target=_safe_run,
+            args=(handle_fund, clean_args, p_reply, None, chat_id, account),
             daemon=True,
         ).start()
         return
@@ -293,13 +377,17 @@ def handle_command(
         paused_str = "⏸ PAUSED" if _state["paused"] else "▶️ Running"
         conf_str   = str(_state["confidence_gate"])
 
-        # Phase 2A: Add portfolio stats to /status
-        holdings_count = 0
-        open_opts_count = 0
+        # Phase 2A: Add portfolio stats to /status (both accounts)
+        brad_holdings = 0
+        brad_opts = 0
+        mom_holdings = 0
+        mom_opts = 0
         try:
             from portfolio import get_all_holdings, get_open_options
-            holdings_count = len(get_all_holdings())
-            open_opts_count = len(get_open_options())
+            brad_holdings = len(get_all_holdings(account="brad"))
+            brad_opts = len(get_open_options(account="brad"))
+            mom_holdings = len(get_all_holdings(account="mom"))
+            mom_opts = len(get_open_options(account="mom"))
         except Exception:
             pass  # portfolio not initialized yet — no problem
 
@@ -311,7 +399,8 @@ def handle_command(
             f"Total Scans: {_state['scan_count']}\n"
             f"Confidence Gate: {conf_str}/100\n"
             f"Watchlist: {len(watchlist)} tickers\n"
-            f"Holdings: {holdings_count} | Open Options: {open_opts_count}\n"
+            f"Brad: {brad_holdings} holdings | {brad_opts} open opts\n"
+            f"Mom:  {mom_holdings} holdings | {mom_opts} open opts\n"
             f"Admins: {len(TELEGRAM_ADMIN_IDS)} authorized"
         )
         send_reply(chat_id, msg)
@@ -377,14 +466,26 @@ def handle_command(
             "/check SPY bull — with direction hint\n"
             "/scan AAPL — scan single ticker\n"
             "/scan — run full watchlist scan\n"
-            "\n── Portfolio ──\n"
+            "\n── Portfolio (add --mom for mom's account) ──\n"
             "/hold add AAPL 100 @185.50 — add shares\n"
             "/hold add AAPL 100 @185.50 #wheel — with tag\n"
+            "/hold add AAPL 100 @185.50 --mom — mom's account\n"
             "/hold remove AAPL — remove all shares\n"
             "/hold remove AAPL 50 — partial sale\n"
             "/hold list — show all holdings + P/L\n"
             "/holdings — sentiment scan (EMA/VWAP/Vol)\n"
             "/portfolio — full dashboard (fundamentals + P/L)\n"
+            "\n── Day Trading ──\n"
+            "/daytrade +1234 — log daily P/L\n"
+            "/daytrade -500 — log a loss\n"
+            "/daytrade +800 --mom — log for mom\n"
+            "/daytrade summary — this month's totals\n"
+            "/daytrade history — last 30 entries\n"
+            "\n── Mutual Funds / ETFs ──\n"
+            "/fund — show current P/L\n"
+            "/fund set 50000 — set total invested\n"
+            "/fund update 54200 — update current value\n"
+            "/fund history — value snapshots over time\n"
             "\n── Options ──\n"
             "/sell put AAPL 180 2026-03-21 2.35 — sell CSP\n"
             "/sell call AAPL 195 2026-03-21 1.80 — sell CC\n"
@@ -403,6 +504,7 @@ def handle_command(
             "/pause — pause scheduled scans\n"
             "/resume — resume scheduled scans\n"
             "/help — show this message\n\n"
+            "💡 Add --mom to any portfolio command for mom's account\n"
             "— Not financial advice —"
         )
         send_reply(chat_id, msg)
@@ -414,7 +516,7 @@ def handle_command(
 
 
 # ─────────────────────────────────────────────────────────
-# INTERNAL HELPERS (Phase 2A + 2B)
+# INTERNAL HELPERS (Phase 2A + 2B + v3.2)
 # ─────────────────────────────────────────────────────────
 
 def _no_spot(ticker: str) -> float:
@@ -427,21 +529,23 @@ def _no_md_get(url: str, params=None):
     raise RuntimeError("MarketData API not available — md_get_fn not wired")
 
 
-def _safe_run(handler_fn, args, reply_fn, extra_arg, chat_id):
+def _safe_run(handler_fn, args, reply_fn, extra_arg, chat_id, account="brad"):
     """
     Wrapper to run a holdings_commands handler in a thread with error handling.
+
+    v3.2: All handlers now accept account as final kwarg.
     Handlers have different signatures:
-      handle_hold(args, send_fn, get_spot_fn)
-      handle_sell(args, send_fn)
-      handle_close(args, send_fn)
+      handle_hold(args, send_fn, get_spot_fn, account="brad")
+      handle_sell(args, send_fn, account="brad")
+      handle_close(args, send_fn, account="brad")
+      handle_daytrade(args, send_fn, account="brad")
       etc.
-    We pass extra_arg only if the handler accepts it (hold needs get_spot_fn).
     """
     try:
         if extra_arg is not None:
-            handler_fn(args, reply_fn, extra_arg)
+            handler_fn(args, reply_fn, extra_arg, account=account)
         else:
-            handler_fn(args, reply_fn)
+            handler_fn(args, reply_fn, account=account)
     except Exception as e:
         log.error(f"Portfolio command error: {type(e).__name__}: {e}")
         send_reply(chat_id, f"⚠️ Error: {type(e).__name__}: {str(e)[:120]}")
