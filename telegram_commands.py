@@ -105,13 +105,15 @@ def handle_command(
     check_fn,         # check_ticker function from app.py (v3)
     watchlist: list,
     get_spot_fn=None, # get_spot function from app.py (Phase 2A)
+    md_get_fn=None,   # md_get function from app.py (Phase 2B)
 ) -> None:
     """
     Parse and execute a Telegram command.
     Runs in a background thread to avoid blocking the webhook response.
 
     Phase 2A adds get_spot_fn for live price lookups in portfolio commands.
-    It's optional so existing callers don't break.
+    Phase 2B adds md_get_fn for sentiment analysis (candle/quote data).
+    Both optional so existing callers don't break.
     """
     if not is_authorized(user_id):
         send_reply(chat_id, "⛔ You are not authorized to use this bot.")
@@ -189,6 +191,16 @@ def handle_command(
         threading.Thread(
             target=_safe_run,
             args=(handle_wheel, args, reply, None, chat_id),
+            daemon=True,
+        ).start()
+        return
+
+    if cmd in ("/holdings", "/holdings@omegabot"):
+        from holdings_commands import handle_holdings
+        _md = md_get_fn or _no_md_get
+        threading.Thread(
+            target=_safe_run,
+            args=(handle_holdings, args, reply, _md, chat_id),
             daemon=True,
         ).start()
         return
@@ -361,6 +373,7 @@ def handle_command(
             "/hold remove AAPL — remove all shares\n"
             "/hold remove AAPL 50 — partial sale\n"
             "/hold list — show all holdings + P/L\n"
+            "/holdings — sentiment scan (EMA/VWAP/Vol)\n"
             "\n── Options ──\n"
             "/sell put AAPL 180 2026-03-21 2.35 — sell CSP\n"
             "/sell call AAPL 195 2026-03-21 1.80 — sell CC\n"
@@ -390,12 +403,17 @@ def handle_command(
 
 
 # ─────────────────────────────────────────────────────────
-# INTERNAL HELPERS (Phase 2A)
+# INTERNAL HELPERS (Phase 2A + 2B)
 # ─────────────────────────────────────────────────────────
 
 def _no_spot(ticker: str) -> float:
     """Placeholder when get_spot_fn not provided."""
     raise RuntimeError("Price lookup not available — get_spot_fn not wired")
+
+
+def _no_md_get(url: str, params=None):
+    """Placeholder when md_get_fn not provided."""
+    raise RuntimeError("MarketData API not available — md_get_fn not wired")
 
 
 def _safe_run(handler_fn, args, reply_fn, extra_arg, chat_id):
