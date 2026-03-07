@@ -551,3 +551,24 @@ def _wheel_summary(send_fn):
     lines.append(f"\nGrand Total Premium: {_fmt_money(grand_total)}")
     lines.append("\nUse /wheel TICKER for full history")
     send_fn("\n".join(lines))
+
+
+# ═══════════════════════════════════════════════════════════
+# /holdings COMMAND (Phase 2B — Sentiment Report)
+# ═══════════════════════════════════════════════════════════
+
+def handle_holdings(args: list, send_fn, md_get_fn):
+    """
+    /holdings → run sentiment scan on all holdings (EMA/VWAP/Vol + P/L)
+    Delegates to sentiment_report.generate_sentiment_report()
+    """
+    from sentiment_report import generate_sentiment_report
+
+    send_fn("🔍 Running sentiment scan...")
+
+    try:
+        report = generate_sentiment_report(md_get_fn)
+        send_fn(report)
+    except Exception as e:
+        log.error(f"/holdings error: {type(e).__name__}: {e}")
+        send_fn(f"⚠️ Sentiment scan failed: {type(e).__name__}: {str(e)[:120]}")
