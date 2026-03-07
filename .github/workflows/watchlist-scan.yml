@@ -1,5 +1,4 @@
 name: Watchlist Scan
-
 on:
   schedule:
     # GitHub schedules are UTC
@@ -7,7 +6,6 @@ on:
     - cron: "15 17 * * 1-5"   # 12:30pm Central
     - cron: "00 20 * * 1-5"   # 3:30pm Central
   workflow_dispatch:
-
 jobs:
   scan:
     runs-on: ubuntu-latest
@@ -18,5 +16,17 @@ jobs:
           SCAN_SECRET: ${{ secrets.SCAN_SECRET }}
         run: |
           curl -X POST "$BOT_URL/scan" \
+          -H "Content-Type: application/json" \
+          -d "{\"secret\":\"$SCAN_SECRET\"}"
+
+  holdings-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger holdings sentiment scan
+        env:
+          BOT_URL: ${{ secrets.BOT_URL }}
+          SCAN_SECRET: ${{ secrets.SCAN_SECRET }}
+        run: |
+          curl -X POST "$BOT_URL/holdings_scan" \
           -H "Content-Type: application/json" \
           -d "{\"secret\":\"$SCAN_SECRET\"}"
