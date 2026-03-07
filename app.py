@@ -8,6 +8,14 @@
 #   - Legacy scan route preserved (still uses old engine if needed)
 #   - Earnings week + dividend blocking enforced at trade level
 #   - Exit targets use Brad's 30%/35%/50% return-on-risk formula
+#
+# v3.2 UPGRADE — Multi-account portfolio support:
+#   - Two accounts: "brad" (default) and "mom"
+#   - Separate private Telegram channels for each portfolio
+#   - --mom flag on any portfolio command targets mom's account
+#   - Trade alerts (/tv, /scan) stay on the main channel
+#   - Scheduled holdings scans post BOTH portfolios to their channels
+#   - /daytrade command for logging daily P/L
 
 from telegram_commands import (
     handle_command,
@@ -66,7 +74,7 @@ app = Flask(__name__)
 # ENV VARS
 # ─────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN",  "").strip()
-TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID",    "").strip()
+TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID",    "").strip()   # main channel (trade alerts)
 TV_WEBHOOK_SECRET   = os.getenv("TV_WEBHOOK_SECRET",   "").strip()
 MARKETDATA_TOKEN    = os.getenv("MARKETDATA_TOKEN",    "").strip()
 WATCHLIST           = os.getenv("WATCHLIST",           "").strip()
@@ -75,6 +83,16 @@ BOT_URL             = os.getenv("BOT_URL",             "").strip()
 REDIS_URL           = os.getenv("REDIS_URL",           "").strip()
 SCAN_WORKERS        = int(os.getenv("SCAN_WORKERS", "4") or 4)
 DEDUP_TTL_SECONDS   = int(os.getenv("DEDUP_TTL_SECONDS", "3600") or 3600)
+
+# v3.2 — Private portfolio channels
+TELEGRAM_PORTFOLIO_CHAT_ID     = os.getenv("TELEGRAM_PORTFOLIO_CHAT_ID",     "").strip()  # Brad's private channel
+TELEGRAM_MOM_PORTFOLIO_CHAT_ID = os.getenv("TELEGRAM_MOM_PORTFOLIO_CHAT_ID", "").strip()  # Mom's private channel
+
+# Account → channel mapping
+ACCOUNT_CHAT_IDS = {
+    "brad": TELEGRAM_PORTFOLIO_CHAT_ID,
+    "mom":  TELEGRAM_MOM_PORTFOLIO_CHAT_ID,
+}
 
 # ─────────────────────────────────────────────────────────
 # REDIS (graceful fallback to in-memory)
@@ -147,11 +165,17 @@ def mark_trade_sent(ticker, direction, short_k, long_k):
 # TELEGRAM
 # ─────────────────────────────────────────────────────────
 
-def post_to_telegram(text: str, max_retries: int = 4):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+def post_to_telegram(text: str, max_retries: int = 4, chat_id: str = None):
+    """
+    Post a message to Telegram.
+    If chat_id is provided, posts to that specific channel.
+    Otherwise falls back to the main TELEGRAM_CHAT_ID (trade alerts channel).
+    """
+    cid = chat_id or TELEGRAM_CHAT_ID
+    if not TELEGRAM_BOT_TOKEN or not cid:
         return 400, "TELEGRAM tokens not set"
     url     = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True}
+    payload = {"chat_id": cid, "text": text, "disable_web_page_preview": True}
     last_err = ""
     for attempt in range(max_retries):
         try:
@@ -163,6 +187,15 @@ def post_to_telegram(text: str, max_retries: int = 4):
             last_err = str(e)
         time.sleep(min(1.5 * (attempt + 1), 6.0))
     return 500, f"Telegram failed: {last_err}"
+
+
+def get_portfolio_chat_id(account: str) -> str:
+    """
+    Get the private Telegram channel ID for a portfolio account.
+    Falls back to main TELEGRAM_CHAT_ID if the account channel isn't configured.
+    """
+    cid = ACCOUNT_CHAT_IDS.get(account, "")
+    return cid if cid else TELEGRAM_CHAT_ID
 
 # ─────────────────────────────────────────────────────────
 # MARKETDATA API
@@ -413,6 +446,7 @@ def check_ticker(
         if has_earnings and earnings_warn:
             card = earnings_warn + "\n\n" + card
 
+        # Trade alerts always go to main channel
         st, body = post_to_telegram(card)
 
         if st == 200:
@@ -454,14 +488,16 @@ def debug():
         "MARKETDATA_set":  bool(MARKETDATA_TOKEN),
         "REDIS_connected": r is not None,
         "WATCHLIST_len":   len([t for t in WATCHLIST.split(",") if t.strip()]),
-        "ENGINE_VERSION":  "v3",
+        "ENGINE_VERSION":  "v3.2",
         "SCAN_WORKERS":    SCAN_WORKERS,
         "DEDUP_TTL_S":     DEDUP_TTL_SECONDS,
+        "PORTFOLIO_CHANNEL_set": bool(TELEGRAM_PORTFOLIO_CHAT_ID),
+        "MOM_CHANNEL_set":       bool(TELEGRAM_MOM_PORTFOLIO_CHAT_ID),
     })
 
 @app.route("/tgtest", methods=["GET"])
 def tgtest():
-    st, body = post_to_telegram("✅ Telegram test OK (v3 engine)")
+    st, body = post_to_telegram("✅ Telegram test OK (v3.2 multi-account)")
     return jsonify({"status": st, "body": body})
 
 
@@ -497,8 +533,10 @@ def telegram_webhook(secret):
            full_scan_fn = lambda: scan_watchlist_internal(tickers),
            check_fn     = check_ticker,
            watchlist    = tickers,
-           get_spot_fn  = get_spot,       # ← NEW (Phase 2A)
-           md_get_fn    = md_get,         # ← NEW (Phase 2B)
+           get_spot_fn  = get_spot,
+           md_get_fn    = md_get,
+           post_fn      = post_to_telegram,               # v3.2
+           get_portfolio_chat_id_fn = get_portfolio_chat_id,  # v3.2
        )
 
 
@@ -580,7 +618,7 @@ def tv_webhook():
     # Run check in background — return to TradingView immediately
     def run_tv_check():
         try:
-            # Post signal context first
+            # Post signal context first (main channel)
             post_to_telegram(signal_msg)
 
             # Only process bull signals (per trading rules)
@@ -588,7 +626,7 @@ def tv_webhook():
                 post_to_telegram(f"ℹ️ {ticker}: {bias} signal skipped — bull only mode")
                 return
 
-            # Run v3 engine
+            # Run v3 engine (posts trade card to main channel)
             check_ticker(ticker, direction=bias, webhook_data=webhook_data)
 
         except Exception as e:
@@ -633,7 +671,7 @@ def scan_watchlist_internal(tickers: list, max_posts: int = 6):
             else:
                 no_trade.append(f"{ticker}: {res.get('reason', '—')[:40]}")
 
-    # Summary
+    # Summary (goes to main channel)
     summary_lines = [
         f"📋 WATCHLIST SUMMARY — {datetime.now(timezone.utc).strftime('%H:%M UTC')}",
         f"Scanned: {len(tickers)} | Trade cards: {posted}",
@@ -676,7 +714,7 @@ def scan_watchlist():
     return jsonify({"status": "accepted", "tickers": len(tickers)})
 
 # ─────────────────────────────────────────────────────────
-# HOLDINGS SENTIMENT SCAN (cron endpoint for daily scheduled scan)
+# HOLDINGS SENTIMENT SCAN (cron endpoint — posts BOTH accounts)
 # ─────────────────────────────────────────────────────────
 
 @app.route("/holdings_scan", methods=["POST"])
@@ -688,13 +726,21 @@ def holdings_scan():
         return jsonify({"error": "Unauthorized"}), 403
 
     def run_scan():
-        try:
-            from sentiment_report import generate_sentiment_report
-            report = generate_sentiment_report(md_get)
-            post_to_telegram(report)
-        except Exception as e:
-            log.error(f"Holdings scan error: {e}")
-            post_to_telegram(f"⚠️ Holdings scan failed: {type(e).__name__}")
+        from sentiment_report import generate_sentiment_report
+
+        # Scan BOTH accounts and post to their respective private channels
+        for account in ("brad", "mom"):
+            try:
+                report = generate_sentiment_report(md_get, account=account)
+                target_chat = get_portfolio_chat_id(account)
+                post_to_telegram(report, chat_id=target_chat)
+            except Exception as e:
+                log.error(f"Holdings scan error ({account}): {e}")
+                target_chat = get_portfolio_chat_id(account)
+                post_to_telegram(
+                    f"⚠️ Holdings scan failed ({account}): {type(e).__name__}",
+                    chat_id=target_chat,
+                )
 
     threading.Thread(target=run_scan, daemon=True).start()
     return jsonify({"status": "accepted"})
@@ -710,7 +756,7 @@ with app.app_context():
 
     # Phase 2A — Wire portfolio to the same Redis store
     portfolio.init_store(store_get, store_set)
-    
+
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
