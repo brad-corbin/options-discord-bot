@@ -745,6 +745,10 @@ def holdings_scan():
     threading.Thread(target=run_scan, daemon=True).start()
     return jsonify({"status": "accepted"})
 
+@app.route("/migrate", methods=["GET"])
+def migrate():
+    count = portfolio.migrate_to_multi_account()
+    return jsonify({"migrated": count, "status": "done"})
 # ─────────────────────────────────────────────────────────
 # STARTUP
 # ─────────────────────────────────────────────────────────
