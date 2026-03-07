@@ -572,3 +572,26 @@ def handle_holdings(args: list, send_fn, md_get_fn):
     except Exception as e:
         log.error(f"/holdings error: {type(e).__name__}: {e}")
         send_fn(f"⚠️ Sentiment scan failed: {type(e).__name__}: {str(e)[:120]}")
+
+
+# ═══════════════════════════════════════════════════════════
+# /portfolio COMMAND (Phase 2C — Full Dashboard)
+# ═══════════════════════════════════════════════════════════
+
+def handle_portfolio(args: list, send_fn, md_get_fn):
+    """
+    /portfolio → full dashboard (fundamentals + technicals + options)
+    Delegates to portfolio_dashboard.generate_dashboard()
+    Dashboard returns multiple messages to stay under Telegram limits.
+    """
+    from portfolio_dashboard import generate_dashboard
+
+    send_fn("📊 Building dashboard...")
+
+    try:
+        messages = generate_dashboard(md_get_fn)
+        for msg in messages:
+            send_fn(msg)
+    except Exception as e:
+        log.error(f"/portfolio error: {type(e).__name__}: {e}")
+        send_fn(f"⚠️ Dashboard failed: {type(e).__name__}: {str(e)[:120]}")
