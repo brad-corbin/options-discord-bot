@@ -39,8 +39,8 @@ def _key_options_counter(account: str = "brad") -> str:
 def _key_settings(account: str = "brad") -> str:
     return f"{account}:portfolio:settings"
 
-def _key_daytrades(account: str = "brad") -> str:
-    return f"{account}:portfolio:daytrades"
+def _key_cash(account: str = "brad") -> str:
+    return f"{account}:portfolio:cash"
 
 def _key_mutualfunds(account: str = "brad") -> str:
     return f"{account}:portfolio:mutualfunds"
@@ -502,45 +502,146 @@ def calc_wheel_pnl(ticker: str, account: str = "brad") -> dict:
 
 
 # ═══════════════════════════════════════════════════════════
-# DAY TRADE P/L LOG (v3.2)
+# CASH BALANCE TRACKING (v3.3)
 # ═══════════════════════════════════════════════════════════
+#
+# Instead of logging individual day trades, we track:
+#   - total_deposited: total cash you put INTO the brokerage account
+#   - cash_balance:    current cash sitting in the account (update periodically)
+#
+# The bot computes everything else automatically:
+#   - Holdings value   = sum(shares × current price)       ← live from API
+#   - Account value    = cash_balance + holdings_value
+#   - Total P/L        = account_value - total_deposited
+#   - Unrealized P/L   = holdings_value - holdings_cost_basis
+#   - Realized P/L     = total P/L - unrealized P/L
+#     (this captures day trades, closed options, everything)
+#
+# Commands:
+#   /cash deposit 50000     → set total cash deposited
+#   /cash deposit +5000     → add to deposits (transferred more money in)
+#   /cash 12345             → update current cash balance
+#   /cash                   → show account P/L breakdown
+#   /cash history           → show balance snapshots over time
 
-def add_daytrade(amount: float, note: str = "",
-                 account: str = "brad") -> dict:
+def get_cash_data(account: str = "brad") -> dict:
     """
-    Log a day trade net P/L entry.
+    Get cash balance data for an account.
+    Returns dict with total_deposited, cash_balance, last_updated, history.
+    """
+    key = _key_cash(account)
+    return _load_json(key, {
+        "total_deposited": 0.0,
+        "cash_balance":    0.0,
+        "last_updated":    None,
+        "history":         [],
+    })
+
+
+def set_total_deposited(amount: float, add: bool = False,
+                        account: str = "brad") -> dict:
+    """
+    Set (or add to) the total amount deposited into the brokerage account.
+    This is money you transferred IN — your baseline.
 
     Args:
-        amount:  Net P/L for the day (positive or negative)
-        note:    Optional note (e.g. "SPY scalps")
-        account: "brad" or "mom"
-
-    Returns the entry dict that was stored.
+        amount: Dollar amount
+        add:    If True, adds to existing deposits (e.g. wired in more cash).
+                If False, sets the total (e.g. initial setup).
     """
-    key = _key_daytrades(account)
-    trades = _load_json(key, [])
+    key = _key_cash(account)
+    data = get_cash_data(account=account)
 
-    entry = {
-        "date":   _today_str(),
-        "time":   datetime.now(timezone.utc).strftime("%H:%M UTC"),
-        "amount": round(amount, 2),
-        "note":   note,
+    if add:
+        data["total_deposited"] = round(data.get("total_deposited", 0) + amount, 2)
+    else:
+        data["total_deposited"] = round(amount, 2)
+
+    _save_json(key, data)
+    log.info(f"Cash [{account}]: deposits {'added' if add else 'set'} "
+             f"→ ${data['total_deposited']:,.2f}")
+    return data
+
+
+def update_cash_balance(balance: float, account: str = "brad") -> dict:
+    """
+    Update the current cash balance (what your broker shows as cash).
+    Records a history snapshot for tracking over time.
+    """
+    key = _key_cash(account)
+    data = get_cash_data(account=account)
+
+    today = _today_str()
+    data["cash_balance"] = round(balance, 2)
+    data["last_updated"] = today
+
+    # Add snapshot to history
+    data.setdefault("history", [])
+    data["history"].append({
+        "date":    today,
+        "cash":    round(balance, 2),
+    })
+
+    _save_json(key, data)
+    log.info(f"Cash [{account}]: balance updated to ${balance:,.2f}")
+    return data
+
+
+def calc_account_pnl(price_map: dict, account: str = "brad") -> dict:
+    """
+    Full account P/L breakdown.
+
+    price_map: {"AAPL": 192.30, ...} — current prices for holdings
+
+    Returns:
+        total_deposited:  money you put in
+        cash_balance:     cash sitting in account
+        holdings_cost:    total cost basis of shares
+        holdings_value:   total current market value of shares
+        account_value:    cash + holdings_value
+        unrealized_pnl:   holdings_value - holdings_cost
+        total_pnl:        account_value - total_deposited
+        realized_pnl:     total_pnl - unrealized_pnl
+        return_pct:       total P/L as % of deposits
+    """
+    cash_data = get_cash_data(account=account)
+    holdings  = get_all_holdings(account=account)
+
+    total_deposited = cash_data.get("total_deposited", 0)
+    cash_balance    = cash_data.get("cash_balance", 0)
+
+    # Calculate holdings cost and current value
+    holdings_cost  = 0.0
+    holdings_value = 0.0
+
+    for ticker, h in holdings.items():
+        shares = h.get("shares", 0)
+        cost   = h.get("cost_basis", 0)
+        holdings_cost += shares * cost
+
+        price = price_map.get(ticker)
+        if price is not None:
+            holdings_value += shares * price
+
+    account_value  = cash_balance + holdings_value
+    unrealized_pnl = round(holdings_value - holdings_cost, 2)
+    total_pnl      = round(account_value - total_deposited, 2)
+    realized_pnl   = round(total_pnl - unrealized_pnl, 2)
+    return_pct     = round((total_pnl / total_deposited) * 100, 2) if total_deposited > 0 else 0.0
+
+    return {
+        "total_deposited": total_deposited,
+        "cash_balance":    cash_balance,
+        "holdings_cost":   round(holdings_cost, 2),
+        "holdings_value":  round(holdings_value, 2),
+        "account_value":   round(account_value, 2),
+        "unrealized_pnl":  unrealized_pnl,
+        "realized_pnl":    realized_pnl,
+        "total_pnl":       total_pnl,
+        "return_pct":      return_pct,
+        "last_updated":    cash_data.get("last_updated"),
+        "num_snapshots":   len(cash_data.get("history", [])),
     }
-
-    trades.append(entry)
-    _save_json(key, trades)
-    log.info(f"Daytrade [{account}]: logged ${amount:+,.2f} on {entry['date']}")
-    return entry
-
-
-def get_daytrades(account: str = "brad") -> list:
-    """
-    Get all day trade entries for an account.
-    Returns list of dicts sorted by date (oldest first).
-    """
-    key = _key_daytrades(account)
-    trades = _load_json(key, [])
-    return sorted(trades, key=lambda t: t.get("date", ""))
 
 
 # ═══════════════════════════════════════════════════════════
