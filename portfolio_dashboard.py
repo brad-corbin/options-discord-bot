@@ -10,6 +10,8 @@
 #   - Analyst consensus target
 #   - Per-holding P/L overlay
 #
+# v3.2 — Multi-account support via account parameter
+#
 # Uses md_get from app.py (passed in at call time).
 # Uses get_iv_rank_from_candles from data_providers if available,
 # otherwise computes IV rank locally from candle HV as proxy.
@@ -228,10 +230,6 @@ def _fetch_quote_full(ticker: str, md_get: Callable) -> Optional[dict]:
 # ─────────────────────────────────────────────────────────
 # IV RANK (Historical Volatility proxy)
 # ─────────────────────────────────────────────────────────
-# True IV rank requires options IV data across 52 weeks.
-# As a credit-efficient proxy, we compute HV rank:
-#   - 20-day HV at each point over the last year
-#   - Current HV percentile within that range
 
 def _calc_hv(closes: list, window: int = HV_WINDOW) -> list:
     """
@@ -302,7 +300,8 @@ def _range_bar(pct: int) -> str:
 # PER-TICKER DASHBOARD DATA
 # ─────────────────────────────────────────────────────────
 
-def _analyze_holding(ticker: str, holding: dict, md_get: Callable) -> dict:
+def _analyze_holding(ticker: str, holding: dict, md_get: Callable,
+                     account: str = "brad") -> dict:
     """
     Fetch all dashboard data for one holding.
     Returns a dict with all fundamental + technical data.
@@ -363,7 +362,7 @@ def _analyze_holding(ticker: str, holding: dict, md_get: Callable) -> dict:
     result["earnings"] = earnings  # {"date": ..., "days_away": ...} or None
 
     # P/L
-    pnl = calc_holding_pnl(ticker, price)
+    pnl = calc_holding_pnl(ticker, price, account=account)
     if "error" not in pnl:
         result["unrealized"]  = pnl["unrealized"]
         result["opt_income"]  = pnl["opt_income"]
@@ -382,20 +381,16 @@ def _analyze_holding(ticker: str, holding: dict, md_get: Callable) -> dict:
 # FULL DASHBOARD REPORT
 # ─────────────────────────────────────────────────────────
 
-def generate_dashboard(md_get: Callable) -> list:
+def generate_dashboard(md_get: Callable, account: str = "brad") -> list:
     """
-    Generate full portfolio dashboard.
+    Generate full portfolio dashboard for a given account.
     Returns list of Telegram message strings (split to stay under limits).
-
-    Fetches data for all holdings in parallel, then formats:
-      1. Per-holding detail cards
-      2. Sector exposure breakdown
-      3. Earnings calendar
-      4. Portfolio totals
     """
-    holdings = get_all_holdings()
+    holdings = get_all_holdings(account=account)
+    acct_label = "👩 Mom" if account == "mom" else "📁 Brad"
+
     if not holdings:
-        return ["📊 No holdings to dashboard. Use /hold add TICKER SHARES @PRICE"]
+        return [f"📊 {acct_label} — No holdings to dashboard. Use /hold add TICKER SHARES @PRICE"]
 
     # Fetch all data in parallel
     results = []
@@ -403,7 +398,7 @@ def generate_dashboard(md_get: Callable) -> list:
 
     with ThreadPoolExecutor(max_workers=DASHBOARD_WORKERS) as executor:
         futures = {
-            executor.submit(_analyze_holding, ticker, h, md_get): ticker
+            executor.submit(_analyze_holding, ticker, h, md_get, account): ticker
             for ticker, h in holdings.items()
         }
         for future in as_completed(futures):
@@ -424,7 +419,7 @@ def generate_dashboard(md_get: Callable) -> list:
     messages = []
 
     # === PART 1: Holdings Detail ===
-    lines = [f"📊 PORTFOLIO DASHBOARD — {datetime.now(timezone.utc).strftime('%I:%M %p UTC')}\n"]
+    lines = [f"📊 {acct_label} — PORTFOLIO DASHBOARD — {datetime.now(timezone.utc).strftime('%I:%M %p UTC')}\n"]
 
     for r in results:
         lines.append(_format_holding_card(r))
@@ -475,7 +470,7 @@ def generate_dashboard(md_get: Callable) -> list:
     total_opt_income = sum(r.get("opt_income", 0) for r in results)
     combined = total_unrealized + total_opt_income
 
-    open_opts = get_open_options()
+    open_opts = get_open_options(account=account)
 
     lines2.append("💰 PORTFOLIO TOTALS\n")
     lines2.append(f"  Holdings: {len(results)} positions")
