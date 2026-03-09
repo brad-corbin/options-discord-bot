@@ -203,6 +203,17 @@ def handle_command(
         ).start()
         return
 
+    if cmd in ("/roll", "/roll@omegabot"):
+        account, clean_args = _parse_account_flag(args)
+        from holdings_commands import handle_roll
+        p_reply = _portfolio_reply(account)
+        threading.Thread(
+            target=_safe_run,
+            args=(handle_roll, clean_args, p_reply, None, chat_id, account),
+            daemon=True,
+        ).start()
+        return
+
     if cmd in ("/expire", "/expire@omegabot"):
         account, clean_args = _parse_account_flag(args)
         from holdings_commands import handle_expire
@@ -490,14 +501,15 @@ def handle_command(
             "\n── Options ──\n"
             "/sell put AAPL 180 2026-03-21 2.35 — sell CSP\n"
             "/sell call AAPL 195 2026-03-21 1.80 — sell CC\n"
+            "/roll opt_001 2026-04-17 185 2.50 — roll option\n"
             "/close opt_001 0.15 — buy back option\n"
             "/expire opt_001 — mark expired worthless\n"
-            "/assign opt_001 — mark assigned (auto-updates holdings)\n"
+            "/assign opt_001 — mark assigned\n"
             "/options — show open options\n"
             "/options history — show closed P/L\n"
             "\n── Wheel ──\n"
-            "/wheel AAPL — wheel history for ticker\n"
-            "/wheel — all wheel tickers summary\n"
+            "/wheel AAPL — full wheel analytics + adjusted basis\n"
+            "/wheel — all wheels with stage + premium\n"
             "\n── Settings ──\n"
             "/status — bot health + portfolio stats\n"
             "/watchlist — show all tickers\n"
