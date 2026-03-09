@@ -117,10 +117,15 @@ def handle_command(
     md_get_fn=None,
     post_fn=None,
     get_portfolio_chat_id_fn=None,
+    get_regime_fn=None,
 ) -> None:
     if not is_authorized(user_id):
         send_reply(chat_id, "⛔ You are not authorized to use this bot.")
         return
+
+    # Store regime fn reference for threaded handlers
+    global _get_regime_ref
+    _get_regime_ref = get_regime_fn
 
     text  = (text or "").strip()
     parts = text.split()
@@ -292,6 +297,49 @@ def handle_command(
         threading.Thread(
             target=_safe_run,
             args=(handle_spread, clean_args, p_reply, None, chat_id, account),
+            daemon=True,
+        ).start()
+        return
+
+    # ─────────────────────────────────────
+    # /risk — Portfolio Risk Dashboard (v3.5)
+    # ─────────────────────────────────────
+    if cmd in ("/risk", "/risk@omegabot"):
+        account, clean_args = _parse_account_flag(args)
+        from holdings_commands import handle_risk
+        p_reply = _portfolio_reply(account)
+        # handle_risk(args, send_fn, get_regime_fn, account)
+        threading.Thread(
+            target=_safe_run_with_regime,
+            args=(handle_risk, clean_args, p_reply, chat_id, account),
+            daemon=True,
+        ).start()
+        return
+
+    # ─────────────────────────────────────
+    # /regime — Market Regime Status (v3.5)
+    # ─────────────────────────────────────
+    if cmd in ("/regime", "/regime@omegabot"):
+        account, clean_args = _parse_account_flag(args)
+        from holdings_commands import handle_regime
+        p_reply = _portfolio_reply(account)
+        threading.Thread(
+            target=_safe_run_with_regime,
+            args=(handle_regime, clean_args, p_reply, chat_id, account),
+            daemon=True,
+        ).start()
+        return
+
+    # ─────────────────────────────────────
+    # /journal — Trade Journal & Analytics (v3.5)
+    # ─────────────────────────────────────
+    if cmd in ("/journal", "/journal@omegabot"):
+        account, clean_args = _parse_account_flag(args)
+        from holdings_commands import handle_journal
+        p_reply = _portfolio_reply(account)
+        threading.Thread(
+            target=_safe_run,
+            args=(handle_journal, clean_args, p_reply, None, chat_id, account),
             daemon=True,
         ).start()
         return
@@ -497,9 +545,18 @@ def handle_command(
             "/watchlist — show tickers\n"
             "/confidence 60 — set min confidence\n"
             "/pause | /resume — control scheduled scans\n"
+            "\n── Risk & Regime (v3.5) ──\n"
+            "/risk — portfolio risk dashboard\n"
+            "/regime — market regime (VIX + ADX)\n"
+            "/journal — trade analytics + backtest data\n"
+            "/journal AAPL — per-ticker stats\n"
+            "/journal signals — recent signal log\n"
+            "/journal trades — recent trade log\n"
+            "/journal attrs — Greeks P/L attribution\n"
             "/help — this message\n\n"
             "💡 --mom on any portfolio command for mom's account\n"
             "⚡ TV signals auto-warn if you have opposite spreads open\n"
+            "🛡️ Risk limits auto-block trades that exceed exposure caps\n"
             "— Not financial advice —"
         )
         send_reply(chat_id, msg)
@@ -531,3 +588,16 @@ def _safe_run(handler_fn, args, reply_fn, extra_arg, chat_id, account="brad"):
     except Exception as e:
         log.error(f"Portfolio command error: {type(e).__name__}: {e}")
         send_reply(chat_id, f"⚠️ Error: {type(e).__name__}: {str(e)[:120]}")
+
+
+def _safe_run_with_regime(handler_fn, args, reply_fn, chat_id, account="brad"):
+    """Wrapper for handlers that need get_regime_fn (handle_risk, handle_regime)."""
+    try:
+        handler_fn(args, reply_fn, get_regime_fn=_get_regime_ref, account=account)
+    except Exception as e:
+        log.error(f"Command error: {type(e).__name__}: {e}")
+        send_reply(chat_id, f"⚠️ Error: {type(e).__name__}: {str(e)[:120]}")
+
+
+# Reference to get_regime_fn — set by handle_command on each call
+_get_regime_ref = None
