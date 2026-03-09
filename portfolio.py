@@ -589,23 +589,26 @@ def update_cash_balance(balance: float, account: str = "brad") -> dict:
 
 def calc_account_pnl(price_map: dict, account: str = "brad") -> dict:
     """
-    Full account P/L breakdown.
+    Full account P/L breakdown — includes stocks AND mutual funds.
 
     price_map: {"AAPL": 192.30, ...} — current prices for holdings
 
     Returns:
-        total_deposited:  money you put in
+        total_deposited:  money you put in (across everything)
         cash_balance:     cash sitting in account
         holdings_cost:    total cost basis of shares
         holdings_value:   total current market value of shares
-        account_value:    cash + holdings_value
-        unrealized_pnl:   holdings_value - holdings_cost
+        fund_cost:        mutual fund cost basis
+        fund_value:       mutual fund current value
+        account_value:    cash + holdings_value + fund_value
+        unrealized_pnl:   (holdings_value - holdings_cost) + (fund_value - fund_cost)
         total_pnl:        account_value - total_deposited
         realized_pnl:     total_pnl - unrealized_pnl
         return_pct:       total P/L as % of deposits
     """
     cash_data = get_cash_data(account=account)
     holdings  = get_all_holdings(account=account)
+    fund_data = get_mutual_fund(account=account)
 
     total_deposited = cash_data.get("total_deposited", 0)
     cash_balance    = cash_data.get("cash_balance", 0)
@@ -623,8 +626,12 @@ def calc_account_pnl(price_map: dict, account: str = "brad") -> dict:
         if price is not None:
             holdings_value += shares * price
 
-    account_value  = cash_balance + holdings_value
-    unrealized_pnl = round(holdings_value - holdings_cost, 2)
+    # Include mutual funds
+    fund_cost  = fund_data.get("cost_basis", 0)
+    fund_value = fund_data.get("current_value", 0)
+
+    account_value  = cash_balance + holdings_value + fund_value
+    unrealized_pnl = round((holdings_value - holdings_cost) + (fund_value - fund_cost), 2)
     total_pnl      = round(account_value - total_deposited, 2)
     realized_pnl   = round(total_pnl - unrealized_pnl, 2)
     return_pct     = round((total_pnl / total_deposited) * 100, 2) if total_deposited > 0 else 0.0
@@ -634,6 +641,8 @@ def calc_account_pnl(price_map: dict, account: str = "brad") -> dict:
         "cash_balance":    cash_balance,
         "holdings_cost":   round(holdings_cost, 2),
         "holdings_value":  round(holdings_value, 2),
+        "fund_cost":       round(fund_cost, 2),
+        "fund_value":      round(fund_value, 2),
         "account_value":   round(account_value, 2),
         "unrealized_pnl":  unrealized_pnl,
         "realized_pnl":    realized_pnl,
