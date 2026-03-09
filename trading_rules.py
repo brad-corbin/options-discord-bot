@@ -154,6 +154,13 @@ SECTOR_MAP = {
     "SPX":   "index", "GLD":  "commodity",
 }
 
+# Portfolio-level Greeks caps (v3.6)
+# These are SOFT limits (warnings, not blocks).
+# Net delta/gamma/vega across all open spreads × contracts × 100.
+MAX_PORTFOLIO_DELTA      = 300                # Max ±300 net delta
+MAX_PORTFOLIO_GAMMA      = 50                 # Max ±50 net gamma
+MAX_PORTFOLIO_VEGA       = 150                # Max ±150 net vega
+
 
 # ═══════════════════════════════════════════════════════════
 # MARKET REGIME DETECTION (v3.5)
