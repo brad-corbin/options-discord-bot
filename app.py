@@ -47,7 +47,10 @@ from trading_rules import (
     ALLOWED_DIRECTIONS,
     NO_EARNINGS_WEEK,
     RV_LOOKBACK_DAYS,
+    JOURNAL_LOG_ALL_SIGNALS,
 )
+import risk_manager
+import trade_journal
 
 # ─────────────────────────────────────────────────────────
 # LOGGING
@@ -225,6 +228,47 @@ def get_daily_candles(ticker: str, days: int = 30) -> list:
     except Exception as e:
         log.warning(f"Daily candles fetch failed for {ticker}: {e}")
         return []
+
+def get_vix() -> float:
+    """Fetch current VIX spot level."""
+    try:
+        data = md_get(f"https://api.marketdata.app/v1/stocks/quotes/VIX/")
+        for field in ("last", "mid", "bid", "ask"):
+            v = as_float(data.get(field), 0.0)
+            if v > 0:
+                return v
+    except Exception as e:
+        log.warning(f"VIX fetch failed: {e}")
+    return 0.0
+
+# Cached regime — refreshed at most once per 5 minutes
+_regime_cache = {"data": None, "ts": 0}
+
+def get_current_regime() -> dict:
+    """
+    Get current market regime (VIX + ADX-based).
+    Cached for 5 minutes to avoid hammering the API.
+    """
+    import time as _time
+    now = _time.time()
+    if _regime_cache["data"] and (now - _regime_cache["ts"]) < 300:
+        return _regime_cache["data"]
+
+    try:
+        vix = get_vix()
+        spy_candles = get_daily_candles("SPY", days=30)
+        regime = risk_manager.classify_regime(
+            vix=vix,
+            spy_candles=spy_candles,
+        )
+        _regime_cache["data"] = regime
+        _regime_cache["ts"] = now
+        log.info(f"Regime: {regime.get('label')} (VIX {vix:.1f}, ADX {regime.get('adx', 0):.0f})")
+        return regime
+    except Exception as e:
+        log.warning(f"Regime detection failed: {e}")
+        return {"label": "UNKNOWN", "emoji": "❓", "vix": 0, "adx": 0,
+                "vix_regime": "UNKNOWN", "adx_regime": "UNKNOWN", "size_mult": 1.0}
 
 def get_options_chain(ticker: str) -> list:
     from trading_rules import MAX_EXPIRATIONS_TO_PULL
@@ -455,8 +499,12 @@ def check_ticker(
         # v3.4 — Fetch daily candles for RV calculation
         candle_closes = get_daily_candles(ticker, days=RV_LOOKBACK_DAYS + 5)
 
+        # v3.5 — Get current market regime
+        regime = get_current_regime()
+
         log.info(f"check_ticker({ticker}): spot={spot} expirations={len(chains)} "
-                 f"earnings={has_earnings} candles={len(candle_closes)}")
+                 f"earnings={has_earnings} candles={len(candle_closes)} "
+                 f"regime={regime.get('label', '?')}")
 
         all_recs = []
         all_reasons = []
@@ -471,7 +519,8 @@ def check_ticker(
                 webhook_data=webhook_data,
                 has_earnings=has_earnings,
                 has_dividend=has_dividend,
-                candle_closes=candle_closes,  # v3.4
+                candle_closes=candle_closes,
+                regime=regime,  # v3.5
             )
 
             if rec.get("ok"):
@@ -488,6 +537,13 @@ def check_ticker(
             combined_reason = "No valid spreads across any expiration"
             if all_reasons:
                 combined_reason += "\n" + "\n".join(all_reasons[:4])
+
+            # v3.5 — Log rejected signal
+            trade_journal.log_signal(
+                ticker, webhook_data, outcome="rejected",
+                reason=combined_reason[:200],
+            )
+
             return {
                 "ticker":     ticker,
                 "ok":         False,
@@ -517,6 +573,10 @@ def check_ticker(
 
         trade = best_rec.get("trade", {})
         if is_duplicate_trade(ticker, direction, trade.get("short"), trade.get("long")):
+            trade_journal.log_signal(
+                ticker, webhook_data, outcome="duplicate",
+                confidence=best_rec.get("confidence"),
+            )
             return {
                 "ticker": ticker,
                 "ok":     True,
@@ -524,7 +584,33 @@ def check_ticker(
                 "reason": "Duplicate trade in dedup window",
             }
 
+        # v3.5 — Risk check before posting
+        risk_result = risk_manager.check_risk_limits(
+            ticker=ticker,
+            debit=trade.get("debit", 0),
+            contracts=best_rec.get("contracts", 1),
+            regime=regime,
+        )
+
+        if not risk_result["allowed"]:
+            block_reasons = "; ".join(risk_result["blocks"])
+            trade_journal.log_signal(
+                ticker, webhook_data, outcome="risk_blocked",
+                confidence=best_rec.get("confidence"),
+                reason=block_reasons[:200],
+            )
+            # Still post the card but with risk warning
+            risk_warning = "🚫 RISK LIMIT HIT — DO NOT ENTER\n" + block_reasons + "\n\n"
+
         card = format_trade_card(best_rec)
+
+        # Prepend risk warning if blocked
+        if not risk_result["allowed"]:
+            card = risk_warning + card
+
+        # Add risk soft warnings to card
+        if risk_result.get("warnings"):
+            card += "\n⚠️ Risk: " + " | ".join(risk_result["warnings"][:3])
 
         if other_exps:
             alt_lines = ["\n📅 Other Expirations:"]
@@ -544,6 +630,13 @@ def check_ticker(
 
         if st == 200:
             mark_trade_sent(ticker, direction, trade.get("short"), trade.get("long"))
+
+        # v3.5 — Log signal to journal
+        trade_journal.log_signal(
+            ticker, webhook_data,
+            outcome="trade_opened" if risk_result["allowed"] else "risk_blocked",
+            confidence=best_rec.get("confidence"),
+        )
 
         return {
             "ticker":     ticker,
@@ -630,6 +723,7 @@ def telegram_webhook(secret):
            md_get_fn    = md_get,
            post_fn      = post_to_telegram,
            get_portfolio_chat_id_fn = get_portfolio_chat_id,
+           get_regime_fn = get_current_regime,  # v3.5
        )
 
     threading.Thread(target=run_command, daemon=True).start()
@@ -719,6 +813,7 @@ def tv_webhook():
 
             # If bearish, don't try to build a bull trade
             if bias == "bear":
+                trade_journal.log_signal(ticker, webhook_data, outcome="bear_signal")
                 log.info(f"TV bear signal for {ticker} — exit warning check complete")
                 return
 
@@ -852,6 +947,7 @@ with app.app_context():
         register_webhook(BOT_URL, _tg_ws)
 
     portfolio.init_store(store_get, store_set)
+    trade_journal.init_store(store_get, store_set)
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
