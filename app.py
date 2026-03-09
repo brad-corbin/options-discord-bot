@@ -35,7 +35,6 @@ from options_engine_v3 import (
     format_trade_card,
     as_float,
     as_int,
-    calc_realized_vol,
 )
 from data_providers import (
     enrich_ticker,
@@ -316,16 +315,30 @@ def get_options_chain(ticker: str) -> list:
 
 
 # ─────────────────────────────────────────────────────────
-# BEARISH EXIT WARNING (v3.4)
+# EXIT WARNING (v3.4 — supports both bull and bear spreads)
 # ─────────────────────────────────────────────────────────
 
-def check_bearish_exit_warning(ticker: str, webhook_data: dict):
+def check_spread_exit_warning(ticker: str, signal_bias: str, webhook_data: dict):
     """
-    Called when a bearish TV signal comes in.
-    Checks if we have any open debit spreads on this ticker (any account).
-    If so, posts an exit warning to the MAIN channel.
+    Called when a TV signal comes in. Checks if we have open spreads
+    on this ticker that are OPPOSITE to the signal direction.
+
+    Bear signal → warns about open BULL (call) spreads
+    Bull signal → warns about open BEAR (put) spreads
+
+    Exit warnings go to the MAIN channel.
     """
     ticker = ticker.upper()
+
+    # Determine which spread direction to warn about
+    if signal_bias == "bear":
+        warn_direction = "bull"
+        warn_side = "call"
+    elif signal_bias == "bull":
+        warn_direction = "bear"
+        warn_side = "put"
+    else:
+        return
 
     for account in ("brad", "mom"):
         try:
@@ -333,7 +346,15 @@ def check_bearish_exit_warning(ticker: str, webhook_data: dict):
             if not open_spreads:
                 continue
 
-            # Build warning message for each open spread
+            # Filter to spreads that are opposite to the signal
+            at_risk = [
+                sp for sp in open_spreads
+                if sp.get("direction", "bull") == warn_direction
+                or sp.get("side", "call") == warn_side
+            ]
+            if not at_risk:
+                continue
+
             tier = webhook_data.get("tier", "?")
             wt2 = as_float(webhook_data.get("wt2"), 0)
             close_price = as_float(webhook_data.get("close"), 0)
@@ -345,33 +366,42 @@ def check_bearish_exit_warning(ticker: str, webhook_data: dict):
 
             acct_label = "👩 Mom" if account == "mom" else "📁 Brad"
 
-            for sp in open_spreads:
+            for sp in at_risk:
                 sp_debit = sp.get("debit", 0)
                 sp_contracts = sp.get("contracts", 1)
                 total_risk = sp_debit * sp_contracts * 100
                 targets = sp.get("targets", {})
 
-                # Determine urgency level
                 short_strike = sp.get("short", 0)
                 long_strike = sp.get("long", 0)
+                sp_side = sp.get("side", "call")
+                side_label = "BULL CALL" if sp_side == "call" else "BEAR PUT"
 
                 urgency = "⚠️"
                 urgency_note = "Monitor position"
 
-                if close_price > 0 and short_strike > 0:
-                    if close_price <= short_strike:
+                if close_price > 0 and sp_side == "call":
+                    # Bull call spread at risk from bearish signal
+                    if short_strike > 0 and close_price <= short_strike:
                         urgency = "🚨"
                         urgency_note = "PRICE AT/BELOW SHORT STRIKE — spread losing value"
-                    elif close_price <= long_strike:
+                    elif long_strike > 0 and close_price <= long_strike:
+                        urgency = "🔴"
+                        urgency_note = "Price between strikes — partial loss territory"
+                elif close_price > 0 and sp_side == "put":
+                    # Bear put spread at risk from bullish signal
+                    if short_strike > 0 and close_price >= short_strike:
+                        urgency = "🚨"
+                        urgency_note = "PRICE AT/ABOVE SHORT STRIKE — spread losing value"
+                    elif long_strike > 0 and close_price >= long_strike:
                         urgency = "🔴"
                         urgency_note = "Price between strikes — partial loss territory"
 
-                # Check if near stop level
                 stop_level = targets.get("stop", 0)
 
                 lines = [
-                    f"{urgency} BEARISH EXIT WARNING — {ticker} ({acct_label})",
-                    f"TV Signal: T{tier} BEAR | Close: ${close_price:.2f}",
+                    f"{urgency} EXIT WARNING — {ticker} {side_label} ({acct_label})",
+                    f"TV Signal: T{tier} {signal_bias.upper()} | Close: ${close_price:.2f}",
                     f"1H Trend: {trend_str} | Wave: {wave_zone}",
                     "",
                     f"Open Spread: {sp['id']}",
@@ -393,9 +423,9 @@ def check_bearish_exit_warning(ticker: str, webhook_data: dict):
                     "— Not financial advice —",
                 ])
 
-                # Exit warnings go to MAIN channel (not private portfolio channel)
+                # Exit warnings go to MAIN channel
                 post_to_telegram("\n".join(lines))
-                log.info(f"Exit warning posted for {ticker} spread {sp['id']} ({account})")
+                log.info(f"Exit warning posted for {ticker} {side_label} spread {sp['id']} ({account})")
 
         except Exception as e:
             log.error(f"Exit warning check failed for {ticker}/{account}: {e}")
@@ -682,11 +712,15 @@ def tv_webhook():
             # Post signal context first (main channel)
             post_to_telegram(signal_msg)
 
-            # v3.4 — If BEARISH signal, check for open spreads and warn
+            # v3.4 — Check for open spreads in the OPPOSITE direction and warn
+            # Bear signal → warn bull call spreads
+            # Bull signal → warn bear put spreads
+            check_spread_exit_warning(ticker, bias, webhook_data)
+
+            # If bearish, don't try to build a bull trade
             if bias == "bear":
-                check_bearish_exit_warning(ticker, webhook_data)
                 log.info(f"TV bear signal for {ticker} — exit warning check complete")
-                return  # Don't try to build a bull trade from a bear signal
+                return
 
             # Only process bull signals for trade recommendations
             if bias not in ALLOWED_DIRECTIONS:
