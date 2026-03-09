@@ -88,6 +88,9 @@ CONFIDENCE_BOOSTS = {
     "rsi_mfi_bull":      5,     # RSI+MFI buying pressure
     "above_vwap":        5,     # Price above VWAP
     "wave_oversold":     10,    # Wave trend below -30
+    "iv_edge":           8,     # IV > RV = seller's edge, but we're buyers
+    "rv_edge":           10,    # RV > IV = buyer's edge (vol is cheap)
+    "within_em":         5,     # Spread strikes within expected move
 }
 
 CONFIDENCE_PENALTIES = {
@@ -98,6 +101,37 @@ CONFIDENCE_PENALTIES = {
     "wide_spread":       -5,    # Per leg with wide bid/ask
     "earnings_week":     -100,  # Instant kill
     "dividend_in_dte":   -100,  # Instant kill
+    "iv_crushed":        -5,    # IV rank very low (< 20%) — premiums thin
+    "beyond_em":         -8,    # Spread strikes outside expected move
 }
 
 MIN_CONFIDENCE_TO_TRADE  = 40    # Below this = no trade
+
+# ─────────────────────────────────────────────────────────
+# EXPECTED MOVE & IV vs RV EDGE (v3.4)
+# ─────────────────────────────────────────────────────────
+# Expected Move = spot × IV × sqrt(DTE/365)
+# Used to gauge whether spread strikes sit inside the
+# statistically likely range.
+#
+# IV vs RV edge:
+#   IV > RV → implied volatility is overpriced → seller's edge
+#   RV > IV → implied volatility is cheap → buyer's edge (good for us)
+#
+# RV is computed from recent candle data (20-day HV by default).
+
+EM_DISPLAY_ON_CARD       = True               # Show expected move on trade cards
+IV_RV_DISPLAY_ON_CARD    = True               # Show IV vs RV edge on trade cards
+
+# IV Rank thresholds
+IV_RANK_LOW              = 20                 # Below this = IV crushed (thin premiums)
+IV_RANK_HIGH             = 70                 # Above this = elevated IV
+
+# RV lookback period (trading days)
+RV_LOOKBACK_DAYS         = 20                 # 20 trading days ≈ 1 month
+RV_ANNUALIZE_FACTOR      = 252                # Trading days per year
+
+# Edge classification thresholds
+IV_RV_BUYER_EDGE_PCT     = -5.0              # If (IV - RV) < -5% → RV > IV → buyer's edge
+IV_RV_SELLER_EDGE_PCT    = 5.0               # If (IV - RV) > +5% → IV > RV → seller's edge
+# Between -5% and +5% = neutral / no edge
