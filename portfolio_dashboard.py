@@ -487,25 +487,8 @@ def generate_dashboard(md_get: Callable, account: str = "brad") -> list:
     if open_opts:
         lines2.append(f"  Open Options: {len(open_opts)}")
 
-    # Cash balance & account-level P/L (if configured)
-    cash_data = get_cash_data(account=account)
-    if cash_data.get("total_deposited", 0) > 0:
-        # Build price map from results for calc_account_pnl
-        price_map = {r["ticker"]: r["price"] for r in results if r.get("price")}
-        acct_pnl = calc_account_pnl(price_map, account=account)
-
-        real_emoji = "🟢" if acct_pnl["realized_pnl"] >= 0 else "🔴"
-        total_emoji = "🟢" if acct_pnl["total_pnl"] >= 0 else "🔴"
-
-        lines2.append("")
-        lines2.append("💵 ACCOUNT OVERVIEW\n")
-        lines2.append(f"  Deposited: ${acct_pnl['total_deposited']:,.0f}")
-        lines2.append(f"  Cash: ${acct_pnl['cash_balance']:,.0f}")
-        lines2.append(f"  Account Value: ${acct_pnl['account_value']:,.0f}")
-        lines2.append(f"  {real_emoji} Realized P/L: {_fmt_money(acct_pnl['realized_pnl'])}")
-        lines2.append(f"  {total_emoji} Total P/L: {_fmt_money(acct_pnl['total_pnl'])} ({_fmt_pct(acct_pnl['return_pct'])})")
-
-    # Mutual fund P/L (if configured)
+    # Mutual fund P/L (shown as its own line item)
+    fund_pnl = None
     try:
         fund_pnl = calc_mutual_fund_pnl(account=account)
         if fund_pnl.get("cost_basis", 0) > 0:
@@ -516,7 +499,30 @@ def generate_dashboard(md_get: Callable, account: str = "brad") -> list:
             lines2.append(f"  Value: ${fund_pnl['current_value']:,.0f}")
             lines2.append(f"  {fund_emoji} P/L: {_fmt_money(fund_pnl['pnl'])} ({_fmt_pct(fund_pnl['return_pct'])})")
     except Exception:
-        pass  # fund not configured
+        pass
+
+    # Full account overview (cash + stocks + mutual funds — one unified number)
+    cash_data = get_cash_data(account=account)
+    if cash_data.get("total_deposited", 0) > 0:
+        price_map = {r["ticker"]: r["price"] for r in results if r.get("price")}
+        acct_pnl = calc_account_pnl(price_map, account=account)
+
+        real_emoji = "🟢" if acct_pnl["realized_pnl"] >= 0 else "🔴"
+        unreal_emoji = "🟢" if acct_pnl["unrealized_pnl"] >= 0 else "🔴"
+        total_emoji = "🟢" if acct_pnl["total_pnl"] >= 0 else "🔴"
+
+        lines2.append("")
+        lines2.append("📊 FULL ACCOUNT OVERVIEW\n")
+        lines2.append(f"  Deposited:       ${acct_pnl['total_deposited']:,.0f}")
+        lines2.append(f"  Cash:            ${acct_pnl['cash_balance']:,.0f}")
+        lines2.append(f"  Holdings Value:  ${acct_pnl['holdings_value']:,.0f}")
+        if acct_pnl.get("fund_value", 0) > 0:
+            lines2.append(f"  Funds Value:     ${acct_pnl['fund_value']:,.0f}")
+        lines2.append(f"  Account Value:   ${acct_pnl['account_value']:,.0f}")
+        lines2.append("")
+        lines2.append(f"  {unreal_emoji} Unrealized: {_fmt_money(acct_pnl['unrealized_pnl'])}")
+        lines2.append(f"  {real_emoji} Realized:   {_fmt_money(acct_pnl['realized_pnl'])}")
+        lines2.append(f"  {total_emoji} Total P/L:  {_fmt_money(acct_pnl['total_pnl'])} ({_fmt_pct(acct_pnl['return_pct'])})")
 
     messages.append("\n".join(lines2))
 
