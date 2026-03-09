@@ -37,18 +37,13 @@ def check_risk_limits(
     contracts: int,
     account: str = "brad",
     regime: Dict = None,
+    new_trade_greeks: Dict = None,
 ) -> Dict:
     """
     Run all portfolio-level risk checks before opening a new spread.
 
-    Returns:
-        {
-            "allowed": True/False,
-            "warnings": [...],       # soft warnings (sector concentration, etc.)
-            "blocks": [...],         # hard blocks (daily loss, gross exposure, etc.)
-            "size_multiplier": 1.0,  # regime-adjusted sizing
-            "regime": {...},         # current market regime data
-        }
+    v3.6: Also checks portfolio-level net delta/gamma/vega limits.
+    new_trade_greeks: {"net_delta": 0.12, "net_gamma": 0.003, "net_vega": 0.02}
     """
     from trading_rules import (
         ACCOUNT_SIZE,
@@ -60,6 +55,7 @@ def check_risk_limits(
         REGIME_CRISIS_BLOCK,
         REGIME_ELEVATED_SIZE_MULT, REGIME_CHOPPY_SIZE_MULT,
         REGIME_TRENDING_SIZE_MULT,
+        MAX_PORTFOLIO_DELTA, MAX_PORTFOLIO_GAMMA, MAX_PORTFOLIO_VEGA,
     )
     from portfolio import get_open_spreads, calc_spread_pnl, get_all_spreads
 
@@ -129,7 +125,34 @@ def check_risk_limits(
             f"(soft limit: {MAX_SAME_SECTOR_SPREADS})"
         )
 
-    # ── 6. Market regime adjustments ──
+    # ── 6. Portfolio Greeks limits (v3.6) ──
+    port_greeks = calc_portfolio_greeks(account)
+    new_greeks = new_trade_greeks or {}
+    new_nd = new_greeks.get("net_delta", 0) * contracts * 100
+    new_ng = new_greeks.get("net_gamma", 0) * contracts * 100
+    new_nv = new_greeks.get("net_vega", 0) * contracts * 100
+
+    projected_delta = port_greeks["net_delta"] + new_nd
+    projected_gamma = port_greeks["net_gamma"] + new_ng
+    projected_vega = port_greeks["net_vega"] + new_nv
+
+    if MAX_PORTFOLIO_DELTA > 0 and abs(projected_delta) > MAX_PORTFOLIO_DELTA:
+        warnings.append(
+            f"Portfolio delta would be {projected_delta:+.0f} "
+            f"(limit: ±{MAX_PORTFOLIO_DELTA:.0f})"
+        )
+    if MAX_PORTFOLIO_GAMMA > 0 and abs(projected_gamma) > MAX_PORTFOLIO_GAMMA:
+        warnings.append(
+            f"Portfolio gamma would be {projected_gamma:+.1f} "
+            f"(limit: ±{MAX_PORTFOLIO_GAMMA:.0f})"
+        )
+    if MAX_PORTFOLIO_VEGA > 0 and abs(projected_vega) > MAX_PORTFOLIO_VEGA:
+        warnings.append(
+            f"Portfolio vega would be {projected_vega:+.1f} "
+            f"(limit: ±{MAX_PORTFOLIO_VEGA:.0f})"
+        )
+
+    # ── 7. Market regime adjustments ──
     vix_regime = regime.get("vix_regime", "NORMAL")
     adx_regime = regime.get("adx_regime", "MODERATE")
 
@@ -360,13 +383,88 @@ def _compute_adx(closes: List[float], period: int = 14) -> float:
 
 
 # ─────────────────────────────────────────────────────────
+# PORTFOLIO GREEKS (v3.6)
+# ─────────────────────────────────────────────────────────
+
+def calc_portfolio_greeks(account: str = "brad") -> Dict:
+    """
+    Compute aggregate Greeks across all open spreads.
+
+    Uses the entry Greeks stored in the trade journal (open entries).
+    This is an approximation — real-time Greeks would require live
+    options chain re-pricing, which costs API credits.
+
+    Returns:
+        net_delta:  sum of (net_delta × contracts × 100) across open spreads
+        net_gamma:  sum of (net_gamma × contracts × 100)
+        net_vega:   sum of (net_vega × contracts × 100)
+        net_theta:  sum of (net_theta × contracts × 100)
+        by_ticker:  {ticker: {delta, gamma, vega, theta}} breakdown
+    """
+    from portfolio import get_open_spreads
+
+    open_spreads = get_open_spreads(account=account)
+
+    totals = {"net_delta": 0, "net_gamma": 0, "net_vega": 0, "net_theta": 0}
+    by_ticker = {}
+
+    # Try to get entry Greeks from journal; fall back to spread record
+    for s in open_spreads:
+        ticker = s.get("ticker", "?")
+        contracts = s.get("contracts", 1)
+        multiplier = contracts * 100
+
+        # Look for Greeks in spread record or journal
+        nd = s.get("net_delta") or 0
+        ng = s.get("net_gamma") or 0
+        nv = s.get("net_vega") or 0
+        nt = s.get("net_theta") or 0
+
+        # If not on spread record, try journal
+        if nd == 0:
+            try:
+                from trade_journal import _find_open_entry
+                journal_entry = _find_open_entry(s.get("id", ""), account)
+                if journal_entry:
+                    ld = journal_entry.get("entry_delta_long") or 0
+                    sd = journal_entry.get("entry_delta_short") or 0
+                    nd = ld - sd
+                    nt = journal_entry.get("entry_net_theta") or 0
+                    nv = journal_entry.get("entry_net_vega") or 0
+            except Exception:
+                pass
+
+        d = nd * multiplier
+        g = ng * multiplier
+        v = nv * multiplier
+        t = nt * multiplier
+
+        totals["net_delta"] += d
+        totals["net_gamma"] += g
+        totals["net_vega"] += v
+        totals["net_theta"] += t
+
+        if ticker not in by_ticker:
+            by_ticker[ticker] = {"delta": 0, "gamma": 0, "vega": 0, "theta": 0}
+        by_ticker[ticker]["delta"] += d
+        by_ticker[ticker]["gamma"] += g
+        by_ticker[ticker]["vega"] += v
+        by_ticker[ticker]["theta"] += t
+
+    return {
+        "net_delta": round(totals["net_delta"], 2),
+        "net_gamma": round(totals["net_gamma"], 4),
+        "net_vega":  round(totals["net_vega"], 2),
+        "net_theta": round(totals["net_theta"], 2),
+        "by_ticker": {t: {k: round(v, 2) for k, v in d.items()} for t, d in by_ticker.items()},
+    }
+
+
+# ─────────────────────────────────────────────────────────
 # RISK DASHBOARD (for /risk command)
 # ─────────────────────────────────────────────────────────
 
 def get_risk_dashboard(account: str = "brad", regime: Dict = None) -> Dict:
-    """
-    Full risk status for display via /risk command.
-    """
     from trading_rules import (
         ACCOUNT_SIZE,
         MAX_GROSS_EXPOSURE_USD, MAX_GROSS_EXPOSURE_PCT,
@@ -374,13 +472,13 @@ def get_risk_dashboard(account: str = "brad", regime: Dict = None) -> Dict:
         DAILY_LOSS_LIMIT_USD, DAILY_LOSS_LIMIT_PCT,
         MAX_OPEN_SPREADS, MAX_SAME_SECTOR_SPREADS,
         SECTOR_MAP,
+        MAX_PORTFOLIO_DELTA, MAX_PORTFOLIO_GAMMA, MAX_PORTFOLIO_VEGA,
     )
     from portfolio import get_open_spreads
 
     regime = regime or {}
     open_spreads = get_open_spreads(account=account)
 
-    # Gross exposure
     gross = sum(
         s.get("debit", 0) * s.get("contracts", 1) * 100
         for s in open_spreads
@@ -388,7 +486,6 @@ def get_risk_dashboard(account: str = "brad", regime: Dict = None) -> Dict:
     gross_limit = min(MAX_GROSS_EXPOSURE_USD, ACCOUNT_SIZE * MAX_GROSS_EXPOSURE_PCT)
     gross_pct = round(gross / gross_limit * 100, 1) if gross_limit > 0 else 0
 
-    # Ticker exposure breakdown
     ticker_risk = {}
     for s in open_spreads:
         t = s.get("ticker", "?")
@@ -397,16 +494,17 @@ def get_risk_dashboard(account: str = "brad", regime: Dict = None) -> Dict:
 
     ticker_limit = min(MAX_TICKER_EXPOSURE_USD, ACCOUNT_SIZE * MAX_TICKER_EXPOSURE_PCT)
 
-    # Sector breakdown
     sector_counts = {}
     for s in open_spreads:
         t = s.get("ticker", "?")
         sector = SECTOR_MAP.get(t, "other")
         sector_counts[sector] = sector_counts.get(sector, 0) + 1
 
-    # Daily P/L
     daily_pnl = _calc_daily_realized_pnl(account)
     daily_limit = min(DAILY_LOSS_LIMIT_USD, ACCOUNT_SIZE * DAILY_LOSS_LIMIT_PCT)
+
+    # v3.6 — Portfolio Greeks
+    port_greeks = calc_portfolio_greeks(account)
 
     return {
         "open_count":       len(open_spreads),
@@ -421,4 +519,11 @@ def get_risk_dashboard(account: str = "brad", regime: Dict = None) -> Dict:
         "daily_pnl":        daily_pnl,
         "daily_limit":      round(daily_limit, 2),
         "regime":           regime,
+        # v3.6 — Portfolio Greeks
+        "portfolio_greeks": port_greeks,
+        "greek_limits": {
+            "delta": MAX_PORTFOLIO_DELTA,
+            "gamma": MAX_PORTFOLIO_GAMMA,
+            "vega":  MAX_PORTFOLIO_VEGA,
+        },
     }
