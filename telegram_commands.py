@@ -2,13 +2,8 @@
 # Telegram command interface for Omega 3000 Bot
 # NOTE: Educational/demo code. Not financial advice. Use at your own risk.
 #
-# v3 UPGRADE: Added /check TICKER command for on-demand trade analysis
-# v3.1 UPGRADE (Phase 2A): Added portfolio commands:
-#   /hold, /sell, /close, /expire, /assign, /options, /wheel
-# v3.2 UPGRADE: Multi-account portfolio support:
-#   --mom flag on portfolio commands → targets mom's account
-#   /cash 12345 → update cash balance for P/L tracking
-#   Portfolio replies route to private channels
+# v3.2 — Multi-account portfolio support
+# v3.4 — /spread command for debit spread tracking
 
 import os
 import logging
@@ -27,7 +22,6 @@ TELEGRAM_ADMIN_IDS  = [
     if x.strip()
 ]
 
-# Runtime state (stored in memory, survives within a session)
 _state = {
     "paused":          False,
     "confidence_gate": int(os.getenv("MIN_CONFIDENCE_TO_POST", "40") or 40),
@@ -58,7 +52,7 @@ def get_confidence_gate() -> int:
 
 def is_authorized(user_id: str) -> bool:
     if not TELEGRAM_ADMIN_IDS:
-        return True   # no whitelist = anyone can use (open mode)
+        return True
     return str(user_id) in TELEGRAM_ADMIN_IDS
 
 
@@ -105,15 +99,6 @@ def register_webhook(bot_url: str, webhook_secret: str):
 # ─────────────────────────────────────────────────────────
 
 def _parse_account_flag(args: list) -> tuple:
-    """
-    Check for --mom flag in args list.
-    Returns (account, cleaned_args) where account is "brad" or "mom".
-
-    Examples:
-      ["add", "AAPL", "100", "@185", "--mom"] → ("mom", ["add", "AAPL", "100", "@185"])
-      ["add", "AAPL", "100", "@185"]          → ("brad", ["add", "AAPL", "100", "@185"])
-      ["--mom", "add", "AAPL", "100", "@185"] → ("mom", ["add", "AAPL", "100", "@185"])
-    """
     cleaned = [a for a in args if a.lower() != "--mom"]
     has_mom = len(cleaned) < len(args)
     account = "mom" if has_mom else "brad"
@@ -124,23 +109,15 @@ def handle_command(
     user_id:   str,
     chat_id:   str,
     text:      str,
-    scan_fn,          # scan_ticker function from app.py
-    full_scan_fn,     # scan_watchlist logic from app.py
-    check_fn,         # check_ticker function from app.py (v3)
+    scan_fn,
+    full_scan_fn,
+    check_fn,
     watchlist: list,
-    get_spot_fn=None, # get_spot function from app.py (Phase 2A)
-    md_get_fn=None,   # md_get function from app.py (Phase 2B)
-    post_fn=None,     # post_to_telegram from app.py (v3.2)
-    get_portfolio_chat_id_fn=None,  # get_portfolio_chat_id from app.py (v3.2)
+    get_spot_fn=None,
+    md_get_fn=None,
+    post_fn=None,
+    get_portfolio_chat_id_fn=None,
 ) -> None:
-    """
-    Parse and execute a Telegram command.
-    Runs in a background thread to avoid blocking the webhook response.
-
-    v3.2 adds:
-      post_fn(text, chat_id=None)     — post to a specific channel
-      get_portfolio_chat_id_fn(acct)   — get private channel ID for an account
-    """
     if not is_authorized(user_id):
         send_reply(chat_id, "⛔ You are not authorized to use this bot.")
         return
@@ -150,15 +127,9 @@ def handle_command(
     cmd   = parts[0].lower() if parts else ""
     args  = parts[1:] if len(parts) > 1 else []
 
-    # Helper: send to the chat the command came from (default)
     reply = lambda msg: send_reply(chat_id, msg)
 
-    # v3.2 — Helper to build a reply function that targets the private portfolio channel
     def _portfolio_reply(account: str):
-        """
-        Returns a send function that posts to the correct private channel.
-        Falls back to the chat the command came from if channel not configured.
-        """
         if post_fn and get_portfolio_chat_id_fn:
             target_chat = get_portfolio_chat_id_fn(account)
             if target_chat:
@@ -166,7 +137,7 @@ def handle_command(
         return reply
 
     # ─────────────────────────────────────
-    # PHASE 2A — PORTFOLIO COMMANDS (v3.2: with --mom support)
+    # PORTFOLIO COMMANDS (v3.2: with --mom support)
     # ─────────────────────────────────────
 
     if cmd in ("/hold", "/hold@omegabot"):
@@ -298,7 +269,7 @@ def handle_command(
         return
 
     # ─────────────────────────────────────
-    # /fund — Mutual Fund / ETF balance tracker (v3.2)
+    # /fund — Mutual Fund / ETF tracker (v3.2)
     # ─────────────────────────────────────
     if cmd in ("/fund", "/fund@omegabot"):
         account, clean_args = _parse_account_flag(args)
@@ -312,7 +283,21 @@ def handle_command(
         return
 
     # ─────────────────────────────────────
-    # /check TICKER [bull|bear] — on-demand trade analysis (v3 engine)
+    # /spread — Debit Spread Tracking (v3.4)
+    # ─────────────────────────────────────
+    if cmd in ("/spread", "/spread@omegabot"):
+        account, clean_args = _parse_account_flag(args)
+        from holdings_commands import handle_spread
+        p_reply = _portfolio_reply(account)
+        threading.Thread(
+            target=_safe_run,
+            args=(handle_spread, clean_args, p_reply, None, chat_id, account),
+            daemon=True,
+        ).start()
+        return
+
+    # ─────────────────────────────────────
+    # /check TICKER [bull|bear]
     # ─────────────────────────────────────
     if cmd in ("/check", "/check@omegabot"):
         if not args:
@@ -336,7 +321,6 @@ def handle_command(
         def run_check():
             try:
                 result = check_fn(ticker, direction)
-                # check_fn posts the trade card directly to telegram
                 if not result.get("posted") and not result.get("ok"):
                     reason = result.get("reason") or result.get("error") or "no valid setup"
                     conf = result.get("confidence")
@@ -389,19 +373,22 @@ def handle_command(
         paused_str = "⏸ PAUSED" if _state["paused"] else "▶️ Running"
         conf_str   = str(_state["confidence_gate"])
 
-        # Phase 2A: Add portfolio stats to /status (both accounts)
         brad_holdings = 0
         brad_opts = 0
+        brad_spreads = 0
         mom_holdings = 0
         mom_opts = 0
+        mom_spreads = 0
         try:
-            from portfolio import get_all_holdings, get_open_options
+            from portfolio import get_all_holdings, get_open_options, get_open_spreads
             brad_holdings = len(get_all_holdings(account="brad"))
             brad_opts = len(get_open_options(account="brad"))
+            brad_spreads = len(get_open_spreads(account="brad"))
             mom_holdings = len(get_all_holdings(account="mom"))
             mom_opts = len(get_open_options(account="mom"))
+            mom_spreads = len(get_open_spreads(account="mom"))
         except Exception:
-            pass  # portfolio not initialized yet — no problem
+            pass
 
         msg = (
             f"🤖 Omega 3000 Status\n"
@@ -411,8 +398,8 @@ def handle_command(
             f"Total Scans: {_state['scan_count']}\n"
             f"Confidence Gate: {conf_str}/100\n"
             f"Watchlist: {len(watchlist)} tickers\n"
-            f"Brad: {brad_holdings} holdings | {brad_opts} open opts\n"
-            f"Mom:  {mom_holdings} holdings | {mom_opts} open opts\n"
+            f"Brad: {brad_holdings} hold | {brad_opts} opts | {brad_spreads} spreads\n"
+            f"Mom:  {mom_holdings} hold | {mom_opts} opts | {mom_spreads} spreads\n"
             f"Admins: {len(TELEGRAM_ADMIN_IDS)} authorized"
         )
         send_reply(chat_id, msg)
@@ -453,23 +440,14 @@ def handle_command(
         except ValueError:
             send_reply(chat_id, "⚠️ Usage: /confidence 60 (must be 0–100)")
 
-    # ─────────────────────────────────────
-    # /pause
-    # ─────────────────────────────────────
     elif cmd in ("/pause", "/pause@omegabot"):
         _state["paused"] = True
         send_reply(chat_id, "⏸ Bot paused. Scheduled scans will be skipped. Use /resume to restart.")
 
-    # ─────────────────────────────────────
-    # /resume
-    # ─────────────────────────────────────
     elif cmd in ("/resume", "/resume@omegabot"):
         _state["paused"] = False
         send_reply(chat_id, "▶️ Bot resumed. Scheduled scans will run normally.")
 
-    # ─────────────────────────────────────
-    # /help
-    # ─────────────────────────────────────
     elif cmd in ("/help", "/help@omegabot", "/start"):
         msg = (
             "🤖 Omega 3000 Commands:\n\n"
@@ -480,44 +458,46 @@ def handle_command(
             "/scan — run full watchlist scan\n"
             "\n── Portfolio (add --mom for mom's account) ──\n"
             "/hold add AAPL 100 @185.50 — add shares\n"
-            "/hold add AAPL 100 @185.50 #wheel — with tag\n"
-            "/hold add AAPL 100 @185.50 --mom — mom's account\n"
-            "/hold remove AAPL — remove all shares\n"
-            "/hold remove AAPL 50 — partial sale\n"
+            "/hold remove AAPL — remove shares\n"
             "/hold list — show all holdings + P/L\n"
-            "/holdings — sentiment scan (EMA/VWAP/Vol)\n"
-            "/portfolio — full dashboard (fundamentals + P/L)\n"
+            "/holdings — sentiment scan\n"
+            "/portfolio — full dashboard\n"
             "\n── Cash & Account P/L ──\n"
             "/cash deposit 50000 — set total deposited\n"
-            "/cash deposit +5000 — add a new deposit\n"
             "/cash 12345 — update cash balance\n"
-            "/cash — show full account P/L breakdown\n"
-            "/cash history — balance snapshots\n"
+            "/cash — show full account P/L\n"
             "\n── Mutual Funds / ETFs ──\n"
-            "/fund — show current P/L\n"
             "/fund set 50000 — set total invested\n"
             "/fund update 54200 — update current value\n"
-            "/fund history — value snapshots over time\n"
-            "\n── Options ──\n"
-            "/sell put AAPL 180 2026-03-21 2.35 — sell CSP\n"
-            "/sell call AAPL 195 2026-03-21 1.80 — sell CC\n"
-            "/roll opt_001 2026-04-17 185 2.50 — roll option\n"
-            "/close opt_001 0.15 — buy back option\n"
-            "/expire opt_001 — mark expired worthless\n"
-            "/assign opt_001 — mark assigned\n"
-            "/options — show open options\n"
-            "/options history — show closed P/L\n"
-            "\n── Wheel ──\n"
-            "/wheel AAPL — full wheel analytics + adjusted basis\n"
-            "/wheel — all wheels with stage + premium\n"
+            "/fund — show P/L\n"
+            "\n── Debit Spreads (v3.4) ──\n"
+            "/spread add AAPL 570/571 0.65 2026-03-14 x3\n"
+            "/spread close sp_001 0.91 — close at price\n"
+            "/spread stop sp_001 — stopped out\n"
+            "/spread expire sp_001 — expired ITM\n"
+            "/spread expire sp_001 otm — expired OTM\n"
+            "/spread list — show open spreads\n"
+            "/spread history — closed P/L\n"
+            "/spread summary — win rate + totals\n"
+            "\n── Options (wheel) ──\n"
+            "/sell put AAPL 180 2026-03-21 2.35\n"
+            "/sell call AAPL 195 2026-03-21 1.80\n"
+            "/roll opt_001 2026-04-17 185 2.50\n"
+            "/close opt_001 0.15 — buy back\n"
+            "/expire opt_001 — expired worthless\n"
+            "/assign opt_001 — assigned\n"
+            "/options — open options\n"
+            "/options history — closed P/L\n"
+            "/wheel AAPL — wheel analytics\n"
+            "/wheel — all wheels summary\n"
             "\n── Settings ──\n"
             "/status — bot health + portfolio stats\n"
-            "/watchlist — show all tickers\n"
-            "/confidence 60 — set min confidence gate\n"
-            "/pause — pause scheduled scans\n"
-            "/resume — resume scheduled scans\n"
-            "/help — show this message\n\n"
-            "💡 Add --mom to any portfolio command for mom's account\n"
+            "/watchlist — show tickers\n"
+            "/confidence 60 — set min confidence\n"
+            "/pause | /resume — control scheduled scans\n"
+            "/help — this message\n\n"
+            "💡 --mom on any portfolio command for mom's account\n"
+            "⚡ Bearish TV signals auto-warn if you have open spreads\n"
             "— Not financial advice —"
         )
         send_reply(chat_id, msg)
@@ -529,31 +509,18 @@ def handle_command(
 
 
 # ─────────────────────────────────────────────────────────
-# INTERNAL HELPERS (Phase 2A + 2B + v3.2)
+# INTERNAL HELPERS
 # ─────────────────────────────────────────────────────────
 
 def _no_spot(ticker: str) -> float:
-    """Placeholder when get_spot_fn not provided."""
     raise RuntimeError("Price lookup not available — get_spot_fn not wired")
 
 
 def _no_md_get(url: str, params=None):
-    """Placeholder when md_get_fn not provided."""
     raise RuntimeError("MarketData API not available — md_get_fn not wired")
 
 
 def _safe_run(handler_fn, args, reply_fn, extra_arg, chat_id, account="brad"):
-    """
-    Wrapper to run a holdings_commands handler in a thread with error handling.
-
-    v3.2: All handlers now accept account as final kwarg.
-    Handlers have different signatures:
-      handle_hold(args, send_fn, get_spot_fn, account="brad")
-      handle_sell(args, send_fn, account="brad")
-      handle_close(args, send_fn, account="brad")
-      handle_cash(args, send_fn, get_spot_fn, account="brad")
-      etc.
-    """
     try:
         if extra_arg is not None:
             handler_fn(args, reply_fn, extra_arg, account=account)
