@@ -13,6 +13,10 @@
 #   - Mutual fund / ETF lump balance tracking
 #   - One-time migration helper for existing data
 #
+# v3.4 — Spread tracking:
+#   - open/close/stop debit spread positions
+#   - get_open_spreads_for_ticker() used by TV webhook exit warnings
+#
 # Uses the same store_get/store_set pattern from app.py.
 # All data is JSON-serialized in Redis (or in-memory fallback).
 
@@ -44,6 +48,12 @@ def _key_cash(account: str = "brad") -> str:
 
 def _key_mutualfunds(account: str = "brad") -> str:
     return f"{account}:portfolio:mutualfunds"
+
+def _key_spreads(account: str = "brad") -> str:
+    return f"{account}:portfolio:spreads"
+
+def _key_spreads_counter(account: str = "brad") -> str:
+    return f"{account}:portfolio:spreads:counter"
 
 # Legacy keys (pre-v3.2, no account prefix)
 _LEGACY_KEY_HOLDINGS        = "portfolio:holdings"
@@ -107,6 +117,15 @@ def _next_option_id(account: str = "brad") -> str:
     n += 1
     _set(key, str(n))
     return f"opt_{n:03d}"
+
+def _next_spread_id(account: str = "brad") -> str:
+    """Auto-increment spread ID: sp_001, sp_002, ..."""
+    key = _key_spreads_counter(account)
+    raw = _get(key)
+    n = int(raw) if raw else 0
+    n += 1
+    _set(key, str(n))
+    return f"sp_{n:03d}"
 
 
 # ═══════════════════════════════════════════════════════════
@@ -648,31 +667,8 @@ def calc_wheel_pnl(ticker: str, account: str = "brad") -> dict:
 # ═══════════════════════════════════════════════════════════
 # CASH BALANCE TRACKING (v3.3)
 # ═══════════════════════════════════════════════════════════
-#
-# Instead of logging individual day trades, we track:
-#   - total_deposited: total cash you put INTO the brokerage account
-#   - cash_balance:    current cash sitting in the account (update periodically)
-#
-# The bot computes everything else automatically:
-#   - Holdings value   = sum(shares × current price)       ← live from API
-#   - Account value    = cash_balance + holdings_value
-#   - Total P/L        = account_value - total_deposited
-#   - Unrealized P/L   = holdings_value - holdings_cost_basis
-#   - Realized P/L     = total P/L - unrealized P/L
-#     (this captures day trades, closed options, everything)
-#
-# Commands:
-#   /cash deposit 50000     → set total cash deposited
-#   /cash deposit +5000     → add to deposits (transferred more money in)
-#   /cash 12345             → update current cash balance
-#   /cash                   → show account P/L breakdown
-#   /cash history           → show balance snapshots over time
 
 def get_cash_data(account: str = "brad") -> dict:
-    """
-    Get cash balance data for an account.
-    Returns dict with total_deposited, cash_balance, last_updated, history.
-    """
     key = _key_cash(account)
     return _load_json(key, {
         "total_deposited": 0.0,
@@ -684,15 +680,6 @@ def get_cash_data(account: str = "brad") -> dict:
 
 def set_total_deposited(amount: float, add: bool = False,
                         account: str = "brad") -> dict:
-    """
-    Set (or add to) the total amount deposited into the brokerage account.
-    This is money you transferred IN — your baseline.
-
-    Args:
-        amount: Dollar amount
-        add:    If True, adds to existing deposits (e.g. wired in more cash).
-                If False, sets the total (e.g. initial setup).
-    """
     key = _key_cash(account)
     data = get_cash_data(account=account)
 
@@ -708,10 +695,6 @@ def set_total_deposited(amount: float, add: bool = False,
 
 
 def update_cash_balance(balance: float, account: str = "brad") -> dict:
-    """
-    Update the current cash balance (what your broker shows as cash).
-    Records a history snapshot for tracking over time.
-    """
     key = _key_cash(account)
     data = get_cash_data(account=account)
 
@@ -719,7 +702,6 @@ def update_cash_balance(balance: float, account: str = "brad") -> dict:
     data["cash_balance"] = round(balance, 2)
     data["last_updated"] = today
 
-    # Add snapshot to history
     data.setdefault("history", [])
     data["history"].append({
         "date":    today,
@@ -732,24 +714,6 @@ def update_cash_balance(balance: float, account: str = "brad") -> dict:
 
 
 def calc_account_pnl(price_map: dict, account: str = "brad") -> dict:
-    """
-    Full account P/L breakdown — includes stocks AND mutual funds.
-
-    price_map: {"AAPL": 192.30, ...} — current prices for holdings
-
-    Returns:
-        total_deposited:  money you put in (across everything)
-        cash_balance:     cash sitting in account
-        holdings_cost:    total cost basis of shares
-        holdings_value:   total current market value of shares
-        fund_cost:        mutual fund cost basis
-        fund_value:       mutual fund current value
-        account_value:    cash + holdings_value + fund_value
-        unrealized_pnl:   (holdings_value - holdings_cost) + (fund_value - fund_cost)
-        total_pnl:        account_value - total_deposited
-        realized_pnl:     total_pnl - unrealized_pnl
-        return_pct:       total P/L as % of deposits
-    """
     cash_data = get_cash_data(account=account)
     holdings  = get_all_holdings(account=account)
     fund_data = get_mutual_fund(account=account)
@@ -757,7 +721,6 @@ def calc_account_pnl(price_map: dict, account: str = "brad") -> dict:
     total_deposited = cash_data.get("total_deposited", 0)
     cash_balance    = cash_data.get("cash_balance", 0)
 
-    # Calculate holdings cost and current value
     holdings_cost  = 0.0
     holdings_value = 0.0
 
@@ -770,7 +733,6 @@ def calc_account_pnl(price_map: dict, account: str = "brad") -> dict:
         if price is not None:
             holdings_value += shares * price
 
-    # Include mutual funds
     fund_cost  = fund_data.get("cost_basis", 0)
     fund_value = fund_data.get("current_value", 0)
 
@@ -800,24 +762,8 @@ def calc_account_pnl(price_map: dict, account: str = "brad") -> dict:
 # ═══════════════════════════════════════════════════════════
 # MUTUAL FUND / ETF LUMP BALANCE TRACKER (v3.2)
 # ═══════════════════════════════════════════════════════════
-#
-# Stores a single lump record per account:
-#   - cost_basis:    total amount originally invested
-#   - current_value: last-updated market value
-#   - last_updated:  date of last value update
-#   - history:       list of {date, value} snapshots for P/L over time
-#
-# Commands:
-#   /fund set 50000           → set original cost basis
-#   /fund update 54200        → update current market value (adds snapshot)
-#   /fund                     → show current P/L
-#   /fund history             → show value over time
 
 def get_mutual_fund(account: str = "brad") -> dict:
-    """
-    Get the mutual fund / ETF lump balance for an account.
-    Returns dict with cost_basis, current_value, last_updated, history.
-    """
     key = _key_mutualfunds(account)
     return _load_json(key, {
         "cost_basis":    0.0,
@@ -828,10 +774,6 @@ def get_mutual_fund(account: str = "brad") -> dict:
 
 
 def set_mutual_fund_basis(cost_basis: float, account: str = "brad") -> dict:
-    """
-    Set (or reset) the original cost basis for mutual funds.
-    This is the total amount invested across all mutual funds / ETFs.
-    """
     key = _key_mutualfunds(account)
     fund = get_mutual_fund(account=account)
     fund["cost_basis"] = round(cost_basis, 2)
@@ -844,10 +786,6 @@ def set_mutual_fund_basis(cost_basis: float, account: str = "brad") -> dict:
 
 def update_mutual_fund_value(current_value: float,
                              account: str = "brad") -> dict:
-    """
-    Update the current market value and record a history snapshot.
-    Call this periodically (weekly, monthly) to track P/L over time.
-    """
     key = _key_mutualfunds(account)
     fund = get_mutual_fund(account=account)
 
@@ -855,7 +793,6 @@ def update_mutual_fund_value(current_value: float,
     fund["current_value"] = round(current_value, 2)
     fund["last_updated"]  = today
 
-    # Add snapshot to history
     fund.setdefault("history", [])
     fund["history"].append({
         "date":  today,
@@ -868,10 +805,6 @@ def update_mutual_fund_value(current_value: float,
 
 
 def calc_mutual_fund_pnl(account: str = "brad") -> dict:
-    """
-    Calculate P/L for the mutual fund lump balance.
-    Returns dict with cost_basis, current_value, pnl, return_pct.
-    """
     fund = get_mutual_fund(account=account)
     cost    = fund.get("cost_basis", 0)
     current = fund.get("current_value", 0)
@@ -885,6 +818,238 @@ def calc_mutual_fund_pnl(account: str = "brad") -> dict:
         "return_pct":    pct,
         "last_updated":  fund.get("last_updated"),
         "num_snapshots": len(fund.get("history", [])),
+    }
+
+
+# ═══════════════════════════════════════════════════════════
+# SPREAD TRACKING (v3.4)
+# ═══════════════════════════════════════════════════════════
+#
+# Tracks open debit spreads so the bot can:
+#   1. Show you what's currently on (/spread list)
+#   2. Fire exit warnings when a bearish TV signal hits a ticker
+#      you have an open spread on
+#
+# Each spread record:
+#   {
+#     "id":         "sp_001",
+#     "ticker":     "AAPL",
+#     "direction":  "bull",
+#     "side":       "call",
+#     "long":       570.0,       # long strike
+#     "short":      571.0,       # short strike
+#     "width":      1.0,
+#     "debit":      0.65,        # per-contract cost
+#     "contracts":  3,
+#     "exp":        "2026-03-14",
+#     "open_date":  "2026-03-10",
+#     "close_date": null,
+#     "close_price": null,        # per-contract close price
+#     "status":     "open",       # open / closed / stopped / expired
+#     "notes":      "",
+#     "targets": {
+#       "same_day": 0.85,
+#       "next_day": 0.88,
+#       "extended": 0.98,
+#       "stop":     0.39
+#     }
+#   }
+
+def get_all_spreads(account: str = "brad") -> list:
+    """Return all spread records (open + closed)."""
+    return _load_json(_key_spreads(account), [])
+
+
+def get_open_spreads(account: str = "brad") -> list:
+    """Return only open spreads."""
+    return [s for s in get_all_spreads(account=account) if s.get("status") == "open"]
+
+
+def get_open_spreads_for_ticker(ticker: str, account: str = "brad") -> list:
+    """
+    Get open spreads for a specific ticker.
+    Used by TV webhook to check if a bearish signal should trigger an exit warning.
+    """
+    ticker = ticker.upper()
+    return [
+        s for s in get_all_spreads(account=account)
+        if s.get("ticker") == ticker and s.get("status") == "open"
+    ]
+
+
+def get_spread_by_id(sp_id: str, account: str = "brad") -> Optional[dict]:
+    """Find a spread by ID."""
+    for s in get_all_spreads(account=account):
+        if s.get("id") == sp_id:
+            return s
+    return None
+
+
+def add_spread(ticker: str, long_strike: float, short_strike: float,
+               debit: float, exp: str, contracts: int = 1,
+               direction: str = "bull", side: str = "call",
+               notes: str = "", account: str = "brad") -> dict:
+    """
+    Record a new debit spread position.
+    Returns the new spread dict.
+    """
+    from trading_rules import SAME_DAY_EXIT_PCT, NEXT_DAY_EXIT_PCT, EXTENDED_HOLD_EXIT_PCT, STOP_LOSS_PCT
+
+    spreads = get_all_spreads(account=account)
+    sp_id = _next_spread_id(account=account)
+
+    ticker = ticker.upper()
+    width = round(abs(short_strike - long_strike), 2)
+
+    # Compute exit targets
+    targets = {
+        "same_day": round(debit * (1 + SAME_DAY_EXIT_PCT), 2),
+        "next_day": round(debit * (1 + NEXT_DAY_EXIT_PCT), 2),
+        "extended": round(debit * (1 + EXTENDED_HOLD_EXIT_PCT), 2),
+        "stop":     round(debit * (1 - STOP_LOSS_PCT), 2),
+    }
+
+    new_spread = {
+        "id":          sp_id,
+        "ticker":      ticker,
+        "direction":   direction.lower(),
+        "side":        side.lower(),
+        "long":        round(long_strike, 2),
+        "short":       round(short_strike, 2),
+        "width":       width,
+        "debit":       round(debit, 2),
+        "contracts":   contracts,
+        "exp":         exp,
+        "open_date":   _today_str(),
+        "close_date":  None,
+        "close_price": None,
+        "status":      "open",
+        "notes":       notes,
+        "targets":     targets,
+    }
+
+    spreads.append(new_spread)
+    _save_json(_key_spreads(account), spreads)
+
+    total_risk = debit * contracts * 100
+    log.info(f"Spreads [{account}]: opened {sp_id} — {direction} {side} "
+             f"{ticker} {long_strike}/{short_strike} @${debit} x{contracts} "
+             f"exp {exp} (${total_risk:,.0f} risk)")
+    return new_spread
+
+
+def close_spread(sp_id: str, close_price: float,
+                 account: str = "brad") -> dict:
+    """
+    Close a spread at close_price (per-contract).
+    Returns the updated spread dict with P/L.
+    """
+    spreads = get_all_spreads(account=account)
+    for s in spreads:
+        if s["id"] == sp_id:
+            if s["status"] != "open":
+                return {"error": f"{sp_id} is already {s['status']}"}
+
+            s["status"]      = "closed"
+            s["close_date"]  = _today_str()
+            s["close_price"] = round(close_price, 2)
+            _save_json(_key_spreads(account), spreads)
+
+            pnl = calc_spread_pnl(s)
+            log.info(f"Spreads [{account}]: closed {sp_id} @${close_price} P/L=${pnl:,.2f}")
+            return {**s, "pnl": pnl}
+
+    return {"error": f"{sp_id} not found"}
+
+
+def stop_spread(sp_id: str, account: str = "brad") -> dict:
+    """
+    Mark spread as stopped out (closed at $0 = total loss).
+    """
+    spreads = get_all_spreads(account=account)
+    for s in spreads:
+        if s["id"] == sp_id:
+            if s["status"] != "open":
+                return {"error": f"{sp_id} is already {s['status']}"}
+
+            s["status"]      = "stopped"
+            s["close_date"]  = _today_str()
+            s["close_price"] = 0.0
+            _save_json(_key_spreads(account), spreads)
+
+            pnl = calc_spread_pnl(s)
+            log.info(f"Spreads [{account}]: stopped {sp_id} P/L=${pnl:,.2f}")
+            return {**s, "pnl": pnl}
+
+    return {"error": f"{sp_id} not found"}
+
+
+def expire_spread(sp_id: str, itm: bool = True,
+                  account: str = "brad") -> dict:
+    """
+    Mark spread as expired.
+    itm=True → expired ITM → max profit (close_price = width)
+    itm=False → expired OTM → total loss (close_price = 0)
+    """
+    spreads = get_all_spreads(account=account)
+    for s in spreads:
+        if s["id"] == sp_id:
+            if s["status"] != "open":
+                return {"error": f"{sp_id} is already {s['status']}"}
+
+            s["status"]      = "expired"
+            s["close_date"]  = _today_str()
+            s["close_price"] = s["width"] if itm else 0.0
+            _save_json(_key_spreads(account), spreads)
+
+            pnl = calc_spread_pnl(s)
+            log.info(f"Spreads [{account}]: expired {sp_id} "
+                     f"{'ITM (max profit)' if itm else 'OTM (total loss)'} "
+                     f"P/L=${pnl:,.2f}")
+            return {**s, "pnl": pnl}
+
+    return {"error": f"{sp_id} not found"}
+
+
+def calc_spread_pnl(spread: dict) -> float:
+    """
+    Calculate P/L for a spread.
+    For debit spreads: P/L = (close_price - debit) × contracts × 100
+    """
+    if spread.get("status") == "open":
+        return 0.0
+
+    debit       = spread.get("debit", 0)
+    close_price = spread.get("close_price", 0) or 0
+    contracts   = spread.get("contracts", 1)
+
+    pnl = (close_price - debit) * contracts * 100
+    return round(pnl, 2)
+
+
+def calc_spread_summary(account: str = "brad") -> dict:
+    """
+    Summary of all spread activity for an account.
+    """
+    all_spreads = get_all_spreads(account=account)
+    open_spreads = [s for s in all_spreads if s["status"] == "open"]
+    closed_spreads = [s for s in all_spreads if s["status"] != "open"]
+
+    total_open_risk = sum(s["debit"] * s["contracts"] * 100 for s in open_spreads)
+    total_realized = sum(calc_spread_pnl(s) for s in closed_spreads)
+
+    wins = sum(1 for s in closed_spreads if calc_spread_pnl(s) > 0)
+    losses = sum(1 for s in closed_spreads if calc_spread_pnl(s) < 0)
+
+    return {
+        "total_spreads":   len(all_spreads),
+        "open_count":      len(open_spreads),
+        "closed_count":    len(closed_spreads),
+        "total_open_risk": round(total_open_risk, 2),
+        "total_realized":  round(total_realized, 2),
+        "wins":            wins,
+        "losses":          losses,
+        "win_rate":        round(wins / max(wins + losses, 1) * 100, 1),
     }
 
 
