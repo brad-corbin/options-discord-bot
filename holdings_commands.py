@@ -734,16 +734,24 @@ def _cash_show(send_fn, get_spot_fn, account: str = "brad"):
         f"Cash Balance:     ${pnl['cash_balance']:,.2f}",
         f"Holdings Cost:    ${pnl['holdings_cost']:,.2f}",
         f"Holdings Value:   ${pnl['holdings_value']:,.2f}",
+    ]
+
+    # Show mutual fund line if configured
+    if pnl.get("fund_value", 0) > 0 or pnl.get("fund_cost", 0) > 0:
+        lines.append(f"Funds Cost:       ${pnl['fund_cost']:,.2f}")
+        lines.append(f"Funds Value:      ${pnl['fund_value']:,.2f}")
+
+    lines.extend([
         f"Account Value:    ${pnl['account_value']:,.2f}",
         "",
         f"{unreal_emoji} Unrealized P/L:  {_fmt_money(pnl['unrealized_pnl'])}",
-        f"  (current share prices vs purchase prices)",
+        f"  (shares + funds vs purchase prices)",
         f"{real_emoji} Realized P/L:    {_fmt_money(pnl['realized_pnl'])}",
         f"  (day trades, closed options, dividends, etc.)",
         f"{total_emoji} Total P/L:       {_fmt_money(pnl['total_pnl'])} ({_fmt_pct(pnl['return_pct'])})",
         "",
         f"Last cash update: {last}",
-    ]
+    ])
 
     if missing:
         lines.append(f"⚠️ No price data: {', '.join(missing)}")
