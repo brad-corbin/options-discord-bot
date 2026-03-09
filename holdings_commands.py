@@ -1310,3 +1310,279 @@ def _spread_summary_cmd(send_fn, account: str = "brad"):
     ]
 
     send_fn("\n".join(lines))
+
+
+# ═══════════════════════════════════════════════════════════
+# /risk COMMAND (v3.5 — Portfolio Risk Dashboard)
+# ═══════════════════════════════════════════════════════════
+
+def handle_risk(args: list, send_fn, get_regime_fn=None, account: str = "brad"):
+    """
+    /risk → show full risk dashboard (exposure, limits, regime)
+    """
+    from risk_manager import get_risk_dashboard
+
+    regime = get_regime_fn() if get_regime_fn else {}
+
+    dash = get_risk_dashboard(account=account, regime=regime)
+
+    gross_bar = _progress_bar(dash["gross_pct"])
+
+    lines = [
+        f"🛡️ {_acct_label(account)} — RISK DASHBOARD\n",
+        f"Open Spreads: {dash['open_count']}/{dash['max_open']}",
+        f"Gross Exposure: ${dash['gross_exposure']:,.0f} / ${dash['gross_limit']:,.0f} {gross_bar}",
+        "",
+    ]
+
+    if dash["ticker_risk"]:
+        lines.append("Ticker Exposure:")
+        for t, risk in sorted(dash["ticker_risk"].items(), key=lambda x: -x[1]):
+            pct = round(risk / dash["ticker_limit"] * 100, 0)
+            warn = " ⚠️" if risk >= dash["ticker_limit"] * 0.8 else ""
+            lines.append(f"  {t}: ${risk:,.0f} ({pct:.0f}% of limit){warn}")
+        lines.append("")
+
+    if dash["sector_counts"]:
+        lines.append("Sector Concentration:")
+        for sector, count in sorted(dash["sector_counts"].items(), key=lambda x: -x[1]):
+            warn = " ⚠️" if count >= dash["sector_limit"] else ""
+            lines.append(f"  {sector}: {count} positions{warn}")
+        lines.append("")
+
+    daily_emoji = _pnl_emoji(dash["daily_pnl"])
+    lines.append(f"Daily P/L: {_fmt_money(dash['daily_pnl'])} {daily_emoji} (limit: -${dash['daily_limit']:,.0f})")
+
+    r = dash.get("regime", {})
+    if r.get("label"):
+        lines.append(f"\nRegime: {r.get('emoji', '⚪')} {r['label']}")
+        lines.append(f"  VIX: {r.get('vix', 0):.1f} ({r.get('vix_regime', '?')})")
+        lines.append(f"  ADX: {r.get('adx', 0):.0f} ({r.get('adx_regime', '?')})")
+        lines.append(f"  Size multiplier: ×{r.get('size_mult', 1.0)}")
+
+    send_fn("\n".join(lines))
+
+
+def _progress_bar(pct: float, width: int = 10) -> str:
+    filled = int(min(pct, 100) / 100 * width)
+    empty = width - filled
+    bar = "█" * filled + "░" * empty
+    return f"[{bar}] {pct:.0f}%"
+
+
+# ═══════════════════════════════════════════════════════════
+# /regime COMMAND (v3.5 — Market Regime Status)
+# ═══════════════════════════════════════════════════════════
+
+def handle_regime(args: list, send_fn, get_regime_fn=None, account: str = "brad"):
+    """
+    /regime → show current market regime
+    """
+    regime = get_regime_fn() if get_regime_fn else {}
+
+    if not regime or regime.get("label") == "UNKNOWN":
+        send_fn("❓ Unable to determine market regime — VIX/SPY data unavailable")
+        return
+
+    from trading_rules import (
+        REGIME_VIX_LOW, REGIME_VIX_NORMAL, REGIME_VIX_ELEVATED,
+        REGIME_ADX_CHOPPY, REGIME_ADX_TRENDING,
+    )
+
+    lines = [
+        f"🌍 MARKET REGIME\n",
+        f"Status: {regime.get('emoji', '⚪')} {regime['label']}",
+        f"Size Multiplier: ×{regime.get('size_mult', 1.0)}",
+        "",
+        f"VIX: {regime.get('vix', 0):.1f} — {regime.get('vix_regime', '?')}",
+        f"  Low < {REGIME_VIX_LOW} | Normal < {REGIME_VIX_NORMAL} | "
+        f"Elevated < {REGIME_VIX_ELEVATED} | Crisis",
+        "",
+        f"ADX (SPY): {regime.get('adx', 0):.0f} — {regime.get('adx_regime', '?')}",
+        f"  Choppy < {REGIME_ADX_CHOPPY} | Moderate < {REGIME_ADX_TRENDING} | Trending",
+        "",
+    ]
+
+    label = regime.get("label", "")
+    if label == "CRISIS":
+        lines.append("🔴 All new entries BLOCKED until VIX normalizes")
+    elif label == "HIGH VOL CHOP":
+        lines.append("🟠 Elevated risk — position sizes halved")
+    elif label == "TRENDING":
+        lines.append("🟢 Strong trend — full size, confidence boosted")
+    elif "CHOPPY" in label.upper():
+        lines.append("🟡 Range-bound — watch for whipsaws, size reduced")
+    else:
+        lines.append("⚪ Standard conditions — proceed normally")
+
+    send_fn("\n".join(lines))
+
+
+# ═══════════════════════════════════════════════════════════
+# /journal COMMAND (v3.5 — Trade Journal & Analytics)
+# ═══════════════════════════════════════════════════════════
+
+def handle_journal(args: list, send_fn, account: str = "brad"):
+    """
+    /journal           → aggregate stats
+    /journal AAPL      → stats for one ticker
+    /journal signals   → recent signal log
+    /journal trades    → recent trade log
+    /journal attrs     → Greeks P/L attribution summary
+    """
+    if not args:
+        _journal_stats(send_fn, account)
+        return
+
+    sub = args[0].lower()
+
+    if sub == "signals":
+        _journal_signals(send_fn, account)
+    elif sub == "trades":
+        _journal_trades(send_fn, account)
+    elif sub in ("attrs", "attribution"):
+        _journal_attribution(send_fn, account)
+    else:
+        _journal_stats(send_fn, account, ticker=args[0].upper())
+
+
+def _journal_stats(send_fn, account: str = "brad", ticker: str = None):
+    from trade_journal import calc_journal_stats
+
+    stats = calc_journal_stats(account=account, ticker=ticker)
+
+    if stats["signal_count"] == 0 and stats["trade_count"] == 0:
+        send_fn(f"📓 {_acct_label(account)} — No journal data yet. Signals and trades log automatically.")
+        return
+
+    title = f"📓 {_acct_label(account)} — JOURNAL"
+    if ticker:
+        title += f" — {ticker}"
+
+    lines = [f"{title}\n"]
+
+    lines.append(f"Signals: {stats['signal_count']} total | "
+                 f"{stats['trade_signals']} → trades | "
+                 f"{stats['rejected_signals']} rejected")
+    lines.append(f"Conversion: {stats['conversion_rate']:.0f}%")
+    lines.append("")
+
+    if stats["trade_count"] > 0:
+        wr_emoji = "🟢" if stats["win_rate"] >= 50 else "🔴"
+        lines.append(f"Trades: {stats['trade_count']} | "
+                     f"W/L: {stats['wins']}/{stats['losses']} | "
+                     f"Win Rate: {stats['win_rate']:.0f}% {wr_emoji}")
+        lines.append(f"Total P/L: {_fmt_money(stats['total_pnl'])} {_pnl_emoji(stats['total_pnl'])}")
+        lines.append(f"Avg P/L: {_fmt_money(stats['avg_pnl'])} | "
+                     f"Avg Win: {_fmt_money(stats['avg_win'])} | "
+                     f"Avg Loss: {_fmt_money(stats['avg_loss'])}")
+        lines.append(f"Avg Hold: {stats['avg_hold_days']}d")
+        lines.append("")
+
+        if stats["by_tier"]:
+            lines.append("By Tier:")
+            for t, d in sorted(stats["by_tier"].items()):
+                wr = round(d["wins"] / max(d["count"], 1) * 100, 0)
+                lines.append(f"  T{t}: {d['count']} trades | {_fmt_money(d['pnl'])} | {wr:.0f}% win")
+            lines.append("")
+
+        lines.append("By Confidence:")
+        for band, d in stats["by_confidence"].items():
+            if d["count"] > 0:
+                wr = round(d["wins"] / max(d["count"], 1) * 100, 0)
+                lines.append(f"  {band}: {d['count']} trades | {_fmt_money(d['pnl'])} | {wr:.0f}% win")
+        lines.append("")
+
+        lines.append("By Vol Edge:")
+        for edge, d in stats["by_vol_edge"].items():
+            if d["count"] > 0:
+                wr = round(d["wins"] / max(d["count"], 1) * 100, 0)
+                lines.append(f"  {edge}: {d['count']} trades | {_fmt_money(d['pnl'])} | {wr:.0f}% win")
+
+    send_fn("\n".join(lines))
+
+
+def _journal_signals(send_fn, account: str = "brad"):
+    from trade_journal import query_journal
+
+    entries = query_journal(account=account, entry_type="signal", limit=15)
+    if not entries:
+        send_fn(f"📓 {_acct_label(account)} — No signals logged yet.")
+        return
+
+    lines = [f"📓 {_acct_label(account)} — RECENT SIGNALS\n"]
+    for e in entries:
+        outcome_emoji = {
+            "trade_opened": "✅", "rejected": "❌", "duplicate": "🔁",
+            "risk_blocked": "🚫", "bear_signal": "🐻",
+        }.get(e.get("outcome", ""), "❓")
+
+        conf_str = f" C{e['confidence']}" if e.get("confidence") else ""
+        lines.append(
+            f"{outcome_emoji} {e.get('date', '?')} {e.get('ticker', '?')} "
+            f"T{e.get('tier', '?')} {e.get('bias', '?').upper()}{conf_str}"
+        )
+        if e.get("reason"):
+            lines.append(f"    {e['reason'][:60]}")
+
+    send_fn("\n".join(lines))
+
+
+def _journal_trades(send_fn, account: str = "brad"):
+    from trade_journal import query_journal
+
+    entries = query_journal(account=account, entry_type="close", limit=15)
+    if not entries:
+        send_fn(f"📓 {_acct_label(account)} — No closed trades logged yet.")
+        return
+
+    lines = [f"📓 {_acct_label(account)} — RECENT TRADES\n"]
+    for e in entries:
+        pnl = e.get("pnl", 0)
+        emoji = _pnl_emoji(pnl)
+        lines.append(
+            f"{emoji} {e.get('close_date', '?')} {e.get('ticker', '?')} "
+            f"{e.get('spread_id', '?')} {_fmt_money(pnl)} "
+            f"({e.get('ror_pct', 0):+.0f}% RoR) "
+            f"{e.get('hold_days', 0)}d {e.get('exit_reason', '?')}"
+        )
+
+    send_fn("\n".join(lines))
+
+
+def _journal_attribution(send_fn, account: str = "brad"):
+    from trade_journal import calc_journal_stats
+
+    stats = calc_journal_stats(account=account)
+    attr = stats.get("attribution", {})
+
+    if attr.get("count", 0) == 0:
+        send_fn(f"📓 {_acct_label(account)} — No attribution data yet. Close some spreads first.")
+        return
+
+    total = attr.get("delta_pnl", 0) + attr.get("theta_pnl", 0) + attr.get("vega_pnl", 0) + attr.get("residual", 0)
+
+    def pct_of(val):
+        return f"{abs(val) / abs(total) * 100:.0f}%" if total != 0 else "—"
+
+    lines = [
+        f"📓 {_acct_label(account)} — GREEKS P/L ATTRIBUTION\n",
+        f"Trades analyzed: {attr['count']}\n",
+        f"Delta P/L:    {_fmt_money(attr['delta_pnl'])} ({pct_of(attr['delta_pnl'])})",
+        f"  (price movement × net delta)",
+        f"Theta P/L:    {_fmt_money(attr['theta_pnl'])} ({pct_of(attr['theta_pnl'])})",
+        f"  (time decay × hold days)",
+        f"Vega P/L:     {_fmt_money(attr['vega_pnl'])} ({pct_of(attr['vega_pnl'])})",
+        f"  (IV change × net vega)",
+        f"Residual:     {_fmt_money(attr['residual'])} ({pct_of(attr['residual'])})",
+        f"  (gamma + model error)",
+        "",
+        f"Total:        {_fmt_money(total)}",
+    ]
+
+    if abs(attr.get("delta_pnl", 0)) > abs(attr.get("theta_pnl", 0)):
+        lines.append("\n💡 P/L is primarily delta-driven (directional)")
+    else:
+        lines.append("\n💡 P/L is primarily theta-driven (time decay)")
+
+    send_fn("\n".join(lines))
