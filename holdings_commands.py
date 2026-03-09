@@ -30,6 +30,7 @@ from portfolio import (
     close_option,
     expire_option,
     assign_option,
+    roll_option,
     calc_holding_pnl,
     calc_option_pnl,
     calc_ticker_options_income,
@@ -80,6 +81,7 @@ def _opt_status_emoji(status: str) -> str:
         "closed":   "✅",
         "expired":  "💀",
         "assigned": "📌",
+        "rolled":   "🔁",
     }.get(status, "❓")
 
 
@@ -312,12 +314,32 @@ def handle_sell(args: list, send_fn, account: str = "brad"):
     total_credit = premium * contracts * 100
     label = "CSP" if opt_side == "put" else "CC"
 
-    send_fn(
-        f"✅ {_acct_label(account)} — Opened {opt['id']}\n"
-        f"SELL {label} {ticker} ${strike} exp {exp}\n"
-        f"Premium: ${premium} × {contracts} = ${total_credit:,.0f} credit\n"
-        f"Use /close {opt['id']} PRICE to close"
-    )
+    # Build enhanced response
+    lines = [
+        f"✅ {_acct_label(account)} — Opened {opt['id']}",
+        f"SELL {label} {ticker} ${strike} exp {exp}",
+        f"Premium: ${premium} × {contracts} = ${total_credit:,.0f} credit",
+    ]
+
+    if opt_side == "put":
+        cash_secured = strike * contracts * 100
+        breakeven = round(strike - premium, 2)
+        lines.append(f"Cash secured: ${cash_secured:,.0f}")
+        lines.append(f"Break-even: ${breakeven}")
+    else:
+        holding = get_holding(ticker, account=account)
+        if holding:
+            lines.append(f"Covered by: {holding['shares']}sh")
+
+    # Show wheel context
+    wheel = calc_wheel_pnl(ticker, account=account)
+    lines.append(f"Wheel: {wheel['stage_emoji']} {wheel['stage']}")
+    if wheel["realized_premium"] != 0:
+        lines.append(f"Total premium on {ticker}: {_fmt_money(wheel['total_premium'])}")
+    if wheel["adjusted_basis"] is not None:
+        lines.append(f"Adjusted basis: ${wheel['adjusted_basis']}")
+
+    send_fn("\n".join(lines))
 
 
 # ═══════════════════════════════════════════════════════════
@@ -398,12 +420,120 @@ def handle_assign(args: list, send_fn, account: str = "brad"):
     opt = result["option"]
     action = result.get("action", "—")
     label = _opt_type_label(opt)
+    ticker = opt["ticker"]
 
-    send_fn(
-        f"📌 {_acct_label(account)} — Assigned {opt_id}\n"
-        f"{label} {opt['ticker']} ${opt['strike']}\n"
-        f"→ {action}"
+    lines = [
+        f"📌 {_acct_label(account)} — Assigned {opt_id}",
+        f"{label} {opt['ticker']} ${opt['strike']}",
+        f"→ {action}",
+    ]
+
+    # Show wheel context after assignment
+    wheel = calc_wheel_pnl(ticker, account=account)
+
+    if opt["type"] == "csp" and wheel["has_shares"]:
+        # Just got assigned shares — show adjusted basis
+        lines.append("")
+        lines.append(f"Premium collected on {ticker}: {_fmt_money(wheel['realized_premium'])}")
+        if wheel["adjusted_basis"] is not None:
+            lines.append(f"Adjusted cost basis: ${wheel['adjusted_basis']}")
+        lines.append(f"Wheel: {wheel['stage_emoji']} {wheel['stage']}")
+        lines.append(f"\n💡 Next: sell a covered call above ${wheel['adjusted_basis'] or opt['strike']}")
+    elif opt["type"] == "covered_call":
+        lines.append(f"\nPremium collected on {ticker}: {_fmt_money(wheel['realized_premium'])}")
+        lines.append(f"Wheel: {wheel['stage_emoji']} {wheel['stage']}")
+
+    send_fn("\n".join(lines))
+
+
+def handle_roll(args: list, send_fn, account: str = "brad"):
+    """
+    /roll opt_016 2026-03-20 13 4.32          → roll to new exp/strike/premium
+    /roll opt_016 2026-03-20 13 4.32 3.77     → roll with explicit close price
+    /roll out opt_016 2026-03-20 4.32         → roll out (same strike, new exp)
+    /roll up opt_016 14 2026-03-20 3.10       → roll up
+    /roll down opt_016 12 2026-03-20 5.20     → roll down
+    """
+    if len(args) < 4:
+        send_fn(
+            "Usage:\n"
+            "  /roll OPT_ID NEW_EXP NEW_STRIKE NEW_PREMIUM [CLOSE_PRICE]\n"
+            "  /roll opt_016 2026-03-20 13 4.32\n"
+            "  /roll opt_016 2026-03-20 13 4.32 3.77\n\n"
+            "Closes the old position and opens a new one,\n"
+            "tracking the roll chain and net credit."
+        )
+        return
+
+    # Parse args — handle optional direction keywords (out/up/down)
+    idx = 0
+    direction_hint = None
+    if args[0].lower() in ("out", "up", "down"):
+        direction_hint = args[0].lower()
+        idx = 1
+
+    opt_id = args[idx]
+    idx += 1
+
+    # Remaining: NEW_EXP NEW_STRIKE NEW_PREMIUM [CLOSE_PRICE]
+    remaining = args[idx:]
+    if len(remaining) < 3:
+        send_fn("Need at least: NEW_EXP NEW_STRIKE NEW_PREMIUM")
+        return
+
+    new_exp = remaining[0]
+
+    try:
+        new_strike = float(remaining[1])
+    except ValueError:
+        send_fn(f"Bad strike: {remaining[1]}")
+        return
+
+    try:
+        new_premium = float(remaining[2])
+    except ValueError:
+        send_fn(f"Bad premium: {remaining[2]}")
+        return
+
+    close_premium = None
+    if len(remaining) >= 4:
+        try:
+            close_premium = float(remaining[3])
+        except ValueError:
+            send_fn(f"Bad close price: {remaining[3]}")
+            return
+
+    result = roll_option(
+        opt_id, new_exp, new_strike, new_premium,
+        close_premium=close_premium, account=account,
     )
+
+    if "error" in result:
+        send_fn(f"❌ {result['error']}")
+        return
+
+    old = result["old_opt"]
+    new = result["new_opt"]
+    ticker = old["ticker"]
+    label = _opt_type_label(old)
+
+    lines = [
+        f"🔁 {_acct_label(account)} — Rolled {opt_id} → {new['id']}",
+        f"{label} {ticker}",
+        f"Old: ${old['strike']} exp {old['exp']} @${old['premium']}",
+        f"New: ${new['strike']} exp {new['exp']} @${new['premium']}",
+        "",
+        f"Net roll credit: {_fmt_money(result['net_credit'])}",
+        f"Total premium on {ticker}: {_fmt_money(result['total_ticker_premium'])}",
+    ]
+
+    # Show adjusted basis if shares are held
+    wheel = calc_wheel_pnl(ticker, account=account)
+    if wheel["adjusted_basis"] is not None:
+        lines.append(f"Adjusted basis: ${wheel['adjusted_basis']}")
+    lines.append(f"Wheel: {wheel['stage_emoji']} {wheel['stage']}")
+
+    send_fn("\n".join(lines))
 
 
 # ═══════════════════════════════════════════════════════════
@@ -451,7 +581,7 @@ def _options_open(send_fn, account: str = "brad"):
 def _options_history(send_fn, account: str = "brad"):
     """Show closed/expired/assigned options with realized P/L."""
     all_opts = get_all_options(account=account)
-    closed = [o for o in all_opts if o.get("status") in ("closed", "expired", "assigned")]
+    closed = [o for o in all_opts if o.get("status") in ("closed", "expired", "assigned", "rolled")]
 
     if not closed:
         send_fn(f"📋 {_acct_label(account)} — No options history yet.")
@@ -500,7 +630,7 @@ def handle_wheel(args: list, send_fn, account: str = "brad"):
 
 
 def _wheel_ticker(ticker: str, send_fn, account: str = "brad"):
-    """Full wheel history for one ticker."""
+    """Full wheel analytics for one ticker with adjusted basis."""
     result = calc_wheel_pnl(ticker, account=account)
     history = result["history"]
 
@@ -510,41 +640,73 @@ def _wheel_ticker(ticker: str, send_fn, account: str = "brad"):
 
     lines = [
         f"🔄 {_acct_label(account)} — WHEEL — {ticker}",
-        f"Total Premium: {_fmt_money(result['total_premium'])} "
-        f"({result['closed_rounds']} rounds closed)\n",
+        f"Status: {result['stage_emoji']} {result['stage']}",
     ]
 
+    # Shares info + adjusted basis
+    if result["has_shares"]:
+        lines.append(f"Shares: {result['shares']} @ ${result['entry_price']:.2f}")
+        if result["adjusted_basis"] is not None:
+            lines.append(f"Adjusted Basis: ${result['adjusted_basis']}")
+
+    lines.append("")
+
+    # Premium breakdown
+    lines.append("Premium History:")
     for o in history:
         label = _opt_type_label(o)
         status = _opt_status_emoji(o["status"])
-        pnl_str = ""
+        prem = o.get("premium", 0) * o.get("contracts", 1) * 100
+        prem_str = f"${prem:,.0f}"
 
+        # Show close info for non-open positions
+        extra = ""
+        if o["status"] == "rolled":
+            extra = f" → {o.get('rolled_to', '?')}"
+        elif o["status"] in ("closed",):
+            close_p = o.get("close_premium", 0)
+            extra = f" closed@${close_p}"
+
+        contracts_str = f" x{o['contracts']}" if o.get("contracts", 1) > 1 else ""
+        exp_short = o["exp"][5:] if len(o["exp"]) >= 10 else o["exp"]
+
+        pnl_str = ""
         if o["status"] != "open":
             pnl = calc_option_pnl(o)
             pnl_str = f"  {_fmt_money(pnl)}"
 
         lines.append(
-            f"{status} {o['id']}  {label}  ${o['strike']}  "
-            f"exp {o['exp']}  @${o['premium']}"
-            f"{'  x' + str(o['contracts']) if o['contracts'] > 1 else ''}"
-            f"{pnl_str}"
+            f"  {status} {o['id']} {label} ${o['strike']} {exp_short} "
+            f"@${o['premium']}{contracts_str}{pnl_str}{extra}"
         )
 
-    if result["open_positions"] > 0:
-        lines.append(f"\n{result['open_positions']} position(s) still open")
+    lines.append("")
+    lines.append(f"Realized Premium: {_fmt_money(result['realized_premium'])}")
+    if result["open_premium"] > 0:
+        lines.append(f"Open Premium: {_fmt_money(result['open_premium'])}")
+    lines.append(f"Total Premium: {_fmt_money(result['total_premium'])}")
 
-    # Check if shares are currently held (wheel in CC phase)
-    holding = get_holding(ticker, account=account)
-    if holding:
-        lines.append(
-            f"\n📦 Currently holding {holding['shares']}sh @${holding['cost_basis']:.2f}"
-        )
+    # Adjusted cost basis math
+    if result["has_shares"] and result["adjusted_basis"] is not None:
+        lines.append("")
+        lines.append("Adjusted Cost Basis:")
+        prem_per_share = round(result["realized_premium"] / result["shares"], 2) if result["shares"] > 0 else 0
+        lines.append(f"  ${result['entry_price']:.2f} - ${prem_per_share:.2f} = ${result['adjusted_basis']}")
+
+    # Open positions
+    if result["open_opts"]:
+        lines.append("")
+        lines.append("Open Position(s):")
+        for o in result["open_opts"]:
+            label = _opt_type_label(o)
+            contracts_str = f" x{o['contracts']}" if o.get("contracts", 1) > 1 else ""
+            lines.append(f"  {label} ${o['strike']} exp {o['exp']} @${o['premium']}{contracts_str}")
 
     send_fn("\n".join(lines))
 
 
 def _wheel_summary(send_fn, account: str = "brad"):
-    """Summary of all tickers with wheel activity."""
+    """Summary of all tickers with wheel activity — stage + adjusted basis."""
     all_opts = get_all_options(account=account)
     wheel_tickers = set()
 
@@ -562,14 +724,16 @@ def _wheel_summary(send_fn, account: str = "brad"):
     for ticker in sorted(wheel_tickers):
         result = calc_wheel_pnl(ticker, account=account)
         grand_total += result["total_premium"]
-        open_str = f"  ({result['open_positions']} open)" if result["open_positions"] else ""
+
+        basis_str = f"  basis ${result['adjusted_basis']}" if result["adjusted_basis"] is not None else ""
+        stage_str = f"{result['stage_emoji']}{result['stage'][:3]}"
 
         lines.append(
-            f"{ticker}  {result['closed_rounds']} rounds  "
-            f"{_fmt_money(result['total_premium'])}{open_str}"
+            f"{ticker}  {stage_str}  "
+            f"prem {_fmt_money(result['total_premium'])}{basis_str}"
         )
 
-    lines.append(f"\nGrand Total Premium: {_fmt_money(grand_total)}")
+    lines.append(f"\nTotal Premium: {_fmt_money(grand_total)}")
     lines.append("\nUse /wheel TICKER for full history")
     send_fn("\n".join(lines))
 
