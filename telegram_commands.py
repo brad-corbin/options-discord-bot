@@ -99,7 +99,7 @@ def register_webhook(bot_url: str, webhook_secret: str):
 # ─────────────────────────────────────────────────────────
 
 def _parse_account_flag(args: list) -> tuple:
-    cleaned = [a for a in args if a.lower() != "--mom"]
+    cleaned = [a for a in args if a.lower() != "-mom"]
     has_mom = len(cleaned) < len(args)
     account = "mom" if has_mom else "brad"
     return account, cleaned
