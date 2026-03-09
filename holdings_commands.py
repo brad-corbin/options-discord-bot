@@ -1353,6 +1353,27 @@ def handle_risk(args: list, send_fn, get_regime_fn=None, account: str = "brad"):
     daily_emoji = _pnl_emoji(dash["daily_pnl"])
     lines.append(f"Daily P/L: {_fmt_money(dash['daily_pnl'])} {daily_emoji} (limit: -${dash['daily_limit']:,.0f})")
 
+    # v3.6 — Portfolio Greeks
+    pg = dash.get("portfolio_greeks", {})
+    gl = dash.get("greek_limits", {})
+    if pg:
+        lines.append("")
+        lines.append("Portfolio Greeks:")
+        delta_warn = " ⚠️" if gl.get("delta") and abs(pg.get("net_delta", 0)) > gl["delta"] * 0.8 else ""
+        gamma_warn = " ⚠️" if gl.get("gamma") and abs(pg.get("net_gamma", 0)) > gl["gamma"] * 0.8 else ""
+        vega_warn = " ⚠️" if gl.get("vega") and abs(pg.get("net_vega", 0)) > gl["vega"] * 0.8 else ""
+        lines.append(f"  Δ Delta: {pg.get('net_delta', 0):+.0f} (limit ±{gl.get('delta', 0):.0f}){delta_warn}")
+        lines.append(f"  Γ Gamma: {pg.get('net_gamma', 0):+.1f} (limit ±{gl.get('gamma', 0):.0f}){gamma_warn}")
+        lines.append(f"  V Vega:  {pg.get('net_vega', 0):+.0f} (limit ±{gl.get('vega', 0):.0f}){vega_warn}")
+        lines.append(f"  Θ Theta: {pg.get('net_theta', 0):+.0f}/day")
+
+        # Per-ticker Greek breakdown if multiple tickers
+        by_ticker = pg.get("by_ticker", {})
+        if len(by_ticker) > 1:
+            lines.append("  Per Ticker:")
+            for t, g in sorted(by_ticker.items()):
+                lines.append(f"    {t}: Δ{g['delta']:+.0f} Γ{g['gamma']:+.1f} V{g['vega']:+.0f} Θ{g['theta']:+.0f}")
+
     r = dash.get("regime", {})
     if r.get("label"):
         lines.append(f"\nRegime: {r.get('emoji', '⚪')} {r['label']}")
