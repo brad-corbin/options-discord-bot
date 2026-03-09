@@ -237,6 +237,8 @@ def add_option(ticker: str, opt_type: str, direction: str,
         "close_premium": None,
         "status":        "open",
         "notes":         notes,
+        "rolled_from":   None,    # opt_id this was rolled from
+        "rolled_to":     None,    # opt_id this was rolled into
     }
 
     opts.append(new_opt)
@@ -326,13 +328,104 @@ def assign_option(opt_id: str, account: str = "brad") -> dict:
     return {"error": f"{opt_id} not found"}
 
 
+def roll_option(opt_id: str, new_exp: str, new_strike: float,
+                new_premium: float, close_premium: float = None,
+                account: str = "brad") -> dict:
+    """
+    Roll an option in one step: close the old position and open a new one.
+
+    If close_premium is not provided, closes at 0 (assumes net roll credit
+    is fully captured in new_premium). If provided, records the buyback cost.
+
+    Links the two positions via rolled_from / rolled_to fields.
+
+    Returns dict with:
+      - old_opt: the closed option
+      - new_opt: the newly opened option
+      - net_credit: net premium from the roll
+      - total_ticker_premium: total premium collected on this ticker
+    """
+    opts = get_all_options(account=account)
+
+    # Find the old option
+    old_opt = None
+    for o in opts:
+        if o["id"] == opt_id:
+            old_opt = o
+            break
+
+    if old_opt is None:
+        return {"error": f"{opt_id} not found"}
+    if old_opt["status"] != "open":
+        return {"error": f"{opt_id} is already {old_opt['status']}"}
+
+    ticker    = old_opt["ticker"]
+    opt_type  = old_opt["type"]
+    direction = old_opt["direction"]
+    contracts = old_opt["contracts"]
+
+    # Close the old position
+    actual_close = close_premium if close_premium is not None else 0.0
+    old_opt["status"]        = "rolled"
+    old_opt["close_date"]    = _today_str()
+    old_opt["close_premium"] = round(actual_close, 2)
+
+    # Open the new position
+    new_id = _next_option_id(account=account)
+    new_opt = {
+        "id":            new_id,
+        "ticker":        ticker,
+        "type":          opt_type,
+        "direction":     direction,
+        "strike":        round(new_strike, 2),
+        "exp":           new_exp,
+        "contracts":     contracts,
+        "premium":       round(new_premium, 2),
+        "open_date":     _today_str(),
+        "close_date":    None,
+        "close_premium": None,
+        "status":        "open",
+        "notes":         f"Rolled from {opt_id}",
+        "rolled_from":   opt_id,
+        "rolled_to":     None,
+    }
+
+    # Link old → new
+    old_opt["rolled_to"] = new_id
+
+    opts.append(new_opt)
+    _save_json(_key_options(account), opts)
+
+    # Calculate net credit
+    old_pnl = calc_option_pnl(old_opt)
+    new_credit = new_premium * contracts * 100
+    net_credit = round(old_pnl + new_credit, 2)  # what you kept + new credit
+
+    # Total premium on this ticker
+    total_premium = calc_ticker_options_income(ticker, account=account)
+    # Add open premium from the new position
+    open_premium = new_premium * contracts * 100
+    total_with_open = round(total_premium + open_premium, 2)
+
+    log.info(f"Options [{account}]: rolled {opt_id} → {new_id} "
+             f"({ticker} ${old_opt['strike']} → ${new_strike} exp {new_exp} "
+             f"@${new_premium}) net credit: ${net_credit:,.0f}")
+
+    return {
+        "old_opt":              old_opt,
+        "new_opt":              new_opt,
+        "net_credit":           net_credit,
+        "total_ticker_premium": total_with_open,
+    }
+
+
 # ═══════════════════════════════════════════════════════════
 # P/L CALCULATIONS
 # ═══════════════════════════════════════════════════════════
 
 def calc_option_pnl(opt: dict) -> float:
     """
-    Calculate realized P/L for a CLOSED/EXPIRED/ASSIGNED option.
+    Calculate realized P/L for a CLOSED/EXPIRED/ASSIGNED/ROLLED option.
     Returns dollar P/L (positive = profit).
     """
     if opt.get("status") == "open":
@@ -354,11 +447,11 @@ def calc_option_pnl(opt: dict) -> float:
 
 
 def calc_ticker_options_income(ticker: str, account: str = "brad") -> float:
-    """Sum of realized P/L from all closed options on a ticker."""
+    """Sum of realized P/L from all closed/expired/assigned/rolled options on a ticker."""
     ticker = ticker.upper()
     total = 0.0
     for o in get_all_options(account=account):
-        if o.get("ticker") == ticker and o.get("status") in ("closed", "expired", "assigned"):
+        if o.get("ticker") == ticker and o.get("status") in ("closed", "expired", "assigned", "rolled"):
             total += calc_option_pnl(o)
     return round(total, 2)
 
@@ -477,27 +570,78 @@ def get_wheel_history(ticker: str, account: str = "brad") -> list:
 
 def calc_wheel_pnl(ticker: str, account: str = "brad") -> dict:
     """
-    Total wheel P/L for a ticker = sum of all premiums collected/lost
-    across all CSPs and covered calls (closed + expired + assigned).
+    Full wheel analytics for a ticker:
+      - Realized premium (closed/expired/assigned/rolled)
+      - Open premium (currently open positions)
+      - Adjusted cost basis (entry price minus premium per share)
+      - Wheel stage (put/share/call/cash)
+      - Total wheel P/L including share unrealized
     """
     ticker = ticker.upper()
     history = get_wheel_history(ticker, account=account)
-    total_premium = 0.0
+    holding = get_holding(ticker, account=account)
+
+    realized_premium = 0.0
+    open_premium = 0.0
     rounds = 0
+    open_positions = []
 
     for o in history:
-        if o.get("status") in ("closed", "expired", "assigned"):
-            total_premium += calc_option_pnl(o)
+        if o.get("status") in ("closed", "expired", "assigned", "rolled"):
+            realized_premium += calc_option_pnl(o)
             rounds += 1
+        elif o.get("status") == "open":
+            open_premium += o.get("premium", 0) * o.get("contracts", 1) * 100
+            open_positions.append(o)
 
-    open_positions = [o for o in history if o.get("status") == "open"]
+    total_premium = round(realized_premium + open_premium, 2)
+
+    # Determine wheel stage
+    has_open_puts  = any(o["type"] == "csp" for o in open_positions)
+    has_open_calls = any(o["type"] == "covered_call" for o in open_positions)
+    has_shares     = holding is not None and holding.get("shares", 0) > 0
+
+    if has_open_calls and has_shares:
+        stage = "CALL STAGE"
+        stage_emoji = "📞"
+    elif has_shares and not has_open_calls:
+        stage = "SHARE STAGE"
+        stage_emoji = "📦"
+    elif has_open_puts:
+        stage = "PUT STAGE"
+        stage_emoji = "🔻"
+    elif rounds > 0 and not has_shares and not has_open_puts:
+        stage = "CASH STAGE"
+        stage_emoji = "💵"
+    else:
+        stage = "ACTIVE"
+        stage_emoji = "🔄"
+
+    # Adjusted cost basis (only meaningful if shares are held)
+    adjusted_basis = None
+    shares = 0
+    entry_price = 0.0
+    if has_shares:
+        shares = holding["shares"]
+        entry_price = holding["cost_basis"]
+        premium_per_share = realized_premium / shares if shares > 0 else 0
+        adjusted_basis = round(entry_price - premium_per_share, 2)
 
     return {
-        "ticker":         ticker,
-        "total_premium":  round(total_premium, 2),
-        "closed_rounds":  rounds,
-        "open_positions": len(open_positions),
-        "history":        history,
+        "ticker":           ticker,
+        "realized_premium": round(realized_premium, 2),
+        "open_premium":     round(open_premium, 2),
+        "total_premium":    total_premium,
+        "closed_rounds":    rounds,
+        "open_positions":   len(open_positions),
+        "open_opts":        open_positions,
+        "history":          history,
+        "stage":            stage,
+        "stage_emoji":      stage_emoji,
+        "has_shares":       has_shares,
+        "shares":           shares,
+        "entry_price":      entry_price,
+        "adjusted_basis":   adjusted_basis,
     }
 
 
