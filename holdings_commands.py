@@ -992,14 +992,17 @@ def handle_spread(args: list, send_fn, account: str = "brad"):
     if not args:
         send_fn(
             "Usage:\n"
-            "  /spread add TICKER LONG/SHORT DEBIT EXP [xN]\n"
+            "  /spread add [call|put] TICKER LONG/SHORT DEBIT EXP [xN]\n"
             "  /spread close SP_ID PRICE\n"
             "  /spread stop SP_ID\n"
             "  /spread expire SP_ID [otm]\n"
             "  /spread list\n"
             "  /spread history\n"
             "  /spread summary\n\n"
-            "Example: /spread add AAPL 570/571 0.65 2026-03-14 x3"
+            "Examples:\n"
+            "  /spread add call AAPL 570/571 0.65 2026-03-14 x3\n"
+            "  /spread add put AAPL 580/579 0.55 2026-03-14 x2\n"
+            "  /spread add AAPL 570/571 0.65 2026-03-14  (defaults to call)"
         )
         return
 
@@ -1025,20 +1028,43 @@ def handle_spread(args: list, send_fn, account: str = "brad"):
 
 def _spread_add(args: list, send_fn, account: str = "brad"):
     """
-    /spread add AAPL 570/571 0.65 2026-03-14
-    /spread add AAPL 570/571 0.65 2026-03-14 x3
+    /spread add call AAPL 570/571 0.65 2026-03-14        → bull call (default)
+    /spread add put AAPL 580/579 0.55 2026-03-14 x2      → bear put
+    /spread add AAPL 570/571 0.65 2026-03-14 x3          → bull call (legacy, no side keyword)
     """
     if len(args) < 4:
         send_fn(
-            "Usage: /spread add TICKER LONG/SHORT DEBIT EXP [xN]\n"
-            "Example: /spread add AAPL 570/571 0.65 2026-03-14 x3"
+            "Usage: /spread add [call|put] TICKER LONG/SHORT DEBIT EXP [xN]\n"
+            "Examples:\n"
+            "  /spread add call AAPL 570/571 0.65 2026-03-14 x3\n"
+            "  /spread add put AAPL 580/579 0.55 2026-03-14 x2\n"
+            "  /spread add AAPL 570/571 0.65 2026-03-14  (defaults to call)"
         )
         return
 
-    ticker = args[0].upper()
+    # Check if first arg is call/put or a ticker
+    idx = 0
+    side = "call"
+    direction = "bull"
+
+    if args[0].lower() in ("call", "put"):
+        side = args[0].lower()
+        direction = "bull" if side == "call" else "bear"
+        idx = 1
+
+    if len(args) - idx < 4:
+        send_fn(
+            "Usage: /spread add [call|put] TICKER LONG/SHORT DEBIT EXP [xN]\n"
+            "Example: /spread add put AAPL 580/579 0.55 2026-03-14 x2"
+        )
+        return
+
+    ticker = args[idx].upper()
+    idx += 1
 
     # Parse strikes: "570/571"
-    strikes_str = args[1]
+    strikes_str = args[idx]
+    idx += 1
     if "/" not in strikes_str:
         send_fn(f"Bad strikes: {strikes_str} — use LONG/SHORT (e.g. 570/571)")
         return
@@ -1052,22 +1078,24 @@ def _spread_add(args: list, send_fn, account: str = "brad"):
         return
 
     try:
-        debit = float(args[2])
+        debit = float(args[idx])
     except ValueError:
-        send_fn(f"Bad debit: {args[2]}")
+        send_fn(f"Bad debit: {args[idx]}")
         return
+    idx += 1
 
-    exp = args[3]
+    exp = args[idx]
+    idx += 1
 
     contracts = 1
-    if len(args) >= 5:
-        c_str = args[4].lower()
+    if idx < len(args):
+        c_str = args[idx].lower()
         if c_str.startswith("x"):
             c_str = c_str[1:]
         try:
             contracts = int(c_str)
         except ValueError:
-            send_fn(f"Bad contract count: {args[4]} — use x3")
+            send_fn(f"Bad contract count: {args[idx]} — use x3")
             return
 
     spread = add_spread(
@@ -1077,15 +1105,18 @@ def _spread_add(args: list, send_fn, account: str = "brad"):
         debit=debit,
         exp=exp,
         contracts=contracts,
+        direction=direction,
+        side=side,
         account=account,
     )
 
     total_risk = debit * contracts * 100
     targets = spread["targets"]
+    label = "BULL CALL" if side == "call" else "BEAR PUT"
 
     lines = [
         f"✅ {_acct_label(account)} — Opened {spread['id']}",
-        f"BULL CALL {ticker} ${long_strike}/{short_strike}",
+        f"{label} {ticker} ${long_strike}/{short_strike}",
         f"Width: ${spread['width']:.2f} | Debit: ${debit:.2f} x{contracts} = ${total_risk:,.0f} risk",
         f"Exp: {exp}",
         "",
@@ -1205,9 +1236,10 @@ def _spread_list(send_fn, account: str = "brad"):
         exp_short = s["exp"][5:] if len(s["exp"]) >= 10 else s["exp"]
         risk = s["debit"] * s["contracts"] * 100
         contracts_str = f" x{s['contracts']}" if s["contracts"] > 1 else ""
+        side_label = "C" if s.get("side", "call") == "call" else "P"
 
         lines.append(
-            f"{s['id']}  {s['ticker']}  "
+            f"{s['id']}  {s['ticker']}  {side_label}  "
             f"${s['long']}/{s['short']}  "
             f"@${s['debit']:.2f}{contracts_str}  "
             f"{exp_short}  "
@@ -1238,9 +1270,10 @@ def _spread_history(send_fn, account: str = "brad"):
         total_pnl += pnl
         status = _opt_status_emoji(s["status"])
         contracts_str = f" x{s['contracts']}" if s["contracts"] > 1 else ""
+        side_label = "C" if s.get("side", "call") == "call" else "P"
 
         lines.append(
-            f"{status} {s['id']}  {s['ticker']}  "
+            f"{status} {s['id']}  {s['ticker']}  {side_label}  "
             f"${s['long']}/{s['short']}  "
             f"${s['debit']:.2f}→${s.get('close_price', 0):.2f}{contracts_str}  "
             f"{_fmt_money(pnl)} {_pnl_emoji(pnl)}"
