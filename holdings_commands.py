@@ -1,7 +1,7 @@
 # holdings_commands.py
 # NOTE: Educational/demo code. Not financial advice. Use at your own risk.
 #
-# Phase 2A — Telegram Command Handlers for Portfolio
+# Phase 2A — Telegram Command Handlers for Portfolio -
 #   /hold, /sell, /close, /expire, /assign, /options, /wheel
 #
 # v3.2 — Multi-account support
