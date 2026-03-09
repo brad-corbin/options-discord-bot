@@ -412,16 +412,18 @@ def compute_confidence(
     has_dividend: bool = False,
     vol_edge: Dict = None,
     em_data: Dict = None,
+    regime: Dict = None,
 ) -> Tuple[int, List[str]]:
     """
     Score trade confidence from 0-100 based on webhook signal data,
-    trade quality metrics, and IV/RV edge.
+    trade quality metrics, IV/RV edge, and market regime.
 
-    v3.4: vol_edge and em_data feed into scoring.
+    v3.5: regime data feeds into scoring.
     """
     reasons = []
     vol_edge = vol_edge or {}
     em_data = em_data or {}
+    regime = regime or {}
 
     is_manual = (
         webhook_data.get("tier") in (None, "2", "0", "") and
@@ -537,6 +539,29 @@ def compute_confidence(
             score += CONFIDENCE_PENALTIES.get("beyond_em", -8)
             reasons.append("Short strike beyond EM")
 
+    # ── Market Regime scoring (v3.5 — applies to BOTH modes) ──
+    regime_label = regime.get("label", "")
+    adx_regime = regime.get("adx_regime", "")
+    vix_regime = regime.get("vix_regime", "")
+
+    if adx_regime == "TRENDING" and vix_regime in ("LOW", "NORMAL"):
+        score += CONFIDENCE_BOOSTS.get("regime_trending", 8)
+        reasons.append(f"Regime: {regime_label} (trending)")
+    elif vix_regime == "LOW":
+        score += CONFIDENCE_BOOSTS.get("regime_low_vix", 5)
+        reasons.append(f"Regime: low VIX ({regime.get('vix', 0):.0f})")
+
+    if adx_regime == "CHOPPY":
+        score += CONFIDENCE_PENALTIES.get("regime_choppy", -10)
+        reasons.append(f"Regime: choppy (ADX {regime.get('adx', 0):.0f})")
+
+    if vix_regime == "ELEVATED":
+        score += CONFIDENCE_PENALTIES.get("regime_high_vix", -8)
+        reasons.append(f"Regime: elevated VIX ({regime.get('vix', 0):.0f})")
+    elif vix_regime == "CRISIS":
+        score += CONFIDENCE_PENALTIES.get("regime_crisis", -25)
+        reasons.append(f"Regime: CRISIS VIX ({regime.get('vix', 0):.0f})")
+
     # ── Deal-breakers (apply to BOTH modes) ──
     if has_earnings:
         score += CONFIDENCE_PENALTIES["earnings_week"]
@@ -564,13 +589,14 @@ def recommend_trade(
     has_earnings: bool = False,
     has_dividend: bool = False,
     candle_closes: List[float] = None,
+    regime: Dict = None,
 ) -> Dict[str, Any]:
     """
     Main entry point. Given a ticker's option chain and signal data,
     returns a complete trade recommendation or rejection with reason.
 
     v3.4: accepts candle_closes for RV calculation.
-    candle_closes = list of recent daily close prices (most recent last).
+    v3.5: accepts regime for market regime-aware confidence + sizing.
     """
     webhook_data = webhook_data or {}
     candle_closes = candle_closes or []
@@ -656,11 +682,13 @@ def recommend_trade(
         "dte":           dte,
     }
 
-    # ── Confidence scoring (now includes vol edge) ──
+    # ── Confidence scoring (now includes vol edge + regime) ──
+    regime = regime or {}
     confidence, conf_reasons = compute_confidence(
         webhook_data, best, has_earnings, has_dividend,
         vol_edge=vol_edge,
         em_data=em_data,
+        regime=regime,
     )
 
     if confidence < MIN_CONFIDENCE_TO_TRADE:
@@ -668,6 +696,13 @@ def recommend_trade(
         result["confidence"] = confidence
         result["conf_reasons"] = conf_reasons
         return result
+
+    # ── Apply regime size multiplier ──
+    regime_size_mult = regime.get("size_mult", 1.0)
+    if regime_size_mult < 1.0 and regime_size_mult > 0:
+        num_contracts = max(1, int(num_contracts * regime_size_mult))
+        total_risk = num_contracts * best["debit"] * 100
+        sizing_note += f" [regime ×{regime_size_mult}]"
 
     # ── Build exit targets ──
     exits = {
@@ -725,6 +760,9 @@ def recommend_trade(
         "expected_move":    expected_move,
         "vol_edge":         vol_edge,
         "em_data":          em_data,
+
+        # v3.5 — Regime data
+        "regime":           regime,
     }
 
 
@@ -785,6 +823,15 @@ def format_trade_card(rec: Dict) -> str:
             f"Vol Edge: {vol_edge['edge_emoji']} {vol_edge['edge_label']} "
             f"(IV {vol_edge.get('iv_pct', 0):.0f}% vs RV {vol_edge.get('rv_pct', 0):.0f}% | "
             f"spread {vol_edge.get('edge_pct', 0):+.1f}pp)"
+        )
+        lines.append("")
+
+    # v3.5 — Market Regime line
+    regime = rec.get("regime", {})
+    if regime.get("label"):
+        lines.append(
+            f"Regime: {regime.get('emoji', '⚪')} {regime['label']} "
+            f"(VIX {regime.get('vix', 0):.0f} | ADX {regime.get('adx', 0):.0f})"
         )
         lines.append("")
 
