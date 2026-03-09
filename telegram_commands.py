@@ -471,7 +471,9 @@ def handle_command(
             "/fund update 54200 — update current value\n"
             "/fund — show P/L\n"
             "\n── Debit Spreads (v3.4) ──\n"
-            "/spread add AAPL 570/571 0.65 2026-03-14 x3\n"
+            "/spread add call AAPL 570/571 0.65 2026-03-14 x3\n"
+            "/spread add put AAPL 580/579 0.55 2026-03-14 x2\n"
+            "/spread add AAPL 570/571 0.65 2026-03-14  (defaults to call)\n"
             "/spread close sp_001 0.91 — close at price\n"
             "/spread stop sp_001 — stopped out\n"
             "/spread expire sp_001 — expired ITM\n"
@@ -497,7 +499,7 @@ def handle_command(
             "/pause | /resume — control scheduled scans\n"
             "/help — this message\n\n"
             "💡 --mom on any portfolio command for mom's account\n"
-            "⚡ Bearish TV signals auto-warn if you have open spreads\n"
+            "⚡ TV signals auto-warn if you have opposite spreads open\n"
             "— Not financial advice —"
         )
         send_reply(chat_id, msg)
