@@ -1,21 +1,10 @@
 # app.py
 # NOTE: Educational/demo code. Not financial advice. Use at your own risk.
 #
-# v3 UPGRADE — Key changes:
-#   - /tv webhook now parses BUS v1.0 payload (tier, wave data, trend state)
-#   - New /check TICKER command via Telegram (on-demand analysis)
-#   - options_engine_v3 used for all new trade recommendations
-#   - Legacy scan route preserved (still uses old engine if needed)
-#   - Earnings week + dividend blocking enforced at trade level
-#   - Exit targets use Brad's 30%/35%/50% return-on-risk formula
-#
-# v3.2 UPGRADE — Multi-account portfolio support:
-#   - Two accounts: "brad" (default) and "mom"
-#   - Separate private Telegram channels for each portfolio
-#   - --mom flag on any portfolio command targets mom's account
-#   - Trade alerts (/tv, /scan) stay on the main channel
-#   - Scheduled holdings scans post BOTH portfolios to their channels
-#   - /cash command for cash balance & realized P/L tracking
+# v3.4 UPGRADE:
+#   - Bearish TV webhook exit warnings for open spreads
+#   - Candle data fetching for RV calculation in /check trade cards
+#   - /spread command wired to telegram_commands
 
 from telegram_commands import (
     handle_command,
@@ -46,6 +35,7 @@ from options_engine_v3 import (
     format_trade_card,
     as_float,
     as_int,
+    calc_realized_vol,
 )
 from data_providers import (
     enrich_ticker,
@@ -57,6 +47,7 @@ from trading_rules import (
     MIN_CONFIDENCE_TO_TRADE,
     ALLOWED_DIRECTIONS,
     NO_EARNINGS_WEEK,
+    RV_LOOKBACK_DAYS,
 )
 
 # ─────────────────────────────────────────────────────────
@@ -74,7 +65,7 @@ app = Flask(__name__)
 # ENV VARS
 # ─────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN",  "").strip()
-TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID",    "").strip()   # main channel (trade alerts)
+TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID",    "").strip()
 TV_WEBHOOK_SECRET   = os.getenv("TV_WEBHOOK_SECRET",   "").strip()
 MARKETDATA_TOKEN    = os.getenv("MARKETDATA_TOKEN",    "").strip()
 WATCHLIST           = os.getenv("WATCHLIST",           "").strip()
@@ -85,17 +76,16 @@ SCAN_WORKERS        = int(os.getenv("SCAN_WORKERS", "4") or 4)
 DEDUP_TTL_SECONDS   = int(os.getenv("DEDUP_TTL_SECONDS", "3600") or 3600)
 
 # v3.2 — Private portfolio channels
-TELEGRAM_PORTFOLIO_CHAT_ID     = os.getenv("TELEGRAM_PORTFOLIO_CHAT_ID",     "").strip()  # Brad's private channel
-TELEGRAM_MOM_PORTFOLIO_CHAT_ID = os.getenv("TELEGRAM_MOM_PORTFOLIO_CHAT_ID", "").strip()  # Mom's private channel
+TELEGRAM_PORTFOLIO_CHAT_ID     = os.getenv("TELEGRAM_PORTFOLIO_CHAT_ID",     "").strip()
+TELEGRAM_MOM_PORTFOLIO_CHAT_ID = os.getenv("TELEGRAM_MOM_PORTFOLIO_CHAT_ID", "").strip()
 
-# Account → channel mapping
 ACCOUNT_CHAT_IDS = {
     "brad": TELEGRAM_PORTFOLIO_CHAT_ID,
     "mom":  TELEGRAM_MOM_PORTFOLIO_CHAT_ID,
 }
 
 # ─────────────────────────────────────────────────────────
-# REDIS (graceful fallback to in-memory)
+# REDIS
 # ─────────────────────────────────────────────────────────
 _redis_client = None
 _mem_store: dict = {}
@@ -166,11 +156,6 @@ def mark_trade_sent(ticker, direction, short_k, long_k):
 # ─────────────────────────────────────────────────────────
 
 def post_to_telegram(text: str, max_retries: int = 4, chat_id: str = None):
-    """
-    Post a message to Telegram.
-    If chat_id is provided, posts to that specific channel.
-    Otherwise falls back to the main TELEGRAM_CHAT_ID (trade alerts channel).
-    """
     cid = chat_id or TELEGRAM_CHAT_ID
     if not TELEGRAM_BOT_TOKEN or not cid:
         return 400, "TELEGRAM tokens not set"
@@ -190,10 +175,6 @@ def post_to_telegram(text: str, max_retries: int = 4, chat_id: str = None):
 
 
 def get_portfolio_chat_id(account: str) -> str:
-    """
-    Get the private Telegram channel ID for a portfolio account.
-    Falls back to main TELEGRAM_CHAT_ID if the account channel isn't configured.
-    """
     cid = ACCOUNT_CHAT_IDS.get(account, "")
     return cid if cid else TELEGRAM_CHAT_ID
 
@@ -225,22 +206,34 @@ def get_expirations(ticker: str) -> list:
         raise RuntimeError(f"Bad expirations for {ticker}")
     return sorted(set(str(e)[:10] for e in (data.get("expirations") or []) if e))
 
-def get_options_chain(ticker: str) -> list:
+def get_daily_candles(ticker: str, days: int = 30) -> list:
     """
-    Fetch multiple expirations within MIN_DTE–MAX_DTE range.
-    Returns list of (expiration_str, dte, contracts_list) tuples,
-    sorted by DTE (nearest first).
+    Fetch recent daily candles for RV (realized vol) calculation.
+    Returns list of closing prices (oldest first).
+    """
+    try:
+        from_date = (datetime.now(timezone.utc) - timedelta(days=days + 10)).strftime("%Y-%m-%d")
+        data = md_get(
+            f"https://api.marketdata.app/v1/stocks/candles/daily/{ticker}/",
+            {"from": from_date, "countback": days + 5},
+        )
+        if not isinstance(data, dict) or data.get("s") != "ok":
+            return []
+        closes = data.get("c", [])
+        if isinstance(closes, list):
+            return [float(c) for c in closes if c is not None]
+        return []
+    except Exception as e:
+        log.warning(f"Daily candles fetch failed for {ticker}: {e}")
+        return []
 
-    Pulls up to MAX_EXPIRATIONS_TO_PULL chains to balance
-    coverage vs API credit usage.
-    """
+def get_options_chain(ticker: str) -> list:
     from trading_rules import MAX_EXPIRATIONS_TO_PULL
 
     ticker = ticker.strip().upper()
     exps   = get_expirations(ticker)
     today  = datetime.now(timezone.utc).date()
 
-    # Find all expirations within range, sorted by DTE
     valid_exps = []
     for exp in exps:
         try:
@@ -253,7 +246,6 @@ def get_options_chain(ticker: str) -> list:
     valid_exps.sort(key=lambda x: x[0])
 
     if not valid_exps:
-        # Fallback: grab the nearest expiration regardless of range
         for exp in exps:
             try:
                 dte = max((datetime.fromisoformat(exp).date() - today).days, 0)
@@ -265,7 +257,6 @@ def get_options_chain(ticker: str) -> list:
     if not valid_exps:
         raise RuntimeError(f"No usable expirations for {ticker}")
 
-    # Limit how many we pull to conserve API credits
     exps_to_fetch = valid_exps[:MAX_EXPIRATIONS_TO_PULL]
 
     results = []
@@ -325,7 +316,93 @@ def get_options_chain(ticker: str) -> list:
 
 
 # ─────────────────────────────────────────────────────────
-# CHECK TICKER (v3 engine — on-demand via /check or /tv)
+# BEARISH EXIT WARNING (v3.4)
+# ─────────────────────────────────────────────────────────
+
+def check_bearish_exit_warning(ticker: str, webhook_data: dict):
+    """
+    Called when a bearish TV signal comes in.
+    Checks if we have any open debit spreads on this ticker (any account).
+    If so, posts an exit warning to the MAIN channel.
+    """
+    ticker = ticker.upper()
+
+    for account in ("brad", "mom"):
+        try:
+            open_spreads = portfolio.get_open_spreads_for_ticker(ticker, account=account)
+            if not open_spreads:
+                continue
+
+            # Build warning message for each open spread
+            tier = webhook_data.get("tier", "?")
+            wt2 = as_float(webhook_data.get("wt2"), 0)
+            close_price = as_float(webhook_data.get("close"), 0)
+
+            wave_zone = "🟢 Oversold" if wt2 < -30 else "🔴 Overbought" if wt2 > 60 else "⚪ Neutral"
+            trend_str = ("✅ Confirmed" if webhook_data.get("htf_confirmed")
+                         else "🟡 Converging" if webhook_data.get("htf_converging")
+                         else "❌ Diverging")
+
+            acct_label = "👩 Mom" if account == "mom" else "📁 Brad"
+
+            for sp in open_spreads:
+                sp_debit = sp.get("debit", 0)
+                sp_contracts = sp.get("contracts", 1)
+                total_risk = sp_debit * sp_contracts * 100
+                targets = sp.get("targets", {})
+
+                # Determine urgency level
+                short_strike = sp.get("short", 0)
+                long_strike = sp.get("long", 0)
+
+                urgency = "⚠️"
+                urgency_note = "Monitor position"
+
+                if close_price > 0 and short_strike > 0:
+                    if close_price <= short_strike:
+                        urgency = "🚨"
+                        urgency_note = "PRICE AT/BELOW SHORT STRIKE — spread losing value"
+                    elif close_price <= long_strike:
+                        urgency = "🔴"
+                        urgency_note = "Price between strikes — partial loss territory"
+
+                # Check if near stop level
+                stop_level = targets.get("stop", 0)
+
+                lines = [
+                    f"{urgency} BEARISH EXIT WARNING — {ticker} ({acct_label})",
+                    f"TV Signal: T{tier} BEAR | Close: ${close_price:.2f}",
+                    f"1H Trend: {trend_str} | Wave: {wave_zone}",
+                    "",
+                    f"Open Spread: {sp['id']}",
+                    f"  ${long_strike}/{short_strike} @${sp_debit:.2f} x{sp_contracts}",
+                    f"  Risk: ${total_risk:,.0f} | Exp: {sp.get('exp', '?')}",
+                    f"  {urgency_note}",
+                    "",
+                    f"Targets: sell@${targets.get('same_day', 0):.2f} (30%) | "
+                    f"${targets.get('next_day', 0):.2f} (35%) | "
+                    f"${targets.get('extended', 0):.2f} (50%)",
+                ]
+
+                if stop_level:
+                    lines.append(f"Stop: ${stop_level:.2f}")
+
+                lines.extend([
+                    "",
+                    "Action: Consider closing or tightening stop",
+                    "— Not financial advice —",
+                ])
+
+                # Exit warnings go to MAIN channel (not private portfolio channel)
+                post_to_telegram("\n".join(lines))
+                log.info(f"Exit warning posted for {ticker} spread {sp['id']} ({account})")
+
+        except Exception as e:
+            log.error(f"Exit warning check failed for {ticker}/{account}: {e}")
+
+
+# ─────────────────────────────────────────────────────────
+# CHECK TICKER (v3.4: with candle data for RV)
 # ─────────────────────────────────────────────────────────
 
 def check_ticker(
@@ -333,30 +410,24 @@ def check_ticker(
     direction: str = "bull",
     webhook_data: dict = None,
 ) -> dict:
-    """
-    Full v3 pipeline: fetch data → check rules → build spread → post card.
-    Now scans MULTIPLE expirations and picks the best trade across all of them.
-    Used by both /check command and /tv webhook.
-    Returns result dict with 'ok', 'posted', 'reason' keys.
-    """
     ticker = ticker.strip().upper()
     webhook_data = webhook_data or {"bias": direction, "tier": "2"}
 
     try:
-        # Fetch market data
         spot = get_spot(ticker)
-        chains = get_options_chain(ticker)  # list of (exp, dte, contracts)
+        chains = get_options_chain(ticker)
 
-        # Enrichment: earnings + IV
         enrichment = enrich_ticker(ticker)
         has_earnings = enrichment.get("has_earnings", False)
         earnings_warn = enrichment.get("earnings_warn")
-        has_dividend = False  # TODO: Add dividend API check
+        has_dividend = False
+
+        # v3.4 — Fetch daily candles for RV calculation
+        candle_closes = get_daily_candles(ticker, days=RV_LOOKBACK_DAYS + 5)
 
         log.info(f"check_ticker({ticker}): spot={spot} expirations={len(chains)} "
-                 f"earnings={has_earnings}")
+                 f"earnings={has_earnings} candles={len(candle_closes)}")
 
-        # Run v3 engine on EACH expiration, collect all valid recommendations
         all_recs = []
         all_reasons = []
 
@@ -370,6 +441,7 @@ def check_ticker(
                 webhook_data=webhook_data,
                 has_earnings=has_earnings,
                 has_dividend=has_dividend,
+                candle_closes=candle_closes,  # v3.4
             )
 
             if rec.get("ok"):
@@ -382,7 +454,6 @@ def check_ticker(
                 all_reasons.append(f"DTE {dte} ({exp}): {reason}")
                 log.info(f"  {exp} (DTE {dte}): ❌ {reason}")
 
-        # If no valid trades across any expiration
         if not all_recs:
             combined_reason = "No valid spreads across any expiration"
             if all_reasons:
@@ -395,8 +466,6 @@ def check_ticker(
                 "confidence": all_recs[0].get("confidence") if all_recs else None,
             }
 
-        # Pick the best trade across all expirations
-        # Ranking: highest RoR, prefer tighter width, prefer DTE closer to TARGET_DTE
         def rec_score(r):
             trade = r.get("trade", {})
             ror = trade.get("ror", 0)
@@ -409,7 +478,6 @@ def check_ticker(
         all_recs.sort(key=rec_score, reverse=True)
         best_rec = all_recs[0]
 
-        # Collect the best trade from each OTHER expiration for the ladder
         other_exps = []
         seen_exps = {best_rec.get("exp")}
         for r in all_recs[1:]:
@@ -417,7 +485,6 @@ def check_ticker(
                 seen_exps.add(r.get("exp"))
                 other_exps.append(r)
 
-        # Dedup check
         trade = best_rec.get("trade", {})
         if is_duplicate_trade(ticker, direction, trade.get("short"), trade.get("long")):
             return {
@@ -427,10 +494,8 @@ def check_ticker(
                 "reason": "Duplicate trade in dedup window",
             }
 
-        # Format trade card
         card = format_trade_card(best_rec)
 
-        # Add multi-expiration comparison if we have alternatives
         if other_exps:
             alt_lines = ["\n📅 Other Expirations:"]
             for r in other_exps[:3]:
@@ -442,11 +507,9 @@ def check_ticker(
                 )
             card += "\n".join(alt_lines)
 
-        # Prepend earnings warning if applicable
         if has_earnings and earnings_warn:
             card = earnings_warn + "\n\n" + card
 
-        # Trade alerts always go to main channel
         st, body = post_to_telegram(card)
 
         if st == 200:
@@ -488,7 +551,7 @@ def debug():
         "MARKETDATA_set":  bool(MARKETDATA_TOKEN),
         "REDIS_connected": r is not None,
         "WATCHLIST_len":   len([t for t in WATCHLIST.split(",") if t.strip()]),
-        "ENGINE_VERSION":  "v3.2",
+        "ENGINE_VERSION":  "v3.4",
         "SCAN_WORKERS":    SCAN_WORKERS,
         "DEDUP_TTL_S":     DEDUP_TTL_SECONDS,
         "PORTFOLIO_CHANNEL_set": bool(TELEGRAM_PORTFOLIO_CHAT_ID),
@@ -497,7 +560,7 @@ def debug():
 
 @app.route("/tgtest", methods=["GET"])
 def tgtest():
-    st, body = post_to_telegram("✅ Telegram test OK (v3.2 multi-account)")
+    st, body = post_to_telegram("✅ Telegram test OK (v3.4 spread tracking + vol edge)")
     return jsonify({"status": st, "body": body})
 
 
@@ -535,17 +598,16 @@ def telegram_webhook(secret):
            watchlist    = tickers,
            get_spot_fn  = get_spot,
            md_get_fn    = md_get,
-           post_fn      = post_to_telegram,               # v3.2
-           get_portfolio_chat_id_fn = get_portfolio_chat_id,  # v3.2
+           post_fn      = post_to_telegram,
+           get_portfolio_chat_id_fn = get_portfolio_chat_id,
        )
-
 
     threading.Thread(target=run_command, daemon=True).start()
     return jsonify({"ok": True})
 
 
 # ─────────────────────────────────────────────────────────
-# TRADINGVIEW WEBHOOK (BUS v1.0 payload)
+# TRADINGVIEW WEBHOOK (BUS v1.0 payload) — v3.4 updated
 # ─────────────────────────────────────────────────────────
 
 @app.route("/tv", methods=["POST"])
@@ -595,7 +657,7 @@ def tv_webhook():
         "timeframe":       data.get("timeframe", ""),
     }
 
-    # Build signal context message for Telegram
+    # Build signal context message
     tier_emoji = "🥇" if tier == "1" else "🥈" if tier == "2" else "📢"
     wt2 = webhook_data.get("wt2") or 0
     wave_zone = "🟢 Oversold" if wt2 < -30 else "🔴 Overbought" if wt2 > 60 else "⚪ Neutral"
@@ -615,18 +677,23 @@ def tv_webhook():
     ]
     signal_msg = "\n".join(signal_lines)
 
-    # Run check in background — return to TradingView immediately
     def run_tv_check():
         try:
             # Post signal context first (main channel)
             post_to_telegram(signal_msg)
 
-            # Only process bull signals (per trading rules)
+            # v3.4 — If BEARISH signal, check for open spreads and warn
+            if bias == "bear":
+                check_bearish_exit_warning(ticker, webhook_data)
+                log.info(f"TV bear signal for {ticker} — exit warning check complete")
+                return  # Don't try to build a bull trade from a bear signal
+
+            # Only process bull signals for trade recommendations
             if bias not in ALLOWED_DIRECTIONS:
                 post_to_telegram(f"ℹ️ {ticker}: {bias} signal skipped — bull only mode")
                 return
 
-            # Run v3 engine (posts trade card to main channel)
+            # Run v3 engine
             check_ticker(ticker, direction=bias, webhook_data=webhook_data)
 
         except Exception as e:
@@ -637,7 +704,7 @@ def tv_webhook():
 
 
 # ─────────────────────────────────────────────────────────
-# WATCHLIST SCAN (scheduled via cron or /scan command)
+# WATCHLIST SCAN
 # ─────────────────────────────────────────────────────────
 
 def scan_watchlist_internal(tickers: list, max_posts: int = 6):
@@ -649,7 +716,6 @@ def scan_watchlist_internal(tickers: list, max_posts: int = 6):
     results = []
     no_trade = []
     errors = []
-    earnings_flagged = []
 
     with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as executor:
         futures = {
@@ -671,7 +737,6 @@ def scan_watchlist_internal(tickers: list, max_posts: int = 6):
             else:
                 no_trade.append(f"{ticker}: {res.get('reason', '—')[:40]}")
 
-    # Summary (goes to main channel)
     summary_lines = [
         f"📋 WATCHLIST SUMMARY — {datetime.now(timezone.utc).strftime('%H:%M UTC')}",
         f"Scanned: {len(tickers)} | Trade cards: {posted}",
@@ -704,7 +769,6 @@ def scan_watchlist():
 
     max_posts = as_int(data.get("max_posts"), 6)
 
-    # Run in background
     threading.Thread(
         target=scan_watchlist_internal,
         args=(tickers, max_posts),
@@ -714,7 +778,7 @@ def scan_watchlist():
     return jsonify({"status": "accepted", "tickers": len(tickers)})
 
 # ─────────────────────────────────────────────────────────
-# HOLDINGS SENTIMENT SCAN (cron endpoint — posts BOTH accounts)
+# HOLDINGS SENTIMENT SCAN
 # ─────────────────────────────────────────────────────────
 
 @app.route("/holdings_scan", methods=["POST"])
@@ -728,7 +792,6 @@ def holdings_scan():
     def run_scan():
         from sentiment_report import generate_sentiment_report
 
-        # Scan BOTH accounts and post to their respective private channels
         for account in ("brad", "mom"):
             try:
                 report = generate_sentiment_report(md_get, account=account)
@@ -754,7 +817,6 @@ with app.app_context():
     if _tg_ws and BOT_URL:
         register_webhook(BOT_URL, _tg_ws)
 
-    # Phase 2A — Wire portfolio to the same Redis store
     portfolio.init_store(store_get, store_set)
 
 if __name__ == "__main__":
