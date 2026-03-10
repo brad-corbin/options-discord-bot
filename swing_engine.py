@@ -60,8 +60,9 @@ FIB_EXTENSIONS = {
     "1.618": "161.8% extension (golden)",
 }
 
-# Swing confidence thresholds
-SWING_MIN_CONFIDENCE      = 45
+# Swing confidence thresholds — v1.1: raised from 45 → 65 (only strong Fib setups)
+SWING_MIN_CONFIDENCE      = 65
+SWING_MIN_WIN_PROBABILITY = 0.60   # B-S win prob gate — reject if below this
 SWING_WIDTH_PREFERENCE    = [1.0, 2.5, 5.0, 10.0]  # Allow wider spreads for swing
 
 
@@ -579,8 +580,12 @@ def compute_swing_confidence(
 
     Weights Fib level quality heavily, then trend confirmation,
     then B-S fair value, then IV environment.
+
+    v1.1: Base score lowered 30→20, penalties tightened, gate raised to 65.
+    A perfect T1 setup at exact 61.8% with all confirmations scores ~95-100.
+    A weak T2 at 38.2% with mixed signals scores ~45-55 — correctly blocked.
     """
-    score = 30
+    score = 20  # v1.1: lowered from 30 — signals must earn their score
     reasons = list(fib_reasons)
     swing_em = swing_em or {}
     bs_data = bs_data or {}
@@ -606,7 +611,7 @@ def compute_swing_confidence(
         score += 6
         reasons.append("Daily trend converging")
     else:
-        score -= 15
+        score -= 20  # v1.1: tightened from -15 — diverging trend is a serious problem
         reasons.append("Daily trend diverging")
 
     # ── Weekly trend ──
@@ -617,20 +622,30 @@ def compute_swing_confidence(
             score += 15
             reasons.append("Weekly trend bearish (confirms bear)")
         elif weekly_bull:
-            score -= 12
+            score -= 15  # v1.1: tightened from -12
             reasons.append("Weekly trend bullish (fights bear)")
+        else:
+            score -= 8   # flat weekly also penalized
+            reasons.append("Weekly trend flat (no confirmation)")
     else:
         if weekly_bull:
             score += 15
             reasons.append("Weekly trend bullish (confirms bull)")
         elif weekly_bear:
-            score -= 12
+            score -= 15  # v1.1: tightened from -12
             reasons.append("Weekly trend bearish (fights bull)")
+        else:
+            score -= 8
+            reasons.append("Weekly trend flat (no confirmation)")
 
     # ── Volume contraction (coiling before move) ──
+    # Required by Pine filter now, but still boosts score when present
     if webhook_data.get("vol_contracting"):
         score += 8
         reasons.append("Volume contracting (coiling)")
+    else:
+        score -= 5   # v1.1: penalize if somehow not contracting
+        reasons.append("Volume not contracting")
 
     # ── RSI/MFI direction ──
     rsi_mfi_bull = webhook_data.get("rsi_mfi_bull", False)
@@ -638,10 +653,16 @@ def compute_swing_confidence(
         if not rsi_mfi_bull:
             score += 5
             reasons.append("RSI+MFI selling")
+        else:
+            score -= 5
+            reasons.append("RSI+MFI buying (fights bear)")
     else:
         if rsi_mfi_bull:
             score += 5
             reasons.append("RSI+MFI buying")
+        else:
+            score -= 5
+            reasons.append("RSI+MFI selling (fights bull)")
 
     # ── IV environment ──
     # For swing debit spread buyers: low IV = cheap entry
@@ -653,7 +674,7 @@ def compute_swing_confidence(
             score += 6
             reasons.append(f"IV low (rank {iv_rank:.0f})")
         elif iv_rank > 70:
-            score -= 10
+            score -= 12  # v1.1: tightened from -10
             reasons.append(f"IV elevated (rank {iv_rank:.0f}) — expensive entry")
 
     # ── B-S fair value ──
@@ -665,7 +686,7 @@ def compute_swing_confidence(
         score += 4
         reasons.append(f"Spread near B-S fair value ({bs_premium:+.1f}%)")
     elif bs_premium > 10:
-        score -= 6
+        score -= 8   # v1.1: tightened from -6
         reasons.append(f"Spread above B-S fair value ({bs_premium:+.1f}%)")
 
     # ── Win probability from B-S ──
@@ -676,8 +697,8 @@ def compute_swing_confidence(
     elif win_prob >= 0.60:
         score += 4
         reasons.append(f"B-S win prob {win_prob:.0%}")
-    elif win_prob < 0.45:
-        score -= 8
+    elif win_prob < 0.60:
+        score -= 10  # v1.1: tightened from -8, aligned with 60% gate
         reasons.append(f"B-S win prob low ({win_prob:.0%})")
 
     # ── EM zone ──
@@ -686,7 +707,7 @@ def compute_swing_confidence(
         score += 5
         reasons.append("Short strike inside 14-day EM")
     elif em_zone == "outside":
-        score -= 8
+        score -= 10  # v1.1: tightened from -8
         reasons.append("Short strike beyond 14-day EM")
 
     score = max(0, min(100, score))
@@ -827,6 +848,14 @@ def recommend_swing_trade(
         if confidence < SWING_MIN_CONFIDENCE:
             all_reasons.append(
                 f"DTE {dte}: confidence {confidence}/100 below {SWING_MIN_CONFIDENCE}"
+            )
+            continue
+
+        # ── Win probability gate (v1.1) ──
+        win_prob = best.get("win_prob", 0)
+        if win_prob < SWING_MIN_WIN_PROBABILITY:
+            all_reasons.append(
+                f"DTE {dte}: B-S win prob {win_prob:.0%} below {SWING_MIN_WIN_PROBABILITY:.0%} minimum"
             )
             continue
 
