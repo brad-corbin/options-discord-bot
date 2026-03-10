@@ -741,27 +741,40 @@ def compute_confidence(
             reasons.append("Short strike beyond EM")
 
     # ── Market Regime ──
-    adx_regime = regime.get("adx_regime", "")
-    vix_regime = regime.get("vix_regime", "")
+    adx_regime   = regime.get("adx_regime", "")
+    vix_regime   = regime.get("vix_regime", "")
     regime_label = regime.get("label", "")
+    vix_val      = regime.get("vix", 0)
 
     if adx_regime == "TRENDING" and vix_regime in ("LOW", "NORMAL"):
         score += CONFIDENCE_BOOSTS.get("regime_trending", 8)
         reasons.append(f"Regime: {regime_label} (trending)")
     elif vix_regime == "LOW":
         score += CONFIDENCE_BOOSTS.get("regime_low_vix", 5)
-        reasons.append(f"Regime: low VIX ({regime.get('vix', 0):.0f})")
+        reasons.append(f"Regime: low VIX ({vix_val:.0f})")
 
     if adx_regime == "CHOPPY":
         score += CONFIDENCE_PENALTIES.get("regime_choppy", -10)
         reasons.append(f"Regime: choppy (ADX {regime.get('adx', 0):.0f})")
 
-    if vix_regime == "ELEVATED":
-        score += CONFIDENCE_PENALTIES.get("regime_high_vix", -8)
-        reasons.append(f"Regime: elevated VIX ({regime.get('vix', 0):.0f})")
-    elif vix_regime == "CRISIS":
-        score += CONFIDENCE_PENALTIES.get("regime_crisis", -25)
-        reasons.append(f"Regime: CRISIS VIX ({regime.get('vix', 0):.0f})")
+    if vix_regime == "CRISIS":
+        if is_bear:
+            # Bear spreads in CRISIS: market fear confirms direction
+            # IV inflation compresses net debit — actually favorable for spread buyers
+            score += 8
+            reasons.append(f"CRISIS VIX {vix_val:.0f} — confirms bear direction")
+        else:
+            # Bull spreads fighting extreme fear — meaningful penalty
+            score += CONFIDENCE_PENALTIES.get("regime_crisis", -10)
+            reasons.append(f"Regime: CRISIS VIX {vix_val:.0f} (fighting fear)")
+    elif vix_regime == "ELEVATED":
+        if is_bear:
+            # Elevated VIX slightly favors bears
+            score += 3
+            reasons.append(f"Elevated VIX {vix_val:.0f} (mild bear confirm)")
+        else:
+            score += CONFIDENCE_PENALTIES.get("regime_high_vix", -5)
+            reasons.append(f"Regime: elevated VIX {vix_val:.0f}")
 
     # ── Deal-breakers ──
     if has_earnings:
