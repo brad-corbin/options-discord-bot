@@ -911,10 +911,17 @@ def recommend_trade(
 
     # ── Apply regime size multiplier ──
     regime_size_mult = regime.get("size_mult", 1.0)
+    regime_note = ""
     if regime_size_mult < 1.0 and regime_size_mult > 0:
         num_contracts = max(1, int(num_contracts * regime_size_mult))
         total_risk = num_contracts * best["debit"] * 100
-        sizing_note += f" [regime ×{regime_size_mult}]"
+        regime_note = f" | Regime ×{regime_size_mult} (choppy — sized down)"
+
+    # Rebuild sizing note after regime adjustment — one contract count, no contradictions
+    sizing_note = (
+        f"{num_contracts} contract(s) × ${best['debit']:.2f} = ${total_risk:.0f} risk "
+        f"[max ${MAX_RISK_PER_TRADE_USD:.0f}, {MAX_RISK_PCT_ACCOUNT:.0%} acct]{regime_note}"
+    )
 
     # ── Exit targets ──
     exits = {
@@ -982,27 +989,22 @@ def recommend_trade(
 def format_trade_card(rec: Dict) -> str:
     if not rec.get("ok"):
         reason = rec.get("reason", "Unknown")
-        conf = rec.get("confidence")
-        lines = [
-            f"❌ {rec.get('ticker', '?')} — NO TRADE",
-            f"Reason: {reason}",
-        ]
+        conf   = rec.get("confidence")
+        lines  = [f"❌ {rec.get('ticker', '?')} — NO TRADE", f"Reason: {reason}"]
         if conf is not None:
             lines.append(f"Confidence: {conf}/100")
-        lines.append("")
         lines.append("— Not financial advice —")
         return "\n".join(lines)
 
-    trade = rec["trade"]
-    exits = rec["exits"]
-    ticker = rec["ticker"]
-    tier = rec.get("tier", "?")
-    conf = rec.get("confidence", 0)
+    trade        = rec["trade"]
+    exits        = rec["exits"]
+    ticker       = rec["ticker"]
+    tier         = rec.get("tier", "?")
+    conf         = rec.get("confidence", 0)
     spread_label = rec.get("spread_label", "BULL CALL")
-    direction = rec.get("direction", "bull")
-
-    tier_emoji = "🥇" if tier == "1" else "🥈"
-    dir_emoji = "🐻" if direction == "bear" else "🐂"
+    direction    = rec.get("direction", "bull")
+    tier_emoji   = "🥇" if tier == "1" else "🥈"
+    dir_emoji    = "🐻" if direction == "bear" else "🐂"
 
     lines = [
         f"{tier_emoji} {ticker} — {dir_emoji} {spread_label} DEBIT SPREAD",
@@ -1010,47 +1012,41 @@ def format_trade_card(rec: Dict) -> str:
         f"Spot: ${rec['spot']:.2f} | DTE: {rec['dte']} ({rec['exp']})",
     ]
 
+    # Expected Move
     em = rec.get("expected_move", 0)
     if EM_DISPLAY_ON_CARD and em > 0:
-        em_low = round(rec["spot"] - em, 2)
+        em_low  = round(rec["spot"] - em, 2)
         em_high = round(rec["spot"] + em, 2)
         lines.append(f"Expected Move: ±${em:.2f} ({em_low} – {em_high})")
 
     lines.append("")
 
-    if direction == "bear":
-        lines += [
-            f"Long:  ${trade['long']} (${trade['long_itm']:.2f} ITM put)",
-            f"Short: ${trade['short']} (${trade['short_itm']:.2f} ITM put)",
-        ]
-    else:
-        lines += [
-            f"Long:  ${trade['long']} (${trade['long_itm']:.2f} ITM)",
-            f"Short: ${trade['short']} (${trade['short_itm']:.2f} ITM)",
-        ]
-
+    # Legs
+    opt_type = "put" if direction == "bear" else "call"
     lines += [
+        f"Long:  ${trade['long']} (${trade['long_itm']:.2f} ITM {opt_type})",
+        f"Short: ${trade['short']} (${trade['short_itm']:.2f} ITM {opt_type})",
         f"Width: ${trade['width']:.2f} | Cost: ${trade['debit']:.2f} ({trade['cost_pct']:.0f}%)",
         f"Max Profit: ${trade['max_profit']:.2f} | RoR: {trade['ror']:.0%}",
     ]
 
+    # Win prob / EV
     wp = trade.get("win_prob", 0)
     ev = trade.get("expected_value", 0)
     if wp > 0:
         ev_emoji = "🟢" if ev > 0 else "🔴"
         lines.append(f"Win Prob: {wp:.0%} | EV: {ev_emoji} ${ev:.2f}/contract")
 
+    # EM zone
     em_zone = trade.get("em_zone", "unknown")
     em_prox = trade.get("em_proximity")
     if em_zone != "unknown" and em_prox is not None:
         zone_emoji = "✅" if em_zone == "inside" else "⚠️"
-        lines.append(
-            f"EM Zone: {zone_emoji} Short strike {em_zone} EM "
-            f"(${em_prox:+.2f} from boundary)"
-        )
+        lines.append(f"EM Zone: {zone_emoji} Short strike {em_zone} EM (${em_prox:+.2f} from boundary)")
 
     lines.append("")
 
+    # Vol edge
     vol_edge = rec.get("vol_edge", {})
     if IV_RV_DISPLAY_ON_CARD and vol_edge.get("edge_label") and vol_edge["edge_label"] != "UNKNOWN":
         lines.append(
@@ -1058,82 +1054,86 @@ def format_trade_card(rec: Dict) -> str:
             f"(IV {vol_edge.get('iv_pct', 0):.0f}% vs RV {vol_edge.get('rv_pct', 0):.0f}% | "
             f"spread {vol_edge.get('edge_pct', 0):+.1f}pp)"
         )
-        lines.append("")
 
+    # Regime — single line, no trailing blank before sizing
     regime = rec.get("regime", {})
     if regime.get("label"):
         lines.append(
             f"Regime: {regime.get('emoji', '⚪')} {regime['label']} "
             f"(VIX {regime.get('vix', 0):.0f} | ADX {regime.get('adx', 0):.0f})"
         )
-        lines.append("")
 
+    lines.append("")
+
+    # Greeks
     if trade.get("net_theta") is not None:
-        delta_str = f"Δ {trade.get('net_delta', 0):.3f}" if trade.get("net_delta") is not None else ""
-        gamma_str = f"Γ {trade.get('net_gamma', 0):.4f}" if trade.get("net_gamma") is not None else ""
-        theta_str = f"Θ ${trade['net_theta']:.3f}/day"
-        vega_str = f"V ${trade.get('net_vega', 0):.3f}/pt"
-        parts = [p for p in [delta_str, gamma_str, theta_str, vega_str] if p]
+        parts = []
+        if trade.get("net_delta") is not None: parts.append(f"Δ {trade['net_delta']:.3f}")
+        if trade.get("net_gamma") is not None: parts.append(f"Γ {trade['net_gamma']:.4f}")
+        parts.append(f"Θ ${trade['net_theta']:.3f}/day")
+        if trade.get("net_vega") is not None:  parts.append(f"V ${trade['net_vega']:.3f}/pt")
         lines.append(" | ".join(parts))
 
+        # Dynamic exit hints
         dynamic_exits = []
         nd = trade.get("net_delta")
         ng = trade.get("net_gamma")
         if nd is not None and abs(nd) > 0.85:
-            dynamic_exits.append("Delta > 0.85 → close early (spread is deep ITM, diminishing returns)")
+            dynamic_exits.append("Delta > 0.85 → close early (diminishing returns)")
         if ng is not None and abs(ng) > 0.05 and rec.get("dte", 5) <= 1:
             dynamic_exits.append("Gamma spike on 0-1 DTE → tighten stop (pin risk)")
         if trade.get("net_vega") is not None and abs(trade["net_vega"]) > 0.03:
-            dynamic_exits.append("If IV crushes >5pts → close (vega drag)")
-
+            dynamic_exits.append("IV crush >5pts → close (vega drag)")
         if dynamic_exits:
-            lines.append("⚡ Dynamic Exits:")
-            for de in dynamic_exits:
-                lines.append(f"  {de}")
+            lines.append("⚡ " + " | ".join(dynamic_exits))
 
         lines.append("")
 
-    lines += [
-        f"Size: {rec['contracts']} contract(s) | ${rec['total_risk']:.0f} risk",
-        rec["sizing_note"],
-        "",
-    ]
+    # Sizing — single consolidated line
+    lines.append(f"Size: {rec['sizing_note']}")
+    lines.append("")
 
+    # Exit targets
     lines += [
         "📊 Exit Targets:",
         f"  Same Day (30%): sell at ${exits['same_day']['sell_at']:.2f} → +${exits['same_day']['profit_total']:.0f}",
         f"  Next Day (35%): sell at ${exits['next_day']['sell_at']:.2f} → +${exits['next_day']['profit_total']:.0f}",
         f"  Extended (50%): sell at ${exits['extended']['sell_at']:.2f} → +${exits['extended']['profit_total']:.0f}",
-        "",
     ]
 
+    # Stop
     if rec.get("stop_price"):
-        lines.append(f"🛑 Stop: ${rec['stop_price']:.2f} ({rec['stop_note']})")
+        lines.append(f"  Stop: ${rec['stop_price']:.2f} ({rec['stop_note']})")
     else:
-        lines.append(f"🛑 {rec['stop_note']}")
+        lines.append(f"  {rec['stop_note']}")
+
     lines.append("")
 
+    # Width ladder
     ladder = rec.get("ladder", [])
     if len(ladder) > 1:
         lines.append("📐 Width Options:")
         for c in ladder:
-            star = " ⭐" if c["long"] == trade["long"] and c["short"] == trade["short"] else ""
-            ev_c = c.get("expected_value", 0)
-            wp_c = c.get("win_prob", 0)
+            star  = " ⭐" if c["long"] == trade["long"] and c["short"] == trade["short"] else ""
+            ev_c  = c.get("expected_value", 0)
+            wp_c  = c.get("win_prob", 0)
             lines.append(
                 f"  ${c['width']:.2f}w | ${c['debit']:.2f} ({c['cost_pct']:.0f}%) | "
-                f"EV ${ev_c:.2f} | {wp_c:.0%} win | "
-                f"{c['long']}/{c['short']}{star}"
+                f"EV ${ev_c:.2f} | {wp_c:.0%} win | {c['long']}/{c['short']}{star}"
             )
         lines.append("")
 
+    # Liquidity warnings
     if trade.get("warnings"):
         lines.append("⚠️ " + "; ".join(trade["warnings"][:3]))
         lines.append("")
 
+    # Confidence breakdown — max 3 items, each on own line for readability
     if rec.get("conf_reasons"):
-        lines.append("🧠 " + " | ".join(rec["conf_reasons"][:4]))
+        reasons_short = rec["conf_reasons"][:3]
+        lines.append("🧠 " + " | ".join(reasons_short))
         lines.append("")
 
+    # Footer — always last
     lines.append("— Not financial advice —")
     return "\n".join(lines)
