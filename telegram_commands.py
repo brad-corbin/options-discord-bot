@@ -4,6 +4,7 @@
 #
 # v3.2 — Multi-account portfolio support
 # v3.4 — /spread command for debit spread tracking
+# v3.8 — /check runs both bull + bear, engine decides
 
 import os
 import logging
@@ -346,39 +347,61 @@ def handle_command(
 
     # ─────────────────────────────────────
     # /check TICKER [bull|bear]
+    # Engine decides direction — runs both unless you specify one.
     # ─────────────────────────────────────
     if cmd in ("/check", "/check@omegabot"):
         if not args:
             send_reply(chat_id,
                 "Usage: /check AAPL\n"
-                "       /check SPY bull\n\n"
-                "Analyzes any ticker and returns a trade card\n"
-                "if it meets your rules, or explains why not."
+                "       /check AAPL bull  — force bull only\n"
+                "       /check AAPL bear  — force bear only\n\n"
+                "By default runs both directions — engine posts\n"
+                "whichever setups meet your confidence gate."
             )
             return
 
         ticker = args[0].upper()
-        direction = args[1].lower() if len(args) > 1 else "bull"
 
-        if direction not in ("bull", "bear"):
-            send_reply(chat_id, f"⚠️ Direction must be 'bull' or 'bear', got '{direction}'")
-            return
+        # Explicit direction override
+        forced_direction = None
+        if len(args) > 1:
+            d = args[1].lower()
+            if d not in ("bull", "bear"):
+                send_reply(chat_id, f"⚠️ Direction must be 'bull' or 'bear', got '{d}'")
+                return
+            forced_direction = d
 
-        send_reply(chat_id, f"🔍 Checking {ticker} ({direction})...")
+        directions = [forced_direction] if forced_direction else ["bull", "bear"]
+        dir_label  = forced_direction.upper() if forced_direction else "BULL + BEAR"
+        send_reply(chat_id, f"🔍 Checking {ticker} ({dir_label})...")
 
         def run_check():
-            try:
-                result = check_fn(ticker, direction)
-                if not result.get("posted") and not result.get("ok"):
-                    reason = result.get("reason") or result.get("error") or "no valid setup"
-                    conf = result.get("confidence")
-                    msg = f"❌ {ticker} — {reason}"
+            any_posted = False
+            results    = []
+
+            for direction in directions:
+                try:
+                    result = check_fn(ticker, direction)
+                    if result.get("posted"):
+                        any_posted = True
+                    else:
+                        reason = result.get("reason") or result.get("error") or "no valid setup"
+                        conf   = result.get("confidence")
+                        results.append((direction, reason, conf))
+                except Exception as e:
+                    log.error(f"/check {ticker} {direction}: {e}")
+                    results.append((direction, f"{type(e).__name__}", None))
+
+            # Only send a rejection summary if nothing was posted at all
+            if not any_posted:
+                lines = [f"❌ {ticker} — no setups found"]
+                for direction, reason, conf in results:
+                    dir_emoji = "🐂" if direction == "bull" else "🐻"
+                    line = f"{dir_emoji} {direction.upper()}: {reason}"
                     if conf is not None:
-                        msg += f"\nConfidence: {conf}/100"
-                    send_reply(chat_id, msg)
-            except Exception as e:
-                log.error(f"/check {ticker}: {e}")
-                send_reply(chat_id, f"⚠️ Error checking {ticker}: {type(e).__name__}")
+                        line += f" (conf {conf}/100)"
+                    lines.append(line)
+                send_reply(chat_id, "\n".join(lines))
 
         threading.Thread(target=run_check, daemon=True).start()
 
@@ -500,8 +523,9 @@ def handle_command(
         msg = (
             "🤖 Omega 3000 Commands:\n\n"
             "── Analysis ──\n"
-            "/check AAPL — analyze any ticker (v3 engine)\n"
-            "/check SPY bull — with direction hint\n"
+            "/check AAPL — auto bull+bear, engine decides\n"
+            "/check AAPL bull — force bull only\n"
+            "/check AAPL bear — force bear only\n"
             "/scan AAPL — scan single ticker\n"
             "/scan — run full watchlist scan\n"
             "\n── Portfolio (add --mom for mom's account) ──\n"
