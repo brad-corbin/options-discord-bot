@@ -29,6 +29,7 @@ import json
 import hashlib
 import logging
 import threading
+import queue
 import portfolio
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -92,9 +93,48 @@ ACCOUNT_CHAT_IDS = {
 }
 
 # ─────────────────────────────────────────────────────────
-# REDIS
+# TV SIGNAL QUEUE
 # ─────────────────────────────────────────────────────────
-_redis_client = None
+# Processes /tv webhook signals one at a time through a bounded
+# FIFO queue. Prevents simultaneous 1H bar-close floods from
+# overwhelming the options engine or timing out Render.
+#
+# Capacity: 50 signals max. If the queue is full (extremely
+# unlikely), the oldest signal is dropped and a warning is logged.
+# Each signal runs in the single worker thread — no race conditions,
+# no ThreadPoolExecutor, no shared-state bugs.
+
+TV_QUEUE_MAX   = 50   # max signals waiting before dropping oldest
+_tv_queue: queue.Queue = queue.Queue(maxsize=TV_QUEUE_MAX)
+
+def _tv_queue_worker():
+    """Single worker thread — drains the TV signal queue one by one."""
+    log.info("TV queue worker started")
+    while True:
+        try:
+            job = _tv_queue.get(block=True, timeout=5)
+            if job is None:
+                break  # poison pill — graceful shutdown
+            ticker, bias, webhook_data, signal_msg = job
+            try:
+                post_to_telegram(signal_msg)
+                check_spread_exit_warning(ticker, bias, webhook_data)
+                if bias in ALLOWED_DIRECTIONS:
+                    check_ticker(ticker, direction=bias, webhook_data=webhook_data)
+                else:
+                    post_to_telegram(f"ℹ️ {ticker}: {bias} signal skipped — not in allowed directions")
+            except Exception as e:
+                log.error(f"TV queue worker error for {ticker}: {e}", exc_info=True)
+            finally:
+                _tv_queue.task_done()
+        except queue.Empty:
+            continue  # just keep waiting
+
+# Start the worker thread at module load
+_tv_worker_thread = threading.Thread(target=_tv_queue_worker, daemon=True, name="tv-queue-worker")
+_tv_worker_thread.start()
+
+
 _mem_store: dict = {}
 
 def _get_redis():
@@ -880,40 +920,46 @@ def tv_webhook():
         "timeframe":      data.get("timeframe", ""),
     }
 
-    tier_emoji = "🥇" if tier == "1" else "🥈" if tier == "2" else "📢"
-    wt2        = webhook_data.get("wt2") or 0
-    wave_zone  = "🟢 Oversold" if wt2 < -30 else "🔴 Overbought" if wt2 > 60 else "⚪ Neutral"
-    trend_str  = ("✅ Confirmed" if webhook_data["htf_confirmed"]
-                  else "🟡 Converging" if webhook_data["htf_converging"]
-                  else "❌ Diverging")
-    dir_emoji  = "🐻" if bias == "bear" else "🐂"
+    def _build_signal_msg():
+        tier_emoji = "🥇" if tier == "1" else "🥈" if tier == "2" else "📢"
+        wt2        = webhook_data.get("wt2") or 0
+        wave_zone  = "🟢 Oversold" if wt2 < -30 else "🔴 Overbought" if wt2 > 60 else "⚪ Neutral"
+        trend_str  = ("✅ Confirmed" if webhook_data["htf_confirmed"]
+                      else "🟡 Converging" if webhook_data["htf_converging"]
+                      else "❌ Diverging")
+        dir_emoji  = "🐻" if bias == "bear" else "🐂"
+        return "\n".join([
+            f"{tier_emoji} TV Signal — {ticker} (T{tier} {dir_emoji} {bias.upper()})",
+            f"Close: ${close:.2f} | {data.get('timeframe', '')} timeframe",
+            f"1H Trend: {trend_str} | Daily: {'🟢' if webhook_data['daily_bull'] else '🔴'}",
+            f"Wave: {wave_zone} (wt2={wt2:.1f})",
+            f"VWAP: {'Above ✅' if webhook_data['above_vwap'] else 'Below'} | "
+            f"RSI+MFI: {'Buying ✅' if webhook_data['rsi_mfi_bull'] else 'Selling'}",
+            "",
+        ])
 
-    signal_lines = [
-        f"{tier_emoji} TV Signal — {ticker} (T{tier} {dir_emoji} {bias.upper()})",
-        f"Close: ${close:.2f} | {data.get('timeframe', '')} timeframe",
-        f"1H Trend: {trend_str} | Daily: {'🟢' if webhook_data['daily_bull'] else '🔴'}",
-        f"Wave: {wave_zone} (wt2={wt2:.1f})",
-        f"VWAP: {'Above ✅' if webhook_data['above_vwap'] else 'Below'} | "
-        f"RSI+MFI: {'Buying ✅' if webhook_data['rsi_mfi_bull'] else 'Selling'}",
-        "",
-    ]
-    signal_msg = "\n".join(signal_lines)
+    signal_msg = _build_signal_msg()
 
-    def run_tv_check():
+    # Enqueue — returns immediately so TradingView doesn't time out
+    try:
+        _tv_queue.put_nowait((ticker, bias, webhook_data, signal_msg))
+        qsize = _tv_queue.qsize()
+        log.info(f"TV signal queued: {ticker} (queue depth: {qsize})")
+        if qsize > TV_QUEUE_MAX * 0.8:
+            log.warning(f"TV queue at {qsize}/{TV_QUEUE_MAX} — approaching capacity")
+    except queue.Full:
+        # Queue is full — drop oldest, enqueue new
         try:
-            post_to_telegram(signal_msg)
-            check_spread_exit_warning(ticker, bias, webhook_data)
+            dropped = _tv_queue.get_nowait()
+            log.warning(f"TV queue full — dropped oldest signal: {dropped[0]}")
+            _tv_queue.task_done()
+        except queue.Empty:
+            pass
+        try:
+            _tv_queue.put_nowait((ticker, bias, webhook_data, signal_msg))
+        except queue.Full:
+            log.error(f"TV queue still full after drop — signal for {ticker} lost")
 
-            if bias not in ALLOWED_DIRECTIONS:
-                post_to_telegram(f"ℹ️ {ticker}: {bias} signal skipped — not in allowed directions")
-                return
-
-            check_ticker(ticker, direction=bias, webhook_data=webhook_data)
-
-        except Exception as e:
-            log.error(f"TV check error for {ticker}: {e}")
-
-    threading.Thread(target=run_tv_check, daemon=True).start()
     return jsonify({"status": "accepted", "ticker": ticker, "tier": tier}), 200
 
 
