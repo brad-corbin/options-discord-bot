@@ -7,11 +7,14 @@
 #   - Market regime detection thresholds (VIX, ADX)
 #   - Trade journal settings
 #   - Greeks P/L attribution settings
+#
+# v3.6 additions:
+#   - Bear direction enabled (bull + bear)
 
 # ─────────────────────────────────────────────────────────
 # DIRECTION & SIGNAL
 # ─────────────────────────────────────────────────────────
-ALLOWED_DIRECTIONS       = ["bull"]
+ALLOWED_DIRECTIONS       = ["bull", "bear"]   # v3.6: bear enabled
 SIGNAL_SOURCE            = "unified_pine"
 REQUIRE_TIER             = ["1", "2"]
 TIER1_SIZE_MULTIPLIER    = 1.0
@@ -82,29 +85,35 @@ CONFIDENCE_BOOSTS = {
     "htf_confirmed":     10,
     "htf_converging":    5,
     "daily_bull":        10,
+    "daily_bear":        10,   # v3.6: daily bear confirms bear trades
     "rsi_mfi_bull":      5,
+    "rsi_mfi_bear":      5,    # v3.6: RSI/MFI selling confirms bear trades
     "above_vwap":        5,
+    "below_vwap":        5,    # v3.6: below VWAP confirms bear trades
     "wave_oversold":     10,
+    "wave_overbought":   10,   # v3.6: overbought confirms bear trades
     "iv_edge":           8,
     "rv_edge":           10,
     "within_em":         5,
-    "regime_trending":   8,     # v3.5: trending regime boost
-    "regime_low_vix":    5,     # v3.5: calm market boost
+    "regime_trending":   8,
+    "regime_low_vix":    5,
 }
 
 CONFIDENCE_PENALTIES = {
     "htf_diverging":     -20,
-    "daily_bear":        -10,
-    "wave_overbought":   -15,
+    "daily_bear":        -10,  # penalty when bull trade, daily is bear
+    "daily_bull":        -10,  # v3.6: penalty when bear trade, daily is bull
+    "wave_overbought":   -15,  # penalty when bull trade, wave overbought
+    "wave_oversold":     -15,  # v3.6: penalty when bear trade, wave oversold
     "low_oi":            -5,
     "wide_spread":       -5,
     "earnings_week":     -100,
     "dividend_in_dte":   -100,
     "iv_crushed":        -5,
     "beyond_em":         -8,
-    "regime_choppy":     -10,   # v3.5: choppy / range-bound penalty
-    "regime_high_vix":   -8,    # v3.5: elevated VIX penalty
-    "regime_crisis":     -25,   # v3.5: VIX > 35 = crisis mode
+    "regime_choppy":     -10,
+    "regime_high_vix":   -8,
+    "regime_crisis":     -25,
 }
 
 MIN_CONFIDENCE_TO_TRADE  = 40
@@ -125,26 +134,18 @@ IV_RV_SELLER_EDGE_PCT    = 5.0
 # ═══════════════════════════════════════════════════════════
 # PORTFOLIO-LEVEL RISK LIMITS (v3.5)
 # ═══════════════════════════════════════════════════════════
-#
-# Hard limits enforced by the risk manager.
-# If any limit is breached, new trades are blocked.
 
-# Daily loss limit: realized + unrealized for today
-DAILY_LOSS_LIMIT_USD     = 3000.0             # Max daily drawdown before auto-pause
-DAILY_LOSS_LIMIT_PCT     = 0.03               # 3% of account — whichever hits first
+DAILY_LOSS_LIMIT_USD     = 3000.0
+DAILY_LOSS_LIMIT_PCT     = 0.03
 
-# Gross exposure: total open risk across all spreads
-MAX_GROSS_EXPOSURE_USD   = 10000.0            # Max $10k total open risk
-MAX_GROSS_EXPOSURE_PCT   = 0.10               # 10% of account
+MAX_GROSS_EXPOSURE_USD   = 10000.0
+MAX_GROSS_EXPOSURE_PCT   = 0.10
 
-# Concentration: max risk on a single underlying ticker
-MAX_TICKER_EXPOSURE_USD  = 3000.0             # Max $3k on any one ticker
-MAX_TICKER_EXPOSURE_PCT  = 0.03               # 3% of account on one ticker
+MAX_TICKER_EXPOSURE_USD  = 3000.0
+MAX_TICKER_EXPOSURE_PCT  = 0.03
 
-# Max concurrent open spreads
 MAX_OPEN_SPREADS         = 8
 
-# Sector correlation (soft limit — warns but doesn't block)
 MAX_SAME_SECTOR_SPREADS  = 4
 
 SECTOR_MAP = {
@@ -154,28 +155,14 @@ SECTOR_MAP = {
     "SPX":   "index", "GLD":  "commodity",
 }
 
-# Portfolio-level Greeks caps (v3.6)
-# These are SOFT limits (warnings, not blocks).
-# Net delta/gamma/vega across all open spreads × contracts × 100.
-MAX_PORTFOLIO_DELTA      = 300                # Max ±300 net delta
-MAX_PORTFOLIO_GAMMA      = 50                 # Max ±50 net gamma
-MAX_PORTFOLIO_VEGA       = 150                # Max ±150 net vega
+MAX_PORTFOLIO_DELTA      = 300
+MAX_PORTFOLIO_GAMMA      = 50
+MAX_PORTFOLIO_VEGA       = 150
 
 
 # ═══════════════════════════════════════════════════════════
 # MARKET REGIME DETECTION (v3.5)
 # ═══════════════════════════════════════════════════════════
-#
-# VIX thresholds:
-#   < 15:   LOW — calm, trend-friendly
-#   15-25:  NORMAL — standard conditions
-#   25-35:  ELEVATED — increase caution
-#   > 35:   CRISIS — consider pausing
-#
-# ADX (14-period daily):
-#   < 20:   CHOPPY — range-bound, whipsaw risk
-#   20-30:  MODERATE — trend forming
-#   > 30:   TRENDING — strong trend
 
 REGIME_VIX_LOW           = 15.0
 REGIME_VIX_NORMAL        = 25.0
@@ -184,22 +171,18 @@ REGIME_VIX_ELEVATED      = 35.0
 REGIME_ADX_CHOPPY        = 20.0
 REGIME_ADX_TRENDING      = 30.0
 
-REGIME_CRISIS_BLOCK      = True               # Block entries when VIX > 35
-REGIME_ELEVATED_SIZE_MULT = 0.50              # Halve size when VIX elevated + choppy
-REGIME_CHOPPY_SIZE_MULT  = 0.75               # 75% size in choppy regime
-REGIME_TRENDING_SIZE_MULT = 1.0               # Full size in trending regime
+REGIME_CRISIS_BLOCK      = True
+REGIME_ELEVATED_SIZE_MULT = 0.50
+REGIME_CHOPPY_SIZE_MULT  = 0.75
+REGIME_TRENDING_SIZE_MULT = 1.0
 
 
 # ═══════════════════════════════════════════════════════════
 # TRADE JOURNAL SETTINGS (v3.5)
 # ═══════════════════════════════════════════════════════════
-#
-# Two types of entries:
-#   SIGNAL: logged when Pine fires a webhook (even if no trade)
-#   TRADE:  logged when a spread is opened/closed, with full context
 
-JOURNAL_LOG_ALL_SIGNALS  = True               # Log every TV webhook signal
-JOURNAL_LOG_REJECTED     = True               # Log signals that didn't produce a trade
-JOURNAL_MAX_ENTRIES      = 5000               # Rolling cap (oldest pruned)
+JOURNAL_LOG_ALL_SIGNALS  = True
+JOURNAL_LOG_REJECTED     = True
+JOURNAL_MAX_ENTRIES      = 5000
 
-GREEKS_ATTRIBUTION_ON_CLOSE = True            # Estimate delta/theta/vega P/L attribution
+GREEKS_ATTRIBUTION_ON_CLOSE = True
