@@ -93,48 +93,9 @@ ACCOUNT_CHAT_IDS = {
 }
 
 # ─────────────────────────────────────────────────────────
-# TV SIGNAL QUEUE
+# REDIS
 # ─────────────────────────────────────────────────────────
-# Processes /tv webhook signals one at a time through a bounded
-# FIFO queue. Prevents simultaneous 1H bar-close floods from
-# overwhelming the options engine or timing out Render.
-#
-# Capacity: 50 signals max. If the queue is full (extremely
-# unlikely), the oldest signal is dropped and a warning is logged.
-# Each signal runs in the single worker thread — no race conditions,
-# no ThreadPoolExecutor, no shared-state bugs.
-
-TV_QUEUE_MAX   = 50   # max signals waiting before dropping oldest
-_tv_queue: queue.Queue = queue.Queue(maxsize=TV_QUEUE_MAX)
-
-def _tv_queue_worker():
-    """Single worker thread — drains the TV signal queue one by one."""
-    log.info("TV queue worker started")
-    while True:
-        try:
-            job = _tv_queue.get(block=True, timeout=5)
-            if job is None:
-                break  # poison pill — graceful shutdown
-            ticker, bias, webhook_data, signal_msg = job
-            try:
-                post_to_telegram(signal_msg)
-                check_spread_exit_warning(ticker, bias, webhook_data)
-                if bias in ALLOWED_DIRECTIONS:
-                    check_ticker(ticker, direction=bias, webhook_data=webhook_data)
-                else:
-                    post_to_telegram(f"ℹ️ {ticker}: {bias} signal skipped — not in allowed directions")
-            except Exception as e:
-                log.error(f"TV queue worker error for {ticker}: {e}", exc_info=True)
-            finally:
-                _tv_queue.task_done()
-        except queue.Empty:
-            continue  # just keep waiting
-
-# Start the worker thread at module load
-_tv_worker_thread = threading.Thread(target=_tv_queue_worker, daemon=True, name="tv-queue-worker")
-_tv_worker_thread.start()
-
-
+_redis_client = None
 _mem_store: dict = {}
 
 def _get_redis():
@@ -197,6 +158,43 @@ def is_duplicate_trade(ticker, direction, short_k, long_k) -> bool:
 
 def mark_trade_sent(ticker, direction, short_k, long_k):
     store_set(trade_dedup_key(ticker, direction, short_k, long_k), "1", ttl=DEDUP_TTL_SECONDS)
+
+# ─────────────────────────────────────────────────────────
+# TV SIGNAL QUEUE
+# ─────────────────────────────────────────────────────────
+# Placed here — after Redis, store_*, and dedup helpers are defined.
+# Worker calls post_to_telegram, check_spread_exit_warning, check_ticker
+# which are defined further below; Python resolves these at call time
+# not at definition time, so forward references are fine.
+
+TV_QUEUE_MAX = 50
+_tv_queue: queue.Queue = queue.Queue(maxsize=TV_QUEUE_MAX)
+
+def _tv_queue_worker():
+    """Single worker thread — drains the TV signal queue one by one."""
+    log.info("TV queue worker started")
+    while True:
+        try:
+            job = _tv_queue.get(block=True, timeout=5)
+            if job is None:
+                break
+            ticker, bias, webhook_data, signal_msg = job
+            try:
+                post_to_telegram(signal_msg)
+                check_spread_exit_warning(ticker, bias, webhook_data)
+                if bias in ALLOWED_DIRECTIONS:
+                    check_ticker(ticker, direction=bias, webhook_data=webhook_data)
+                else:
+                    post_to_telegram(f"ℹ️ {ticker}: {bias} signal skipped — not in allowed directions")
+            except Exception as e:
+                log.error(f"TV queue worker error for {ticker}: {e}", exc_info=True)
+            finally:
+                _tv_queue.task_done()
+        except queue.Empty:
+            continue
+
+_tv_worker_thread = threading.Thread(target=_tv_queue_worker, daemon=True, name="tv-queue-worker")
+_tv_worker_thread.start()
 
 # ─────────────────────────────────────────────────────────
 # TELEGRAM
