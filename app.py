@@ -270,16 +270,40 @@ def get_daily_candles(ticker: str, days: int = 30) -> list:
         return []
 
 def get_vix() -> float:
-    """Fetch current VIX spot level."""
+    """Fetch current VIX spot level.
+    MarketData.app serves VIX as an index, not a stock quote.
+    Try indices endpoint first, fall back to SPY IV proxy.
+    """
+    # Primary: indices endpoint
     try:
-        data = md_get("https://api.marketdata.app/v1/stocks/quotes/VIX/")
-        for field in ("last", "mid", "bid", "ask"):
+        data = md_get("https://api.marketdata.app/v1/indices/quotes/VIX/")
+        for field in ("last", "mid", "bid", "ask", "close"):
             v = as_float(data.get(field), 0.0)
             if v > 0:
+                log.info(f"VIX fetched from indices endpoint: {v:.2f}")
                 return v
     except Exception as e:
-        log.warning(f"VIX fetch failed: {e}")
-    return 0.0
+        log.warning(f"VIX indices fetch failed: {e}")
+
+    # Fallback: SPY options chain implied vol as VIX proxy
+    try:
+        spy_chains = get_options_chain_swing("SPY")
+        ivs = []
+        for exp, dte, contracts in spy_chains[:3]:
+            for c in contracts:
+                iv = as_float(c.get("iv") or c.get("impliedVolatility"), 0.0)
+                if 0.05 < iv < 2.0:
+                    ivs.append(iv * 100)
+        if ivs:
+            proxy = round(sum(ivs) / len(ivs), 1)
+            log.info(f"VIX proxy from SPY IV: {proxy:.1f}")
+            return proxy
+    except Exception as e:
+        log.warning(f"VIX SPY-IV fallback failed: {e}")
+
+    log.warning("VIX unavailable — returning 20.0 as neutral default")
+    return 20.0
+
 
 _regime_cache = {"data": None, "ts": 0}
 
