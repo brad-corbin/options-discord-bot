@@ -768,6 +768,7 @@ def check_ticker(
             debit=trade.get("debit", 0),
             contracts=best_rec.get("contracts", 1),
             regime=regime,
+            direction=direction,
         )
 
         card = format_trade_card(best_rec)
