@@ -271,19 +271,28 @@ def get_daily_candles(ticker: str, days: int = 30) -> list:
 
 def get_vix() -> float:
     """Fetch current VIX spot level.
-    MarketData.app serves VIX as an index, not a stock quote.
-    Try indices endpoint first, fall back to SPY IV proxy.
+    MarketData.app does not serve VIX. Use Yahoo Finance instead,
+    with SPY IV as fallback, and 20.0 as last resort.
     """
-    # Primary: indices endpoint
+    # Primary: Yahoo Finance (^VIX) — no API key required
     try:
-        data = md_get("https://api.marketdata.app/v1/indices/quotes/VIX/")
-        for field in ("last", "mid", "bid", "ask", "close"):
-            v = as_float(data.get(field), 0.0)
-            if v > 0:
-                log.info(f"VIX fetched from indices endpoint: {v:.2f}")
-                return v
+        resp = requests.get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/%5EVIX",
+            params={"interval": "1d", "range": "1d"},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=5,
+        )
+        resp.raise_for_status()
+        result = resp.json().get("chart", {}).get("result", [])
+        if result:
+            meta = result[0].get("meta", {})
+            for field in ("regularMarketPrice", "previousClose", "chartPreviousClose"):
+                v = as_float(meta.get(field), 0.0)
+                if v > 0:
+                    log.info(f"VIX from Yahoo Finance: {v:.2f}")
+                    return v
     except Exception as e:
-        log.warning(f"VIX indices fetch failed: {e}")
+        log.warning(f"VIX Yahoo fetch failed: {e}")
 
     # Fallback: SPY options chain implied vol as VIX proxy
     try:
