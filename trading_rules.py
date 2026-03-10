@@ -112,8 +112,8 @@ CONFIDENCE_PENALTIES = {
     "iv_crushed":        -5,
     "beyond_em":         -8,
     "regime_choppy":     -10,
-    "regime_high_vix":   -8,
-    "regime_crisis":     -25,
+    "regime_high_vix":   -5,   # reduced — spread buyers benefit from elevated IV
+    "regime_crisis":     -10,  # reduced — direction-aware boost applied in engine
 }
 
 # v3.7: raised from 40 → 60 (only solid setups)
