@@ -5,6 +5,12 @@
 #   - Bear put debit spread support (bear signals now generate trade cards)
 #   - Scheduled scan disabled — TV webhooks are the only signal source
 #   - Direction-aware confidence scoring
+#
+# v3.7 UPGRADE:
+#   - Fibonacci swing trade support (/swing endpoint)
+#   - Black-Scholes fair value validation for swing spreads
+#   - 7-60 DTE swing engine with auto DTE selection
+#   - Weekly + daily trend confirmation for swing entries
 
 from telegram_commands import (
     handle_command,
@@ -208,7 +214,7 @@ def get_expirations(ticker: str) -> list:
     return sorted(set(str(e)[:10] for e in (data.get("expirations") or []) if e))
 
 def get_daily_candles(ticker: str, days: int = 30) -> list:
-    """Fetch recent daily candles for RV calculation."""
+    """Fetch recent daily candles for RV / IV rank calculation."""
     try:
         from_date = (datetime.now(timezone.utc) - timedelta(days=days + 10)).strftime("%Y-%m-%d")
         data = md_get(
@@ -228,7 +234,7 @@ def get_daily_candles(ticker: str, days: int = 30) -> list:
 def get_vix() -> float:
     """Fetch current VIX spot level."""
     try:
-        data = md_get(f"https://api.marketdata.app/v1/stocks/quotes/VIX/")
+        data = md_get("https://api.marketdata.app/v1/stocks/quotes/VIX/")
         for field in ("last", "mid", "bid", "ask"):
             v = as_float(data.get(field), 0.0)
             if v > 0:
@@ -262,7 +268,13 @@ def get_current_regime() -> dict:
         return {"label": "UNKNOWN", "emoji": "❓", "vix": 0, "adx": 0,
                 "vix_regime": "UNKNOWN", "adx_regime": "UNKNOWN", "size_mult": 1.0}
 
+
+# ─────────────────────────────────────────────────────────
+# OPTIONS CHAIN — SCALP (0-10 DTE)
+# ─────────────────────────────────────────────────────────
+
 def get_options_chain(ticker: str) -> list:
+    """Fetch options chain for scalp trades (MIN_DTE to MAX_DTE)."""
     from trading_rules import MAX_EXPIRATIONS_TO_PULL
 
     ticker = ticker.strip().upper()
@@ -293,8 +305,8 @@ def get_options_chain(ticker: str) -> list:
         raise RuntimeError(f"No usable expirations for {ticker}")
 
     exps_to_fetch = valid_exps[:MAX_EXPIRATIONS_TO_PULL]
-
     results = []
+
     for dte, exp in exps_to_fetch:
         try:
             data = md_get(
@@ -309,6 +321,7 @@ def get_options_chain(ticker: str) -> list:
                 continue
 
             n = len(sym_list)
+
             def col(name, default=None):
                 v = data.get(name, default)
                 return v if isinstance(v, list) else [default] * n
@@ -324,16 +337,16 @@ def get_options_chain(ticker: str) -> list:
                     "strike":       as_float(col("strike",       None)[i], None),
                     "expiration":   exp,
                     "dte":          dte,
-                    "openInterest": as_int(col("openInterest",  0)[i], 0),
-                    "volume":       as_int(col("volume",         0)[i], 0),
-                    "iv":           as_float(col("iv",          None)[i], None),
-                    "gamma":        as_float(col("gamma",        0.0)[i], 0.0),
-                    "delta":        as_float(col("delta",       None)[i], None),
-                    "theta":        as_float(col("theta",       None)[i], None),
-                    "vega":         as_float(col("vega",        None)[i], None),
-                    "bid":          as_float(col("bid",         None)[i], None),
-                    "ask":          as_float(col("ask",         None)[i], None),
-                    "mid":          as_float(col("mid",         None)[i], None),
+                    "openInterest": as_int(col("openInterest",   0)[i], 0),
+                    "volume":       as_int(col("volume",          0)[i], 0),
+                    "iv":           as_float(col("iv",           None)[i], None),
+                    "gamma":        as_float(col("gamma",         0.0)[i], 0.0),
+                    "delta":        as_float(col("delta",        None)[i], None),
+                    "theta":        as_float(col("theta",        None)[i], None),
+                    "vega":         as_float(col("vega",         None)[i], None),
+                    "bid":          as_float(col("bid",          None)[i], None),
+                    "ask":          as_float(col("ask",          None)[i], None),
+                    "mid":          as_float(col("mid",          None)[i], None),
                 })
 
             if contracts:
@@ -351,7 +364,127 @@ def get_options_chain(ticker: str) -> list:
 
 
 # ─────────────────────────────────────────────────────────
-# EXIT WARNING (supports both bull and bear spreads)
+# OPTIONS CHAIN — SWING (7-60 DTE)
+# ─────────────────────────────────────────────────────────
+
+def get_options_chain_swing(ticker: str) -> list:
+    """Fetch options chain for swing trades (7-60 DTE)."""
+    from swing_engine import SWING_MIN_DTE, SWING_MAX_DTE, SWING_MAX_EXPIRATIONS
+
+    ticker = ticker.strip().upper()
+    exps   = get_expirations(ticker)
+    today  = datetime.now(timezone.utc).date()
+
+    valid_exps = []
+    for exp in exps:
+        try:
+            dte = max((datetime.fromisoformat(exp).date() - today).days, 0)
+            if SWING_MIN_DTE <= dte <= SWING_MAX_DTE:
+                valid_exps.append((dte, exp))
+        except Exception:
+            continue
+
+    valid_exps.sort(key=lambda x: x[0])
+
+    if not valid_exps:
+        raise RuntimeError(f"No swing expirations ({SWING_MIN_DTE}-{SWING_MAX_DTE} DTE) for {ticker}")
+
+    results = []
+
+    for dte, exp in valid_exps[:SWING_MAX_EXPIRATIONS]:
+        try:
+            data = md_get(
+                f"https://api.marketdata.app/v1/options/chain/{ticker}/",
+                {"expiration": exp},
+            )
+            if not isinstance(data, dict) or data.get("s") != "ok":
+                continue
+
+            sym_list = data.get("optionSymbol") or []
+            if not sym_list:
+                continue
+
+            n = len(sym_list)
+
+            def col(name, default=None):
+                v = data.get(name, default)
+                return v if isinstance(v, list) else [default] * n
+
+            contracts = []
+            sides = col("side", "")
+            for i in range(n):
+                right = (sides[i] or "").lower().strip()
+                right = "call" if right in ("c", "call") else "put" if right in ("p", "put") else right
+                contracts.append({
+                    "optionSymbol": col("optionSymbol", "")[i],
+                    "right":        right,
+                    "strike":       as_float(col("strike",       None)[i], None),
+                    "expiration":   exp,
+                    "dte":          dte,
+                    "openInterest": as_int(col("openInterest",   0)[i], 0),
+                    "volume":       as_int(col("volume",          0)[i], 0),
+                    "iv":           as_float(col("iv",           None)[i], None),
+                    "gamma":        as_float(col("gamma",         0.0)[i], 0.0),
+                    "delta":        as_float(col("delta",        None)[i], None),
+                    "theta":        as_float(col("theta",        None)[i], None),
+                    "vega":         as_float(col("vega",         None)[i], None),
+                    "bid":          as_float(col("bid",          None)[i], None),
+                    "ask":          as_float(col("ask",          None)[i], None),
+                    "mid":          as_float(col("mid",          None)[i], None),
+                })
+
+            if contracts:
+                results.append((exp, dte, contracts))
+                log.info(f"Swing {ticker}: fetched {len(contracts)} contracts for {exp} (DTE {dte})")
+
+        except Exception as e:
+            log.warning(f"Swing {ticker}: failed chain for {exp}: {e}")
+            continue
+
+    return results
+
+
+# ─────────────────────────────────────────────────────────
+# IV RANK HELPER
+# ─────────────────────────────────────────────────────────
+
+def _estimate_iv_rank(chains: list, candle_closes: list) -> float:
+    """
+    Estimate IV rank (0-100) from current IV vs realized vol.
+    Higher rank = IV expensive relative to recent realized vol.
+    """
+    try:
+        from options_engine_v3 import calc_realized_vol
+
+        current_ivs = []
+        for exp, dte, contracts in chains:
+            for c in contracts:
+                iv = c.get("iv")
+                if iv and iv > 0:
+                    current_ivs.append(iv)
+            if current_ivs:
+                break
+
+        if not current_ivs:
+            return 50.0
+
+        current_iv = sum(current_ivs) / len(current_ivs)
+        rv = calc_realized_vol(candle_closes) if candle_closes else 0
+        if rv <= 0:
+            return 50.0
+
+        # Where is current IV relative to realized vol?
+        # IV == RV → rank 50, IV 2x RV → rank 90, IV 0.5x RV → rank 10
+        ratio = current_iv / rv
+        rank  = min(100, max(0, (ratio - 0.5) / 1.5 * 100))
+        return round(rank, 1)
+
+    except Exception:
+        return 50.0
+
+
+# ─────────────────────────────────────────────────────────
+# EXIT WARNING — warns on opposite open spreads
 # ─────────────────────────────────────────────────────────
 
 def check_spread_exit_warning(ticker: str, signal_bias: str, webhook_data: dict):
@@ -384,44 +517,41 @@ def check_spread_exit_warning(ticker: str, signal_bias: str, webhook_data: dict)
             if not at_risk:
                 continue
 
-            tier = webhook_data.get("tier", "?")
-            wt2 = as_float(webhook_data.get("wt2"), 0)
+            tier        = webhook_data.get("tier", "?")
+            wt2         = as_float(webhook_data.get("wt2"), 0)
             close_price = as_float(webhook_data.get("close"), 0)
-
-            wave_zone = "🟢 Oversold" if wt2 < -30 else "🔴 Overbought" if wt2 > 60 else "⚪ Neutral"
-            trend_str = ("✅ Confirmed" if webhook_data.get("htf_confirmed")
-                         else "🟡 Converging" if webhook_data.get("htf_converging")
-                         else "❌ Diverging")
-
-            acct_label = "👩 Mom" if account == "mom" else "📁 Brad"
+            wave_zone   = "🟢 Oversold" if wt2 < -30 else "🔴 Overbought" if wt2 > 60 else "⚪ Neutral"
+            trend_str   = ("✅ Confirmed" if webhook_data.get("htf_confirmed")
+                           else "🟡 Converging" if webhook_data.get("htf_converging")
+                           else "❌ Diverging")
+            acct_label  = "👩 Mom" if account == "mom" else "📁 Brad"
 
             for sp in at_risk:
-                sp_debit = sp.get("debit", 0)
+                sp_debit     = sp.get("debit", 0)
                 sp_contracts = sp.get("contracts", 1)
-                total_risk = sp_debit * sp_contracts * 100
-                targets = sp.get("targets", {})
-
+                total_risk   = sp_debit * sp_contracts * 100
+                targets      = sp.get("targets", {})
                 short_strike = sp.get("short", 0)
-                long_strike = sp.get("long", 0)
-                sp_side = sp.get("side", "call")
-                side_label = "BULL CALL" if sp_side == "call" else "BEAR PUT"
+                long_strike  = sp.get("long", 0)
+                sp_side      = sp.get("side", "call")
+                side_label   = "BULL CALL" if sp_side == "call" else "BEAR PUT"
 
-                urgency = "⚠️"
+                urgency      = "⚠️"
                 urgency_note = "Monitor position"
 
                 if close_price > 0 and sp_side == "call":
                     if short_strike > 0 and close_price <= short_strike:
-                        urgency = "🚨"
+                        urgency      = "🚨"
                         urgency_note = "PRICE AT/BELOW SHORT STRIKE — spread losing value"
                     elif long_strike > 0 and close_price <= long_strike:
-                        urgency = "🔴"
+                        urgency      = "🔴"
                         urgency_note = "Price between strikes — partial loss territory"
                 elif close_price > 0 and sp_side == "put":
                     if short_strike > 0 and close_price >= short_strike:
-                        urgency = "🚨"
+                        urgency      = "🚨"
                         urgency_note = "PRICE AT/ABOVE SHORT STRIKE — spread losing value"
                     elif long_strike > 0 and close_price >= long_strike:
-                        urgency = "🔴"
+                        urgency      = "🔴"
                         urgency_note = "Price between strikes — partial loss territory"
 
                 stop_level = targets.get("stop", 0)
@@ -458,7 +588,7 @@ def check_spread_exit_warning(ticker: str, signal_bias: str, webhook_data: dict)
 
 
 # ─────────────────────────────────────────────────────────
-# CHECK TICKER
+# CHECK TICKER — scalp engine (0-10 DTE)
 # ─────────────────────────────────────────────────────────
 
 def check_ticker(
@@ -466,26 +596,25 @@ def check_ticker(
     direction: str = "bull",
     webhook_data: dict = None,
 ) -> dict:
-    ticker = ticker.strip().upper()
+    ticker       = ticker.strip().upper()
     webhook_data = webhook_data or {"bias": direction, "tier": "2"}
 
     try:
-        spot = get_spot(ticker)
-        chains = get_options_chain(ticker)
-
-        enrichment = enrich_ticker(ticker)
+        spot        = get_spot(ticker)
+        chains      = get_options_chain(ticker)
+        enrichment  = enrich_ticker(ticker)
         has_earnings = enrichment.get("has_earnings", False)
         earnings_warn = enrichment.get("earnings_warn")
-        has_dividend = False
+        has_dividend  = False
 
         candle_closes = get_daily_candles(ticker, days=RV_LOOKBACK_DAYS + 5)
-        regime = get_current_regime()
+        regime        = get_current_regime()
 
         log.info(f"check_ticker({ticker}): spot={spot} expirations={len(chains)} "
                  f"earnings={has_earnings} candles={len(candle_closes)} "
                  f"direction={direction} regime={regime.get('label', '?')}")
 
-        all_recs = []
+        all_recs    = []
         all_reasons = []
 
         for exp, dte, contracts in chains:
@@ -527,29 +656,30 @@ def check_ticker(
                 "ok":         False,
                 "posted":     False,
                 "reason":     combined_reason,
-                "confidence": all_recs[0].get("confidence") if all_recs else None,
+                "confidence": None,
             }
 
         def rec_score(r):
-            trade = r.get("trade", {})
-            ror = trade.get("ror", 0)
-            width = trade.get("width", 5)
-            dte = r.get("dte", 5)
+            trade      = r.get("trade", {})
+            ror        = trade.get("ror", 0)
+            width      = trade.get("width", 5)
+            dte_val    = r.get("dte", 5)
             width_bonus = 0.3 if width <= 1.0 else 0.1 if width <= 2.5 else 0
-            dte_bonus = 0.1 * (1.0 / (1 + abs(dte - TARGET_DTE)))
+            dte_bonus   = 0.1 * (1.0 / (1 + abs(dte_val - TARGET_DTE)))
             return ror + width_bonus + dte_bonus
 
         all_recs.sort(key=rec_score, reverse=True)
         best_rec = all_recs[0]
 
         other_exps = []
-        seen_exps = {best_rec.get("exp")}
+        seen_exps  = {best_rec.get("exp")}
         for r in all_recs[1:]:
             if r.get("exp") not in seen_exps:
                 seen_exps.add(r.get("exp"))
                 other_exps.append(r)
 
         trade = best_rec.get("trade", {})
+
         if is_duplicate_trade(ticker, direction, trade.get("short"), trade.get("long")):
             trade_journal.log_signal(
                 ticker, webhook_data, outcome="duplicate",
@@ -569,18 +699,11 @@ def check_ticker(
             regime=regime,
         )
 
-        if not risk_result["allowed"]:
-            block_reasons = "; ".join(risk_result["blocks"])
-            trade_journal.log_signal(
-                ticker, webhook_data, outcome="risk_blocked",
-                confidence=best_rec.get("confidence"),
-                reason=block_reasons[:200],
-            )
-            risk_warning = "🚫 RISK LIMIT HIT — DO NOT ENTER\n" + block_reasons + "\n\n"
-
         card = format_trade_card(best_rec)
 
         if not risk_result["allowed"]:
+            block_reasons = "; ".join(risk_result["blocks"])
+            risk_warning  = "🚫 RISK LIMIT HIT — DO NOT ENTER\n" + block_reasons + "\n\n"
             card = risk_warning + card
 
         if risk_result.get("warnings"):
@@ -612,12 +735,12 @@ def check_ticker(
         )
 
         return {
-            "ticker":     ticker,
-            "ok":         True,
-            "posted":     st == 200,
-            "tg_status":  st,
-            "confidence": best_rec.get("confidence"),
-            "trade":      trade,
+            "ticker":              ticker,
+            "ok":                  True,
+            "posted":              st == 200,
+            "tg_status":           st,
+            "confidence":          best_rec.get("confidence"),
+            "trade":               trade,
             "expirations_checked": len(chains),
         }
 
@@ -639,25 +762,27 @@ def check_ticker(
 def health():
     return "OK"
 
+
 @app.route("/debug", methods=["GET"])
 def debug():
     r = _get_redis()
     return jsonify({
-        "TELEGRAM_set":    bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID),
-        "MARKETDATA_set":  bool(MARKETDATA_TOKEN),
-        "REDIS_connected": r is not None,
-        "WATCHLIST_len":   len([t for t in WATCHLIST.split(",") if t.strip()]),
-        "ENGINE_VERSION":  "v3.6",
-        "SCAN_WORKERS":    SCAN_WORKERS,
-        "DEDUP_TTL_S":     DEDUP_TTL_SECONDS,
-        "ALLOWED_DIRECTIONS": ALLOWED_DIRECTIONS,
+        "TELEGRAM_set":          bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID),
+        "MARKETDATA_set":        bool(MARKETDATA_TOKEN),
+        "REDIS_connected":       r is not None,
+        "WATCHLIST_len":         len([t for t in WATCHLIST.split(",") if t.strip()]),
+        "ENGINE_VERSION":        "v3.7",
+        "SCAN_WORKERS":          SCAN_WORKERS,
+        "DEDUP_TTL_S":           DEDUP_TTL_SECONDS,
+        "ALLOWED_DIRECTIONS":    ALLOWED_DIRECTIONS,
         "PORTFOLIO_CHANNEL_set": bool(TELEGRAM_PORTFOLIO_CHAT_ID),
         "MOM_CHANNEL_set":       bool(TELEGRAM_MOM_PORTFOLIO_CHAT_ID),
     })
 
+
 @app.route("/tgtest", methods=["GET"])
 def tgtest():
-    st, body = post_to_telegram("✅ Telegram test OK (v3.6 bull+bear spreads, TV webhooks only)")
+    st, body = post_to_telegram("✅ Telegram test OK (v3.7 scalp + swing)")
     return jsonify({"status": st, "body": body})
 
 
@@ -685,27 +810,28 @@ def telegram_webhook(secret):
     tickers = [t.strip().upper() for t in WATCHLIST.split(",") if t.strip()]
 
     def run_command():
-       handle_command(
-           user_id      = user_id,
-           chat_id      = chat_id,
-           text         = text,
-           scan_fn      = lambda t: check_ticker(t),
-           full_scan_fn = lambda: scan_watchlist_internal(tickers),
-           check_fn     = check_ticker,
-           watchlist    = tickers,
-           get_spot_fn  = get_spot,
-           md_get_fn    = md_get,
-           post_fn      = post_to_telegram,
-           get_portfolio_chat_id_fn = get_portfolio_chat_id,
-           get_regime_fn = get_current_regime,
-       )
+        handle_command(
+            user_id      = user_id,
+            chat_id      = chat_id,
+            text         = text,
+            scan_fn      = lambda t: check_ticker(t),
+            full_scan_fn = lambda: scan_watchlist_internal(tickers),
+            check_fn     = check_ticker,
+            watchlist    = tickers,
+            get_spot_fn  = get_spot,
+            md_get_fn    = md_get,
+            post_fn      = post_to_telegram,
+            get_portfolio_chat_id_fn = get_portfolio_chat_id,
+            get_regime_fn = get_current_regime,
+        )
 
     threading.Thread(target=run_command, daemon=True).start()
     return jsonify({"ok": True})
 
 
 # ─────────────────────────────────────────────────────────
-# TRADINGVIEW WEBHOOK — v3.6 bull + bear
+# TRADINGVIEW WEBHOOK — scalp signals (/tv)
+# Receives signals from BUS v1.0 Pine indicator (15M chart)
 # ─────────────────────────────────────────────────────────
 
 @app.route("/tv", methods=["POST"])
@@ -729,40 +855,38 @@ def tv_webhook():
     log.info(f"TV signal: {ticker} bias={bias} tier={tier} close={close}")
 
     webhook_data = {
-        "tier":            tier,
-        "bias":            bias,
-        "close":           close,
-        "time":            data.get("time", ""),
-        "ema5":            as_float(data.get("ema5")),
-        "ema12":           as_float(data.get("ema12")),
-        "ema_dist_pct":    as_float(data.get("ema_dist_pct")),
-        "macd_hist":       as_float(data.get("macd_hist")),
-        "macd_line":       as_float(data.get("macd_line")),
-        "signal_line":     as_float(data.get("signal_line")),
-        "wt1":             as_float(data.get("wt1")),
-        "wt2":             as_float(data.get("wt2")),
-        "rsi_mfi":         as_float(data.get("rsi_mfi")),
-        "rsi_mfi_bull":    data.get("rsi_mfi_bull") in (True, "true"),
-        "stoch_k":         as_float(data.get("stoch_k")),
-        "stoch_d":         as_float(data.get("stoch_d")),
-        "vwap":            as_float(data.get("vwap")),
-        "above_vwap":      data.get("above_vwap") in (True, "true"),
-        "htf_confirmed":   data.get("htf_confirmed") in (True, "true"),
-        "htf_converging":  data.get("htf_converging") in (True, "true"),
-        "daily_bull":      data.get("daily_bull") in (True, "true"),
-        "volume":          as_float(data.get("volume")),
-        "timeframe":       data.get("timeframe", ""),
+        "tier":           tier,
+        "bias":           bias,
+        "close":          close,
+        "time":           data.get("time", ""),
+        "ema5":           as_float(data.get("ema5")),
+        "ema12":          as_float(data.get("ema12")),
+        "ema_dist_pct":   as_float(data.get("ema_dist_pct")),
+        "macd_hist":      as_float(data.get("macd_hist")),
+        "macd_line":      as_float(data.get("macd_line")),
+        "signal_line":    as_float(data.get("signal_line")),
+        "wt1":            as_float(data.get("wt1")),
+        "wt2":            as_float(data.get("wt2")),
+        "rsi_mfi":        as_float(data.get("rsi_mfi")),
+        "rsi_mfi_bull":   data.get("rsi_mfi_bull") in (True, "true"),
+        "stoch_k":        as_float(data.get("stoch_k")),
+        "stoch_d":        as_float(data.get("stoch_d")),
+        "vwap":           as_float(data.get("vwap")),
+        "above_vwap":     data.get("above_vwap") in (True, "true"),
+        "htf_confirmed":  data.get("htf_confirmed") in (True, "true"),
+        "htf_converging": data.get("htf_converging") in (True, "true"),
+        "daily_bull":     data.get("daily_bull") in (True, "true"),
+        "volume":         as_float(data.get("volume")),
+        "timeframe":      data.get("timeframe", ""),
     }
 
     tier_emoji = "🥇" if tier == "1" else "🥈" if tier == "2" else "📢"
-    wt2 = webhook_data.get("wt2") or 0
-    wave_zone = "🟢 Oversold" if wt2 < -30 else "🔴 Overbought" if wt2 > 60 else "⚪ Neutral"
-
-    trend_str = ("✅ Confirmed" if webhook_data["htf_confirmed"]
-                 else "🟡 Converging" if webhook_data["htf_converging"]
-                 else "❌ Diverging")
-
-    dir_emoji = "🐻" if bias == "bear" else "🐂"
+    wt2        = webhook_data.get("wt2") or 0
+    wave_zone  = "🟢 Oversold" if wt2 < -30 else "🔴 Overbought" if wt2 > 60 else "⚪ Neutral"
+    trend_str  = ("✅ Confirmed" if webhook_data["htf_confirmed"]
+                  else "🟡 Converging" if webhook_data["htf_converging"]
+                  else "❌ Diverging")
+    dir_emoji  = "🐻" if bias == "bear" else "🐂"
 
     signal_lines = [
         f"{tier_emoji} TV Signal — {ticker} (T{tier} {dir_emoji} {bias.upper()})",
@@ -777,24 +901,136 @@ def tv_webhook():
 
     def run_tv_check():
         try:
-            # Post signal context
             post_to_telegram(signal_msg)
-
-            # Check for opposite open spreads and warn
             check_spread_exit_warning(ticker, bias, webhook_data)
 
-            # Skip unsupported directions
             if bias not in ALLOWED_DIRECTIONS:
                 post_to_telegram(f"ℹ️ {ticker}: {bias} signal skipped — not in allowed directions")
                 return
 
-            # Run engine (bull or bear)
             check_ticker(ticker, direction=bias, webhook_data=webhook_data)
 
         except Exception as e:
             log.error(f"TV check error for {ticker}: {e}")
 
     threading.Thread(target=run_tv_check, daemon=True).start()
+    return jsonify({"status": "accepted", "ticker": ticker, "tier": tier}), 200
+
+
+# ─────────────────────────────────────────────────────────
+# SWING WEBHOOK — Fibonacci swing signals (/swing)
+# Receives signals from BFS v1.0 Pine indicator (daily chart)
+# ─────────────────────────────────────────────────────────
+
+@app.route("/swing", methods=["POST"])
+def swing_webhook():
+    data = request.get_json(silent=True) or {}
+
+    if TV_WEBHOOK_SECRET:
+        if data.get("secret") != TV_WEBHOOK_SECRET:
+            return jsonify({"error": "Unauthorized"}), 403
+
+    ticker = (data.get("ticker") or "").strip().upper()
+    bias   = (data.get("bias")   or "bull").strip().lower()
+    tier   = (data.get("tier")   or "2").strip()
+    close  = as_float(data.get("close"), 0.0)
+
+    if not ticker:
+        return jsonify({"status": "ignored", "reason": "no ticker"}), 200
+
+    log.info(f"Swing signal: {ticker} bias={bias} tier={tier} "
+             f"fib={data.get('fib_level')} dist={data.get('fib_distance_pct')}%")
+
+    webhook_data = {
+        "tier":             tier,
+        "bias":             bias,
+        "close":            close,
+        "time":             data.get("time", ""),
+        "fib_level":        data.get("fib_level", "61.8"),
+        "fib_distance_pct": as_float(data.get("fib_distance_pct"), 2.0),
+        "fib_high":         as_float(data.get("fib_high")),
+        "fib_low":          as_float(data.get("fib_low")),
+        "fib_range":        as_float(data.get("fib_range")),
+        "fib_ext_127":      as_float(data.get("fib_ext_127")),
+        "fib_ext_162":      as_float(data.get("fib_ext_162")),
+        "weekly_bull":      data.get("weekly_bull") in (True, "true"),
+        "weekly_bear":      data.get("weekly_bear") in (True, "true"),
+        "htf_confirmed":    data.get("htf_confirmed") in (True, "true"),
+        "htf_converging":   data.get("htf_converging") in (True, "true"),
+        "daily_bull":       data.get("daily_bull") in (True, "true"),
+        "rsi":              as_float(data.get("rsi")),
+        "rsi_mfi_bull":     data.get("rsi_mfi_bull") in (True, "true"),
+        "vol_contracting":  data.get("vol_contracting") in (True, "true"),
+        "vol_expanding":    data.get("vol_expanding") in (True, "true"),
+        "volume":           as_float(data.get("volume")),
+        "timeframe":        data.get("timeframe", "D"),
+    }
+
+    # Signal summary
+    tier_emoji = "🥇" if tier == "1" else "🥈"
+    dir_emoji  = "🐻" if bias == "bear" else "🐂"
+    fib_level  = webhook_data["fib_level"]
+    fib_emojis = {"61.8": "🌟", "50.0": "⭐", "38.2": "✨", "78.6": "💫"}
+    fib_emoji  = fib_emojis.get(str(fib_level), "📐")
+    weekly_str = "🟢 Bull" if webhook_data["weekly_bull"] else "🔴 Bear"
+    daily_str  = ("✅ Confirmed" if webhook_data["htf_confirmed"]
+                  else "🟡 Converging" if webhook_data["htf_converging"]
+                  else "❌ Diverging")
+    vol_str    = "🟢 Contracting" if webhook_data["vol_contracting"] else "📊 Normal"
+
+    signal_lines = [
+        f"{tier_emoji} SWING Signal — {ticker} (T{tier} {dir_emoji} {bias.upper()})",
+        f"Fib: {fib_emoji} {fib_level}% level ({webhook_data['fib_distance_pct']:.1f}% away)",
+        f"Close: ${close:.2f} | {webhook_data['timeframe']} chart",
+        f"Weekly: {weekly_str} | Daily: {daily_str}",
+        f"Volume: {vol_str}",
+        "",
+    ]
+    signal_msg = "\n".join(signal_lines)
+
+    def run_swing_check():
+        try:
+            from swing_engine import recommend_swing_trade, format_swing_card
+
+            post_to_telegram(signal_msg)
+
+            spot   = get_spot(ticker)
+            chains = get_options_chain_swing(ticker)
+
+            if not chains:
+                post_to_telegram(f"❌ {ticker} swing: no options chain data in 7-60 DTE range")
+                return
+
+            candles = get_daily_candles(ticker, days=252)
+            iv_rank = _estimate_iv_rank(chains, candles)
+
+            rec = recommend_swing_trade(
+                ticker=ticker,
+                spot=spot,
+                chains=chains,
+                webhook_data=webhook_data,
+                iv_rank=iv_rank,
+            )
+
+            if not rec.get("ok"):
+                reason = rec.get("reason", "no valid setup")
+                conf   = rec.get("confidence")
+                msg    = f"❌ {ticker} swing — {reason}"
+                if conf:
+                    msg += f"\nConfidence: {conf}/100"
+                post_to_telegram(msg)
+                return
+
+            card = format_swing_card(rec)
+            post_to_telegram(card)
+            log.info(f"Swing card posted: {ticker} {bias} T{tier} "
+                     f"fib={fib_level}% conf={rec.get('confidence')}/100")
+
+        except Exception as e:
+            log.error(f"Swing check error for {ticker}: {type(e).__name__}: {e}")
+            post_to_telegram(f"⚠️ Swing error for {ticker}: {type(e).__name__}")
+
+    threading.Thread(target=run_swing_check, daemon=True).start()
     return jsonify({"status": "accepted", "ticker": ticker, "tier": tier}), 200
 
 
@@ -833,7 +1069,7 @@ def holdings_scan():
 
         for account in ("brad", "mom"):
             try:
-                report = generate_sentiment_report(md_get, account=account)
+                report      = generate_sentiment_report(md_get, account=account)
                 target_chat = get_portfolio_chat_id(account)
                 post_to_telegram(report, chat_id=target_chat)
             except Exception as e:
@@ -846,6 +1082,7 @@ def holdings_scan():
 
     threading.Thread(target=run_scan, daemon=True).start()
     return jsonify({"status": "accepted"})
+
 
 # ─────────────────────────────────────────────────────────
 # STARTUP
