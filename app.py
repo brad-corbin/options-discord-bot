@@ -1,10 +1,10 @@
 # app.py
 # NOTE: Educational/demo code. Not financial advice. Use at your own risk.
 #
-# v3.4 UPGRADE:
-#   - Bearish TV webhook exit warnings for open spreads
-#   - Candle data fetching for RV calculation in /check trade cards
-#   - /spread command wired to telegram_commands
+# v3.6 UPGRADE:
+#   - Bear put debit spread support (bear signals now generate trade cards)
+#   - Scheduled scan disabled — TV webhooks are the only signal source
+#   - Direction-aware confidence scoring
 
 from telegram_commands import (
     handle_command,
@@ -77,7 +77,6 @@ REDIS_URL           = os.getenv("REDIS_URL",           "").strip()
 SCAN_WORKERS        = int(os.getenv("SCAN_WORKERS", "4") or 4)
 DEDUP_TTL_SECONDS   = int(os.getenv("DEDUP_TTL_SECONDS", "3600") or 3600)
 
-# v3.2 — Private portfolio channels
 TELEGRAM_PORTFOLIO_CHAT_ID     = os.getenv("TELEGRAM_PORTFOLIO_CHAT_ID",     "").strip()
 TELEGRAM_MOM_PORTFOLIO_CHAT_ID = os.getenv("TELEGRAM_MOM_PORTFOLIO_CHAT_ID", "").strip()
 
@@ -209,10 +208,7 @@ def get_expirations(ticker: str) -> list:
     return sorted(set(str(e)[:10] for e in (data.get("expirations") or []) if e))
 
 def get_daily_candles(ticker: str, days: int = 30) -> list:
-    """
-    Fetch recent daily candles for RV (realized vol) calculation.
-    Returns list of closing prices (oldest first).
-    """
+    """Fetch recent daily candles for RV calculation."""
     try:
         from_date = (datetime.now(timezone.utc) - timedelta(days=days + 10)).strftime("%Y-%m-%d")
         data = md_get(
@@ -241,14 +237,10 @@ def get_vix() -> float:
         log.warning(f"VIX fetch failed: {e}")
     return 0.0
 
-# Cached regime — refreshed at most once per 5 minutes
 _regime_cache = {"data": None, "ts": 0}
 
 def get_current_regime() -> dict:
-    """
-    Get current market regime (VIX + ADX-based).
-    Cached for 5 minutes to avoid hammering the API.
-    """
+    """Get current market regime (VIX + ADX). Cached 5 minutes."""
     import time as _time
     now = _time.time()
     if _regime_cache["data"] and (now - _regime_cache["ts"]) < 300:
@@ -359,22 +351,16 @@ def get_options_chain(ticker: str) -> list:
 
 
 # ─────────────────────────────────────────────────────────
-# EXIT WARNING (v3.4 — supports both bull and bear spreads)
+# EXIT WARNING (supports both bull and bear spreads)
 # ─────────────────────────────────────────────────────────
 
 def check_spread_exit_warning(ticker: str, signal_bias: str, webhook_data: dict):
     """
-    Called when a TV signal comes in. Checks if we have open spreads
-    on this ticker that are OPPOSITE to the signal direction.
-
-    Bear signal → warns about open BULL (call) spreads
-    Bull signal → warns about open BEAR (put) spreads
-
-    Exit warnings go to the MAIN channel.
+    Called when a TV signal comes in. Warns about open spreads
+    that are OPPOSITE to the signal direction.
     """
     ticker = ticker.upper()
 
-    # Determine which spread direction to warn about
     if signal_bias == "bear":
         warn_direction = "bull"
         warn_side = "call"
@@ -390,7 +376,6 @@ def check_spread_exit_warning(ticker: str, signal_bias: str, webhook_data: dict)
             if not open_spreads:
                 continue
 
-            # Filter to spreads that are opposite to the signal
             at_risk = [
                 sp for sp in open_spreads
                 if sp.get("direction", "bull") == warn_direction
@@ -425,7 +410,6 @@ def check_spread_exit_warning(ticker: str, signal_bias: str, webhook_data: dict)
                 urgency_note = "Monitor position"
 
                 if close_price > 0 and sp_side == "call":
-                    # Bull call spread at risk from bearish signal
                     if short_strike > 0 and close_price <= short_strike:
                         urgency = "🚨"
                         urgency_note = "PRICE AT/BELOW SHORT STRIKE — spread losing value"
@@ -433,7 +417,6 @@ def check_spread_exit_warning(ticker: str, signal_bias: str, webhook_data: dict)
                         urgency = "🔴"
                         urgency_note = "Price between strikes — partial loss territory"
                 elif close_price > 0 and sp_side == "put":
-                    # Bear put spread at risk from bullish signal
                     if short_strike > 0 and close_price >= short_strike:
                         urgency = "🚨"
                         urgency_note = "PRICE AT/ABOVE SHORT STRIKE — spread losing value"
@@ -467,7 +450,6 @@ def check_spread_exit_warning(ticker: str, signal_bias: str, webhook_data: dict)
                     "— Not financial advice —",
                 ])
 
-                # Exit warnings go to MAIN channel
                 post_to_telegram("\n".join(lines))
                 log.info(f"Exit warning posted for {ticker} {side_label} spread {sp['id']} ({account})")
 
@@ -476,7 +458,7 @@ def check_spread_exit_warning(ticker: str, signal_bias: str, webhook_data: dict)
 
 
 # ─────────────────────────────────────────────────────────
-# CHECK TICKER (v3.4: with candle data for RV)
+# CHECK TICKER
 # ─────────────────────────────────────────────────────────
 
 def check_ticker(
@@ -496,15 +478,12 @@ def check_ticker(
         earnings_warn = enrichment.get("earnings_warn")
         has_dividend = False
 
-        # v3.4 — Fetch daily candles for RV calculation
         candle_closes = get_daily_candles(ticker, days=RV_LOOKBACK_DAYS + 5)
-
-        # v3.5 — Get current market regime
         regime = get_current_regime()
 
         log.info(f"check_ticker({ticker}): spot={spot} expirations={len(chains)} "
                  f"earnings={has_earnings} candles={len(candle_closes)} "
-                 f"regime={regime.get('label', '?')}")
+                 f"direction={direction} regime={regime.get('label', '?')}")
 
         all_recs = []
         all_reasons = []
@@ -520,12 +499,12 @@ def check_ticker(
                 has_earnings=has_earnings,
                 has_dividend=has_dividend,
                 candle_closes=candle_closes,
-                regime=regime,  # v3.5
+                regime=regime,
             )
 
             if rec.get("ok"):
                 all_recs.append(rec)
-                log.info(f"  {exp} (DTE {dte}): ✅ trade found — "
+                log.info(f"  {exp} (DTE {dte}): ✅ {direction} trade found — "
                          f"${rec['trade']['debit']:.2f} on ${rec['trade']['width']} wide, "
                          f"RoR {rec['trade']['ror']:.0%}")
             else:
@@ -538,7 +517,6 @@ def check_ticker(
             if all_reasons:
                 combined_reason += "\n" + "\n".join(all_reasons[:4])
 
-            # v3.5 — Log rejected signal
             trade_journal.log_signal(
                 ticker, webhook_data, outcome="rejected",
                 reason=combined_reason[:200],
@@ -584,7 +562,6 @@ def check_ticker(
                 "reason": "Duplicate trade in dedup window",
             }
 
-        # v3.5 — Risk check before posting
         risk_result = risk_manager.check_risk_limits(
             ticker=ticker,
             debit=trade.get("debit", 0),
@@ -599,16 +576,13 @@ def check_ticker(
                 confidence=best_rec.get("confidence"),
                 reason=block_reasons[:200],
             )
-            # Still post the card but with risk warning
             risk_warning = "🚫 RISK LIMIT HIT — DO NOT ENTER\n" + block_reasons + "\n\n"
 
         card = format_trade_card(best_rec)
 
-        # Prepend risk warning if blocked
         if not risk_result["allowed"]:
             card = risk_warning + card
 
-        # Add risk soft warnings to card
         if risk_result.get("warnings"):
             card += "\n⚠️ Risk: " + " | ".join(risk_result["warnings"][:3])
 
@@ -631,7 +605,6 @@ def check_ticker(
         if st == 200:
             mark_trade_sent(ticker, direction, trade.get("short"), trade.get("long"))
 
-        # v3.5 — Log signal to journal
         trade_journal.log_signal(
             ticker, webhook_data,
             outcome="trade_opened" if risk_result["allowed"] else "risk_blocked",
@@ -674,16 +647,17 @@ def debug():
         "MARKETDATA_set":  bool(MARKETDATA_TOKEN),
         "REDIS_connected": r is not None,
         "WATCHLIST_len":   len([t for t in WATCHLIST.split(",") if t.strip()]),
-        "ENGINE_VERSION":  "v3.4",
+        "ENGINE_VERSION":  "v3.6",
         "SCAN_WORKERS":    SCAN_WORKERS,
         "DEDUP_TTL_S":     DEDUP_TTL_SECONDS,
+        "ALLOWED_DIRECTIONS": ALLOWED_DIRECTIONS,
         "PORTFOLIO_CHANNEL_set": bool(TELEGRAM_PORTFOLIO_CHAT_ID),
         "MOM_CHANNEL_set":       bool(TELEGRAM_MOM_PORTFOLIO_CHAT_ID),
     })
 
 @app.route("/tgtest", methods=["GET"])
 def tgtest():
-    st, body = post_to_telegram("✅ Telegram test OK (v3.4 spread tracking + vol edge)")
+    st, body = post_to_telegram("✅ Telegram test OK (v3.6 bull+bear spreads, TV webhooks only)")
     return jsonify({"status": st, "body": body})
 
 
@@ -723,7 +697,7 @@ def telegram_webhook(secret):
            md_get_fn    = md_get,
            post_fn      = post_to_telegram,
            get_portfolio_chat_id_fn = get_portfolio_chat_id,
-           get_regime_fn = get_current_regime,  # v3.5
+           get_regime_fn = get_current_regime,
        )
 
     threading.Thread(target=run_command, daemon=True).start()
@@ -731,7 +705,7 @@ def telegram_webhook(secret):
 
 
 # ─────────────────────────────────────────────────────────
-# TRADINGVIEW WEBHOOK (BUS v1.0 payload) — v3.4 updated
+# TRADINGVIEW WEBHOOK — v3.6 bull + bear
 # ─────────────────────────────────────────────────────────
 
 @app.route("/tv", methods=["POST"])
@@ -754,7 +728,6 @@ def tv_webhook():
 
     log.info(f"TV signal: {ticker} bias={bias} tier={tier} close={close}")
 
-    # Parse BUS v1.0 webhook fields
     webhook_data = {
         "tier":            tier,
         "bias":            bias,
@@ -781,7 +754,6 @@ def tv_webhook():
         "timeframe":       data.get("timeframe", ""),
     }
 
-    # Build signal context message
     tier_emoji = "🥇" if tier == "1" else "🥈" if tier == "2" else "📢"
     wt2 = webhook_data.get("wt2") or 0
     wave_zone = "🟢 Oversold" if wt2 < -30 else "🔴 Overbought" if wt2 > 60 else "⚪ Neutral"
@@ -790,8 +762,10 @@ def tv_webhook():
                  else "🟡 Converging" if webhook_data["htf_converging"]
                  else "❌ Diverging")
 
+    dir_emoji = "🐻" if bias == "bear" else "🐂"
+
     signal_lines = [
-        f"{tier_emoji} TV Signal — {ticker} (T{tier} {bias.upper()})",
+        f"{tier_emoji} TV Signal — {ticker} (T{tier} {dir_emoji} {bias.upper()})",
         f"Close: ${close:.2f} | {data.get('timeframe', '')} timeframe",
         f"1H Trend: {trend_str} | Daily: {'🟢' if webhook_data['daily_bull'] else '🔴'}",
         f"Wave: {wave_zone} (wt2={wt2:.1f})",
@@ -803,26 +777,18 @@ def tv_webhook():
 
     def run_tv_check():
         try:
-            # Post signal context first (main channel)
+            # Post signal context
             post_to_telegram(signal_msg)
 
-            # v3.4 — Check for open spreads in the OPPOSITE direction and warn
-            # Bear signal → warn bull call spreads
-            # Bull signal → warn bear put spreads
+            # Check for opposite open spreads and warn
             check_spread_exit_warning(ticker, bias, webhook_data)
 
-            # If bearish, don't try to build a bull trade
-            if bias == "bear":
-                trade_journal.log_signal(ticker, webhook_data, outcome="bear_signal")
-                log.info(f"TV bear signal for {ticker} — exit warning check complete")
-                return
-
-            # Only process bull signals for trade recommendations
+            # Skip unsupported directions
             if bias not in ALLOWED_DIRECTIONS:
-                post_to_telegram(f"ℹ️ {ticker}: {bias} signal skipped — bull only mode")
+                post_to_telegram(f"ℹ️ {ticker}: {bias} signal skipped — not in allowed directions")
                 return
 
-            # Run v3 engine
+            # Run engine (bull or bear)
             check_ticker(ticker, direction=bias, webhook_data=webhook_data)
 
         except Exception as e:
@@ -833,11 +799,22 @@ def tv_webhook():
 
 
 # ─────────────────────────────────────────────────────────
-# WATCHLIST SCAN
+# WATCHLIST SCAN — DISABLED
+# Scheduled scan removed. TradingView webhooks are the only signal source.
 # ─────────────────────────────────────────────────────────
+
 def scan_watchlist_internal(tickers: list, max_posts: int = 6):
     log.info("scan_watchlist_internal called but scan is disabled — skipping")
     return
+
+
+@app.route("/scan", methods=["POST"])
+def scan_watchlist():
+    return jsonify({
+        "status": "disabled",
+        "reason": "Scheduled scan disabled — use TradingView webhooks only",
+    }), 200
+
 
 # ─────────────────────────────────────────────────────────
 # HOLDINGS SENTIMENT SCAN
