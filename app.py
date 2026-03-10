@@ -835,76 +835,9 @@ def tv_webhook():
 # ─────────────────────────────────────────────────────────
 # WATCHLIST SCAN
 # ─────────────────────────────────────────────────────────
-
 def scan_watchlist_internal(tickers: list, max_posts: int = 6):
-    if is_paused():
-        post_to_telegram("⏸ Scan skipped — bot is paused.")
-        return
-
-    posted = 0
-    results = []
-    no_trade = []
-    errors = []
-
-    with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as executor:
-        futures = {
-            executor.submit(check_ticker, t, "bull"): t
-            for t in tickers
-        }
-        for future in as_completed(futures):
-            if posted >= max_posts:
-                future.cancel()
-                continue
-            res = future.result()
-            results.append(res)
-
-            ticker = res.get("ticker", "?")
-            if res.get("posted"):
-                posted += 1
-            elif res.get("error"):
-                errors.append(ticker)
-            else:
-                no_trade.append(f"{ticker}: {res.get('reason', '—')[:40]}")
-
-    summary_lines = [
-        f"📋 WATCHLIST SUMMARY — {datetime.now(timezone.utc).strftime('%H:%M UTC')}",
-        f"Scanned: {len(tickers)} | Trade cards: {posted}",
-        "",
-    ]
-    if no_trade:
-        summary_lines.append("No setup: " + ", ".join(no_trade[:10]))
-    if errors:
-        summary_lines.append(f"Errors: {', '.join(errors)}")
-    summary_lines += ["", "— Not financial advice —"]
-
-    post_to_telegram("\n".join(summary_lines))
-    set_last_scan(posted, len(tickers))
-
-
-@app.route("/scan", methods=["POST"])
-def scan_watchlist():
-    data     = request.get_json(force=True, silent=True) or {}
-    supplied = (data.get("secret") or request.headers.get("X-Scan-Secret") or "").strip()
-
-    if SCAN_SECRET and supplied != SCAN_SECRET:
-        return jsonify({"error": "Unauthorized"}), 403
-
-    tickers = [t.strip().upper() for t in WATCHLIST.split(",") if t.strip()]
-    if not tickers:
-        return jsonify({"error": "WATCHLIST empty"}), 400
-
-    if is_paused():
-        return jsonify({"status": "paused"})
-
-    max_posts = as_int(data.get("max_posts"), 6)
-
-    threading.Thread(
-        target=scan_watchlist_internal,
-        args=(tickers, max_posts),
-        daemon=True,
-    ).start()
-
-    return jsonify({"status": "accepted", "tickers": len(tickers)})
+    log.info("scan_watchlist_internal called but scan is disabled — skipping")
+    return
 
 # ─────────────────────────────────────────────────────────
 # HOLDINGS SENTIMENT SCAN
