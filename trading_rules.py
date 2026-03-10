@@ -116,7 +116,12 @@ CONFIDENCE_PENALTIES = {
     "regime_crisis":     -25,
 }
 
-MIN_CONFIDENCE_TO_TRADE  = 40
+# v3.7: raised from 40 → 60 (only solid setups)
+MIN_CONFIDENCE_TO_TRADE  = 60
+
+# v3.7: win probability gate — short leg delta must be >= this
+# Rejects spreads where the short strike is unlikely to expire ITM
+MIN_WIN_PROBABILITY      = 0.60
 
 # ─────────────────────────────────────────────────────────
 # EXPECTED MOVE & IV vs RV EDGE (v3.4)
