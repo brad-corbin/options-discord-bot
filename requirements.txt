@@ -2,3 +2,5 @@ flask
 requests
 redis
 gunicorn>=21.0.0
+APScheduler
+pytz
