@@ -909,6 +909,19 @@ def recommend_trade(
         result["conf_reasons"] = conf_reasons
         return result
 
+    # ── Win probability gate (v3.7) ──
+    # Short leg delta must be >= MIN_WIN_PROBABILITY.
+    # Prevents taking spreads where the short strike is unlikely to stay ITM.
+    win_prob = best.get("win_prob", 0)
+    if win_prob < MIN_WIN_PROBABILITY:
+        result["reason"] = (
+            f"Win probability {win_prob:.0%} below {MIN_WIN_PROBABILITY:.0%} minimum "
+            f"(short delta too low — strike not ITM enough)"
+        )
+        result["confidence"] = confidence
+        result["conf_reasons"] = conf_reasons
+        return result
+
     # ── Apply regime size multiplier ──
     regime_size_mult = regime.get("size_mult", 1.0)
     regime_note = ""
