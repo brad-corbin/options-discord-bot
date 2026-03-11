@@ -171,8 +171,6 @@ def mark_trade_sent(ticker, direction, short_k, long_k):
 # Staleness check: signals older than 8 minutes are dropped —
 # by then price has moved and the setup is no longer valid.
 
-import time as _time
-
 TV_QUEUE_MAX      = 60    # max queued signals
 TV_QUEUE_WORKERS  = 3     # parallel worker threads
 TV_SIGNAL_TTL_SEC = 480   # 8 minutes — drop stale signals
@@ -190,7 +188,7 @@ def _tv_queue_worker(worker_id: int):
             ticker, bias, webhook_data, signal_msg, enqueued_at = job
 
             # Staleness check — drop if signal is too old to act on
-            age_sec = _time.time() - enqueued_at
+            age_sec = time.time() - enqueued_at
             if age_sec > TV_SIGNAL_TTL_SEC:
                 log.warning(
                     f"[worker-{worker_id}] Dropping stale signal: {ticker} "
@@ -252,6 +250,15 @@ def post_to_telegram(text: str, max_retries: int = 4, chat_id: str = None):
                 preview = text[:60].replace("\n", " ")
                 log.info(f"Telegram OK (chat={cid}): {preview}...")
                 return 200, ""
+            # Respect Telegram's retry_after on rate limit
+            if r.status_code == 429:
+                try:
+                    retry_after = r.json().get("parameters", {}).get("retry_after", 15)
+                except Exception:
+                    retry_after = 15
+                log.warning(f"Telegram rate limited — waiting {retry_after}s (attempt {attempt+1})")
+                time.sleep(retry_after + 1)
+                continue
             last_err = r.text[:300] if r.text else f"HTTP {r.status_code}"
             log.warning(f"Telegram attempt {attempt+1} failed: {r.status_code} — {last_err}")
         except Exception as e:
@@ -361,8 +368,7 @@ _regime_cache = {"data": None, "ts": 0}
 
 def get_current_regime() -> dict:
     """Get current market regime (VIX + ADX). Cached 5 minutes."""
-    import time as _time
-    now = _time.time()
+    now = time.time()
     if _regime_cache["data"] and (now - _regime_cache["ts"]) < 300:
         return _regime_cache["data"]
 
@@ -1020,7 +1026,7 @@ def tv_webhook():
     signal_msg = _build_signal_msg()
 
     # Enqueue — returns immediately so TradingView doesn't time out
-    enqueued_at = _time.time()
+    enqueued_at = time.time()
     try:
         _tv_queue.put_nowait((ticker, bias, webhook_data, signal_msg, enqueued_at))
         qsize = _tv_queue.qsize()
@@ -1148,7 +1154,7 @@ def swing_webhook():
                 return
 
             card = format_swing_card(rec)
-            post_to_telegram(card)
+            post_to_telegram(card, max_retries=6)
             log.info(f"Swing card posted: {ticker} {bias} T{tier} "
                      f"fib={fib_level}% conf={rec.get('confidence')}/100")
 
