@@ -166,35 +166,70 @@ def mark_trade_sent(ticker, direction, short_k, long_k):
 # Worker calls post_to_telegram, check_spread_exit_warning, check_ticker
 # which are defined further below; Python resolves these at call time
 # not at definition time, so forward references are fine.
+#
+# v3.8: 3 parallel workers to handle mass bar-close floods.
+# Staleness check: signals older than 8 minutes are dropped —
+# by then price has moved and the setup is no longer valid.
 
-TV_QUEUE_MAX = 50
+import time as _time
+
+TV_QUEUE_MAX      = 60    # max queued signals
+TV_QUEUE_WORKERS  = 3     # parallel worker threads
+TV_SIGNAL_TTL_SEC = 480   # 8 minutes — drop stale signals
+
 _tv_queue: queue.Queue = queue.Queue(maxsize=TV_QUEUE_MAX)
 
-def _tv_queue_worker():
-    """Single worker thread — drains the TV signal queue one by one."""
-    log.info("TV queue worker started")
+def _tv_queue_worker(worker_id: int):
+    """Worker thread — drains TV signal queue. Multiple run in parallel."""
+    log.info(f"TV queue worker-{worker_id} started")
     while True:
         try:
             job = _tv_queue.get(block=True, timeout=5)
             if job is None:
                 break
-            ticker, bias, webhook_data, signal_msg = job
+            ticker, bias, webhook_data, signal_msg, enqueued_at = job
+
+            # Staleness check — drop if signal is too old to act on
+            age_sec = _time.time() - enqueued_at
+            if age_sec > TV_SIGNAL_TTL_SEC:
+                log.warning(
+                    f"[worker-{worker_id}] Dropping stale signal: {ticker} "
+                    f"({age_sec:.0f}s old > {TV_SIGNAL_TTL_SEC}s TTL)"
+                )
+                _tv_queue.task_done()
+                continue
+
             try:
                 post_to_telegram(signal_msg)
                 check_spread_exit_warning(ticker, bias, webhook_data)
                 if bias in ALLOWED_DIRECTIONS:
                     check_ticker(ticker, direction=bias, webhook_data=webhook_data)
                 else:
-                    post_to_telegram(f"ℹ️ {ticker}: {bias} signal skipped — not in allowed directions")
+                    post_to_telegram(
+                        f"ℹ️ {ticker}: {bias} signal skipped — not in allowed directions"
+                    )
             except Exception as e:
-                log.error(f"TV queue worker error for {ticker}: {e}", exc_info=True)
+                log.error(
+                    f"[worker-{worker_id}] TV queue error for {ticker}: {e}",
+                    exc_info=True,
+                )
             finally:
                 _tv_queue.task_done()
         except queue.Empty:
             continue
 
-_tv_worker_thread = threading.Thread(target=_tv_queue_worker, daemon=True, name="tv-queue-worker")
-_tv_worker_thread.start()
+# Start worker pool
+_tv_worker_threads = []
+for _i in range(TV_QUEUE_WORKERS):
+    _t = threading.Thread(
+        target=_tv_queue_worker,
+        args=(_i + 1,),
+        daemon=True,
+        name=f"tv-queue-worker-{_i + 1}",
+    )
+    _t.start()
+    _tv_worker_threads.append(_t)
+log.info(f"TV queue pool started: {TV_QUEUE_WORKERS} workers, TTL {TV_SIGNAL_TTL_SEC}s")
 
 # ─────────────────────────────────────────────────────────
 # TELEGRAM
@@ -973,11 +1008,12 @@ def tv_webhook():
     signal_msg = _build_signal_msg()
 
     # Enqueue — returns immediately so TradingView doesn't time out
+    enqueued_at = _time.time()
     try:
-        _tv_queue.put_nowait((ticker, bias, webhook_data, signal_msg))
+        _tv_queue.put_nowait((ticker, bias, webhook_data, signal_msg, enqueued_at))
         qsize = _tv_queue.qsize()
         log.info(f"TV signal queued: {ticker} (queue depth: {qsize})")
-        if qsize > TV_QUEUE_MAX * 0.8:
+        if qsize > TV_QUEUE_MAX * 0.7:
             log.warning(f"TV queue at {qsize}/{TV_QUEUE_MAX} — approaching capacity")
     except queue.Full:
         # Queue is full — drop oldest, enqueue new
@@ -988,7 +1024,7 @@ def tv_webhook():
         except queue.Empty:
             pass
         try:
-            _tv_queue.put_nowait((ticker, bias, webhook_data, signal_msg))
+            _tv_queue.put_nowait((ticker, bias, webhook_data, signal_msg, enqueued_at))
         except queue.Full:
             log.error(f"TV queue still full after drop — signal for {ticker} lost")
 
