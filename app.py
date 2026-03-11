@@ -160,76 +160,160 @@ def mark_trade_sent(ticker, direction, short_k, long_k):
     store_set(trade_dedup_key(ticker, direction, short_k, long_k), "1", ttl=DEDUP_TTL_SECONDS)
 
 # ─────────────────────────────────────────────────────────
-# TV SIGNAL QUEUE
 # ─────────────────────────────────────────────────────────
-# Placed here — after Redis, store_*, and dedup helpers are defined.
-# Worker calls post_to_telegram, check_spread_exit_warning, check_ticker
-# which are defined further below; Python resolves these at call time
-# not at definition time, so forward references are fine.
+# UNIFIED SIGNAL QUEUE
+# ─────────────────────────────────────────────────────────
+# Single FIFO queue for ALL signals — TV scalp and swing daily.
+# Prevents bar-close floods from spawning simultaneous threads
+# and hammering the Telegram 429 rate limit.
 #
-# v3.8: 3 parallel workers to handle mass bar-close floods.
-# Staleness check: signals older than 8 minutes are dropped —
-# by then price has moved and the setup is no longer valid.
+# Job tuple: (job_type, ticker, bias, webhook_data, signal_msg, enqueued_at)
+#   job_type: "tv" | "swing"
+#
+# v3.9: Unified queue replaces separate TV queue + swing threads.
+# Rate limiter enforces minimum gap between Telegram posts.
 
-TV_QUEUE_MAX      = 60    # max queued signals
-TV_QUEUE_WORKERS  = 3     # parallel worker threads
-TV_SIGNAL_TTL_SEC = 480   # 8 minutes — drop stale signals
+QUEUE_MAX        = 80
+QUEUE_WORKERS    = 3
+SIGNAL_TTL_SEC   = 480   # 8 min — drop stale signals
+TG_MIN_GAP_SEC   = 1.5   # minimum seconds between Telegram posts
 
-_tv_queue: queue.Queue = queue.Queue(maxsize=TV_QUEUE_MAX)
+_signal_queue: queue.Queue = queue.Queue(maxsize=QUEUE_MAX)
+_tg_last_post_time: float  = 0.0
+_tg_lock = threading.Lock()
 
-def _tv_queue_worker(worker_id: int):
-    """Worker thread — drains TV signal queue. Multiple run in parallel."""
-    log.info(f"TV queue worker-{worker_id} started")
+
+def _tg_rate_limited_post(text: str, max_retries: int = 6, chat_id: str = None):
+    """Post to Telegram with global rate limiting across all workers."""
+    global _tg_last_post_time
+    with _tg_lock:
+        now     = time.time()
+        gap     = now - _tg_last_post_time
+        if gap < TG_MIN_GAP_SEC:
+            time.sleep(TG_MIN_GAP_SEC - gap)
+        _tg_last_post_time = time.time()
+    return post_to_telegram(text, max_retries=max_retries, chat_id=chat_id)
+
+
+def _signal_queue_worker(worker_id: int):
+    """Drain the unified signal queue sequentially."""
+    log.info(f"Signal queue worker-{worker_id} started")
     while True:
         try:
-            job = _tv_queue.get(block=True, timeout=5)
+            job = _signal_queue.get(block=True, timeout=5)
             if job is None:
                 break
-            ticker, bias, webhook_data, signal_msg, enqueued_at = job
 
-            # Staleness check — drop if signal is too old to act on
+            job_type, ticker, bias, webhook_data, signal_msg, enqueued_at = job
+
             age_sec = time.time() - enqueued_at
-            if age_sec > TV_SIGNAL_TTL_SEC:
+            if age_sec > SIGNAL_TTL_SEC:
                 log.warning(
-                    f"[worker-{worker_id}] Dropping stale signal: {ticker} "
-                    f"({age_sec:.0f}s old > {TV_SIGNAL_TTL_SEC}s TTL)"
+                    f"[worker-{worker_id}] Stale {job_type} signal dropped: "
+                    f"{ticker} ({age_sec:.0f}s old)"
                 )
-                _tv_queue.task_done()
+                _signal_queue.task_done()
                 continue
 
             try:
                 tier_label = webhook_data.get("tier", "?")
-                log.info(f"[worker-{worker_id}] Processing: {ticker} {bias} T{tier_label}")
-                post_to_telegram(signal_msg)
-                check_spread_exit_warning(ticker, bias, webhook_data)
-                if bias in ALLOWED_DIRECTIONS:
-                    check_ticker(ticker, direction=bias, webhook_data=webhook_data)
-                else:
-                    post_to_telegram(
-                        f"ℹ️ {ticker}: {bias} signal skipped — not in allowed directions"
-                    )
+                log.info(
+                    f"[worker-{worker_id}] Processing {job_type}: "
+                    f"{ticker} {bias} T{tier_label} (queued {age_sec:.0f}s ago)"
+                )
+
+                if job_type == "tv":
+                    _tg_rate_limited_post(signal_msg)
+                    check_spread_exit_warning(ticker, bias, webhook_data)
+                    if bias in ALLOWED_DIRECTIONS:
+                        check_ticker(ticker, direction=bias, webhook_data=webhook_data)
+                    else:
+                        _tg_rate_limited_post(
+                            f"ℹ️ {ticker}: {bias} signal skipped — not in allowed directions"
+                        )
+
+                elif job_type == "swing":
+                    from swing_engine import recommend_swing_trade, format_swing_card
+                    _tg_rate_limited_post(signal_msg)
+                    spot   = get_spot(ticker)
+                    chains = get_options_chain_swing(ticker)
+                    if not chains:
+                        _tg_rate_limited_post(
+                            f"❌ {ticker} swing: no options chain data in 7-60 DTE range"
+                        )
+                    else:
+                        candles = get_daily_candles(ticker, days=252)
+                        iv_rank = _estimate_iv_rank(chains, candles)
+                        rec = recommend_swing_trade(
+                            ticker=ticker,
+                            spot=spot,
+                            chains=chains,
+                            webhook_data=webhook_data,
+                            iv_rank=iv_rank,
+                        )
+                        if not rec.get("ok"):
+                            reason = rec.get("reason", "no valid setup")
+                            conf   = rec.get("confidence")
+                            msg    = f"❌ {ticker} swing — {reason}"
+                            if conf:
+                                msg += f"\nConfidence: {conf}/100"
+                            _tg_rate_limited_post(msg)
+                        else:
+                            card = format_swing_card(rec)
+                            _tg_rate_limited_post(card)
+                            log.info(
+                                f"Swing card posted: {ticker} {bias} T{tier_label} "
+                                f"conf={rec.get('confidence')}/100"
+                            )
+
             except Exception as e:
                 log.error(
-                    f"[worker-{worker_id}] TV queue error for {ticker}: {e}",
+                    f"[worker-{worker_id}] Queue error for {ticker} ({job_type}): {e}",
                     exc_info=True,
                 )
             finally:
-                _tv_queue.task_done()
+                _signal_queue.task_done()
+
         except queue.Empty:
             continue
 
+
+def _enqueue_signal(job_type: str, ticker: str, bias: str,
+                    webhook_data: dict, signal_msg: str):
+    """Enqueue a signal. Drops oldest if full."""
+    enqueued_at = time.time()
+    job = (job_type, ticker, bias, webhook_data, signal_msg, enqueued_at)
+    try:
+        _signal_queue.put_nowait(job)
+        qsize = _signal_queue.qsize()
+        log.info(f"{job_type.upper()} signal queued: {ticker} (queue depth: {qsize})")
+        if qsize > QUEUE_MAX * 0.7:
+            log.warning(f"Signal queue at {qsize}/{QUEUE_MAX} — approaching capacity")
+    except queue.Full:
+        try:
+            dropped = _signal_queue.get_nowait()
+            log.warning(f"Queue full — dropped oldest: {dropped[1]} ({dropped[0]})")
+            _signal_queue.task_done()
+        except queue.Empty:
+            pass
+        try:
+            _signal_queue.put_nowait(job)
+        except queue.Full:
+            log.error(f"Queue still full — signal lost: {ticker} ({job_type})")
+
+
 # Start worker pool
-_tv_worker_threads = []
-for _i in range(TV_QUEUE_WORKERS):
+_queue_worker_threads = []
+for _i in range(QUEUE_WORKERS):
     _t = threading.Thread(
-        target=_tv_queue_worker,
+        target=_signal_queue_worker,
         args=(_i + 1,),
         daemon=True,
-        name=f"tv-queue-worker-{_i + 1}",
+        name=f"signal-queue-worker-{_i + 1}",
     )
     _t.start()
-    _tv_worker_threads.append(_t)
-log.info(f"TV queue pool started: {TV_QUEUE_WORKERS} workers, TTL {TV_SIGNAL_TTL_SEC}s")
+    _queue_worker_threads.append(_t)
+log.info(f"Signal queue pool started: {QUEUE_WORKERS} workers, TTL {SIGNAL_TTL_SEC}s")
 
 # ─────────────────────────────────────────────────────────
 # TELEGRAM
@@ -1026,25 +1110,7 @@ def tv_webhook():
     signal_msg = _build_signal_msg()
 
     # Enqueue — returns immediately so TradingView doesn't time out
-    enqueued_at = time.time()
-    try:
-        _tv_queue.put_nowait((ticker, bias, webhook_data, signal_msg, enqueued_at))
-        qsize = _tv_queue.qsize()
-        log.info(f"TV signal queued: {ticker} (queue depth: {qsize})")
-        if qsize > TV_QUEUE_MAX * 0.7:
-            log.warning(f"TV queue at {qsize}/{TV_QUEUE_MAX} — approaching capacity")
-    except queue.Full:
-        # Queue is full — drop oldest, enqueue new
-        try:
-            dropped = _tv_queue.get_nowait()
-            log.warning(f"TV queue full — dropped oldest signal: {dropped[0]}")
-            _tv_queue.task_done()
-        except queue.Empty:
-            pass
-        try:
-            _tv_queue.put_nowait((ticker, bias, webhook_data, signal_msg, enqueued_at))
-        except queue.Full:
-            log.error(f"TV queue still full after drop — signal for {ticker} lost")
+    _enqueue_signal("tv", ticker, bias, webhook_data, signal_msg)
 
     return jsonify({"status": "accepted", "ticker": ticker, "tier": tier}), 200
 
@@ -1120,49 +1186,9 @@ def swing_webhook():
     ]
     signal_msg = "\n".join(signal_lines)
 
-    def run_swing_check():
-        try:
-            from swing_engine import recommend_swing_trade, format_swing_card
+    # Enqueue — returns immediately so TradingView doesn't time out
+    _enqueue_signal("swing", ticker, bias, webhook_data, signal_msg)
 
-            post_to_telegram(signal_msg)
-
-            spot   = get_spot(ticker)
-            chains = get_options_chain_swing(ticker)
-
-            if not chains:
-                post_to_telegram(f"❌ {ticker} swing: no options chain data in 7-60 DTE range")
-                return
-
-            candles = get_daily_candles(ticker, days=252)
-            iv_rank = _estimate_iv_rank(chains, candles)
-
-            rec = recommend_swing_trade(
-                ticker=ticker,
-                spot=spot,
-                chains=chains,
-                webhook_data=webhook_data,
-                iv_rank=iv_rank,
-            )
-
-            if not rec.get("ok"):
-                reason = rec.get("reason", "no valid setup")
-                conf   = rec.get("confidence")
-                msg    = f"❌ {ticker} swing — {reason}"
-                if conf:
-                    msg += f"\nConfidence: {conf}/100"
-                post_to_telegram(msg)
-                return
-
-            card = format_swing_card(rec)
-            post_to_telegram(card, max_retries=6)
-            log.info(f"Swing card posted: {ticker} {bias} T{tier} "
-                     f"fib={fib_level}% conf={rec.get('confidence')}/100")
-
-        except Exception as e:
-            log.error(f"Swing check error for {ticker}: {type(e).__name__}: {e}")
-            post_to_telegram(f"⚠️ Swing error for {ticker}: {type(e).__name__}")
-
-    threading.Thread(target=run_swing_check, daemon=True).start()
     return jsonify({"status": "accepted", "ticker": ticker, "tier": tier}), 200
 
 
