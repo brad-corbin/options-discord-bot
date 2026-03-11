@@ -969,6 +969,7 @@ def tv_webhook():
         return jsonify({"status": "received_raw", "tg_status": st})
 
     log.info(f"TV signal: {ticker} bias={bias} tier={tier} close={close}")
+    log.info(f"TV webhook_data: htf_confirmed={data.get('htf_confirmed')} htf_converging={data.get('htf_converging')} daily_bull={data.get('daily_bull')} wt2={data.get('wt2')} rsi_mfi_bull={data.get('rsi_mfi_bull')} above_vwap={data.get('above_vwap')}")
 
     webhook_data = {
         "tier":           tier,
