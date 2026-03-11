@@ -238,6 +238,7 @@ log.info(f"TV queue pool started: {TV_QUEUE_WORKERS} workers, TTL {TV_SIGNAL_TTL
 def post_to_telegram(text: str, max_retries: int = 4, chat_id: str = None):
     cid = chat_id or TELEGRAM_CHAT_ID
     if not TELEGRAM_BOT_TOKEN or not cid:
+        log.error("post_to_telegram: TELEGRAM_BOT_TOKEN or CHAT_ID not set")
         return 400, "TELEGRAM tokens not set"
     url     = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": cid, "text": text, "disable_web_page_preview": True}
@@ -246,11 +247,16 @@ def post_to_telegram(text: str, max_retries: int = 4, chat_id: str = None):
         try:
             r = requests.post(url, json=payload, timeout=20)
             if r.status_code == 200:
+                preview = text[:60].replace("\n", " ")
+                log.info(f"Telegram OK (chat={cid}): {preview}...")
                 return 200, ""
             last_err = r.text[:300] if r.text else f"HTTP {r.status_code}"
+            log.warning(f"Telegram attempt {attempt+1} failed: {r.status_code} — {last_err}")
         except Exception as e:
             last_err = str(e)
+            log.warning(f"Telegram attempt {attempt+1} exception: {last_err}")
         time.sleep(min(1.5 * (attempt + 1), 6.0))
+    log.error(f"Telegram FAILED after {max_retries} attempts: {last_err}")
     return 500, f"Telegram failed: {last_err}"
 
 
@@ -830,7 +836,10 @@ def check_ticker(
         if has_earnings and earnings_warn:
             card = earnings_warn + "\n\n" + card
 
+        conf = best_rec.get("confidence", 0)
+        log.info(f"Posting trade card: {ticker} {direction} conf={conf}/100 tg_chat={TELEGRAM_CHAT_ID[:6]}...")
         st, body = post_to_telegram(card)
+        log.info(f"Trade card post result: {ticker} {direction} tg_status={st} body={body[:80] if body else 'ok'}")
 
         if st == 200:
             mark_trade_sent(ticker, direction, trade.get("short"), trade.get("long"))
