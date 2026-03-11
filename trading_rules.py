@@ -119,9 +119,9 @@ CONFIDENCE_PENALTIES = {
 # v3.7: raised from 40 → 60 (only solid setups)
 MIN_CONFIDENCE_TO_TRADE  = 60
 
-# v3.7: win probability gate — short leg delta must be >= this
-# Rejects spreads where the short strike is unlikely to expire ITM
-MIN_WIN_PROBABILITY      = 0.60
+# v3.8: lowered from 0.60 — scalp short strikes are typically OTM/ATM
+# with deltas of 0.35-0.50. 0.60 was blocking nearly all valid setups.
+MIN_WIN_PROBABILITY      = 0.45
 
 # ─────────────────────────────────────────────────────────
 # EXPECTED MOVE & IV vs RV EDGE (v3.4)
