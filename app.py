@@ -200,6 +200,8 @@ def _tv_queue_worker(worker_id: int):
                 continue
 
             try:
+                tier_label = webhook_data.get("tier", "?")
+                log.info(f"[worker-{worker_id}] Processing: {ticker} {bias} T{tier_label}")
                 post_to_telegram(signal_msg)
                 check_spread_exit_warning(ticker, bias, webhook_data)
                 if bias in ALLOWED_DIRECTIONS:
