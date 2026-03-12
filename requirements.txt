@@ -1,6 +1,6 @@
 flask
 requests
 redis
-gunicorn>=21.0.0
+gunicorn>=21.2.0
 APScheduler
 pytz
