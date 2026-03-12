@@ -108,17 +108,31 @@ _mem_store: dict = {}
 def _get_redis():
     global _redis_client
     if _redis_client is not None:
-        return _redis_client
+        # Verify the cached connection is still alive
+        try:
+            _redis_client.ping()
+            return _redis_client
+        except Exception:
+            log.warning("Redis cached connection dead — reconnecting")
+            _redis_client = None
+
     if not REDIS_URL:
         return None
     try:
         import redis
-        _redis_client = redis.from_url(REDIS_URL, decode_responses=True, socket_timeout=3)
+        _redis_client = redis.from_url(
+            REDIS_URL,
+            decode_responses=True,
+            socket_timeout=10,         # longer for BRPOP blocking calls
+            socket_connect_timeout=5,
+            retry_on_timeout=True,
+        )
         _redis_client.ping()
         log.info("Redis connected")
         return _redis_client
     except Exception as e:
         log.warning(f"Redis unavailable ({e}), using in-memory fallback")
+        _redis_client = None
         return None
 
 def store_set(key: str, value: str, ttl: int = 0):
@@ -363,7 +377,7 @@ def _signal_queue_worker_redis(worker_id: int):
 
         except Exception as e:
             log.error(f"[worker-{worker_id}] Redis worker error: {e}", exc_info=True)
-            # Reset client so next iteration reconnects
+            # Null out cached client so _get_redis() reconnects on next iteration
             global _redis_client
             _redis_client = None
             time.sleep(3)
