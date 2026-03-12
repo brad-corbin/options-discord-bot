@@ -174,9 +174,9 @@ def mark_trade_sent(ticker, direction, short_k, long_k):
 # Rate limiter enforces minimum gap between Telegram posts.
 
 QUEUE_MAX        = 80
-QUEUE_WORKERS    = 3
-SIGNAL_TTL_SEC   = 480   # 8 min — drop stale signals
-TG_MIN_GAP_SEC   = 1.5   # minimum seconds between Telegram posts
+QUEUE_WORKERS    = 6
+SIGNAL_TTL_SEC   = 900   # 8 min — drop stale signals
+TG_MIN_GAP_SEC   = 0.8   # minimum seconds between Telegram posts
 
 _signal_queue: queue.Queue = queue.Queue(maxsize=QUEUE_MAX)
 _tg_last_post_time: float  = 0.0
