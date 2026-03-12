@@ -193,6 +193,7 @@ QUEUE_MAX        = 80
 QUEUE_WORKERS    = 6      # v3.9: raised from 3
 SIGNAL_TTL_SEC   = 480    # 8 min — drop stale signals
 TG_MIN_GAP_SEC   = 0.8    # v3.9: lowered from 1.5
+WAVE_COLLECT_SEC = 90     # v4.0: seconds to wait for bar-close flood to settle before digest
 
 REDIS_QUEUE_KEY  = "signal_queue"
 
@@ -201,6 +202,119 @@ _mem_signal_queue: queue.Queue = queue.Queue(maxsize=QUEUE_MAX)
 
 _tg_last_post_time: float = 0.0
 _tg_lock = threading.Lock()
+
+# ─────────────────────────────────────────────────────────
+# WAVE COLLECTOR — v4.0
+# ─────────────────────────────────────────────────────────
+# Workers silently accumulate results during a bar-close flood.
+# After WAVE_COLLECT_SEC of quiet, digest-poster fires one summary
+# message + only the winning trade cards.
+
+_wave_lock         = threading.Lock()
+_wave_results: list = []
+_wave_last_arrival: float = 0.0
+
+
+def _record_wave_result(result: dict):
+    """Add a processed signal result to the current wave buffer."""
+    global _wave_last_arrival
+    with _wave_lock:
+        _wave_results.append(result)
+        _wave_last_arrival = time.time()
+
+
+def _flush_wave_digest():
+    """
+    Post one digest summary + trade cards for winners only.
+    Clears the wave buffer.
+    """
+    global _wave_results
+    with _wave_lock:
+        if not _wave_results:
+            return
+        results = list(_wave_results)
+        _wave_results = []
+
+    tv_winners, tv_skipped, swing_winners, swing_skipped = [], [], [], []
+
+    for r in results:
+        job_type = r.get("job_type", "tv")
+        entry = {
+            "ticker": r.get("ticker", "?"),
+            "bias":   r.get("bias",   "bull"),
+            "tier":   r.get("tier",   "?"),
+            "conf":   r.get("confidence"),
+            "card":   r.get("card"),
+        }
+        won = r.get("outcome") == "trade"
+        if job_type == "swing":
+            (swing_winners if won else swing_skipped).append(entry)
+        else:
+            (tv_winners if won else tv_skipped).append(entry)
+
+    lines = []
+
+    if tv_winners or tv_skipped:
+        lines.append("📊 TV SIGNAL DIGEST")
+        if tv_winners:
+            lines.append(f"✅ {len(tv_winners)} trade card(s) below")
+        if tv_skipped:
+            t1b, t1bear, t2b, t2bear, other = [], [], [], [], []
+            for e in tv_skipped:
+                t, b = e["tier"], e["bias"]
+                if   t == "1" and b == "bull": t1b.append(e["ticker"])
+                elif t == "1" and b == "bear": t1bear.append(e["ticker"])
+                elif t == "2" and b == "bull": t2b.append(e["ticker"])
+                elif t == "2" and b == "bear": t2bear.append(e["ticker"])
+                else: other.append(e["ticker"])
+            lines.append("❌ No trade:")
+            if t1b:    lines.append("  T1 🐂: " + " · ".join(t1b))
+            if t1bear: lines.append("  T1 🐻: " + " · ".join(t1bear))
+            if t2b:    lines.append("  T2 🐂: " + " · ".join(t2b))
+            if t2bear: lines.append("  T2 🐻: " + " · ".join(t2bear))
+            if other:  lines.append("  Other: " + " · ".join(other))
+
+    if swing_winners or swing_skipped:
+        if lines:
+            lines.append("")
+        lines.append("🔄 SWING SIGNAL DIGEST")
+        if swing_winners:
+            lines.append(f"✅ {len(swing_winners)} swing card(s) below")
+        if swing_skipped:
+            bull_s = [e["ticker"] for e in swing_skipped if e["bias"] == "bull"]
+            bear_s = [e["ticker"] for e in swing_skipped if e["bias"] == "bear"]
+            lines.append("❌ No swing trade:")
+            if bull_s: lines.append("  🐂: " + " · ".join(bull_s))
+            if bear_s: lines.append("  🐻: " + " · ".join(bear_s))
+
+    if not lines:
+        return
+
+    log.info(f"Wave digest: {len(tv_winners)} TV wins, {len(tv_skipped)} skipped, "
+             f"{len(swing_winners)} swing wins, {len(swing_skipped)} swing skipped")
+    _tg_rate_limited_post("\n".join(lines))
+
+    for entry in tv_winners + swing_winners:
+        if entry.get("card"):
+            _tg_rate_limited_post(entry["card"])
+
+
+def _digest_poster_thread():
+    """Flush wave digest after WAVE_COLLECT_SEC of silence."""
+    log.info("Wave digest poster started")
+    while True:
+        time.sleep(5)
+        with _wave_lock:
+            has_results  = bool(_wave_results)
+            last_arrival = _wave_last_arrival
+        if has_results and (time.time() - last_arrival) >= WAVE_COLLECT_SEC:
+            try:
+                _flush_wave_digest()
+            except Exception as e:
+                log.error(f"Digest flush error: {e}", exc_info=True)
+
+
+threading.Thread(target=_digest_poster_thread, daemon=True, name="digest-poster").start()
 
 
 def _tg_rate_limited_post(text: str, max_retries: int = 6, chat_id: str = None):
@@ -264,73 +378,102 @@ def _enqueue_signal(job_type: str, ticker: str, bias: str,
 
 
 def _process_job(worker_id: int, job: dict):
-    """Process a single signal job (shared by Redis and memory workers)."""
-    job_type    = job["job_type"]
-    ticker      = job["ticker"]
-    bias        = job["bias"]
+    """
+    Process a single signal job silently — accumulate result in wave buffer.
+    The digest-poster thread fires one summary + winning cards after the wave
+    settles (WAVE_COLLECT_SEC quiet period). v4.0
+    """
+    job_type     = job["job_type"]
+    ticker       = job["ticker"]
+    bias         = job["bias"]
     webhook_data = job["webhook_data"]
-    signal_msg  = job["signal_msg"]
-    enqueued_at = job["enqueued_at"]
+    enqueued_at  = job["enqueued_at"]
+    tier_label   = webhook_data.get("tier", "?")
 
     age_sec = time.time() - enqueued_at
     if age_sec > SIGNAL_TTL_SEC:
-        log.warning(
-            f"[worker-{worker_id}] Stale {job_type} signal dropped: "
-            f"{ticker} ({age_sec:.0f}s old)"
-        )
+        log.warning(f"[worker-{worker_id}] Stale {job_type} signal dropped: {ticker} ({age_sec:.0f}s)")
         return
 
-    tier_label = webhook_data.get("tier", "?")
-    log.info(
-        f"[worker-{worker_id}] Processing {job_type}: "
-        f"{ticker} {bias} T{tier_label} (queued {age_sec:.0f}s ago)"
-    )
+    log.info(f"[worker-{worker_id}] Processing {job_type}: {ticker} {bias} T{tier_label} ({age_sec:.0f}s ago)")
+
+    base = {
+        "job_type":   job_type,
+        "ticker":     ticker,
+        "bias":       bias,
+        "tier":       tier_label,
+        "outcome":    "skip",
+        "card":       None,
+        "confidence": None,
+        "reason":     "",
+    }
 
     if job_type == "tv":
-        st, body = _tg_rate_limited_post(signal_msg)
-        log.info(f"[worker-{worker_id}] Signal msg TG result: {st} | {body[:80] if body else 'ok'}")
+        # Exit warning is time-sensitive — still posts immediately
         check_spread_exit_warning(ticker, bias, webhook_data)
-        if bias in ALLOWED_DIRECTIONS:
-            check_ticker_with_timeout(ticker, direction=bias, webhook_data=webhook_data)
-        else:
-            _tg_rate_limited_post(
-                f"ℹ️ {ticker}: {bias} signal skipped — not in allowed directions"
-            )
+
+        if bias not in ALLOWED_DIRECTIONS:
+            base["reason"] = f"{bias} not in allowed directions"
+            _record_wave_result(base)
+            return
+
+        rec = check_ticker_with_timeout(ticker, direction=bias, webhook_data=webhook_data)
+        base["confidence"] = rec.get("confidence")
+
+        if rec.get("error") == "timeout":
+            base["reason"] = "timeout"
+            _record_wave_result(base)
+            return
+
+        if not rec.get("ok"):
+            base["reason"] = rec.get("reason", "no valid spread")
+            _record_wave_result(base)
+            return
+
+        if not rec.get("posted") and rec.get("reason") == "Duplicate trade in dedup window":
+            base["reason"] = "duplicate"
+            _record_wave_result(base)
+            return
+
+        # Trade winner — card was already built in check_ticker
+        card_text = rec.get("card")
+        base["outcome"] = "trade"
+        base["card"]    = card_text
+        _record_wave_result(base)
+        log.info(f"TV winner queued for digest: {ticker} {bias} T{tier_label} conf={rec.get('confidence')}/100")
 
     elif job_type == "swing":
         from swing_engine import recommend_swing_trade, format_swing_card
-        st, body = _tg_rate_limited_post(signal_msg)
-        log.info(f"[worker-{worker_id}] Swing signal msg TG result: {st} | {body[:80] if body else 'ok'}")
-        spot   = get_spot(ticker)
-        chains = get_options_chain_swing(ticker)
+        try:
+            spot   = get_spot(ticker)
+            chains = get_options_chain_swing(ticker)
+        except Exception as e:
+            base["reason"] = f"data fetch error: {e}"
+            _record_wave_result(base)
+            return
+
         if not chains:
-            _tg_rate_limited_post(
-                f"❌ {ticker} swing: no options chain data in 7-60 DTE range"
-            )
+            base["reason"] = "no options chain data in 7-60 DTE range"
+            _record_wave_result(base)
+            return
+
+        candles = get_daily_candles(ticker, days=252)
+        iv_rank = _estimate_iv_rank(chains, candles)
+        rec = recommend_swing_trade(
+            ticker=ticker, spot=spot, chains=chains,
+            webhook_data=webhook_data, iv_rank=iv_rank,
+        )
+        base["confidence"] = rec.get("confidence")
+
+        if not rec.get("ok"):
+            base["reason"] = rec.get("reason", "no valid setup")
+            _record_wave_result(base)
         else:
-            candles = get_daily_candles(ticker, days=252)
-            iv_rank = _estimate_iv_rank(chains, candles)
-            rec = recommend_swing_trade(
-                ticker=ticker,
-                spot=spot,
-                chains=chains,
-                webhook_data=webhook_data,
-                iv_rank=iv_rank,
-            )
-            if not rec.get("ok"):
-                reason = rec.get("reason", "no valid setup")
-                conf   = rec.get("confidence")
-                msg    = f"❌ {ticker} swing — {reason}"
-                if conf:
-                    msg += f"\nConfidence: {conf}/100"
-                _tg_rate_limited_post(msg)
-            else:
-                card = format_swing_card(rec)
-                _tg_rate_limited_post(card)
-                log.info(
-                    f"Swing card posted: {ticker} {bias} T{tier_label} "
-                    f"conf={rec.get('confidence')}/100"
-                )
+            base["outcome"] = "trade"
+            base["card"]    = format_swing_card(rec)
+            _record_wave_result(base)
+            log.info(f"Swing winner queued for digest: {ticker} {bias} conf={rec.get('confidence')}/100")
+
 
 
 def _signal_queue_worker_redis(worker_id: int):
@@ -481,13 +624,9 @@ def check_ticker_with_timeout(
     t.join(timeout=timeout_sec)
 
     if t.is_alive():
-        log.error(
-            f"check_ticker({ticker}) TIMED OUT after {timeout_sec}s — worker unblocked"
-        )
-        _tg_rate_limited_post(
-            f"⏱️ {ticker}: options lookup timed out ({timeout_sec}s) — skipping trade card"
-        )
-        return {"ticker": ticker, "ok": False, "posted": False, "error": "timeout"}
+        log.error(f"check_ticker({ticker}) TIMED OUT after {timeout_sec}s — worker unblocked")
+        # Don't post directly — let wave digest handle it as a skip
+        return {"ticker": ticker, "ok": False, "posted": False, "error": "timeout", "reason": "timeout"}
 
     if exc_holder:
         raise exc_holder[0]
@@ -1095,12 +1234,10 @@ def check_ticker(
             card = earnings_warn + "\n\n" + card
 
         conf = best_rec.get("confidence", 0)
-        log.info(f"Posting trade card: {ticker} {direction} conf={conf}/100 tg_chat={TELEGRAM_CHAT_ID[:6]}...")
-        st, body = post_to_telegram(card)
-        log.info(f"Trade card post result: {ticker} {direction} tg_status={st} body={body[:80] if body else 'ok'}")
+        log.info(f"Trade card built: {ticker} {direction} conf={conf}/100 — queued for wave digest")
 
-        if st == 200:
-            mark_trade_sent(ticker, direction, trade.get("short"), trade.get("long"))
+        # Mark dedup now so duplicate signals in the same wave are suppressed
+        mark_trade_sent(ticker, direction, trade.get("short"), trade.get("long"))
 
         trade_journal.log_signal(
             ticker, webhook_data,
@@ -1111,8 +1248,8 @@ def check_ticker(
         return {
             "ticker":              ticker,
             "ok":                  True,
-            "posted":              st == 200,
-            "tg_status":           st,
+            "posted":              True,   # will be posted via digest
+            "card":                card,   # returned so digest poster can send it
             "confidence":          best_rec.get("confidence"),
             "trade":               trade,
             "expirations_checked": len(chains),
