@@ -5,19 +5,19 @@
 # v3.2 — Multi-account portfolio support
 # v3.4 — /spread command for debit spread tracking
 # v3.8 — /check runs both bull + bear, engine decides
+# v3.9 — /em command for 0DTE Expected Move (SPY & QQQ)
 
 import os
 import logging
 import threading
 from datetime import datetime, timezone
-from typing import Optional
 
 import requests
 
 log = logging.getLogger(__name__)
 
-TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN",  "").strip()
-TELEGRAM_ADMIN_IDS  = [
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_ADMIN_IDS = [
     x.strip() for x in
     os.getenv("TELEGRAM_ADMIN_IDS", "").split(",")
     if x.strip()
@@ -31,16 +31,19 @@ _state = {
     "start_time":      datetime.now(timezone.utc),
 }
 
+# Reference to get_regime_fn — set by handle_command on each call
+_get_regime_ref = None
+
 
 def get_state() -> dict:
     return _state
 
 
 def set_last_scan(posted: int, total: int):
-    _state["last_scan_time"] = datetime.now(timezone.utc)
-    _state["scan_count"] += 1
-    _state["last_scan_posted"] = posted
-    _state["last_scan_total"]  = total
+    _state["last_scan_time"]    = datetime.now(timezone.utc)
+    _state["scan_count"]       += 1
+    _state["last_scan_posted"]  = posted
+    _state["last_scan_total"]   = total
 
 
 def is_paused() -> bool:
@@ -81,7 +84,7 @@ def register_webhook(bot_url: str, webhook_secret: str):
 
     webhook_url = f"{bot_url.rstrip('/')}/telegram_webhook/{webhook_secret}"
     try:
-        r = requests.post(
+        r    = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook",
             json={"url": webhook_url},
             timeout=10,
@@ -96,7 +99,7 @@ def register_webhook(bot_url: str, webhook_secret: str):
 
 
 # ─────────────────────────────────────────────────────────
-# ACCOUNT FLAG PARSING (v3.2)
+# ACCOUNT FLAG PARSING
 # ─────────────────────────────────────────────────────────
 
 def _parse_account_flag(args: list) -> tuple:
@@ -105,6 +108,10 @@ def _parse_account_flag(args: list) -> tuple:
     account = "mom" if has_mom else "brad"
     return account, cleaned
 
+
+# ─────────────────────────────────────────────────────────
+# MAIN COMMAND HANDLER
+# ─────────────────────────────────────────────────────────
 
 def handle_command(
     user_id:   str,
@@ -119,12 +126,12 @@ def handle_command(
     post_fn=None,
     get_portfolio_chat_id_fn=None,
     get_regime_fn=None,
+    post_em_card_fn=None,
 ) -> None:
     if not is_authorized(user_id):
         send_reply(chat_id, "⛔ You are not authorized to use this bot.")
         return
 
-    # Store regime fn reference for threaded handlers
     global _get_regime_ref
     _get_regime_ref = get_regime_fn
 
@@ -143,17 +150,15 @@ def handle_command(
         return reply
 
     # ─────────────────────────────────────
-    # PORTFOLIO COMMANDS (v3.2: with --mom support)
+    # PORTFOLIO COMMANDS
     # ─────────────────────────────────────
 
     if cmd in ("/hold", "/hold@omegabot"):
         account, clean_args = _parse_account_flag(args)
         from holdings_commands import handle_hold
-        _spot = get_spot_fn or _no_spot
-        p_reply = _portfolio_reply(account)
         threading.Thread(
             target=_safe_run,
-            args=(handle_hold, clean_args, p_reply, _spot, chat_id, account),
+            args=(handle_hold, clean_args, _portfolio_reply(account), get_spot_fn or _no_spot, chat_id, account),
             daemon=True,
         ).start()
         return
@@ -161,10 +166,9 @@ def handle_command(
     if cmd in ("/sell", "/sell@omegabot"):
         account, clean_args = _parse_account_flag(args)
         from holdings_commands import handle_sell
-        p_reply = _portfolio_reply(account)
         threading.Thread(
             target=_safe_run,
-            args=(handle_sell, clean_args, p_reply, None, chat_id, account),
+            args=(handle_sell, clean_args, _portfolio_reply(account), None, chat_id, account),
             daemon=True,
         ).start()
         return
@@ -172,10 +176,9 @@ def handle_command(
     if cmd in ("/close", "/close@omegabot"):
         account, clean_args = _parse_account_flag(args)
         from holdings_commands import handle_close
-        p_reply = _portfolio_reply(account)
         threading.Thread(
             target=_safe_run,
-            args=(handle_close, clean_args, p_reply, None, chat_id, account),
+            args=(handle_close, clean_args, _portfolio_reply(account), None, chat_id, account),
             daemon=True,
         ).start()
         return
@@ -183,10 +186,9 @@ def handle_command(
     if cmd in ("/roll", "/roll@omegabot"):
         account, clean_args = _parse_account_flag(args)
         from holdings_commands import handle_roll
-        p_reply = _portfolio_reply(account)
         threading.Thread(
             target=_safe_run,
-            args=(handle_roll, clean_args, p_reply, None, chat_id, account),
+            args=(handle_roll, clean_args, _portfolio_reply(account), None, chat_id, account),
             daemon=True,
         ).start()
         return
@@ -194,10 +196,9 @@ def handle_command(
     if cmd in ("/expire", "/expire@omegabot"):
         account, clean_args = _parse_account_flag(args)
         from holdings_commands import handle_expire
-        p_reply = _portfolio_reply(account)
         threading.Thread(
             target=_safe_run,
-            args=(handle_expire, clean_args, p_reply, None, chat_id, account),
+            args=(handle_expire, clean_args, _portfolio_reply(account), None, chat_id, account),
             daemon=True,
         ).start()
         return
@@ -205,10 +206,9 @@ def handle_command(
     if cmd in ("/assign", "/assign@omegabot"):
         account, clean_args = _parse_account_flag(args)
         from holdings_commands import handle_assign
-        p_reply = _portfolio_reply(account)
         threading.Thread(
             target=_safe_run,
-            args=(handle_assign, clean_args, p_reply, None, chat_id, account),
+            args=(handle_assign, clean_args, _portfolio_reply(account), None, chat_id, account),
             daemon=True,
         ).start()
         return
@@ -216,10 +216,9 @@ def handle_command(
     if cmd in ("/options", "/options@omegabot"):
         account, clean_args = _parse_account_flag(args)
         from holdings_commands import handle_options
-        p_reply = _portfolio_reply(account)
         threading.Thread(
             target=_safe_run,
-            args=(handle_options, clean_args, p_reply, None, chat_id, account),
+            args=(handle_options, clean_args, _portfolio_reply(account), None, chat_id, account),
             daemon=True,
         ).start()
         return
@@ -227,10 +226,9 @@ def handle_command(
     if cmd in ("/wheel", "/wheel@omegabot"):
         account, clean_args = _parse_account_flag(args)
         from holdings_commands import handle_wheel
-        p_reply = _portfolio_reply(account)
         threading.Thread(
             target=_safe_run,
-            args=(handle_wheel, clean_args, p_reply, None, chat_id, account),
+            args=(handle_wheel, clean_args, _portfolio_reply(account), None, chat_id, account),
             daemon=True,
         ).start()
         return
@@ -238,11 +236,9 @@ def handle_command(
     if cmd in ("/holdings", "/holdings@omegabot"):
         account, clean_args = _parse_account_flag(args)
         from holdings_commands import handle_holdings
-        _md = md_get_fn or _no_md_get
-        p_reply = _portfolio_reply(account)
         threading.Thread(
             target=_safe_run,
-            args=(handle_holdings, clean_args, p_reply, _md, chat_id, account),
+            args=(handle_holdings, clean_args, _portfolio_reply(account), md_get_fn or _no_md_get, chat_id, account),
             daemon=True,
         ).start()
         return
@@ -250,108 +246,108 @@ def handle_command(
     if cmd in ("/portfolio", "/portfolio@omegabot"):
         account, clean_args = _parse_account_flag(args)
         from holdings_commands import handle_portfolio
-        _md = md_get_fn or _no_md_get
-        p_reply = _portfolio_reply(account)
         threading.Thread(
             target=_safe_run,
-            args=(handle_portfolio, clean_args, p_reply, _md, chat_id, account),
+            args=(handle_portfolio, clean_args, _portfolio_reply(account), md_get_fn or _no_md_get, chat_id, account),
             daemon=True,
         ).start()
         return
 
-    # ─────────────────────────────────────
-    # /cash — Cash balance & account P/L (v3.3)
-    # ─────────────────────────────────────
     if cmd in ("/cash", "/cash@omegabot"):
         account, clean_args = _parse_account_flag(args)
         from holdings_commands import handle_cash
-        _spot = get_spot_fn or _no_spot
-        p_reply = _portfolio_reply(account)
         threading.Thread(
             target=_safe_run,
-            args=(handle_cash, clean_args, p_reply, _spot, chat_id, account),
+            args=(handle_cash, clean_args, _portfolio_reply(account), get_spot_fn or _no_spot, chat_id, account),
             daemon=True,
         ).start()
         return
 
-    # ─────────────────────────────────────
-    # /fund — Mutual Fund / ETF tracker (v3.2)
-    # ─────────────────────────────────────
     if cmd in ("/fund", "/fund@omegabot"):
         account, clean_args = _parse_account_flag(args)
         from holdings_commands import handle_fund
-        p_reply = _portfolio_reply(account)
         threading.Thread(
             target=_safe_run,
-            args=(handle_fund, clean_args, p_reply, None, chat_id, account),
+            args=(handle_fund, clean_args, _portfolio_reply(account), None, chat_id, account),
             daemon=True,
         ).start()
         return
 
-    # ─────────────────────────────────────
-    # /spread — Debit Spread Tracking (v3.4)
-    # ─────────────────────────────────────
     if cmd in ("/spread", "/spread@omegabot"):
         account, clean_args = _parse_account_flag(args)
         from holdings_commands import handle_spread
-        p_reply = _portfolio_reply(account)
         threading.Thread(
             target=_safe_run,
-            args=(handle_spread, clean_args, p_reply, None, chat_id, account),
+            args=(handle_spread, clean_args, _portfolio_reply(account), None, chat_id, account),
             daemon=True,
         ).start()
         return
 
-    # ─────────────────────────────────────
-    # /risk — Portfolio Risk Dashboard (v3.5)
-    # ─────────────────────────────────────
     if cmd in ("/risk", "/risk@omegabot"):
         account, clean_args = _parse_account_flag(args)
         from holdings_commands import handle_risk
-        p_reply = _portfolio_reply(account)
-        # handle_risk(args, send_fn, get_regime_fn, account)
         threading.Thread(
             target=_safe_run_with_regime,
-            args=(handle_risk, clean_args, p_reply, chat_id, account),
+            args=(handle_risk, clean_args, _portfolio_reply(account), chat_id, account),
             daemon=True,
         ).start()
         return
 
-    # ─────────────────────────────────────
-    # /regime — Market Regime Status (v3.5)
-    # ─────────────────────────────────────
     if cmd in ("/regime", "/regime@omegabot"):
         account, clean_args = _parse_account_flag(args)
         from holdings_commands import handle_regime
-        p_reply = _portfolio_reply(account)
         threading.Thread(
             target=_safe_run_with_regime,
-            args=(handle_regime, clean_args, p_reply, chat_id, account),
+            args=(handle_regime, clean_args, _portfolio_reply(account), chat_id, account),
+            daemon=True,
+        ).start()
+        return
+
+    if cmd in ("/journal", "/journal@omegabot"):
+        account, clean_args = _parse_account_flag(args)
+        from holdings_commands import handle_journal
+        threading.Thread(
+            target=_safe_run,
+            args=(handle_journal, clean_args, _portfolio_reply(account), None, chat_id, account),
             daemon=True,
         ).start()
         return
 
     # ─────────────────────────────────────
-    # /journal — Trade Journal & Analytics (v3.5)
+    # /em [morning|afternoon] — 0DTE Expected Move
     # ─────────────────────────────────────
-    if cmd in ("/journal", "/journal@omegabot"):
-        account, clean_args = _parse_account_flag(args)
-        from holdings_commands import handle_journal
-        p_reply = _portfolio_reply(account)
-        threading.Thread(
-            target=_safe_run,
-            args=(handle_journal, clean_args, p_reply, None, chat_id, account),
-            daemon=True,
-        ).start()
+    if cmd in ("/em", "/em@omegabot"):
+        if not post_em_card_fn:
+            reply("⚠️ EM function not wired — post_em_card_fn missing.")
+            return
+
+        # Optional session override: /em morning or /em afternoon
+        session = args[0].lower() if args else "manual"
+        if session not in ("morning", "afternoon", "manual"):
+            reply("⚠️ Usage: /em  or  /em morning  or  /em afternoon")
+            return
+
+        from app import EM_TICKERS
+        tickers = EM_TICKERS  # ["SPY", "QQQ"]
+        reply(f"📐 Fetching 0DTE EM for {', '.join(tickers)} ({session})...")
+
+        def run_em():
+            for ticker in tickers:
+                try:
+                    post_em_card_fn(ticker, session)
+                except Exception as e:
+                    log.error(f"/em {ticker}: {e}")
+                    reply(f"⚠️ EM error for {ticker}: {type(e).__name__}")
+
+        threading.Thread(target=run_em, daemon=True).start()
         return
 
     # ─────────────────────────────────────
     # /check TICKER [bull|bear]
-    # Engine decides direction — runs both unless you specify one.
     # ─────────────────────────────────────
     if cmd in ("/check", "/check@omegabot"):
         if not args:
-            send_reply(chat_id,
+            reply(
                 "Usage: /check AAPL\n"
                 "       /check AAPL bull  — force bull only\n"
                 "       /check AAPL bear  — force bear only\n\n"
@@ -360,25 +356,23 @@ def handle_command(
             )
             return
 
-        ticker = args[0].upper()
-
-        # Explicit direction override
+        ticker           = args[0].upper()
         forced_direction = None
+
         if len(args) > 1:
             d = args[1].lower()
             if d not in ("bull", "bear"):
-                send_reply(chat_id, f"⚠️ Direction must be 'bull' or 'bear', got '{d}'")
+                reply(f"⚠️ Direction must be 'bull' or 'bear', got '{d}'")
                 return
             forced_direction = d
 
         directions = [forced_direction] if forced_direction else ["bull", "bear"]
         dir_label  = forced_direction.upper() if forced_direction else "BULL + BEAR"
-        send_reply(chat_id, f"🔍 Checking {ticker} ({dir_label})...")
+        reply(f"🔍 Checking {ticker} ({dir_label})...")
 
         def run_check():
             any_posted = False
             results    = []
-
             for direction in directions:
                 try:
                     result = check_fn(ticker, direction)
@@ -392,7 +386,6 @@ def handle_command(
                     log.error(f"/check {ticker} {direction}: {e}")
                     results.append((direction, f"{type(e).__name__}", None))
 
-            # Only send a rejection summary if nothing was posted at all
             if not any_posted:
                 lines = [f"❌ {ticker} — no setups found"]
                 for direction, reason, conf in results:
@@ -401,99 +394,91 @@ def handle_command(
                     if conf is not None:
                         line += f" (conf {conf}/100)"
                     lines.append(line)
-                send_reply(chat_id, "\n".join(lines))
+                reply("\n".join(lines))
 
         threading.Thread(target=run_check, daemon=True).start()
+        return
 
     # ─────────────────────────────────────
     # /scan [TICKER]
     # ─────────────────────────────────────
-    elif cmd in ("/scan", "/scan@omegabot"):
+    if cmd in ("/scan", "/scan@omegabot"):
         if args:
             ticker = args[0].upper()
-            send_reply(chat_id, f"🔍 Scanning {ticker}...")
+            reply(f"🔍 Scanning {ticker}...")
             result = scan_fn(ticker)
             if result.get("posted"):
-                send_reply(chat_id, f"✅ {ticker} scan card posted above.")
+                reply(f"✅ {ticker} scan card posted above.")
             else:
                 reason = result.get("skipped") or result.get("error") or "no setup found"
-                send_reply(chat_id, f"ℹ️ {ticker}: {reason}")
+                reply(f"ℹ️ {ticker}: {reason}")
         else:
             if is_paused():
-                send_reply(chat_id, "⏸ Bot is paused. Use /resume first.")
+                reply("⏸ Bot is paused. Use /resume first.")
                 return
-            send_reply(chat_id, f"🔍 Scanning full watchlist ({len(watchlist)} tickers)...")
-            def run_scan():
-                full_scan_fn()
-            threading.Thread(target=run_scan, daemon=True).start()
+            reply(f"🔍 Scanning full watchlist ({len(watchlist)} tickers)...")
+            threading.Thread(target=full_scan_fn, daemon=True).start()
+        return
 
     # ─────────────────────────────────────
     # /status
     # ─────────────────────────────────────
-    elif cmd in ("/status", "/status@omegabot"):
+    if cmd in ("/status", "/status@omegabot"):
         uptime     = datetime.now(timezone.utc) - _state["start_time"]
         uptime_str = f"{int(uptime.total_seconds() // 3600)}h {int((uptime.total_seconds() % 3600) // 60)}m"
 
         last_scan = _state.get("last_scan_time")
         if last_scan:
-            mins_ago  = int((datetime.now(timezone.utc) - last_scan).total_seconds() / 60)
-            scan_str  = f"{mins_ago}m ago ({_state.get('last_scan_posted',0)}/{_state.get('last_scan_total',0)} posted)"
+            mins_ago = int((datetime.now(timezone.utc) - last_scan).total_seconds() / 60)
+            scan_str = f"{mins_ago}m ago ({_state.get('last_scan_posted', 0)}/{_state.get('last_scan_total', 0)} posted)"
         else:
             scan_str = "No scan run yet"
 
-        paused_str = "⏸ PAUSED" if _state["paused"] else "▶️ Running"
-        conf_str   = str(_state["confidence_gate"])
-
-        brad_holdings = 0
-        brad_opts = 0
-        brad_spreads = 0
-        mom_holdings = 0
-        mom_opts = 0
-        mom_spreads = 0
+        brad_holdings = brad_opts = brad_spreads = 0
+        mom_holdings  = mom_opts  = mom_spreads  = 0
         try:
             from portfolio import get_all_holdings, get_open_options, get_open_spreads
             brad_holdings = len(get_all_holdings(account="brad"))
-            brad_opts = len(get_open_options(account="brad"))
-            brad_spreads = len(get_open_spreads(account="brad"))
-            mom_holdings = len(get_all_holdings(account="mom"))
-            mom_opts = len(get_open_options(account="mom"))
-            mom_spreads = len(get_open_spreads(account="mom"))
+            brad_opts     = len(get_open_options(account="brad"))
+            brad_spreads  = len(get_open_spreads(account="brad"))
+            mom_holdings  = len(get_all_holdings(account="mom"))
+            mom_opts      = len(get_open_options(account="mom"))
+            mom_spreads   = len(get_open_spreads(account="mom"))
         except Exception:
             pass
 
-        msg = (
+        reply(
             f"🤖 Omega 3000 Status\n"
-            f"State: {paused_str}\n"
+            f"State: {'⏸ PAUSED' if _state['paused'] else '▶️ Running'}\n"
             f"Uptime: {uptime_str}\n"
             f"Last Scan: {scan_str}\n"
             f"Total Scans: {_state['scan_count']}\n"
-            f"Confidence Gate: {conf_str}/100\n"
+            f"Confidence Gate: {_state['confidence_gate']}/100\n"
             f"Watchlist: {len(watchlist)} tickers\n"
             f"Brad: {brad_holdings} hold | {brad_opts} opts | {brad_spreads} spreads\n"
             f"Mom:  {mom_holdings} hold | {mom_opts} opts | {mom_spreads} spreads\n"
             f"Admins: {len(TELEGRAM_ADMIN_IDS)} authorized"
         )
-        send_reply(chat_id, msg)
+        return
 
     # ─────────────────────────────────────
     # /watchlist
     # ─────────────────────────────────────
-    elif cmd in ("/watchlist", "/watchlist@omegabot"):
+    if cmd in ("/watchlist", "/watchlist@omegabot"):
         if not watchlist:
-            send_reply(chat_id, "⚠️ Watchlist is empty.")
+            reply("⚠️ Watchlist is empty.")
             return
-        chunks = [watchlist[i:i+20] for i in range(0, len(watchlist), 20)]
+        chunks = [watchlist[i:i + 20] for i in range(0, len(watchlist), 20)]
         for i, chunk in enumerate(chunks):
-            msg = f"📋 Watchlist ({i*20+1}–{i*20+len(chunk)}):\n"
-            msg += ", ".join(chunk)
-            send_reply(chat_id, msg)
+            reply(f"📋 Watchlist ({i * 20 + 1}–{i * 20 + len(chunk)}):\n" + ", ".join(chunk))
+        return
 
     # ─────────────────────────────────────
     # /confidence [value]
     # ─────────────────────────────────────
-    elif cmd in ("/confidence", "/confidence@omegabot"):
+    if cmd in ("/confidence", "/confidence@omegabot"):
         if not args:
-            send_reply(chat_id,
+            reply(
                 f"Current confidence gate: {_state['confidence_gate']}/100\n"
                 f"Usage: /confidence 60"
             )
@@ -504,23 +489,26 @@ def handle_command(
                 raise ValueError
             old = _state["confidence_gate"]
             _state["confidence_gate"] = val
-            send_reply(chat_id,
+            reply(
                 f"✅ Confidence gate updated: {old} → {val}/100\n"
                 f"Trades below {val}/100 will be suppressed."
             )
         except ValueError:
-            send_reply(chat_id, "⚠️ Usage: /confidence 60 (must be 0–100)")
+            reply("⚠️ Usage: /confidence 60 (must be 0–100)")
+        return
 
-    elif cmd in ("/pause", "/pause@omegabot"):
+    if cmd in ("/pause", "/pause@omegabot"):
         _state["paused"] = True
-        send_reply(chat_id, "⏸ Bot paused. Scheduled scans will be skipped. Use /resume to restart.")
+        reply("⏸ Bot paused. Scheduled scans will be skipped. Use /resume to restart.")
+        return
 
-    elif cmd in ("/resume", "/resume@omegabot"):
+    if cmd in ("/resume", "/resume@omegabot"):
         _state["paused"] = False
-        send_reply(chat_id, "▶️ Bot resumed. Scheduled scans will run normally.")
+        reply("▶️ Bot resumed. Scheduled scans will run normally.")
+        return
 
-    elif cmd in ("/help", "/help@omegabot", "/start"):
-        msg = (
+    if cmd in ("/help", "/help@omegabot", "/start"):
+        reply(
             "🤖 Omega 3000 Commands:\n\n"
             "── Analysis ──\n"
             "/check AAPL — auto bull+bear, engine decides\n"
@@ -528,7 +516,12 @@ def handle_command(
             "/check AAPL bear — force bear only\n"
             "/scan AAPL — scan single ticker\n"
             "/scan — run full watchlist scan\n"
-            "\n── Portfolio (add --mom for mom's account) ──\n"
+            "\n── 0DTE Expected Move ──\n"
+            "/em — fetch EM for SPY & QQQ now\n"
+            "/em morning — today's EM (hours remaining)\n"
+            "/em afternoon — next day full-session EM\n"
+            "  Auto-fires: 8:45 AM CT (today) & 2:45 PM CT (next day)\n"
+            "\n── Portfolio (add -mom for mom's account) ──\n"
             "/hold add AAPL 100 @185.50 — add shares\n"
             "/hold remove AAPL — remove shares\n"
             "/hold list — show all holdings + P/L\n"
@@ -542,7 +535,7 @@ def handle_command(
             "/fund set 50000 — set total invested\n"
             "/fund update 54200 — update current value\n"
             "/fund — show P/L\n"
-            "\n── Debit Spreads (v3.4) ──\n"
+            "\n── Debit Spreads ──\n"
             "/spread add call AAPL 570/571 0.65 2026-03-14 x3\n"
             "/spread add put AAPL 580/579 0.55 2026-03-14 x2\n"
             "/spread add AAPL 570/571 0.65 2026-03-14  (defaults to call)\n"
@@ -569,7 +562,7 @@ def handle_command(
             "/watchlist — show tickers\n"
             "/confidence 60 — set min confidence\n"
             "/pause | /resume — control scheduled scans\n"
-            "\n── Risk & Regime (v3.5) ──\n"
+            "\n── Risk & Regime ──\n"
             "/risk — portfolio risk dashboard\n"
             "/regime — market regime (VIX + ADX)\n"
             "/journal — trade analytics + backtest data\n"
@@ -578,17 +571,14 @@ def handle_command(
             "/journal trades — recent trade log\n"
             "/journal attrs — Greeks P/L attribution\n"
             "/help — this message\n\n"
-            "💡 --mom on any portfolio command for mom's account\n"
+            "💡 -mom on any portfolio command for mom's account\n"
             "⚡ TV signals auto-warn if you have opposite spreads open\n"
             "🛡️ Risk limits auto-block trades that exceed exposure caps\n"
             "— Not financial advice —"
         )
-        send_reply(chat_id, msg)
+        return
 
-    else:
-        send_reply(chat_id,
-            f"❓ Unknown command: {cmd}\nType /help for available commands."
-        )
+    reply(f"❓ Unknown command: {cmd}\nType /help for available commands.")
 
 
 # ─────────────────────────────────────────────────────────
@@ -615,13 +605,8 @@ def _safe_run(handler_fn, args, reply_fn, extra_arg, chat_id, account="brad"):
 
 
 def _safe_run_with_regime(handler_fn, args, reply_fn, chat_id, account="brad"):
-    """Wrapper for handlers that need get_regime_fn (handle_risk, handle_regime)."""
     try:
         handler_fn(args, reply_fn, get_regime_fn=_get_regime_ref, account=account)
     except Exception as e:
         log.error(f"Command error: {type(e).__name__}: {e}")
         send_reply(chat_id, f"⚠️ Error: {type(e).__name__}: {str(e)[:120]}")
-
-
-# Reference to get_regime_fn — set by handle_command on each call
-_get_regime_ref = None
