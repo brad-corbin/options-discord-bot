@@ -11,6 +11,13 @@
 #   - Black-Scholes fair value validation for swing spreads
 #   - 7-60 DTE swing engine with auto DTE selection
 #   - Weekly + daily trend confirmation for swing entries
+#
+# v3.9 UPGRADE:
+#   - Redis-backed signal queue (survives deploys)
+#   - Faster md_get timeout (8s vs 25s) to unblock workers faster
+#   - check_ticker wrapped with 45s hard timeout
+#   - QUEUE_WORKERS raised to 6
+#   - Worker heartbeat logging every 60s
 
 from telegram_commands import (
     handle_command,
@@ -160,26 +167,25 @@ def mark_trade_sent(ticker, direction, short_k, long_k):
     store_set(trade_dedup_key(ticker, direction, short_k, long_k), "1", ttl=DEDUP_TTL_SECONDS)
 
 # ─────────────────────────────────────────────────────────
+# UNIFIED SIGNAL QUEUE — Redis-backed (v3.9)
 # ─────────────────────────────────────────────────────────
-# UNIFIED SIGNAL QUEUE
-# ─────────────────────────────────────────────────────────
-# Single FIFO queue for ALL signals — TV scalp and swing daily.
-# Prevents bar-close floods from spawning simultaneous threads
-# and hammering the Telegram 429 rate limit.
+# Signals are pushed to a Redis list ("signal_queue") so they survive
+# deploys and process restarts.  Workers use BRPOP (blocking pop).
+# Falls back to in-memory queue if Redis is unavailable.
 #
-# Job tuple: (job_type, ticker, bias, webhook_data, signal_msg, enqueued_at)
-#   job_type: "tv" | "swing"
-#
-# v3.9: Unified queue replaces separate TV queue + swing threads.
-# Rate limiter enforces minimum gap between Telegram posts.
+# Job dict keys: job_type, ticker, bias, webhook_data, signal_msg, enqueued_at
 
 QUEUE_MAX        = 80
-QUEUE_WORKERS    = 6
-SIGNAL_TTL_SEC   = 900   # 8 min — drop stale signals
-TG_MIN_GAP_SEC   = 0.8   # minimum seconds between Telegram posts
+QUEUE_WORKERS    = 6      # v3.9: raised from 3
+SIGNAL_TTL_SEC   = 480    # 8 min — drop stale signals
+TG_MIN_GAP_SEC   = 0.8    # v3.9: lowered from 1.5
 
-_signal_queue: queue.Queue = queue.Queue(maxsize=QUEUE_MAX)
-_tg_last_post_time: float  = 0.0
+REDIS_QUEUE_KEY  = "signal_queue"
+
+# In-memory fallback queue (used only when Redis is unavailable)
+_mem_signal_queue: queue.Queue = queue.Queue(maxsize=QUEUE_MAX)
+
+_tg_last_post_time: float = 0.0
 _tg_lock = threading.Lock()
 
 
@@ -187,133 +193,293 @@ def _tg_rate_limited_post(text: str, max_retries: int = 6, chat_id: str = None):
     """Post to Telegram with global rate limiting across all workers."""
     global _tg_last_post_time
     with _tg_lock:
-        now     = time.time()
-        gap     = now - _tg_last_post_time
+        now = time.time()
+        gap = now - _tg_last_post_time
         if gap < TG_MIN_GAP_SEC:
             time.sleep(TG_MIN_GAP_SEC - gap)
         _tg_last_post_time = time.time()
     return post_to_telegram(text, max_retries=max_retries, chat_id=chat_id)
 
 
-def _signal_queue_worker(worker_id: int):
-    """Drain the unified signal queue sequentially."""
-    log.info(f"Signal queue worker-{worker_id} started")
-    while True:
-        try:
-            job = _signal_queue.get(block=True, timeout=5)
-            if job is None:
-                break
-
-            job_type, ticker, bias, webhook_data, signal_msg, enqueued_at = job
-
-            age_sec = time.time() - enqueued_at
-            if age_sec > SIGNAL_TTL_SEC:
-                log.warning(
-                    f"[worker-{worker_id}] Stale {job_type} signal dropped: "
-                    f"{ticker} ({age_sec:.0f}s old)"
-                )
-                _signal_queue.task_done()
-                continue
-
-            try:
-                tier_label = webhook_data.get("tier", "?")
-                log.info(
-                    f"[worker-{worker_id}] Processing {job_type}: "
-                    f"{ticker} {bias} T{tier_label} (queued {age_sec:.0f}s ago)"
-                )
-
-                if job_type == "tv":
-                    _tg_rate_limited_post(signal_msg)
-                    check_spread_exit_warning(ticker, bias, webhook_data)
-                    if bias in ALLOWED_DIRECTIONS:
-                        check_ticker(ticker, direction=bias, webhook_data=webhook_data)
-                    else:
-                        _tg_rate_limited_post(
-                            f"ℹ️ {ticker}: {bias} signal skipped — not in allowed directions"
-                        )
-
-                elif job_type == "swing":
-                    from swing_engine import recommend_swing_trade, format_swing_card
-                    _tg_rate_limited_post(signal_msg)
-                    spot   = get_spot(ticker)
-                    chains = get_options_chain_swing(ticker)
-                    if not chains:
-                        _tg_rate_limited_post(
-                            f"❌ {ticker} swing: no options chain data in 7-60 DTE range"
-                        )
-                    else:
-                        candles = get_daily_candles(ticker, days=252)
-                        iv_rank = _estimate_iv_rank(chains, candles)
-                        rec = recommend_swing_trade(
-                            ticker=ticker,
-                            spot=spot,
-                            chains=chains,
-                            webhook_data=webhook_data,
-                            iv_rank=iv_rank,
-                        )
-                        if not rec.get("ok"):
-                            reason = rec.get("reason", "no valid setup")
-                            conf   = rec.get("confidence")
-                            msg    = f"❌ {ticker} swing — {reason}"
-                            if conf:
-                                msg += f"\nConfidence: {conf}/100"
-                            _tg_rate_limited_post(msg)
-                        else:
-                            card = format_swing_card(rec)
-                            _tg_rate_limited_post(card)
-                            log.info(
-                                f"Swing card posted: {ticker} {bias} T{tier_label} "
-                                f"conf={rec.get('confidence')}/100"
-                            )
-
-            except Exception as e:
-                log.error(
-                    f"[worker-{worker_id}] Queue error for {ticker} ({job_type}): {e}",
-                    exc_info=True,
-                )
-            finally:
-                _signal_queue.task_done()
-
-        except queue.Empty:
-            continue
-
-
 def _enqueue_signal(job_type: str, ticker: str, bias: str,
                     webhook_data: dict, signal_msg: str):
-    """Enqueue a signal. Drops oldest if full."""
-    enqueued_at = time.time()
-    job = (job_type, ticker, bias, webhook_data, signal_msg, enqueued_at)
+    """
+    Push a signal job to Redis list.
+    Falls back to in-memory queue if Redis is unavailable.
+    """
+    job = {
+        "job_type":    job_type,
+        "ticker":      ticker,
+        "bias":        bias,
+        "webhook_data": webhook_data,
+        "signal_msg":  signal_msg,
+        "enqueued_at": time.time(),
+    }
+
+    r = _get_redis()
+    if r:
+        try:
+            pipe = r.pipeline()
+            pipe.lpush(REDIS_QUEUE_KEY, json.dumps(job))
+            pipe.ltrim(REDIS_QUEUE_KEY, 0, QUEUE_MAX - 1)
+            pipe.execute()
+            qsize = r.llen(REDIS_QUEUE_KEY)
+            log.info(f"{job_type.upper()} signal pushed to Redis: {ticker} (depth: {qsize})")
+            if qsize > QUEUE_MAX * 0.7:
+                log.warning(f"Redis signal queue at {qsize}/{QUEUE_MAX} — approaching capacity")
+            return
+        except Exception as e:
+            log.warning(f"Redis enqueue failed ({e}), falling back to memory queue")
+
+    # In-memory fallback
+    mem_job = (job_type, ticker, bias, webhook_data, signal_msg, job["enqueued_at"])
     try:
-        _signal_queue.put_nowait(job)
-        qsize = _signal_queue.qsize()
-        log.info(f"{job_type.upper()} signal queued: {ticker} (queue depth: {qsize})")
-        if qsize > QUEUE_MAX * 0.7:
-            log.warning(f"Signal queue at {qsize}/{QUEUE_MAX} — approaching capacity")
+        _mem_signal_queue.put_nowait(mem_job)
+        log.info(f"{job_type.upper()} signal queued (memory fallback): {ticker}")
     except queue.Full:
         try:
-            dropped = _signal_queue.get_nowait()
-            log.warning(f"Queue full — dropped oldest: {dropped[1]} ({dropped[0]})")
-            _signal_queue.task_done()
+            dropped = _mem_signal_queue.get_nowait()
+            log.warning(f"Memory queue full — dropped: {dropped[1]} ({dropped[0]})")
+            _mem_signal_queue.task_done()
         except queue.Empty:
             pass
         try:
-            _signal_queue.put_nowait(job)
+            _mem_signal_queue.put_nowait(mem_job)
         except queue.Full:
-            log.error(f"Queue still full — signal lost: {ticker} ({job_type})")
+            log.error(f"Memory queue still full — signal lost: {ticker} ({job_type})")
 
 
-# Start worker pool
-_queue_worker_threads = []
-for _i in range(QUEUE_WORKERS):
-    _t = threading.Thread(
-        target=_signal_queue_worker,
-        args=(_i + 1,),
-        daemon=True,
-        name=f"signal-queue-worker-{_i + 1}",
+def _process_job(worker_id: int, job: dict):
+    """Process a single signal job (shared by Redis and memory workers)."""
+    job_type    = job["job_type"]
+    ticker      = job["ticker"]
+    bias        = job["bias"]
+    webhook_data = job["webhook_data"]
+    signal_msg  = job["signal_msg"]
+    enqueued_at = job["enqueued_at"]
+
+    age_sec = time.time() - enqueued_at
+    if age_sec > SIGNAL_TTL_SEC:
+        log.warning(
+            f"[worker-{worker_id}] Stale {job_type} signal dropped: "
+            f"{ticker} ({age_sec:.0f}s old)"
+        )
+        return
+
+    tier_label = webhook_data.get("tier", "?")
+    log.info(
+        f"[worker-{worker_id}] Processing {job_type}: "
+        f"{ticker} {bias} T{tier_label} (queued {age_sec:.0f}s ago)"
     )
-    _t.start()
-    _queue_worker_threads.append(_t)
-log.info(f"Signal queue pool started: {QUEUE_WORKERS} workers, TTL {SIGNAL_TTL_SEC}s")
+
+    if job_type == "tv":
+        st, body = _tg_rate_limited_post(signal_msg)
+        log.info(f"[worker-{worker_id}] Signal msg TG result: {st} | {body[:80] if body else 'ok'}")
+        check_spread_exit_warning(ticker, bias, webhook_data)
+        if bias in ALLOWED_DIRECTIONS:
+            check_ticker_with_timeout(ticker, direction=bias, webhook_data=webhook_data)
+        else:
+            _tg_rate_limited_post(
+                f"ℹ️ {ticker}: {bias} signal skipped — not in allowed directions"
+            )
+
+    elif job_type == "swing":
+        from swing_engine import recommend_swing_trade, format_swing_card
+        st, body = _tg_rate_limited_post(signal_msg)
+        log.info(f"[worker-{worker_id}] Swing signal msg TG result: {st} | {body[:80] if body else 'ok'}")
+        spot   = get_spot(ticker)
+        chains = get_options_chain_swing(ticker)
+        if not chains:
+            _tg_rate_limited_post(
+                f"❌ {ticker} swing: no options chain data in 7-60 DTE range"
+            )
+        else:
+            candles = get_daily_candles(ticker, days=252)
+            iv_rank = _estimate_iv_rank(chains, candles)
+            rec = recommend_swing_trade(
+                ticker=ticker,
+                spot=spot,
+                chains=chains,
+                webhook_data=webhook_data,
+                iv_rank=iv_rank,
+            )
+            if not rec.get("ok"):
+                reason = rec.get("reason", "no valid setup")
+                conf   = rec.get("confidence")
+                msg    = f"❌ {ticker} swing — {reason}"
+                if conf:
+                    msg += f"\nConfidence: {conf}/100"
+                _tg_rate_limited_post(msg)
+            else:
+                card = format_swing_card(rec)
+                _tg_rate_limited_post(card)
+                log.info(
+                    f"Swing card posted: {ticker} {bias} T{tier_label} "
+                    f"conf={rec.get('confidence')}/100"
+                )
+
+
+def _signal_queue_worker_redis(worker_id: int):
+    """
+    Redis-backed worker. Uses BRPOP so it blocks efficiently.
+    Reconnects automatically if Redis drops.
+    Survives deploys — signals persist in Redis list.
+    """
+    log.info(f"Redis signal worker-{worker_id} started")
+    last_heartbeat = time.time()
+
+    while True:
+        # Heartbeat
+        now = time.time()
+        if now - last_heartbeat > 60:
+            r_hb = _get_redis()
+            depth = r_hb.llen(REDIS_QUEUE_KEY) if r_hb else "?"
+            log.info(f"[worker-{worker_id}] heartbeat — Redis queue depth: {depth}")
+            last_heartbeat = now
+
+        r = _get_redis()
+        if not r:
+            log.warning(f"[worker-{worker_id}] Redis unavailable — sleeping 5s")
+            time.sleep(5)
+            continue
+
+        try:
+            # Blocking pop with 5s timeout so heartbeat fires regularly
+            result = r.brpop(REDIS_QUEUE_KEY, timeout=5)
+            if not result:
+                continue
+
+            _, raw = result
+            job = json.loads(raw)
+
+            try:
+                _process_job(worker_id, job)
+            except Exception as e:
+                log.error(
+                    f"[worker-{worker_id}] Job error for {job.get('ticker')} "
+                    f"({job.get('job_type')}): {e}",
+                    exc_info=True,
+                )
+
+        except Exception as e:
+            log.error(f"[worker-{worker_id}] Redis worker error: {e}", exc_info=True)
+            # Reset client so next iteration reconnects
+            global _redis_client
+            _redis_client = None
+            time.sleep(3)
+
+
+def _signal_queue_worker_memory(worker_id: int):
+    """
+    In-memory fallback worker (used when Redis is unavailable).
+    Same logic as original worker.
+    """
+    log.info(f"Memory signal worker-{worker_id} started")
+    last_heartbeat = time.time()
+
+    while True:
+        now = time.time()
+        if now - last_heartbeat > 60:
+            log.info(f"[worker-{worker_id}] heartbeat — memory queue depth: {_mem_signal_queue.qsize()}")
+            last_heartbeat = now
+
+        try:
+            try:
+                job_tuple = _mem_signal_queue.get(block=True, timeout=5)
+            except queue.Empty:
+                continue
+
+            if job_tuple is None:
+                break
+
+            job_type, ticker, bias, webhook_data, signal_msg, enqueued_at = job_tuple
+            job = {
+                "job_type":    job_type,
+                "ticker":      ticker,
+                "bias":        bias,
+                "webhook_data": webhook_data,
+                "signal_msg":  signal_msg,
+                "enqueued_at": enqueued_at,
+            }
+
+            try:
+                _process_job(worker_id, job)
+            except Exception as e:
+                log.error(f"[worker-{worker_id}] Memory job error for {ticker}: {e}", exc_info=True)
+            finally:
+                _mem_signal_queue.task_done()
+
+        except Exception as e:
+            log.error(f"[worker-{worker_id}] Memory worker error: {e}", exc_info=True)
+            time.sleep(2)
+
+
+def _start_workers():
+    """Start worker pool — Redis workers if Redis is available, memory otherwise."""
+    r = _get_redis()
+    worker_fn = _signal_queue_worker_redis if r else _signal_queue_worker_memory
+    mode = "Redis" if r else "memory"
+    log.info(f"Starting {QUEUE_WORKERS} {mode} signal workers (TTL {SIGNAL_TTL_SEC}s)")
+
+    threads = []
+    for i in range(QUEUE_WORKERS):
+        t = threading.Thread(
+            target=worker_fn,
+            args=(i + 1,),
+            daemon=True,
+            name=f"signal-worker-{i + 1}",
+        )
+        t.start()
+        threads.append(t)
+    return threads
+
+
+_queue_worker_threads = _start_workers()
+
+
+# ─────────────────────────────────────────────────────────
+# check_ticker WITH HARD TIMEOUT (v3.9)
+# ─────────────────────────────────────────────────────────
+
+def check_ticker_with_timeout(
+    ticker: str,
+    direction: str = "bull",
+    webhook_data: dict = None,
+    timeout_sec: int = 45,
+) -> dict:
+    """
+    Run check_ticker with a hard wall-clock timeout.
+    Prevents a hung MarketData request from blocking a worker indefinitely.
+    """
+    result = {}
+    exc_holder = []
+
+    def _run():
+        try:
+            result.update(
+                check_ticker(ticker, direction=direction, webhook_data=webhook_data)
+            )
+        except Exception as e:
+            exc_holder.append(e)
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(timeout=timeout_sec)
+
+    if t.is_alive():
+        log.error(
+            f"check_ticker({ticker}) TIMED OUT after {timeout_sec}s — worker unblocked"
+        )
+        _tg_rate_limited_post(
+            f"⏱️ {ticker}: options lookup timed out ({timeout_sec}s) — skipping trade card"
+        )
+        return {"ticker": ticker, "ok": False, "posted": False, "error": "timeout"}
+
+    if exc_holder:
+        raise exc_holder[0]
+
+    return result
+
 
 # ─────────────────────────────────────────────────────────
 # TELEGRAM
@@ -334,7 +500,6 @@ def post_to_telegram(text: str, max_retries: int = 4, chat_id: str = None):
                 preview = text[:60].replace("\n", " ")
                 log.info(f"Telegram OK (chat={cid}): {preview}...")
                 return 200, ""
-            # Respect Telegram's retry_after on rate limit
             if r.status_code == 429:
                 try:
                     retry_after = r.json().get("parameters", {}).get("retry_after", 15)
@@ -358,16 +523,18 @@ def get_portfolio_chat_id(account: str) -> str:
     return cid if cid else TELEGRAM_CHAT_ID
 
 # ─────────────────────────────────────────────────────────
-# MARKETDATA API
+# MARKETDATA API — timeout reduced to 8s (v3.9)
 # ─────────────────────────────────────────────────────────
 
 def md_get(url, params=None):
     if not MARKETDATA_TOKEN:
         raise RuntimeError("MARKETDATA_TOKEN not set")
-    r = requests.get(url,
-                     headers={"Authorization": f"Bearer {MARKETDATA_TOKEN}"},
-                     params=params or {},
-                     timeout=25)
+    r = requests.get(
+        url,
+        headers={"Authorization": f"Bearer {MARKETDATA_TOKEN}"},
+        params=params or {},
+        timeout=8,   # v3.9: reduced from 25s — fail fast, don't block workers
+    )
     r.raise_for_status()
     return r.json()
 
@@ -404,11 +571,7 @@ def get_daily_candles(ticker: str, days: int = 30) -> list:
         return []
 
 def get_vix() -> float:
-    """Fetch current VIX spot level.
-    MarketData.app does not serve VIX. Use Yahoo Finance instead,
-    with SPY IV as fallback, and 20.0 as last resort.
-    """
-    # Primary: Yahoo Finance (^VIX) — no API key required
+    """Fetch current VIX spot level."""
     try:
         resp = requests.get(
             "https://query1.finance.yahoo.com/v8/finance/chart/%5EVIX",
@@ -428,7 +591,6 @@ def get_vix() -> float:
     except Exception as e:
         log.warning(f"VIX Yahoo fetch failed: {e}")
 
-    # Fallback: SPY options chain implied vol as VIX proxy
     try:
         spy_chains = get_options_chain_swing("SPY")
         ivs = []
@@ -653,10 +815,6 @@ def get_options_chain_swing(ticker: str) -> list:
 # ─────────────────────────────────────────────────────────
 
 def _estimate_iv_rank(chains: list, candle_closes: list) -> float:
-    """
-    Estimate IV rank (0-100) from current IV vs realized vol.
-    Higher rank = IV expensive relative to recent realized vol.
-    """
     try:
         from options_engine_v3 import calc_realized_vol
 
@@ -677,8 +835,6 @@ def _estimate_iv_rank(chains: list, candle_closes: list) -> float:
         if rv <= 0:
             return 50.0
 
-        # Where is current IV relative to realized vol?
-        # IV == RV → rank 50, IV 2x RV → rank 90, IV 0.5x RV → rank 10
         ratio = current_iv / rv
         rank  = min(100, max(0, (ratio - 0.5) / 1.5 * 100))
         return round(rank, 1)
@@ -688,14 +844,10 @@ def _estimate_iv_rank(chains: list, candle_closes: list) -> float:
 
 
 # ─────────────────────────────────────────────────────────
-# EXIT WARNING — warns on opposite open spreads
+# EXIT WARNING
 # ─────────────────────────────────────────────────────────
 
 def check_spread_exit_warning(ticker: str, signal_bias: str, webhook_data: dict):
-    """
-    Called when a TV signal comes in. Warns about open spreads
-    that are OPPOSITE to the signal direction.
-    """
     ticker = ticker.upper()
 
     if signal_bias == "bear":
@@ -968,19 +1120,29 @@ def check_ticker(
 
 @app.route("/health", methods=["GET"])
 def health():
-    return "OK"
+    r = _get_redis()
+    queue_depth = r.llen(REDIS_QUEUE_KEY) if r else _mem_signal_queue.qsize()
+    return jsonify({
+        "status": "ok",
+        "redis": r is not None,
+        "queue_depth": queue_depth,
+        "workers": QUEUE_WORKERS,
+    })
 
 
 @app.route("/debug", methods=["GET"])
 def debug():
     r = _get_redis()
+    queue_depth = r.llen(REDIS_QUEUE_KEY) if r else _mem_signal_queue.qsize()
     return jsonify({
         "TELEGRAM_set":          bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID),
         "MARKETDATA_set":        bool(MARKETDATA_TOKEN),
         "REDIS_connected":       r is not None,
+        "REDIS_queue_depth":     queue_depth,
         "WATCHLIST_len":         len([t for t in WATCHLIST.split(",") if t.strip()]),
-        "ENGINE_VERSION":        "v3.7",
-        "SCAN_WORKERS":          SCAN_WORKERS,
+        "ENGINE_VERSION":        "v3.9",
+        "QUEUE_WORKERS":         QUEUE_WORKERS,
+        "SIGNAL_TTL_S":          SIGNAL_TTL_SEC,
         "DEDUP_TTL_S":           DEDUP_TTL_SECONDS,
         "ALLOWED_DIRECTIONS":    ALLOWED_DIRECTIONS,
         "PORTFOLIO_CHANNEL_set": bool(TELEGRAM_PORTFOLIO_CHAT_ID),
@@ -990,7 +1152,7 @@ def debug():
 
 @app.route("/tgtest", methods=["GET"])
 def tgtest():
-    st, body = post_to_telegram("✅ Telegram test OK (v3.7 scalp + swing)")
+    st, body = post_to_telegram("✅ Telegram test OK (v3.9 Redis queue + swing)")
     return jsonify({"status": st, "body": body})
 
 
@@ -1039,13 +1201,11 @@ def telegram_webhook(secret):
 
 # ─────────────────────────────────────────────────────────
 # TRADINGVIEW WEBHOOK — scalp signals (/tv)
-# Receives signals from BUS v1.0 Pine indicator (15M chart)
 # ─────────────────────────────────────────────────────────
 
 @app.route("/tv", methods=["POST"])
 def tv_webhook():
     data = request.get_json(silent=True) or {}
-    raw  = (request.get_data(as_text=True) or "").strip()
 
     if TV_WEBHOOK_SECRET:
         if data.get("secret") != TV_WEBHOOK_SECRET:
@@ -1108,16 +1268,13 @@ def tv_webhook():
         ])
 
     signal_msg = _build_signal_msg()
-
-    # Enqueue — returns immediately so TradingView doesn't time out
     _enqueue_signal("tv", ticker, bias, webhook_data, signal_msg)
 
     return jsonify({"status": "accepted", "ticker": ticker, "tier": tier}), 200
 
 
 # ─────────────────────────────────────────────────────────
-# SWING WEBHOOK — Fibonacci swing signals (/swing)
-# Receives signals from BFS v1.0 Pine indicator (daily chart)
+# SWING WEBHOOK (/swing)
 # ─────────────────────────────────────────────────────────
 
 @app.route("/swing", methods=["POST"])
@@ -1164,7 +1321,6 @@ def swing_webhook():
         "timeframe":        data.get("timeframe", "D"),
     }
 
-    # Signal summary
     tier_emoji = "🥇" if tier == "1" else "🥈"
     dir_emoji  = "🐻" if bias == "bear" else "🐂"
     fib_level  = webhook_data["fib_level"]
@@ -1186,7 +1342,6 @@ def swing_webhook():
     ]
     signal_msg = "\n".join(signal_lines)
 
-    # Enqueue — returns immediately so TradingView doesn't time out
     _enqueue_signal("swing", ticker, bias, webhook_data, signal_msg)
 
     return jsonify({"status": "accepted", "ticker": ticker, "tier": tier}), 200
@@ -1194,7 +1349,6 @@ def swing_webhook():
 
 # ─────────────────────────────────────────────────────────
 # WATCHLIST SCAN — DISABLED
-# Scheduled scan removed. TradingView webhooks are the only signal source.
 # ─────────────────────────────────────────────────────────
 
 def scan_watchlist_internal(tickers: list, max_posts: int = 6):
