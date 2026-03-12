@@ -3,5 +3,4 @@ requests
 redis
 gunicorn>=21.2.0
 APScheduler
-pytz
 pytz>=2024.1
