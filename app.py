@@ -1499,6 +1499,31 @@ def swing_webhook():
 
 
 # ─────────────────────────────────────────────────────────
+# 0DTE EM — MANUAL TRIGGER ROUTE
+# ─────────────────────────────────────────────────────────
+
+@app.route("/em", methods=["POST", "GET"])
+def em_trigger():
+    """Manual trigger for 0DTE EM cards. Useful for testing."""
+    data     = request.get_json(force=True, silent=True) or {}
+    supplied = (data.get("secret") or request.args.get("secret") or "").strip()
+
+    if SCAN_SECRET and supplied != SCAN_SECRET:
+        return jsonify({"error": "Unauthorized"}), 403
+
+    tickers = [t.strip().upper() for t in
+               (data.get("tickers") or ",".join(EM_TICKERS)).split(",") if t.strip()]
+    session = data.get("session", "manual")
+
+    def run():
+        for ticker in tickers:
+            _post_em_card(ticker, session)
+
+    threading.Thread(target=run, daemon=True).start()
+    return jsonify({"status": "accepted", "tickers": tickers, "session": session})
+
+
+# ─────────────────────────────────────────────────────────
 # WATCHLIST SCAN — DISABLED
 # ─────────────────────────────────────────────────────────
 
@@ -1545,6 +1570,265 @@ def holdings_scan():
 
     threading.Thread(target=run_scan, daemon=True).start()
     return jsonify({"status": "accepted"})
+
+
+# ─────────────────────────────────────────────────────────
+# 0DTE EXPECTED MOVE SCHEDULER — SPY & QQQ
+# ─────────────────────────────────────────────────────────
+# Fires at 8:45 AM and 2:45 PM Central Time on weekdays.
+# Fetches ATM IV from the 0DTE options chain, calculates
+# the expected move for the remainder of the day, and posts
+# a clean card to Telegram.
+
+EM_SCHEDULE_TIMES_CT = [
+    (8,  45),   # 8:45 AM Central — pre-open EM
+    (14, 45),   # 2:45 PM Central — afternoon EM check
+]
+EM_TICKERS = ["SPY", "QQQ"]
+
+
+def _get_next_trading_day(from_date) -> str:
+    """Return the next weekday date string after from_date (a date object)."""
+    from datetime import timedelta as _td
+    d = from_date + _td(days=1)
+    while d.weekday() >= 5:   # skip Saturday (5) and Sunday (6)
+        d += _td(days=1)
+    return d.strftime("%Y-%m-%d")
+
+
+def _get_0dte_iv(ticker: str, target_date_str: str = None) -> tuple:
+    """
+    Fetch ATM IV from a specific expiration date's options chain.
+    target_date_str: "YYYY-MM-DD" — defaults to today.
+    Returns (iv, spot, expiration) or (None, None, None) on failure.
+
+    For the afternoon card we pass tomorrow's date so we get next-day IV.
+    If no chain exists for that exact date (e.g. holiday), falls back to
+    the nearest available expiration on or after target_date_str.
+    """
+    try:
+        spot = get_spot(ticker)
+        today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        target = target_date_str or today_utc
+
+        # Try exact target date first
+        data = md_get(
+            f"https://api.marketdata.app/v1/options/chain/{ticker}/",
+            {"expiration": target},
+        )
+
+        if not isinstance(data, dict) or data.get("s") != "ok" or not data.get("optionSymbol"):
+            # Fall back to nearest expiration on or after target
+            exps = get_expirations(ticker)
+            future_exps = [e for e in exps if e >= target]
+            if not future_exps:
+                return None, None, None
+            target = future_exps[0]
+            data = md_get(
+                f"https://api.marketdata.app/v1/options/chain/{ticker}/",
+                {"expiration": target},
+            )
+            if not isinstance(data, dict) or data.get("s") != "ok":
+                return None, None, None
+
+        sym_list = data.get("optionSymbol") or []
+        if not sym_list:
+            return None, None, None
+
+        n = len(sym_list)
+        def col(name, default=None):
+            v = data.get(name, default)
+            return v if isinstance(v, list) else [default] * n
+
+        strikes = col("strike", None)
+        iv_list = col("iv",     None)
+
+        # ATM = within 0.5% of spot; widen to 1% if nothing found
+        atm_ivs = []
+        for pct in (0.005, 0.01):
+            atm_range = spot * pct
+            for i in range(n):
+                strike = as_float(strikes[i], 0)
+                iv     = as_float(iv_list[i], 0)
+                if iv > 0 and abs(strike - spot) <= atm_range:
+                    atm_ivs.append(iv)
+            if atm_ivs:
+                break
+
+        if not atm_ivs:
+            return None, spot, target
+
+        avg_iv = sum(atm_ivs) / len(atm_ivs)
+        return round(avg_iv, 4), spot, target
+
+    except Exception as e:
+        log.warning(f"0DTE IV fetch failed for {ticker} (target={target_date_str}): {e}")
+        return None, None, None
+
+
+def _calc_intraday_em(spot: float, iv: float, hours_remaining: float) -> dict:
+    """
+    Calculate intraday expected move based on hours remaining in session.
+    Uses EM = spot × IV × sqrt(hours / 8736)   [8736 = 252 × trading day hrs approx]
+    Trading day ≈ 6.5 hours. Annualized = 252 trading days × 6.5h = 1638h.
+    """
+    if iv <= 0 or hours_remaining <= 0:
+        return {}
+
+    hours_in_year = 252 * 6.5  # ~1638
+    em_1sd = round(spot * iv * math.sqrt(hours_remaining / hours_in_year), 2)
+    em_2sd = round(em_1sd * 2, 2)
+
+    return {
+        "em_1sd":      em_1sd,
+        "em_2sd":      em_2sd,
+        "bull_1sd":    round(spot + em_1sd, 2),
+        "bear_1sd":    round(spot - em_1sd, 2),
+        "bull_2sd":    round(spot + em_2sd, 2),
+        "bear_2sd":    round(spot - em_2sd, 2),
+        "em_pct_1sd":  round((em_1sd / spot) * 100, 2),
+        "hours_used":  round(hours_remaining, 2),
+    }
+
+
+def _post_em_card(ticker: str, session: str):
+    """
+    Fetch IV and calculate Expected Move for Telegram card.
+
+    Morning  (8:45 AM CT): TODAY's 0DTE expiration, hours remaining in today's session.
+    Afternoon (2:45 PM CT): NEXT trading day's expiration, full 6.5h session.
+                            At 2:45 PM only ~15 min remain today — useless for trading.
+                            Next-day EM gives you a level to plan overnight/open positioning.
+    """
+    try:
+        import pytz
+        ct       = pytz.timezone("America/Chicago")
+        now_ct   = datetime.now(ct)
+        today_dt = now_ct.date()
+
+        is_afternoon = (session == "afternoon")
+
+        if is_afternoon:
+            # Use NEXT trading day's expiration and a full 6.5h session
+            target_date_str = _get_next_trading_day(today_dt)
+            hours_for_em    = 6.5
+            session_emoji   = "🌆"
+            session_label   = "Next Day Preview"
+            horizon_note    = f"Full session EM for {target_date_str}"
+        else:
+            # Use TODAY's expiration, hours remaining until 3:00 PM CT close
+            target_date_str = today_dt.strftime("%Y-%m-%d")
+            market_close_ct = now_ct.replace(hour=15, minute=0, second=0, microsecond=0)
+            hours_for_em    = max((market_close_ct - now_ct).total_seconds() / 3600, 0.25)
+            session_emoji   = "🌅"
+            session_label   = "Today (Pre-Open)"
+            horizon_note    = f"{hours_for_em:.1f}h remaining today"
+
+        iv, spot, expiration = _get_0dte_iv(ticker, target_date_str)
+
+        if iv is None or spot is None:
+            log.warning(f"EM card skipped for {ticker}: could not fetch IV (target={target_date_str})")
+            post_to_telegram(f"⚠️ {ticker} EM: could not fetch IV for {target_date_str}")
+            return
+
+        em = _calc_intraday_em(spot, iv, hours_for_em)
+        if not em:
+            return
+
+        iv_pct = iv * 100
+        if iv_pct < 10:
+            iv_emoji = "🟢"
+            iv_note  = "Low IV — tight range expected"
+        elif iv_pct < 20:
+            iv_emoji = "🟡"
+            iv_note  = "Moderate IV"
+        else:
+            iv_emoji = "🔴"
+            iv_note  = "Elevated IV — wider swings expected"
+
+        lines = [
+            f"{session_emoji} {ticker} — Expected Move ({session_label})",
+            f"Spot: ${spot:.2f} | IV: {iv_emoji} {iv_pct:.1f}% annualized",
+            f"Expiration: {expiration} | {horizon_note}",
+            "",
+            f"📐 Expected Move (1σ — 68%): ±${em['em_1sd']:.2f} ({em['em_pct_1sd']:.2f}%)",
+            f"  🐂 Upside:   ${em['bull_1sd']:.2f}",
+            f"  🐻 Downside: ${em['bear_1sd']:.2f}",
+            "",
+            f"📐 Expected Move (2σ — 95%): ±${em['em_2sd']:.2f}",
+            f"  🐂 Upside:   ${em['bull_2sd']:.2f}",
+            f"  🐻 Downside: ${em['bear_2sd']:.2f}",
+            "",
+            f"💡 {iv_note}",
+            "— Not financial advice —",
+        ]
+
+        post_to_telegram("\n".join(lines))
+        log.info(
+            f"EM card posted: {ticker} {session_label} spot={spot} "
+            f"IV={iv_pct:.1f}% EM=±${em['em_1sd']} exp={expiration}"
+        )
+
+    except Exception as e:
+        log.error(f"EM card error for {ticker} ({session}): {e}", exc_info=True)
+
+
+def _em_scheduler():
+    """
+    Background thread. Wakes every minute, checks if it is time to fire
+    an EM card for SPY and QQQ. Fires at 8:45 AM and 2:45 PM Central.
+    Skips weekends.
+    """
+    try:
+        import pytz
+    except ImportError:
+        log.error("pytz not installed — EM scheduler disabled. Add pytz to requirements.txt")
+        return
+
+    log.info(f"0DTE EM scheduler started — fires at {EM_SCHEDULE_TIMES_CT} CT on weekdays")
+    fired_today: set = set()   # tracks (date_str, hour, minute) already fired
+
+    while True:
+        try:
+            ct = pytz.timezone("America/Chicago")
+            now_ct = datetime.now(ct)
+
+            # Skip weekends
+            if now_ct.weekday() >= 5:
+                time.sleep(60)
+                continue
+
+            date_str = now_ct.strftime("%Y-%m-%d")
+
+            for hour, minute in EM_SCHEDULE_TIMES_CT:
+                fire_key = (date_str, hour, minute)
+                if fire_key in fired_today:
+                    continue
+
+                # Fire within a 2-minute window to handle scheduler drift
+                if now_ct.hour == hour and abs(now_ct.minute - minute) <= 1:
+                    session = "morning" if hour < 12 else "afternoon"
+                    fired_today.add(fire_key)
+                    log.info(f"EM scheduler firing: {session} {date_str} {hour:02d}:{minute:02d} CT")
+                    for ticker in EM_TICKERS:
+                        threading.Thread(
+                            target=_post_em_card,
+                            args=(ticker, session),
+                            daemon=True,
+                            name=f"em-card-{ticker}-{session}",
+                        ).start()
+
+            # Prune fired_today to only keep today's entries
+            fired_today = {k for k in fired_today if k[0] == date_str}
+
+        except Exception as e:
+            log.error(f"EM scheduler error: {e}", exc_info=True)
+
+        time.sleep(60)   # check once per minute
+
+
+# Start EM scheduler
+threading.Thread(target=_em_scheduler, daemon=True, name="em-scheduler").start()
 
 
 # ─────────────────────────────────────────────────────────
