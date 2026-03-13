@@ -1343,7 +1343,8 @@ def telegram_webhook(secret):
             md_get_fn    = md_get,
             post_fn      = post_to_telegram,
             get_portfolio_chat_id_fn = get_portfolio_chat_id,
-            get_regime_fn = get_current_regime,
+            get_regime_fn    = get_current_regime,
+            post_em_card_fn  = _post_em_card,
         )
 
     threading.Thread(target=run_command, daemon=True).start()
