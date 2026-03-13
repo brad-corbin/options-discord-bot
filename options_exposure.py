@@ -94,49 +94,47 @@ class InputValidator:
 # Item 12: Explicit data-quality scoring and downgrade paths.
 
 class DataQualityEngine:
-    """Scores data completeness and triggers explicit downgrades."""
+    """Scores data completeness based on what MarketData.app actually provides.
+    Trade-print data is not available — removed from scoring entirely.
+    OI change is computed from cache — scored when available.
+    Liquidity is estimated from stock quote + candles — scored on 2 inputs not 4."""
     @staticmethod
     def score(rows, ctx) -> Dict:
-        """Returns quality scores by category (0-1) and overall."""
         n = max(len(rows), 1)
-        # Trade sign quality: how many rows have actual trade data?
-        has_trades = sum(1 for r in rows if r.trades and len(r.trades) > 0)
-        trade_q = has_trades / n
-        # OI change available?
+        # OI change: computed from cache. Score = fraction of rows that have it.
         has_oi_change = sum(1 for r in rows if r.oi_change is not None)
         oi_q = has_oi_change / n
-        # IV quality: do we have a vol surface or just row IV?
-        iv_q = 0.5  # base: row IV only
-        # (caller can override if vol_surface is loaded)
-        # RV available?
-        rv_q = 1.0 if ctx.realized_vol_20d is not None else (0.7 if (ctx.recent_bars and len(ctx.recent_bars) >= 10) else 0.0)
-        # Liquidity inputs
-        liq_inputs = sum(1 for x in [ctx.avg_daily_dollar_volume, ctx.intraday_dollar_volume,
-                                      ctx.orderbook_depth_dollars, ctx.bid_ask_spread_pct] if x is not None)
-        liq_q = liq_inputs / 4.0
-        # Bid/ask on rows
+        # IV quality: MarketData gives per-contract IV from OPRA feed
+        iv_q = 0.8  # MarketData IV is vendor-computed, better than flat assumption
+        # RV available from OHLC bars?
+        rv_q = 1.0 if ctx.realized_vol_20d is not None else (0.8 if (ctx.recent_bars and len(ctx.recent_bars) >= 10) else 0.0)
+        # Liquidity: ADV + spread are estimable from stock data
+        liq_inputs = sum(1 for x in [ctx.avg_daily_dollar_volume, ctx.bid_ask_spread_pct] if x is not None)
+        liq_q = liq_inputs / 2.0  # only 2 inputs are realistically available
+        # Bid/ask on option rows
         has_ba = sum(1 for r in rows if r.bid is not None and r.ask is not None)
         ba_q = has_ba / n
-        overall = (trade_q * 0.25 + oi_q * 0.15 + iv_q * 0.15 + rv_q * 0.15 + liq_q * 0.15 + ba_q * 0.15)
+        # Chain depth: how many rows do we have? More = better wall/GEX estimates
+        depth_q = min(n / 50.0, 1.0)  # 50+ rows = full score
+        # Weighted: IV(25%) + RV(20%) + bid/ask(20%) + OI change(15%) + liquidity(10%) + depth(10%)
+        overall = (iv_q * 0.25 + rv_q * 0.20 + ba_q * 0.20 + oi_q * 0.15 + liq_q * 0.10 + depth_q * 0.10)
         return {
-            "trade_sign_quality": round(trade_q, 3),
-            "oi_change_quality": round(oi_q, 3),
             "iv_source_quality": round(iv_q, 3),
             "rv_quality": round(rv_q, 3),
-            "liquidity_input_quality": round(liq_q, 3),
             "bid_ask_quality": round(ba_q, 3),
+            "oi_change_quality": round(oi_q, 3),
+            "liquidity_input_quality": round(liq_q, 3),
+            "chain_depth_quality": round(depth_q, 3),
             "overall": round(overall, 3),
         }
 
     @staticmethod
     def downgrade_flags(quality: Dict) -> List[str]:
-        """Returns human-readable downgrade flags."""
         flags = []
-        if quality["trade_sign_quality"] < 0.1: flags.append("NO_TRADE_DATA: dealer sign is assumption-only")
-        if quality["oi_change_quality"] < 0.1: flags.append("NO_OI_CHANGE: opening/closing inference unavailable")
         if quality["rv_quality"] < 0.1: flags.append("NO_RV_DATA: VRP regime unknown")
-        if quality["liquidity_input_quality"] < 0.25: flags.append("LOW_LIQUIDITY_DATA: impact model is heuristic-only")
-        if quality["bid_ask_quality"] < 0.1: flags.append("NO_BID_ASK: trade-sign classification degraded")
+        if quality["bid_ask_quality"] < 0.1: flags.append("NO_BID_ASK: IV and spread data missing")
+        if quality["oi_change_quality"] < 0.1: flags.append("NO_OI_CHANGE: first scan — caching OI for next run")
+        if quality["chain_depth_quality"] < 0.3: flags.append("THIN_CHAIN: fewer than 15 contracts")
         if quality["overall"] < 0.3: flags.append("LOW_DATA_QUALITY: results are low-confidence")
         return flags
 
@@ -147,12 +145,16 @@ class DataQualityEngine:
 class ConfidenceEngine:
     @staticmethod
     def compute(quality: Dict, avg_dealer_conf: float, spread_leg_pct: float) -> Dict:
-        """Composite confidence for the final output."""
+        """Composite confidence. Weighted for MarketData.app data reality:
+        - data_quality (60%): IV, RV, bid/ask, OI change, chain depth
+        - spread_ambiguity (25%): high spread detection = less certain dealer sign
+        - dealer_sign (15%): from OI-based heuristic (best we can do without trade prints)
+        """
         data_conf = quality["overall"]
         sign_conf = avg_dealer_conf
-        spread_penalty = max(0, 1.0 - spread_leg_pct * 0.5)  # 50% spread legs = 25% penalty
-        composite = data_conf * 0.40 + sign_conf * 0.35 + spread_penalty * 0.25
-        if composite >= 0.7: label = "HIGH"
+        spread_penalty = max(0, 1.0 - spread_leg_pct * 0.4)  # softer penalty for indices
+        composite = data_conf * 0.60 + spread_penalty * 0.25 + sign_conf * 0.15
+        if composite >= 0.65: label = "HIGH"
         elif composite >= 0.45: label = "MODERATE"
         else: label = "LOW"
         return {
@@ -160,8 +162,8 @@ class ConfidenceEngine:
             "label": label,
             "components": {
                 "data_quality": round(data_conf, 3),
-                "trade_sign": round(sign_conf, 3),
-                "spread_penalty": round(spread_penalty, 3),
+                "spread_ambiguity": round(spread_penalty, 3),
+                "dealer_sign": round(sign_conf, 3),
             },
         }
 
@@ -619,9 +621,13 @@ class TradeSignEngine:
         if ratio<-0.3: return 'closing',min(0.5+abs(ratio)*0.4,0.90)
         return 'mixed',0.4
     @staticmethod
-    def infer_spread_legs(rows,volume_tol=0.20,max_strike_gap_pct=0.10):
+    def infer_spread_legs(rows,volume_tol=0.20,max_strike_gap_pct=0.10,liquid_index=False):
         """Multi-signal spread detection with ratio spreads, combos, and rolls.
-        Returns groups of (indices, spread_type) tuples."""
+        For liquid indices (SPY/QQQ/SPX), uses tighter volume_tol to avoid
+        false-matching the naturally high activity at every strike."""
+        if liquid_index:
+            volume_tol = 0.08  # much tighter — only clear matched trades
+            max_strike_gap_pct = 0.03  # narrower gap for index spreads
         groups=[];used=set()
         for i,r1 in enumerate(rows):
             if i in used: continue
@@ -663,11 +669,11 @@ class TradeSignEngine:
                 groups.append({"indices":g,"type":stype})
         return groups
     @staticmethod
-    def enrich_rows(rows):
+    def enrich_rows(rows, liquid_index=False):
         """Classify each row, detect spreads, and penalize confidence on spread legs."""
         for r in rows:
             s,c=TradeSignEngine.classify_row(r);r.inferred_side=s;r.dealer_sign_confidence=c
-        spread_groups=TradeSignEngine.infer_spread_legs(rows)
+        spread_groups=TradeSignEngine.infer_spread_legs(rows, liquid_index=liquid_index)
         for group in spread_groups:
             for idx in group["indices"]:
                 rows[idx].dealer_sign_confidence*=0.6
@@ -1044,7 +1050,7 @@ class InstitutionalExpectationEngine:
                 "prob_finish_below":round(pb,4),"prob_touch":touch_result["prob_touch"],
                 "touch_method":touch_result["method"]})
         return ld
-    def snapshot(self,rows,ctx):
+    def snapshot(self,rows,ctx,liquid_index=False):
         if not rows: return{}
         audit=AuditLog()
         # Item 4: Validate inputs
@@ -1053,8 +1059,8 @@ class InstitutionalExpectationEngine:
         if ctx_issues: audit.log("ctx_warning",issues=ctx_issues)
         # Item 2: Pure copies — never mutate originals
         enriched_rows=[OptionRow(option_type=r.option_type,strike=r.strike,days_to_exp=r.days_to_exp,iv=r.iv,open_interest=r.open_interest,underlying_price=r.underlying_price,contract_size=r.contract_size,volume=r.volume,dividend_yield=r.dividend_yield,exercise_style=r.exercise_style,bid=r.bid,ask=r.ask,last=r.last,oi_change=r.oi_change,trades=r.trades,inferred_side=r.inferred_side,dealer_sign_confidence=r.dealer_sign_confidence,delta=r.delta,gamma=r.gamma,vanna=r.vanna,charm=r.charm,volga=r.volga,speed=r.speed,theta=r.theta,rho=r.rho)for r in clean]
-        # Item 1: Enrich trade signs + spread detection
-        enriched_rows,spread_groups=TradeSignEngine.enrich_rows(enriched_rows)
+        # Item 1: Enrich trade signs + spread detection (loosened for liquid indices)
+        enriched_rows,spread_groups=TradeSignEngine.enrich_rows(enriched_rows, liquid_index=liquid_index)
         spread_leg_indices=set()
         for g in spread_groups:
             for idx in g["indices"]: spread_leg_indices.add(idx)
@@ -1103,9 +1109,6 @@ class InstitutionalExpectationEngine:
         audit.log("trade_sign_summary",buy=nb,sell=ns,avg_conf=round(ac,3),spread_leg_pct=round(spread_leg_pct,3))
         # Item 5: Composite confidence
         quality=DataQualityEngine.score(nr,ctx)
-        # Upgrade IV quality if surface loaded
-        if self.ee.vol_surface: quality["iv_source_quality"]=0.9
-        elif self.ee.sabr_params: quality["iv_source_quality"]=0.8
         confidence=ConfidenceEngine.compute(quality,ac,spread_leg_pct)
         # Item 12: Downgrade flags
         downgrades=DataQualityEngine.downgrade_flags(quality)
