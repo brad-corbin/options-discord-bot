@@ -1907,7 +1907,8 @@ def _get_0dte_iv(ticker: str, target_date_str: str = None) -> tuple:
         )
         if call_candidates:
             cw = call_candidates[0]
-            call_top3 = list(dict.fromkeys(call_candidates))[:3]
+            # Top-3 by OI rank, then sorted ascending by strike for readable display
+            call_top3 = sorted(list(dict.fromkeys(call_candidates))[:3])
             walls["call_wall"]    = cw
             walls["call_wall_oi"] = by_strike[cw]["call_oi"]
             if len(call_top3) > 1:
@@ -1919,7 +1920,8 @@ def _get_0dte_iv(ticker: str, target_date_str: str = None) -> tuple:
         )
         if put_candidates:
             pw = put_candidates[0]
-            put_top3 = list(dict.fromkeys(put_candidates))[:3]
+            # Top-3 by OI rank, then sorted descending by strike for readable display
+            put_top3 = sorted(list(dict.fromkeys(put_candidates))[:3], reverse=True)
             walls["put_wall"]    = pw
             walls["put_wall_oi"] = by_strike[pw]["put_oi"]
             if len(put_top3) > 1:
@@ -2461,6 +2463,99 @@ def _calc_bias(spot: float, em: dict, walls: dict, skew: dict,
     }
 
 
+# ─────────────────────────────────────────────────────────────────────
+# SHARED DISPLAY HELPERS — used by both _post_em_card and _post_monitor_card
+# ─────────────────────────────────────────────────────────────────────
+
+def _format_em_block(em: dict, spot: float, bias_score: int, label: str = "") -> list:
+    """
+    Format the Expected Move section with the favored direction bolded
+    using Telegram MarkdownV2 *bold* markers.
+
+    Favored direction is determined by bias_score:
+      score ≥ +2  → bold the bull target
+      score ≤ -2  → bold the bear target
+      -1 to +1    → neither bolded (no clear edge)
+
+    The label parameter is appended to the header, e.g. "(20 calendar days)".
+
+    Telegram bold uses *text* in MarkdownV2 — but since the bot uses
+    plain-text posting (no parse_mode), we use Unicode bold lookalikes
+    via a simple ASCII-art emphasis: >>> and <<< brackets to highlight
+    the favored side. Clean, visible, no markdown dependency.
+
+    Format example (bull favored):
+      1σ (68%):  ► $13.35 ◄  ←  $11.37  →  $9.39
+                 ±$1.98  (17.41%)  — 📈 FAVORED: UPSIDE
+    """
+    header = f"📐 EXPECTED MOVE{(' ' + label) if label else ''}"
+
+    bull_1 = em["bull_1sd"]
+    bear_1 = em["bear_1sd"]
+    bull_2 = em["bull_2sd"]
+    bear_2 = em["bear_2sd"]
+    em_1   = em["em_1sd"]
+    em_2   = em["em_2sd"]
+    em_pct = em["em_pct_1sd"]
+
+    is_bull  = bias_score >=  2
+    is_bear  = bias_score <= -2
+    is_neut  = not is_bull and not is_bear
+
+    if is_bull:
+        line_1sd = f"  1σ (68%):  ► ${bull_1:.2f} ◄  ←  ${spot:.2f}  →  ${bear_1:.2f}"
+        favor    = "  📈 Favored: UPSIDE  (bias score {score:+d})".format(score=bias_score)
+    elif is_bear:
+        line_1sd = f"  1σ (68%):  ${bull_1:.2f}  ←  ${spot:.2f}  →  ► ${bear_1:.2f} ◄"
+        favor    = "  📉 Favored: DOWNSIDE  (bias score {score:+d})".format(score=bias_score)
+    else:
+        line_1sd = f"  1σ (68%):  ${bull_1:.2f}  ←  ${spot:.2f}  →  ${bear_1:.2f}"
+        favor    = "  ↔️  No clear edge  (score {score:+d}/14 — too close to call)".format(score=bias_score)
+
+    return [
+        "",
+        "─" * 32,
+        header,
+        line_1sd,
+        f"             ±${em_1:.2f}  ({em_pct:.2f}%)",
+        f"  2σ (95%):  ${bull_2:.2f}  ←→  ${bear_2:.2f}",
+        f"             ±${em_2:.2f}",
+        favor,
+    ]
+
+
+def _format_skew_line(skew: dict) -> str:
+    """
+    Plain-English IV skew line for the SENTIMENT section.
+    Replaces the cryptic '-2.9pp greed' notation.
+
+    Examples:
+      Calls 75.8% / Puts 72.9% — calls pricier, market chasing upside (greed)
+      Calls 22.1% / Puts 28.4% — puts pricier, market hedging downside (fear)
+      Calls 24.0% / Puts 24.1% — balanced, no directional conviction from skew
+    """
+    if not skew or "call_iv" not in skew or "put_iv" not in skew:
+        return ""
+    c    = skew["call_iv"]
+    p    = skew["put_iv"]
+    diff = abs(p - c)
+
+    if diff < 1.0:
+        reading = "balanced — no directional conviction from skew"
+    elif p > c:
+        if diff >= 5:
+            reading = f"puts pricier by {diff:.1f}% — market aggressively hedging downside (fear)"
+        else:
+            reading = f"puts pricier by {diff:.1f}% — mild downside hedging (slight fear)"
+    else:
+        if diff >= 5:
+            reading = f"calls pricier by {diff:.1f}% — market aggressively chasing upside (greed)"
+        else:
+            reading = f"calls pricier by {diff:.1f}% — mild upside chasing (slight greed)"
+
+    return f"  IV Skew: Calls {c}% / Puts {p}% — {reading}"
+
+
 def _calc_intraday_em(spot: float, iv: float, hours_remaining: float) -> dict:
     """
     EM = Spot × IV × sqrt(hours / trading_hours_per_year)
@@ -2562,15 +2657,7 @@ def _post_em_card(ticker: str, session: str):
         # ════════════════════════════════════════
         # EXPECTED MOVE RANGES
         # ════════════════════════════════════════
-        lines += [
-            "",
-            "─" * 32,
-            "📐 EXPECTED MOVE",
-            f"  1σ (68%):  🐂 ${em['bull_1sd']:.2f}  ←  ${spot:.2f}  →  🐻 ${em['bear_1sd']:.2f}",
-            f"             ±${em['em_1sd']:.2f}  ({em['em_pct_1sd']:.2f}%)",
-            f"  2σ (95%):  🐂 ${em['bull_2sd']:.2f}  ←→  🐻 ${em['bear_2sd']:.2f}",
-            f"             ±${em['em_2sd']:.2f}",
-        ]
+        lines += _format_em_block(em, spot, bias["score"])
 
         # ════════════════════════════════════════
         # DEALER MECHANICS BLOCK
@@ -2666,10 +2753,7 @@ def _post_em_card(ticker: str, session: str):
         # ════════════════════════════════════════
         # SENTIMENT — skew + both PCR values
         # ════════════════════════════════════════
-        skew_str = ""
-        if skew and "call_iv" in skew and "put_iv" in skew:
-            diff = skew["put_iv"] - skew["call_iv"]
-            skew_str = f"  IV Skew: Calls {skew['call_iv']}%  /  Puts {skew['put_iv']}%  ({diff:+.1f}pp {'fear' if diff > 0 else 'greed'})"
+        skew_str = _format_skew_line(skew)
 
         pcr_oi_str  = f"OI {pcr['pcr_oi']:.2f}"   if pcr and pcr.get("pcr_oi")  is not None else "OI n/a"
         pcr_vol_str = f"Vol {pcr['pcr_vol']:.2f}"  if pcr and pcr.get("pcr_vol") is not None else "Vol n/a"
@@ -2893,12 +2977,8 @@ def _get_chain_iv_for_expiry(ticker: str, target_date_str: str, dte: float) -> t
         )
         if call_candidates:
             cw = call_candidates[0]
-            # Top-3 call strikes above spot, deduplicated
-            call_top3_raw = sorted(
-                [k for k in by_strike if k > spot and by_strike[k]["call_oi"] > 0],
-                key=lambda k: by_strike[k]["call_oi"], reverse=True
-            )
-            call_top3 = list(dict.fromkeys(call_top3_raw))[:3]   # preserves order, removes dupes
+            # Top-3 by OI rank, re-sorted ascending by strike for price-ladder display
+            call_top3 = sorted(list(dict.fromkeys(call_candidates))[:3])
             walls["call_wall"]    = cw
             walls["call_wall_oi"] = by_strike[cw]["call_oi"]
             if len(call_top3) > 1:
@@ -2911,11 +2991,8 @@ def _get_chain_iv_for_expiry(ticker: str, target_date_str: str, dte: float) -> t
         )
         if put_candidates:
             pw = put_candidates[0]
-            put_top3_raw = sorted(
-                [k for k in by_strike if k < spot and by_strike[k]["put_oi"] > 0],
-                key=lambda k: by_strike[k]["put_oi"], reverse=True
-            )
-            put_top3 = list(dict.fromkeys(put_top3_raw))[:3]
+            # Top-3 by OI rank, re-sorted descending by strike for price-ladder display
+            put_top3 = sorted(list(dict.fromkeys(put_candidates))[:3], reverse=True)
             walls["put_wall"]    = pw
             walls["put_wall_oi"] = by_strike[pw]["put_oi"]
             if len(put_top3) > 1:
@@ -3391,15 +3468,7 @@ def _post_monitor_card(ticker: str, mode: str):
             lines.append(f"VIX: {v}{v9d_s}")
 
         # ════════════ EXPECTED RANGE over DTE ════════════
-        lines += [
-            "",
-            "─" * 32,
-            f"📐 EXPECTED MOVE  ({dte} calendar days)",
-            f"  1σ (68%):  🐂 ${em['bull_1sd']:.2f}  ←  ${spot:.2f}  →  🐻 ${em['bear_1sd']:.2f}",
-            f"             ±${em['em_1sd']:.2f}  ({em['em_pct_1sd']:.2f}%)",
-            f"  2σ (95%):  🐂 ${em['bull_2sd']:.2f}  ←→  🐻 ${em['bear_2sd']:.2f}",
-            f"             ±${em['em_2sd']:.2f}",
-        ]
+        lines += _format_em_block(em, spot, bias["score"], f"({dte} calendar days)")
 
         # ════════════ DEALER FLOW (liquid only) ════════════
         if liquid and eng:
@@ -3477,10 +3546,7 @@ def _post_monitor_card(ticker: str, mode: str):
                       "  ⚠️ Insufficient OI data to compute reliable walls on this chain."]
 
         # ════════════ SENTIMENT ════════════
-        skew_str = ""
-        if skew and "call_iv" in skew and "put_iv" in skew:
-            diff     = skew["put_iv"] - skew["call_iv"]
-            skew_str = f"  IV Skew: Calls {skew['call_iv']}% / Puts {skew['put_iv']}%  ({diff:+.1f}pp {'fear' if diff > 0 else 'greed'})"
+        skew_str = _format_skew_line(skew)
 
         pcr_oi_s  = f"OI {pcr['pcr_oi']:.2f}"   if pcr and pcr.get("pcr_oi")  is not None else "OI n/a"
         pcr_vol_s = f"Vol {pcr['pcr_vol']:.2f}"  if pcr and pcr.get("pcr_vol") is not None else "Vol n/a"
