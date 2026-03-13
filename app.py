@@ -1592,54 +1592,64 @@ def _get_next_trading_day(from_date) -> str:
     """Return the next weekday date string after from_date (a date object)."""
     from datetime import timedelta as _td
     d = from_date + _td(days=1)
-    while d.weekday() >= 5:   # skip Saturday (5) and Sunday (6)
+    while d.weekday() >= 5:
         d += _td(days=1)
     return d.strftime("%Y-%m-%d")
 
 
-def _get_0dte_iv(ticker: str, target_date_str: str = None) -> tuple:
+def _get_0dte_chain(ticker: str, target_date_str: str = None) -> tuple:
     """
-    Fetch ATM IV and OI wall data from a specific expiration date's options chain.
-    target_date_str: "YYYY-MM-DD" — defaults to today.
-    Returns (iv, spot, expiration, walls) or (None, None, None, None) on failure.
-
-    walls = {
-        "call_wall":    strike (float),
-        "call_wall_oi": open interest (int),
-        "put_wall":     strike (float),
-        "put_wall_oi":  open interest (int),
-    }
+    Fetch the full options chain for a target expiration.
+    Returns (data_dict, spot, resolved_expiration) or (None, None, None).
+    Shared by IV, walls, GEX, skew calculations — one API call for all.
     """
     try:
         spot      = get_spot(ticker)
         today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         target    = target_date_str or today_utc
 
-        # Try exact target date first
         data = md_get(
             f"https://api.marketdata.app/v1/options/chain/{ticker}/",
             {"expiration": target},
         )
-
         if not isinstance(data, dict) or data.get("s") != "ok" or not data.get("optionSymbol"):
-            # Fall back to nearest expiration on or after target
             exps        = get_expirations(ticker)
             future_exps = [e for e in exps if e >= target]
             if not future_exps:
-                return None, None, None, None, {}
+                return None, None, None
             target = future_exps[0]
             data   = md_get(
                 f"https://api.marketdata.app/v1/options/chain/{ticker}/",
                 {"expiration": target},
             )
             if not isinstance(data, dict) or data.get("s") != "ok":
-                return None, None, None, None, {}
+                return None, None, None
 
-        sym_list = data.get("optionSymbol") or []
-        if not sym_list:
-            return None, None, None, None, {}
+        if not data.get("optionSymbol"):
+            return None, None, None
 
-        n = len(sym_list)
+        return data, spot, target
+
+    except Exception as e:
+        log.warning(f"Chain fetch failed for {ticker} (target={target_date_str}): {e}")
+        return None, None, None
+
+
+def _get_0dte_iv(ticker: str, target_date_str: str = None) -> tuple:
+    """
+    Returns (iv, spot, expiration, walls, skew, gex, pcr, vix_data)
+    or (None, None, None, None, {}, None, None, {}) on failure.
+    """
+    empty = (None, None, None, None, {}, None, None, {})
+    try:
+        data, spot, target = _get_0dte_chain(ticker, target_date_str)
+        if data is None:
+            return empty
+
+        n = len(data.get("optionSymbol") or [])
+        if n == 0:
+            return empty
+
         def col(name, default=None):
             v = data.get(name, default)
             return v if isinstance(v, list) else [default] * n
@@ -1647,11 +1657,14 @@ def _get_0dte_iv(ticker: str, target_date_str: str = None) -> tuple:
         strikes = col("strike",       None)
         iv_list = col("iv",           None)
         oi_list = col("openInterest",  0)
+        delta_l = col("delta",         0)
+        gamma_l = col("gamma",         0)
         sides   = col("side",         "")
+        vol_l   = col("volume",        0)
 
-        # ── ATM IV: within 0.5% of spot; widen to 1% if nothing found ──
+        # ── ATM IV ──
         atm_ivs = []
-        for pct in (0.005, 0.01):
+        for pct in (0.005, 0.01, 0.02):
             atm_range = spot * pct
             for i in range(n):
                 strike = as_float(strikes[i], 0)
@@ -1662,23 +1675,26 @@ def _get_0dte_iv(ticker: str, target_date_str: str = None) -> tuple:
                 break
 
         if not atm_ivs:
-            return None, spot, target, None, {}
+            return empty
 
         avg_iv = round(sum(atm_ivs) / len(atm_ivs), 4)
         walls  = _find_oi_walls(strikes, oi_list, sides, n)
         skew   = _get_atm_skew(strikes, iv_list, sides, n, spot)
+        gex    = _calc_gex(strikes, gamma_l, oi_list, sides, n, spot)
+        pcr    = _calc_pcr(oi_list, vol_l, sides, n)
+        vix    = _get_vix_data()
 
-        return avg_iv, spot, target, walls, skew
+        return avg_iv, spot, target, walls, skew, gex, pcr, vix
 
     except Exception as e:
         log.warning(f"0DTE IV fetch failed for {ticker} (target={target_date_str}): {e}")
-        return None, None, None, None, {}
+        return empty
 
 
 def _find_oi_walls(strikes, oi_list, sides, n: int) -> dict:
     """
-    Find the call wall (highest call OI strike) and put wall (highest put OI strike).
-    Returns dict with call_wall, call_wall_oi, put_wall, put_wall_oi — or None.
+    Delta-weighted OI walls — a $0.80 delta option counts 8x more than a $0.10 delta option.
+    Also returns raw OI walls as fallback.
     """
     call_oi: dict = {}
     put_oi:  dict = {}
@@ -1699,10 +1715,13 @@ def _find_oi_walls(strikes, oi_list, sides, n: int) -> dict:
         cw = max(call_oi, key=call_oi.get)
         result["call_wall"]    = cw
         result["call_wall_oi"] = call_oi[cw]
+        # Top 3 call strikes by OI for confluence check
+        result["call_top3"] = sorted(call_oi, key=call_oi.get, reverse=True)[:3]
     if put_oi:
         pw = max(put_oi, key=put_oi.get)
         result["put_wall"]    = pw
         result["put_wall_oi"] = put_oi[pw]
+        result["put_top3"] = sorted(put_oi, key=put_oi.get, reverse=True)[:3]
 
     return result if result else None
 
@@ -1710,9 +1729,8 @@ def _find_oi_walls(strikes, oi_list, sides, n: int) -> dict:
 def _get_atm_skew(strikes, iv_list, sides, n: int, spot: float) -> dict:
     """
     Compare ATM call IV vs ATM put IV within 2% of spot.
-    Returns {"call_iv": float, "put_iv": float} or {} if insufficient data.
-    If put IV > call IV the market is paying more for downside protection (fear).
-    If call IV > put IV the market is paying more for upside (greed/momentum).
+    Put IV > Call IV = fear premium (bearish lean).
+    Call IV > Put IV = greed/momentum premium (bullish lean).
     """
     call_ivs = []
     put_ivs  = []
@@ -1737,93 +1755,283 @@ def _get_atm_skew(strikes, iv_list, sides, n: int, spot: float) -> dict:
     return result
 
 
-def _calc_bias(spot: float, em: dict, walls: dict, skew: dict) -> dict:
+def _calc_gex(strikes, gamma_l, oi_list, sides, n: int, spot: float) -> dict:
     """
-    Synthesize wall structure, skew, and price position into a plain-English
-    directional lean. Returns a dict with:
-      - direction:  "BULLISH" | "BEARISH" | "NEUTRAL"
-      - score:      int  (positive = bullish, negative = bearish, out of ±4)
-      - signals:    list of (emoji, plain_english_string) tuples
-      - verdict:    one-sentence plain English summary
+    Gamma Exposure (GEX) — measures how much dealers must buy/sell as price moves.
+
+    GEX per strike = Gamma × OI × 100 × Spot²/100
+    (×100 for contract multiplier, ÷100 to normalize to dollars per 1% move)
+
+    Call GEX is POSITIVE (dealers long gamma — they sell rallies, buy dips → suppresses moves)
+    Put GEX is NEGATIVE  (dealers short gamma — they sell dips, buy rallies → amplifies moves)
+
+    Total GEX > 0  → dealers suppress volatility → range-bound/pinning day likely
+    Total GEX < 0  → dealers amplify volatility  → trending/explosive day likely
+
+    GEX flip point = strike where total GEX crosses zero (key support/resistance)
+    """
+    strike_gex: dict = {}
+    total_call_gex = 0.0
+    total_put_gex  = 0.0
+
+    for i in range(n):
+        strike = as_float(strikes[i], 0)
+        gamma  = as_float(gamma_l[i], 0)
+        oi     = int(as_float(oi_list[i], 0))
+        side   = str(sides[i] or "").lower()
+        if strike <= 0 or gamma <= 0 or oi <= 0:
+            continue
+
+        # Dollar GEX = gamma × OI × 100 contracts × spot² / 100 (per 1% move)
+        dollar_gex = gamma * oi * 100 * (spot ** 2) / 100
+
+        if side == "call":
+            gex_contribution = dollar_gex        # positive
+            total_call_gex  += dollar_gex
+        elif side == "put":
+            gex_contribution = -dollar_gex       # negative (dealers short put gamma)
+            total_put_gex   -= dollar_gex
+        else:
+            continue
+
+        strike_gex[strike] = strike_gex.get(strike, 0) + gex_contribution
+
+    if not strike_gex:
+        return {}
+
+    total_gex = total_call_gex + total_put_gex
+
+    # GEX flip point: strike closest to zero cumulative GEX
+    sorted_strikes = sorted(strike_gex.keys())
+    cumulative     = 0.0
+    flip_strike    = None
+    prev_strike    = None
+    for s in sorted_strikes:
+        prev_cum    = cumulative
+        cumulative += strike_gex[s]
+        if prev_strike is not None and prev_cum * cumulative <= 0:
+            # Sign change — flip is between prev_strike and s
+            flip_strike = round((prev_strike + s) / 2)
+            break
+        prev_strike = s
+
+    # Largest GEX strike = strongest pinning magnet
+    max_gex_strike = max(strike_gex, key=lambda s: abs(strike_gex[s]))
+
+    return {
+        "total_gex":       round(total_gex / 1_000_000, 2),   # in $M
+        "call_gex":        round(total_call_gex / 1_000_000, 2),
+        "put_gex":         round(total_put_gex / 1_000_000, 2),
+        "flip_strike":     flip_strike,
+        "max_gex_strike":  max_gex_strike,
+        "is_positive":     total_gex > 0,
+    }
+
+
+def _calc_pcr(oi_list, vol_l, sides, n: int) -> dict:
+    """
+    Put/Call Ratio by both OI and Volume.
+    PCR > 1.2 = heavy put buying = fear/bearish sentiment
+    PCR < 0.7 = heavy call buying = greed/bullish sentiment
+    PCR 0.7–1.2 = neutral
+    """
+    call_oi = call_vol = put_oi = put_vol = 0
+    for i in range(n):
+        oi   = int(as_float(oi_list[i], 0))
+        vol  = int(as_float(vol_l[i], 0))
+        side = str(sides[i] or "").lower()
+        if side == "call":
+            call_oi  += oi
+            call_vol += vol
+        elif side == "put":
+            put_oi  += oi
+            put_vol += vol
+
+    return {
+        "put_oi":   put_oi,
+        "call_oi":  call_oi,
+        "put_vol":  put_vol,
+        "call_vol": call_vol,
+        "pcr_oi":   round(put_oi  / call_oi,  2) if call_oi  > 0 else None,
+        "pcr_vol":  round(put_vol / call_vol, 2) if call_vol > 0 else None,
+    }
+
+
+def _get_vix_data() -> dict:
+    """
+    Fetch VIX spot and VIX9D from MarketData (or fallback).
+    Returns {"vix": float, "vix9d": float, "term_structure": str} or {}.
+    VIX9D > VIX = near-term fear spike (move happening NOW)
+    VIX9D < VIX = near-term calm, longer-dated concern
+    """
+    try:
+        vix_data  = md_get("https://api.marketdata.app/v1/stocks/quotes/VIX/")
+        vix9d_data = md_get("https://api.marketdata.app/v1/stocks/quotes/VIX9D/")
+
+        vix   = as_float((vix_data.get("last")  or [None])[0] if isinstance(vix_data.get("last"), list)  else vix_data.get("last"),  0)
+        vix9d = as_float((vix9d_data.get("last") or [None])[0] if isinstance(vix9d_data.get("last"), list) else vix9d_data.get("last"), 0)
+
+        if vix <= 0:
+            return {}
+
+        if vix9d > 0:
+            if vix9d > vix * 1.05:
+                term = "inverted"   # near-term fear > long-term = move happening NOW
+            elif vix9d < vix * 0.95:
+                term = "normal"     # near-term calm, longer concern
+            else:
+                term = "flat"
+        else:
+            term = "unknown"
+
+        return {"vix": round(vix, 1), "vix9d": round(vix9d, 1) if vix9d > 0 else None, "term": term}
+
+    except Exception as e:
+        log.debug(f"VIX fetch failed: {e}")
+        return {}
+
+
+def _calc_bias(spot: float, em: dict, walls: dict, skew: dict, gex: dict, pcr: dict, vix: dict) -> dict:
+    """
+    Synthesize all signals into a plain-English directional lean.
+    Scoring: each signal votes +1 (bullish), -1 (bearish), or 0 (neutral).
+    Max possible score: ±7
     """
     score   = 0
     signals = []
 
-    # ── Signal 1: OI wall asymmetry (which side has more big-money hedging) ──
+    # ── Signal 1: GEX regime — trending day or pinning day? ──
+    if gex and "total_gex" in gex:
+        tgex = gex["total_gex"]
+        if tgex > 0:
+            signals.append(("◆", f"Market makers are suppressing big moves today (GEX +${tgex:.1f}M) — expect a tighter, range-bound session"))
+        else:
+            signals.append(("⚡", f"Market makers will AMPLIFY moves today (GEX -${abs(tgex):.1f}M) — trending/explosive moves more likely"))
+
+        if gex.get("flip_strike"):
+            fs = gex["flip_strike"]
+            if spot > fs:
+                score += 1
+                signals.append(("▲", f"Price (${spot:.0f}) is ABOVE the GEX flip point (${fs:.0f}) — dealer flow supports upside moves"))
+            else:
+                score -= 1
+                signals.append(("▼", f"Price (${spot:.0f}) is BELOW the GEX flip point (${fs:.0f}) — dealer flow supports downside moves"))
+
+    # ── Signal 2: OI wall asymmetry ──
     if walls and "call_wall_oi" in walls and "put_wall_oi" in walls:
         cw_oi = walls["call_wall_oi"]
         pw_oi = walls["put_wall_oi"]
         ratio = pw_oi / cw_oi if cw_oi > 0 else 1.0
         if ratio >= 1.20:
             score += 1
-            signals.append(("▲", f"More big-money contracts protecting the downside (${pw_oi:,} vs ${cw_oi:,}) — they expect to buy dips"))
+            signals.append(("▲", f"More big-money contracts protecting the downside ({pw_oi:,} vs {cw_oi:,}) — institutions expect to buy dips"))
         elif ratio <= 0.83:
             score -= 1
-            signals.append(("▼", f"More big-money contracts protecting the upside (${cw_oi:,} vs ${pw_oi:,}) — they expect to sell rips"))
+            signals.append(("▼", f"More big-money contracts protecting the upside ({cw_oi:,} vs {pw_oi:,}) — institutions expect to sell rips"))
         else:
             signals.append(("◆", "Roughly equal hedging on both sides — no strong lean from big money"))
 
-    # ── Signal 2: Spot position relative to wall midpoint ──
+    # ── Signal 3: Spot vs wall midpoint ──
     if walls and "call_wall" in walls and "put_wall" in walls:
         midpoint = (walls["call_wall"] + walls["put_wall"]) / 2
         dist_pct = ((spot - midpoint) / midpoint) * 100
         if dist_pct >= 0.15:
             score += 1
-            signals.append(("▲", f"Price (${spot:.2f}) is above the midpoint (${midpoint:.2f}) between support and resistance — sitting closer to the ceiling"))
+            signals.append(("▲", f"Price (${spot:.2f}) is above the midpoint (${midpoint:.2f}) — sitting closer to resistance than support"))
         elif dist_pct <= -0.15:
             score -= 1
-            signals.append(("▼", f"Price (${spot:.2f}) is below the midpoint (${midpoint:.2f}) between support and resistance — sitting closer to the floor"))
+            signals.append(("▼", f"Price (${spot:.2f}) is below the midpoint (${midpoint:.2f}) — sitting closer to support than resistance"))
         else:
-            signals.append(("◆", f"Price (${spot:.2f}) is right in the middle of the range (mid ${midpoint:.2f}) — no positional edge"))
+            signals.append(("◆", f"Price (${spot:.2f}) is right in the middle of the range (${midpoint:.2f} mid) — no positional edge"))
 
-    # ── Signal 3: IV skew — which direction the market is paying more to protect ──
+    # ── Signal 4: IV skew ──
     if skew and "call_iv" in skew and "put_iv" in skew:
         diff = skew["put_iv"] - skew["call_iv"]
         if diff >= 1.5:
             score -= 1
-            signals.append(("▼", f"Downside protection costs more ({skew['put_iv']}% vs {skew['call_iv']}%) — market is nervous about a drop"))
+            signals.append(("▼", f"Downside protection costs more ({skew['put_iv']}% vs {skew['call_iv']}%) — market is paying up to hedge a drop"))
         elif diff <= -1.5:
             score += 1
-            signals.append(("▲", f"Upside calls cost more ({skew['call_iv']}% vs {skew['put_iv']}%) — market is chasing upside"))
+            signals.append(("▲", f"Upside calls cost more ({skew['call_iv']}% vs {skew['put_iv']}%) — market is paying up to chase the rally"))
         else:
-            signals.append(("◆", f"Call and put protection cost about the same ({skew.get('call_iv','?')}% / {skew.get('put_iv','?')}%) — balanced"))
+            signals.append(("◆", f"Call and put protection cost about the same ({skew.get('call_iv','?')}% / {skew.get('put_iv','?')}%) — balanced fear"))
 
-    # ── Signal 4: Call wall position — is there a ceiling inside the expected range? ──
+    # ── Signal 5: Put/Call Ratio ──
+    if pcr and pcr.get("pcr_oi") is not None:
+        p = pcr["pcr_oi"]
+        if p > 1.2:
+            score -= 1
+            signals.append(("▼", f"Put/Call ratio is high ({p:.2f}) — more people are buying downside protection than upside calls"))
+        elif p < 0.7:
+            score += 1
+            signals.append(("▲", f"Put/Call ratio is low ({p:.2f}) — more people are buying upside calls than downside puts"))
+        else:
+            signals.append(("◆", f"Put/Call ratio is neutral ({p:.2f}) — balanced options activity"))
+
+    # ── Signal 6: Call wall position ──
     if walls and "call_wall" in walls:
         cw = walls["call_wall"]
         if cw <= em["bull_1sd"]:
             score -= 1
-            signals.append(("▼", f"Resistance ceiling (${cw:.0f}) is INSIDE the expected range — likely to cap any rally before it gets going"))
+            signals.append(("▼", f"Resistance ceiling (${cw:.0f}) is INSIDE the expected move range — likely to cap any rally before it develops"))
         elif cw >= em["bull_2sd"]:
             score += 1
-            signals.append(("▲", f"No resistance ceiling until ${cw:.0f} — well outside the expected range, nothing in the way on the upside"))
+            signals.append(("▲", f"No real resistance until ${cw:.0f} — well outside the expected range, upside is unobstructed"))
         else:
             signals.append(("◆", f"Resistance ceiling at ${cw:.0f} — outside normal range but reachable on a strong move"))
 
-    # ── Verdict ──
-    n_signals = len(signals)
-    if score >= 2:
-        direction = "BULLISH"
-        pct       = min(50 + score * 10, 80)
-        verdict   = f"More signals point UP than down. Not a guarantee, but the setup favors buyers."
-    elif score <= -2:
-        direction = "BEARISH"
-        pct       = min(50 + abs(score) * 10, 80)
-        verdict   = f"More signals point DOWN than up. Not a guarantee, but the setup favors sellers."
-    else:
-        direction = "NEUTRAL"
-        pct       = 50
-        verdict   = "Signals are mixed. No strong edge in either direction — range-bound day likely."
+    # ── Signal 7: VIX term structure ──
+    if vix and vix.get("vix"):
+        v   = vix["vix"]
+        v9d = vix.get("vix9d")
+        term = vix.get("term", "unknown")
 
+        if v >= 30:
+            score -= 1
+            signals.append(("▼", f"VIX is very elevated ({v}) — market is in fear mode, expect sharp and unpredictable moves"))
+        elif v >= 20:
+            signals.append(("◆", f"VIX is elevated ({v}) — above-normal uncertainty, EM ranges are likely accurate"))
+        else:
+            score += 1
+            signals.append(("▲", f"VIX is calm ({v}) — low fear environment, market is orderly"))
+
+        if v9d and term == "inverted":
+            score -= 1
+            signals.append(("▼", f"Short-term fear (VIX9D {v9d}) is HIGHER than 30-day fear (VIX {v}) — something is happening RIGHT NOW"))
+        elif v9d and term == "normal":
+            score += 1
+            signals.append(("▲", f"Short-term calm (VIX9D {v9d} vs VIX {v}) — near-term session should be relatively stable"))
+
+    # ── Verdict ──
+    n_signals  = len(signals)
     up_count   = sum(1 for e, _ in signals if e == "▲")
     down_count = sum(1 for e, _ in signals if e == "▼")
+    neu_count  = n_signals - up_count - down_count
+
+    if score >= 3:
+        direction = "BULLISH"
+        strength  = "Strong" if score >= 5 else "Moderate"
+        verdict   = f"{strength} bullish lean — multiple independent signals agree the setup favors buyers today."
+    elif score <= -3:
+        direction = "BEARISH"
+        strength  = "Strong" if score <= -5 else "Moderate"
+        verdict   = f"{strength} bearish lean — multiple independent signals agree the setup favors sellers today."
+    elif score >= 1:
+        direction = "SLIGHT BULLISH"
+        verdict   = "Mild bullish tilt — more signals favor upside but conviction is low. Proceed carefully."
+    elif score <= -1:
+        direction = "SLIGHT BEARISH"
+        verdict   = "Mild bearish tilt — more signals favor downside but conviction is low. Proceed carefully."
+    else:
+        direction = "NEUTRAL"
+        verdict   = "Signals are split. No edge in either direction — range-bound or choppy session likely."
 
     return {
         "direction":  direction,
         "score":      score,
-        "pct":        pct,
         "up_count":   up_count,
         "down_count": down_count,
+        "neu_count":  neu_count,
         "n_signals":  n_signals,
         "signals":    signals,
         "verdict":    verdict,
@@ -1832,14 +2040,15 @@ def _calc_bias(spot: float, em: dict, walls: dict, skew: dict) -> dict:
 
 def _calc_intraday_em(spot: float, iv: float, hours_remaining: float) -> dict:
     """
-    Calculate intraday expected move based on hours remaining in session.
-    Uses EM = spot × IV × sqrt(hours / 8736)   [8736 = 252 × trading day hrs approx]
-    Trading day ≈ 6.5 hours. Annualized = 252 trading days × 6.5h = 1638h.
+    EM = Spot × IV × sqrt(hours / hours_in_trading_year)
+    Trading year = 252 days × 6.5h = 1,638h
+    1σ = 68% probability price stays within range
+    2σ = 95% probability price stays within range
     """
     if iv <= 0 or hours_remaining <= 0:
         return {}
 
-    hours_in_year = 252 * 6.5  # ~1638
+    hours_in_year = 252 * 6.5
     em_1sd = round(spot * iv * math.sqrt(hours_remaining / hours_in_year), 2)
     em_2sd = round(em_1sd * 2, 2)
 
@@ -1857,12 +2066,9 @@ def _calc_intraday_em(spot: float, iv: float, hours_remaining: float) -> dict:
 
 def _post_em_card(ticker: str, session: str):
     """
-    Fetch IV and calculate Expected Move for Telegram card.
-
-    Morning  (8:45 AM CT): TODAY's 0DTE expiration, hours remaining in today's session.
-    Afternoon (2:45 PM CT): NEXT trading day's expiration, full 6.5h session.
-                            At 2:45 PM only ~15 min remain today — useless for trading.
-                            Next-day EM gives you a level to plan overnight/open positioning.
+    Full institutional-grade EM card.
+    Morning  (8:45 AM CT): TODAY's expiration, hours remaining in session.
+    Afternoon (2:45 PM CT): NEXT trading day, full 6.5h session.
     """
     try:
         import pytz
@@ -1873,14 +2079,12 @@ def _post_em_card(ticker: str, session: str):
         is_afternoon = (session == "afternoon")
 
         if is_afternoon:
-            # Use NEXT trading day's expiration and a full 6.5h session
             target_date_str = _get_next_trading_day(today_dt)
             hours_for_em    = 6.5
             session_emoji   = "🌆"
             session_label   = "Next Day Preview"
             horizon_note    = f"Full session EM for {target_date_str}"
         else:
-            # Use TODAY's expiration, hours remaining until 3:00 PM CT close
             target_date_str = today_dt.strftime("%Y-%m-%d")
             market_close_ct = now_ct.replace(hour=15, minute=0, second=0, microsecond=0)
             hours_for_em    = max((market_close_ct - now_ct).total_seconds() / 3600, 0.25)
@@ -1888,96 +2092,132 @@ def _post_em_card(ticker: str, session: str):
             session_label   = "Today (Pre-Open)"
             horizon_note    = f"{hours_for_em:.1f}h remaining today"
 
-        iv, spot, expiration, walls, skew = _get_0dte_iv(ticker, target_date_str)
+        iv, spot, expiration, walls, skew, gex, pcr, vix = _get_0dte_iv(ticker, target_date_str)
 
         if iv is None or spot is None:
             log.warning(f"EM card skipped for {ticker}: could not fetch IV (target={target_date_str})")
             post_to_telegram(f"⚠️ {ticker} EM: could not fetch IV for {target_date_str}")
             return
 
-        em = _calc_intraday_em(spot, iv, hours_for_em)
+        em   = _calc_intraday_em(spot, iv, hours_for_em)
         if not em:
             return
+
+        bias = _calc_bias(spot, em, walls, skew, gex or {}, pcr or {}, vix or {})
 
         iv_pct = iv * 100
         if iv_pct < 10:
             iv_emoji = "🟢"
-            iv_note  = "Low IV — tight range expected"
+            iv_note  = "Low IV — tight, controlled range expected"
         elif iv_pct < 20:
             iv_emoji = "🟡"
-            iv_note  = "Moderate IV"
+            iv_note  = "Moderate IV — normal session expected"
         else:
             iv_emoji = "🔴"
-            iv_note  = "Elevated IV — wider swings expected"
+            iv_note  = "Elevated IV — wider swings, respect your stops"
 
+        # ── Header ──
         lines = [
             f"{session_emoji} {ticker} — Expected Move ({session_label})",
-            f"Spot: ${spot:.2f} | IV: {iv_emoji} {iv_pct:.1f}% annualized",
+            f"Spot: ${spot:.2f} | IV: {iv_emoji} {iv_pct:.1f}%",
             f"Expiration: {expiration} | {horizon_note}",
-            "",
-            f"📐 Expected Move (1σ — 68%): ±${em['em_1sd']:.2f} ({em['em_pct_1sd']:.2f}%)",
-            f"  🐂 Upside:   ${em['bull_1sd']:.2f}",
-            f"  🐻 Downside: ${em['bear_1sd']:.2f}",
-            "",
-            f"📐 Expected Move (2σ — 95%): ±${em['em_2sd']:.2f}",
-            f"  🐂 Upside:   ${em['bull_2sd']:.2f}",
-            f"  🐻 Downside: ${em['bear_2sd']:.2f}",
         ]
 
-        # ── Directional Bias ──
-        bias = _calc_bias(spot, em, walls, skew)
+        # ── VIX context inline ──
+        if vix and vix.get("vix"):
+            v9d_str = f" | VIX9D: {vix['vix9d']}" if vix.get("vix9d") else ""
+            lines.append(f"VIX: {vix['vix']}{v9d_str}")
 
-        dir_emoji = {"BULLISH": "🟢", "BEARISH": "🔴", "NEUTRAL": "⚪"}.get(bias["direction"], "⚪")
-        dot_bar   = ("▲" * bias["up_count"]) + ("▼" * bias["down_count"]) + ("◆" * (bias["n_signals"] - bias["up_count"] - bias["down_count"]))
+        # ── EM ranges ──
+        lines += [
+            "",
+            f"📐 Expected Move (1σ — 68% chance stays inside):",
+            f"  🐂 Upside:   ${em['bull_1sd']:.2f}  (+${em['em_1sd']:.2f} / +{em['em_pct_1sd']:.2f}%)",
+            f"  🐻 Downside: ${em['bear_1sd']:.2f}  (-${em['em_1sd']:.2f} / -{em['em_pct_1sd']:.2f}%)",
+            "",
+            f"📐 Expected Move (2σ — 95% chance stays inside):",
+            f"  🐂 Upside:   ${em['bull_2sd']:.2f}  (+${em['em_2sd']:.2f})",
+            f"  🐻 Downside: ${em['bear_2sd']:.2f}  (-${em['em_2sd']:.2f})",
+        ]
 
-        lines.append("")
-        lines.append(f"{'━' * 28}")
-        lines.append(f"{dir_emoji} LEAN: {bias['direction']}  ({bias['up_count']} up · {bias['down_count']} down · {bias['n_signals'] - bias['up_count'] - bias['down_count']} neutral)  {dot_bar}")
-        lines.append(f"💬 {bias['verdict']}")
-        lines.append("")
-        for arrow, text in bias["signals"]:
-            lines.append(f"  {arrow} {text}")
-        lines.append(f"{'━' * 28}")
+        # ── GEX regime banner ──
+        if gex and "total_gex" in gex:
+            tgex = gex["total_gex"]
+            if tgex > 0:
+                gex_banner = f"🧲 GEX: +${tgex:.1f}M  →  Range-bound day — big moves will be faded"
+            else:
+                gex_banner = f"⚡ GEX: -${abs(tgex):.1f}M  →  Trending day — moves will be amplified"
+            if gex.get("flip_strike"):
+                gex_banner += f"  |  Flip: ${gex['flip_strike']:.0f}"
+            lines += ["", gex_banner]
 
         # ── OI Walls ──
         if walls:
-            lines.append("")
-            lines.append("🧱 OI Walls (dealer hedging levels):")
-
+            lines += ["", "🧱 Key Levels (where big money is parked):"]
             if "call_wall" in walls:
                 cw    = walls["call_wall"]
                 cw_oi = walls["call_wall_oi"]
                 if cw <= em["bull_1sd"]:
-                    cw_note = "⚠️ inside 1σ — may cap rally early"
+                    cw_note = "⚠️ inside expected range — ceiling will likely cap the move"
                 elif cw <= em["bull_2sd"]:
-                    cw_note = "within 2σ — soft ceiling"
+                    cw_note = "soft ceiling — reachable on a strong move"
                 else:
-                    cw_note = "outside 2σ — room to run"
-                lines.append(f"  📵 Call Wall: ${cw:.0f}  ({cw_oi:,} OI) — {cw_note}")
-
+                    cw_note = "outside expected range — no ceiling in the way"
+                lines.append(f"  📵 Resistance: ${cw:.0f}  ({cw_oi:,} contracts) — {cw_note}")
             if "put_wall" in walls:
                 pw    = walls["put_wall"]
                 pw_oi = walls["put_wall_oi"]
                 if pw >= em["bear_1sd"]:
-                    pw_note = "⚠️ inside 1σ — may cap selloff early"
+                    pw_note = "⚠️ inside expected range — floor will likely stop the drop"
                 elif pw >= em["bear_2sd"]:
-                    pw_note = "within 2σ — soft floor"
+                    pw_note = "soft floor — reachable on a strong selloff"
                 else:
-                    pw_note = "outside 2σ — limited downside support"
-                lines.append(f"  🛡️ Put Wall:  ${pw:.0f}  ({pw_oi:,} OI) — {pw_note}")
+                    pw_note = "outside expected range — limited cushion below"
+                lines.append(f"  🛡️ Support:    ${pw:.0f}  ({pw_oi:,} contracts) — {pw_note}")
 
-            # Pin risk: both walls inside 1σ
             if (
                 "call_wall" in walls and "put_wall" in walls
                 and walls["call_wall"] <= em["bull_1sd"]
                 and walls["put_wall"] >= em["bear_1sd"]
             ):
                 pin_range = walls["call_wall"] - walls["put_wall"]
-                lines.append(f"  📌 Pin risk: walls ${walls['put_wall']:.0f}–${walls['call_wall']:.0f} (${pin_range:.0f} range)")
-        else:
-            lines.append("")
-            lines.append("🧱 OI Walls: data unavailable")
+                lines.append(f"  📌 Pin zone: ${walls['put_wall']:.0f}–${walls['call_wall']:.0f} (${pin_range:.0f} wide) — price may get stuck here")
 
+        # ── PCR ──
+        if pcr and pcr.get("pcr_oi") is not None:
+            p = pcr["pcr_oi"]
+            if p > 1.2:
+                pcr_note = "elevated — more puts than calls, market is nervous"
+            elif p < 0.7:
+                pcr_note = "low — more calls than puts, market is optimistic"
+            else:
+                pcr_note = "neutral"
+            lines += ["", f"📊 Put/Call Ratio: {p:.2f}  ({pcr_note})"]
+
+        # ── Directional Lean ──
+        dir_emoji = {
+            "BULLISH":       "🟢",
+            "SLIGHT BULLISH":"🟡",
+            "NEUTRAL":       "⚪",
+            "SLIGHT BEARISH":"🟠",
+            "BEARISH":       "🔴",
+        }.get(bias["direction"], "⚪")
+
+        dot_bar = ("▲" * bias["up_count"]) + ("▼" * bias["down_count"]) + ("◆" * bias["neu_count"])
+
+        lines += [
+            "",
+            f"{'━' * 30}",
+            f"{dir_emoji} TODAY'S LEAN: {bias['direction']}",
+            f"Signals: {dot_bar}  ({bias['up_count']} bullish · {bias['down_count']} bearish · {bias['neu_count']} neutral)",
+            f"💬 {bias['verdict']}",
+            "",
+        ]
+        for arrow, text in bias["signals"]:
+            lines.append(f"  {arrow} {text}")
+        lines.append(f"{'━' * 30}")
+
+        # ── Footer ──
         lines += [
             "",
             f"💡 {iv_note}",
@@ -1986,12 +2226,15 @@ def _post_em_card(ticker: str, session: str):
 
         post_to_telegram("\n".join(lines))
         log.info(
-            f"EM card posted: {ticker} {session_label} spot={spot} "
-            f"IV={iv_pct:.1f}% EM=±${em['em_1sd']} exp={expiration} walls={walls}"
+            f"EM card posted: {ticker} {session_label} spot={spot} IV={iv_pct:.1f}% "
+            f"EM=±${em['em_1sd']} GEX={gex.get('total_gex') if gex else 'N/A'} "
+            f"PCR={pcr.get('pcr_oi') if pcr else 'N/A'} exp={expiration}"
         )
 
     except Exception as e:
         log.error(f"EM card error for {ticker} ({session}): {e}", exc_info=True)
+
+
 
 
 def _em_scheduler():
