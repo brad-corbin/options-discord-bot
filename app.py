@@ -1345,6 +1345,7 @@ def telegram_webhook(secret):
             get_portfolio_chat_id_fn = get_portfolio_chat_id,
             get_regime_fn    = get_current_regime,
             post_em_card_fn  = _post_em_card,
+            post_monitor_card_fn = _post_monitor_card,
         )
 
     threading.Thread(target=run_command, daemon=True).start()
@@ -2554,10 +2555,649 @@ def _post_em_card(ticker: str, session: str):
             f"score={bias['score']} | lean={bias['direction']} | exp={expiration}"
         )
 
+        # ── Trade card posted immediately after EM card (same data, no new API call) ──
+        _post_trade_card(
+            ticker     = ticker,
+            spot       = spot,
+            expiration = expiration,
+            eng        = eng or {},
+            walls      = walls or {},
+            bias       = bias,
+            em         = em,
+            vix        = vix or {},
+            pcr        = pcr or {},
+            is_0dte    = True,
+        )
+
     except Exception as e:
         log.error(f"EM card error for {ticker} ({session}): {e}", exc_info=True)
 
 
+
+
+
+# ─────────────────────────────────────────────────────────────────────
+# LIQUID SYMBOL DETECTION
+# Full institutional card (GEX/DEX/Vanna/Charm) on these — they have
+# deep enough chains for the exposure engine to produce reliable reads.
+# Everything else gets a simplified card.
+# ─────────────────────────────────────────────────────────────────────
+
+LIQUID_SYMBOLS = {
+    "SPY", "QQQ", "SPX", "NDX",
+    "AAPL", "NVDA", "TSLA", "AMZN", "META", "MSFT", "GOOGL", "GOOG",
+    "AMD", "NFLX", "COIN", "MSTR", "ARM", "PLTR", "SMCI",
+}
+
+def _is_liquid(ticker: str) -> bool:
+    return ticker.upper() in LIQUID_SYMBOLS
+
+
+# ─────────────────────────────────────────────────────────────────────
+# EXPIRY SELECTION
+# ─────────────────────────────────────────────────────────────────────
+
+def _find_expiry_nearest(ticker: str) -> tuple:
+    """
+    /monitorshort — find the nearest available expiration regardless of DTE.
+    Returns (expiry_str, dte_int) or (None, None).
+    """
+    try:
+        from datetime import date as _date
+        today      = _date.today()
+        today_str  = today.strftime("%Y-%m-%d")
+        exps       = get_expirations(ticker)
+        future     = [e for e in exps if e >= today_str]
+        if not future:
+            return None, None
+        exp = future[0]
+        dte = (_date.fromisoformat(exp) - today).days
+        return exp, dte
+    except Exception as e:
+        log.warning(f"_find_expiry_nearest failed for {ticker}: {e}")
+        return None, None
+
+
+def _find_expiry_closest_to_21(ticker: str) -> tuple:
+    """
+    /monitorlong — find the expiration closest to 21 days (standard monthly).
+    Must be at least 15 days out. Returns (expiry_str, dte_int) or (None, None).
+    """
+    try:
+        from datetime import date as _date
+        today     = _date.today()
+        today_str = today.strftime("%Y-%m-%d")
+        exps      = get_expirations(ticker)
+        candidates = []
+        for e in exps:
+            dte = (_date.fromisoformat(e) - today).days
+            if dte >= 15:
+                candidates.append((abs(dte - 21), dte, e))
+        if not candidates:
+            return None, None
+        candidates.sort()
+        _, dte, exp = candidates[0]
+        return exp, dte
+    except Exception as e:
+        log.warning(f"_find_expiry_closest_to_21 failed for {ticker}: {e}")
+        return None, None
+
+
+# ─────────────────────────────────────────────────────────────────────
+# CHAIN FETCH FOR ANY EXPIRY (not 0DTE-specific)
+# ─────────────────────────────────────────────────────────────────────
+
+def _get_chain_for_expiry(ticker: str, target_date_str: str) -> tuple:
+    """
+    Fetch options chain for a specific expiration date.
+    Returns (data_dict, spot, resolved_expiration) or (None, None, None).
+    Works for any DTE — 0DTE, weekly, monthly.
+    """
+    try:
+        spot = get_spot(ticker)
+        data = md_get(
+            f"https://api.marketdata.app/v1/options/chain/{ticker}/",
+            {"expiration": target_date_str},
+        )
+        if not isinstance(data, dict) or data.get("s") != "ok" or not data.get("optionSymbol"):
+            return None, None, None
+        return data, spot, target_date_str
+    except Exception as e:
+        log.warning(f"Chain fetch failed for {ticker} exp={target_date_str}: {e}")
+        return None, None, None
+
+
+def _get_chain_iv_for_expiry(ticker: str, target_date_str: str, dte: float) -> tuple:
+    """
+    Full chain analysis for any expiry. Same pipeline as _get_0dte_iv but
+    accepts pre-resolved expiry date and DTE. Returns the same 8-tuple.
+    Returns (iv, spot, expiration, engine_result, walls, skew, pcr, vix) or empties.
+    """
+    empty = (None, None, None, None, {}, {}, {}, {})
+    try:
+        from options_exposure import ExposureEngine, gex_regime, vanna_charm_context
+
+        data, spot, target = _get_chain_for_expiry(ticker, target_date_str)
+        if data is None:
+            return empty
+
+        rows = _build_option_rows(data, spot, max(dte, 0.5))
+        if not rows:
+            return empty
+
+        engine = ExposureEngine(r=0.04)
+        result = engine.compute(rows)
+
+        lo   = int(spot * 0.90)
+        hi   = int(spot * 1.10) + 1
+        grid = [float(p) for p in range(lo, hi, 1)]
+        flip = engine.gamma_flip(rows, grid)
+
+        net         = result["net"]
+        regime_info = gex_regime(net["gex"])
+        vc_info     = vanna_charm_context(net["vanna"], net["charm"])
+        walls_raw   = result["walls"]
+        by_strike   = result["by_strike"]
+
+        walls = {}
+        if walls_raw["call_wall"]:
+            cw = walls_raw["call_wall"]
+            walls["call_wall"]    = cw
+            walls["call_wall_oi"] = by_strike[cw]["call_oi"]
+            walls["call_top3"]    = sorted(by_strike, key=lambda k: by_strike[k]["call_oi"], reverse=True)[:3]
+        if walls_raw["put_wall"]:
+            pw = walls_raw["put_wall"]
+            walls["put_wall"]    = pw
+            walls["put_wall_oi"] = by_strike[pw]["put_oi"]
+            walls["put_top3"]    = sorted(by_strike, key=lambda k: by_strike[k]["put_oi"], reverse=True)[:3]
+        if walls_raw["gamma_wall"]:
+            gw = walls_raw["gamma_wall"]
+            walls["gamma_wall"]     = gw
+            walls["gamma_wall_gex"] = by_strike[gw]["gex"]
+
+        engine_result = {
+            "gex":        round(net["gex"]   / 1_000_000, 2),
+            "dex":        round(net["dex"]   / 1_000_000, 2),
+            "vanna":      round(net["vanna"] / 1_000_000, 2),
+            "charm":      round(net["charm"] / 1_000_000, 2),
+            "flip_price": flip,
+            "is_positive_gex": net["gex"] >= 0,
+            "regime":     regime_info,
+            "vc":         vc_info,
+        }
+
+        # ATM IV
+        n       = len(data.get("optionSymbol") or [])
+        def col(name, default=None):
+            v = data.get(name, default)
+            return v if isinstance(v, list) else [default] * n
+
+        strikes  = col("strike", None)
+        iv_list  = col("iv",     None)
+        iv_sides = col("side",   "")
+        oi_list  = col("openInterest", 0)
+        vol_l    = col("volume", 0)
+
+        atm_ivs = []
+        for pct in (0.01, 0.02, 0.03):
+            atm_range = spot * pct
+            for i in range(n):
+                s  = as_float(strikes[i], 0)
+                iv = as_float(iv_list[i],  0)
+                if iv > 0 and abs(s - spot) <= atm_range:
+                    atm_ivs.append(iv)
+            if atm_ivs:
+                break
+
+        if not atm_ivs:
+            return empty
+
+        avg_iv = round(sum(atm_ivs) / len(atm_ivs), 4)
+        skew   = _get_atm_skew(strikes, iv_list, iv_sides, n, spot)
+        pcr    = _calc_pcr(oi_list, vol_l, iv_sides, n)
+        vix    = _get_vix_data()
+
+        return avg_iv, spot, target, engine_result, walls, skew, pcr, vix
+
+    except Exception as e:
+        log.warning(f"Chain IV fetch failed for {ticker} exp={target_date_str}: {e}")
+        return empty
+
+
+# ─────────────────────────────────────────────────────────────────────
+# TRADE CARD — posted immediately after the EM card
+# Takes already-fetched data — zero extra API calls.
+# ─────────────────────────────────────────────────────────────────────
+
+def _post_trade_card(
+    ticker: str,
+    spot: float,
+    expiration: str,
+    eng: dict,
+    walls: dict,
+    bias: dict,
+    em: dict,
+    vix: dict,
+    pcr: dict,
+    is_0dte: bool = True,
+):
+    """
+    0DTE trade recommendation card.
+    Consumes already-computed bias + exposure data — no new API calls.
+    """
+    try:
+        direction = bias.get("direction", "NEUTRAL")
+        score     = bias.get("score", 0)
+
+        # ── No trade if NEUTRAL or low conviction ──
+        if direction == "NEUTRAL":
+            post_to_telegram(
+                f"🎯 {ticker} TRADE SETUP\n"
+                f"⚪ Bias is NEUTRAL (score {score:+d}/14) — no directional edge.\n"
+                f"Sit this one out or use a tight iron condor between the walls if GEX is positive.\n"
+                f"— Not financial advice —"
+            )
+            return
+
+        if direction in ("SLIGHT BULLISH", "SLIGHT BEARISH") and abs(score) < 2:
+            post_to_telegram(
+                f"🎯 {ticker} TRADE SETUP\n"
+                f"{'🟡' if 'BULL' in direction else '🟠'} Lean is {direction} (score {score:+d}/14) — edge too thin for a directional play.\n"
+                f"Wait for a cleaner setup or a price action confirmation first.\n"
+                f"— Not financial advice —"
+            )
+            return
+
+        is_bull = "BULL" in direction
+
+        # ── GEX regime — strategy type ──
+        tgex         = eng.get("gex", 0) if eng else 0
+        neg_gex      = tgex < 0
+        dex          = eng.get("dex", 0) if eng else 0
+        flip         = eng.get("flip_price") if eng else None
+        charm_m      = eng.get("charm", 0) if eng else 0
+        charm_tail   = charm_m > 0  # tailwind = bullish drift into close
+
+        # ── Strike selection ──
+        # Long leg: first ITM strike (~0.65 delta proxy = 1-2 strikes ITM)
+        # Short leg: the wall on our side (natural target / ceiling)
+        strike_step = 1 if ticker in ("SPX", "NDX") else 1
+
+        if is_bull:
+            # ITM call: buy strike just below spot
+            long_strike  = (int(spot) // 5) * 5   # round down to nearest $5
+            if long_strike >= spot:
+                long_strike -= 5
+            wall_strike  = walls.get("call_wall") if walls else None
+            if wall_strike and wall_strike > spot:
+                short_strike = wall_strike
+            else:
+                short_strike = long_strike + 10    # fallback $10 wide
+            spread_type  = "CALL DEBIT SPREAD"
+            option_type  = "C"
+            long_label   = f"${long_strike}C"
+            short_label  = f"${short_strike}C"
+            target1      = walls.get("gamma_wall", long_strike + (short_strike - long_strike) * 0.5)
+            target2      = short_strike
+            stop_level   = flip if (flip and flip < spot) else round(spot * 0.993, 2)
+        else:
+            # ITM put: buy strike just above spot
+            long_strike  = (int(spot) // 5) * 5
+            if long_strike <= spot:
+                long_strike += 5
+            wall_strike  = walls.get("put_wall") if walls else None
+            if wall_strike and wall_strike < spot:
+                short_strike = wall_strike
+            else:
+                short_strike = long_strike - 10
+            spread_type  = "PUT DEBIT SPREAD"
+            option_type  = "P"
+            long_label   = f"${long_strike}P"
+            short_label  = f"${short_strike}P"
+            target1      = walls.get("gamma_wall", long_strike - (long_strike - short_strike) * 0.5)
+            target2      = short_strike
+            stop_level   = flip if (flip and flip > spot) else round(spot * 1.007, 2)
+
+        width       = abs(short_strike - long_strike)
+        # Rough cost estimate: ITM debit spread on 0DTE typically costs 25-35% of width
+        cost_est    = round(width * 0.30, 2)
+        max_profit  = round(width - cost_est, 2)
+        rr          = round(max_profit / cost_est, 2) if cost_est > 0 else 0
+
+        # ── Position size from VIX + DEX confirmation ──
+        v = vix.get("vix", 20) if vix else 20
+        if v >= 40:
+            base_pct = 0
+        elif v >= 28:
+            base_pct = 25
+        elif v >= 20:
+            base_pct = 50
+        elif v >= 15:
+            base_pct = 75
+        else:
+            base_pct = 100
+
+        # DEX confirmation bonus/penalty
+        dex_confirms = (is_bull and dex < -0.25) or (not is_bull and dex > 0.25)
+        dex_disagrees = (is_bull and dex > 0.25) or (not is_bull and dex < -0.25)
+        if dex_confirms and base_pct > 0:
+            size_pct = min(base_pct + 25, 100)
+            dex_note = f"DEX confirms direction → +1 size tier"
+        elif dex_disagrees:
+            size_pct = max(base_pct - 25, 0)
+            dex_note = f"DEX disagrees → -1 size tier (be careful)"
+        else:
+            size_pct = base_pct
+            dex_note = f"DEX neutral — no size adjustment"
+
+        if base_pct == 0:
+            size_note = "⛔ VIX too extreme — STAND ASIDE"
+        else:
+            size_note = f"{size_pct}% of normal position size"
+
+        # ── Entry window from Charm ──
+        if charm_tail:
+            timing_note  = "Afternoon drift favors you — can hold into 2:30 PM CT"
+            timing_warn  = "Exit before 2:45 PM CT to avoid final gamma acceleration"
+        else:
+            timing_note  = "Charm headwind — EXIT by noon CT, do not hold into close"
+            timing_warn  = "⚠️ Time decay adds selling pressure as the day progresses"
+
+        # ── GEX strategy note ──
+        if neg_gex:
+            gex_note = f"⚡ Negative GEX (${abs(tgex):.1f}M) — buy debit spreads only, dealers amplify moves"
+        else:
+            gex_note = f"🧲 Positive GEX (+${tgex:.1f}M) — consider tighter width, moves may be suppressed"
+
+        # ── Checklist ──
+        checks = []
+        checks.append(f"{'✅' if neg_gex else '⚠️'} GEX {'negative — debit spread confirmed' if neg_gex else 'positive — reduce width or skip'}")
+        checks.append(f"✅ Score {score:+d}/14 — {'strong' if abs(score) >= 7 else 'moderate'} conviction")
+        if flip:
+            flip_ok = (is_bull and spot > flip) or (not is_bull and spot < flip)
+            checks.append(f"{'✅' if flip_ok else '⚠️'} Spot {'above' if spot > flip else 'BELOW'} gamma flip ${flip:.2f}")
+        checks.append(f"{'✅' if dex_confirms else '⚠️'} DEX {'confirms' if dex_confirms else 'does not confirm'} direction")
+        if vix:
+            checks.append(f"{'✅' if v < 28 else '⚠️'} VIX {v} — size at {size_pct}%")
+
+        # ── Invalidation ──
+        if is_bull:
+            inval = f"If spot drops below gamma flip ${flip:.2f}" if flip else f"If spot drops to ${stop_level:.2f}"
+        else:
+            inval = f"If spot breaks above gamma flip ${flip:.2f}" if flip else f"If spot rises to ${stop_level:.2f}"
+
+        dir_emoji = {
+            "STRONG BULLISH": "🟢🟢", "BULLISH": "🟢", "SLIGHT BULLISH": "🟡",
+            "SLIGHT BEARISH": "🟠", "BEARISH": "🔴", "STRONG BEARISH": "🔴🔴",
+        }.get(direction, "⚪")
+
+        exp_short = expiration[5:] if expiration else "?"  # MM-DD
+
+        lines = [
+            f"🎯 {ticker} — 0DTE TRADE SETUP",
+            f"Generated: {datetime.now().strftime('%I:%M %p CT')}  |  Exp: {exp_short}",
+            f"Lean: {dir_emoji} {direction}  [Score: {score:+d}/14]",
+            "━" * 32,
+            "",
+            f"⚙️ REGIME: {gex_note}",
+            "",
+            f"📋 SETUP: ITM {spread_type}",
+            f"  Buy:   {ticker} {long_label}  (ITM, ~0.65Δ)",
+            f"  Sell:  {ticker} {short_label}  ({'call wall' if is_bull else 'put wall'} — natural ceiling)",
+            f"  Width: ${width:.0f}  |  Est. cost: ~${cost_est:.2f}/contract",
+            f"  Max profit: ~${max_profit:.2f}/contract  |  R/R: {rr:.1f}:1",
+            "",
+            f"📍 LEVELS",
+            f"  Entry zone:  ${spot:.2f} ± 0.3%  (current spot)",
+            f"  Target 1:    ${target1:.0f}  (gamma wall — take 50% here)",
+            f"  Target 2:    ${target2:.0f}  ({'call' if is_bull else 'put'} wall — full exit)",
+            f"  Hard stop:   ${stop_level:.2f}  (flip crosses wrong way → exit immediately)",
+            f"  Alt stop:    -50% of premium paid (spread loses half → cut it)",
+            "",
+            f"⏱️ TIMING",
+            f"  {timing_note}",
+            f"  {timing_warn}",
+            f"  ⚠️ Gamma risk zone: after 2:30 PM CT — don't enter new positions",
+            "",
+            f"📊 SIZE",
+            f"  VIX {v} → base: {base_pct}%",
+            f"  {dex_note}",
+            f"  → {size_note}",
+            "",
+            "✅ CHECKLIST",
+        ]
+        for c in checks:
+            lines.append(f"  {c}")
+
+        lines += [
+            "",
+            "⛔ INVALIDATION",
+            f"  {inval} → exit immediately, no averaging in",
+            f"  Spread loses 50% of cost → stop out regardless of time",
+            "━" * 32,
+            "— Not financial advice —",
+        ]
+
+        post_to_telegram("\n".join(lines))
+        log.info(
+            f"Trade card: {ticker} | {direction} | score={score} | "
+            f"{spread_type} {long_label}/{short_label} | stop=${stop_level}"
+        )
+
+    except Exception as e:
+        log.error(f"Trade card error for {ticker}: {e}", exc_info=True)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# MONITOR CARD — /monitorlong and /monitorshort
+# Full card on liquid symbols. Simplified card on thin chains.
+# ─────────────────────────────────────────────────────────────────────
+
+def _post_monitor_card(ticker: str, mode: str):
+    """
+    mode = "long"  → expiry closest to 21 DTE (min 15 days)
+    mode = "short" → nearest available expiry
+    Posts a positional outlook card. No trade card — monitoring only.
+    """
+    try:
+        ticker = ticker.upper()
+
+        if mode == "long":
+            expiry, dte = _find_expiry_closest_to_21(ticker)
+            mode_label  = "Swing Outlook (≈21 DTE)"
+            mode_emoji  = "📅"
+        else:
+            expiry, dte = _find_expiry_nearest(ticker)
+            mode_label  = "Near-Term Outlook (Nearest Exp)"
+            mode_emoji  = "⚡"
+
+        if not expiry:
+            post_to_telegram(f"⚠️ {ticker}: could not find a valid expiration for /monitor{mode}")
+            return
+
+        liquid = _is_liquid(ticker)
+
+        if liquid:
+            iv, spot, expiration, eng, walls, skew, pcr, vix = _get_chain_iv_for_expiry(ticker, expiry, dte)
+        else:
+            # Simplified fetch — ATM IV + basic walls only, skip heavy exposure engine
+            iv, spot, expiration, eng, walls, skew, pcr, vix = _get_chain_iv_for_expiry(ticker, expiry, dte)
+            # Strip the heavy dealer metrics for thin chains — walls and skew still useful
+            eng = {}
+
+        if iv is None or spot is None:
+            post_to_telegram(f"⚠️ {ticker}: could not fetch IV for {expiry} (DTE={dte})")
+            return
+
+        # For non-0DTE: EM over full calendar days, not intraday hours
+        # Use annualized EM: Spot × IV × sqrt(DTE/365)
+        trading_days = max(dte * (252/365), 0.5)
+        hours_equiv  = trading_days * 6.5
+        em = _calc_intraday_em(spot, iv, hours_equiv)
+        if not em:
+            return
+
+        # Bias engine — same 14-signal system
+        bias = _calc_bias(spot, em or {}, walls or {}, skew or {}, eng or {}, pcr or {}, vix or {})
+
+        iv_pct = iv * 100
+        if iv_pct < 15:
+            iv_emoji = "🟢"
+            iv_note  = "Low IV — options are cheap, premium selling less attractive"
+        elif iv_pct < 30:
+            iv_emoji = "🟡"
+            iv_note  = "Moderate IV — balanced environment for buyers and sellers"
+        elif iv_pct < 50:
+            iv_emoji = "🔴"
+            iv_note  = "Elevated IV — options expensive, consider spreads over naked positions"
+        else:
+            iv_emoji = "🚨"
+            iv_note  = "EXTREME IV — very wide expected ranges. Size down significantly."
+
+        dir_emoji = {
+            "STRONG BULLISH": "🟢🟢", "BULLISH": "🟢", "SLIGHT BULLISH": "🟡",
+            "NEUTRAL": "⚪", "SLIGHT BEARISH": "🟠", "BEARISH": "🔴", "STRONG BEARISH": "🔴🔴",
+        }.get(bias["direction"], "⚪")
+
+        chain_note = "Full institutional analysis" if liquid else "Simplified (thin chain — dealer metrics omitted)"
+
+        # ════════════ HEADER ════════════
+        lines = [
+            f"{mode_emoji} {ticker} — {mode_label}",
+            f"Spot: ${spot:.2f}  |  IV: {iv_emoji} {iv_pct:.1f}%  |  DTE: {dte}",
+            f"Expiry: {expiration}  |  {chain_note}",
+        ]
+        if vix and vix.get("vix"):
+            v    = vix["vix"]
+            v9d  = vix.get("vix9d")
+            term = vix.get("term", "")
+            t_str = {"inverted": " 🚨 INVERTED", "normal": " ✅ normal", "flat": " flat"}.get(term, "")
+            v9d_s = f"  VIX9D: {v9d}{t_str}" if v9d else ""
+            lines.append(f"VIX: {v}{v9d_s}")
+
+        # ════════════ EXPECTED RANGE over DTE ════════════
+        lines += [
+            "",
+            "─" * 32,
+            f"📐 EXPECTED MOVE  ({dte} calendar days)",
+            f"  1σ (68%):  🐂 ${em['bull_1sd']:.2f}  ←  ${spot:.2f}  →  🐻 ${em['bear_1sd']:.2f}",
+            f"             ±${em['em_1sd']:.2f}  ({em['em_pct_1sd']:.2f}%)",
+            f"  2σ (95%):  🐂 ${em['bull_2sd']:.2f}  ←→  🐻 ${em['bear_2sd']:.2f}",
+            f"             ±${em['em_2sd']:.2f}",
+        ]
+
+        # ════════════ DEALER FLOW (liquid only) ════════════
+        if liquid and eng:
+            tgex    = eng.get("gex", 0)
+            dex     = eng.get("dex", 0)
+            vanna_m = eng.get("vanna", 0)
+            charm_m = eng.get("charm", 0)
+            flip    = eng.get("flip_price")
+            regime  = eng.get("regime", {})
+
+            gex_icon = "🧲" if tgex >= 0 else "⚡"
+            gex_mode = "SUPPRESSING (range-bound)" if tgex >= 0 else "AMPLIFYING (trending)"
+            dex_note = "dealers SHORT → BUY on rallies" if dex < 0 else "dealers LONG → SELL on drops"
+
+            lines += [
+                "",
+                "─" * 32,
+                "⚙️ DEALER FLOW",
+                f"  {gex_icon} GEX:   {'+'if tgex>=0 else ''}{tgex:.1f}M  —  {gex_mode}",
+                f"  📍 Flip:  ${flip:.2f}" if flip else "  📍 Flip:  not found",
+                f"  📊 DEX:   {dex:+.1f}M  —  {dex_note}",
+                f"  🌊 Vanna: {vanna_m:+.1f}M  |  Charm: {charm_m:+.1f}M",
+            ]
+            if regime.get("preferred"):
+                lines.append(f"  ✅ Favors: {regime['preferred']}")
+            if regime.get("avoid"):
+                lines.append(f"  ❌ Avoid:  {regime['avoid']}")
+
+        # ════════════ KEY LEVELS ════════════
+        if walls:
+            lines += ["", "─" * 32, "🧱 KEY LEVELS"]
+
+            if "call_wall" in walls:
+                cw    = walls["call_wall"]
+                cw_oi = walls["call_wall_oi"]
+                dist  = ((cw - spot) / spot) * 100
+                in_1  = cw <= em["bull_1sd"]
+                tag   = "inside 1σ — strong cap" if in_1 else ("within 2σ" if cw <= em["bull_2sd"] else "outside 2σ")
+                lines.append(f"  📵 Resistance: ${cw:.0f}  ({cw_oi:,} OI, +{dist:.1f}%) — {tag}")
+
+            if "put_wall" in walls:
+                pw    = walls["put_wall"]
+                pw_oi = walls["put_wall_oi"]
+                dist  = ((spot - pw) / spot) * 100
+                in_1  = pw >= em["bear_1sd"]
+                tag   = "inside 1σ — strong floor" if in_1 else ("within 2σ" if pw >= em["bear_2sd"] else "outside 2σ")
+                lines.append(f"  🛡️ Support:    ${pw:.0f}  ({pw_oi:,} OI, -{dist:.1f}%) — {tag}")
+
+            if "gamma_wall" in walls and liquid:
+                gw = walls["gamma_wall"]
+                lines.append(f"  🎯 Gamma Wall: ${gw:.0f}  — dealer hedging magnet")
+
+            if "call_top3" in walls:
+                ct3 = " → ".join(f"${x:.0f}" for x in walls["call_top3"])
+                lines.append(f"  📵 Resistance cluster: {ct3}")
+            if "put_top3" in walls:
+                pt3 = " → ".join(f"${x:.0f}" for x in walls["put_top3"])
+                lines.append(f"  🛡️ Support cluster:    {pt3}")
+
+        # ════════════ SENTIMENT ════════════
+        skew_str = ""
+        if skew and "call_iv" in skew and "put_iv" in skew:
+            diff     = skew["put_iv"] - skew["call_iv"]
+            skew_str = f"  IV Skew: Calls {skew['call_iv']}% / Puts {skew['put_iv']}%  ({diff:+.1f}pp {'fear' if diff > 0 else 'greed'})"
+
+        pcr_oi_s  = f"OI {pcr['pcr_oi']:.2f}"   if pcr and pcr.get("pcr_oi")  is not None else "OI n/a"
+        pcr_vol_s = f"Vol {pcr['pcr_vol']:.2f}"  if pcr and pcr.get("pcr_vol") is not None else "Vol n/a"
+
+        lines += [
+            "",
+            "─" * 32,
+            "📊 SENTIMENT",
+            f"  PCR: {pcr_oi_s}  |  {pcr_vol_s}",
+        ]
+        if skew_str:
+            lines.append(skew_str)
+
+        # ════════════ DIRECTIONAL LEAN ════════════
+        strength_str = f"  [{bias['strength']}]" if bias.get("strength") else ""
+        score_str    = f"{bias['score']:+d}/{bias.get('max_score', 14)}"
+        dot_bar      = ("▲" * bias["up_count"]) + ("▼" * bias["down_count"]) + ("◆" * bias["neu_count"])
+
+        lines += [
+            "",
+            "═" * 32,
+            f"{dir_emoji}  OUTLOOK: {bias['direction']}{strength_str}",
+            f"Score: {score_str}  |  {dot_bar}",
+            f"  ▲ {bias['up_count']} bullish  ·  ▼ {bias['down_count']} bearish  ·  ◆ {bias['neu_count']} neutral",
+            "",
+            f"📋 {bias['verdict']}",
+            "",
+            "── Signal Breakdown ──",
+        ]
+        for arrow, text in bias["signals"]:
+            lines.append(f"  {arrow}  {text}")
+
+        lines += [
+            "═" * 32,
+            "",
+            f"💡 {iv_note}",
+            f"📌 This is a monitoring card — no trade recommended.",
+            "— Not financial advice —",
+        ]
+
+        post_to_telegram("\n".join(lines))
+        log.info(
+            f"Monitor card: {ticker} | mode={mode} | exp={expiration} | DTE={dte} | "
+            f"IV={iv_pct:.1f}% | EM=±{em['em_1sd']} | lean={bias['direction']} | score={bias['score']}"
+        )
+
+    except Exception as e:
+        log.error(f"Monitor card error for {ticker} mode={mode}: {e}", exc_info=True)
+        post_to_telegram(f"⚠️ Monitor card failed for {ticker}: {type(e).__name__}")
 
 
 def _em_scheduler():
