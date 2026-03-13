@@ -345,6 +345,8 @@ class OptionRow:
 @dataclass
 class ScheduledEvent:
     name:str;days_until:float;implied_move:float;confidence:float=0.8
+    product:str=""  # e.g. "SPX","AAPL","QQQ" — for product-specific filtering
+    event_type:str="generic"  # "earnings","fomc","cpi","expiry","dividend" — affects variance model
 
 @dataclass
 class MarketContext:
@@ -394,21 +396,50 @@ class TradeSignEngine:
     @staticmethod
     def detect_sweeps(row): return sum(1 for tc in(row.trades or[])if tc.is_sweep)
     @staticmethod
-    def infer_spread_legs(rows,tol=500):
+    def classify_opening_closing(row):
+        """Per-row opening vs closing classification using OI change + volume.
+        Returns: ('opening'|'closing'|'mixed', confidence 0-1)"""
+        if row.oi_change is None or row.volume==0: return 'mixed',0.3
+        ratio=row.oi_change/max(row.volume,1)
+        if ratio>0.5: return 'opening',min(0.5+ratio*0.4,0.95)
+        if ratio<-0.3: return 'closing',min(0.5+abs(ratio)*0.4,0.90)
+        return 'mixed',0.4
+    @staticmethod
+    def infer_spread_legs(rows,volume_tol=0.20,max_strike_gap_pct=0.10):
+        """Multi-signal spread detection: same expiry + matching volume ± tol +
+        opposite or same type + reasonable strike gap. Returns groups of indices.
+        Spread legs get a confidence penalty since net dealer exposure is partial."""
         groups=[];used=set()
         for i,r1 in enumerate(rows):
             if i in used: continue
             g=[i]
             for j,r2 in enumerate(rows):
-                if j<=i or j in used or r1.days_to_exp!=r2.days_to_exp: continue
-                if abs(r1.volume-r2.volume)<=max(r1.volume,r2.volume)*0.15: g.append(j)
+                if j<=i or j in used: continue
+                # Must share expiry
+                if r1.days_to_exp!=r2.days_to_exp: continue
+                # Volume must match within tolerance
+                v1,v2=max(r1.volume,1),max(r2.volume,1)
+                if abs(v1-v2)/max(v1,v2)>volume_tol: continue
+                # Strike gap must be reasonable
+                mid=max(r1.underlying_price,1)
+                if abs(r1.strike-r2.strike)/mid>max_strike_gap_pct: continue
+                # Must be different strikes (same strike = not a spread)
+                if r1.strike==r2.strike and r1.option_type==r2.option_type: continue
+                g.append(j)
             if len(g)>1:
                 for idx in g: used.add(idx)
                 groups.append(g)
         return groups
     @staticmethod
     def enrich_rows(rows):
-        for r in rows: s,c=TradeSignEngine.classify_row(r);r.inferred_side=s;r.dealer_sign_confidence=c
+        """Classify each row, detect spreads, and penalize confidence on spread legs."""
+        for r in rows:
+            s,c=TradeSignEngine.classify_row(r);r.inferred_side=s;r.dealer_sign_confidence=c
+        # Detect spread legs and reduce confidence (net exposure is ambiguous on spreads)
+        spread_groups=TradeSignEngine.infer_spread_legs(rows)
+        for group in spread_groups:
+            for idx in group:
+                rows[idx].dealer_sign_confidence*=0.6  # penalize: spread leg = less certain dealer sign
         return rows
 
 # ── 11. HELPERS ──────────────────────────────────────────────────
@@ -425,16 +456,20 @@ class ExposureEngine:
     def __init__(self,r=0.04,vol_surface=None,sabr_params=None):
         self.r=r;self.vol_surface=vol_surface;self.sabr_params=sabr_params;self._ivc={}
     def resolve_iv(self,S,K,T,q,row_iv):
-        """Unified IV: SVI -> SABR -> row fallback. Used by exposure AND ladder."""
+        """Unified IV: SVI -> SABR -> row fallback. Used by exposure AND ladder.
+        SVI is tried first; if it fails or is absent, SABR is tried; then row IV.
+        This is a priority stack, not mutual exclusion — SABR can catch SVI failures."""
         ck=(round(S,4),round(K,4),round(T,8),round(q,6))
         if ck in self._ivc: return self._ivc[ck]
-        res=max(row_iv,1e-8)
+        res=max(row_iv,1e-8);resolved=False
         if self.vol_surface:
-            try: res=self.vol_surface.implied_vol(K,S,T,self.r,q)
+            try: res=self.vol_surface.implied_vol(K,S,T,self.r,q);resolved=True
             except: pass
-        elif self.sabr_params:
+        if not resolved and self.sabr_params:
             ts=sorted(self.sabr_params.keys());nt=min(ts,key=lambda t:abs(t-T),default=None)
-            if nt is not None: res=self.sabr_params[nt].implied_vol(S*math.exp((self.r-q)*T),K,T)
+            if nt is not None:
+                try: res=self.sabr_params[nt].implied_vol(S*math.exp((self.r-q)*T),K,T);resolved=True
+                except: pass
         self._ivc[ck]=res;return res
     def clear_cache(self): self._ivc.clear()
     def _enrich(self,row):
@@ -471,6 +506,10 @@ class ExposureEngine:
         gw=max(bs,key=lambda k:abs(bs[k]["gex"]),default=None);vt=max(bs,key=lambda k:abs(bs[k]["volga"]),default=None)
         return{"enriched":enriched,"by_strike":bs,"net":{"gex":net["gex"],"dex":net["dex"],"vanna":net["vanna_exp"],"charm":net["charm_exp"],"volga":net["volga_exp"],"speed":net["speed_exp"],"theta":net["theta_exp"],"rho":net["rho_exp"]},"walls":{"call_wall":cw,"put_wall":pw,"gamma_wall":gw,"vol_trigger":vt},"units":UNITS}
     def _mk(self,r,sp,dto=0):
+        """Create shifted OptionRow for sweep/decay/scenario.
+        DESIGN: vendor Greek overrides (delta, gamma, etc.) are intentionally NOT carried
+        over because shifting spot or DTE invalidates them. Model Greeks are recalculated
+        at the new (spot, T) by _enrich(). This is the correct behavior for sweeps."""
         return OptionRow(option_type=r.option_type,strike=r.strike,days_to_exp=max(r.days_to_exp-dto,0.01),iv=r.iv,open_interest=r.open_interest,underlying_price=sp,contract_size=r.contract_size,volume=r.volume,dividend_yield=r.dividend_yield,exercise_style=r.exercise_style,bid=r.bid,ask=r.ask,last=r.last,oi_change=r.oi_change,dealer_sign_confidence=r.dealer_sign_confidence,inferred_side=r.inferred_side)
     def _fz(self,pts):
         for i in range(1,len(pts)):
@@ -524,21 +563,30 @@ def term_structure(rows,engine,buckets=None):
 # ── 14. EVENT-VOL LAYER ─────────────────────────────────────────
 
 class EventVolEngine:
+    # Event-type variance multipliers: earnings are spikier, macro is more diffuse
+    _TYPE_SCALE={"earnings":1.0,"fomc":0.85,"cpi":0.80,"expiry":0.60,"dividend":0.30,"generic":0.90}
     @staticmethod
-    def event_variance(e): return(e.implied_move**2)*e.confidence
+    def event_variance(e):
+        scale=EventVolEngine._TYPE_SCALE.get(e.event_type,0.90)
+        return(e.implied_move**2)*e.confidence*scale
     @staticmethod
-    def adjust_iv(base_iv,T,events=None):
+    def adjust_iv(base_iv,T,events=None,product=None):
+        """Add event variance. If product is specified, only include matching events."""
         if not events: return base_iv
-        bv=base_iv**2*T;ev=sum(EventVolEngine.event_variance(e)for e in events if e.days_until<=T*365)
+        bv=base_iv**2*T
+        ev=sum(EventVolEngine.event_variance(e)for e in events
+               if e.days_until<=T*365 and(product is None or not e.product or e.product==product))
         return safe_sqrt((bv+ev)/max(T,1e-8))
     @staticmethod
-    def strip_event_vol(total_iv,T,events=None):
+    def strip_event_vol(total_iv,T,events=None,product=None):
         if not events: return total_iv
-        tv=total_iv**2*T;ev=sum(EventVolEngine.event_variance(e)for e in events if e.days_until<=T*365)
+        tv=total_iv**2*T
+        ev=sum(EventVolEngine.event_variance(e)for e in events
+               if e.days_until<=T*365 and(product is None or not e.product or e.product==product))
         return safe_sqrt(max(tv-ev,0)/max(T,1e-8))
     @staticmethod
-    def event_adjusted_expected_move(S,base_iv,T,events=None):
-        ai=EventVolEngine.adjust_iv(base_iv,T,events)
+    def event_adjusted_expected_move(S,base_iv,T,events=None,product=None):
+        ai=EventVolEngine.adjust_iv(base_iv,T,events,product)
         return{"base_move":expected_move_from_iv(S,base_iv,T),"adjusted_move":expected_move_from_iv(S,ai,T),"base_iv":base_iv,"adjusted_iv":ai}
 
 # ── 15. BARRIER / PATH MODEL ────────────────────────────────────
@@ -546,7 +594,10 @@ class EventVolEngine:
 class BarrierModel:
     @staticmethod
     def analytic_touch(S,H,T,r,q,sigma):
-        """Continuous-monitoring barrier-touch via reflection principle."""
+        """Continuous-monitoring barrier-touch via reflection principle.
+        NOTE: This assumes flat vol (GBM). For skew-consistent touch probabilities,
+        use monte_carlo_touch with a calibrated local vol or stochastic vol model.
+        The analytic result is a clean lower bound for most skew regimes."""
         if sigma<=0 or T<=0: return 0
         if H==S: return 1
         sigma=max(sigma,1e-8);T=max(T,1e-8)
@@ -559,7 +610,12 @@ class BarrierModel:
         else: p=norm_cdf(a)+pw*norm_cdf(-b)
         return clamp(p,0,1)
     @staticmethod
-    def monte_carlo_touch(S,H,T,r,q,sigma,n_paths=10000,n_steps=252,jump_intensity=0,jump_mean=0,jump_std=0,seed=None):
+    def skew_adjusted_touch(S,H,T,r,q,atm_sigma,barrier_sigma):
+        """Use barrier-strike IV (not ATM IV) for more accurate touch probability.
+        barrier_sigma should be the IV at strike=H from the vol surface."""
+        return BarrierModel.analytic_touch(S,H,T,r,q,barrier_sigma)
+    @staticmethod
+    def monte_carlo_touch(S,H,T,r,q,sigma,n_paths=10000,n_steps=252,jump_intensity=0,jump_mean=0,jump_std=0,seed=None,product_type="equity"):
         """MC touch with optional Merton jump-diffusion."""
         if seed is not None: random.seed(seed)
         dt=T/n_steps;sdt=math.sqrt(dt);drift=(r-q-0.5*sigma**2)*dt
@@ -664,16 +720,48 @@ class LiquidityEngine:
         return clamp(s,0.75,1.30)
     @staticmethod
     def calibrated_impact(net,ctx):
-        spot=ctx.spot;gc=clamp(-net["gex"]/max(spot**2*80000,1),-0.35,0.35)
-        vc=clamp(net["vanna"]/max(spot*8e6,1),-0.12,0.12);cc=clamp(net["charm"]/max(spot*8e6,1),-0.10,0.10)
-        base=1+gc+0.5*vc+0.4*cc
-        if ctx.intraday_return_vol is not None and ctx.intraday_return_vol>0:
-            base=1+(base-1)*clamp(ctx.intraday_return_vol/0.01,0.5,2.0)
+        """Semi-calibrated impact model. Uses realized spread, return vol, and
+        ADV participation to estimate an impact coefficient, then applies
+        dealer flow pressure through that coefficient.
+        Falls back to heuristic tiers only when calibration inputs are absent."""
+        spot=ctx.spot
+        # Step 1: Estimate impact coefficient eta ($ move per $ flow)
+        # Almgren-Chriss style: eta ~ sigma_daily / sqrt(ADV)
+        # We use intraday return vol as sigma proxy
+        eta=None
+        if ctx.intraday_return_vol is not None and ctx.avg_daily_dollar_volume is not None:
+            sigma_d=max(ctx.intraday_return_vol,1e-6)
+            adv=max(ctx.avg_daily_dollar_volume,1e6)
+            eta=sigma_d/math.sqrt(adv)*1e4  # normalize to sensible scale
+        # Step 2: Realized spread adjustment
+        spread_adj=1.0
+        if ctx.bid_ask_spread_pct is not None:
+            # Wider spread = less resilient book = more impact
+            spread_adj=1.0+clamp((ctx.bid_ask_spread_pct-0.001)*50,-0.15,0.20)
+        # Step 3: Depth adjustment
+        depth_adj=1.0
+        if ctx.orderbook_depth_dollars is not None:
+            # Thinner book = more impact
+            depth_adj=clamp(1e9/max(ctx.orderbook_depth_dollars,1e6),0.80,1.25)
+        # Step 4: ADV participation adjustment
+        part_adj=1.0
         if ctx.intraday_dollar_volume is not None and ctx.avg_daily_dollar_volume is not None:
-            p=ctx.intraday_dollar_volume/max(ctx.avg_daily_dollar_volume,1)
-            if p<0.2: base*=1.05
-            elif p>0.6: base*=0.95
-        return clamp(base,0.70,1.50)
+            part=ctx.intraday_dollar_volume/max(ctx.avg_daily_dollar_volume,1)
+            part_adj=1.0+clamp((0.35-part)*0.3,-0.10,0.10)  # low participation = more impact
+        # Step 5: Flow pressure through coefficient
+        if eta is not None:
+            # Use calibrated coefficient
+            gex_pressure=clamp(-net["gex"]*eta/max(spot,1),-0.40,0.40)
+            vanna_pressure=clamp(net["vanna"]*eta*0.3/max(spot,1),-0.15,0.15)
+            charm_pressure=clamp(net["charm"]*eta*0.2/max(spot,1),-0.12,0.12)
+        else:
+            # Fallback: original heuristic
+            gex_pressure=clamp(-net["gex"]/max(spot**2*80000,1),-0.35,0.35)
+            vanna_pressure=clamp(net["vanna"]/max(spot*8e6,1),-0.12,0.12)
+            charm_pressure=clamp(net["charm"]/max(spot*8e6,1),-0.10,0.10)
+        base=1.0+gex_pressure+0.5*vanna_pressure+0.4*charm_pressure
+        base*=spread_adj*depth_adj*part_adj
+        return clamp(base,0.65,1.55)
 
 class VolatilityRegimeEngine:
     @staticmethod
@@ -722,19 +810,23 @@ class InstitutionalExpectationEngine:
         return ld
     def snapshot(self,rows,ctx):
         if not rows: return{}
-        TradeSignEngine.enrich_rows(rows)
-        if ctx.recent_bars and ctx.realized_vol_20d is None:
+        # Pure: enrich copies, don't mutate originals
+        enriched_rows=[OptionRow(option_type=r.option_type,strike=r.strike,days_to_exp=r.days_to_exp,iv=r.iv,open_interest=r.open_interest,underlying_price=r.underlying_price,contract_size=r.contract_size,volume=r.volume,dividend_yield=r.dividend_yield,exercise_style=r.exercise_style,bid=r.bid,ask=r.ask,last=r.last,oi_change=r.oi_change,trades=r.trades,inferred_side=r.inferred_side,dealer_sign_confidence=r.dealer_sign_confidence,delta=r.delta,gamma=r.gamma,vanna=r.vanna,charm=r.charm,volga=r.volga,speed=r.speed,theta=r.theta,rho=r.rho)for r in rows]
+        TradeSignEngine.enrich_rows(enriched_rows)
+        # Compute RV locally — never mutate ctx
+        rv20=ctx.realized_vol_20d;rv10=ctx.realized_vol_10d;rv5=ctx.realized_vol_5d
+        if ctx.recent_bars and rv20 is None:
             rv=RealizedVolEngine.multi_window(ctx.recent_bars)
-            if rv.get("rv_20d"): ctx.realized_vol_20d=rv["rv_20d"]
-            if rv.get("rv_10d"): ctx.realized_vol_10d=rv["rv_10d"]
-            if rv.get("rv_5d"): ctx.realized_vol_5d=rv["rv_5d"]
-        nr=[OptionRow(option_type=r.option_type,strike=r.strike,days_to_exp=r.days_to_exp,iv=r.iv,open_interest=r.open_interest,underlying_price=ctx.spot,contract_size=r.contract_size,volume=r.volume,dividend_yield=r.dividend_yield,exercise_style=r.exercise_style,delta=r.delta,gamma=r.gamma,vanna=r.vanna,charm=r.charm,volga=r.volga,speed=r.speed,theta=r.theta,rho=r.rho,bid=r.bid,ask=r.ask,last=r.last,oi_change=r.oi_change,trades=r.trades,inferred_side=r.inferred_side,dealer_sign_confidence=r.dealer_sign_confidence)for r in rows]
+            if rv.get("rv_20d"): rv20=rv["rv_20d"]
+            if rv.get("rv_10d"): rv10=rv["rv_10d"]
+            if rv.get("rv_5d"): rv5=rv["rv_5d"]
+        nr=[OptionRow(option_type=r.option_type,strike=r.strike,days_to_exp=r.days_to_exp,iv=r.iv,open_interest=r.open_interest,underlying_price=ctx.spot,contract_size=r.contract_size,volume=r.volume,dividend_yield=r.dividend_yield,exercise_style=r.exercise_style,delta=r.delta,gamma=r.gamma,vanna=r.vanna,charm=r.charm,volga=r.volga,speed=r.speed,theta=r.theta,rho=r.rho,bid=r.bid,ask=r.ask,last=r.last,oi_change=r.oi_change,trades=r.trades,inferred_side=r.inferred_side,dealer_sign_confidence=r.dealer_sign_confidence)for r in enriched_rows]
         exp=self.ee.compute(nr);ivs=UnifiedIVSurface(nr,self.ee);pos=PositioningEngine.estimate_opening_pressure(nr)
         riv=ivs.representative_iv(ctx.spot);rdte=ivs.representative_dte();T=year_fraction(rdte);ev=ctx.events
         aiv=EventVolEngine.adjust_iv(riv,T,ev)if ev else riv
         r1s=expected_move_from_iv(ctx.spot,riv,T);a1b=expected_move_from_iv(ctx.spot,aiv,T)
         fm=LiquidityEngine.calibrated_impact(exp["net"],ctx);lm=LiquidityEngine.liquidity_score(ctx)
-        rm=VolatilityRegimeEngine.regime_multiplier(aiv,ctx.realized_vol_20d)
+        rm=VolatilityRegimeEngine.regime_multiplier(aiv,rv20)
         sm=1.0
         if ctx.is_0dte: sm=0.85+0.30*clamp(1-ctx.session_progress,0,1)
         a1s=a1b*fm*lm*rm*sm;pr=self._ps(exp["net"],ctx.spot,pos);bias=self._bl(pr)
@@ -746,13 +838,13 @@ class InstitutionalExpectationEngine:
             for x in ladder:
                 if abs(x["strike"]-strike)<1e-9: return x
             return None
-        vrp20=VolatilityRegimeEngine.compute_vrp(aiv,ctx.realized_vol_20d)
-        vrp10=VolatilityRegimeEngine.compute_vrp(aiv,ctx.realized_vol_10d)
-        vrp5=VolatilityRegimeEngine.compute_vrp(aiv,ctx.realized_vol_5d)
+        vrp20=VolatilityRegimeEngine.compute_vrp(aiv,rv20)
+        vrp10=VolatilityRegimeEngine.compute_vrp(aiv,rv10)
+        vrp5=VolatilityRegimeEngine.compute_vrp(aiv,rv5)
         reg=composite_regime(exp["net"]);decay=DecaySimulator(self.ee).project(nr,5);ts=term_structure(nr,self.ee)
         nb=sum(1 for r in nr if r.inferred_side==TradeSide.BUY);ns=sum(1 for r in nr if r.inferred_side==TradeSide.SELL)
         ac=sum(r.dealer_sign_confidence for r in nr)/max(len(nr),1)
-        return{"spot":round(ctx.spot,2),"representative_iv":round(riv,4),"event_adjusted_iv":round(aiv,4),"representative_dte":round(rdte,2),"raw_expected_move":{"move_1sigma":round(r1s,2),"move_2sigma":round(r1s*2,2),"range_1sigma":{"low":round(ctx.spot-r1s,2),"high":round(ctx.spot+r1s,2)}},"adjusted_expectation":{"move_1sigma":round(a1s,2),"move_2sigma":round(a1s*2,2),"expected_center":round(ec,2),"expected_low":round(ec-a1s,2),"expected_high":round(ec+a1s,2),"bias_score":round(pr,3),"bias":bias},"multipliers":{"flow":round(fm,3),"liquidity":round(lm,3),"vrp":round(rm,3),"session":round(sm,3)},"dealer_flows":{**{k:round(v,2)for k,v in exp["net"].items()},"gex_regime":self._gl(exp["net"]["gex"]),"gamma_flip":gf,"vanna_flip":vf},"trade_sign":{"inferred_buy_rows":nb,"inferred_sell_rows":ns,"avg_confidence":round(ac,3)},"regime":reg,"volatility_regime":{"realized_vol_20d":None if ctx.realized_vol_20d is None else round(ctx.realized_vol_20d,4),"realized_vol_10d":None if ctx.realized_vol_10d is None else round(ctx.realized_vol_10d,4),"realized_vol_5d":None if ctx.realized_vol_5d is None else round(ctx.realized_vol_5d,4),"vrp_20d":None if vrp20 is None else round(vrp20,4),"vrp_10d":None if vrp10 is None else round(vrp10,4),"vrp_5d":None if vrp5 is None else round(vrp5,4),"label":VolatilityRegimeEngine.regime_label(aiv,ctx.realized_vol_20d)},"positioning":pos,"walls":{"call_wall":walls["call_wall"],"put_wall":walls["put_wall"],"gamma_wall":walls["gamma_wall"],"vol_trigger":walls.get("vol_trigger"),"call_wall_stats":None if walls["call_wall"]is None else bst[walls["call_wall"]],"put_wall_stats":None if walls["put_wall"]is None else bst[walls["put_wall"]],"gamma_wall_stats":None if walls["gamma_wall"]is None else bst[walls["gamma_wall"]]},"wall_probabilities":{"call_wall":fl(walls["call_wall"]),"put_wall":fl(walls["put_wall"]),"gamma_wall":fl(walls["gamma_wall"])},"strike_probability_ladder":ladder,"decay_path":decay,"term_structure":ts,"units":UNITS}
+        return{"spot":round(ctx.spot,2),"representative_iv":round(riv,4),"event_adjusted_iv":round(aiv,4),"representative_dte":round(rdte,2),"raw_expected_move":{"move_1sigma":round(r1s,2),"move_2sigma":round(r1s*2,2),"range_1sigma":{"low":round(ctx.spot-r1s,2),"high":round(ctx.spot+r1s,2)}},"adjusted_expectation":{"move_1sigma":round(a1s,2),"move_2sigma":round(a1s*2,2),"expected_center":round(ec,2),"expected_low":round(ec-a1s,2),"expected_high":round(ec+a1s,2),"bias_score":round(pr,3),"bias":bias},"multipliers":{"flow":round(fm,3),"liquidity":round(lm,3),"vrp":round(rm,3),"session":round(sm,3)},"dealer_flows":{**{k:round(v,2)for k,v in exp["net"].items()},"gex_regime":self._gl(exp["net"]["gex"]),"gamma_flip":gf,"vanna_flip":vf},"trade_sign":{"inferred_buy_rows":nb,"inferred_sell_rows":ns,"avg_confidence":round(ac,3)},"regime":reg,"volatility_regime":{"realized_vol_20d":None if rv20 is None else round(rv20,4),"realized_vol_10d":None if rv10 is None else round(rv10,4),"realized_vol_5d":None if rv5 is None else round(rv5,4),"vrp_20d":None if vrp20 is None else round(vrp20,4),"vrp_10d":None if vrp10 is None else round(vrp10,4),"vrp_5d":None if vrp5 is None else round(vrp5,4),"label":VolatilityRegimeEngine.regime_label(aiv,rv20)},"positioning":pos,"walls":{"call_wall":walls["call_wall"],"put_wall":walls["put_wall"],"gamma_wall":walls["gamma_wall"],"vol_trigger":walls.get("vol_trigger"),"call_wall_stats":None if walls["call_wall"]is None else bst[walls["call_wall"]],"put_wall_stats":None if walls["put_wall"]is None else bst[walls["put_wall"]],"gamma_wall_stats":None if walls["gamma_wall"]is None else bst[walls["gamma_wall"]]},"wall_probabilities":{"call_wall":fl(walls["call_wall"]),"put_wall":fl(walls["put_wall"]),"gamma_wall":fl(walls["gamma_wall"])},"strike_probability_ladder":ladder,"decay_path":decay,"term_structure":ts,"units":UNITS}
     def institutional_card(self,rows,ctx):
         s=self.snapshot(rows,ctx)
         if not s: return"No data."
