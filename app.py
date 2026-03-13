@@ -1599,18 +1599,21 @@ def _get_next_trading_day(from_date) -> str:
 
 def _get_0dte_iv(ticker: str, target_date_str: str = None) -> tuple:
     """
-    Fetch ATM IV from a specific expiration date's options chain.
+    Fetch ATM IV and OI wall data from a specific expiration date's options chain.
     target_date_str: "YYYY-MM-DD" — defaults to today.
-    Returns (iv, spot, expiration) or (None, None, None) on failure.
+    Returns (iv, spot, expiration, walls) or (None, None, None, None) on failure.
 
-    For the afternoon card we pass tomorrow's date so we get next-day IV.
-    If no chain exists for that exact date (e.g. holiday), falls back to
-    the nearest available expiration on or after target_date_str.
+    walls = {
+        "call_wall":    strike (float),
+        "call_wall_oi": open interest (int),
+        "put_wall":     strike (float),
+        "put_wall_oi":  open interest (int),
+    }
     """
     try:
-        spot = get_spot(ticker)
+        spot      = get_spot(ticker)
         today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        target = target_date_str or today_utc
+        target    = target_date_str or today_utc
 
         # Try exact target date first
         data = md_get(
@@ -1620,31 +1623,33 @@ def _get_0dte_iv(ticker: str, target_date_str: str = None) -> tuple:
 
         if not isinstance(data, dict) or data.get("s") != "ok" or not data.get("optionSymbol"):
             # Fall back to nearest expiration on or after target
-            exps = get_expirations(ticker)
+            exps        = get_expirations(ticker)
             future_exps = [e for e in exps if e >= target]
             if not future_exps:
-                return None, None, None
+                return None, None, None, None, {}
             target = future_exps[0]
-            data = md_get(
+            data   = md_get(
                 f"https://api.marketdata.app/v1/options/chain/{ticker}/",
                 {"expiration": target},
             )
             if not isinstance(data, dict) or data.get("s") != "ok":
-                return None, None, None
+                return None, None, None, None, {}
 
         sym_list = data.get("optionSymbol") or []
         if not sym_list:
-            return None, None, None
+            return None, None, None, None, {}
 
         n = len(sym_list)
         def col(name, default=None):
             v = data.get(name, default)
             return v if isinstance(v, list) else [default] * n
 
-        strikes = col("strike", None)
-        iv_list = col("iv",     None)
+        strikes = col("strike",       None)
+        iv_list = col("iv",           None)
+        oi_list = col("openInterest",  0)
+        sides   = col("side",         "")
 
-        # ATM = within 0.5% of spot; widen to 1% if nothing found
+        # ── ATM IV: within 0.5% of spot; widen to 1% if nothing found ──
         atm_ivs = []
         for pct in (0.005, 0.01):
             atm_range = spot * pct
@@ -1657,14 +1662,172 @@ def _get_0dte_iv(ticker: str, target_date_str: str = None) -> tuple:
                 break
 
         if not atm_ivs:
-            return None, spot, target
+            return None, spot, target, None, {}
 
-        avg_iv = sum(atm_ivs) / len(atm_ivs)
-        return round(avg_iv, 4), spot, target
+        avg_iv = round(sum(atm_ivs) / len(atm_ivs), 4)
+        walls  = _find_oi_walls(strikes, oi_list, sides, n)
+        skew   = _get_atm_skew(strikes, iv_list, sides, n, spot)
+
+        return avg_iv, spot, target, walls, skew
 
     except Exception as e:
         log.warning(f"0DTE IV fetch failed for {ticker} (target={target_date_str}): {e}")
-        return None, None, None
+        return None, None, None, None, {}
+
+
+def _find_oi_walls(strikes, oi_list, sides, n: int) -> dict:
+    """
+    Find the call wall (highest call OI strike) and put wall (highest put OI strike).
+    Returns dict with call_wall, call_wall_oi, put_wall, put_wall_oi — or None.
+    """
+    call_oi: dict = {}
+    put_oi:  dict = {}
+
+    for i in range(n):
+        strike = as_float(strikes[i], 0)
+        oi     = int(as_float(oi_list[i], 0))
+        side   = str(sides[i] or "").lower()
+        if strike <= 0 or oi <= 0:
+            continue
+        if side == "call":
+            call_oi[strike] = call_oi.get(strike, 0) + oi
+        elif side == "put":
+            put_oi[strike]  = put_oi.get(strike, 0) + oi
+
+    result = {}
+    if call_oi:
+        cw = max(call_oi, key=call_oi.get)
+        result["call_wall"]    = cw
+        result["call_wall_oi"] = call_oi[cw]
+    if put_oi:
+        pw = max(put_oi, key=put_oi.get)
+        result["put_wall"]    = pw
+        result["put_wall_oi"] = put_oi[pw]
+
+    return result if result else None
+
+
+def _get_atm_skew(strikes, iv_list, sides, n: int, spot: float) -> dict:
+    """
+    Compare ATM call IV vs ATM put IV within 2% of spot.
+    Returns {"call_iv": float, "put_iv": float} or {} if insufficient data.
+    If put IV > call IV the market is paying more for downside protection (fear).
+    If call IV > put IV the market is paying more for upside (greed/momentum).
+    """
+    call_ivs = []
+    put_ivs  = []
+    atm_range = spot * 0.02
+
+    for i in range(n):
+        strike = as_float(strikes[i], 0)
+        iv     = as_float(iv_list[i], 0)
+        side   = str(sides[i] or "").lower()
+        if iv <= 0 or abs(strike - spot) > atm_range:
+            continue
+        if side == "call":
+            call_ivs.append(iv)
+        elif side == "put":
+            put_ivs.append(iv)
+
+    result = {}
+    if call_ivs:
+        result["call_iv"] = round(sum(call_ivs) / len(call_ivs) * 100, 1)
+    if put_ivs:
+        result["put_iv"]  = round(sum(put_ivs)  / len(put_ivs)  * 100, 1)
+    return result
+
+
+def _calc_bias(spot: float, em: dict, walls: dict, skew: dict) -> dict:
+    """
+    Synthesize wall structure, skew, and price position into a plain-English
+    directional lean. Returns a dict with:
+      - direction:  "BULLISH" | "BEARISH" | "NEUTRAL"
+      - score:      int  (positive = bullish, negative = bearish, out of ±4)
+      - signals:    list of (emoji, plain_english_string) tuples
+      - verdict:    one-sentence plain English summary
+    """
+    score   = 0
+    signals = []
+
+    # ── Signal 1: OI wall asymmetry (which side has more big-money hedging) ──
+    if walls and "call_wall_oi" in walls and "put_wall_oi" in walls:
+        cw_oi = walls["call_wall_oi"]
+        pw_oi = walls["put_wall_oi"]
+        ratio = pw_oi / cw_oi if cw_oi > 0 else 1.0
+        if ratio >= 1.20:
+            score += 1
+            signals.append(("▲", f"More big-money contracts protecting the downside (${pw_oi:,} vs ${cw_oi:,}) — they expect to buy dips"))
+        elif ratio <= 0.83:
+            score -= 1
+            signals.append(("▼", f"More big-money contracts protecting the upside (${cw_oi:,} vs ${pw_oi:,}) — they expect to sell rips"))
+        else:
+            signals.append(("◆", "Roughly equal hedging on both sides — no strong lean from big money"))
+
+    # ── Signal 2: Spot position relative to wall midpoint ──
+    if walls and "call_wall" in walls and "put_wall" in walls:
+        midpoint = (walls["call_wall"] + walls["put_wall"]) / 2
+        dist_pct = ((spot - midpoint) / midpoint) * 100
+        if dist_pct >= 0.15:
+            score += 1
+            signals.append(("▲", f"Price (${spot:.2f}) is above the midpoint (${midpoint:.2f}) between support and resistance — sitting closer to the ceiling"))
+        elif dist_pct <= -0.15:
+            score -= 1
+            signals.append(("▼", f"Price (${spot:.2f}) is below the midpoint (${midpoint:.2f}) between support and resistance — sitting closer to the floor"))
+        else:
+            signals.append(("◆", f"Price (${spot:.2f}) is right in the middle of the range (mid ${midpoint:.2f}) — no positional edge"))
+
+    # ── Signal 3: IV skew — which direction the market is paying more to protect ──
+    if skew and "call_iv" in skew and "put_iv" in skew:
+        diff = skew["put_iv"] - skew["call_iv"]
+        if diff >= 1.5:
+            score -= 1
+            signals.append(("▼", f"Downside protection costs more ({skew['put_iv']}% vs {skew['call_iv']}%) — market is nervous about a drop"))
+        elif diff <= -1.5:
+            score += 1
+            signals.append(("▲", f"Upside calls cost more ({skew['call_iv']}% vs {skew['put_iv']}%) — market is chasing upside"))
+        else:
+            signals.append(("◆", f"Call and put protection cost about the same ({skew.get('call_iv','?')}% / {skew.get('put_iv','?')}%) — balanced"))
+
+    # ── Signal 4: Call wall position — is there a ceiling inside the expected range? ──
+    if walls and "call_wall" in walls:
+        cw = walls["call_wall"]
+        if cw <= em["bull_1sd"]:
+            score -= 1
+            signals.append(("▼", f"Resistance ceiling (${cw:.0f}) is INSIDE the expected range — likely to cap any rally before it gets going"))
+        elif cw >= em["bull_2sd"]:
+            score += 1
+            signals.append(("▲", f"No resistance ceiling until ${cw:.0f} — well outside the expected range, nothing in the way on the upside"))
+        else:
+            signals.append(("◆", f"Resistance ceiling at ${cw:.0f} — outside normal range but reachable on a strong move"))
+
+    # ── Verdict ──
+    n_signals = len(signals)
+    if score >= 2:
+        direction = "BULLISH"
+        pct       = min(50 + score * 10, 80)
+        verdict   = f"More signals point UP than down. Not a guarantee, but the setup favors buyers."
+    elif score <= -2:
+        direction = "BEARISH"
+        pct       = min(50 + abs(score) * 10, 80)
+        verdict   = f"More signals point DOWN than up. Not a guarantee, but the setup favors sellers."
+    else:
+        direction = "NEUTRAL"
+        pct       = 50
+        verdict   = "Signals are mixed. No strong edge in either direction — range-bound day likely."
+
+    up_count   = sum(1 for e, _ in signals if e == "▲")
+    down_count = sum(1 for e, _ in signals if e == "▼")
+
+    return {
+        "direction":  direction,
+        "score":      score,
+        "pct":        pct,
+        "up_count":   up_count,
+        "down_count": down_count,
+        "n_signals":  n_signals,
+        "signals":    signals,
+        "verdict":    verdict,
+    }
 
 
 def _calc_intraday_em(spot: float, iv: float, hours_remaining: float) -> dict:
@@ -1725,7 +1888,7 @@ def _post_em_card(ticker: str, session: str):
             session_label   = "Today (Pre-Open)"
             horizon_note    = f"{hours_for_em:.1f}h remaining today"
 
-        iv, spot, expiration = _get_0dte_iv(ticker, target_date_str)
+        iv, spot, expiration, walls, skew = _get_0dte_iv(ticker, target_date_str)
 
         if iv is None or spot is None:
             log.warning(f"EM card skipped for {ticker}: could not fetch IV (target={target_date_str})")
@@ -1759,6 +1922,63 @@ def _post_em_card(ticker: str, session: str):
             f"📐 Expected Move (2σ — 95%): ±${em['em_2sd']:.2f}",
             f"  🐂 Upside:   ${em['bull_2sd']:.2f}",
             f"  🐻 Downside: ${em['bear_2sd']:.2f}",
+        ]
+
+        # ── Directional Bias ──
+        bias = _calc_bias(spot, em, walls, skew)
+
+        dir_emoji = {"BULLISH": "🟢", "BEARISH": "🔴", "NEUTRAL": "⚪"}.get(bias["direction"], "⚪")
+        dot_bar   = ("▲" * bias["up_count"]) + ("▼" * bias["down_count"]) + ("◆" * (bias["n_signals"] - bias["up_count"] - bias["down_count"]))
+
+        lines.append("")
+        lines.append(f"{'━' * 28}")
+        lines.append(f"{dir_emoji} LEAN: {bias['direction']}  ({bias['up_count']} up · {bias['down_count']} down · {bias['n_signals'] - bias['up_count'] - bias['down_count']} neutral)  {dot_bar}")
+        lines.append(f"💬 {bias['verdict']}")
+        lines.append("")
+        for arrow, text in bias["signals"]:
+            lines.append(f"  {arrow} {text}")
+        lines.append(f"{'━' * 28}")
+
+        # ── OI Walls ──
+        if walls:
+            lines.append("")
+            lines.append("🧱 OI Walls (dealer hedging levels):")
+
+            if "call_wall" in walls:
+                cw    = walls["call_wall"]
+                cw_oi = walls["call_wall_oi"]
+                if cw <= em["bull_1sd"]:
+                    cw_note = "⚠️ inside 1σ — may cap rally early"
+                elif cw <= em["bull_2sd"]:
+                    cw_note = "within 2σ — soft ceiling"
+                else:
+                    cw_note = "outside 2σ — room to run"
+                lines.append(f"  📵 Call Wall: ${cw:.0f}  ({cw_oi:,} OI) — {cw_note}")
+
+            if "put_wall" in walls:
+                pw    = walls["put_wall"]
+                pw_oi = walls["put_wall_oi"]
+                if pw >= em["bear_1sd"]:
+                    pw_note = "⚠️ inside 1σ — may cap selloff early"
+                elif pw >= em["bear_2sd"]:
+                    pw_note = "within 2σ — soft floor"
+                else:
+                    pw_note = "outside 2σ — limited downside support"
+                lines.append(f"  🛡️ Put Wall:  ${pw:.0f}  ({pw_oi:,} OI) — {pw_note}")
+
+            # Pin risk: both walls inside 1σ
+            if (
+                "call_wall" in walls and "put_wall" in walls
+                and walls["call_wall"] <= em["bull_1sd"]
+                and walls["put_wall"] >= em["bear_1sd"]
+            ):
+                pin_range = walls["call_wall"] - walls["put_wall"]
+                lines.append(f"  📌 Pin risk: walls ${walls['put_wall']:.0f}–${walls['call_wall']:.0f} (${pin_range:.0f} range)")
+        else:
+            lines.append("")
+            lines.append("🧱 OI Walls: data unavailable")
+
+        lines += [
             "",
             f"💡 {iv_note}",
             "— Not financial advice —",
@@ -1767,7 +1987,7 @@ def _post_em_card(ticker: str, session: str):
         post_to_telegram("\n".join(lines))
         log.info(
             f"EM card posted: {ticker} {session_label} spot={spot} "
-            f"IV={iv_pct:.1f}% EM=±${em['em_1sd']} exp={expiration}"
+            f"IV={iv_pct:.1f}% EM=±${em['em_1sd']} exp={expiration} walls={walls}"
         )
 
     except Exception as e:
