@@ -2782,93 +2782,188 @@ def _post_trade_card(
     is_0dte: bool = True,
 ):
     """
-    0DTE trade recommendation card.
-    Consumes already-computed bias + exposure data — no new API calls.
+    0DTE trade recommendation card — v2.
+
+    WIDTH LOGIC (fixed):
+      Width is determined by the underlying price, NOT by wall distance.
+      Walls are targets, not spread legs. This prevents absurdly wide spreads.
+
+      SPX/NDX:          $15–$25 wide
+      SPY/QQQ (>$400):  $4–$6 wide
+      High-price stocks (>$300): $5–$10 wide
+      Mid-price stocks ($50–$300): $3–$5 wide
+      Low-price stocks (<$50):    $1–$2 wide
+
+      Width is then tightened by 50% when GEX is positive (range-bound day)
+      because the expected move is being suppressed.
+
+    GATE LOGIC (blocks the trade before posting):
+      G1 — NEUTRAL bias:               no trade, sit out
+      G2 — SLIGHT with score < 2:      no trade, wait for setup
+      G3 — Flip mismatch (bull below flip OR bear above flip): no trade, wrong side
+      G4 — VIX >= 40:                  no trade, stand aside
+      G5 — GEX positive + score < 5:   downgrade to monitoring only (not enough edge
+                                        to fight dealer suppression on a 0DTE spread)
+
+    STRIKE LOGIC (fixed):
+      Long leg: ATM or first ITM strike (~0.55–0.65Δ proxy)
+        - Round to nearest $1 strike for stocks < $100
+        - Round to nearest $5 strike for ETFs and stocks $100–$500
+        - Round to nearest $25 for SPX/NDX
+      Short leg: long_strike + width (bull) or long_strike - width (bear)
+      Wall is a TARGET, not the short leg.
     """
     try:
         direction = bias.get("direction", "NEUTRAL")
         score     = bias.get("score", 0)
+        is_bull   = "BULL" in direction
 
-        # ── No trade if NEUTRAL or low conviction ──
+        tgex      = eng.get("gex", 0)      if eng else 0
+        dex       = eng.get("dex", 0)      if eng else 0
+        flip      = eng.get("flip_price")  if eng else None
+        charm_m   = eng.get("charm", 0)    if eng else 0
+        neg_gex   = tgex < 0
+        v         = vix.get("vix", 20)     if vix else 20
+
+        exp_short = expiration[5:] if expiration else "?"
+
+        def no_trade(reason: str, emoji: str = "⚪"):
+            post_to_telegram(
+                f"🎯 {ticker} — 0DTE TRADE SETUP  |  Exp: {exp_short}\n"
+                f"{emoji} NO TRADE — {reason}\n"
+                f"— Not financial advice —"
+            )
+            log.info(f"Trade card blocked: {ticker} | {reason}")
+
+        # ════════════════════════════
+        # GATE CHECKS — block before any strike math
+        # ════════════════════════════
+
+        # G1 — No directional edge
         if direction == "NEUTRAL":
-            post_to_telegram(
-                f"🎯 {ticker} TRADE SETUP\n"
-                f"⚪ Bias is NEUTRAL (score {score:+d}/14) — no directional edge.\n"
-                f"Sit this one out or use a tight iron condor between the walls if GEX is positive.\n"
-                f"— Not financial advice —"
+            no_trade(
+                f"Bias NEUTRAL (score {score:+d}/14). No directional edge.\n"
+                f"If GEX is positive and walls are tight, a small iron condor between\n"
+                f"${walls.get('put_wall','?')} and ${walls.get('call_wall','?')} could work — but no debit spread today.",
+                "⚪"
             )
             return
 
+        # G2 — Edge too thin
         if direction in ("SLIGHT BULLISH", "SLIGHT BEARISH") and abs(score) < 2:
-            post_to_telegram(
-                f"🎯 {ticker} TRADE SETUP\n"
-                f"{'🟡' if 'BULL' in direction else '🟠'} Lean is {direction} (score {score:+d}/14) — edge too thin for a directional play.\n"
-                f"Wait for a cleaner setup or a price action confirmation first.\n"
-                f"— Not financial advice —"
+            no_trade(
+                f"Lean {direction} but score is only {score:+d}/14 — edge too thin.\n"
+                f"Wait for a price action confirmation or a score of at least ±3 before entering.",
+                "🟡" if is_bull else "🟠"
             )
             return
 
-        is_bull = "BULL" in direction
+        # G3 — Flip mismatch: spot is on the wrong side of the flip for this direction
+        if flip:
+            flip_wrong = (is_bull and spot < flip) or (not is_bull and spot > flip)
+            if flip_wrong:
+                side_word = "BELOW" if is_bull else "ABOVE"
+                no_trade(
+                    f"Spot ${spot:.2f} is {side_word} the gamma flip ${flip:.2f}.\n"
+                    f"This means dealers are in AMPLIFICATION mode against your direction.\n"
+                    f"Do not enter a {'bull' if is_bull else 'bear'} spread while spot is {side_word} the flip.\n"
+                    f"Wait for spot to reclaim ${flip:.2f} before entering.",
+                    "🔴" if is_bull else "🔴"
+                )
+                return
 
-        # ── GEX regime — strategy type ──
-        tgex         = eng.get("gex", 0) if eng else 0
-        neg_gex      = tgex < 0
-        dex          = eng.get("dex", 0) if eng else 0
-        flip         = eng.get("flip_price") if eng else None
-        charm_m      = eng.get("charm", 0) if eng else 0
-        charm_tail   = charm_m > 0  # tailwind = bullish drift into close
-
-        # ── Strike selection ──
-        # Long leg: first ITM strike (~0.65 delta proxy = 1-2 strikes ITM)
-        # Short leg: the wall on our side (natural target / ceiling)
-        strike_step = 1 if ticker in ("SPX", "NDX") else 1
-
-        if is_bull:
-            # ITM call: buy strike just below spot
-            long_strike  = (int(spot) // 5) * 5   # round down to nearest $5
-            if long_strike >= spot:
-                long_strike -= 5
-            wall_strike  = walls.get("call_wall") if walls else None
-            if wall_strike and wall_strike > spot:
-                short_strike = wall_strike
-            else:
-                short_strike = long_strike + 10    # fallback $10 wide
-            spread_type  = "CALL DEBIT SPREAD"
-            option_type  = "C"
-            long_label   = f"${long_strike}C"
-            short_label  = f"${short_strike}C"
-            target1      = walls.get("gamma_wall", long_strike + (short_strike - long_strike) * 0.5)
-            target2      = short_strike
-            stop_level   = flip if (flip and flip < spot) else round(spot * 0.993, 2)
-        else:
-            # ITM put: buy strike just above spot
-            long_strike  = (int(spot) // 5) * 5
-            if long_strike <= spot:
-                long_strike += 5
-            wall_strike  = walls.get("put_wall") if walls else None
-            if wall_strike and wall_strike < spot:
-                short_strike = wall_strike
-            else:
-                short_strike = long_strike - 10
-            spread_type  = "PUT DEBIT SPREAD"
-            option_type  = "P"
-            long_label   = f"${long_strike}P"
-            short_label  = f"${short_strike}P"
-            target1      = walls.get("gamma_wall", long_strike - (long_strike - short_strike) * 0.5)
-            target2      = short_strike
-            stop_level   = flip if (flip and flip > spot) else round(spot * 1.007, 2)
-
-        width       = abs(short_strike - long_strike)
-        # Rough cost estimate: ITM debit spread on 0DTE typically costs 25-35% of width
-        cost_est    = round(width * 0.30, 2)
-        max_profit  = round(width - cost_est, 2)
-        rr          = round(max_profit / cost_est, 2) if cost_est > 0 else 0
-
-        # ── Position size from VIX + DEX confirmation ──
-        v = vix.get("vix", 20) if vix else 20
+        # G4 — VIX extreme
         if v >= 40:
-            base_pct = 0
-        elif v >= 28:
+            no_trade(
+                f"VIX {v} is extreme — EM ranges are unreliable at these levels.\n"
+                f"Stand aside until VIX drops below 35.",
+                "🚨"
+            )
+            return
+
+        # G5 — Positive GEX + weak score = suppressed moves, not enough edge
+        if not neg_gex and abs(score) < 5:
+            no_trade(
+                f"GEX is POSITIVE (+${tgex:.1f}M) and score is only {score:+d}/14.\n"
+                f"Positive GEX suppresses intraday moves — debit spreads need momentum.\n"
+                f"This setup doesn't have enough conviction to fight dealer suppression.\n"
+                f"Either wait for score ≥ ±5, or wait for GEX to flip negative.",
+                "🧲"
+            )
+            return
+
+        # ════════════════════════════
+        # WIDTH — price-based, tightened on positive GEX
+        # ════════════════════════════
+        ticker_up = ticker.upper()
+        if ticker_up in ("SPX", "NDX"):
+            base_width = 20
+            step       = 5
+        elif spot >= 400:        # SPY, QQQ, high-price ETFs
+            base_width = 5
+            step       = 1
+        elif spot >= 200:
+            base_width = 5
+            step       = 1
+        elif spot >= 100:
+            base_width = 3
+            step       = 1
+        elif spot >= 50:
+            base_width = 2
+            step       = 1
+        else:
+            base_width = 1
+            step       = 1
+
+        # Tighten on positive GEX (suppressed moves — less range to profit from)
+        width = base_width if neg_gex else max(base_width // 2, step)
+
+        # ════════════════════════════
+        # STRIKE SELECTION
+        # Long leg: first ITM strike at ~step intervals
+        # Short leg: long ± width (never the wall — wall is a target)
+        # ════════════════════════════
+        if is_bull:
+            # Round spot down to nearest step for long strike (ITM call)
+            long_strike  = (int(spot) // step) * step
+            if long_strike >= spot:
+                long_strike -= step
+            short_strike = long_strike + width
+            spread_type  = "CALL DEBIT SPREAD"
+            long_label   = f"${long_strike:.0f}C"
+            short_label  = f"${short_strike:.0f}C"
+            # Targets: gamma wall first, then call wall (if inside spread)
+            gwall = walls.get("gamma_wall")
+            cwall = walls.get("call_wall")
+            target1 = gwall if (gwall and long_strike < gwall <= short_strike) else short_strike
+            target2 = cwall if (cwall and cwall > short_strike) else None
+            stop_level = flip if flip else round(spot * (1 - 0.007), 2)
+        else:
+            # Round spot up to nearest step for long strike (ITM put)
+            long_strike  = (int(spot) // step) * step
+            if long_strike <= spot:
+                long_strike += step
+            short_strike = long_strike - width
+            spread_type  = "PUT DEBIT SPREAD"
+            long_label   = f"${long_strike:.0f}P"
+            short_label  = f"${short_strike:.0f}P"
+            gwall = walls.get("gamma_wall")
+            pwall = walls.get("put_wall")
+            target1 = gwall if (gwall and short_strike <= gwall < long_strike) else short_strike
+            target2 = pwall if (pwall and pwall < short_strike) else None
+            stop_level = flip if flip else round(spot * (1 + 0.007), 2)
+
+        actual_width = abs(short_strike - long_strike)
+        # ITM 0DTE debit spread: cost ~55–70% of width (deep ITM = higher % of width)
+        # Use 60% as a realistic mid estimate
+        cost_est   = round(actual_width * 0.60, 2)
+        max_profit = round(actual_width - cost_est, 2)
+        rr         = round(max_profit / cost_est, 2) if cost_est > 0 else 0
+
+        # ════════════════════════════
+        # SIZE — VIX tier + DEX confirmation
+        # ════════════════════════════
+        if v >= 28:
             base_pct = 25
         elif v >= 20:
             base_pct = 50
@@ -2877,61 +2972,61 @@ def _post_trade_card(
         else:
             base_pct = 100
 
-        # DEX confirmation bonus/penalty
-        dex_confirms = (is_bull and dex < -0.25) or (not is_bull and dex > 0.25)
-        dex_disagrees = (is_bull and dex > 0.25) or (not is_bull and dex < -0.25)
-        if dex_confirms and base_pct > 0:
+        dex_confirms  = (is_bull and dex < -0.25) or (not is_bull and dex > 0.25)
+        dex_disagrees = (is_bull and dex > 0.25)  or (not is_bull and dex < -0.25)
+        if dex_confirms:
             size_pct = min(base_pct + 25, 100)
-            dex_note = f"DEX confirms direction → +1 size tier"
+            dex_note = "DEX confirms direction → +1 tier"
         elif dex_disagrees:
-            size_pct = max(base_pct - 25, 0)
-            dex_note = f"DEX disagrees → -1 size tier (be careful)"
+            size_pct = max(base_pct - 25, 25)
+            dex_note = "DEX disagrees → -1 tier"
         else:
             size_pct = base_pct
-            dex_note = f"DEX neutral — no size adjustment"
+            dex_note = "DEX neutral — no adjustment"
 
-        if base_pct == 0:
-            size_note = "⛔ VIX too extreme — STAND ASIDE"
-        else:
-            size_note = f"{size_pct}% of normal position size"
-
-        # ── Entry window from Charm ──
+        # ════════════════════════════
+        # TIMING from Charm
+        # ════════════════════════════
+        charm_tail = charm_m > 0
         if charm_tail:
-            timing_note  = "Afternoon drift favors you — can hold into 2:30 PM CT"
-            timing_warn  = "Exit before 2:45 PM CT to avoid final gamma acceleration"
+            timing_note = "Charm tailwind — afternoon drift works for you. Hold into 2:30 PM CT."
+            timing_warn = "Exit by 2:45 PM CT to avoid final gamma acceleration."
         else:
-            timing_note  = "Charm headwind — EXIT by noon CT, do not hold into close"
-            timing_warn  = "⚠️ Time decay adds selling pressure as the day progresses"
+            timing_note = "Charm headwind — do NOT hold into the close."
+            timing_warn = "⚠️ EXIT by noon CT. Time decay adds selling pressure as day progresses."
 
-        # ── GEX strategy note ──
+        # ════════════════════════════
+        # GEX regime note
+        # ════════════════════════════
         if neg_gex:
-            gex_note = f"⚡ Negative GEX (${abs(tgex):.1f}M) — buy debit spreads only, dealers amplify moves"
+            gex_note = f"⚡ Negative GEX (-${abs(tgex):.1f}M) — dealers AMPLIFY moves. Debit spreads confirmed."
         else:
-            gex_note = f"🧲 Positive GEX (+${tgex:.1f}M) — consider tighter width, moves may be suppressed"
+            gex_note = f"🧲 Positive GEX (+${tgex:.1f}M) — dealers suppress moves. Width tightened to ${actual_width:.0f}."
 
-        # ── Checklist ──
-        checks = []
-        checks.append(f"{'✅' if neg_gex else '⚠️'} GEX {'negative — debit spread confirmed' if neg_gex else 'positive — reduce width or skip'}")
-        checks.append(f"✅ Score {score:+d}/14 — {'strong' if abs(score) >= 7 else 'moderate'} conviction")
+        # ════════════════════════════
+        # CHECKLIST — all pass by this point (gates already blocked failures)
+        # ════════════════════════════
+        checks = [
+            f"✅ Bias: {direction} (score {score:+d}/14)",
+            f"✅ GEX: {'negative — momentum confirmed' if neg_gex else f'positive but score ≥ 5 — proceeding with tight width'}",
+            f"✅ Spot ${spot:.2f} {'above' if is_bull else 'below'} flip ${flip:.2f} — correct side" if flip else f"✅ No flip found — using price-based stop ${stop_level:.2f}",
+            f"✅ DEX: {dex_note}",
+            f"✅ VIX {v} → base size {base_pct}%",
+        ]
+
+        # ════════════════════════════
+        # INVALIDATION
+        # ════════════════════════════
         if flip:
-            flip_ok = (is_bull and spot > flip) or (not is_bull and spot < flip)
-            checks.append(f"{'✅' if flip_ok else '⚠️'} Spot {'above' if spot > flip else 'BELOW'} gamma flip ${flip:.2f}")
-        checks.append(f"{'✅' if dex_confirms else '⚠️'} DEX {'confirms' if dex_confirms else 'does not confirm'} direction")
-        if vix:
-            checks.append(f"{'✅' if v < 28 else '⚠️'} VIX {v} — size at {size_pct}%")
-
-        # ── Invalidation ──
-        if is_bull:
-            inval = f"If spot drops below gamma flip ${flip:.2f}" if flip else f"If spot drops to ${stop_level:.2f}"
+            inval_price = f"gamma flip ${flip:.2f}"
+            inval_note  = f"If spot crosses the gamma flip (${flip:.2f}) against you → exit immediately, no averaging"
         else:
-            inval = f"If spot breaks above gamma flip ${flip:.2f}" if flip else f"If spot rises to ${stop_level:.2f}"
+            inval_note  = f"If spread loses 50% of cost (${round(cost_est*0.5,2):.2f}) → stop out"
 
         dir_emoji = {
             "STRONG BULLISH": "🟢🟢", "BULLISH": "🟢", "SLIGHT BULLISH": "🟡",
             "SLIGHT BEARISH": "🟠", "BEARISH": "🔴", "STRONG BEARISH": "🔴🔴",
         }.get(direction, "⚪")
-
-        exp_short = expiration[5:] if expiration else "?"  # MM-DD
 
         lines = [
             f"🎯 {ticker} — 0DTE TRADE SETUP",
@@ -2942,29 +3037,36 @@ def _post_trade_card(
             f"⚙️ REGIME: {gex_note}",
             "",
             f"📋 SETUP: ITM {spread_type}",
-            f"  Buy:   {ticker} {long_label}  (ITM, ~0.65Δ)",
-            f"  Sell:  {ticker} {short_label}  ({'call wall' if is_bull else 'put wall'} — natural ceiling)",
-            f"  Width: ${width:.0f}  |  Est. cost: ~${cost_est:.2f}/contract",
-            f"  Max profit: ~${max_profit:.2f}/contract  |  R/R: {rr:.1f}:1",
+            f"  Buy:   {ticker} {long_label}  (ITM, ~0.60Δ)",
+            f"  Sell:  {ticker} {short_label}  ({actual_width:.0f}-wide spread)",
+            f"  Width: ${actual_width:.0f}  |  Est. cost: ~${cost_est:.2f}/contract",
+            f"  Max profit: ~${max_profit:.2f}/contract  |  R/R: ~{rr:.1f}:1",
+            f"  Cost is ~60% of width — this is normal for ITM 0DTE spreads",
             "",
             f"📍 LEVELS",
-            f"  Entry zone:  ${spot:.2f} ± 0.3%  (current spot)",
-            f"  Target 1:    ${target1:.0f}  (gamma wall — take 50% here)",
-            f"  Target 2:    ${target2:.0f}  ({'call' if is_bull else 'put'} wall — full exit)",
-            f"  Hard stop:   ${stop_level:.2f}  (flip crosses wrong way → exit immediately)",
-            f"  Alt stop:    -50% of premium paid (spread loses half → cut it)",
+            f"  Entry zone:  ${spot:.2f} ± 0.3%",
+        ]
+
+        if target1 and target1 != short_strike:
+            lines.append(f"  Target 1:    ${target1:.0f}  (gamma wall — take 50% profit here)")
+        lines.append(f"  {'Target 2' if target1 != short_strike else 'Target 1'}:    ${short_strike:.0f}  (short leg — full exit at spread max)")
+        if target2:
+            wall_name = "call wall" if is_bull else "put wall"
+            lines.append(f"  Extended T:  ${target2:.0f}  ({wall_name} — only if ITM and time permits)")
+        lines += [
+            f"  Hard stop:   ${stop_level:.2f}  ({'gamma flip — regime change' if flip else 'price-based stop'})",
+            f"  Alt stop:    -50% of premium  (${round(cost_est*0.5,2):.2f} loss per contract)",
             "",
             f"⏱️ TIMING",
             f"  {timing_note}",
             f"  {timing_warn}",
-            f"  ⚠️ Gamma risk zone: after 2:30 PM CT — don't enter new positions",
+            f"  ⚠️ No new entries after 2:30 PM CT — gamma risk zone",
             "",
             f"📊 SIZE",
-            f"  VIX {v} → base: {base_pct}%",
-            f"  {dex_note}",
-            f"  → {size_note}",
+            f"  VIX {v} → base: {base_pct}%  |  {dex_note}",
+            f"  → FINAL: {size_pct}% of normal position size",
             "",
-            "✅ CHECKLIST",
+            "✅ ENTRY CHECKLIST",
         ]
         for c in checks:
             lines.append(f"  {c}")
@@ -2972,8 +3074,8 @@ def _post_trade_card(
         lines += [
             "",
             "⛔ INVALIDATION",
-            f"  {inval} → exit immediately, no averaging in",
-            f"  Spread loses 50% of cost → stop out regardless of time",
+            f"  {inval_note}",
+            f"  Spread loses 50% of cost → stop out regardless of time or P/L",
             "━" * 32,
             "— Not financial advice —",
         ]
@@ -2981,7 +3083,8 @@ def _post_trade_card(
         post_to_telegram("\n".join(lines))
         log.info(
             f"Trade card: {ticker} | {direction} | score={score} | "
-            f"{spread_type} {long_label}/{short_label} | stop=${stop_level}"
+            f"{spread_type} {long_label}/{short_label} | width=${actual_width} | "
+            f"cost_est=${cost_est} | stop=${stop_level} | size={size_pct}%"
         )
 
     except Exception as e:
