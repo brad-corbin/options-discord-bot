@@ -49,11 +49,8 @@ def _as_int(val, default=0):
 
 def build_option_rows(chain_data: dict, spot: float, days_to_exp: float) -> List[OptionRow]:
     """
-    Convert a MarketData.app chain response dict into v4 OptionRow objects.
-    Drop-in replacement for app.py's _build_option_rows().
-
-    Handles all fields the API provides: strike, side, IV, OI, volume,
-    delta, gamma, theta, vega, bid, ask.
+    Convert MarketData.app chain response into v4 OptionRow objects.
+    Reads 'oiChange' array if present (populated by OICache).
     """
     sym_list = chain_data.get("optionSymbol") or []
     n = len(sym_list)
@@ -75,6 +72,7 @@ def build_option_rows(chain_data: dict, spot: float, days_to_exp: float) -> List
     bid_l    = col("bid", None)
     ask_l    = col("ask", None)
     sides    = col("side", "")
+    oi_chg_l = col("oiChange", None)
 
     rows = []
     for i in range(n):
@@ -86,6 +84,8 @@ def build_option_rows(chain_data: dict, spot: float, days_to_exp: float) -> List
 
         if strike <= 0 or iv <= 0 or side not in ("call", "put"):
             continue
+
+        oi_change = _as_int(oi_chg_l[i], None) if oi_chg_l[i] is not None else None
 
         rows.append(OptionRow(
             option_type      = side,
@@ -100,7 +100,7 @@ def build_option_rows(chain_data: dict, spot: float, days_to_exp: float) -> List
             delta            = _as_float(delta_l[i]),
             gamma            = _as_float(gamma_l[i]),
             theta            = _as_float(theta_l[i]),
-            # vega from API — engine computes vanna/charm/volga/speed/rho
+            oi_change        = oi_change,
         ))
 
     return rows
@@ -112,9 +112,10 @@ def build_market_context(
     events: Optional[List[ScheduledEvent]] = None,
     session_progress: float = 0.5,
     is_0dte: bool = False,
-    vix: Optional[float] = None,
+    avg_daily_dollar_volume: Optional[float] = None,
+    bid_ask_spread_pct: Optional[float] = None,
 ) -> MarketContext:
-    """Build a MarketContext from available data."""
+    """Build MarketContext with liquidity inputs from stock data."""
     return MarketContext(
         spot=spot,
         risk_free_rate=0.04,
@@ -122,6 +123,8 @@ def build_market_context(
         session_progress=session_progress,
         is_0dte=is_0dte,
         events=events,
+        avg_daily_dollar_volume=avg_daily_dollar_volume,
+        bid_ask_spread_pct=bid_ask_spread_pct,
     )
 
 
@@ -133,41 +136,31 @@ def run_institutional_snapshot(
     events: Optional[List[ScheduledEvent]] = None,
     session_progress: float = 0.5,
     is_0dte: bool = False,
+    avg_daily_dollar_volume: Optional[float] = None,
+    bid_ask_spread_pct: Optional[float] = None,
+    liquid_index: bool = False,
 ) -> Dict:
     """
     One-call bridge: takes raw MarketData.app chain dict + spot,
     runs the full v4 institutional snapshot, and returns a result dict
     with everything the EM/trade/monitor cards need.
-
-    Returns dict with keys:
-        rows:        List[OptionRow] — the parsed chain
-        snapshot:    full v4 snapshot dict (confidence, downgrades, audit, etc.)
-        engine_result: legacy-format engine dict for backward compat with _calc_bias
-            {gex, dex, vanna, charm, flip_price, is_positive_gex, regime, vc}
-        walls:       wall dict in app.py's expected format
-        iv:          ATM IV (float)
-        spot:        spot price
-        by_strike:   strike-level exposure breakdown
-        skew:        {call_iv, put_iv} from ATM options
-        pcr:         {pcr_oi, pcr_vol, put_oi, call_oi, ...}
-        confidence:  {composite, label, components}
-        downgrades:  List[str]
-        schema_version: str
     """
-    # 1. Build v4 rows
+    # 1. Build v4 rows (now reads oiChange if OICache injected it)
     rows = build_option_rows(chain_data, spot, max(dte, 0.5))
     if not rows:
         return {"error": "no valid option rows", "rows": [], "iv": None}
 
-    # 2. Build context
+    # 2. Build context with liquidity inputs
     ctx = build_market_context(
         spot=spot, recent_bars=recent_bars, events=events,
         session_progress=session_progress, is_0dte=is_0dte,
+        avg_daily_dollar_volume=avg_daily_dollar_volume,
+        bid_ask_spread_pct=bid_ask_spread_pct,
     )
 
-    # 3. Run full v4 snapshot
+    # 3. Run full v4 snapshot (liquid_index loosens spread detection)
     engine = InstitutionalExpectationEngine(r=0.04)
-    snap = engine.snapshot(rows, ctx)
+    snap = engine.snapshot(rows, ctx, liquid_index=liquid_index)
 
     if not snap or "error" in snap:
         return {"error": snap.get("error", "snapshot failed"), "rows": rows, "iv": None}
