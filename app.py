@@ -70,9 +70,13 @@ from engine_bridge import (
     format_vol_regime_line,
 )
 from options_exposure import SCHEMA_VERSION
+from oi_cache import OICache
 
 import risk_manager
 import trade_journal
+
+# OI cache will be initialized after store_get/store_set are defined
+_oi_cache = None
 
 # ─────────────────────────────────────────────────────────
 # LOGGING
@@ -1422,7 +1426,7 @@ def _get_next_trading_day(from_date) -> str:
 
 # ─────────────────────────────────────────────────────────
 # V4 ENGINE INTEGRATION — _get_0dte_iv
-# Replaces raw ExposureEngine with full institutional snapshot
+# Uses OI cache for oi_change, stock data for liquidity, liquid_index for spread detection
 # ─────────────────────────────────────────────────────────
 
 def _get_0dte_iv(ticker: str, target_date_str: str = None) -> tuple:
@@ -1430,7 +1434,6 @@ def _get_0dte_iv(ticker: str, target_date_str: str = None) -> tuple:
     Full v4 institutional chain analysis.
     Returns: (iv, spot, expiration, engine_result, walls, skew, pcr, vix, v4_result)
     The 9th element (v4_result) contains confidence, downgrades, trade_sign, audit, vol_regime.
-    Returns empties on failure.
     """
     empty = (None, None, None, None, {}, {}, {}, {}, {})
     try:
@@ -1445,15 +1448,25 @@ def _get_0dte_iv(ticker: str, target_date_str: str = None) -> tuple:
         except Exception:
             dte = 0
 
-        # ── v4 engine: one call gets everything ──
-        # Fetch recent bars for RV computation
-        from options_exposure import OHLC as _OHLC
+        # ── OI change: diff current OI against cached prior snapshot ──
+        _oi_cache.apply_oi_changes_to_chain(ticker, data)
+
+        # ── OHLC bars for RV ──
         bars = _get_ohlc_bars(ticker, days=65)
+
+        # ── Estimate liquidity from stock data ──
+        adv, spread = _estimate_liquidity(ticker, spot)
 
         v4 = run_institutional_snapshot(
             chain_data=data, spot=spot, dte=max(dte, 0.5),
             recent_bars=bars, is_0dte=(dte == 0),
+            avg_daily_dollar_volume=adv,
+            bid_ask_spread_pct=spread,
+            liquid_index=_is_liquid(ticker),
         )
+
+        # ── Save current OI as reference for next run ──
+        _oi_cache.save_snapshot(ticker, data)
 
         if v4.get("error") or v4.get("iv") is None:
             return empty
@@ -1464,7 +1477,7 @@ def _get_0dte_iv(ticker: str, target_date_str: str = None) -> tuple:
             v4["iv"], spot, target,
             v4["engine_result"], v4["walls"],
             v4["skew"], v4["pcr"], vix,
-            v4,  # full v4 result with confidence, downgrades, audit
+            v4,
         )
 
     except Exception as e:
@@ -1490,21 +1503,29 @@ def _get_chain_for_expiry(ticker: str, target_date_str: str) -> tuple:
 
 
 def _get_chain_iv_for_expiry(ticker: str, target_date_str: str, dte: float) -> tuple:
-    """
-    Full v4 chain analysis for any expiry (monitor cards).
-    Returns same 9-tuple as _get_0dte_iv.
-    """
+    """Full v4 chain analysis for any expiry (monitor cards)."""
     empty = (None, None, None, None, {}, {}, {}, {}, {})
     try:
         data, spot, target = _get_chain_for_expiry(ticker, target_date_str)
         if data is None:
             return empty
 
+        # ── OI change ──
+        _oi_cache.apply_oi_changes_to_chain(ticker, data)
+
         bars = _get_ohlc_bars(ticker, days=65)
+        adv, spread = _estimate_liquidity(ticker, spot)
+
         v4 = run_institutional_snapshot(
             chain_data=data, spot=spot, dte=max(dte, 0.5),
             recent_bars=bars, is_0dte=(dte <= 1),
+            avg_daily_dollar_volume=adv,
+            bid_ask_spread_pct=spread,
+            liquid_index=_is_liquid(ticker),
         )
+
+        # ── Save OI snapshot ──
+        _oi_cache.save_snapshot(ticker, data)
 
         if v4.get("error") or v4.get("iv") is None:
             return empty
@@ -1515,6 +1536,52 @@ def _get_chain_iv_for_expiry(ticker: str, target_date_str: str, dte: float) -> t
     except Exception as e:
         log.warning(f"Chain IV fetch failed for {ticker} exp={target_date_str}: {e}")
         return empty
+
+
+def _estimate_liquidity(ticker: str, spot: float) -> tuple:
+    """
+    Estimate ADV and bid-ask spread from stock candles + quote.
+    Returns (avg_daily_dollar_volume, bid_ask_spread_pct) or (None, None).
+    """
+    adv = None
+    spread = None
+    try:
+        # ADV: average of last 20 days of (close * volume)
+        candles = get_daily_candles(ticker, days=25)
+        if candles and len(candles) >= 5:
+            # candles is a list of close prices from get_daily_candles
+            # We need volume too — fetch raw candles
+            from_date = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%d")
+            raw = md_get(f"https://api.marketdata.app/v1/stocks/candles/D/{ticker}/",
+                        {"from": from_date})
+            if raw and raw.get("s") == "ok":
+                closes = raw.get("c") or []
+                volumes = raw.get("v") or []
+                n = min(len(closes), len(volumes))
+                if n >= 5:
+                    dvols = []
+                    for i in range(max(n - 20, 0), n):
+                        c = as_float(closes[i], 0)
+                        v = as_float(volumes[i], 0)
+                        if c > 0 and v > 0:
+                            dvols.append(c * v)
+                    if dvols:
+                        adv = sum(dvols) / len(dvols)
+    except Exception as e:
+        log.debug(f"ADV estimate failed for {ticker}: {e}")
+
+    try:
+        # Spread from stock quote
+        stock_data = md_get(f"https://api.marketdata.app/v1/stocks/quotes/{ticker}/")
+        if stock_data and stock_data.get("s") == "ok":
+            bid = as_float((stock_data.get("bid") or [None])[0], 0)
+            ask = as_float((stock_data.get("ask") or [None])[0], 0)
+            if bid > 0 and ask > 0 and ask > bid:
+                spread = (ask - bid) / ((ask + bid) / 2)
+    except Exception as e:
+        log.debug(f"Spread estimate failed for {ticker}: {e}")
+
+    return adv, spread
 
 
 def _get_ohlc_bars(ticker: str, days: int = 65) -> list:
@@ -2224,6 +2291,8 @@ with app.app_context():
         register_webhook(BOT_URL, _tg_ws)
     portfolio.init_store(store_get, store_set)
     trade_journal.init_store(store_get, store_set)
+    _oi_cache = OICache(store_get, store_set)
+    log.info(f"OI cache initialized (Redis: {_get_redis() is not None})")
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
