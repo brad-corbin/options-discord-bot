@@ -1894,19 +1894,37 @@ def _get_0dte_iv(ticker: str, target_date_str: str = None) -> tuple:
         vc_info      = vanna_charm_context(net["vanna"], net["charm"])
         walls_raw    = result["walls"]
 
-        # Build walls dict in same shape the rest of the code expects
+        # Build walls dict — enforce spot-relative constraints so call wall is
+        # always above spot and put wall is always below spot. Without this,
+        # thin chains where one strike dominates both sides produce call_wall ==
+        # put_wall, which displays as identical resistance and support levels.
         by_strike = result["by_strike"]
         walls = {}
-        if walls_raw["call_wall"]:
-            cw = walls_raw["call_wall"]
+
+        call_candidates = sorted(
+            [k for k in by_strike if k > spot and by_strike[k]["call_oi"] > 0],
+            key=lambda k: by_strike[k]["call_oi"], reverse=True
+        )
+        if call_candidates:
+            cw = call_candidates[0]
+            call_top3 = list(dict.fromkeys(call_candidates))[:3]
             walls["call_wall"]    = cw
             walls["call_wall_oi"] = by_strike[cw]["call_oi"]
-            walls["call_top3"]    = sorted(by_strike, key=lambda k: by_strike[k]["call_oi"], reverse=True)[:3]
-        if walls_raw["put_wall"]:
-            pw = walls_raw["put_wall"]
+            if len(call_top3) > 1:
+                walls["call_top3"] = call_top3
+
+        put_candidates = sorted(
+            [k for k in by_strike if k < spot and by_strike[k]["put_oi"] > 0],
+            key=lambda k: by_strike[k]["put_oi"], reverse=True
+        )
+        if put_candidates:
+            pw = put_candidates[0]
+            put_top3 = list(dict.fromkeys(put_candidates))[:3]
             walls["put_wall"]    = pw
             walls["put_wall_oi"] = by_strike[pw]["put_oi"]
-            walls["put_top3"]    = sorted(by_strike, key=lambda k: by_strike[k]["put_oi"], reverse=True)[:3]
+            if len(put_top3) > 1:
+                walls["put_top3"] = put_top3
+
         if walls_raw["gamma_wall"]:
             gw = walls_raw["gamma_wall"]
             walls["gamma_wall"]     = gw
@@ -2861,18 +2879,49 @@ def _get_chain_iv_for_expiry(ticker: str, target_date_str: str, dte: float) -> t
         vc_info     = vanna_charm_context(net["vanna"], net["charm"])
         walls_raw   = result["walls"]
         by_strike   = result["by_strike"]
+        strikes_asc = sorted(by_strike.keys())
 
         walls = {}
-        if walls_raw["call_wall"]:
-            cw = walls_raw["call_wall"]
+
+        # ── Call wall: highest call OI at a strike ABOVE spot ──
+        # Without the spot constraint, a strike with heavy call AND put OI
+        # (e.g. $12 on an $11.37 stock) becomes both resistance and support,
+        # producing contradictory display. Enforce directionality here.
+        call_candidates = sorted(
+            [k for k in by_strike if k > spot and by_strike[k]["call_oi"] > 0],
+            key=lambda k: by_strike[k]["call_oi"], reverse=True
+        )
+        if call_candidates:
+            cw = call_candidates[0]
+            # Top-3 call strikes above spot, deduplicated
+            call_top3_raw = sorted(
+                [k for k in by_strike if k > spot and by_strike[k]["call_oi"] > 0],
+                key=lambda k: by_strike[k]["call_oi"], reverse=True
+            )
+            call_top3 = list(dict.fromkeys(call_top3_raw))[:3]   # preserves order, removes dupes
             walls["call_wall"]    = cw
             walls["call_wall_oi"] = by_strike[cw]["call_oi"]
-            walls["call_top3"]    = sorted(by_strike, key=lambda k: by_strike[k]["call_oi"], reverse=True)[:3]
-        if walls_raw["put_wall"]:
-            pw = walls_raw["put_wall"]
+            if len(call_top3) > 1:
+                walls["call_top3"] = call_top3
+
+        # ── Put wall: highest put OI at a strike BELOW spot ──
+        put_candidates = sorted(
+            [k for k in by_strike if k < spot and by_strike[k]["put_oi"] > 0],
+            key=lambda k: by_strike[k]["put_oi"], reverse=True
+        )
+        if put_candidates:
+            pw = put_candidates[0]
+            put_top3_raw = sorted(
+                [k for k in by_strike if k < spot and by_strike[k]["put_oi"] > 0],
+                key=lambda k: by_strike[k]["put_oi"], reverse=True
+            )
+            put_top3 = list(dict.fromkeys(put_top3_raw))[:3]
             walls["put_wall"]    = pw
             walls["put_wall_oi"] = by_strike[pw]["put_oi"]
-            walls["put_top3"]    = sorted(by_strike, key=lambda k: by_strike[k]["put_oi"], reverse=True)[:3]
+            if len(put_top3) > 1:
+                walls["put_top3"] = put_top3
+
+        # ── Gamma wall: highest |GEX| strike, any side ──
         if walls_raw["gamma_wall"]:
             gw = walls_raw["gamma_wall"]
             walls["gamma_wall"]     = gw
@@ -3380,35 +3429,52 @@ def _post_monitor_card(ticker: str, mode: str):
                 lines.append(f"  ❌ Avoid:  {regime['avoid']}")
 
         # ════════════ KEY LEVELS ════════════
-        if walls:
+        has_call_wall = "call_wall" in walls
+        has_put_wall  = "put_wall"  in walls
+
+        if walls and (has_call_wall or has_put_wall or "gamma_wall" in walls):
             lines += ["", "─" * 32, "🧱 KEY LEVELS"]
 
-            if "call_wall" in walls:
+            if has_call_wall:
                 cw    = walls["call_wall"]
                 cw_oi = walls["call_wall_oi"]
                 dist  = ((cw - spot) / spot) * 100
                 in_1  = cw <= em["bull_1sd"]
                 tag   = "inside 1σ — strong cap" if in_1 else ("within 2σ" if cw <= em["bull_2sd"] else "outside 2σ")
-                lines.append(f"  📵 Resistance: ${cw:.0f}  ({cw_oi:,} OI, +{dist:.1f}%) — {tag}")
+                lines.append(f"  📵 Resistance: ${cw:.2f}  ({cw_oi:,} OI, +{dist:.1f}%) — {tag}")
 
-            if "put_wall" in walls:
+            if has_put_wall:
                 pw    = walls["put_wall"]
                 pw_oi = walls["put_wall_oi"]
                 dist  = ((spot - pw) / spot) * 100
                 in_1  = pw >= em["bear_1sd"]
                 tag   = "inside 1σ — strong floor" if in_1 else ("within 2σ" if pw >= em["bear_2sd"] else "outside 2σ")
-                lines.append(f"  🛡️ Support:    ${pw:.0f}  ({pw_oi:,} OI, -{dist:.1f}%) — {tag}")
+                lines.append(f"  🛡️ Support:    ${pw:.2f}  ({pw_oi:,} OI, -{dist:.1f}%) — {tag}")
+
+            if not has_call_wall and not has_put_wall:
+                # Thin chain: all significant OI is at-the-money with no clean directional wall
+                lines.append(f"  ⚠️ No clear directional walls — OI is too concentrated at-the-money to define distinct resistance/support")
+
+            elif not has_call_wall:
+                lines.append(f"  ⚠️ No resistance wall found above spot — call OI is sparse above ${spot:.2f}")
+            elif not has_put_wall:
+                lines.append(f"  ⚠️ No support wall found below spot — put OI is sparse below ${spot:.2f}")
 
             if "gamma_wall" in walls and liquid:
-                gw = walls["gamma_wall"]
-                lines.append(f"  🎯 Gamma Wall: ${gw:.0f}  — dealer hedging magnet")
+                gw   = walls["gamma_wall"]
+                gdir = "above" if gw > spot else "below"
+                lines.append(f"  🎯 Gamma Wall: ${gw:.2f}  ({gdir} spot) — dealer hedging magnet")
 
             if "call_top3" in walls:
-                ct3 = " → ".join(f"${x:.0f}" for x in walls["call_top3"])
+                ct3 = " → ".join(f"${x:.2f}" for x in walls["call_top3"])
                 lines.append(f"  📵 Resistance cluster: {ct3}")
             if "put_top3" in walls:
-                pt3 = " → ".join(f"${x:.0f}" for x in walls["put_top3"])
+                pt3 = " → ".join(f"${x:.2f}" for x in walls["put_top3"])
                 lines.append(f"  🛡️ Support cluster:    {pt3}")
+
+        elif not walls:
+            lines += ["", "─" * 32, "🧱 KEY LEVELS",
+                      "  ⚠️ Insufficient OI data to compute reliable walls on this chain."]
 
         # ════════════ SENTIMENT ════════════
         skew_str = ""
