@@ -127,6 +127,7 @@ def handle_command(
     get_portfolio_chat_id_fn=None,
     get_regime_fn=None,
     post_em_card_fn=None,
+    post_monitor_card_fn=None,
 ) -> None:
     if not is_authorized(user_id):
         send_reply(chat_id, "⛔ You are not authorized to use this bot.")
@@ -314,32 +315,89 @@ def handle_command(
         return
 
     # ─────────────────────────────────────
-    # /em [morning|afternoon] — 0DTE Expected Move
+    # /em [TICKER] [morning|afternoon] — 0DTE Expected Move + Trade Card
     # ─────────────────────────────────────
     if cmd in ("/em", "/em@omegabot"):
         if not post_em_card_fn:
             reply("⚠️ EM function not wired — post_em_card_fn missing.")
             return
 
-        # Optional session override: /em morning or /em afternoon
-        session = args[0].lower() if args else "manual"
-        if session not in ("morning", "afternoon", "manual"):
-            reply("⚠️ Usage: /em  or  /em morning  or  /em afternoon")
-            return
-
         from app import EM_TICKERS
-        tickers = EM_TICKERS  # ["SPY", "QQQ"]
-        reply(f"📐 Fetching 0DTE EM for {', '.join(tickers)} ({session})...")
+
+        # Parse args: /em | /em SPY | /em morning | /em SPY morning
+        # First arg could be a ticker (all-caps, no digits only) or a session word
+        SESSION_WORDS = {"morning", "afternoon", "manual"}
+        ticker_arg  = None
+        session_arg = "manual"
+
+        for arg in args:
+            al = arg.lower()
+            if al in SESSION_WORDS:
+                session_arg = al
+            elif arg.upper().replace(".", "").isalpha():
+                ticker_arg = arg.upper()
+
+        # Determine ticker list
+        if ticker_arg:
+            tickers = [ticker_arg]
+        else:
+            tickers = EM_TICKERS  # default: SPY + QQQ
+
+        reply(f"📐 Fetching 0DTE EM + Trade setup for {', '.join(tickers)} ({session_arg})...")
 
         def run_em():
             for ticker in tickers:
                 try:
-                    post_em_card_fn(ticker, session)
+                    post_em_card_fn(ticker, session_arg)
                 except Exception as e:
                     log.error(f"/em {ticker}: {e}")
                     reply(f"⚠️ EM error for {ticker}: {type(e).__name__}")
 
         threading.Thread(target=run_em, daemon=True).start()
+        return
+
+    # /monitorlong TICKER — swing outlook, expiry closest to 21 DTE
+    # ─────────────────────────────────────
+    if cmd in ("/monitorlong", "/monitorlong@omegabot"):
+        if not post_monitor_card_fn:
+            reply("⚠️ Monitor function not wired — post_monitor_card_fn missing.")
+            return
+        if not args:
+            reply("Usage: /monitorlong IREN\n15–30 day swing outlook on the nearest monthly expiration.")
+            return
+        ticker = args[0].upper()
+        reply(f"📅 Fetching swing monitor card for {ticker} (~21 DTE)...")
+
+        def run_monitor_long():
+            try:
+                post_monitor_card_fn(ticker, "long")
+            except Exception as e:
+                log.error(f"/monitorlong {ticker}: {e}")
+                reply(f"⚠️ Monitor error for {ticker}: {type(e).__name__}")
+
+        threading.Thread(target=run_monitor_long, daemon=True).start()
+        return
+
+    # /monitorshort TICKER — near-term outlook, nearest available expiry
+    # ─────────────────────────────────────
+    if cmd in ("/monitorshort", "/monitorshort@omegabot"):
+        if not post_monitor_card_fn:
+            reply("⚠️ Monitor function not wired — post_monitor_card_fn missing.")
+            return
+        if not args:
+            reply("Usage: /monitorshort IREN\nNear-term outlook on the nearest available expiration.")
+            return
+        ticker = args[0].upper()
+        reply(f"⚡ Fetching near-term monitor card for {ticker} (nearest exp)...")
+
+        def run_monitor_short():
+            try:
+                post_monitor_card_fn(ticker, "short")
+            except Exception as e:
+                log.error(f"/monitorshort {ticker}: {e}")
+                reply(f"⚠️ Monitor error for {ticker}: {type(e).__name__}")
+
+        threading.Thread(target=run_monitor_short, daemon=True).start()
         return
 
     # ─────────────────────────────────────
@@ -517,10 +575,18 @@ def handle_command(
             "/scan AAPL — scan single ticker\n"
             "/scan — run full watchlist scan\n"
             "\n── 0DTE Expected Move ──\n"
-            "/em — fetch EM for SPY & QQQ now\n"
+            "/em — EM + Trade card for SPY & QQQ (0DTE)\n"
+            "/em SPY — EM + Trade card for any symbol\n"
             "/em morning — today's EM (hours remaining)\n"
             "/em afternoon — next day full-session EM\n"
+            "/em SPY morning — specific ticker + session\n"
             "  Auto-fires: 8:45 AM CT (today) & 2:45 PM CT (next day)\n"
+            "\n── Position Monitor ──\n"
+            "/monitorlong IREN — swing outlook, ~21 DTE expiry\n"
+            "/monitorshort IREN — near-term outlook, nearest expiry\n"
+            "  Works on any symbol with liquid options\n"
+            "  Liquid symbols (SPY/QQQ/AAPL/NVDA etc): full dealer flow card\n"
+            "  Other symbols: simplified range + levels + lean\n"
             "\n── Portfolio (add -mom for mom's account) ──\n"
             "/hold add AAPL 100 @185.50 — add shares\n"
             "/hold remove AAPL — remove shares\n"
