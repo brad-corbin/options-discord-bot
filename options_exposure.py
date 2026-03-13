@@ -1,9 +1,9 @@
-# options_exposure.py  — v3 institutional-grade
+# options_exposure.py  — v4 production-hardened
 # Educational/demo code. Not financial advice.
 
-import math, random
+import math, random, time, copy, json
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Tuple, Callable
+from typing import List, Dict, Optional, Tuple, Callable, Any
 from enum import Enum
 from functools import lru_cache
 
@@ -16,6 +16,216 @@ UNITS = {
     "volga": "$ vega per 1 vol point", "speed": "$ gamma per 1% spot move",
     "theta": "$ per calendar day", "rho": "$ per 1% rate move",
 }
+
+# ── SCHEMA VERSION ───────────────────────────────────────────────
+# Item 15: Frozen output schema. Bump MINOR for additive fields, MAJOR for breaking.
+SCHEMA_VERSION = "4.0.0"
+
+
+# ── OBSERVABILITY / LOGGING ──────────────────────────────────────
+# Item 14: Structured audit log. Consumers can inject their own logger.
+
+class AuditLog:
+    """Collects diagnostic traces during a snapshot computation.
+    Every snapshot returns its audit log so callers can inspect why the engine
+    said what it said. No side effects, no global state."""
+    def __init__(self):
+        self.entries: List[Dict[str, Any]] = []
+    def log(self, category: str, **kwargs):
+        self.entries.append({"cat": category, "ts": time.monotonic(), **kwargs})
+    def summary(self) -> Dict:
+        cats = {}
+        for e in self.entries:
+            c = e["cat"]
+            cats[c] = cats.get(c, 0) + 1
+        return {"total_entries": len(self.entries), "by_category": cats}
+
+
+# ── INPUT VALIDATION ─────────────────────────────────────────────
+# Item 4: Fail-closed validation. Returns (cleaned_rows, quarantined, warnings).
+
+class InputValidator:
+    @staticmethod
+    def validate_row(r) -> Tuple[bool, List[str]]:
+        """Returns (is_valid, list_of_issues)."""
+        issues = []
+        if r.underlying_price <= 0: issues.append("non-positive underlying_price")
+        if r.strike <= 0: issues.append("non-positive strike")
+        if r.open_interest < 0: issues.append("negative open_interest")
+        if r.days_to_exp < 0: issues.append("negative days_to_exp")
+        if r.iv < 0 or r.iv > 10: issues.append(f"iv out of range: {r.iv}")
+        if r.dividend_yield < -0.5 or r.dividend_yield > 1.0: issues.append(f"dividend_yield out of range: {r.dividend_yield}")
+        if r.option_type.lower() not in ("call", "put"): issues.append(f"invalid option_type: {r.option_type}")
+        if r.bid is not None and r.ask is not None and r.bid > r.ask + 0.01: issues.append("bid > ask")
+        if r.bid is not None and r.bid < 0: issues.append("negative bid")
+        if r.volume < 0: issues.append("negative volume")
+        # Check for non-finite values
+        for fld in [r.iv, r.underlying_price, r.strike, r.days_to_exp]:
+            if not math.isfinite(fld): issues.append(f"non-finite value: {fld}")
+        return len(issues) == 0, issues
+
+    @staticmethod
+    def validate_context(ctx) -> List[str]:
+        issues = []
+        if ctx.spot <= 0: issues.append("non-positive spot")
+        if not math.isfinite(ctx.spot): issues.append("non-finite spot")
+        if ctx.risk_free_rate < -0.5 or ctx.risk_free_rate > 1.0: issues.append("rate out of range")
+        if ctx.session_progress < 0 or ctx.session_progress > 1: issues.append("session_progress out of [0,1]")
+        return issues
+
+    @staticmethod
+    def validate_chain(rows, ctx, audit: Optional[AuditLog] = None):
+        """Returns (clean_rows, quarantined_rows, ctx_warnings)."""
+        clean, quarantined = [], []
+        for r in rows:
+            ok, issues = InputValidator.validate_row(r)
+            if ok:
+                clean.append(r)
+            else:
+                quarantined.append({"row": r, "issues": issues})
+                if audit: audit.log("validation_quarantine", strike=r.strike, ot=r.option_type, issues=issues)
+        ctx_issues = InputValidator.validate_context(ctx)
+        if audit:
+            audit.log("validation_summary", clean=len(clean), quarantined=len(quarantined), ctx_issues=ctx_issues)
+        return clean, quarantined, ctx_issues
+
+
+# ── DATA QUALITY / DOWNGRADE LOGIC ───────────────────────────────
+# Item 12: Explicit data-quality scoring and downgrade paths.
+
+class DataQualityEngine:
+    """Scores data completeness and triggers explicit downgrades."""
+    @staticmethod
+    def score(rows, ctx) -> Dict:
+        """Returns quality scores by category (0-1) and overall."""
+        n = max(len(rows), 1)
+        # Trade sign quality: how many rows have actual trade data?
+        has_trades = sum(1 for r in rows if r.trades and len(r.trades) > 0)
+        trade_q = has_trades / n
+        # OI change available?
+        has_oi_change = sum(1 for r in rows if r.oi_change is not None)
+        oi_q = has_oi_change / n
+        # IV quality: do we have a vol surface or just row IV?
+        iv_q = 0.5  # base: row IV only
+        # (caller can override if vol_surface is loaded)
+        # RV available?
+        rv_q = 1.0 if ctx.realized_vol_20d is not None else (0.7 if (ctx.recent_bars and len(ctx.recent_bars) >= 10) else 0.0)
+        # Liquidity inputs
+        liq_inputs = sum(1 for x in [ctx.avg_daily_dollar_volume, ctx.intraday_dollar_volume,
+                                      ctx.orderbook_depth_dollars, ctx.bid_ask_spread_pct] if x is not None)
+        liq_q = liq_inputs / 4.0
+        # Bid/ask on rows
+        has_ba = sum(1 for r in rows if r.bid is not None and r.ask is not None)
+        ba_q = has_ba / n
+        overall = (trade_q * 0.25 + oi_q * 0.15 + iv_q * 0.15 + rv_q * 0.15 + liq_q * 0.15 + ba_q * 0.15)
+        return {
+            "trade_sign_quality": round(trade_q, 3),
+            "oi_change_quality": round(oi_q, 3),
+            "iv_source_quality": round(iv_q, 3),
+            "rv_quality": round(rv_q, 3),
+            "liquidity_input_quality": round(liq_q, 3),
+            "bid_ask_quality": round(ba_q, 3),
+            "overall": round(overall, 3),
+        }
+
+    @staticmethod
+    def downgrade_flags(quality: Dict) -> List[str]:
+        """Returns human-readable downgrade flags."""
+        flags = []
+        if quality["trade_sign_quality"] < 0.1: flags.append("NO_TRADE_DATA: dealer sign is assumption-only")
+        if quality["oi_change_quality"] < 0.1: flags.append("NO_OI_CHANGE: opening/closing inference unavailable")
+        if quality["rv_quality"] < 0.1: flags.append("NO_RV_DATA: VRP regime unknown")
+        if quality["liquidity_input_quality"] < 0.25: flags.append("LOW_LIQUIDITY_DATA: impact model is heuristic-only")
+        if quality["bid_ask_quality"] < 0.1: flags.append("NO_BID_ASK: trade-sign classification degraded")
+        if quality["overall"] < 0.3: flags.append("LOW_DATA_QUALITY: results are low-confidence")
+        return flags
+
+
+# ── CONFIDENCE SCORE ─────────────────────────────────────────────
+# Item 5: Composite output confidence from all signal qualities.
+
+class ConfidenceEngine:
+    @staticmethod
+    def compute(quality: Dict, avg_dealer_conf: float, spread_leg_pct: float) -> Dict:
+        """Composite confidence for the final output."""
+        data_conf = quality["overall"]
+        sign_conf = avg_dealer_conf
+        spread_penalty = max(0, 1.0 - spread_leg_pct * 0.5)  # 50% spread legs = 25% penalty
+        composite = data_conf * 0.40 + sign_conf * 0.35 + spread_penalty * 0.25
+        if composite >= 0.7: label = "HIGH"
+        elif composite >= 0.45: label = "MODERATE"
+        else: label = "LOW"
+        return {
+            "composite": round(composite, 3),
+            "label": label,
+            "components": {
+                "data_quality": round(data_conf, 3),
+                "trade_sign": round(sign_conf, 3),
+                "spread_penalty": round(spread_penalty, 3),
+            },
+        }
+
+
+# ── RV POLICY ────────────────────────────────────────────────────
+# Item 8: Explicit RV metric selection per use case.
+
+class RVPolicy:
+    """Defines which RV estimator is canonical for which purpose."""
+    VRP_ESTIMATOR = "yang_zhang"      # Best for VRP: handles jumps + overnight
+    SIMPLICITY_ESTIMATOR = "close_to_close"  # For quick checks
+    IMPACT_SOURCE = "intraday_return_vol"    # For impact model: from ctx
+
+    @staticmethod
+    def get_vrp_rv(bars, window=20):
+        """Canonical RV for VRP computation."""
+        subset = bars[-window:] if len(bars) >= window else bars
+        return RealizedVolEngine.yang_zhang(subset)
+
+    @staticmethod
+    def get_check_rv(bars, window=20):
+        closes = [b.close for b in bars[-window:]] if len(bars) >= window else [b.close for b in bars]
+        return RealizedVolEngine.close_to_close(closes)
+
+
+# ── TOUCH PROBABILITY ROUTING ────────────────────────────────────
+# Item 10: Defines when to use analytic, skew-adjusted, or MC touch.
+
+class TouchRouter:
+    """Routes touch probability queries to the appropriate model."""
+    MAX_MC_STRIKES = 10   # Item 3: guardrail on MC cost
+    MAX_MC_PATHS = 5000   # Item 3: cap paths per strike
+
+    @staticmethod
+    def route(S, H, T, r, q, sigma, barrier_sigma=None,
+              has_events=False, jump_params=None, audit=None) -> Dict:
+        """
+        Decision tree:
+        1. If barrier_sigma available → skew-adjusted analytic
+        2. If events or jumps AND within MC budget → MC
+        3. Otherwise → flat analytic
+        """
+        method = "analytic_flat"
+        prob = BarrierModel.analytic_touch(S, H, T, r, q, sigma)
+
+        if barrier_sigma is not None and abs(barrier_sigma - sigma) > 0.005:
+            prob = BarrierModel.skew_adjusted_touch(S, H, T, r, q, sigma, barrier_sigma)
+            method = "analytic_skew"
+
+        if (has_events or jump_params) and T <= 7/365:  # only MC for short-dated
+            mc_paths = min(TouchRouter.MAX_MC_PATHS, 3000)
+            ji = jump_params.get("intensity", 0) if jump_params else 0
+            jm = jump_params.get("mean", 0) if jump_params else 0
+            js = jump_params.get("std", 0) if jump_params else 0
+            if ji > 0:
+                mc = BarrierModel.monte_carlo_touch(S, H, T, r, q, sigma,
+                    n_paths=mc_paths, n_steps=max(int(T*365*24), 50),
+                    jump_intensity=ji, jump_mean=jm, jump_std=js)
+                prob = mc["prob_touch"]
+                method = "mc_jump"
+
+        if audit:
+            audit.log("touch_routing", strike=H, method=method, prob=round(prob, 4))
+        return {"prob_touch": round(prob, 4), "method": method}
 
 # ── 1. MATH PRIMITIVES ──────────────────────────────────────────
 
@@ -174,6 +384,10 @@ class SABRParams:
 
 @dataclass
 class HestonParams:
+    """Heston stochastic vol model. PRODUCTION NOTE (Item 11): Use as optional
+    validation/secondary model only. Do NOT make default pricing engine unless
+    calibrated daily with diagnostics. Feller check and numerical guards are in place,
+    but integration can still misbehave for extreme parameters."""
     v0:float;theta:float;kappa:float;xi:float;rho:float
     def feller_satisfied(self): return 2*self.kappa*self.theta>self.xi**2
     def feller_ratio(self): return(2*self.kappa*self.theta)/max(self.xi**2,1e-12)
@@ -406,41 +620,58 @@ class TradeSignEngine:
         return 'mixed',0.4
     @staticmethod
     def infer_spread_legs(rows,volume_tol=0.20,max_strike_gap_pct=0.10):
-        """Multi-signal spread detection: same expiry + matching volume ± tol +
-        opposite or same type + reasonable strike gap. Returns groups of indices.
-        Spread legs get a confidence penalty since net dealer exposure is partial."""
+        """Multi-signal spread detection with ratio spreads, combos, and rolls.
+        Returns groups of (indices, spread_type) tuples."""
         groups=[];used=set()
         for i,r1 in enumerate(rows):
             if i in used: continue
             g=[i]
             for j,r2 in enumerate(rows):
                 if j<=i or j in used: continue
-                # Must share expiry
-                if r1.days_to_exp!=r2.days_to_exp: continue
-                # Volume must match within tolerance
-                v1,v2=max(r1.volume,1),max(r2.volume,1)
-                if abs(v1-v2)/max(v1,v2)>volume_tol: continue
-                # Strike gap must be reasonable
-                mid=max(r1.underlying_price,1)
-                if abs(r1.strike-r2.strike)/mid>max_strike_gap_pct: continue
-                # Must be different strikes (same strike = not a spread)
-                if r1.strike==r2.strike and r1.option_type==r2.option_type: continue
-                g.append(j)
+                # Same expiry spreads
+                if r1.days_to_exp==r2.days_to_exp:
+                    v1,v2=max(r1.volume,1),max(r2.volume,1)
+                    mid=max(r1.underlying_price,1)
+                    strike_gap=abs(r1.strike-r2.strike)/mid
+                    if strike_gap>max_strike_gap_pct: continue
+                    if r1.strike==r2.strike and r1.option_type==r2.option_type: continue
+                    # 1:1 ratio check
+                    if abs(v1-v2)/max(v1,v2)<=volume_tol:
+                        g.append(j);continue
+                    # 1:2 or 2:1 ratio check (ratio spreads)
+                    if min(v1,v2)>0:
+                        ratio=max(v1,v2)/min(v1,v2)
+                        if 1.8<=ratio<=2.2 or 2.8<=ratio<=3.2:
+                            g.append(j);continue
+                # Roll detection: same strike+type, different expiry, similar volume
+                elif r1.strike==r2.strike and r1.option_type==r2.option_type:
+                    v1,v2=max(r1.volume,1),max(r2.volume,1)
+                    if abs(v1-v2)/max(v1,v2)<=volume_tol:
+                        g.append(j)  # likely a calendar roll
             if len(g)>1:
                 for idx in g: used.add(idx)
-                groups.append(g)
+                # Classify spread type
+                types=set(rows[idx].option_type.lower() for idx in g)
+                expiries=set(rows[idx].days_to_exp for idx in g)
+                if len(expiries)>1: stype="roll"
+                elif len(types)==2: stype="combo"
+                elif len(g)==2:
+                    v1,v2=rows[g[0]].volume,rows[g[1]].volume
+                    r=max(v1,v2)/max(min(v1,v2),1)
+                    stype="ratio" if r>1.5 else "vertical"
+                else: stype="complex"
+                groups.append({"indices":g,"type":stype})
         return groups
     @staticmethod
     def enrich_rows(rows):
         """Classify each row, detect spreads, and penalize confidence on spread legs."""
         for r in rows:
             s,c=TradeSignEngine.classify_row(r);r.inferred_side=s;r.dealer_sign_confidence=c
-        # Detect spread legs and reduce confidence (net exposure is ambiguous on spreads)
         spread_groups=TradeSignEngine.infer_spread_legs(rows)
         for group in spread_groups:
-            for idx in group:
-                rows[idx].dealer_sign_confidence*=0.6  # penalize: spread leg = less certain dealer sign
-        return rows
+            for idx in group["indices"]:
+                rows[idx].dealer_sign_confidence*=0.6
+        return rows, spread_groups
 
 # ── 11. HELPERS ──────────────────────────────────────────────────
 
@@ -798,41 +1029,66 @@ class InstitutionalExpectationEngine:
     def _grid(self,spot,pct=0.12,steps=121):
         lo=spot*(1-pct);hi=spot*(1+pct);st=(hi-lo)/max(steps-1,1)
         return[round(lo+i*st,2)for i in range(steps)]
-    def _ladder(self,rows,ctx,ivs,events=None):
+    def _ladder(self,rows,ctx,ivs,events=None,audit=None):
         us=sorted({r.strike for r in rows});rd=ivs.representative_dte();T=year_fraction(rd)
         qa=sum(r.dividend_yield for r in rows)/max(len(rows),1);ld=[]
+        has_events=bool(events)
         for K in us:
             siv=ivs.strike_iv(K,ctx.spot)
             if events: siv=EventVolEngine.adjust_iv(siv,T,events)
             pa=prob_finish_above(ctx.spot,K,T,self.r,qa,siv);pb=prob_finish_below(ctx.spot,K,T,self.r,qa,siv)
-            pt=BarrierModel.analytic_touch(ctx.spot,K,T,self.r,qa,siv)
-            ld.append({"strike":round(K,2),"iv_used":round(siv,4),"prob_finish_above":round(pa,4),"prob_finish_below":round(pb,4),"prob_touch":round(pt,4)})
+            # Item 10: Route touch probability through TouchRouter
+            touch_result=TouchRouter.route(ctx.spot,K,T,self.r,qa,siv,
+                barrier_sigma=None,has_events=has_events,audit=audit)
+            ld.append({"strike":round(K,2),"iv_used":round(siv,4),"prob_finish_above":round(pa,4),
+                "prob_finish_below":round(pb,4),"prob_touch":touch_result["prob_touch"],
+                "touch_method":touch_result["method"]})
         return ld
     def snapshot(self,rows,ctx):
         if not rows: return{}
-        # Pure: enrich copies, don't mutate originals
-        enriched_rows=[OptionRow(option_type=r.option_type,strike=r.strike,days_to_exp=r.days_to_exp,iv=r.iv,open_interest=r.open_interest,underlying_price=r.underlying_price,contract_size=r.contract_size,volume=r.volume,dividend_yield=r.dividend_yield,exercise_style=r.exercise_style,bid=r.bid,ask=r.ask,last=r.last,oi_change=r.oi_change,trades=r.trades,inferred_side=r.inferred_side,dealer_sign_confidence=r.dealer_sign_confidence,delta=r.delta,gamma=r.gamma,vanna=r.vanna,charm=r.charm,volga=r.volga,speed=r.speed,theta=r.theta,rho=r.rho)for r in rows]
-        TradeSignEngine.enrich_rows(enriched_rows)
-        # Compute RV locally — never mutate ctx
+        audit=AuditLog()
+        # Item 4: Validate inputs
+        clean,quarantined,ctx_issues=InputValidator.validate_chain(rows,ctx,audit)
+        if not clean: return{"error":"all rows quarantined","quarantined":len(quarantined),"schema_version":SCHEMA_VERSION}
+        if ctx_issues: audit.log("ctx_warning",issues=ctx_issues)
+        # Item 2: Pure copies — never mutate originals
+        enriched_rows=[OptionRow(option_type=r.option_type,strike=r.strike,days_to_exp=r.days_to_exp,iv=r.iv,open_interest=r.open_interest,underlying_price=r.underlying_price,contract_size=r.contract_size,volume=r.volume,dividend_yield=r.dividend_yield,exercise_style=r.exercise_style,bid=r.bid,ask=r.ask,last=r.last,oi_change=r.oi_change,trades=r.trades,inferred_side=r.inferred_side,dealer_sign_confidence=r.dealer_sign_confidence,delta=r.delta,gamma=r.gamma,vanna=r.vanna,charm=r.charm,volga=r.volga,speed=r.speed,theta=r.theta,rho=r.rho)for r in clean]
+        # Item 1: Enrich trade signs + spread detection
+        enriched_rows,spread_groups=TradeSignEngine.enrich_rows(enriched_rows)
+        spread_leg_indices=set()
+        for g in spread_groups:
+            for idx in g["indices"]: spread_leg_indices.add(idx)
+            audit.log("spread_detected",type=g["type"],legs=len(g["indices"]))
+        spread_leg_pct=len(spread_leg_indices)/max(len(enriched_rows),1)
+        # Item 8: Compute RV locally using canonical policy — never mutate ctx
         rv20=ctx.realized_vol_20d;rv10=ctx.realized_vol_10d;rv5=ctx.realized_vol_5d
+        rv_source="external"
         if ctx.recent_bars and rv20 is None:
-            rv=RealizedVolEngine.multi_window(ctx.recent_bars)
-            if rv.get("rv_20d"): rv20=rv["rv_20d"]
-            if rv.get("rv_10d"): rv10=rv["rv_10d"]
-            if rv.get("rv_5d"): rv5=rv["rv_5d"]
+            rv20=RVPolicy.get_vrp_rv(ctx.recent_bars,20)
+            rv10=RVPolicy.get_vrp_rv(ctx.recent_bars,10)
+            rv5=RVPolicy.get_vrp_rv(ctx.recent_bars,5)
+            rv_source="yang_zhang_from_bars"
+        audit.log("rv_source",source=rv_source,rv20=rv20,rv10=rv10,rv5=rv5)
+        # Normalize to ctx.spot
         nr=[OptionRow(option_type=r.option_type,strike=r.strike,days_to_exp=r.days_to_exp,iv=r.iv,open_interest=r.open_interest,underlying_price=ctx.spot,contract_size=r.contract_size,volume=r.volume,dividend_yield=r.dividend_yield,exercise_style=r.exercise_style,delta=r.delta,gamma=r.gamma,vanna=r.vanna,charm=r.charm,volga=r.volga,speed=r.speed,theta=r.theta,rho=r.rho,bid=r.bid,ask=r.ask,last=r.last,oi_change=r.oi_change,trades=r.trades,inferred_side=r.inferred_side,dealer_sign_confidence=r.dealer_sign_confidence)for r in enriched_rows]
         exp=self.ee.compute(nr);ivs=UnifiedIVSurface(nr,self.ee);pos=PositioningEngine.estimate_opening_pressure(nr)
         riv=ivs.representative_iv(ctx.spot);rdte=ivs.representative_dte();T=year_fraction(rdte);ev=ctx.events
+        audit.log("iv_source",surface="svi" if self.ee.vol_surface else("sabr" if self.ee.sabr_params else "row"))
         aiv=EventVolEngine.adjust_iv(riv,T,ev)if ev else riv
+        if ev: audit.log("event_vol",base_iv=round(riv,4),adjusted_iv=round(aiv,4),n_events=len(ev))
         r1s=expected_move_from_iv(ctx.spot,riv,T);a1b=expected_move_from_iv(ctx.spot,aiv,T)
+        # Item 2/3: Impact model with audit
         fm=LiquidityEngine.calibrated_impact(exp["net"],ctx);lm=LiquidityEngine.liquidity_score(ctx)
+        audit.log("impact_model",flow_mult=round(fm,4),liq_mult=round(lm,4))
         rm=VolatilityRegimeEngine.regime_multiplier(aiv,rv20)
         sm=1.0
         if ctx.is_0dte: sm=0.85+0.30*clamp(1-ctx.session_progress,0,1)
         a1s=a1b*fm*lm*rm*sm;pr=self._ps(exp["net"],ctx.spot,pos);bias=self._bl(pr)
         cs=a1s*0.40*pr;ec=ctx.spot+cs
         grid=self._grid(ctx.spot);gf=self.ee.gamma_flip(nr,grid);vf=self.ee.vanna_flip(nr,grid)
-        ladder=self._ladder(nr,ctx,ivs,ev);bst=exp["by_strike"];walls=exp["walls"]
+        # Item 10: Touch routing for ladder
+        ladder=self._ladder(nr,ctx,ivs,ev,audit)
+        bst=exp["by_strike"];walls=exp["walls"]
         def fl(strike):
             if strike is None: return None
             for x in ladder:
@@ -844,27 +1100,42 @@ class InstitutionalExpectationEngine:
         reg=composite_regime(exp["net"]);decay=DecaySimulator(self.ee).project(nr,5);ts=term_structure(nr,self.ee)
         nb=sum(1 for r in nr if r.inferred_side==TradeSide.BUY);ns=sum(1 for r in nr if r.inferred_side==TradeSide.SELL)
         ac=sum(r.dealer_sign_confidence for r in nr)/max(len(nr),1)
-        return{"spot":round(ctx.spot,2),"representative_iv":round(riv,4),"event_adjusted_iv":round(aiv,4),"representative_dte":round(rdte,2),"raw_expected_move":{"move_1sigma":round(r1s,2),"move_2sigma":round(r1s*2,2),"range_1sigma":{"low":round(ctx.spot-r1s,2),"high":round(ctx.spot+r1s,2)}},"adjusted_expectation":{"move_1sigma":round(a1s,2),"move_2sigma":round(a1s*2,2),"expected_center":round(ec,2),"expected_low":round(ec-a1s,2),"expected_high":round(ec+a1s,2),"bias_score":round(pr,3),"bias":bias},"multipliers":{"flow":round(fm,3),"liquidity":round(lm,3),"vrp":round(rm,3),"session":round(sm,3)},"dealer_flows":{**{k:round(v,2)for k,v in exp["net"].items()},"gex_regime":self._gl(exp["net"]["gex"]),"gamma_flip":gf,"vanna_flip":vf},"trade_sign":{"inferred_buy_rows":nb,"inferred_sell_rows":ns,"avg_confidence":round(ac,3)},"regime":reg,"volatility_regime":{"realized_vol_20d":None if rv20 is None else round(rv20,4),"realized_vol_10d":None if rv10 is None else round(rv10,4),"realized_vol_5d":None if rv5 is None else round(rv5,4),"vrp_20d":None if vrp20 is None else round(vrp20,4),"vrp_10d":None if vrp10 is None else round(vrp10,4),"vrp_5d":None if vrp5 is None else round(vrp5,4),"label":VolatilityRegimeEngine.regime_label(aiv,rv20)},"positioning":pos,"walls":{"call_wall":walls["call_wall"],"put_wall":walls["put_wall"],"gamma_wall":walls["gamma_wall"],"vol_trigger":walls.get("vol_trigger"),"call_wall_stats":None if walls["call_wall"]is None else bst[walls["call_wall"]],"put_wall_stats":None if walls["put_wall"]is None else bst[walls["put_wall"]],"gamma_wall_stats":None if walls["gamma_wall"]is None else bst[walls["gamma_wall"]]},"wall_probabilities":{"call_wall":fl(walls["call_wall"]),"put_wall":fl(walls["put_wall"]),"gamma_wall":fl(walls["gamma_wall"])},"strike_probability_ladder":ladder,"decay_path":decay,"term_structure":ts,"units":UNITS}
+        audit.log("trade_sign_summary",buy=nb,sell=ns,avg_conf=round(ac,3),spread_leg_pct=round(spread_leg_pct,3))
+        # Item 5: Composite confidence
+        quality=DataQualityEngine.score(nr,ctx)
+        # Upgrade IV quality if surface loaded
+        if self.ee.vol_surface: quality["iv_source_quality"]=0.9
+        elif self.ee.sabr_params: quality["iv_source_quality"]=0.8
+        confidence=ConfidenceEngine.compute(quality,ac,spread_leg_pct)
+        # Item 12: Downgrade flags
+        downgrades=DataQualityEngine.downgrade_flags(quality)
+        if downgrades: audit.log("downgrades",flags=downgrades)
+        # Item 15: Frozen schema output
+        return{"schema_version":SCHEMA_VERSION,"spot":round(ctx.spot,2),"representative_iv":round(riv,4),"event_adjusted_iv":round(aiv,4),"representative_dte":round(rdte,2),"raw_expected_move":{"move_1sigma":round(r1s,2),"move_2sigma":round(r1s*2,2),"range_1sigma":{"low":round(ctx.spot-r1s,2),"high":round(ctx.spot+r1s,2)}},"adjusted_expectation":{"move_1sigma":round(a1s,2),"move_2sigma":round(a1s*2,2),"expected_center":round(ec,2),"expected_low":round(ec-a1s,2),"expected_high":round(ec+a1s,2),"bias_score":round(pr,3),"bias":bias},"multipliers":{"flow":round(fm,3),"liquidity":round(lm,3),"vrp":round(rm,3),"session":round(sm,3)},"dealer_flows":{**{k:round(v,2)for k,v in exp["net"].items()},"gex_regime":self._gl(exp["net"]["gex"]),"gamma_flip":gf,"vanna_flip":vf},"trade_sign":{"inferred_buy_rows":nb,"inferred_sell_rows":ns,"avg_confidence":round(ac,3),"spread_leg_pct":round(spread_leg_pct,3),"spread_groups":[g["type"]for g in spread_groups]},"confidence":confidence,"data_quality":quality,"downgrades":downgrades,"regime":reg,"volatility_regime":{"realized_vol_20d":None if rv20 is None else round(rv20,4),"realized_vol_10d":None if rv10 is None else round(rv10,4),"realized_vol_5d":None if rv5 is None else round(rv5,4),"vrp_20d":None if vrp20 is None else round(vrp20,4),"vrp_10d":None if vrp10 is None else round(vrp10,4),"vrp_5d":None if vrp5 is None else round(vrp5,4),"label":VolatilityRegimeEngine.regime_label(aiv,rv20),"rv_source":rv_source},"positioning":pos,"walls":{"call_wall":walls["call_wall"],"put_wall":walls["put_wall"],"gamma_wall":walls["gamma_wall"],"vol_trigger":walls.get("vol_trigger"),"call_wall_stats":None if walls["call_wall"]is None else bst[walls["call_wall"]],"put_wall_stats":None if walls["put_wall"]is None else bst[walls["put_wall"]],"gamma_wall_stats":None if walls["gamma_wall"]is None else bst[walls["gamma_wall"]]},"wall_probabilities":{"call_wall":fl(walls["call_wall"]),"put_wall":fl(walls["put_wall"]),"gamma_wall":fl(walls["gamma_wall"])},"strike_probability_ladder":ladder,"decay_path":decay,"term_structure":ts,"units":UNITS,"quarantined":len(quarantined),"audit_log":audit.summary()}
     def institutional_card(self,rows,ctx):
         s=self.snapshot(rows,ctx)
-        if not s: return"No data."
+        if not s or "error" in s: return s.get("error","No data.")
         a=s["adjusted_expectation"];r=s["raw_expected_move"];f=s["dealer_flows"];v=s["volatility_regime"]
         w=s["walls"];wp=s["wall_probabilities"];p=s["positioning"];rg=s["regime"];ts=s["trade_sign"]
+        conf=s["confidence"];dg=s["downgrades"]
         fp=lambda x:f"{x*100:.1f}%"if x is not None else"n/a"
         cwt=wp["call_wall"]["prob_touch"]if wp["call_wall"]else None
         pwt=wp["put_wall"]["prob_touch"]if wp["put_wall"]else None
         gwt=wp["gamma_wall"]["prob_touch"]if wp["gamma_wall"]else None
-        L=[f"Spot: {s['spot']:.2f} | IV: {s['representative_iv']:.2%}"+
+        L=[f"[v{SCHEMA_VERSION}] Spot: {s['spot']:.2f} | IV: {s['representative_iv']:.2%}"+
            (f" (event-adj: {s['event_adjusted_iv']:.2%})"if s['event_adjusted_iv']!=s['representative_iv']else"")+
-           f" | DTE: {s['representative_dte']:.2f}","",
+           f" | DTE: {s['representative_dte']:.2f}",
+           f"Confidence: {conf['label']} ({conf['composite']:.0%}) | Quarantined: {s.get('quarantined',0)}",""]
+        if dg: L.append("⚠ DOWNGRADES: "+"; ".join(dg));L.append("")
+        L+=[
            "EXPECTED MOVE",f"  Raw 1σ: ±{r['move_1sigma']:.2f}  ({r['range_1sigma']['low']:.2f} – {r['range_1sigma']['high']:.2f})","",
            "DEALER-ADJUSTED EXPECTATION",f"  Bias: {a['bias']}  (score {a['bias_score']:+.3f})",f"  Center: {a['expected_center']:.2f}",f"  1σ Range: {a['expected_low']:.2f} – {a['expected_high']:.2f}","",
            "FLOW STATE",f"  GEX:   {f['gex']:+,.1f}   → {f['gex_regime']}",f"  DEX:   {f['dex']:+,.1f}",f"  Vanna: {f['vanna']:+,.1f}   Volga: {f['volga']:+,.1f}",f"  Charm: {f['charm']:+,.1f}",f"  Gamma Flip: {f['gamma_flip']}  |  Vanna Flip: {f['vanna_flip']}","",
-           "TRADE SIGN",f"  Buy: {ts['inferred_buy_rows']}  Sell: {ts['inferred_sell_rows']}  Confidence: {ts['avg_confidence']:.1%}","",
-           "REGIME",f"  {rg['regime']}  (score {rg['composite_score']:+d})",f"  {rg['style']}",f"  Plays: {rg['preferred_plays']}","",
-           "VOL REGIME",f"  {v['label']}",f"  RV20: {v['realized_vol_20d']} | VRP20: {v['vrp_20d']}","",
+           "TRADE SIGN",f"  Buy: {ts['inferred_buy_rows']}  Sell: {ts['inferred_sell_rows']}  Conf: {ts['avg_confidence']:.1%}  Spreads: {ts['spread_leg_pct']:.0%}","",
+           "REGIME",f"  {rg['regime']}  (score {rg['composite_score']:+d})",f"  {rg['style']}","",
+           "VOL REGIME",f"  {v['label']} (source: {v.get('rv_source','N/A')})",f"  RV20: {v['realized_vol_20d']} | VRP20: {v['vrp_20d']}","",
            "POSITIONING",f"  {p['label']} | net bias {p['net_opening_bias']:+.3f}","",
-           "KEY LEVELS (barrier-touch)",f"  Call Wall:   {w['call_wall']}  | touch {fp(cwt)}",f"  Put Wall:    {w['put_wall']}  | touch {fp(pwt)}",f"  Gamma Wall:  {w['gamma_wall']} | touch {fp(gwt)}"]
+           "KEY LEVELS",f"  Call Wall:   {w['call_wall']}  | touch {fp(cwt)}",f"  Put Wall:    {w['put_wall']}  | touch {fp(pwt)}",f"  Gamma Wall:  {w['gamma_wall']} | touch {fp(gwt)}"]
         if w.get("vol_trigger"): L.append(f"  Vol Trigger: {w['vol_trigger']}")
         return"\n".join(L)
 
@@ -873,3 +1144,65 @@ class InstitutionalExpectationEngine:
 def quick_analysis(rows,r=0.04,vol_surface=None,sabr_params=None):
     e=ExposureEngine(r=r,vol_surface=vol_surface,sabr_params=sabr_params);res=e.compute(rows)
     return{"exposures":res,"gamma_flip":e.gamma_flip(rows),"vanna_flip":e.vanna_flip(rows),"decay_path":DecaySimulator(e).project(rows,5),"term_structure":term_structure(rows,e),"regime":composite_regime(res["net"])}
+
+# ── REGRESSION TESTS (Item 13) ──────────────────────────────────
+
+def run_regression_tests():
+    """Edge case tests. Returns (passed, failed, details)."""
+    passed=[];failed=[]
+    def check(name,cond):
+        if cond: passed.append(name)
+        else: failed.append(name)
+    # Near-zero DTE
+    r=OptionRow("call",100,0.01,0.30,1000,100);e=ExposureEngine()
+    res=e.compute([r]);check("near_zero_dte",res["net"]["gex"]!=0)
+    # Deep ITM call
+    r=OptionRow("call",50,30,0.25,500,100);res=e.compute([r])
+    check("deep_itm_call",abs(res["net"]["dex"])>0)
+    # Deep OTM put
+    r=OptionRow("put",50,30,0.25,500,100);res=e.compute([r])
+    check("deep_otm_put",abs(res["net"]["gex"])>=0)  # should not crash
+    # Zero rate
+    e0=ExposureEngine(r=0.0);r=OptionRow("put",100,30,0.25,1000,100)
+    res=e0.compute([r]);check("zero_rate",math.isfinite(res["net"]["gex"]))
+    # Dividend-heavy
+    r=OptionRow("call",100,30,0.25,1000,100,dividend_yield=0.08)
+    res=e.compute([r]);check("high_dividend",math.isfinite(res["net"]["gex"]))
+    # American put
+    r=OptionRow("put",105,30,0.30,1000,100,exercise_style=ExerciseStyle.AMERICAN,dividend_yield=0.03)
+    res=e.compute([r]);check("american_put",res["enriched"][0]["price"]>0)
+    # BAW edge: very short T
+    p=baw_american_price("put",100,105,0.001,0.05,0.03,0.30)
+    check("baw_tiny_T",math.isfinite(p) and p>=0)
+    # Empty chain
+    res=e.compute([]);check("empty_chain",res["net"]["gex"]==0)
+    # Single expiry
+    rows=[OptionRow("call",100,7,0.25,500,100),OptionRow("put",100,7,0.25,500,100)]
+    res=e.compute(rows);check("single_expiry",len(res["by_strike"])>0)
+    # Bad input validation
+    bad=OptionRow("call",-10,30,0.25,1000,100)
+    ok,issues=InputValidator.validate_row(bad)
+    check("validation_negative_strike",not ok and len(issues)>0)
+    bad2=OptionRow("call",100,30,15.0,-50,0)  # iv=15, OI=-50, spot=0
+    ok2,issues2=InputValidator.validate_row(bad2)
+    check("validation_multi_bad",not ok2 and len(issues2)>=2)
+    # Heston Feller
+    hp=HestonParams(0.04,0.04,2.0,0.5,-0.7)
+    check("heston_feller_false",not hp.feller_satisfied())
+    hp2=HestonParams(0.04,0.04,5.0,0.3,-0.7)
+    check("heston_feller_true",hp2.feller_satisfied())
+    # RV engine with minimal bars
+    b=[OHLC(100,101,99,100.5)]
+    check("rv_single_bar",RealizedVolEngine.yang_zhang(b) is None)
+    # Barrier at spot
+    check("barrier_at_spot",BarrierModel.analytic_touch(100,100,0.1,0.04,0,0.25)==1.0)
+    # Schema version present
+    rows=[OptionRow("call",100,7,0.25,500,100)]
+    ctx=MarketContext(spot=100)
+    eng=InstitutionalExpectationEngine()
+    snap=eng.snapshot(rows,ctx)
+    check("schema_version",snap.get("schema_version")==SCHEMA_VERSION)
+    check("confidence_present","confidence" in snap)
+    check("downgrades_present","downgrades" in snap)
+    check("audit_present","audit_log" in snap)
+    return{"passed":len(passed),"failed":len(failed),"details":{"passed":passed,"failed":failed}}
