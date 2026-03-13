@@ -103,7 +103,54 @@ ACCOUNT_CHAT_IDS = {
 # REDIS
 # ─────────────────────────────────────────────────────────
 _redis_client = None
-_mem_store: dict = {}
+
+
+class _MemStore:
+    """
+    TTL-aware in-memory fallback store.
+
+    Mirrors the Redis setex / get / exists interface so store_set / store_get /
+    store_exists behave identically whether Redis is up or down.
+
+    Keys written without a TTL live forever (same semantics as Redis SET with no EX).
+    Keys written with TTL > 0 expire at `time.monotonic() + ttl` and are pruned
+    lazily on every read/write — no background thread needed.
+
+    Without this, dedup keys written during a Redis outage would live forever in
+    the process, silently suppressing valid future alerts for the remainder of the
+    Render dyno's uptime.
+    """
+    def __init__(self):
+        self._data: dict = {}   # key → (value, expires_at_monotonic | None)
+        self._lock = threading.Lock()
+
+    def _prune(self):
+        """Remove all expired keys. Called inside the lock on every read/write."""
+        now = time.monotonic()
+        expired = [k for k, (_, exp) in self._data.items() if exp is not None and now >= exp]
+        for k in expired:
+            del self._data[k]
+
+    def set(self, key: str, value: str, ttl: int = 0):
+        exp = (time.monotonic() + ttl) if ttl > 0 else None
+        with self._lock:
+            self._prune()
+            self._data[key] = (value, exp)
+
+    def get(self, key: str):
+        with self._lock:
+            self._prune()
+            entry = self._data.get(key)
+            return entry[0] if entry is not None else None
+
+    def exists(self, key: str) -> bool:
+        with self._lock:
+            self._prune()
+            return key in self._data
+
+
+_mem_store = _MemStore()
+
 
 def _get_redis():
     global _redis_client
@@ -135,6 +182,7 @@ def _get_redis():
         _redis_client = None
         return None
 
+
 def store_set(key: str, value: str, ttl: int = 0):
     r = _get_redis()
     if r:
@@ -145,8 +193,9 @@ def store_set(key: str, value: str, ttl: int = 0):
                 r.set(key, value)
             return
         except Exception as e:
-            log.warning(f"Redis set failed: {e}")
-    _mem_store[key] = value
+            log.warning(f"Redis set failed ({e}) — writing to mem fallback")
+    _mem_store.set(key, value, ttl)
+
 
 def store_get(key: str):
     r = _get_redis()
@@ -157,6 +206,7 @@ def store_get(key: str):
             pass
     return _mem_store.get(key)
 
+
 def store_exists(key: str) -> bool:
     r = _get_redis()
     if r:
@@ -164,7 +214,7 @@ def store_exists(key: str) -> bool:
             return bool(r.exists(key))
         except Exception:
             pass
-    return key in _mem_store
+    return _mem_store.exists(key)
 
 # ─────────────────────────────────────────────────────────
 # DEDUP
@@ -1328,6 +1378,20 @@ def telegram_webhook(secret):
     if not text.startswith("/"):
         return jsonify({"ok": True})
 
+    # ── Command dedup guard ──
+    # A fresh daemon thread is spawned per command. Under a burst (network
+    # retry, double-tap, or Telegram re-delivery) the same command can arrive
+    # 2-3 times within seconds, triggering duplicate chain fetches and double
+    # Telegram posts. Suppress identical commands from the same user within a
+    # 8-second window using the TTL store (works in both Redis and mem-fallback
+    # mode since _MemStore now honours TTL correctly).
+    cmd_word  = text.split()[0].lower() if text.split() else text.lower()
+    dedup_key = f"cmd_dedup:{user_id}:{cmd_word}"
+    if store_exists(dedup_key):
+        log.info(f"Command dedup hit — suppressing repeat: {cmd_word} from user {user_id}")
+        return jsonify({"ok": True})
+    store_set(dedup_key, "1", ttl=8)
+
     tickers = [t.strip().upper() for t in WATCHLIST.split(",") if t.strip()]
 
     def run_command():
@@ -1364,14 +1428,30 @@ def tv_webhook():
         if data.get("secret") != TV_WEBHOOK_SECRET:
             return jsonify({"error": "Unauthorized"}), 403
 
+    # ── Payload validation ──
+    # Reject early with a clear reason rather than letting bad data
+    # propagate through the engine and produce silent garbage output.
     ticker = (data.get("ticker") or "").strip().upper()
-    bias   = (data.get("bias")   or "bull").strip().lower()
-    tier   = (data.get("tier")   or "2").strip()
-    close  = as_float(data.get("close"), 0.0)
+    bias   = (data.get("bias")   or "").strip().lower()
+    tier   = str(data.get("tier") or "").strip()
+    close  = as_float(data.get("close"), None)
 
+    validation_errors = []
     if not ticker:
-        st, _ = post_to_telegram("📢 TV signal received (no ticker)")
-        return jsonify({"status": "received_raw", "tg_status": st})
+        validation_errors.append("missing 'ticker'")
+    elif not ticker.replace(".", "").isalpha():
+        validation_errors.append(f"invalid ticker '{ticker}' — must be alphabetic")
+    if bias not in ("bull", "bear"):
+        validation_errors.append(f"invalid bias '{bias}' — must be 'bull' or 'bear'")
+    if tier not in ("1", "2", "3"):
+        validation_errors.append(f"invalid tier '{tier}' — must be '1', '2', or '3'")
+    if close is None or close <= 0:
+        validation_errors.append(f"invalid close '{data.get('close')}' — must be a positive number")
+
+    if validation_errors:
+        reason = "; ".join(validation_errors)
+        log.warning(f"TV webhook rejected — {reason} | raw={data}")
+        return jsonify({"error": "invalid_payload", "reason": reason}), 400
 
     log.info(f"TV signal: {ticker} bias={bias} tier={tier} close={close}")
     log.info(f"TV webhook_data: htf_confirmed={data.get('htf_confirmed')} htf_converging={data.get('htf_converging')} daily_bull={data.get('daily_bull')} wt2={data.get('wt2')} rsi_mfi_bull={data.get('rsi_mfi_bull')} above_vwap={data.get('above_vwap')}")
@@ -1438,13 +1518,28 @@ def swing_webhook():
         if data.get("secret") != TV_WEBHOOK_SECRET:
             return jsonify({"error": "Unauthorized"}), 403
 
+    # ── Payload validation ──
     ticker = (data.get("ticker") or "").strip().upper()
-    bias   = (data.get("bias")   or "bull").strip().lower()
-    tier   = (data.get("tier")   or "2").strip()
-    close  = as_float(data.get("close"), 0.0)
+    bias   = (data.get("bias")   or "").strip().lower()
+    tier   = str(data.get("tier") or "").strip()
+    close  = as_float(data.get("close"), None)
 
+    validation_errors = []
     if not ticker:
-        return jsonify({"status": "ignored", "reason": "no ticker"}), 200
+        validation_errors.append("missing 'ticker'")
+    elif not ticker.replace(".", "").isalpha():
+        validation_errors.append(f"invalid ticker '{ticker}' — must be alphabetic")
+    if bias not in ("bull", "bear"):
+        validation_errors.append(f"invalid bias '{bias}' — must be 'bull' or 'bear'")
+    if tier not in ("1", "2", "3"):
+        validation_errors.append(f"invalid tier '{tier}' — must be '1', '2', or '3'")
+    if close is None or close <= 0:
+        validation_errors.append(f"invalid close '{data.get('close')}' — must be a positive number")
+
+    if validation_errors:
+        reason = "; ".join(validation_errors)
+        log.warning(f"Swing webhook rejected — {reason} | raw={data}")
+        return jsonify({"error": "invalid_payload", "reason": reason}), 400
 
     log.info(f"Swing signal: {ticker} bias={bias} tier={tier} "
              f"fib={data.get('fib_level')} dist={data.get('fib_distance_pct')}%")
@@ -1650,15 +1745,69 @@ def _build_option_rows(data: dict, spot: float, days_to_exp: float) -> list:
     return rows
 
 
+# ─────────────────────────────────────────────────────────────────────
+# CHAIN DATA CACHE
+# ─────────────────────────────────────────────────────────────────────
+# Options chain fetches are expensive: ~300–800 ms each, and they count
+# against the MarketData.app rate limit. Without caching, firing /em SPY
+# then /monitorshort SPY within seconds fetches the same chain twice.
+# The scheduled 8:45 AM card for SPY + QQQ fires two concurrent fetches
+# already — add any user monitor commands on top and quota burns fast.
+#
+# Cache keyed by (ticker, expiry_date) → (data, spot, expiry, fetched_at).
+# TTL: 60 seconds — chain OI/IV moves slowly intraday; a 60s window is
+# safe and eliminates nearly all redundant fetches during burst usage.
+# Thread-safe via a simple lock.
+# ─────────────────────────────────────────────────────────────────────
+
+_CHAIN_CACHE_TTL   = 60           # seconds
+_chain_cache: dict = {}           # (ticker, expiry) → (data, spot, expiry, fetched_at)
+_chain_cache_lock  = threading.Lock()
+
+
+def _chain_cache_get(ticker: str, expiry: str):
+    """Return cached (data, spot, expiry) if fresh, else None."""
+    key = (ticker.upper(), expiry)
+    with _chain_cache_lock:
+        entry = _chain_cache.get(key)
+        if entry and (time.monotonic() - entry[3]) < _CHAIN_CACHE_TTL:
+            log.debug(f"Chain cache HIT: {ticker} {expiry}")
+            return entry[0], entry[1], entry[2]
+        if entry:
+            del _chain_cache[key]   # stale — evict immediately
+    return None
+
+
+def _chain_cache_set(ticker: str, expiry: str, data, spot: float):
+    """Store a fresh chain fetch in the cache."""
+    key = (ticker.upper(), expiry)
+    with _chain_cache_lock:
+        # Prune any stale entries while we have the lock (bounded memory)
+        now = time.monotonic()
+        stale = [k for k, v in _chain_cache.items() if (now - v[3]) >= _CHAIN_CACHE_TTL]
+        for k in stale:
+            del _chain_cache[k]
+        _chain_cache[key] = (data, spot, expiry, now)
+        log.debug(f"Chain cache SET: {ticker} {expiry} ({len(_chain_cache)} entries)")
+
+
 def _get_0dte_chain(ticker: str, target_date_str: str = None) -> tuple:
     """
     Fetch the full options chain for a target expiration.
     Returns (data_dict, spot, resolved_expiration) or (None, None, None).
+    Results are cached for _CHAIN_CACHE_TTL seconds to avoid redundant
+    API calls when multiple commands touch the same ticker concurrently.
     """
     try:
-        spot      = get_spot(ticker)
         today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         target    = target_date_str or today_utc
+
+        # ── Cache check (uses pre-resolved target so hit rate is high) ──
+        cached = _chain_cache_get(ticker, target)
+        if cached:
+            return cached   # (data, spot, expiry)
+
+        spot = get_spot(ticker)
 
         data = md_get(
             f"https://api.marketdata.app/v1/options/chain/{ticker}/",
@@ -1670,7 +1819,13 @@ def _get_0dte_chain(ticker: str, target_date_str: str = None) -> tuple:
             if not future_exps:
                 return None, None, None
             target = future_exps[0]
-            data   = md_get(
+
+            # Check cache again with resolved target
+            cached = _chain_cache_get(ticker, target)
+            if cached:
+                return cached
+
+            data = md_get(
                 f"https://api.marketdata.app/v1/options/chain/{ticker}/",
                 {"expiration": target},
             )
@@ -1680,6 +1835,7 @@ def _get_0dte_chain(ticker: str, target_date_str: str = None) -> tuple:
         if not data.get("optionSymbol"):
             return None, None, None
 
+        _chain_cache_set(ticker, target, data, spot)
         return data, spot, target
 
     except Exception as e:
@@ -2652,8 +2808,13 @@ def _get_chain_for_expiry(ticker: str, target_date_str: str) -> tuple:
     Fetch options chain for a specific expiration date.
     Returns (data_dict, spot, resolved_expiration) or (None, None, None).
     Works for any DTE — 0DTE, weekly, monthly.
+    Results are cached for _CHAIN_CACHE_TTL seconds.
     """
     try:
+        cached = _chain_cache_get(ticker, target_date_str)
+        if cached:
+            return cached
+
         spot = get_spot(ticker)
         data = md_get(
             f"https://api.marketdata.app/v1/options/chain/{ticker}/",
@@ -2661,6 +2822,8 @@ def _get_chain_for_expiry(ticker: str, target_date_str: str) -> tuple:
         )
         if not isinstance(data, dict) or data.get("s") != "ok" or not data.get("optionSymbol"):
             return None, None, None
+
+        _chain_cache_set(ticker, target_date_str, data, spot)
         return data, spot, target_date_str
     except Exception as e:
         log.warning(f"Chain fetch failed for {ticker} exp={target_date_str}: {e}")
