@@ -1449,7 +1449,7 @@ def _get_0dte_iv(ticker: str, target_date_str: str = None) -> tuple:
             dte = 0
 
         # ── OI change: diff current OI against cached prior snapshot ──
-        _oi_cache.apply_oi_changes_to_chain(ticker, data)
+        _oi_cache.apply_oi_changes_to_chain(ticker, target, data)
 
         # ── OHLC bars for RV ──
         bars = _get_ohlc_bars(ticker, days=65)
@@ -1466,7 +1466,7 @@ def _get_0dte_iv(ticker: str, target_date_str: str = None) -> tuple:
         )
 
         # ── Save current OI as reference for next run ──
-        _oi_cache.save_snapshot(ticker, data)
+        _oi_cache.save_snapshot(ticker, target, data)
 
         if v4.get("error") or v4.get("iv") is None:
             return empty
@@ -1511,7 +1511,7 @@ def _get_chain_iv_for_expiry(ticker: str, target_date_str: str, dte: float) -> t
             return empty
 
         # ── OI change ──
-        _oi_cache.apply_oi_changes_to_chain(ticker, data)
+        _oi_cache.apply_oi_changes_to_chain(ticker, target, data)
 
         bars = _get_ohlc_bars(ticker, days=65)
         adv, spread = _estimate_liquidity(ticker, spot)
@@ -1525,7 +1525,7 @@ def _get_chain_iv_for_expiry(ticker: str, target_date_str: str, dte: float) -> t
         )
 
         # ── Save OI snapshot ──
-        _oi_cache.save_snapshot(ticker, data)
+        _oi_cache.save_snapshot(ticker, target, data)
 
         if v4.get("error") or v4.get("iv") is None:
             return empty
