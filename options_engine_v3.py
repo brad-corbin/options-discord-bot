@@ -582,15 +582,18 @@ def compute_confidence(
     em_data: Dict = None,
     regime: Dict = None,
     direction: str = "bull",
+    v4_flow: Dict = None,
 ) -> Tuple[int, List[str]]:
     """
     Score trade confidence 0-100.
     v3.6: direction-aware — bear trades score differently from bull.
+    v3.9: v4 flow quality signals from options_exposure engine.
     """
     reasons = []
     vol_edge = vol_edge or {}
     em_data = em_data or {}
     regime = regime or {}
+    v4_flow = v4_flow or {}
     is_bear = direction == "bear"
 
     is_manual = (
@@ -776,6 +779,77 @@ def compute_confidence(
             score += CONFIDENCE_PENALTIES.get("regime_high_vix", -5)
             reasons.append(f"Regime: elevated VIX {vix_val:.0f}")
 
+    # ── v4 Institutional Flow Quality (v3.9) ──
+    # These signals come from the v4 options_exposure engine when available.
+    # They measure dealer positioning agreement with the trade direction.
+    if v4_flow:
+        # Data quality gate: LOW quality data = penalize
+        v4_conf_label = v4_flow.get("confidence_label", "")
+        if v4_conf_label == "LOW":
+            score -= 15
+            reasons.append("v4 data quality LOW (-15)")
+        elif v4_conf_label == "HIGH":
+            score += 5
+            reasons.append("v4 data quality HIGH (+5)")
+
+        # GEX regime agreement
+        gex_val = v4_flow.get("gex", 0)
+        gex_positive = gex_val >= 0
+        if gex_positive:
+            # Positive GEX = suppressive environment, fights directional trades
+            score -= 8
+            reasons.append(f"GEX positive (suppressing, -8)")
+        else:
+            # Negative GEX = trending environment, favors directional trades
+            score += 8
+            reasons.append(f"GEX negative (trending, +8)")
+
+        # Dealer flow direction agreement
+        v4_bias = v4_flow.get("bias", "NEUTRAL")  # UPSIDE / DOWNSIDE / NEUTRAL
+        if is_bear:
+            if v4_bias == "DOWNSIDE":
+                score += 10
+                reasons.append("v4 dealer flow confirms DOWNSIDE (+10)")
+            elif v4_bias == "UPSIDE":
+                score -= 10
+                reasons.append("v4 dealer flow shows UPSIDE (fights bear, -10)")
+        else:
+            if v4_bias == "UPSIDE":
+                score += 10
+                reasons.append("v4 dealer flow confirms UPSIDE (+10)")
+            elif v4_bias == "DOWNSIDE":
+                score -= 10
+                reasons.append("v4 dealer flow shows DOWNSIDE (fights bull, -10)")
+
+        # Flip price alignment
+        flip = v4_flow.get("gamma_flip")
+        if flip and v4_flow.get("spot"):
+            spot_v4 = v4_flow["spot"]
+            if is_bear:
+                if spot_v4 < flip:
+                    score += 5
+                    reasons.append(f"Spot below gamma flip ${flip:.0f} (confirms bear, +5)")
+                else:
+                    score -= 5
+                    reasons.append(f"Spot above gamma flip ${flip:.0f} (fights bear, -5)")
+            else:
+                if spot_v4 > flip:
+                    score += 5
+                    reasons.append(f"Spot above gamma flip ${flip:.0f} (confirms bull, +5)")
+                else:
+                    score -= 5
+                    reasons.append(f"Spot below gamma flip ${flip:.0f} (fights bull, -5)")
+
+        # Composite regime agreement
+        v4_regime = v4_flow.get("composite_regime", "")
+        if "PIN" in v4_regime:
+            # Pinning regime fights directional trades
+            score -= 8
+            reasons.append(f"v4 regime: {v4_regime} (fights directional, -8)")
+        elif "TREND" in v4_regime or "EXPLOSIVE" in v4_regime:
+            score += 5
+            reasons.append(f"v4 regime: {v4_regime} (confirms directional, +5)")
+
     # ── Deal-breakers ──
     if has_earnings:
         score += CONFIDENCE_PENALTIES["earnings_week"]
@@ -804,10 +878,12 @@ def recommend_trade(
     has_dividend: bool = False,
     candle_closes: List[float] = None,
     regime: Dict = None,
+    v4_flow: Dict = None,
 ) -> Dict[str, Any]:
     """
     Main entry point. Returns a complete trade recommendation or rejection.
     v3.6: supports both bull call and bear put debit spreads.
+    v3.9: accepts v4_flow from institutional engine for flow quality scoring.
     """
     webhook_data = webhook_data or {}
     candle_closes = candle_closes or []
@@ -914,6 +990,7 @@ def recommend_trade(
         em_data=em_data,
         regime=regime,
         direction=bias,
+        v4_flow=v4_flow,
     )
 
     if confidence < MIN_CONFIDENCE_TO_TRADE:
