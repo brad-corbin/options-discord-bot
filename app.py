@@ -71,6 +71,12 @@ from engine_bridge import (
 )
 from options_exposure import SCHEMA_VERSION
 from oi_cache import OICache
+from em_reconciler import (
+    reconcile_em_predictions,
+    compute_accuracy_stats,
+    format_accuracy_report,
+    fetch_eod_close_marketdata,
+)
 
 import risk_manager
 import trade_journal
@@ -1447,6 +1453,98 @@ def scan_watchlist():
 
 
 # ─────────────────────────────────────────────────────────
+# EM RECONCILER — compares predictions to actual EOD prices
+# ─────────────────────────────────────────────────────────
+
+@app.route("/reconcile", methods=["POST", "GET"])
+def reconcile_route():
+    """
+    Trigger EM prediction reconciliation.
+    Compares past EM cards against actual EOD closes.
+    POST/GET with secret param for auth.
+    Optional params:
+      - lookback: days to scan (default 5)
+      - post: "true" to post summary to Telegram
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    supplied = (data.get("secret") or request.args.get("secret") or "").strip()
+    if SCAN_SECRET and supplied != SCAN_SECRET:
+        return jsonify({"error": "Unauthorized"}), 403
+
+    lookback = int(data.get("lookback", request.args.get("lookback", 5)))
+    post_summary = str(data.get("post", request.args.get("post", "true"))).lower() == "true"
+
+    def run():
+        try:
+            r = _get_redis()
+            if not r:
+                log.warning("Reconciler: no Redis — cannot scan")
+                return
+
+            # Build the EOD fetcher using app.py's md_get
+            def eod_fetcher(ticker, date_str):
+                return fetch_eod_close_marketdata(ticker, date_str, md_get)
+
+            entries = reconcile_em_predictions(
+                redis_client=r,
+                fetch_eod_close=eod_fetcher,
+                store_set=store_set,
+                lookback_days=lookback,
+            )
+
+            if not entries:
+                log.info("Reconciler: no entries to process")
+                return
+
+            stats = compute_accuracy_stats(entries)
+            report = format_accuracy_report(stats)
+
+            log.info(f"Reconciler stats: n={stats.get('n')} "
+                     f"1σ={stats.get('in_1_sigma_pct')}% "
+                     f"dir={stats.get('direction_correct_pct')}%")
+
+            if post_summary and stats.get("n", 0) > 0:
+                post_to_telegram(report)
+                log.info("Reconciler: accuracy report posted to Telegram")
+
+        except Exception as e:
+            log.error(f"Reconciler error: {e}", exc_info=True)
+
+    threading.Thread(target=run, daemon=True).start()
+    return jsonify({"status": "accepted", "lookback_days": lookback})
+
+
+def _run_reconciler_auto():
+    """Called by the EM scheduler at 4:15 PM CT to auto-reconcile."""
+    try:
+        r = _get_redis()
+        if not r:
+            return
+
+        def eod_fetcher(ticker, date_str):
+            return fetch_eod_close_marketdata(ticker, date_str, md_get)
+
+        entries = reconcile_em_predictions(
+            redis_client=r,
+            fetch_eod_close=eod_fetcher,
+            store_set=store_set,
+            lookback_days=3,
+        )
+
+        if entries:
+            stats = compute_accuracy_stats(entries)
+            if stats.get("n", 0) >= 5:
+                # Only post summary once we have enough data
+                report = format_accuracy_report(stats)
+                post_to_telegram(report)
+                log.info(f"Auto-reconciler: posted accuracy report ({stats['n']} entries)")
+            else:
+                log.info(f"Auto-reconciler: {stats.get('n', 0)} entries — waiting for more data before posting")
+    except Exception as e:
+        log.error(f"Auto-reconciler error: {e}", exc_info=True)
+
+
+# ─────────────────────────────────────────────────────────
 # HOLDINGS SENTIMENT SCAN
 # ─────────────────────────────────────────────────────────
 
@@ -2417,6 +2515,7 @@ def _em_scheduler():
         log.error("pytz not installed — EM scheduler disabled")
         return
     log.info(f"0DTE EM scheduler started — fires at {EM_SCHEDULE_TIMES_CT} CT on weekdays")
+    log.info("EM reconciler scheduled at 16:15 CT on weekdays")
     fired_today: set = set()
     while True:
         try:
@@ -2432,6 +2531,15 @@ def _em_scheduler():
                     log.info(f"EM scheduler firing: {session}")
                     for ticker in EM_TICKERS:
                         threading.Thread(target=_post_em_card, args=(ticker, session), daemon=True).start()
+
+            # ── Auto-reconciler: 4:15 PM CT (after market close) ──
+            recon_key = (date_str, 16, 15)
+            if recon_key not in fired_today:
+                if now_ct.hour == 16 and abs(now_ct.minute - 15) <= 1:
+                    fired_today.add(recon_key)
+                    log.info("EM reconciler firing (4:15 PM CT)")
+                    threading.Thread(target=_run_reconciler_auto, daemon=True, name="reconciler").start()
+
             fired_today = {k for k in fired_today if k[0] == date_str}
         except Exception as e:
             log.error(f"EM scheduler error: {e}", exc_info=True)
