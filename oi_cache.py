@@ -1,33 +1,35 @@
 # oi_cache.py
 # ═══════════════════════════════════════════════════════════════════
-# OI Change Cache — stores yesterday's OI per contract, computes
-# oi_change (delta) on the next fetch.
+# OI Change Cache — stores prior OI per contract per expiration,
+# computes oi_change (delta) on the next fetch.
 #
-# Uses the same store_get/store_set interface as app.py's Redis/mem store.
-# Keyed by ticker → {(strike, side, expiry): oi}
-# TTL: 25 hours (survives overnight, auto-expires if stale).
+# Keys are (ticker, expiration) so 0DTE and 21DTE monitor chains
+# don't overwrite each other's snapshots.
+#
+# TTL: 50 hours — survives overnight + a missed morning run.
+# For weekend survival, we also keep a "last known" snapshot per
+# ticker+expiry that only gets replaced on successful save.
 #
 # Usage:
 #   from oi_cache import OICache
 #   oi_cache = OICache(store_get, store_set)
-#   oi_changes = oi_cache.compute_oi_changes(ticker, current_chain_data)
-#   # oi_changes = {(strike, side, expiry): delta_oi} or {}
-#   oi_cache.save_snapshot(ticker, current_chain_data)
+#   enriched = oi_cache.apply_oi_changes_to_chain("SPY", "2026-03-16", chain_data)
+#   oi_cache.save_snapshot("SPY", "2026-03-16", chain_data)
 # ═══════════════════════════════════════════════════════════════════
 
 import json
 import logging
-from typing import Dict, Optional, Callable, Tuple
+from typing import Dict, Optional, Callable
 
 log = logging.getLogger(__name__)
 
-OI_CACHE_TTL = 25 * 3600  # 25 hours — survives overnight, stale after
+OI_CACHE_TTL = 50 * 3600  # 50 hours — survives overnight + one missed cycle
 
 
 class OICache:
     """
-    Caches OI per contract. On the next fetch, diffs current OI against
-    cached OI to produce oi_change per contract.
+    Caches OI per contract per expiration. On the next fetch, diffs
+    current OI against cached OI to produce oi_change per contract.
 
     store_get / store_set must match app.py's Redis/mem store interface:
         store_get(key) → str or None
@@ -38,7 +40,12 @@ class OICache:
         self._get = store_get_fn
         self._set = store_set_fn
 
-    def _key(self, ticker: str) -> str:
+    def _key(self, ticker: str, expiration: str) -> str:
+        """Key includes expiration so different DTEs don't collide."""
+        return f"oi_snap:{ticker.upper()}:{expiration}"
+
+    # ── Legacy key for backward compat on first deploy ──
+    def _legacy_key(self, ticker: str) -> str:
         return f"oi_snap:{ticker.upper()}"
 
     def _parse_chain_oi(self, chain_data: dict) -> Dict[str, int]:
@@ -63,35 +70,49 @@ class OICache:
             oi     = int(oi_list[i] or 0)
             if strike is None or side not in ("call", "put"):
                 continue
-            # Key: "strike|side" e.g. "575.0|call"
             key = f"{float(strike)}|{side}"
             result[key] = oi
 
         return result
 
-    def get_prior_snapshot(self, ticker: str) -> Optional[Dict[str, int]]:
-        """Load the cached OI snapshot from store."""
+    def get_prior_snapshot(self, ticker: str, expiration: str) -> Optional[Dict[str, int]]:
+        """
+        Load the cached OI snapshot from store.
+        Tries new expiration-aware key first, falls back to legacy key.
+        """
         try:
-            raw = self._get(self._key(ticker))
-            if raw is None:
-                return None
-            return json.loads(raw)
+            raw = self._get(self._key(ticker, expiration))
+            if raw is not None:
+                return json.loads(raw)
+            # Fall back to legacy key (one-time migration path)
+            raw = self._get(self._legacy_key(ticker))
+            if raw is not None:
+                log.info(f"OI cache: migrating legacy key for {ticker} → {ticker}:{expiration}")
+                return json.loads(raw)
+            return None
         except Exception as e:
-            log.warning(f"OI cache load failed for {ticker}: {e}")
+            log.warning(f"OI cache load failed for {ticker}:{expiration}: {e}")
             return None
 
-    def save_snapshot(self, ticker: str, chain_data: dict):
+    def save_snapshot(self, ticker: str, expiration: str, chain_data: dict):
         """Save current OI as the reference snapshot for next comparison."""
         try:
             current = self._parse_chain_oi(chain_data)
             if not current:
                 return
-            self._set(self._key(ticker), json.dumps(current), ttl=OI_CACHE_TTL)
-            log.debug(f"OI snapshot saved for {ticker}: {len(current)} contracts")
+            self._set(
+                self._key(ticker, expiration),
+                json.dumps(current),
+                ttl=OI_CACHE_TTL,
+            )
+            log.info(
+                f"OI snapshot saved for {ticker}:{expiration} — "
+                f"{len(current)} contracts, TTL={OI_CACHE_TTL // 3600}h"
+            )
         except Exception as e:
-            log.warning(f"OI cache save failed for {ticker}: {e}")
+            log.warning(f"OI cache save failed for {ticker}:{expiration}: {e}")
 
-    def compute_oi_changes(self, ticker: str, chain_data: dict) -> Dict[str, int]:
+    def compute_oi_changes(self, ticker: str, expiration: str, chain_data: dict) -> Dict[str, int]:
         """
         Compare current chain OI against cached prior snapshot.
         Returns {contract_key: oi_change} where oi_change = current - prior.
@@ -99,28 +120,44 @@ class OICache:
 
         If no prior snapshot exists, returns empty dict (first run).
         """
-        prior = self.get_prior_snapshot(ticker)
+        prior = self.get_prior_snapshot(ticker, expiration)
         if prior is None:
+            log.info(f"OI cache: no prior snapshot for {ticker}:{expiration} — first run, caching now")
             return {}
 
         current = self._parse_chain_oi(chain_data)
+        if not current:
+            return {}
+
         changes = {}
+        matched = 0
         for key, cur_oi in current.items():
             prev_oi = prior.get(key, 0)
             delta = cur_oi - prev_oi
+            if key in prior:
+                matched += 1
             if delta != 0:
                 changes[key] = delta
 
+        log.info(
+            f"OI cache: {ticker}:{expiration} — "
+            f"{matched}/{len(current)} strikes matched prior, "
+            f"{len(changes)} changed"
+        )
         return changes
 
-    def apply_oi_changes_to_chain(self, ticker: str, chain_data: dict) -> dict:
+    def apply_oi_changes_to_chain(self, ticker: str, expiration: str, chain_data: dict) -> dict:
         """
         Compute OI changes and inject them into the chain data as an
         'oiChange' array parallel to the existing arrays.
         Returns the enriched chain_data dict (mutates in place for efficiency).
         """
-        changes = self.compute_oi_changes(ticker, chain_data)
+        changes = self.compute_oi_changes(ticker, expiration, chain_data)
         if not changes:
+            # Still inject an oiChange array of Nones so downstream knows
+            # the field exists but had no data (vs field missing entirely)
+            sym_list = chain_data.get("optionSymbol") or []
+            chain_data["oiChange"] = [None] * len(sym_list)
             return chain_data
 
         sym_list = chain_data.get("optionSymbol") or []
@@ -134,6 +171,7 @@ class OICache:
         sides   = col("side", "")
 
         oi_change_list = []
+        populated = 0
         for i in range(n):
             strike = strikes[i]
             side   = str(sides[i] or "").lower()
@@ -141,7 +179,11 @@ class OICache:
                 oi_change_list.append(None)
                 continue
             key = f"{float(strike)}|{side}"
-            oi_change_list.append(changes.get(key))
+            val = changes.get(key)
+            oi_change_list.append(val)
+            if val is not None:
+                populated += 1
 
         chain_data["oiChange"] = oi_change_list
+        log.info(f"OI cache: injected {populated} oiChange values into {ticker}:{expiration} chain")
         return chain_data
