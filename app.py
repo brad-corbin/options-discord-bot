@@ -974,7 +974,116 @@ def check_spread_exit_warning(ticker: str, signal_bias: str, webhook_data: dict)
 
 
 # ─────────────────────────────────────────────────────────
-# CHECK TICKER — scalp engine (0-10 DTE)
+# V4 PREFILTER — institutional flow quality gate for scalp engine
+# Runs v4 snapshot on nearest-DTE chain before spread selection.
+# Returns a v4_flow dict that compute_confidence can score.
+# ─────────────────────────────────────────────────────────
+
+def _contracts_to_chain_data(contracts: list) -> dict:
+    """
+    Convert v3 contract dicts back to MarketData.app columnar format
+    so engine_bridge can consume it.
+    """
+    if not contracts:
+        return {}
+    keys = {
+        "optionSymbol": "optionSymbol", "strike": "strike", "side": "right",
+        "iv": "iv", "openInterest": "openInterest", "volume": "volume",
+        "delta": "delta", "gamma": "gamma", "theta": "theta", "vega": "vega",
+        "bid": "bid", "ask": "ask",
+    }
+    result = {"s": "ok"}
+    for md_key, contract_key in keys.items():
+        result[md_key] = [c.get(contract_key) for c in contracts]
+    return result
+
+
+def _run_v4_prefilter(ticker: str, spot: float, chains: list, candle_closes: list) -> dict:
+    """
+    Run v4 institutional snapshot on the nearest-DTE chain.
+    Returns a v4_flow dict for compute_confidence, or empty dict on failure.
+
+    The v4_flow dict contains:
+      - confidence_label: HIGH/MODERATE/LOW
+      - gex: net GEX value
+      - bias: UPSIDE/DOWNSIDE/NEUTRAL
+      - gamma_flip: flip price or None
+      - spot: current spot
+      - composite_regime: regime label string
+      - downgrades: list of downgrade flags
+    """
+    try:
+        if not chains:
+            return {}
+
+        # Use nearest-DTE chain (first in list, already sorted by DTE)
+        exp, dte, contracts = chains[0]
+
+        # Convert to MarketData.app format for the v4 engine
+        chain_data = _contracts_to_chain_data(contracts)
+        if not chain_data.get("optionSymbol"):
+            return {}
+
+        # Apply OI cache
+        _oi_cache.apply_oi_changes_to_chain(ticker, exp, chain_data)
+
+        # Build OHLC bars from candle closes for RV
+        bars = _get_ohlc_bars(ticker, days=65)
+
+        # Estimate liquidity
+        adv, spread_pct = _estimate_liquidity(ticker, spot)
+
+        # Run v4 snapshot
+        v4 = run_institutional_snapshot(
+            chain_data=chain_data, spot=spot, dte=max(dte, 0.5),
+            recent_bars=bars, is_0dte=(dte == 0),
+            avg_daily_dollar_volume=adv,
+            bid_ask_spread_pct=spread_pct,
+            liquid_index=_is_liquid(ticker),
+        )
+
+        # Save OI snapshot for next run
+        _oi_cache.save_snapshot(ticker, exp, chain_data)
+
+        if v4.get("error"):
+            log.warning(f"v4 prefilter failed for {ticker}: {v4['error']}")
+            return {}
+
+        snap = v4.get("snapshot", {})
+        confidence = snap.get("confidence", {})
+        dealer = snap.get("dealer_flows", {})
+        regime = snap.get("regime", {})
+        adj = snap.get("adjusted_expectation", {})
+
+        v4_flow = {
+            "confidence_label": confidence.get("label", ""),
+            "confidence_score": confidence.get("composite", 0),
+            "gex": dealer.get("gex", 0),
+            "dex": dealer.get("dex", 0),
+            "vanna": dealer.get("vanna", 0),
+            "charm": dealer.get("charm", 0),
+            "bias": adj.get("bias", "NEUTRAL"),
+            "bias_score": adj.get("bias_score", 0),
+            "gamma_flip": dealer.get("gamma_flip"),
+            "spot": spot,
+            "composite_regime": regime.get("regime", ""),
+            "downgrades": snap.get("downgrades", []),
+            "vol_regime_label": snap.get("volatility_regime", {}).get("label", ""),
+        }
+
+        log.info(f"v4 prefilter {ticker}: conf={confidence.get('label')} "
+                 f"gex={dealer.get('gex', 0):.0f} bias={adj.get('bias')} "
+                 f"regime={regime.get('regime', '?')} flip={dealer.get('gamma_flip')}")
+
+        return v4_flow
+
+    except Exception as e:
+        log.warning(f"v4 prefilter error for {ticker}: {e}")
+        return {}
+
+
+# ─────────────────────────────────────────────────────────
+# CHECK TICKER — scalp engine (0-10 DTE) + v4 flow quality gate
 # ─────────────────────────────────────────────────────────
 
 def check_ticker(ticker, direction="bull", webhook_data=None):
@@ -990,8 +1099,12 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
         candle_closes = get_daily_candles(ticker, days=RV_LOOKBACK_DAYS + 5)
         regime = get_current_regime()
 
+        # ── v4 prefilter: run institutional snapshot for flow quality ──
+        v4_flow = _run_v4_prefilter(ticker, spot, chains, candle_closes)
+
         log.info(f"check_ticker({ticker}): spot={spot} expirations={len(chains)} "
-                 f"earnings={has_earnings} candles={len(candle_closes)} direction={direction}")
+                 f"earnings={has_earnings} candles={len(candle_closes)} direction={direction}"
+                 f"{' v4=' + v4_flow.get('composite_regime', '?') if v4_flow else ''}")
 
         all_recs = []; all_reasons = []
         for exp, dte, contracts in chains:
@@ -1000,6 +1113,7 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
                 expiration=exp, webhook_data=webhook_data,
                 has_earnings=has_earnings, has_dividend=has_dividend,
                 candle_closes=candle_closes, regime=regime,
+                v4_flow=v4_flow,
             )
             if rec.get("ok"):
                 all_recs.append(rec)
@@ -1691,18 +1805,20 @@ def _format_em_block(em, spot, bias_score, label=""):
     bull_1 = em["bull_1sd"]; bear_1 = em["bear_1sd"]
     bull_2 = em["bull_2sd"]; bear_2 = em["bear_2sd"]
     em_1 = em["em_1sd"]; em_2 = em["em_2sd"]; em_pct = em["em_pct_1sd"]
-    is_bull = bias_score >= 2; is_bear = bias_score <= -2
-    if is_bull:
-        line_1sd = f"  1σ (68%):  ► ${bull_1:.2f} ◄  ←  ${spot:.2f}  →  ${bear_1:.2f}"
-        favor = f"  📈 Favored: UPSIDE  (bias score {bias_score:+d})"
-    elif is_bear:
-        line_1sd = f"  1σ (68%):  ${bull_1:.2f}  ←  ${spot:.2f}  →  ► ${bear_1:.2f} ◄"
-        favor = f"  📉 Favored: DOWNSIDE  (bias score {bias_score:+d})"
+    line_1sd = f"  1σ (68%):  ${bear_1:.2f}  ←  ${spot:.2f}  →  ${bull_1:.2f}"
+    # Bias score informs lean but NOT the range — range is pure IV math
+    if bias_score >= 4:
+        lean = f"  📈 Lean: BULLISH  (score {bias_score:+d}/14)"
+    elif bias_score >= 2:
+        lean = f"  📈 Lean: slight bullish  (score {bias_score:+d}/14)"
+    elif bias_score <= -4:
+        lean = f"  📉 Lean: BEARISH  (score {bias_score:+d}/14)"
+    elif bias_score <= -2:
+        lean = f"  📉 Lean: slight bearish  (score {bias_score:+d}/14)"
     else:
-        line_1sd = f"  1σ (68%):  ${bull_1:.2f}  ←  ${spot:.2f}  →  ${bear_1:.2f}"
-        favor = f"  ↔️  No clear edge  (score {bias_score:+d}/14)"
+        lean = f"  ↔️  No clear lean  (score {bias_score:+d}/14)"
     return ["", "─" * 32, header, line_1sd, f"             ±${em_1:.2f}  ({em_pct:.2f}%)",
-            f"  2σ (95%):  ${bull_2:.2f}  ←→  ${bear_2:.2f}", f"             ±${em_2:.2f}", favor]
+            f"  2σ (95%):  ${bear_2:.2f}  ←→  ${bull_2:.2f}", f"             ±${em_2:.2f}", lean]
 
 
 def _format_skew_line(skew):
@@ -1772,6 +1888,47 @@ def _find_expiry_closest_to_21(ticker):
     except Exception as e:
         log.warning(f"_find_expiry_closest_to_21 failed for {ticker}: {e}")
         return None, None
+
+
+# ─────────────────────────────────────────────────────────────────────
+# EM ACCURACY LOGGER — saves predictions for backtest analysis
+# Stores each EM card's prediction in Redis so we can compare
+# against actual EOD prices and compute hit rates over time.
+# ─────────────────────────────────────────────────────────────────────
+
+def _log_em_prediction(ticker: str, session: str, spot: float, em: dict, bias: dict, v4_result: dict):
+    """
+    Log EM prediction to Redis for backtest analysis.
+    Key: em_log:{date}:{ticker}:{session}
+    Stored as JSON with prediction data. TTL: 90 days.
+    """
+    try:
+        import json
+        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        key = f"em_log:{now_str}:{ticker}:{session}"
+        entry = {
+            "ticker": ticker,
+            "date": now_str,
+            "session": session,
+            "spot_at_prediction": spot,
+            "em_1sd": em.get("em_1sd"),
+            "bull_1sd": em.get("bull_1sd"),
+            "bear_1sd": em.get("bear_1sd"),
+            "bull_2sd": em.get("bull_2sd"),
+            "bear_2sd": em.get("bear_2sd"),
+            "bias_score": bias.get("score"),
+            "bias_direction": bias.get("direction"),
+            "v4_confidence": v4_result.get("confidence", {}).get("label") if v4_result else None,
+            "v4_bias": v4_result.get("snapshot", {}).get("adjusted_expectation", {}).get("bias") if v4_result else None,
+            "v4_regime": v4_result.get("snapshot", {}).get("regime", {}).get("regime") if v4_result else None,
+            # EOD price gets filled in later by a separate reconciler
+            "eod_price": None,
+            "reconciled": False,
+        }
+        store_set(key, json.dumps(entry), ttl=90 * 86400)  # 90 day TTL
+        log.debug(f"EM prediction logged: {key}")
+    except Exception as e:
+        log.warning(f"EM prediction log failed: {e}")
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1929,6 +2086,9 @@ def _post_em_card(ticker: str, session: str):
         log.info(f"EM card posted: {ticker} | {session_label} | spot={spot} | IV={iv_pct:.1f}% | "
                  f"EM=±${em['em_1sd']} | score={bias['score']} | lean={bias['direction']} | "
                  f"conf={v4_result.get('confidence', {}).get('label', '?')}")
+
+        # ── EM accuracy logger: save prediction for backtest ──
+        _log_em_prediction(ticker, session, spot, em, bias, v4_result)
 
         _post_trade_card(
             ticker=ticker, spot=spot, expiration=expiration,
