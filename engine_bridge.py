@@ -219,11 +219,10 @@ def run_institutional_snapshot(
     snap_walls = snap.get("walls", {})
     by_strike  = snap.get("exposures", {}).get("by_strike", {}) if "exposures" in snap else {}
 
-    # If snapshot doesn't have exposures directly, get from a fresh compute
-    if not by_strike:
-        ee = ExposureEngine(r=0.04)
-        raw_result = ee.compute(rows)
-        by_strike = raw_result.get("by_strike", {})
+    # v4.1: Removed redundant ExposureEngine fallback.
+    # The v4 snapshot should always populate by_strike.
+    # If empty, walls will be empty — that's correct behavior
+    # rather than running a duplicate compute path.
 
     walls = _build_walls(by_strike, spot, snap_walls)
 
