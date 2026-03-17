@@ -2272,11 +2272,20 @@ def _post_em_card(ticker: str, session: str):
         # ── EM accuracy logger: save prediction for backtest ──
         _log_em_prediction(ticker, session, spot, em, bias, v4_result)
 
+        # ── Compute session progress for trade card timing gates ──
+        _mkt_open_ct = now_ct.replace(hour=8, minute=30, second=0, microsecond=0)
+        _mkt_close_ct = now_ct.replace(hour=15, minute=0, second=0, microsecond=0)
+        _session_secs = (_mkt_close_ct - _mkt_open_ct).total_seconds()
+        _elapsed_secs = max(0, (now_ct - _mkt_open_ct).total_seconds())
+        _sess_progress = min(1.0, _elapsed_secs / _session_secs) if _session_secs > 0 else 0.5
+
         _post_trade_card(
             ticker=ticker, spot=spot, expiration=expiration,
             eng=eng or {}, walls=walls or {}, bias=bias, em=em,
-            vix=vix or {}, pcr=pcr or {}, is_0dte=True, v4_result=v4_result,
+            vix=vix or {}, pcr=pcr or {}, is_0dte=(not is_afternoon), v4_result=v4_result,
             cagf=cagf, dte_rec=dte_rec,
+            now_ct=now_ct, session_progress=_sess_progress,
+            is_next_day=is_afternoon,
         )
 
     except Exception as e:
@@ -2289,10 +2298,19 @@ def _post_em_card(ticker: str, session: str):
 # ─────────────────────────────────────────────────────────────────────
 
 def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
-                     is_0dte=True, v4_result=None, cagf=None, dte_rec=None):
+                     is_0dte=True, v4_result=None, cagf=None, dte_rec=None,
+                     now_ct=None, session_progress=None, is_next_day=False):
     """
-    0DTE trade recommendation card — v4.1.
-    Now includes CAGF institutional flow model and DTE recommendation.
+    Trade recommendation card — v4.2.
+    CAGF-integrated: respects DTE recommendation, session timing, and EM-aware strike placement.
+
+    v4.2 fixes:
+      - Timestamp uses CT timezone (not server-local/UTC)
+      - Session gate: blocks 0DTE when <15 min remain or market closed
+      - DTE recommendation enforced: if CAGF says avoid 0DTE, card uses recommended DTE
+      - Afternoon session → next-day trade card (not 0DTE)
+      - Strikes constrained to EM 1σ boundary (short strike inside expected move)
+      - Width scaled relative to EM range (no wider than 1σ move)
     """
     try:
         direction = bias.get("direction", "NEUTRAL")
@@ -2306,9 +2324,89 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
         v = vix.get("vix", 20) if vix else 20
         exp_short = expiration[5:] if expiration else "?"
 
+        # ── CT timestamp (v4.2 fix) ──
+        if now_ct is None:
+            try:
+                import pytz
+                now_ct = datetime.now(pytz.timezone("America/Chicago"))
+            except Exception:
+                now_ct = datetime.now()
+        time_str = now_ct.strftime('%I:%M %p CT')
+
+        # ── Determine effective DTE from CAGF recommendation ──
+        # Start with the raw is_0dte flag, then let CAGF override
+        effective_dte_label = "0DTE" if is_0dte else "NEXT DAY"
+        effective_dte = 0 if is_0dte else 1
+        dte_was_upgraded = False
+        dte_upgrade_reason = ""
+
+        # v4.2: CAGF DTE enforcement — if CAGF says avoid 0DTE, use recommended DTE
+        if dte_rec and dte_rec.get("primary"):
+            rec_dte = dte_rec["primary"].get("dte", 0)
+            rec_label = dte_rec["primary"].get("label", "0DTE")
+            avoid_list = dte_rec.get("avoid", [])
+
+            # Check if 0DTE is in the avoid list
+            dte_0_avoided = any("0DTE" in a for a in avoid_list)
+            dte_1_avoided = any("1DTE" in a for a in avoid_list)
+
+            if is_0dte and dte_0_avoided:
+                # CAGF says no 0DTE — upgrade to recommended DTE
+                effective_dte = rec_dte
+                effective_dte_label = rec_label
+                dte_was_upgraded = True
+                dte_upgrade_reason = avoid_list[0] if avoid_list else "0DTE conditions not met"
+                log.info(f"Trade card DTE upgraded: 0DTE → {rec_label} | {dte_upgrade_reason}")
+
+        # v4.2: Next-day session → always at least 1 DTE
+        if is_next_day:
+            if effective_dte < 1:
+                effective_dte = max(1, effective_dte)
+            effective_dte_label = dte_rec["primary"]["label"] if (dte_rec and dte_rec.get("primary")) else f"{effective_dte} DTE"
+            dte_was_upgraded = True
+            dte_upgrade_reason = "afternoon session → next trading day"
+
+        # ── Session timing gate (v4.2 fix) ──
+        # Block 0DTE trades when market is closed or <15 min remain
+        if effective_dte == 0 and session_progress is not None:
+            mkt_open_ct = now_ct.replace(hour=8, minute=30, second=0, microsecond=0)
+            mkt_close_ct = now_ct.replace(hour=15, minute=0, second=0, microsecond=0)
+            is_market_hours = mkt_open_ct <= now_ct <= mkt_close_ct
+            minutes_remaining = max(0, (mkt_close_ct - now_ct).total_seconds() / 60)
+
+            if not is_market_hours:
+                # Outside market hours — upgrade to next-day DTE
+                if dte_rec and dte_rec.get("primary"):
+                    effective_dte = max(dte_rec["primary"].get("dte", 1), 1)
+                    effective_dte_label = dte_rec["primary"].get("label", "1 DTE")
+                else:
+                    effective_dte = 1
+                    effective_dte_label = "1 DTE"
+                dte_was_upgraded = True
+                dte_upgrade_reason = f"market closed ({time_str})"
+                log.info(f"Trade card: 0DTE blocked — market closed at {time_str}")
+
+            elif minutes_remaining < 15:
+                # Less than 15 minutes left — too late for 0DTE
+                if dte_rec and dte_rec.get("primary"):
+                    effective_dte = max(dte_rec["primary"].get("dte", 1), 1)
+                    effective_dte_label = dte_rec["primary"].get("label", "1 DTE")
+                else:
+                    effective_dte = 1
+                    effective_dte_label = "1 DTE"
+                dte_was_upgraded = True
+                dte_upgrade_reason = f"<15 min to close ({minutes_remaining:.0f} min left)"
+                log.info(f"Trade card: 0DTE blocked — only {minutes_remaining:.0f} min remaining")
+
+        # ── Build card title based on effective DTE ──
+        if effective_dte == 0:
+            card_title = "0DTE TRADE SETUP"
+        else:
+            card_title = f"TRADE SETUP ({effective_dte_label})"
+
         def no_trade(reason, emoji="⚪"):
             post_to_telegram(
-                f"🎯 {ticker} — 0DTE TRADE SETUP  |  Exp: {exp_short}\n"
+                f"🎯 {ticker} — {card_title}  |  Exp: {exp_short}\n"
                 f"{emoji} NO TRADE — {reason}\n— Not financial advice —")
             log.info(f"Trade card blocked: {ticker} | {reason}")
 
@@ -2350,21 +2448,74 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
             no_trade(f"GEX positive (+${tgex:.1f}M), score only {score:+d}/14 — not enough edge.", "🧲")
             return
 
-        # ══════ WIDTH ══════
+        # G6 — CAGF direction conflict (v4.2)
+        # If CAGF has strong directional signal opposing the bias, flag it
+        cagf_conflict = False
+        cagf_conflict_note = ""
+        if cagf and cagf.get("regime") != "UNKNOWN":
+            cagf_prob = cagf.get("probability", 50)
+            cagf_dir = cagf.get("direction", "NEUTRAL")
+            # Bull bias but CAGF says < 40% upside = conflict
+            if is_bull and cagf_prob < 40:
+                cagf_conflict = True
+                cagf_conflict_note = f"⚠️ CAGF conflict: bias BULL but flow {cagf_prob:.0f}% upside ({cagf_dir})"
+            # Bear bias but CAGF says > 60% upside = conflict
+            elif not is_bull and cagf_prob > 60:
+                cagf_conflict = True
+                cagf_conflict_note = f"⚠️ CAGF conflict: bias BEAR but flow {cagf_prob:.0f}% upside ({cagf_dir})"
+
+        # ══════ EM-AWARE WIDTH (v4.2 fix) ══════
         ticker_up = ticker.upper()
-        if ticker_up in ("SPX", "NDX"): base_width = 20; step = 5
-        elif spot >= 400: base_width = 5; step = 1
-        elif spot >= 200: base_width = 5; step = 1
-        elif spot >= 100: base_width = 3; step = 1
-        elif spot >= 50: base_width = 2; step = 1
-        else: base_width = 1; step = 1
+        if ticker_up in ("SPX", "NDX"): step = 5
+        elif spot >= 50: step = 1
+        else: step = 1
+
+        # Width is capped by the EM 1σ move — short strike must be reachable
+        em_1sd = em.get("em_1sd", 0) if em else 0
+        if em_1sd > 0:
+            # Maximum width = EM 1σ move, rounded down to step
+            max_em_width = int(em_1sd / step) * step
+            max_em_width = max(max_em_width, step)  # at least 1 step wide
+        else:
+            max_em_width = 999  # no EM data, fall back to old logic
+
+        # Base width from price tier
+        if ticker_up in ("SPX", "NDX"): base_width = 20
+        elif spot >= 400: base_width = 5
+        elif spot >= 200: base_width = 5
+        elif spot >= 100: base_width = 3
+        elif spot >= 50: base_width = 2
+        else: base_width = 1
+
         width = base_width if neg_gex else max(base_width // 2, step)
 
-        # ══════ STRIKES ══════
+        # v4.2: Clamp width to EM 1σ boundary
+        if width > max_em_width:
+            log.info(f"Trade card width clamped: ${width} → ${max_em_width} (EM 1σ = ${em_1sd:.2f})")
+            width = max_em_width
+
+        # ══════ EM-AWARE STRIKES (v4.2 fix) ══════
+        bull_1sd = em.get("bull_1sd", spot + 999) if em else spot + 999
+        bear_1sd = em.get("bear_1sd", spot - 999) if em else spot - 999
+
         if is_bull:
             long_strike = (int(spot) // step) * step
             if long_strike >= spot: long_strike -= step
             short_strike = long_strike + width
+
+            # v4.2: Clamp short strike to EM 1σ upper boundary
+            em_upper_strike = (int(bull_1sd) // step) * step
+            if short_strike > em_upper_strike and em_1sd > 0:
+                old_short = short_strike
+                short_strike = em_upper_strike
+                width = short_strike - long_strike
+                if width < step:
+                    # EM range is too tight for any spread at this step — use minimum
+                    short_strike = long_strike + step
+                    width = step
+                log.info(f"Trade card: bull short strike clamped ${old_short} → ${short_strike} "
+                         f"(EM 1σ upper = ${bull_1sd:.2f})")
+
             spread_type = "CALL DEBIT SPREAD"
             long_label = f"${long_strike:.0f}C"; short_label = f"${short_strike:.0f}C"
             stop_level = flip if flip else round(spot * (1 - 0.007), 2)
@@ -2372,6 +2523,19 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
             long_strike = (int(spot) // step) * step
             if long_strike <= spot: long_strike += step
             short_strike = long_strike - width
+
+            # v4.2: Clamp short strike to EM 1σ lower boundary
+            em_lower_strike = int(math.ceil(bear_1sd / step)) * step
+            if short_strike < em_lower_strike and em_1sd > 0:
+                old_short = short_strike
+                short_strike = em_lower_strike
+                width = long_strike - short_strike
+                if width < step:
+                    short_strike = long_strike - step
+                    width = step
+                log.info(f"Trade card: bear short strike clamped ${old_short} → ${short_strike} "
+                         f"(EM 1σ lower = ${bear_1sd:.2f})")
+
             spread_type = "PUT DEBIT SPREAD"
             long_label = f"${long_strike:.0f}P"; short_label = f"${short_strike:.0f}P"
             stop_level = flip if flip else round(spot * (1 + 0.007), 2)
@@ -2392,10 +2556,22 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
         elif dex_disagrees: size_pct = max(base_pct - 25, 25); dex_note = "DEX disagrees → -1 tier"
         else: size_pct = base_pct; dex_note = "DEX neutral"
 
+        # v4.2: Reduce size if CAGF conflicts with bias direction
+        if cagf_conflict:
+            size_pct = max(int(size_pct * 0.5), 25)
+            dex_note += " | CAGF conflict → halved"
+
         # ══════ TIMING ══════
         charm_tail = charm_m > 0
-        timing_note = "Charm tailwind — hold into 2:30 PM CT." if charm_tail else "Charm headwind — do NOT hold into close."
-        timing_warn = "Exit by 2:45 PM CT." if charm_tail else "⚠️ EXIT by noon CT."
+        if effective_dte == 0:
+            timing_note = "Charm tailwind — hold into 2:30 PM CT." if charm_tail else "Charm headwind — do NOT hold into close."
+            timing_warn = "Exit by 2:45 PM CT." if charm_tail else "⚠️ EXIT by noon CT."
+            entry_cutoff = "⚠️ No new entries after 2:30 PM CT"
+        else:
+            # Multi-day trades have different timing
+            timing_note = "Charm tailwind — favorable into close." if charm_tail else "Charm headwind — consider early entry."
+            timing_warn = f"Target hold: {effective_dte} trading day{'s' if effective_dte > 1 else ''}."
+            entry_cutoff = "📌 Enter at/near open for best fill" if is_next_day else "⚠️ No new entries after 2:30 PM CT"
 
         gex_note = f"⚡ Negative GEX (-${abs(tgex):.1f}M) — debit spreads confirmed." if neg_gex else f"🧲 Positive GEX (+${tgex:.1f}M) — width tightened."
 
@@ -2403,14 +2579,18 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
                      "SLIGHT BEARISH": "🟠", "BEARISH": "🔴", "STRONG BEARISH": "🔴🔴"}.get(direction, "⚪")
 
         lines = [
-            f"🎯 {ticker} — 0DTE TRADE SETUP",
-            f"Generated: {datetime.now().strftime('%I:%M %p CT')}  |  Exp: {exp_short}",
+            f"🎯 {ticker} — {card_title}",
+            f"Generated: {time_str}  |  Exp: {exp_short}",
             f"Lean: {dir_emoji} {direction}  [Score: {score:+d}/14]",
         ]
 
         # ── v4: Confidence line ──
         if v4_result:
             lines.append(format_confidence_header(v4_result))
+
+        # ── v4.2: DTE upgrade notice ──
+        if dte_was_upgraded:
+            lines.append(f"📆 DTE: {effective_dte_label} (reason: {dte_upgrade_reason})")
 
         lines += [
             "━" * 32, "", f"⚙️ REGIME: {gex_note}", "",
@@ -2433,17 +2613,40 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
             if avoid_list:
                 lines.append(f"  ❌ {avoid_list[0]}")
 
+        # ── v4.2: CAGF conflict warning ──
+        if cagf_conflict:
+            lines.append(f"  {cagf_conflict_note}")
+
+        # ── EM zone check for short strike ──
+        if em_1sd > 0:
+            if is_bull:
+                em_distance = bull_1sd - short_strike
+                em_zone = "inside" if short_strike <= bull_1sd else "outside"
+            else:
+                em_distance = short_strike - bear_1sd
+                em_zone = "inside" if short_strike >= bear_1sd else "outside"
+            em_zone_emoji = "✅" if em_zone == "inside" else "⚠️"
+            em_zone_note = f"  {em_zone_emoji} Short strike {em_zone} EM 1σ (${em_distance:+.2f} from boundary)"
+        else:
+            em_zone_note = ""
+
         lines += [
             "",
             f"📋 SETUP: ITM {spread_type}",
             f"  Buy:   {ticker} {long_label}", f"  Sell:  {ticker} {short_label}",
             f"  Width: ${actual_width:.0f}  |  Est. cost: ~${cost_est:.2f}/contract",
-            f"  Max profit: ~${max_profit:.2f}/contract  |  R/R: ~{rr:.1f}:1", "",
+            f"  Max profit: ~${max_profit:.2f}/contract  |  R/R: ~{rr:.1f}:1",
+        ]
+        if em_zone_note:
+            lines.append(em_zone_note)
+
+        lines += [
+            "",
             f"📍 LEVELS",
             f"  Entry zone:  ${spot:.2f} ± 0.3%",
             f"  Hard stop:   ${stop_level:.2f}", "",
             f"⏱️ TIMING", f"  {timing_note}", f"  {timing_warn}",
-            f"  ⚠️ No new entries after 2:30 PM CT", "",
+            f"  {entry_cutoff}", "",
             f"📊 SIZE",
             f"  VIX {v} → base: {base_pct}%  |  {dex_note}",
             f"  → FINAL: {size_pct}% of normal position size",
@@ -2451,8 +2654,11 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
         ]
 
         post_to_telegram("\n".join(lines))
-        log.info(f"Trade card: {ticker} | {direction} | {spread_type} {long_label}/{short_label} | "
-                 f"size={size_pct}% | conf={v4_result.get('confidence', {}).get('label', '?') if v4_result else 'N/A'}")
+        log.info(f"Trade card: {ticker} | {direction} | {effective_dte_label} | "
+                 f"{spread_type} {long_label}/{short_label} | "
+                 f"width=${actual_width} (EM 1σ=${em_1sd:.2f}) | "
+                 f"size={size_pct}% | dte_upgraded={dte_was_upgraded} | "
+                 f"conf={v4_result.get('confidence', {}).get('label', '?') if v4_result else 'N/A'}")
 
     except Exception as e:
         log.error(f"Trade card error for {ticker}: {e}", exc_info=True)
