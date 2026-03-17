@@ -2107,6 +2107,12 @@ def _post_em_card(ticker: str, session: str):
 
             _vix_val = vix.get("vix", 20) if vix else 20
 
+            # Get ADV for normalization
+            _adv, _ = _estimate_liquidity(ticker, spot)
+
+            # Get candle closes for momentum component
+            _closes = get_daily_candles(ticker, days=60)
+
             cagf = compute_cagf(
                 dealer_flows={
                     "gex": eng.get("gex", 0),
@@ -2120,6 +2126,9 @@ def _post_em_card(ticker: str, session: str):
                 spot=spot,
                 vix=_vix_val,
                 session_progress=_sess_progress,
+                adv=_adv,
+                candle_closes=_closes,
+                ticker=ticker,
             )
             lines += format_cagf_block(cagf)
 
@@ -2339,9 +2348,10 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
 
         # ── CAGF Institutional Edge (SPY/QQQ) ──
         if cagf and cagf.get("regime") != "UNKNOWN":
-            edge_emoji = "🟢" if cagf["edge"] > 0.15 else "🔴" if cagf["edge"] < -0.15 else "⚪"
-            lines.append(f"🏛️ FLOW EDGE: {edge_emoji} {cagf['direction']}  (edge {cagf['edge']:+.2f})")
-            lines.append(f"  Trend Day: {cagf['trend_day_probability']:.0%}  |  Vol: {cagf['vol_emoji']} {cagf['vol_label']}")
+            prob = cagf.get("probability", 50)
+            edge_emoji = "🟢" if prob >= 58 else "🔴" if prob <= 42 else "⚪"
+            lines.append(f"🏛️ FLOW: {edge_emoji} {cagf['direction']}  ({prob:.0f}% upside prob)")
+            lines.append(f"  Trend Day: {cagf['trend_day_probability']:.0%}  |  Vol: {cagf['vol_emoji']} {cagf['vol_label']}  |  {cagf['strategy_emoji']} {cagf['strategy']}")
 
         # ── DTE Recommendation ──
         if dte_rec and dte_rec.get("primary"):
