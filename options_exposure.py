@@ -276,10 +276,11 @@ def gbs_volga(S,K,T,r,q,sigma):
     sigma=max(sigma,1e-8);T=max(T,1e-8);d1=gbs_d1(S,K,T,r,q,sigma);d2=d1-sigma*safe_sqrt(T)
     return S*math.exp(-q*T)*norm_pdf(d1)*safe_sqrt(T)*d1*d2/sigma
 def gbs_charm(ot,S,K,T,r,q,sigma):
+    """Charm = -∂delta/∂T. Raw BS derivative is per-year; divide by 365 for per-calendar-day (matches gbs_theta convention)."""
     sigma=max(sigma,1e-8);T=max(T,1e-8);d1=gbs_d1(S,K,T,r,q,sigma);d2=d1-sigma*safe_sqrt(T)
     cc=-math.exp(-q*T)*norm_pdf(d1)*(2.0*(r-q)*T-d2*sigma*safe_sqrt(T))/(2.0*T*sigma*safe_sqrt(T))
-    if ot.lower()=="call": return cc+q*math.exp(-q*T)*norm_cdf(d1)
-    return cc-q*math.exp(-q*T)*norm_cdf(-d1)
+    if ot.lower()=="call": return (cc+q*math.exp(-q*T)*norm_cdf(d1))/365.0
+    return (cc-q*math.exp(-q*T)*norm_cdf(-d1))/365.0
 def gbs_veta(S,K,T,r,q,sigma):
     sigma=max(sigma,1e-8);T=max(T,1e-8);d1=gbs_d1(S,K,T,r,q,sigma);d2=d1-sigma*safe_sqrt(T)
     return -S*math.exp(-q*T)*norm_pdf(d1)*safe_sqrt(T)*(q+((r-q)*d1)/(sigma*safe_sqrt(T))-(1.0+d1*d2)/(2.0*T))
