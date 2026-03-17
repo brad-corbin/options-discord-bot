@@ -36,6 +36,7 @@ import logging
 import threading
 import queue
 import portfolio
+import pytz
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -91,8 +92,17 @@ from em_reconciler import (
 import risk_manager
 import trade_journal
 
-# OI cache will be initialized after store_get/store_set are defined
+# OI cache — initialized in the startup block after store_get/store_set are
+# defined.  Workers start before that block runs, so we use an Event to let
+# any early caller block (briefly) rather than crash with AttributeError.
 _oi_cache = None
+_oi_cache_ready = threading.Event()
+
+def _get_oi_cache():
+    """Return the OICache instance, waiting up to 10 s for startup to finish."""
+    if not _oi_cache_ready.wait(timeout=10):
+        raise RuntimeError("OI cache not initialized within 10 s of startup")
+    return _oi_cache
 
 # ─────────────────────────────────────────────────────────
 # LOGGING
@@ -459,7 +469,7 @@ def _process_job(worker_id: int, job: dict):
                 _today = _date.today().strftime("%Y-%m-%d")
                 _chain_data, _c_spot, _c_exp = _get_0dte_chain(ticker, _today)
                 if _chain_data and _c_spot:
-                    _oi_cache.apply_oi_changes_to_chain(ticker, _c_exp, _chain_data)
+                    _get_oi_cache().apply_oi_changes_to_chain(ticker, _c_exp, _chain_data)
                     _v4 = run_institutional_snapshot(
                         chain_data=_chain_data, spot=_c_spot, dte=0.5,
                         recent_bars=_bars, is_0dte=True,
@@ -471,8 +481,7 @@ def _process_job(worker_id: int, job: dict):
                         _rv = _v4.get("vol_regime", {}).get("realized_vol_20d", 0) or 0
                         _iv = _v4.get("iv", 0) or 0
 
-                        import pytz as _pytz
-                        _ct = _pytz.timezone("America/Chicago")
+                        _ct = pytz.timezone("America/Chicago")
                         _now_ct = datetime.now(_ct)
                         _mkt_open = _now_ct.replace(hour=8, minute=30, second=0, microsecond=0)
                         _mkt_close = _now_ct.replace(hour=15, minute=0, second=0, microsecond=0)
@@ -786,7 +795,13 @@ def get_current_regime() -> dict:
     if _regime_cache["data"] and (now - _regime_cache["ts"]) < 300:
         return _regime_cache["data"]
     try:
-        vix = get_vix()
+        # Use the cached VIX layer (_cached_md) rather than the uncached
+        # get_vix() Yahoo fallback so both regime detection and EM cards
+        # see the same VIX value.
+        vix_data = _cached_md.get_vix_data(as_float_fn=as_float)
+        vix = vix_data.get("vix") or 0
+        if not vix:
+            vix = get_vix()  # fall back to Yahoo only if cached layer failed
         spy_candles = get_daily_candles("SPY", days=30)
         regime = risk_manager.classify_regime(vix=vix, spy_candles=spy_candles)
         _regime_cache["data"] = regime
@@ -836,7 +851,7 @@ def get_options_chain(ticker: str) -> list:
 
     for dte, exp in exps_to_fetch:
         try:
-            data = md_get(f"https://api.marketdata.app/v1/options/chain/{ticker}/", {"expiration": exp})
+            data = _cached_md.get_chain(ticker, exp)
             if not isinstance(data, dict) or data.get("s") != "ok":
                 continue
             sym_list = data.get("optionSymbol") or []
@@ -906,7 +921,7 @@ def get_options_chain_swing(ticker: str) -> list:
     results = []
     for dte, exp in valid_exps[:SWING_MAX_EXPIRATIONS]:
         try:
-            data = md_get(f"https://api.marketdata.app/v1/options/chain/{ticker}/", {"expiration": exp})
+            data = _cached_md.get_chain(ticker, exp)
             if not isinstance(data, dict) or data.get("s") != "ok":
                 continue
             sym_list = data.get("optionSymbol") or []
@@ -1100,7 +1115,7 @@ def _run_v4_prefilter(ticker: str, spot: float, chains: list, candle_closes: lis
             return {}
 
         # Apply OI cache
-        _oi_cache.apply_oi_changes_to_chain(ticker, exp, chain_data)
+        _get_oi_cache().apply_oi_changes_to_chain(ticker, exp, chain_data)
 
         # Build OHLC bars from candle closes for RV
         bars = _get_ohlc_bars(ticker, days=65)
@@ -1118,7 +1133,7 @@ def _run_v4_prefilter(ticker: str, spot: float, chains: list, candle_closes: lis
         )
 
         # Save OI snapshot for next run
-        _oi_cache.save_snapshot(ticker, exp, chain_data)
+        _get_oi_cache().save_snapshot(ticker, exp, chain_data)
 
         if v4.get("error"):
             log.warning(f"v4 prefilter failed for {ticker}: {v4['error']}")
@@ -1650,57 +1665,37 @@ def holdings_scan():
 
 
 # ─────────────────────────────────────────────────────────
-# CHAIN DATA CACHE
+# CHAIN DATA HELPERS
+# Both functions route through _cached_md.get_chain() (TTL=20 s) so the
+# local 60-second hand-rolled dict is no longer needed.  One cache, one TTL.
 # ─────────────────────────────────────────────────────────
 
-_CHAIN_CACHE_TTL = 60
-_chain_cache: dict = {}
-_chain_cache_lock = threading.Lock()
-
-def _chain_cache_get(ticker: str, expiry: str):
-    key = (ticker.upper(), expiry)
-    with _chain_cache_lock:
-        entry = _chain_cache.get(key)
-        if entry and (time.monotonic() - entry[3]) < _CHAIN_CACHE_TTL:
-            return entry[0], entry[1], entry[2]
-        if entry:
-            del _chain_cache[key]
-    return None
-
-def _chain_cache_set(ticker: str, expiry: str, data, spot: float):
-    key = (ticker.upper(), expiry)
-    with _chain_cache_lock:
-        now = time.monotonic()
-        stale = [k for k, v in _chain_cache.items() if (now - v[3]) >= _CHAIN_CACHE_TTL]
-        for k in stale:
-            del _chain_cache[k]
-        _chain_cache[key] = (data, spot, expiry, now)
-
-
 def _get_0dte_chain(ticker: str, target_date_str: str = None) -> tuple:
+    """Return (chain_data, spot, expiry) for the nearest available expiry.
+
+    Uses _cached_md.get_chain() so duplicate calls within the same cycle are
+    served from cache rather than hitting the MarketData API again.
+    """
     try:
         today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         target = target_date_str or today_utc
-        cached = _chain_cache_get(ticker, target)
-        if cached:
-            return cached
         spot = get_spot(ticker)
-        data = md_get(f"https://api.marketdata.app/v1/options/chain/{ticker}/", {"expiration": target})
+
+        data = _cached_md.get_chain(ticker, target)
         if not isinstance(data, dict) or data.get("s") != "ok" or not data.get("optionSymbol"):
+            # Fall back to the next available expiry
             exps = get_expirations(ticker)
             future_exps = [e for e in exps if e >= target]
             if not future_exps:
                 return None, None, None
             target = future_exps[0]
-            cached = _chain_cache_get(ticker, target)
-            if cached:
-                return cached
-            data = md_get(f"https://api.marketdata.app/v1/options/chain/{ticker}/", {"expiration": target})
+            data = _cached_md.get_chain(ticker, target)
             if not isinstance(data, dict) or data.get("s") != "ok":
                 return None, None, None
+
         if not data.get("optionSymbol"):
             return None, None, None
-        _chain_cache_set(ticker, target, data, spot)
+
         return data, spot, target
     except Exception as e:
         log.warning(f"Chain fetch failed for {ticker}: {e}")
@@ -1739,7 +1734,7 @@ def _get_0dte_iv(ticker: str, target_date_str: str = None) -> tuple:
             dte = 0
 
         # ── OI change: diff current OI against cached prior snapshot ──
-        _oi_cache.apply_oi_changes_to_chain(ticker, target, data)
+        _get_oi_cache().apply_oi_changes_to_chain(ticker, target, data)
 
         # ── OHLC bars for RV ──
         bars = _get_ohlc_bars(ticker, days=65)
@@ -1756,7 +1751,7 @@ def _get_0dte_iv(ticker: str, target_date_str: str = None) -> tuple:
         )
 
         # ── Save current OI as reference for next run ──
-        _oi_cache.save_snapshot(ticker, target, data)
+        _get_oi_cache().save_snapshot(ticker, target, data)
 
         if v4.get("error") or v4.get("iv") is None:
             return empty
@@ -1776,16 +1771,12 @@ def _get_0dte_iv(ticker: str, target_date_str: str = None) -> tuple:
 
 
 def _get_chain_for_expiry(ticker: str, target_date_str: str) -> tuple:
-    """Fetch chain for specific expiry. Cached."""
+    """Fetch chain for a specific expiry — routed through _cached_md (TTL=20 s)."""
     try:
-        cached = _chain_cache_get(ticker, target_date_str)
-        if cached:
-            return cached
         spot = get_spot(ticker)
-        data = md_get(f"https://api.marketdata.app/v1/options/chain/{ticker}/", {"expiration": target_date_str})
+        data = _cached_md.get_chain(ticker, target_date_str)
         if not isinstance(data, dict) or data.get("s") != "ok" or not data.get("optionSymbol"):
             return None, None, None
-        _chain_cache_set(ticker, target_date_str, data, spot)
         return data, spot, target_date_str
     except Exception as e:
         log.warning(f"Chain fetch failed for {ticker} exp={target_date_str}: {e}")
@@ -1801,7 +1792,7 @@ def _get_chain_iv_for_expiry(ticker: str, target_date_str: str, dte: float) -> t
             return empty
 
         # ── OI change ──
-        _oi_cache.apply_oi_changes_to_chain(ticker, target, data)
+        _get_oi_cache().apply_oi_changes_to_chain(ticker, target, data)
 
         bars = _get_ohlc_bars(ticker, days=65)
         adv, spread = _estimate_liquidity(ticker, spot)
@@ -1815,7 +1806,7 @@ def _get_chain_iv_for_expiry(ticker: str, target_date_str: str, dte: float) -> t
         )
 
         # ── Save OI snapshot ──
-        _oi_cache.save_snapshot(ticker, target, data)
+        _get_oi_cache().save_snapshot(ticker, target, data)
 
         if v4.get("error") or v4.get("iv") is None:
             return empty
@@ -1830,48 +1821,11 @@ def _get_chain_iv_for_expiry(ticker: str, target_date_str: str, dte: float) -> t
 
 def _estimate_liquidity(ticker: str, spot: float) -> tuple:
     """
-    Estimate ADV and bid-ask spread from stock candles + quote.
-    Returns (avg_daily_dollar_volume, bid_ask_spread_pct) or (None, None).
+    Estimate ADV and bid-ask spread — fully cached via CachedMarketData.get_liquidity().
+    Returns (avg_daily_dollar_volume, bid_ask_spread_pct) — either may be None.
+    Spot is accepted for API compatibility but not used in the computation.
     """
-    adv = None
-    spread = None
-    try:
-        # ADV: average of last 20 days of (close * volume)
-        candles = get_daily_candles(ticker, days=25)
-        if candles and len(candles) >= 5:
-            # candles is a list of close prices from get_daily_candles
-            # We need volume too — fetch raw candles
-            from_date = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%d")
-            raw = md_get(f"https://api.marketdata.app/v1/stocks/candles/D/{ticker}/",
-                        {"from": from_date})
-            if raw and raw.get("s") == "ok":
-                closes = raw.get("c") or []
-                volumes = raw.get("v") or []
-                n = min(len(closes), len(volumes))
-                if n >= 5:
-                    dvols = []
-                    for i in range(max(n - 20, 0), n):
-                        c = as_float(closes[i], 0)
-                        v = as_float(volumes[i], 0)
-                        if c > 0 and v > 0:
-                            dvols.append(c * v)
-                    if dvols:
-                        adv = sum(dvols) / len(dvols)
-    except Exception as e:
-        log.debug(f"ADV estimate failed for {ticker}: {e}")
-
-    try:
-        # Spread from stock quote
-        stock_data = md_get(f"https://api.marketdata.app/v1/stocks/quotes/{ticker}/")
-        if stock_data and stock_data.get("s") == "ok":
-            bid = as_float((stock_data.get("bid") or [None])[0], 0)
-            ask = as_float((stock_data.get("ask") or [None])[0], 0)
-            if bid > 0 and ask > 0 and ask > bid:
-                spread = (ask - bid) / ((ask + bid) / 2)
-    except Exception as e:
-        log.debug(f"Spread estimate failed for {ticker}: {e}")
-
-    return adv, spread
+    return _cached_md.get_liquidity(ticker, as_float_fn=as_float)
 
 
 def _get_ohlc_bars(ticker: str, days: int = 65) -> list:
@@ -2075,7 +2029,6 @@ def _log_em_prediction(ticker: str, session: str, spot: float, em: dict, bias: d
 
 def _post_em_card(ticker: str, session: str):
     try:
-        import pytz
         ct = pytz.timezone("America/Chicago"); now_ct = datetime.now(ct); today_dt = now_ct.date()
         is_afternoon = (session == "afternoon")
 
@@ -2191,8 +2144,7 @@ def _post_em_card(ticker: str, session: str):
         dte_rec = None
         if eng and ticker.upper() in ("SPY", "QQQ", "SPX"):
             # Compute CAGF from dealer flows
-            import pytz as _pytz
-            _ct = _pytz.timezone("America/Chicago")
+            _ct = pytz.timezone("America/Chicago")
             _now_ct = datetime.now(_ct)
             _mkt_open = _now_ct.replace(hour=8, minute=30, second=0, microsecond=0)
             _mkt_close = _now_ct.replace(hour=15, minute=0, second=0, microsecond=0)
@@ -2377,7 +2329,6 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
         # ── CT timestamp (v4.2 fix) ──
         if now_ct is None:
             try:
-                import pytz
                 now_ct = datetime.now(pytz.timezone("America/Chicago"))
             except Exception:
                 now_ct = datetime.now()
@@ -2917,38 +2868,66 @@ def _post_monitor_card(ticker: str, mode: str):
 # ─────────────────────────────────────────────────────────────────────
 
 def _em_scheduler():
-    try:
-        import pytz
-    except ImportError:
-        log.error("pytz not installed — EM scheduler disabled")
-        return
     log.info(f"0DTE EM scheduler started — fires at {EM_SCHEDULE_TIMES_CT} CT on weekdays")
     log.info("EM reconciler scheduled at 16:15 CT on weekdays")
-    fired_today: set = set()
+
+    def _redis_fire_key(date_str: str, hour: int, minute: int) -> str:
+        return f"em_scheduler_fired:{date_str}:{hour:02d}:{minute:02d}"
+
+    def _already_fired(date_str: str, hour: int, minute: int) -> bool:
+        """Check in-process set first, then Redis — survives restarts."""
+        if (date_str, hour, minute) in _fired_in_process:
+            return True
+        try:
+            return store_exists(_redis_fire_key(date_str, hour, minute))
+        except Exception:
+            return False
+
+    def _mark_fired(date_str: str, hour: int, minute: int):
+        _fired_in_process.add((date_str, hour, minute))
+        try:
+            # TTL of 25 hours — expires safely before same slot next day
+            store_set(_redis_fire_key(date_str, hour, minute), "1", ttl=25 * 3600)
+        except Exception as e:
+            log.warning(f"EM scheduler: failed to persist fire key to store: {e}")
+
+    _fired_in_process: set = set()
+
     while True:
         try:
-            ct = pytz.timezone("America/Chicago"); now_ct = datetime.now(ct)
-            if now_ct.weekday() >= 5: time.sleep(60); continue
+            ct = pytz.timezone("America/Chicago")
+            now_ct = datetime.now(ct)
+            if now_ct.weekday() >= 5:
+                time.sleep(60)
+                continue
+
             date_str = now_ct.strftime("%Y-%m-%d")
+
             for hour, minute in EM_SCHEDULE_TIMES_CT:
-                fire_key = (date_str, hour, minute)
-                if fire_key in fired_today: continue
                 if now_ct.hour == hour and abs(now_ct.minute - minute) <= 1:
-                    session = "morning" if hour < 12 else "afternoon"
-                    fired_today.add(fire_key)
-                    log.info(f"EM scheduler firing: {session}")
-                    for ticker in EM_TICKERS:
-                        threading.Thread(target=_post_em_card, args=(ticker, session), daemon=True).start()
+                    if not _already_fired(date_str, hour, minute):
+                        session = "morning" if hour < 12 else "afternoon"
+                        _mark_fired(date_str, hour, minute)
+                        log.info(f"EM scheduler firing: {session}")
+                        for ticker in EM_TICKERS:
+                            threading.Thread(
+                                target=_post_em_card, args=(ticker, session), daemon=True,
+                            ).start()
 
             # ── Auto-reconciler: 4:15 PM CT (after market close) ──
-            recon_key = (date_str, 16, 15)
-            if recon_key not in fired_today:
-                if now_ct.hour == 16 and abs(now_ct.minute - 15) <= 1:
-                    fired_today.add(recon_key)
+            if now_ct.hour == 16 and abs(now_ct.minute - 15) <= 1:
+                if not _already_fired(date_str, 16, 15):
+                    _mark_fired(date_str, 16, 15)
                     log.info("EM reconciler firing (4:15 PM CT)")
-                    threading.Thread(target=_run_reconciler_auto, daemon=True, name="reconciler").start()
+                    threading.Thread(
+                        target=_run_reconciler_auto, daemon=True, name="reconciler",
+                    ).start()
 
-            fired_today = {k for k in fired_today if k[0] == date_str}
+            # Prune in-process set to today only
+            _fired_in_process.intersection_update(
+                {k for k in _fired_in_process if k[0] == date_str}
+            )
+
         except Exception as e:
             log.error(f"EM scheduler error: {e}", exc_info=True)
         time.sleep(60)
@@ -2968,6 +2947,7 @@ with app.app_context():
     portfolio.init_store(store_get, store_set)
     trade_journal.init_store(store_get, store_set)
     _oi_cache = OICache(store_get, store_set)
+    _oi_cache_ready.set()
     log.info(f"OI cache initialized (Redis: {_get_redis() is not None})")
 
 if __name__ == "__main__":
