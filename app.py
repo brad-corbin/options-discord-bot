@@ -1,21 +1,22 @@
 # app.py
 # NOTE: Educational/demo code. Not financial advice. Use at your own risk.
 #
-# v4.0 UPGRADE:
+# v4.2 UPGRADE (2026-03-17):
+#   - CHECK_TICKER_TIMEOUT_SEC imported from trading_rules (45s, was hardcoded 75s)
+#   - PREFETCH_WORKER_WAIT_SEC used consistently (was hardcoded 60s in one path)
+#   - PIN regime gate: blocks directional spreads when v4 prefilter reports *PIN
+#   - CHOP regime gate: raises confidence threshold + reduces size in choppy tape
+#   - _estimate_iv_rank: IV clamped to SWING_IV_MIN/MAX (same fix as swing_engine)
+#   - _get_ohlc_bars: OHLC_WARN_ONCE_PER_CYCLE dedup (32 duplicate MA warnings today)
+#   - CHOP_REGIME_SIZE_MULT applied in _post_trade_card size block
+#
+# v4.0/v4.1 preserved:
 #   - v4 institutional engine integration via engine_bridge.py
 #   - Confidence scoring on all cards (HIGH/MODERATE/LOW)
-#   - Data quality downgrades displayed when data is incomplete
-#   - Trade sign inference (buy/sell/spread detection) shown on cards
-#   - Vol regime (Yang-Zhang RV, VRP) computed from bars when available
-#   - Audit trail for every snapshot computation
-#   - Confidence gate on trade cards (LOW data quality = no trade)
-#   - Schema versioning on all outputs
-#
-# Prior versions preserved:
-#   v3.6: Bear put debit spread, direction-aware confidence
-#   v3.7: Fibonacci swing trade, Black-Scholes validation
-#   v3.9: Redis-backed signal queue, faster timeouts
-#   v4.0: Wave digest, bar-close flood collection
+#   - Wave prefetch cache, Redis-backed signal queue
+#   - CAGF regime gate for SPY/QQQ/SPX
+#   - EM-aware strike placement and width clamping
+#   - EM accuracy logger + auto-reconciler
 
 from telegram_commands import (
     handle_command,
@@ -62,6 +63,12 @@ from trading_rules import (
     JOURNAL_LOG_ALL_SIGNALS,
     IMMEDIATE_POST_TIER, IMMEDIATE_POST_MIN_CONF, IMMEDIATE_POST_0DTE,
     DIGEST_CARD_CACHE_TTL_SEC,
+    # v4.2
+    CHECK_TICKER_TIMEOUT_SEC,
+    CHOP_REGIME_CONF_GATE, CHOP_REGIME_SIZE_MULT,
+    PIN_REGIME_BLOCK_BEAR_PUTS, PIN_REGIME_BLOCK_BULL_CALLS,
+    SWING_IV_MIN, SWING_IV_MAX, SWING_IV_ATM_BAND_PCT,
+    OHLC_WARN_ONCE_PER_CYCLE,
 )
 # ── v4 engine bridge ──
 from engine_bridge import (
@@ -691,6 +698,46 @@ def _process_job(worker_id: int, job: dict):
             except Exception as e:
                 log.warning(f"[worker-{worker_id}] CAGF gate error for {ticker}: {e} — proceeding without gate")
 
+        # ── v4.2: PIN regime gate (all tickers) ──
+        # Uses prefetch v4_flow if available (no extra API call).
+        # Blocks directional debit spreads when v4 regime contains PIN —
+        # same logic check_ticker enforces via "not enough ITM strikes",
+        # but surfaced here earlier to save a full timeout cycle.
+        _cached_prefetch = _prefetch_get(ticker)
+        if _cached_prefetch and _cached_prefetch.get("v4_flow"):
+            _v4f = _cached_prefetch["v4_flow"]
+            _composite = (_v4f.get("composite_regime") or "").upper()
+            if "PIN" in _composite:
+                if bias == "bear" and PIN_REGIME_BLOCK_BEAR_PUTS:
+                    base["reason"] = f"PIN regime ({_composite}) — bear puts blocked"
+                    log.info(f"[worker-{worker_id}] {ticker} blocked: {base['reason']}")
+                    _record_wave_result(base)
+                    return
+                if bias == "bull" and PIN_REGIME_BLOCK_BULL_CALLS:
+                    base["reason"] = f"PIN regime ({_composite}) — bull calls blocked"
+                    log.info(f"[worker-{worker_id}] {ticker} blocked: {base['reason']}")
+                    _record_wave_result(base)
+                    return
+
+        # ── v4.2: CHOP regime confidence gate (all tickers) ──
+        # LOW VOL CHOP: only take trades that clear the tighter confidence threshold.
+        # Regime is cheap to fetch — already cached by prefetch or get_current_regime().
+        _current_regime = (_cached_prefetch.get("regime") if _cached_prefetch else None) or get_current_regime()
+        _regime_label = (_current_regime.get("label") or "").upper()
+        if "CHOP" in _regime_label:
+            # Pre-check: if we have a prefetch confidence score, gate early
+            if _cached_prefetch and _cached_prefetch.get("v4_flow"):
+                _conf_score = _cached_prefetch["v4_flow"].get("confidence_score", 1.0)
+                # confidence_score is 0.0–1.0; CHOP_REGIME_CONF_GATE is 0–100
+                if _conf_score * 100 < CHOP_REGIME_CONF_GATE:
+                    base["reason"] = (
+                        f"CHOP regime gate: v4 conf {_conf_score*100:.0f}/100 "
+                        f"< {CHOP_REGIME_CONF_GATE} (LOW VOL CHOP)"
+                    )
+                    log.info(f"[worker-{worker_id}] {ticker} blocked: {base['reason']}")
+                    _record_wave_result(base)
+                    return
+
         rec = check_ticker_with_timeout(ticker, direction=bias, webhook_data=webhook_data)
         base["confidence"] = rec.get("confidence")
 
@@ -838,7 +885,8 @@ _queue_worker_threads = _start_workers()
 # check_ticker WITH HARD TIMEOUT (v3.9)
 # ─────────────────────────────────────────────────────────
 
-def check_ticker_with_timeout(ticker, direction="bull", webhook_data=None, timeout_sec=75):
+def check_ticker_with_timeout(ticker, direction="bull", webhook_data=None, timeout_sec=None):
+    timeout_sec = timeout_sec if timeout_sec is not None else CHECK_TICKER_TIMEOUT_SEC
     result = {}
     exc_holder = []
 
@@ -1137,7 +1185,10 @@ def _estimate_iv_rank(chains: list, candle_closes: list) -> float:
         for exp, dte, contracts in chains:
             for c in contracts:
                 iv = c.get("iv")
-                if iv and iv > 0:
+                # v4.2: clamp to sane range — same fix as swing_engine avg_iv computation.
+                # Deep OTM / near-expiry contracts return IV > 100 from MarketData.app
+                # and would inflate the rank to 100 for every ticker.
+                if iv and SWING_IV_MIN < iv < SWING_IV_MAX:
                     current_ivs.append(iv)
             if current_ivs:
                 break
@@ -1351,7 +1402,7 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
         cached = _prefetch_get(ticker)
         if not cached and _prefetch_thread_active:
             wait_start = time.time()
-            while (time.time() - wait_start) < 60:  # wait up to 60s for prefetch
+            while (time.time() - wait_start) < PREFETCH_WORKER_WAIT_SEC:
                 time.sleep(2)
                 cached = _prefetch_get(ticker)
                 if cached:
@@ -2083,9 +2134,33 @@ def _estimate_liquidity(ticker: str, spot: float) -> tuple:
     return adv, spread
 
 
+# v4.2: Per-cycle OHLC warning dedup.
+# api_cache.get_ohlc_bars logs a WARNING on every timeout, which produced
+# 32 identical lines for MA in today's run. We gate to one warning per
+# ticker per process lifetime using a simple set. The set stays small
+# (one entry per unique ticker that has ever timed out) and never needs
+# to be cleared — the underlying cache TTL handles re-fetching.
+_ohlc_warned_tickers: set = set()
+
+
 def _get_ohlc_bars(ticker: str, days: int = 65) -> list:
-    """Fetch daily OHLC and convert to options_exposure.OHLC objects (cached)."""
-    return _cached_md.get_ohlc_bars(ticker, days)
+    """Fetch daily OHLC and convert to options_exposure.OHLC objects (cached).
+    v4.2: Suppresses repeated timeout warnings for the same ticker (OHLC_WARN_ONCE_PER_CYCLE).
+    """
+    if OHLC_WARN_ONCE_PER_CYCLE and ticker.upper() in _ohlc_warned_tickers:
+        # Warning already emitted for this ticker — fetch silently
+        import logging as _logging
+        _orig_level = logging.getLogger("api_cache").level
+        logging.getLogger("api_cache").setLevel(_logging.ERROR)
+        try:
+            return _cached_md.get_ohlc_bars(ticker, days)
+        finally:
+            logging.getLogger("api_cache").setLevel(_orig_level)
+
+    result = _cached_md.get_ohlc_bars(ticker, days)
+    if not result and OHLC_WARN_ONCE_PER_CYCLE:
+        _ohlc_warned_tickers.add(ticker.upper())
+    return result
 
 
 def _get_atm_skew(strikes, iv_list, sides, n, spot):
@@ -2846,6 +2921,12 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
         if cagf_conflict:
             size_pct = max(int(size_pct * 0.5), 25)
             dex_note += " | CAGF conflict → halved"
+
+        # v4.2: Reduce size in CHOP regime
+        _tc_regime_label = (unified_regime.get("label") or "").upper() if unified_regime else ""
+        if "CHOP" in _tc_regime_label:
+            size_pct = max(int(size_pct * CHOP_REGIME_SIZE_MULT), 25)
+            dex_note += f" | CHOP regime → ×{CHOP_REGIME_SIZE_MULT}"
 
         # ══════ TIMING ══════
         charm_tail = charm_m > 0
