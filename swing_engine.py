@@ -25,7 +25,8 @@ log = logging.getLogger(__name__)
 
 SWING_MIN_DTE            = 7
 SWING_MAX_DTE            = 60
-SWING_TARGET_DTE         = 21       # v4.2: tightened from 30 — prefer 3-week horizon
+SWING_TARGET_DTE         = 32       # Entry DTE target: give a ~21-day thesis extra time to work
+SWING_FORECAST_DAYS      = 21       # Thesis horizon for EM / strike framing
 SWING_MAX_EXPIRATIONS    = 6        # Check more expirations than scalp
 
 SWING_MAX_COST_PCT       = 0.70
@@ -342,7 +343,7 @@ def select_best_dte(
     Score and rank available expirations for swing trading.
 
     Scoring factors:
-      - Proximity to TARGET_DTE (30 days)
+      - Proximity to the preferred entry DTE target
       - IV term structure (prefer lower IV expirations)
       - Liquidity at that expiration
       - Fib-adjusted time horizon (61.8% setups deserve more time)
@@ -712,10 +713,10 @@ def compute_swing_confidence(
     em_zone = trade.get("em_zone", "unknown")
     if em_zone == "inside":
         score += 5
-        reasons.append("Short strike inside 14-day EM")
+        reasons.append(f"Short strike inside {SWING_FORECAST_DAYS}-day EM")
     elif em_zone == "outside":
         score -= 10  # v1.1: tightened from -8
-        reasons.append("Short strike beyond 14-day EM")
+        reasons.append(f"Short strike beyond {SWING_FORECAST_DAYS}-day EM")
 
     score = max(0, min(100, score))
     return score, reasons
@@ -819,8 +820,8 @@ def recommend_swing_trade(
         result["reason"] = f"No expirations in {SWING_MIN_DTE}-{SWING_MAX_DTE} DTE range"
         return result
 
-    # ── 14-day swing expected move ──
-    swing_em = calc_swing_expected_move(spot, avg_iv, days=14)
+    # ── Forecast-horizon expected move (21-day thesis, longer entry DTE allowed) ──
+    swing_em = calc_swing_expected_move(spot, avg_iv, days=SWING_FORECAST_DAYS)
 
     # ── Try chains in order until we find a good spread ──
     all_reasons = []
@@ -974,7 +975,7 @@ def format_swing_card(rec: Dict) -> str:
     if swing_em.get("em_1sd"):
         em = swing_em["em_1sd"]
         bull_r, bear_r = swing_em.get("bull_range", (0, 0))
-        lines.append(f"14-Day EM (1σ): ±${em:.2f} | Range: ${bull_r:.2f} – ${bear_r:.2f}")
+        lines.append(f"{SWING_FORECAST_DAYS}-Day EM (1σ): ±${em:.2f} | Range: ${bull_r:.2f} – ${bear_r:.2f}")
 
         # Extension targets
         exts = swing_em.get("extensions", {})
