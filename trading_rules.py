@@ -2,19 +2,18 @@
 # Brad's Trading Rules — encoded from conversation
 # NOTE: Educational/demo code. Not financial advice. Use at your own risk.
 #
-# v3.5 additions:
-#   - Portfolio-level risk limits (daily loss, gross exposure, concentration)
-#   - Market regime detection thresholds (VIX, ADX)
-#   - Trade journal settings
-#   - Greeks P/L attribution settings
-#
-# v3.6 additions:
-#   - Bear direction enabled (bull + bear)
+# v4.1 additions:
+#   - Hard liquidity filters (tightened from soft warnings)
+#   - Ranking model composite weights
+#   - Slippage model
+#   - Journal feedback loop thresholds
+#   - Digest / tradecard settings
+#   - Index ETF tiered liquidity requirements
 
 # ─────────────────────────────────────────────────────────
 # DIRECTION & SIGNAL
 # ─────────────────────────────────────────────────────────
-ALLOWED_DIRECTIONS       = ["bull", "bear"]   # v3.6: bear enabled
+ALLOWED_DIRECTIONS       = ["bull", "bear"]
 SIGNAL_SOURCE            = "unified_pine"
 REQUIRE_TIER             = ["1", "2"]
 TIER1_SIZE_MULTIPLIER    = 1.0
@@ -65,9 +64,63 @@ USE_STOP_LOSS_ALL        = False
 # ─────────────────────────────────────────────────────────
 NO_EARNINGS_WEEK         = True
 NO_DIVIDEND_IN_DTE       = True
-MIN_OPEN_INTEREST        = 50
-MAX_BID_ASK_SPREAD       = 0.50
 MIN_VOLUME_LEG           = 0
+
+# ═══════════════════════════════════════════════════════════
+# HARD LIQUIDITY FILTERS (v4.1)
+# ═══════════════════════════════════════════════════════════
+
+MIN_OPEN_INTEREST        = 500
+MAX_BID_ASK_SPREAD       = 0.15
+MAX_SPREAD_PCT_OF_MID    = 0.12
+
+INDEX_ETF_TICKERS        = {"SPY", "QQQ", "IWM", "DIA", "SPX", "GLD"}
+INDEX_MIN_OPEN_INTEREST  = 2000
+INDEX_MAX_BID_ASK_SPREAD = 0.06
+INDEX_MAX_SPREAD_PCT     = 0.05
+
+LARGE_CAP_TICKERS        = {
+    "AAPL", "MSFT", "NVDA", "AMZN", "META",
+    "TSLA", "GOOGL", "AMD", "NFLX", "COIN",
+}
+LARGE_CAP_MIN_OI         = 1000
+LARGE_CAP_MAX_SPREAD     = 0.10
+LARGE_CAP_MAX_SPREAD_PCT = 0.08
+
+
+def get_liquidity_thresholds(ticker: str) -> dict:
+    t = ticker.upper()
+    if t in INDEX_ETF_TICKERS:
+        return {"min_oi": INDEX_MIN_OPEN_INTEREST, "max_spread": INDEX_MAX_BID_ASK_SPREAD,
+                "max_spread_pct": INDEX_MAX_SPREAD_PCT, "tier": "index"}
+    elif t in LARGE_CAP_TICKERS:
+        return {"min_oi": LARGE_CAP_MIN_OI, "max_spread": LARGE_CAP_MAX_SPREAD,
+                "max_spread_pct": LARGE_CAP_MAX_SPREAD_PCT, "tier": "large_cap"}
+    else:
+        return {"min_oi": MIN_OPEN_INTEREST, "max_spread": MAX_BID_ASK_SPREAD,
+                "max_spread_pct": MAX_SPREAD_PCT_OF_MID, "tier": "default"}
+
+
+# ═══════════════════════════════════════════════════════════
+# SLIPPAGE MODEL (v4.1)
+# ═══════════════════════════════════════════════════════════
+
+SLIPPAGE_SPREAD_FACTOR   = 0.35
+SLIPPAGE_MIN_EV_AFTER    = 0.0
+
+
+# ═══════════════════════════════════════════════════════════
+# TRADE RANKING MODEL (v4.1)
+# ═══════════════════════════════════════════════════════════
+
+RANK_WEIGHT_EV           = 0.30
+RANK_WEIGHT_WIN_PROB     = 0.25
+RANK_WEIGHT_LIQUIDITY    = 0.20
+RANK_WEIGHT_IV_EDGE      = 0.10
+RANK_WEIGHT_EM_DISTANCE  = 0.10
+RANK_WEIGHT_WIDTH_EFF    = 0.05
+RANK_MIN_SCORE           = 0.15
+
 
 # ─────────────────────────────────────────────────────────
 # POSITION SIZING
@@ -85,13 +138,13 @@ CONFIDENCE_BOOSTS = {
     "htf_confirmed":     10,
     "htf_converging":    5,
     "daily_bull":        10,
-    "daily_bear":        10,   # v3.6: daily bear confirms bear trades
+    "daily_bear":        10,
     "rsi_mfi_bull":      5,
-    "rsi_mfi_bear":      5,    # v3.6: RSI/MFI selling confirms bear trades
+    "rsi_mfi_bear":      5,
     "above_vwap":        5,
-    "below_vwap":        5,    # v3.6: below VWAP confirms bear trades
+    "below_vwap":        5,
     "wave_oversold":     10,
-    "wave_overbought":   10,   # v3.6: overbought confirms bear trades
+    "wave_overbought":   10,
     "iv_edge":           8,
     "rv_edge":           10,
     "within_em":         5,
@@ -101,10 +154,10 @@ CONFIDENCE_BOOSTS = {
 
 CONFIDENCE_PENALTIES = {
     "htf_diverging":     -20,
-    "daily_bear":        -10,  # penalty when bull trade, daily is bear
-    "daily_bull":        -10,  # v3.6: penalty when bear trade, daily is bull
-    "wave_overbought":   -15,  # penalty when bull trade, wave overbought
-    "wave_oversold":     -15,  # v3.6: penalty when bear trade, wave oversold
+    "daily_bear":        -10,
+    "daily_bull":        -10,
+    "wave_overbought":   -15,
+    "wave_oversold":     -15,
     "low_oi":            -5,
     "wide_spread":       -5,
     "earnings_week":     -100,
@@ -112,19 +165,15 @@ CONFIDENCE_PENALTIES = {
     "iv_crushed":        -5,
     "beyond_em":         -8,
     "regime_choppy":     -10,
-    "regime_high_vix":   -5,   # reduced — spread buyers benefit from elevated IV
-    "regime_crisis":     -10,  # reduced — direction-aware boost applied in engine
+    "regime_high_vix":   -5,
+    "regime_crisis":     -10,
 }
 
-# v3.7: raised from 40 → 60 (only solid setups)
 MIN_CONFIDENCE_TO_TRADE  = 60
-
-# v3.8: lowered from 0.60 — scalp short strikes are typically OTM/ATM
-# with deltas of 0.35-0.50. 0.60 was blocking nearly all valid setups.
 MIN_WIN_PROBABILITY      = 0.45
 
 # ─────────────────────────────────────────────────────────
-# EXPECTED MOVE & IV vs RV EDGE (v3.4)
+# EXPECTED MOVE & IV vs RV EDGE
 # ─────────────────────────────────────────────────────────
 EM_DISPLAY_ON_CARD       = True
 IV_RV_DISPLAY_ON_CARD    = True
@@ -137,20 +186,28 @@ IV_RV_SELLER_EDGE_PCT    = 5.0
 
 
 # ═══════════════════════════════════════════════════════════
-# PORTFOLIO-LEVEL RISK LIMITS (v3.5)
+# JOURNAL FEEDBACK LOOP (v4.1)
+# ═══════════════════════════════════════════════════════════
+
+JOURNAL_FEEDBACK_ENABLED      = True
+JOURNAL_MIN_TRADES_FOR_STATS  = 15
+JOURNAL_SUPPRESS_WIN_RATE     = 0.30
+JOURNAL_REDUCE_WIN_RATE       = 0.40
+JOURNAL_REDUCE_SIZE_MULT      = 0.50
+JOURNAL_LOOKBACK_SIGNALS      = 30
+
+
+# ═══════════════════════════════════════════════════════════
+# PORTFOLIO-LEVEL RISK LIMITS
 # ═══════════════════════════════════════════════════════════
 
 DAILY_LOSS_LIMIT_USD     = 3000.0
 DAILY_LOSS_LIMIT_PCT     = 0.03
-
 MAX_GROSS_EXPOSURE_USD   = 10000.0
 MAX_GROSS_EXPOSURE_PCT   = 0.10
-
 MAX_TICKER_EXPOSURE_USD  = 3000.0
 MAX_TICKER_EXPOSURE_PCT  = 0.03
-
 MAX_OPEN_SPREADS         = 8
-
 MAX_SAME_SECTOR_SPREADS  = 4
 
 SECTOR_MAP = {
@@ -166,16 +223,14 @@ MAX_PORTFOLIO_VEGA       = 150
 
 
 # ═══════════════════════════════════════════════════════════
-# MARKET REGIME DETECTION (v3.5)
+# MARKET REGIME DETECTION
 # ═══════════════════════════════════════════════════════════
 
 REGIME_VIX_LOW           = 15.0
 REGIME_VIX_NORMAL        = 25.0
 REGIME_VIX_ELEVATED      = 35.0
-
 REGIME_ADX_CHOPPY        = 20.0
 REGIME_ADX_TRENDING      = 30.0
-
 REGIME_CRISIS_BLOCK      = True
 REGIME_ELEVATED_SIZE_MULT = 0.50
 REGIME_CHOPPY_SIZE_MULT  = 0.75
@@ -183,11 +238,20 @@ REGIME_TRENDING_SIZE_MULT = 1.0
 
 
 # ═══════════════════════════════════════════════════════════
-# TRADE JOURNAL SETTINGS (v3.5)
+# TRADE JOURNAL SETTINGS
 # ═══════════════════════════════════════════════════════════
 
 JOURNAL_LOG_ALL_SIGNALS  = True
 JOURNAL_LOG_REJECTED     = True
 JOURNAL_MAX_ENTRIES      = 5000
-
 GREEKS_ATTRIBUTION_ON_CLOSE = True
+
+
+# ═══════════════════════════════════════════════════════════
+# DIGEST / TRADECARD SETTINGS (v4.1)
+# ═══════════════════════════════════════════════════════════
+
+IMMEDIATE_POST_TIER          = ["1"]
+IMMEDIATE_POST_MIN_CONF      = 75
+IMMEDIATE_POST_0DTE          = True
+DIGEST_CARD_CACHE_TTL_SEC    = 3600
