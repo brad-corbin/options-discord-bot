@@ -25,11 +25,18 @@ log = logging.getLogger(__name__)
 
 SWING_MIN_DTE            = 7
 SWING_MAX_DTE            = 60
-SWING_TARGET_DTE         = 30       # Prefer ~30 DTE when available
+SWING_TARGET_DTE         = 21       # v4.2: tightened from 30 — prefer 3-week horizon
 SWING_MAX_EXPIRATIONS    = 6        # Check more expirations than scalp
 
 SWING_MAX_COST_PCT       = 0.70
 SWING_MIN_COST_PCT       = 0.20
+
+# IV sanity bounds — clamp before use in EM and B-S calculations.
+# MarketData.app returns IV > 100.0 on deep OTM / near-expiry contracts;
+# those blow up calc_swing_expected_move and all downstream B-S math.
+SWING_IV_MIN             = 0.05    # 5%  — discard below (data noise)
+SWING_IV_MAX             = 5.00    # 500% — discard above (blown-up contract)
+SWING_IV_ATM_BAND_PCT    = 0.05    # Prefer ATM contracts (within 5% of spot) for IV
 
 # Sizing — smaller than scalp due to longer exposure
 SWING_MAX_RISK_USD        = 1000.0
@@ -787,14 +794,24 @@ def recommend_swing_trade(
         daily_confirmed=bool(daily_ok),
     )
 
-    # ── Get average IV from best chain ──
+    # ── Get average ATM IV from best chain ──
+    # Clamp to SWING_IV_MIN–SWING_IV_MAX to filter out deep-OTM/near-expiry
+    # IV explosions that would corrupt the EM and B-S calculations.
+    # Prefer ATM contracts (within SWING_IV_ATM_BAND_PCT of spot); fall back to all if needed.
+    atm_iv = []
     all_iv = []
     for _, _, contracts in chains:
         for c in contracts:
             iv = c.get("iv")
-            if iv and iv > 0:
+            if iv and SWING_IV_MIN < iv < SWING_IV_MAX:
                 all_iv.append(iv)
-    avg_iv = sum(all_iv) / len(all_iv) if all_iv else 0.25  # fallback 25%
+                strike = c.get("strike") or 0
+                if strike > 0 and abs(strike - spot) / spot <= SWING_IV_ATM_BAND_PCT:
+                    atm_iv.append(iv)
+        if all_iv:
+            break  # use first (closest) expiry for IV reference
+    iv_pool = atm_iv if len(atm_iv) >= 3 else all_iv
+    avg_iv = sum(iv_pool) / len(iv_pool) if iv_pool else 0.25  # fallback 25%
 
     # ── Select best DTE ──
     sorted_chains = select_best_dte(chains, spot, avg_iv, fib_level)
