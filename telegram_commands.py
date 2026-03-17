@@ -401,6 +401,38 @@ def handle_command(
         return
 
     # ─────────────────────────────────────
+    # /tradecard TICKER — retrieve cached full trade card from digest
+    # ─────────────────────────────────────
+    if cmd in ("/tradecard", "/tradecard@omegabot"):
+        if not args:
+            reply(
+                "Usage: /tradecard SPY\n"
+                "Retrieves the full trade card for a ticker from the latest signal digest.\n"
+                "Cards are cached for 1 hour after a signal fires."
+            )
+            return
+
+        ticker = args[0].upper()
+        # Look up cached card from store
+        try:
+            from app import store_get
+            cache_key = f"tradecard:{ticker}"
+            cached_card = store_get(cache_key)
+            if cached_card:
+                reply(cached_card)
+                log.info(f"/tradecard {ticker}: card retrieved from cache")
+            else:
+                reply(
+                    f"❌ No cached trade card for {ticker}.\n"
+                    f"Cards are available after a signal fires and appear in the digest.\n"
+                    f"Use /check {ticker} to run a fresh analysis."
+                )
+        except Exception as e:
+            log.error(f"/tradecard {ticker}: {e}")
+            reply(f"⚠️ Error retrieving card: {type(e).__name__}")
+        return
+
+    # ─────────────────────────────────────
     # /check TICKER [bull|bear]
     # ─────────────────────────────────────
     if cmd in ("/check", "/check@omegabot"):
@@ -565,6 +597,21 @@ def handle_command(
         reply("▶️ Bot resumed. Scheduled scans will run normally.")
         return
 
+    # ─────────────────────────────────────
+    # /cachestats — API cache hit rates
+    # ─────────────────────────────────────
+    if cmd in ("/cachestats", "/cachestats@omegabot"):
+        try:
+            from app import _cached_md
+            stats = _cached_md.get_stats()
+            lines = ["📊 API Cache Stats"]
+            for name, s in stats.items():
+                lines.append(f"  {name}: {s['hits']} hits / {s['misses']} miss ({s['hit_rate']:.0%}) | {s['size']} cached")
+            reply("\n".join(lines))
+        except Exception as e:
+            reply(f"⚠️ Cache stats error: {e}")
+        return
+
     if cmd in ("/help", "/help@omegabot", "/start"):
         reply(
             "🤖 Omega 3000 Commands:\n\n"
@@ -572,6 +619,7 @@ def handle_command(
             "/check AAPL — auto bull+bear, engine decides\n"
             "/check AAPL bull — force bull only\n"
             "/check AAPL bear — force bear only\n"
+            "/tradecard SPY — full card from digest\n"
             "/scan AAPL — scan single ticker\n"
             "/scan — run full watchlist scan\n"
             "\n── 0DTE Expected Move ──\n"
@@ -625,6 +673,7 @@ def handle_command(
             "/wheel — all wheels summary\n"
             "\n── Settings ──\n"
             "/status — bot health + portfolio stats\n"
+            "/cachestats — API cache hit rates\n"
             "/watchlist — show tickers\n"
             "/confidence 60 — set min confidence\n"
             "/pause | /resume — control scheduled scans\n"
