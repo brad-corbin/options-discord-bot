@@ -356,17 +356,17 @@ def handle_command(
         threading.Thread(target=run_em, daemon=True).start()
         return
 
-    # /monitorlong TICKER — swing outlook, expiry closest to 21 DTE
+    # /monitorlong TICKER — swing outlook, target ~21-day thesis using ~28-35 DTE entry when possible
     # ─────────────────────────────────────
     if cmd in ("/monitorlong", "/monitorlong@omegabot"):
         if not post_monitor_card_fn:
             reply("⚠️ Monitor function not wired — post_monitor_card_fn missing.")
             return
         if not args:
-            reply("Usage: /monitorlong IREN\n15–30 day swing outlook on the nearest monthly expiration.")
+            reply("Usage: /monitorlong IREN\nSwing outlook using a ~21-day thesis with extra DTE buffer when available.")
             return
         ticker = args[0].upper()
-        reply(f"📅 Fetching swing monitor card for {ticker} (~21 DTE)...")
+        reply(f"📅 Fetching swing monitor card for {ticker} (~21-day thesis, buffered DTE)...")
 
         def run_monitor_long():
             try:
@@ -638,7 +638,7 @@ def handle_command(
             "/em SPY morning — specific ticker + session\n"
             "  Auto-fires: 8:45 AM CT (today) & 2:45 PM CT (next day)\n"
             "\n── Position Monitor ──\n"
-            "/monitorlong IREN — swing outlook, ~21 DTE expiry\n"
+            "/monitorlong IREN — swing outlook, ~21-day thesis with extra DTE buffer\n"
             "/monitorshort IREN — near-term outlook, nearest expiry\n"
             "  Works on any symbol with liquid options\n"
             "  Liquid symbols (SPY/QQQ/AAPL/NVDA etc): full dealer flow card\n"
