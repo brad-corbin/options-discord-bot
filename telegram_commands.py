@@ -466,7 +466,15 @@ def handle_command(
             for direction in directions:
                 try:
                     result = check_fn(ticker, direction)
-                    if result.get("posted"):
+                    if result.get("posted") and result.get("card"):
+                        # v4.3: Actually post the card — check_fn builds it but doesn't send
+                        if post_fn:
+                            post_fn(result["card"])
+                        else:
+                            reply(result["card"])
+                        any_posted = True
+                    elif result.get("posted"):
+                        # posted=True but no card text (shouldn't happen, but handle it)
                         any_posted = True
                     else:
                         reason = result.get("reason") or result.get("error") or "no valid setup"
