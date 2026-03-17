@@ -533,7 +533,10 @@ _prefetch_pending_lock = threading.Lock()
 _prefetch_pending: list = []
 _prefetch_last_signal: float = 0.0
 _prefetch_thread_active = False
+_prefetch_wave_done = threading.Event()  # Workers wait on this
+_prefetch_wave_done.set()  # Start in "done" state (no wave pending)
 PREFETCH_SETTLE_SEC = 3  # wait this long after last signal before prefetching
+PREFETCH_WORKER_WAIT_SEC = 45  # max time workers wait for prefetch
 
 
 def _record_prefetch_ticker(ticker: str):
@@ -542,6 +545,7 @@ def _record_prefetch_ticker(ticker: str):
     with _prefetch_pending_lock:
         _prefetch_pending.append(ticker.strip().upper())
         _prefetch_last_signal = time.time()
+        _prefetch_wave_done.clear()  # Signal workers to wait
         _maybe_start_prefetch_thread()
 
 
@@ -572,6 +576,7 @@ def _prefetch_collector_thread():
                     break
                 elif not _prefetch_pending:
                     # No signals pending
+                    _prefetch_wave_done.set()
                     return
 
         # Dedupe and prefetch
@@ -582,7 +587,9 @@ def _prefetch_collector_thread():
     except Exception as e:
         log.error(f"Prefetch collector error: {e}", exc_info=True)
     finally:
+        _prefetch_wave_done.set()  # Unblock workers even on error
         _prefetch_thread_active = False
+        log.info("Prefetch wave complete — workers unblocked")
 
 
 def _process_job(worker_id: int, job: dict):
@@ -598,7 +605,21 @@ def _process_job(worker_id: int, job: dict):
         log.warning(f"[worker-{worker_id}] Stale {job_type} signal dropped: {ticker} ({age_sec:.0f}s)")
         return
 
-    log.info(f"[worker-{worker_id}] Processing {job_type}: {ticker} {bias} T{tier_label} ({age_sec:.0f}s ago)")
+    # v4.3: Wait for wave prefetch to complete before processing
+    # This ensures workers pull from cache instead of hitting APIs independently
+    if not _prefetch_wave_done.is_set():
+        log.info(f"[worker-{worker_id}] Waiting for wave prefetch ({ticker} {bias})...")
+        _prefetch_wave_done.wait(timeout=PREFETCH_WORKER_WAIT_SEC)
+        if not _prefetch_wave_done.is_set():
+            log.warning(f"[worker-{worker_id}] Prefetch wait timed out — proceeding with live fetch for {ticker}")
+
+    age_sec = time.time() - enqueued_at  # re-check age after waiting
+    if age_sec > SIGNAL_TTL_SEC:
+        log.warning(f"[worker-{worker_id}] Signal aged out during prefetch wait: {ticker} ({age_sec:.0f}s)")
+        return
+
+    log.info(f"[worker-{worker_id}] Processing {job_type}: {ticker} {bias} T{tier_label} ({age_sec:.0f}s ago)"
+             f"{' [cached]' if _prefetch_get(ticker) else ''}")
 
     base = {
         "job_type": job_type, "ticker": ticker, "bias": bias,
