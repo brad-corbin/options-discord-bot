@@ -2369,11 +2369,15 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
                 dte_upgrade_reason = avoid_list[0] if avoid_list else "0DTE conditions not met"
                 log.info(f"Trade card DTE upgraded: 0DTE → {rec_label} | {dte_upgrade_reason}")
 
-        # v4.2: Next-day session → always at least 1 DTE
+        # v4.2: Next-day session → always at least 1 DTE, prefer CAGF recommendation
         if is_next_day:
-            if effective_dte < 1:
-                effective_dte = max(1, effective_dte)
-            effective_dte_label = dte_rec["primary"]["label"] if (dte_rec and dte_rec.get("primary")) else f"{effective_dte} DTE"
+            if dte_rec and dte_rec.get("primary"):
+                rec_dte = dte_rec["primary"].get("dte", 1)
+                effective_dte = max(rec_dte, 1)
+                effective_dte_label = dte_rec["primary"]["label"]
+            else:
+                effective_dte = max(effective_dte, 1)
+                effective_dte_label = f"{effective_dte} DTE"
             dte_was_upgraded = True
             dte_upgrade_reason = "afternoon session → next trading day"
 
