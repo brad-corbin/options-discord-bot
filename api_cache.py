@@ -10,6 +10,7 @@
 #   expirations   → 5 min   (changes once per day)
 #   daily candles → 10 min  (changes once per day)
 #   OHLC bars     → 10 min  (same as candles)
+#   ADV + spread  → 10 min  (volume/quote-based liquidity, stable intraday)
 #   VIX data      → 60 sec  (changes intraday but not per-second)
 #   earnings      → 1 hour  (changes once per day)
 #   stock quote   → 15 sec  (for liquidity estimates)
@@ -97,6 +98,7 @@ TTL_CHAIN        = 20
 TTL_EXPIRATIONS  = 300   # 5 min
 TTL_CANDLES      = 600   # 10 min
 TTL_OHLC_BARS    = 600   # 10 min
+TTL_ADV          = 600   # 10 min — ADV + spread, stable intraday
 TTL_VIX          = 60
 TTL_STOCK_QUOTE  = 15
 TTL_EARNINGS     = 3600  # 1 hour
@@ -121,6 +123,7 @@ class CachedMarketData:
         self._exp_cache = _TTLCache(TTL_EXPIRATIONS)
         self._candle_cache = _TTLCache(TTL_CANDLES)
         self._ohlc_cache = _TTLCache(TTL_OHLC_BARS)
+        self._adv_cache = _TTLCache(TTL_ADV)
         self._vix_cache = _TTLCache(TTL_VIX)
         self._quote_cache = _TTLCache(TTL_STOCK_QUOTE)
 
@@ -304,6 +307,63 @@ class CachedMarketData:
             log.debug(f"Cached VIX fetch failed: {e}")
             return {}
 
+    # ── Liquidity Estimate (ADV + bid-ask spread) ──
+    def get_liquidity(self, ticker: str, as_float_fn=None) -> tuple:
+        """
+        Cached ADV (avg daily dollar volume) and bid-ask spread pct.
+        Returns (adv, spread_pct) — either may be None on failure.
+        TTL=10min: volume is stable enough intraday.
+        """
+        key = ticker.upper()
+        cached = self._adv_cache.get(key)
+        if cached is not None:
+            return cached
+
+        af = as_float_fn or _default_as_float
+        adv = None
+        spread = None
+
+        try:
+            from datetime import datetime, timezone, timedelta
+            from_date = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%d")
+            raw = self._md_get(
+                f"https://api.marketdata.app/v1/stocks/candles/D/{key}/",
+                {"from": from_date},
+            )
+            if isinstance(raw, dict) and raw.get("s") == "ok":
+                closes = raw.get("c") or []
+                volumes = raw.get("v") or []
+                n = min(len(closes), len(volumes))
+                if n >= 5:
+                    dvols = []
+                    for i in range(max(n - 20, 0), n):
+                        c = af(closes[i], 0)
+                        v = af(volumes[i], 0)
+                        if c > 0 and v > 0:
+                            dvols.append(c * v)
+                    if dvols:
+                        adv = sum(dvols) / len(dvols)
+        except Exception as e:
+            log.debug(f"Cached ADV fetch failed for {ticker}: {e}")
+
+        try:
+            quote = self.get_stock_quote(key)
+            if isinstance(quote, dict) and quote.get("s") == "ok":
+                bid_raw = quote.get("bid")
+                ask_raw = quote.get("ask")
+                bid = af(bid_raw[0] if isinstance(bid_raw, list) else bid_raw, 0)
+                ask = af(ask_raw[0] if isinstance(ask_raw, list) else ask_raw, 0)
+                if bid > 0 and ask > 0 and ask > bid:
+                    spread = (ask - bid) / ((ask + bid) / 2)
+        except Exception as e:
+            log.debug(f"Cached spread fetch failed for {ticker}: {e}")
+
+        result = (adv, spread)
+        # Only cache if we got at least one value; don't cache double-None
+        if adv is not None or spread is not None:
+            self._adv_cache.set(key, result)
+        return result
+
     # ── Raw md_get passthrough (for uncached calls) ──
     def raw_get(self, url: str, params=None) -> dict:
         """Direct md_get passthrough for uncacheable calls."""
@@ -317,6 +377,7 @@ class CachedMarketData:
             "expirations": self._exp_cache.stats,
             "candles": self._candle_cache.stats,
             "ohlc": self._ohlc_cache.stats,
+            "adv": self._adv_cache.stats,
             "vix": self._vix_cache.stats,
             "quote": self._quote_cache.stats,
         }
@@ -324,8 +385,8 @@ class CachedMarketData:
     def prune_all(self):
         """Remove expired entries from all caches."""
         for cache in (self._spot_cache, self._chain_cache, self._exp_cache,
-                      self._candle_cache, self._ohlc_cache, self._vix_cache,
-                      self._quote_cache):
+                      self._candle_cache, self._ohlc_cache, self._adv_cache,
+                      self._vix_cache, self._quote_cache):
             cache.prune()
 
 
