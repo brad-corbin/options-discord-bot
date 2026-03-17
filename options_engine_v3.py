@@ -188,139 +188,175 @@ def get_avg_chain_iv(contracts: List[Dict], spot: float) -> float:
 # ─────────────────────────────────────────────────────────
 
 def build_call_quotes(contracts: List[Dict], spot: float, ticker: str = "") -> Dict[float, Dict]:
-    """ITM calls: strikes BELOW spot. v4.1: hard liquidity filters."""
+    """ITM calls: strikes BELOW spot. v4.1: hard liquidity filters with v4.3 relaxed fallback."""
     # v4.1: Get tier-appropriate liquidity thresholds
     _liq = get_liquidity_thresholds(ticker)
-    _liq_min_oi = _liq["min_oi"]
-    _liq_max_spread = _liq["max_spread"]
-    _liq_max_spread_pct = _liq["max_spread_pct"]
 
-    quotes = {}
-    for c in contracts:
-        right = (c.get("right") or "").lower()
-        if right != "call":
-            continue
+    # v4.3: Try strict first, then relaxed if too few strikes pass
+    for pass_name, mult in [("strict", 1.0), ("relaxed", 2.5)]:
+        _liq_min_oi = max(int(_liq["min_oi"] / mult), 1)
+        _liq_max_spread = _liq["max_spread"] * mult
+        _liq_max_spread_pct = min(_liq["max_spread_pct"] * mult, 0.50)
 
-        strike = as_float(c.get("strike"), None)
-        if strike is None or strike >= spot:
-            continue
+        quotes = {}
+        filtered_reasons = {}  # track why strikes were filtered (for logging)
+        for c in contracts:
+            right = (c.get("right") or "").lower()
+            if right != "call":
+                continue
 
-        bid = as_float(c.get("bid"), None)
-        ask = as_float(c.get("ask"), None)
-        mid = as_float(c.get("mid"), None)
-        oi  = as_int(c.get("openInterest"), 0)
-        vol = as_int(c.get("volume"), 0)
-        delta = as_float(c.get("delta"), None)
-        iv  = as_float(c.get("iv"), None)
-        theta = as_float(c.get("theta"), None)
-        vega = as_float(c.get("vega"), None)
+            strike = as_float(c.get("strike"), None)
+            if strike is None or strike >= spot:
+                continue
 
-        if mid is None and bid is not None and ask is not None:
-            mid = (bid + ask) / 2.0
-        if mid is None or mid <= 0:
-            continue
+            bid = as_float(c.get("bid"), None)
+            ask = as_float(c.get("ask"), None)
+            mid = as_float(c.get("mid"), None)
+            oi  = as_int(c.get("openInterest"), 0)
+            vol = as_int(c.get("volume"), 0)
+            delta = as_float(c.get("delta"), None)
+            iv  = as_float(c.get("iv"), None)
+            theta = as_float(c.get("theta"), None)
+            vega = as_float(c.get("vega"), None)
 
-        # v4.1: Hard liquidity filter — BLOCKING, not just warnings
-        warnings = []
-        spread_abs = (ask - bid) if (bid is not None and ask is not None) else 0
-        spread_pct = spread_abs / mid if mid > 0 else 0
+            if mid is None and bid is not None and ask is not None:
+                mid = (bid + ask) / 2.0
+            if mid is None or mid <= 0:
+                filtered_reasons[strike] = "no mid price"
+                continue
 
-        if oi is not None and oi < _liq_min_oi:
-            continue  # HARD BLOCK: insufficient open interest
-        if spread_abs > _liq_max_spread:
-            continue  # HARD BLOCK: absolute spread too wide
-        if spread_pct > _liq_max_spread_pct:
-            continue  # HARD BLOCK: relative spread too wide
+            # Liquidity filters
+            warnings = []
+            spread_abs = (ask - bid) if (bid is not None and ask is not None) else 0
+            spread_pct = spread_abs / mid if mid > 0 else 0
 
-        # Soft warnings for marginal liquidity (still passed, just flagged)
-        if oi is not None and oi < _liq_min_oi * 2:
-            warnings.append(f"Marginal OI ({oi})")
-        if spread_pct > _liq_max_spread_pct * 0.7:
-            warnings.append(f"B/A {spread_pct:.0%} of mid")
+            if oi is not None and oi < _liq_min_oi:
+                filtered_reasons[strike] = f"OI {oi} < {_liq_min_oi}"
+                continue
+            if spread_abs > _liq_max_spread:
+                filtered_reasons[strike] = f"spread ${spread_abs:.2f} > ${_liq_max_spread:.2f}"
+                continue
+            if spread_pct > _liq_max_spread_pct:
+                filtered_reasons[strike] = f"spread {spread_pct:.0%} > {_liq_max_spread_pct:.0%}"
+                continue
 
-        quotes[strike] = {
-            "strike": strike,
-            "mid": mid,
-            "bid": bid,
-            "ask": ask,
-            "oi": oi,
-            "volume": vol,
-            "delta": delta,
-            "iv": iv,
-            "theta": theta,
-            "vega": vega,
-            "itm_amount": round(spot - strike, 2),
-            "spread_pct": round(spread_pct, 4),
-            "warnings": warnings,
-        }
+            # Soft warnings for marginal liquidity
+            if oi is not None and oi < _liq["min_oi"] * 2:
+                warnings.append(f"Marginal OI ({oi})")
+            if spread_pct > _liq["max_spread_pct"] * 0.7:
+                warnings.append(f"B/A {spread_pct:.0%} of mid")
+
+            quotes[strike] = {
+                "strike": strike, "mid": mid, "bid": bid, "ask": ask,
+                "oi": oi, "volume": vol, "delta": delta, "iv": iv,
+                "theta": theta, "vega": vega,
+                "itm_amount": round(spot - strike, 2),
+                "spread_pct": round(spread_pct, 4),
+                "warnings": warnings,
+            }
+
+        if len(quotes) >= 2 or pass_name == "relaxed":
+            if pass_name == "relaxed" and quotes:
+                import logging as _log
+                _log.getLogger(__name__).info(
+                    f"build_call_quotes({ticker}): relaxed pass found {len(quotes)} strikes "
+                    f"(strict found <2). Filters relaxed {mult:.1f}x."
+                )
+            if pass_name == "strict" and len(quotes) < 2 and filtered_reasons:
+                import logging as _log
+                # Log first 5 filtered strikes for debugging
+                top_filtered = sorted(filtered_reasons.items(), key=lambda x: -x[0])[:5]
+                _log.getLogger(__name__).info(
+                    f"build_call_quotes({ticker}): strict pass filtered all ITM calls. "
+                    f"Top filtered: {', '.join(f'${k:.0f}:{v}' for k,v in top_filtered)}"
+                )
+            return quotes
 
     return quotes
 
 
 def build_put_quotes(contracts: List[Dict], spot: float, ticker: str = "") -> Dict[float, Dict]:
-    """ITM puts: strikes ABOVE spot. v4.1: hard liquidity filters."""
+    """ITM puts: strikes ABOVE spot. v4.1: hard liquidity filters with v4.3 relaxed fallback."""
     _liq = get_liquidity_thresholds(ticker)
-    _liq_min_oi = _liq["min_oi"]
-    _liq_max_spread = _liq["max_spread"]
-    _liq_max_spread_pct = _liq["max_spread_pct"]
 
-    quotes = {}
-    for c in contracts:
-        right = (c.get("right") or "").lower()
-        if right != "put":
-            continue
+    # v4.3: Try strict first, then relaxed if too few strikes pass
+    for pass_name, mult in [("strict", 1.0), ("relaxed", 2.5)]:
+        _liq_min_oi = max(int(_liq["min_oi"] / mult), 1)
+        _liq_max_spread = _liq["max_spread"] * mult
+        _liq_max_spread_pct = min(_liq["max_spread_pct"] * mult, 0.50)
 
-        strike = as_float(c.get("strike"), None)
-        if strike is None or strike <= spot:
-            continue
+        quotes = {}
+        filtered_reasons = {}
+        for c in contracts:
+            right = (c.get("right") or "").lower()
+            if right != "put":
+                continue
 
-        bid = as_float(c.get("bid"), None)
-        ask = as_float(c.get("ask"), None)
-        mid = as_float(c.get("mid"), None)
-        oi  = as_int(c.get("openInterest"), 0)
-        vol = as_int(c.get("volume"), 0)
-        delta = as_float(c.get("delta"), None)
-        iv  = as_float(c.get("iv"), None)
-        theta = as_float(c.get("theta"), None)
-        vega = as_float(c.get("vega"), None)
+            strike = as_float(c.get("strike"), None)
+            if strike is None or strike <= spot:
+                continue
 
-        if mid is None and bid is not None and ask is not None:
-            mid = (bid + ask) / 2.0
-        if mid is None or mid <= 0:
-            continue
+            bid = as_float(c.get("bid"), None)
+            ask = as_float(c.get("ask"), None)
+            mid = as_float(c.get("mid"), None)
+            oi  = as_int(c.get("openInterest"), 0)
+            vol = as_int(c.get("volume"), 0)
+            delta = as_float(c.get("delta"), None)
+            iv  = as_float(c.get("iv"), None)
+            theta = as_float(c.get("theta"), None)
+            vega = as_float(c.get("vega"), None)
 
-        # v4.1: Hard liquidity filter
-        warnings = []
-        spread_abs = (ask - bid) if (bid is not None and ask is not None) else 0
-        spread_pct = spread_abs / mid if mid > 0 else 0
+            if mid is None and bid is not None and ask is not None:
+                mid = (bid + ask) / 2.0
+            if mid is None or mid <= 0:
+                filtered_reasons[strike] = "no mid price"
+                continue
 
-        if oi is not None and oi < _liq_min_oi:
-            continue
-        if spread_abs > _liq_max_spread:
-            continue
-        if spread_pct > _liq_max_spread_pct:
-            continue
+            # Liquidity filters
+            warnings = []
+            spread_abs = (ask - bid) if (bid is not None and ask is not None) else 0
+            spread_pct = spread_abs / mid if mid > 0 else 0
 
-        if oi is not None and oi < _liq_min_oi * 2:
-            warnings.append(f"Marginal OI ({oi})")
-        if spread_pct > _liq_max_spread_pct * 0.7:
-            warnings.append(f"B/A {spread_pct:.0%} of mid")
+            if oi is not None and oi < _liq_min_oi:
+                filtered_reasons[strike] = f"OI {oi} < {_liq_min_oi}"
+                continue
+            if spread_abs > _liq_max_spread:
+                filtered_reasons[strike] = f"spread ${spread_abs:.2f} > ${_liq_max_spread:.2f}"
+                continue
+            if spread_pct > _liq_max_spread_pct:
+                filtered_reasons[strike] = f"spread {spread_pct:.0%} > {_liq_max_spread_pct:.0%}"
+                continue
 
-        quotes[strike] = {
-            "strike": strike,
-            "mid": mid,
-            "bid": bid,
-            "ask": ask,
-            "oi": oi,
-            "volume": vol,
-            "delta": delta,
-            "iv": iv,
-            "theta": theta,
-            "vega": vega,
-            "itm_amount": round(strike - spot, 2),
-            "spread_pct": round(spread_pct, 4),
-            "warnings": warnings,
-        }
+            # Soft warnings
+            if oi is not None and oi < _liq["min_oi"] * 2:
+                warnings.append(f"Marginal OI ({oi})")
+            if spread_pct > _liq["max_spread_pct"] * 0.7:
+                warnings.append(f"B/A {spread_pct:.0%} of mid")
+
+            quotes[strike] = {
+                "strike": strike, "mid": mid, "bid": bid, "ask": ask,
+                "oi": oi, "volume": vol, "delta": delta, "iv": iv,
+                "theta": theta, "vega": vega,
+                "itm_amount": round(strike - spot, 2),
+                "spread_pct": round(spread_pct, 4),
+                "warnings": warnings,
+            }
+
+        if len(quotes) >= 2 or pass_name == "relaxed":
+            if pass_name == "relaxed" and quotes:
+                import logging as _log
+                _log.getLogger(__name__).info(
+                    f"build_put_quotes({ticker}): relaxed pass found {len(quotes)} strikes "
+                    f"(strict found <2). Filters relaxed {mult:.1f}x."
+                )
+            if pass_name == "strict" and len(quotes) < 2 and filtered_reasons:
+                import logging as _log
+                top_filtered = sorted(filtered_reasons.items())[:5]
+                _log.getLogger(__name__).info(
+                    f"build_put_quotes({ticker}): strict pass filtered all ITM puts. "
+                    f"Top filtered: {', '.join(f'${k:.0f}:{v}' for k,v in top_filtered)}"
+                )
+            return quotes
 
     return quotes
 
