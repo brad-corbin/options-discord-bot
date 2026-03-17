@@ -74,6 +74,7 @@ from engine_bridge import (
 from options_exposure import SCHEMA_VERSION
 from oi_cache import OICache
 from api_cache import CachedMarketData
+from institutional_flow import compute_cagf, recommend_dte, format_cagf_block, format_dte_block
 from em_reconciler import (
     reconcile_em_predictions,
     compute_accuracy_stats,
@@ -2085,6 +2086,56 @@ def _post_em_card(ticker: str, session: str):
             if ts_line:
                 lines.append(f"  🔍 {ts_line}")
 
+        # ══════ INSTITUTIONAL FLOW MODEL (CAGF) — SPY/QQQ ══════
+        cagf = None
+        dte_rec = None
+        if eng and ticker.upper() in ("SPY", "QQQ", "SPX"):
+            # Compute CAGF from dealer flows
+            import pytz as _pytz
+            _ct = _pytz.timezone("America/Chicago")
+            _now_ct = datetime.now(_ct)
+            _mkt_open = _now_ct.replace(hour=8, minute=30, second=0, microsecond=0)
+            _mkt_close = _now_ct.replace(hour=15, minute=0, second=0, microsecond=0)
+            _session_secs = (_mkt_close - _mkt_open).total_seconds()
+            _elapsed = max(0, (_now_ct - _mkt_open).total_seconds())
+            _sess_progress = min(1.0, _elapsed / _session_secs) if _session_secs > 0 else 0.5
+
+            # Get RV from v4 result
+            _rv = 0
+            if v4_result and v4_result.get("vol_regime"):
+                _rv = v4_result["vol_regime"].get("realized_vol_20d", 0) or 0
+
+            _vix_val = vix.get("vix", 20) if vix else 20
+
+            cagf = compute_cagf(
+                dealer_flows={
+                    "gex": eng.get("gex", 0),
+                    "dex": eng.get("dex", 0),
+                    "vanna": eng.get("vanna", 0),
+                    "charm": eng.get("charm", 0),
+                    "gamma_flip": eng.get("flip_price"),
+                },
+                iv=iv,
+                rv=_rv,
+                spot=spot,
+                vix=_vix_val,
+                session_progress=_sess_progress,
+            )
+            lines += format_cagf_block(cagf)
+
+            # DTE recommendation
+            dte_rec = recommend_dte(
+                cagf=cagf,
+                iv=iv,
+                vix=_vix_val,
+                session_progress=_sess_progress,
+            )
+            lines += format_dte_block(dte_rec)
+
+            log.info(f"CAGF {ticker}: edge={cagf['edge']:+.2f} dir={cagf['direction']} "
+                     f"trend={cagf['trend_day_probability']:.0%} regime={cagf['regime']} "
+                     f"dte_rec={dte_rec['primary']['label']}")
+
         # ══════ KEY LEVELS ══════
         if walls:
             lines += ["", "─" * 32, "🧱 KEY LEVELS"]
@@ -2146,6 +2197,7 @@ def _post_em_card(ticker: str, session: str):
             ticker=ticker, spot=spot, expiration=expiration,
             eng=eng or {}, walls=walls or {}, bias=bias, em=em,
             vix=vix or {}, pcr=pcr or {}, is_0dte=True, v4_result=v4_result,
+            cagf=cagf, dte_rec=dte_rec,
         )
 
     except Exception as e:
@@ -2158,10 +2210,10 @@ def _post_em_card(ticker: str, session: str):
 # ─────────────────────────────────────────────────────────────────────
 
 def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
-                     is_0dte=True, v4_result=None):
+                     is_0dte=True, v4_result=None, cagf=None, dte_rec=None):
     """
-    0DTE trade recommendation card — v4.
-    Same logic as original, plus confidence gate from v4 engine.
+    0DTE trade recommendation card — v4.1.
+    Now includes CAGF institutional flow model and DTE recommendation.
     """
     try:
         direction = bias.get("direction", "NEUTRAL")
@@ -2283,6 +2335,26 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
 
         lines += [
             "━" * 32, "", f"⚙️ REGIME: {gex_note}", "",
+        ]
+
+        # ── CAGF Institutional Edge (SPY/QQQ) ──
+        if cagf and cagf.get("regime") != "UNKNOWN":
+            edge_emoji = "🟢" if cagf["edge"] > 0.15 else "🔴" if cagf["edge"] < -0.15 else "⚪"
+            lines.append(f"🏛️ FLOW EDGE: {edge_emoji} {cagf['direction']}  (edge {cagf['edge']:+.2f})")
+            lines.append(f"  Trend Day: {cagf['trend_day_probability']:.0%}  |  Vol: {cagf['vol_emoji']} {cagf['vol_label']}")
+
+        # ── DTE Recommendation ──
+        if dte_rec and dte_rec.get("primary"):
+            p = dte_rec["primary"]
+            lines.append(f"📆 DTE: {p['emoji']} {p['label']} recommended  (score {p['score']})")
+            if p.get("reasoning"):
+                lines.append(f"  {p['reasoning']}")
+            avoid_list = dte_rec.get("avoid", [])
+            if avoid_list:
+                lines.append(f"  ❌ {avoid_list[0]}")
+
+        lines += [
+            "",
             f"📋 SETUP: ITM {spread_type}",
             f"  Buy:   {ticker} {long_label}", f"  Sell:  {ticker} {short_label}",
             f"  Width: ${actual_width:.0f}  |  Est. cost: ~${cost_est:.2f}/contract",
