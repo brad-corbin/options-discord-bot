@@ -605,32 +605,7 @@ def _process_job(worker_id: int, job: dict):
         log.warning(f"[worker-{worker_id}] Stale {job_type} signal dropped: {ticker} ({age_sec:.0f}s)")
         return
 
-    # v4.3: Wait for prefetch cache to have this ticker's data
-    # If a prefetch wave is in progress, poll for our ticker rather than hitting APIs
-    cached = _prefetch_get(ticker)
-    if not cached and _prefetch_thread_active:
-        log.info(f"[worker-{worker_id}] Waiting for prefetch: {ticker} {bias}")
-        wait_start = time.time()
-        while (time.time() - wait_start) < PREFETCH_WORKER_WAIT_SEC:
-            time.sleep(2)
-            cached = _prefetch_get(ticker)
-            if cached:
-                log.info(f"[worker-{worker_id}] Prefetch ready for {ticker} ({time.time()-wait_start:.0f}s wait)")
-                break
-            if not _prefetch_thread_active:
-                # Prefetch finished but our ticker wasn't in it — proceed with live fetch
-                log.info(f"[worker-{worker_id}] Prefetch done, {ticker} not cached — live fetch")
-                break
-        else:
-            log.warning(f"[worker-{worker_id}] Prefetch wait timed out for {ticker} — live fetch")
-
-    age_sec = time.time() - enqueued_at  # re-check after waiting
-    if age_sec > SIGNAL_TTL_SEC:
-        log.warning(f"[worker-{worker_id}] Signal aged out during prefetch wait: {ticker} ({age_sec:.0f}s)")
-        return
-
-    log.info(f"[worker-{worker_id}] Processing {job_type}: {ticker} {bias} T{tier_label} ({age_sec:.0f}s ago)"
-             f"{' [cached]' if _prefetch_get(ticker) else ''}")
+    log.info(f"[worker-{worker_id}] Processing {job_type}: {ticker} {bias} T{tier_label} ({age_sec:.0f}s ago)")
 
     base = {
         "job_type": job_type, "ticker": ticker, "bias": bias,
@@ -1370,8 +1345,23 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
     webhook_data = webhook_data or {"bias": direction, "tier": "2"}
 
     try:
-        # v4.3: Check prefetch cache first — avoids redundant API calls during wave processing
+        # v4.3: Smart prefetch-aware data loading
+        # If a prefetch wave is in progress, wait for this ticker's data
+        # rather than hitting APIs independently and causing rate limit cascades
         cached = _prefetch_get(ticker)
+        if not cached and _prefetch_thread_active:
+            wait_start = time.time()
+            while (time.time() - wait_start) < 60:  # wait up to 60s for prefetch
+                time.sleep(2)
+                cached = _prefetch_get(ticker)
+                if cached:
+                    log.info(f"check_ticker({ticker}): prefetch ready ({time.time()-wait_start:.0f}s wait)")
+                    break
+                if not _prefetch_thread_active:
+                    break
+            if not cached:
+                log.info(f"check_ticker({ticker}): prefetch wait expired — live fetch")
+
         if cached and cached.get("spot") and cached.get("chains"):
             spot = cached["spot"]
             chains = cached["chains"]
@@ -1385,7 +1375,10 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
         else:
             # No cache — fetch live (normal /check path or cache miss)
             spot = get_spot(ticker); chains = get_options_chain(ticker)
-            enrichment = enrich_ticker(ticker)
+            try:
+                enrichment = enrich_ticker(ticker)
+            except Exception:
+                enrichment = {"has_earnings": False, "earnings_warn": None}
             has_earnings = enrichment.get("has_earnings", False)
             earnings_warn = enrichment.get("earnings_warn")
             candle_closes = get_daily_candles(ticker, days=RV_LOOKBACK_DAYS + 5)
