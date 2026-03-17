@@ -75,6 +75,12 @@ from options_exposure import SCHEMA_VERSION
 from oi_cache import OICache
 from api_cache import CachedMarketData
 from institutional_flow import compute_cagf, recommend_dte, format_cagf_block, format_dte_block
+from card_formatters import (
+    format_plain_english_card,
+    format_decision_card,
+    resolve_unified_regime,
+    regime_gate,
+)
 from em_reconciler import (
     reconcile_em_predictions,
     compute_accuracy_stats,
@@ -2116,12 +2122,17 @@ def _post_em_card(ticker: str, session: str):
             f"Session: {horizon_note}",
         ]
 
-        # ── v4: Confidence + downgrades ──
+        # ── v4.3: Confidence (single line, no duplicate) ──
         if v4_result:
-            lines.append(format_confidence_header(v4_result))
+            conf = v4_result.get("confidence", {})
             dg = v4_result.get("downgrades", [])
+            conf_label_str = conf.get("label", "?")
+            conf_score = conf.get("composite", 0)
+            conf_line = f"Confidence: {conf_label_str} ({conf_score:.0%})"
             if dg:
-                lines.append("⚠ " + "; ".join(d.split(":")[0] for d in dg[:3]))
+                short_dg = [d.split(":")[0] for d in dg[:2]]
+                conf_line += " | Data note: " + ", ".join(short_dg)
+            lines.append(conf_line)
 
         if vix and vix.get("vix"):
             v = vix["vix"]; v9d = vix.get("vix9d"); term = vix.get("term", "")
@@ -2267,7 +2278,7 @@ def _post_em_card(ticker: str, session: str):
         na_count = bias.get("na_count", 0)
         dot_bar = ("▲" * bias["up_count"]) + ("▼" * bias["down_count"]) + ("◆" * bias["neu_count"]) + ("—" * na_count)
 
-        lines += ["", "═" * 32, f"{dir_emoji}  LEAN: {bias['direction']}{strength_str}",
+        lines += ["", "═" * 32, f"{dir_emoji}  BIAS MODEL: {bias['direction']}{strength_str}",
             f"Score: {score_str}  |  {dot_bar}",
             f"  ▲ {bias['up_count']} bullish  ·  ▼ {bias['down_count']} bearish  ·  ◆ {bias['neu_count']} neutral" + (f"  ·  — {na_count} n/a" if na_count else ""),
             "", f"📋 {bias['verdict']}", "", "── Signal Breakdown ({}/14) ──".format(bias['n_signals'])]
@@ -2283,6 +2294,33 @@ def _post_em_card(ticker: str, session: str):
         # ── EM accuracy logger: save prediction for backtest ──
         _log_em_prediction(ticker, session, spot, em, bias, v4_result)
 
+        # ── v4.3: Resolve unified regime for trade card + plain cards ──
+        unified_regime = resolve_unified_regime(eng or {}, cagf, spot)
+
+        # ── v4.3: Post plain English card ──
+        try:
+            plain_card = format_plain_english_card(
+                ticker=ticker, spot=spot, iv=iv, em=em, bias=bias,
+                eng=eng or {}, regime=unified_regime, cagf=cagf,
+                dte_rec=dte_rec, pcr=pcr, v4_result=v4_result,
+                session_label=session_label, target_date=target_date_str,
+                is_next_day=is_afternoon,
+            )
+            post_to_telegram(plain_card)
+        except Exception as e:
+            log.warning(f"Plain English card failed for {ticker}: {e}")
+
+        # ── v4.3: Post 6-line decision card ──
+        try:
+            decision_card = format_decision_card(
+                ticker=ticker, spot=spot, em=em, bias=bias,
+                eng=eng or {}, regime=unified_regime, cagf=cagf,
+                dte_rec=dte_rec, v4_result=v4_result,
+            )
+            post_to_telegram(decision_card)
+        except Exception as e:
+            log.warning(f"Decision card failed for {ticker}: {e}")
+
         # ── Compute session progress for trade card timing gates ──
         _mkt_open_ct = now_ct.replace(hour=8, minute=30, second=0, microsecond=0)
         _mkt_close_ct = now_ct.replace(hour=15, minute=0, second=0, microsecond=0)
@@ -2296,7 +2334,7 @@ def _post_em_card(ticker: str, session: str):
             vix=vix or {}, pcr=pcr or {}, is_0dte=(not is_afternoon), v4_result=v4_result,
             cagf=cagf, dte_rec=dte_rec,
             now_ct=now_ct, session_progress=_sess_progress,
-            is_next_day=is_afternoon,
+            is_next_day=is_afternoon, unified_regime=unified_regime,
         )
 
     except Exception as e:
@@ -2310,7 +2348,8 @@ def _post_em_card(ticker: str, session: str):
 
 def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
                      is_0dte=True, v4_result=None, cagf=None, dte_rec=None,
-                     now_ct=None, session_progress=None, is_next_day=False):
+                     now_ct=None, session_progress=None, is_next_day=False,
+                     unified_regime=None):
     """
     Trade recommendation card — v4.2.
     CAGF-integrated: respects DTE recommendation, session timing, and EM-aware strike placement.
@@ -2463,7 +2502,20 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
             no_trade(f"GEX positive (+${tgex:.1f}M), score only {score:+d}/14 — not enough edge.", "🧲")
             return
 
-        # G6 — CAGF direction conflict (v4.2)
+        # ── v4.3: Resolve unified regime if not passed from caller ──
+        if unified_regime is None:
+            unified_regime = resolve_unified_regime(eng, cagf, spot)
+
+        # G6 — v4.3 REGIME GATE: strategy must fit the environment
+        gate_ok, gate_reason = regime_gate(
+            regime=unified_regime, bias=bias, cagf=cagf,
+            v4_result=v4_result, dte_rec=dte_rec,
+        )
+        if not gate_ok:
+            no_trade(f"Regime gate: {gate_reason}", "🚫")
+            return
+
+        # G7 — CAGF direction conflict (v4.2)
         # If CAGF has strong directional signal opposing the bias, flag it
         cagf_conflict = False
         cagf_conflict_note = ""
@@ -2583,12 +2635,21 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
             timing_warn = "Exit by 2:45 PM CT." if charm_tail else "⚠️ EXIT by noon CT."
             entry_cutoff = "⚠️ No new entries after 2:30 PM CT"
         else:
-            # Multi-day trades have different timing
-            timing_note = "Charm tailwind — favorable into close." if charm_tail else "Charm headwind — consider early entry."
+            # Multi-day trades: context-appropriate charm language
+            if is_next_day:
+                timing_note = ("Charm supportive — time decay favors upside drift during sessions."
+                               if charm_tail else
+                               "Charm headwind — time decay adds selling pressure during sessions.")
+            else:
+                timing_note = ("Charm tailwind — favorable into close."
+                               if charm_tail else
+                               "Charm headwind — consider early entry.")
             timing_warn = f"Target hold: {effective_dte} trading day{'s' if effective_dte > 1 else ''}."
             entry_cutoff = "📌 Enter at/near open for best fill" if is_next_day else "⚠️ No new entries after 2:30 PM CT"
 
         gex_note = f"⚡ Negative GEX (-${abs(tgex):.1f}M) — debit spreads confirmed." if neg_gex else f"🧲 Positive GEX (+${tgex:.1f}M) — width tightened."
+        regime_label = unified_regime.get("label", "UNKNOWN") if unified_regime else "UNKNOWN"
+        regime_desc = unified_regime.get("description", "") if unified_regime else ""
 
         dir_emoji = {"STRONG BULLISH": "🟢🟢", "BULLISH": "🟢", "SLIGHT BULLISH": "🟡",
                      "SLIGHT BEARISH": "🟠", "BEARISH": "🔴", "STRONG BEARISH": "🔴🔴"}.get(direction, "⚪")
@@ -2596,7 +2657,7 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
         lines = [
             f"🎯 {ticker} — {card_title}",
             f"Generated: {time_str}  |  Exp: {exp_short}",
-            f"Lean: {dir_emoji} {direction}  [Score: {score:+d}/14]",
+            f"Bias model: {dir_emoji} {direction}  [Score: {score:+d}/14]",
         ]
 
         # ── v4: Confidence line ──
@@ -2608,7 +2669,11 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
             lines.append(f"📆 DTE: {effective_dte_label} (reason: {dte_upgrade_reason})")
 
         lines += [
-            "━" * 32, "", f"⚙️ REGIME: {gex_note}", "",
+            "━" * 32, "",
+            f"⚙️ REGIME: {regime_label} ({unified_regime.get('source', 'unknown')})",
+            f"  {regime_desc}",
+            f"  GEX: {'negative' if neg_gex else 'positive'} ({tgex:+.1f}M)",
+            "",
         ]
 
         # ── CAGF Institutional Edge (SPY/QQQ) ──
@@ -2673,7 +2738,22 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
                  f"{spread_type} {long_label}/{short_label} | "
                  f"width=${actual_width} (EM 1σ=${em_1sd:.2f}) | "
                  f"size={size_pct}% | dte_upgraded={dte_was_upgraded} | "
+                 f"regime={unified_regime.get('label', '?') if unified_regime else '?'} | "
                  f"conf={v4_result.get('confidence', {}).get('label', '?') if v4_result else 'N/A'}")
+
+        # ── v4.3: Post decision card with trade details ──
+        try:
+            dc = format_decision_card(
+                ticker=ticker, spot=spot, em=em, bias=bias,
+                eng=eng, regime=unified_regime or {},
+                cagf=cagf, dte_rec=dte_rec, v4_result=v4_result,
+                spread_type=spread_type, long_label=long_label,
+                short_label=short_label, stop_level=stop_level,
+                effective_dte_label=effective_dte_label, size_pct=size_pct,
+            )
+            post_to_telegram(dc)
+        except Exception as e:
+            log.warning(f"Decision card failed for {ticker}: {e}")
 
     except Exception as e:
         log.error(f"Trade card error for {ticker}: {e}", exc_info=True)
