@@ -1255,6 +1255,14 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
             outcome="trade_opened" if risk_result["allowed"] else "risk_blocked",
             confidence=best_rec.get("confidence"))
 
+        # v4.3: Cache card for /tradecard retrieval (same as wave digest path)
+        try:
+            cache_key = f"tradecard:{ticker.upper()}"
+            store_set(cache_key, card, ttl=DIGEST_CARD_CACHE_TTL_SEC)
+            log.debug(f"Trade card cached: {cache_key}")
+        except Exception:
+            pass  # non-critical
+
         return {
             "ticker": ticker, "ok": True, "posted": True, "card": card,
             "confidence": best_rec.get("confidence"), "trade": trade,
