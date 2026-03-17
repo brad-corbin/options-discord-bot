@@ -2310,16 +2310,8 @@ def _post_em_card(ticker: str, session: str):
         except Exception as e:
             log.warning(f"Plain English card failed for {ticker}: {e}")
 
-        # ── v4.3: Post 6-line decision card ──
-        try:
-            decision_card = format_decision_card(
-                ticker=ticker, spot=spot, em=em, bias=bias,
-                eng=eng or {}, regime=unified_regime, cagf=cagf,
-                dte_rec=dte_rec, v4_result=v4_result,
-            )
-            post_to_telegram(decision_card)
-        except Exception as e:
-            log.warning(f"Decision card failed for {ticker}: {e}")
+        # NOTE: Decision card is posted by _post_trade_card (with trade details)
+        # rather than here, to avoid a duplicate without execution info.
 
         # ── Compute session progress for trade card timing gates ──
         _mkt_open_ct = now_ct.replace(hour=8, minute=30, second=0, microsecond=0)
