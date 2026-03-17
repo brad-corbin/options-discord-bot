@@ -18,6 +18,17 @@
 import math
 from typing import Any, Dict, List, Optional, Tuple
 from trading_rules import *
+# v4.1 imports for hard liquidity, ranking, slippage, journal feedback
+from trading_rules import (
+    get_liquidity_thresholds,
+    SLIPPAGE_SPREAD_FACTOR, SLIPPAGE_MIN_EV_AFTER,
+    RANK_WEIGHT_EV, RANK_WEIGHT_WIN_PROB, RANK_WEIGHT_LIQUIDITY,
+    RANK_WEIGHT_IV_EDGE, RANK_WEIGHT_EM_DISTANCE, RANK_WEIGHT_WIDTH_EFF,
+    RANK_MIN_SCORE, MAX_SPREAD_PCT_OF_MID,
+    JOURNAL_FEEDBACK_ENABLED, JOURNAL_MIN_TRADES_FOR_STATS,
+    JOURNAL_SUPPRESS_WIN_RATE, JOURNAL_REDUCE_WIN_RATE,
+    JOURNAL_REDUCE_SIZE_MULT, JOURNAL_LOOKBACK_SIGNALS,
+)
 
 
 # ─────────────────────────────────────────────────────────
@@ -176,8 +187,14 @@ def get_avg_chain_iv(contracts: List[Dict], spot: float) -> float:
 # CHAIN DATA BUILDERS
 # ─────────────────────────────────────────────────────────
 
-def build_call_quotes(contracts: List[Dict], spot: float) -> Dict[float, Dict]:
-    """ITM calls: strikes BELOW spot."""
+def build_call_quotes(contracts: List[Dict], spot: float, ticker: str = "") -> Dict[float, Dict]:
+    """ITM calls: strikes BELOW spot. v4.1: hard liquidity filters."""
+    # v4.1: Get tier-appropriate liquidity thresholds
+    _liq = get_liquidity_thresholds(ticker)
+    _liq_min_oi = _liq["min_oi"]
+    _liq_max_spread = _liq["max_spread"]
+    _liq_max_spread_pct = _liq["max_spread_pct"]
+
     quotes = {}
     for c in contracts:
         right = (c.get("right") or "").lower()
@@ -203,11 +220,23 @@ def build_call_quotes(contracts: List[Dict], spot: float) -> Dict[float, Dict]:
         if mid is None or mid <= 0:
             continue
 
+        # v4.1: Hard liquidity filter — BLOCKING, not just warnings
         warnings = []
-        if oi is not None and oi < MIN_OPEN_INTEREST:
-            warnings.append(f"Low OI ({oi})")
-        if bid is not None and ask is not None and (ask - bid) > MAX_BID_ASK_SPREAD:
-            warnings.append(f"Wide B/A (${ask - bid:.2f})")
+        spread_abs = (ask - bid) if (bid is not None and ask is not None) else 0
+        spread_pct = spread_abs / mid if mid > 0 else 0
+
+        if oi is not None and oi < _liq_min_oi:
+            continue  # HARD BLOCK: insufficient open interest
+        if spread_abs > _liq_max_spread:
+            continue  # HARD BLOCK: absolute spread too wide
+        if spread_pct > _liq_max_spread_pct:
+            continue  # HARD BLOCK: relative spread too wide
+
+        # Soft warnings for marginal liquidity (still passed, just flagged)
+        if oi is not None and oi < _liq_min_oi * 2:
+            warnings.append(f"Marginal OI ({oi})")
+        if spread_pct > _liq_max_spread_pct * 0.7:
+            warnings.append(f"B/A {spread_pct:.0%} of mid")
 
         quotes[strike] = {
             "strike": strike,
@@ -221,14 +250,20 @@ def build_call_quotes(contracts: List[Dict], spot: float) -> Dict[float, Dict]:
             "theta": theta,
             "vega": vega,
             "itm_amount": round(spot - strike, 2),
+            "spread_pct": round(spread_pct, 4),
             "warnings": warnings,
         }
 
     return quotes
 
 
-def build_put_quotes(contracts: List[Dict], spot: float) -> Dict[float, Dict]:
-    """ITM puts: strikes ABOVE spot."""
+def build_put_quotes(contracts: List[Dict], spot: float, ticker: str = "") -> Dict[float, Dict]:
+    """ITM puts: strikes ABOVE spot. v4.1: hard liquidity filters."""
+    _liq = get_liquidity_thresholds(ticker)
+    _liq_min_oi = _liq["min_oi"]
+    _liq_max_spread = _liq["max_spread"]
+    _liq_max_spread_pct = _liq["max_spread_pct"]
+
     quotes = {}
     for c in contracts:
         right = (c.get("right") or "").lower()
@@ -254,11 +289,22 @@ def build_put_quotes(contracts: List[Dict], spot: float) -> Dict[float, Dict]:
         if mid is None or mid <= 0:
             continue
 
+        # v4.1: Hard liquidity filter
         warnings = []
-        if oi is not None and oi < MIN_OPEN_INTEREST:
-            warnings.append(f"Low OI ({oi})")
-        if bid is not None and ask is not None and (ask - bid) > MAX_BID_ASK_SPREAD:
-            warnings.append(f"Wide B/A (${ask - bid:.2f})")
+        spread_abs = (ask - bid) if (bid is not None and ask is not None) else 0
+        spread_pct = spread_abs / mid if mid > 0 else 0
+
+        if oi is not None and oi < _liq_min_oi:
+            continue
+        if spread_abs > _liq_max_spread:
+            continue
+        if spread_pct > _liq_max_spread_pct:
+            continue
+
+        if oi is not None and oi < _liq_min_oi * 2:
+            warnings.append(f"Marginal OI ({oi})")
+        if spread_pct > _liq_max_spread_pct * 0.7:
+            warnings.append(f"B/A {spread_pct:.0%} of mid")
 
         quotes[strike] = {
             "strike": strike,
@@ -272,6 +318,7 @@ def build_put_quotes(contracts: List[Dict], spot: float) -> Dict[float, Dict]:
             "theta": theta,
             "vega": vega,
             "itm_amount": round(strike - spot, 2),
+            "spread_pct": round(spread_pct, 4),
             "warnings": warnings,
         }
 
@@ -494,35 +541,100 @@ def build_itm_bear_put_spreads(
 # RANKING
 # ─────────────────────────────────────────────────────────
 
-def rank_candidates(candidates: List[Dict]) -> List[Dict]:
+def rank_candidates(candidates: List[Dict], iv_edge_label: str = "NEUTRAL") -> List[Dict]:
     """
-    Rank by Expected Value (primary) + width bonus + EM zone bonus.
+    v4.1: Composite scoring model.
+    Generates a normalized 0-1 score for each candidate using weighted factors:
+      EV (30%) + Win Prob (25%) + Liquidity (20%) + IV Edge (10%)
+      + EM Distance (10%) + Width Efficiency (5%)
+
+    Candidates below RANK_MIN_SCORE are filtered out.
+    Also applies slippage model: rejects if EV_after_slippage <= 0.
     """
-    def score(c):
-        ev = c.get("expected_value", 0)
-        ror = c.get("ror", 0)
-        width = c.get("width", 5)
+    if not candidates:
+        return []
+
+    # Compute raw values for normalization
+    evs = [c.get("expected_value", 0) for c in candidates]
+    ev_max = max(abs(e) for e in evs) if evs else 1.0
+    ev_max = max(ev_max, 0.01)
+
+    scored = []
+    for c in candidates:
+        # ── Slippage model ──
+        spread_pct_avg = 0
+        long_spread = c.get("long_spread_pct", 0) or 0
+        short_spread = c.get("short_spread_pct", 0) or 0
+        if long_spread or short_spread:
+            spread_pct_avg = (long_spread + short_spread) / 2
+        # Estimate slippage from bid-ask spread
+        debit = c.get("debit", 0)
+        warnings = c.get("warnings", [])
+        est_slippage = debit * SLIPPAGE_SPREAD_FACTOR * spread_pct_avg if spread_pct_avg > 0 else 0.01
+        ev_raw = c.get("expected_value", 0)
+        ev_after_slippage = ev_raw - est_slippage
+        c["ev_after_slippage"] = round(ev_after_slippage, 4)
+        c["est_slippage"] = round(est_slippage, 4)
+
+        if ev_after_slippage <= SLIPPAGE_MIN_EV_AFTER and ev_raw > 0:
+            c["_rejected"] = "slippage"
+            continue
+
+        # ── Factor scores (each 0-1) ──
+        # EV
+        ev_score = max(0, (ev_raw / ev_max + 1) / 2)  # normalize to 0-1
+
+        # Win probability
+        wp = c.get("win_prob", 0.5)
+        wp_score = min(wp, 1.0)
+
+        # Liquidity (fewer warnings = better, OI matters)
+        warn_count = len(warnings)
+        liq_score = max(0, 1.0 - warn_count * 0.25)
+        long_oi = c.get("long_oi", 0) or 0
+        short_oi = c.get("short_oi", 0) or 0
+        avg_oi = (long_oi + short_oi) / 2
+        if avg_oi >= 5000:
+            liq_score = min(1.0, liq_score + 0.2)
+        elif avg_oi >= 2000:
+            liq_score = min(1.0, liq_score + 0.1)
+
+        # IV edge
+        iv_score = 0.5  # neutral
+        if iv_edge_label == "BUYER":
+            iv_score = 0.85
+        elif iv_edge_label == "SELLER":
+            iv_score = 0.15
+
+        # EM distance
         em_zone = c.get("em_zone", "unknown")
-
-        width_bonus = 0.3 if width <= 1.0 else 0.1 if width <= 2.5 else 0
-
-        em_bonus = 0
         em_prox = c.get("em_proximity")
         if em_zone == "inside" and em_prox is not None:
-            if em_prox <= 2.0:
-                em_bonus = 0.4
-            elif em_prox <= 5.0:
-                em_bonus = 0.2
-            else:
-                em_bonus = 0.05
+            em_score = min(1.0, 0.6 + 0.4 * max(0, 1 - em_prox / 5.0))
         elif em_zone == "outside":
-            em_bonus = -0.2
+            em_score = 0.2
+        else:
+            em_score = 0.4
 
-        warn_penalty = len(c.get("warnings", [])) * 0.1
+        # Width efficiency
+        width = c.get("width", 5)
+        width_score = 0.9 if width <= 1.0 else 0.7 if width <= 2.5 else 0.4
 
-        return ev + ror * 0.3 + width_bonus + em_bonus - warn_penalty
+        # ── Composite ──
+        composite = (
+            ev_score * RANK_WEIGHT_EV +
+            wp_score * RANK_WEIGHT_WIN_PROB +
+            liq_score * RANK_WEIGHT_LIQUIDITY +
+            iv_score * RANK_WEIGHT_IV_EDGE +
+            em_score * RANK_WEIGHT_EM_DISTANCE +
+            width_score * RANK_WEIGHT_WIDTH_EFF
+        )
+        c["rank_score"] = round(composite, 4)
 
-    return sorted(candidates, key=score, reverse=True)
+        if composite >= RANK_MIN_SCORE:
+            scored.append(c)
+
+    return sorted(scored, key=lambda c: c.get("rank_score", 0), reverse=True)
 
 
 # ─────────────────────────────────────────────────────────
@@ -924,7 +1036,7 @@ def recommend_trade(
 
     # ── Route by direction ──
     if bias == "bear":
-        quotes = build_put_quotes(contracts, spot)
+        quotes = build_put_quotes(contracts, spot, ticker=ticker)
         if len(quotes) < 2:
             result["reason"] = f"Not enough ITM put strikes (need 2, found {len(quotes)})"
             return result
@@ -939,7 +1051,7 @@ def recommend_trade(
         spread_side = "put"
         spread_label = "BEAR PUT"
     else:
-        quotes = build_call_quotes(contracts, spot)
+        quotes = build_call_quotes(contracts, spot, ticker=ticker)
         if len(quotes) < 2:
             result["reason"] = f"Not enough ITM call strikes (need 2, found {len(quotes)})"
             return result
@@ -963,7 +1075,7 @@ def recommend_trade(
         return result
 
     # ── Rank and pick best ──
-    ranked = rank_candidates(candidates)
+    ranked = rank_candidates(candidates, iv_edge_label=vol_edge.get("edge_label", "NEUTRAL") if vol_edge else "NEUTRAL")
     best = ranked[0]
 
     # ── Width ladder ──
@@ -1240,3 +1352,53 @@ def format_trade_card(rec: Dict) -> str:
     # Footer — always last
     lines.append("— Not financial advice —")
     return "\n".join(lines)
+
+
+
+# ═══════════════════════════════════════════════════════════
+# JOURNAL FEEDBACK LOOP (v4.1)
+# Queries trade journal for ticker win rate and adjusts sizing.
+# ═══════════════════════════════════════════════════════════
+
+def get_journal_adjustment(ticker: str, store_get_fn=None) -> dict:
+    """
+    Check trade journal stats for this ticker.
+    Returns dict with:
+      - allowed: bool (False = suppress this ticker entirely)
+      - size_mult: float (1.0 = normal, 0.5 = reduced)
+      - reason: str (explanation)
+    """
+    if not JOURNAL_FEEDBACK_ENABLED or store_get_fn is None:
+        return {"allowed": True, "size_mult": 1.0, "reason": ""}
+
+    try:
+        import json
+        # Try to load journal stats from store
+        key = f"journal_stats:{ticker.upper()}"
+        raw = store_get_fn(key)
+        if raw is None:
+            return {"allowed": True, "size_mult": 1.0, "reason": ""}
+
+        stats = json.loads(raw)
+        total = stats.get("total", 0)
+        wins = stats.get("wins", 0)
+
+        if total < JOURNAL_MIN_TRADES_FOR_STATS:
+            return {"allowed": True, "size_mult": 1.0,
+                    "reason": f"Insufficient data ({total}/{JOURNAL_MIN_TRADES_FOR_STATS} trades)"}
+
+        win_rate = wins / total if total > 0 else 0
+
+        if win_rate < JOURNAL_SUPPRESS_WIN_RATE:
+            return {"allowed": False, "size_mult": 0.0,
+                    "reason": f"SUPPRESSED: {ticker} win rate {win_rate:.0%} < {JOURNAL_SUPPRESS_WIN_RATE:.0%} over {total} trades"}
+
+        if win_rate < JOURNAL_REDUCE_WIN_RATE:
+            return {"allowed": True, "size_mult": JOURNAL_REDUCE_SIZE_MULT,
+                    "reason": f"Size reduced: {ticker} win rate {win_rate:.0%} < {JOURNAL_REDUCE_WIN_RATE:.0%} over {total} trades"}
+
+        return {"allowed": True, "size_mult": 1.0,
+                "reason": f"{ticker} win rate {win_rate:.0%} over {total} trades"}
+
+    except Exception:
+        return {"allowed": True, "size_mult": 1.0, "reason": ""}
