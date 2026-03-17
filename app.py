@@ -2065,13 +2065,24 @@ def _post_em_card(ticker: str, session: str):
         ct = pytz.timezone("America/Chicago"); now_ct = datetime.now(ct); today_dt = now_ct.date()
         is_afternoon = (session == "afternoon")
 
+        # v4.2: Auto-detect after-hours — if market is closed and session
+        # is not explicitly "afternoon", switch to next-day preview mode.
+        # Market hours: 8:30 AM – 3:00 PM CT
+        market_open_ct = now_ct.replace(hour=8, minute=30, second=0, microsecond=0)
+        market_close_ct = now_ct.replace(hour=15, minute=0, second=0, microsecond=0)
+        is_market_closed = now_ct > market_close_ct or now_ct < market_open_ct
+
+        if not is_afternoon and is_market_closed:
+            log.info(f"EM card: {session} session at {now_ct.strftime('%I:%M %p CT')} — "
+                     f"market closed, auto-switching to next-day preview")
+            is_afternoon = True  # treat as afternoon/next-day
+
         if is_afternoon:
             target_date_str = _get_next_trading_day(today_dt)
             hours_for_em = 6.5; session_emoji = "🌆"; session_label = "Next Day Preview"
             horizon_note = f"Full session EM for {target_date_str}"
         else:
             target_date_str = today_dt.strftime("%Y-%m-%d")
-            market_close_ct = now_ct.replace(hour=15, minute=0, second=0, microsecond=0)
             hours_for_em = max((market_close_ct - now_ct).total_seconds() / 3600, 0.25)
             session_emoji = "🌅"; session_label = "Today (Pre-Open)"
             horizon_note = f"{hours_for_em:.1f}h remaining today"
