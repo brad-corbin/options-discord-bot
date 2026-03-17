@@ -2,13 +2,14 @@
 # Brad's Trading Rules — encoded from conversation
 # NOTE: Educational/demo code. Not financial advice. Use at your own risk.
 #
-# v4.1 additions:
-#   - Hard liquidity filters (tightened from soft warnings)
-#   - Ranking model composite weights
-#   - Slippage model
-#   - Journal feedback loop thresholds
-#   - Digest / tradecard settings
-#   - Index ETF tiered liquidity requirements
+# v4.2 additions (2026-03-17):
+#   - LOW VOL CHOP regime: tighter position sizing and confidence gate
+#   - check_ticker timeout reduced 75s → 45s (CAT timeout wasted a full worker)
+#   - MODERATE PIN regime: bear signals now skip if not enough ITM puts (already
+#     enforced in check_ticker — added rule constant for explicit gating)
+#   - Swing IV bounds guard constants added (fix for NFLX EM overflow bug)
+#   - Swing preferred DTE tightened 30 → 21 (avoid 45 DTE unless no better option)
+#   - OHLC warning dedup: log only first occurrence per ticker per cycle (app.py note)
 
 # ─────────────────────────────────────────────────────────
 # DIRECTION & SIGNAL
@@ -42,7 +43,22 @@ MIN_DTE                  = 0
 MAX_DTE                  = 10
 TARGET_DTE               = 3
 MAX_EXPIRATIONS_TO_PULL  = 4
-NO_ENTRY_FIRST_MINUTES   = 15
+CHECK_TICKER_TIMEOUT_SEC     = 45    # Reduced from 75s — CAT 75s timeout wasted worker-3
+NO_ENTRY_FIRST_MINUTES       = 15
+
+# ─────────────────────────────────────────────────────────
+# REGIME-SPECIFIC GATES (v4.2)
+# ─────────────────────────────────────────────────────────
+# LOW VOL CHOP (VIX 22-25, ADX < 20): reduce size, raise confidence gate.
+# Today's run (VIX 22.4, ADX 19) correctly skipped 12 signals — make explicit.
+CHOP_REGIME_CONF_GATE        = 75    # vs normal MIN_CONFIDENCE_TO_TRADE=60
+CHOP_REGIME_SIZE_MULT        = 0.65  # vs REGIME_CHOPPY_SIZE_MULT=0.75 — tighter
+
+# PIN regime: block directional debit spreads when gamma is pinning price.
+# CAT was MODERATE PIN today → correctly rejected (no ITM puts found).
+# These flags make the intent auditable independent of check_ticker logic.
+PIN_REGIME_BLOCK_BEAR_PUTS   = True  # Block bear puts if v4 regime contains PIN
+PIN_REGIME_BLOCK_BULL_CALLS  = True  # Block bull calls if v4 regime contains PIN
 
 # ─────────────────────────────────────────────────────────
 # EXIT RULES
@@ -255,3 +271,27 @@ IMMEDIATE_POST_TIER          = ["1"]
 IMMEDIATE_POST_MIN_CONF      = 75
 IMMEDIATE_POST_0DTE          = True
 DIGEST_CARD_CACHE_TTL_SEC    = 3600
+
+
+# ═══════════════════════════════════════════════════════════
+# SWING ENGINE SETTINGS (v4.2)
+# ═══════════════════════════════════════════════════════════
+
+# DTE preferences — tightened from 30 to 21.
+# NFLX T1 today used 45 DTE (2026-05-01). For a 2–3 week swing
+# thesis, 21 DTE keeps theta manageable and exits cleaner.
+SWING_TARGET_DTE_OVERRIDE    = 21    # Overrides swing_engine.SWING_TARGET_DTE=30
+SWING_MAX_DTE_OVERRIDE       = 45    # Same ceiling, but engine should prefer shorter
+
+# IV sanity bounds for avg_iv computation — fixes EM overflow bug.
+# swing_engine now clamps all IV values to this range before averaging.
+# Deep OTM / near-expiry contracts can return IV > 100.0 (10,000%)
+# from MarketData.app; those must be excluded from the EM input.
+SWING_IV_MIN                 = 0.05  # 5%  — below this is data noise
+SWING_IV_MAX                 = 5.00  # 500% — above this is a blown-up contract
+SWING_IV_ATM_BAND_PCT        = 0.05  # Use ATM-only IV (within 5% of spot) when >= 3 hits
+
+# Logging dedup: suppress repeated OHLC/candle timeout warnings after first.
+# Today's run logged 32 identical "Cached OHLC bars fetch failed for MA" lines.
+# app.py should track warned_tickers per cycle and skip subsequent log lines.
+OHLC_WARN_ONCE_PER_CYCLE     = True
