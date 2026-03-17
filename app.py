@@ -436,6 +436,76 @@ def _process_job(worker_id: int, job: dict):
             _record_wave_result(base)
             return
 
+        # ── v4.1: CAGF regime gate for liquid index tickers ──
+        # Pine = timing trigger, Python CAGF = regime context
+        # Only gate SPY/QQQ/SPX — other tickers skip this check
+        if ticker.upper() in ("SPY", "QQQ", "SPX"):
+            try:
+                _spot = get_spot(ticker)
+                _bars = _get_ohlc_bars(ticker, days=65)
+                _adv, _ = _estimate_liquidity(ticker, _spot)
+                _closes = get_daily_candles(ticker, days=60)
+                _vix_data = _get_vix_data()
+                _vix_val = _vix_data.get("vix", 20) if _vix_data else 20
+
+                # Run a quick v4 snapshot for dealer flows
+                from datetime import date as _date
+                _today = _date.today().strftime("%Y-%m-%d")
+                _chain_data, _c_spot, _c_exp = _get_0dte_chain(ticker, _today)
+                if _chain_data and _c_spot:
+                    _oi_cache.apply_oi_changes_to_chain(ticker, _c_exp, _chain_data)
+                    _v4 = run_institutional_snapshot(
+                        chain_data=_chain_data, spot=_c_spot, dte=0.5,
+                        recent_bars=_bars, is_0dte=True,
+                        avg_daily_dollar_volume=_adv,
+                        liquid_index=True,
+                    )
+                    if not _v4.get("error"):
+                        _eng = _v4.get("engine_result", {})
+                        _rv = _v4.get("vol_regime", {}).get("realized_vol_20d", 0) or 0
+                        _iv = _v4.get("iv", 0) or 0
+
+                        import pytz as _pytz
+                        _ct = _pytz.timezone("America/Chicago")
+                        _now_ct = datetime.now(_ct)
+                        _mkt_open = _now_ct.replace(hour=8, minute=30, second=0, microsecond=0)
+                        _mkt_close = _now_ct.replace(hour=15, minute=0, second=0, microsecond=0)
+                        _sess_secs = (_mkt_close - _mkt_open).total_seconds()
+                        _elapsed = max(0, (_now_ct - _mkt_open).total_seconds())
+                        _sess_prog = min(1.0, _elapsed / _sess_secs) if _sess_secs > 0 else 0.5
+
+                        _cagf = compute_cagf(
+                            dealer_flows={
+                                "gex": _eng.get("gex", 0), "dex": _eng.get("dex", 0),
+                                "vanna": _eng.get("vanna", 0), "charm": _eng.get("charm", 0),
+                                "gamma_flip": _eng.get("flip_price"),
+                            },
+                            iv=_iv, rv=_rv, spot=_c_spot, vix=_vix_val,
+                            session_progress=_sess_prog, adv=_adv,
+                            candle_closes=_closes, ticker=ticker,
+                        )
+
+                        _trend_prob = _cagf.get("trend_day_probability", 0)
+                        _regime = _cagf.get("regime", "UNKNOWN")
+                        _prob = _cagf.get("probability", 50)
+
+                        # Gate: T1 requires trend_prob >= 0.55, T2 >= 0.40
+                        min_trend = 0.55 if tier_label == "1" else 0.40
+                        if _trend_prob < min_trend:
+                            base["reason"] = (
+                                f"CAGF regime gate: trend prob {_trend_prob:.0%} < {min_trend:.0%} "
+                                f"({_regime}, {_prob:.0f}% directional)"
+                            )
+                            log.info(f"[worker-{worker_id}] {ticker} T{tier_label} blocked by CAGF: "
+                                     f"trend={_trend_prob:.0%} regime={_regime} prob={_prob:.0f}%")
+                            _record_wave_result(base)
+                            return
+
+                        log.info(f"[worker-{worker_id}] {ticker} CAGF passed: "
+                                 f"trend={_trend_prob:.0%} regime={_regime} prob={_prob:.0f}%")
+            except Exception as e:
+                log.warning(f"[worker-{worker_id}] CAGF gate error for {ticker}: {e} — proceeding without gate")
+
         rec = check_ticker_with_timeout(ticker, direction=bias, webhook_data=webhook_data)
         base["confidence"] = rec.get("confidence")
 
