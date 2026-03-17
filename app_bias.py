@@ -65,9 +65,13 @@ def _calc_bias(spot: float, em: dict, walls: dict, skew: dict,
         else:
             score -= 1
             signals.append(("▼", f"[GEX -1] No flip found and net GEX is negative (-${abs(tgex):.1f}M) — dealers are net short gamma, amplifying moves."))
+    else:
+        signals.append(("—", "[FLIP n/a] No dealer GEX data available for this chain."))
 
     # S2 — DEX Direction (weight ±2)
-    if eng and "dex" in eng:
+    if not eng or "dex" not in eng:
+        signals.append(("—", "[DEX n/a] No dealer delta exposure data available."))
+    elif eng and "dex" in eng:
         dex  = eng["dex"]
         adex = abs(dex)
         if dex < -1.0:
@@ -86,7 +90,9 @@ def _calc_bias(spot: float, em: dict, walls: dict, skew: dict,
             signals.append(("◆", f"[DEX  0] Dealers near delta-neutral (DEX ${dex:+.1f}M) — no strong forced re-hedging flow in either direction."))
 
     # S3 — Vanna Flow (weight ±1)
-    if eng and "vanna" in eng:
+    if not eng or "vanna" not in eng:
+        signals.append(("—", "[VANNA n/a] No vanna flow data available."))
+    elif eng and "vanna" in eng:
         vanna_m = eng["vanna"]
         if vanna_m > 0.5:
             score += 1
@@ -98,7 +104,9 @@ def _calc_bias(spot: float, em: dict, walls: dict, skew: dict,
             signals.append(("◆", f"[VANNA  0] Net Vanna ${vanna_m:+.1f}M — minimal IV-driven dealer flow expected."))
 
     # S4 — Charm Flow (weight ±1)
-    if eng and "charm" in eng:
+    if not eng or "charm" not in eng:
+        signals.append(("—", "[CHARM n/a] No charm flow data available."))
+    elif eng and "charm" in eng:
         charm_m = eng["charm"]
         if charm_m > 0.5:
             score += 1
@@ -110,7 +118,9 @@ def _calc_bias(spot: float, em: dict, walls: dict, skew: dict,
             signals.append(("◆", f"[CHARM  0] Net Charm ${charm_m:+.1f}M — time decay has minimal directional effect on dealer hedges today."))
 
     # S5 — GEX Regime Context (informational, no score)
-    if eng and "gex" in eng:
+    if not eng or "gex" not in eng:
+        signals.append(("—", "[GEX REGIME n/a] No GEX regime data."))
+    elif eng and "gex" in eng:
         tgex = eng["gex"]
         regime = eng.get("regime", {})
         preferred = regime.get("preferred", "")
@@ -125,7 +135,9 @@ def _calc_bias(spot: float, em: dict, walls: dict, skew: dict,
     # ══════════════════════════════════════════════════════════════════
 
     # S6 — OI Wall Asymmetry (weight ±1)
-    if walls and "call_wall_oi" in walls and "put_wall_oi" in walls:
+    if not walls or "call_wall_oi" not in walls or "put_wall_oi" not in walls:
+        signals.append(("—", "[OI ASYM n/a] Insufficient wall data for OI comparison."))
+    elif walls and "call_wall_oi" in walls and "put_wall_oi" in walls:
         cw_oi = walls["call_wall_oi"]
         pw_oi = walls["put_wall_oi"]
         ratio = pw_oi / cw_oi if cw_oi > 0 else 1.0
@@ -143,7 +155,9 @@ def _calc_bias(spot: float, em: dict, walls: dict, skew: dict,
             signals.append(("◆", f"[OI ASYM  0] OI is balanced (put {pw_oi:,} vs call {cw_oi:,}, {ratio:.2f}x) — no dominant institutional lean."))
 
     # S7 — Spot vs Wall Midpoint (weight ±1)
-    if walls and "call_wall" in walls and "put_wall" in walls:
+    if not walls or "call_wall" not in walls or "put_wall" not in walls:
+        signals.append(("—", "[MIDPOINT n/a] No call/put wall to compute midpoint."))
+    elif walls and "call_wall" in walls and "put_wall" in walls:
         mid      = (walls["call_wall"] + walls["put_wall"]) / 2
         dist_pct = ((spot - mid) / mid) * 100
         if dist_pct >= 0.30:
@@ -156,7 +170,9 @@ def _calc_bias(spot: float, em: dict, walls: dict, skew: dict,
             signals.append(("◆", f"[MIDPOINT  0] Price ${spot:.2f} near midpoint ${mid:.2f} ({dist_pct:+.1f}%) — no positional edge within the range."))
 
     # S8 — Gamma Wall as Price Magnet (weight ±1)
-    if walls and "gamma_wall" in walls:
+    if not walls or "gamma_wall" not in walls:
+        signals.append(("—", "[GAMMA WALL n/a] No gamma wall identified."))
+    elif walls and "gamma_wall" in walls:
         gw           = walls["gamma_wall"]
         gw_dist_pct  = ((gw - spot) / spot) * 100
         if abs(gw_dist_pct) <= 0.30:
@@ -169,7 +185,9 @@ def _calc_bias(spot: float, em: dict, walls: dict, skew: dict,
             signals.append(("▼", f"[GAMMA WALL -1] Gamma wall ${gw:.0f} is {abs(gw_dist_pct):.1f}% BELOW spot — acts as downside magnet. Price may drift toward it during the session."))
 
     # S9 — Secondary Wall Clusters (informational, no score)
-    if walls and "call_top3" in walls and "put_top3" in walls:
+    if not walls or "call_top3" not in walls or "put_top3" not in walls:
+        signals.append(("—", "[CLUSTERS n/a] No wall cluster data."))
+    elif walls and "call_top3" in walls and "put_top3" in walls:
         ct3 = " → ".join(f"${x:.0f}" for x in walls["call_top3"])
         pt3 = " → ".join(f"${x:.0f}" for x in walls["put_top3"])
         signals.append(("◆", f"[CLUSTERS] Resistance stack: {ct3} | Support stack: {pt3}"))
@@ -179,7 +197,9 @@ def _calc_bias(spot: float, em: dict, walls: dict, skew: dict,
     # ══════════════════════════════════════════════════════════════════
 
     # S10 — IV Skew (weight ±1)
-    if skew and "call_iv" in skew and "put_iv" in skew:
+    if not skew or "call_iv" not in skew or "put_iv" not in skew:
+        signals.append(("—", "[SKEW n/a] No ATM IV skew data available."))
+    elif skew and "call_iv" in skew and "put_iv" in skew:
         diff = skew["put_iv"] - skew["call_iv"]
         if diff >= 2.5:
             score -= 1
@@ -195,7 +215,9 @@ def _calc_bias(spot: float, em: dict, walls: dict, skew: dict,
             signals.append(("◆", f"[SKEW  0] IV balanced: calls {skew.get('call_iv','?')}% / puts {skew.get('put_iv','?')}% ({diff:+.1f}pp) — no directional conviction from skew."))
 
     # S11 — PCR by OI (weight ±1)
-    if pcr and pcr.get("pcr_oi") is not None:
+    if not pcr or pcr.get("pcr_oi") is None:
+        signals.append(("—", "[PCR OI n/a] No put/call ratio data by OI."))
+    elif pcr and pcr.get("pcr_oi") is not None:
         p = pcr["pcr_oi"]
         if p > 1.35:
             score -= 1
@@ -211,7 +233,9 @@ def _calc_bias(spot: float, em: dict, walls: dict, skew: dict,
             signals.append(("◆", f"[PCR OI  0] PCR(OI) {p:.2f} — balanced positioning. No strong structural sentiment."))
 
     # S12 — PCR by Volume (weight ±1)
-    if pcr and pcr.get("pcr_vol") is not None:
+    if not pcr or pcr.get("pcr_vol") is None:
+        signals.append(("—", "[PCR VOL n/a] No put/call ratio data by volume."))
+    elif pcr and pcr.get("pcr_vol") is not None:
         pv = pcr["pcr_vol"]
         if pv > 1.35:
             score -= 1
@@ -231,7 +255,10 @@ def _calc_bias(spot: float, em: dict, walls: dict, skew: dict,
     # ══════════════════════════════════════════════════════════════════
 
     # S13 — VIX Level (weight ±2)
-    if vix and vix.get("vix"):
+    if not vix or not vix.get("vix"):
+        signals.append(("—", "[VIX n/a] VIX data unavailable."))
+        signals.append(("—", "[TERM n/a] VIX term structure unavailable."))
+    elif vix and vix.get("vix"):
         v    = vix["vix"]
         v9d  = vix.get("vix9d")
         term = vix.get("term", "unknown")
@@ -268,7 +295,8 @@ def _calc_bias(spot: float, em: dict, walls: dict, skew: dict,
     # ══════════════════════════════════════════════════════════════════
     up_count   = sum(1 for e, _ in signals if e in ("▲", "▲▲"))
     down_count = sum(1 for e, _ in signals if e in ("▼", "▼▼"))
-    neu_count  = len(signals) - up_count - down_count
+    na_count   = sum(1 for e, _ in signals if e == "—")
+    neu_count  = len(signals) - up_count - down_count - na_count
 
     if score >= 7:
         direction = "STRONG BULLISH"
@@ -328,6 +356,7 @@ def _calc_bias(spot: float, em: dict, walls: dict, skew: dict,
         "up_count":   up_count,
         "down_count": down_count,
         "neu_count":  neu_count,
+        "na_count":   na_count,
         "n_signals":  len(signals),
         "signals":    signals,
         "verdict":    verdict,
