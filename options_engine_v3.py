@@ -1302,6 +1302,18 @@ def recommend_trade(
 
     # ── Rank and pick best ──
     ranked = rank_candidates(candidates, iv_edge_label=vol_edge.get("edge_label", "NEUTRAL") if vol_edge else "NEUTRAL")
+    if not ranked:
+        rejected = {}
+        for c in candidates:
+            reason = c.get("_rejected", "filtered")
+            rejected[reason] = rejected.get(reason, 0) + 1
+        rej_txt = ", ".join(f"{k}:{v}" for k, v in sorted(rejected.items())) if rejected else "all filtered"
+        result["reason"] = (
+            f"No ranked {spread_label} spreads passed quality filters "
+            f"(widths tried: {available_widths}; rejects: {rej_txt})"
+        )
+        result["deal_breaker"] = "ranking_filters"
+        return result
     best = ranked[0]
 
     # ── Width ladder ──
