@@ -16,7 +16,6 @@
 #   - Direction-aware confidence scoring
 
 import math
-import re
 from typing import Any, Dict, List, Optional, Tuple
 from trading_rules import *
 # v4.1 imports for hard liquidity, ranking, slippage, journal feedback
@@ -56,6 +55,105 @@ def as_int(x, default=0):
         return int(x) if x is not None else int(default)
     except (ValueError, TypeError):
         return int(default)
+
+
+def _norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def _prob_finish_above(spot: float, strike: float, iv: float, dte: int) -> Optional[float]:
+    """Approx risk-neutral-style probability spot finishes above strike by expiry.
+    Uses a simple lognormal model with zero rates/dividends for ranking only.
+    """
+    if spot <= 0 or strike <= 0 or iv is None or iv <= 0 or dte <= 0:
+        return None
+    t = max(dte / 365.0, 1.0 / 365.0)
+    sigma_t = iv * math.sqrt(t)
+    if sigma_t <= 0:
+        return None
+    try:
+        d2 = (math.log(spot / strike) - 0.5 * iv * iv * t) / sigma_t
+        return max(0.0, min(1.0, _norm_cdf(d2)))
+    except (ValueError, ZeroDivisionError):
+        return None
+
+
+def _prob_finish_below(spot: float, strike: float, iv: float, dte: int) -> Optional[float]:
+    p_above = _prob_finish_above(spot, strike, iv, dte)
+    if p_above is None:
+        return None
+    return max(0.0, min(1.0, 1.0 - p_above))
+
+
+def estimate_vertical_trade_quality(
+    *,
+    side: str,
+    spot: float,
+    long_strike: float,
+    short_strike: float,
+    width: float,
+    debit: float,
+    dte: int,
+    long_iv: Optional[float],
+    short_iv: Optional[float],
+    short_delta_abs: float,
+) -> Dict[str, float]:
+    """More honest trade-quality approximation for debit spreads.
+
+    Returns:
+      - win_prob: approximate probability of finishing above/below breakeven at expiry
+      - max_profit_prob: approximate probability of finishing through short strike
+      - expected_value: ternary approximation (max profit / partial profit / max loss)
+    """
+    avg_iv = 0.0
+    ivs = [v for v in (long_iv, short_iv) if v is not None and v > 0]
+    if ivs:
+        avg_iv = sum(ivs) / len(ivs)
+
+    if side == 'bull':
+        breakeven = long_strike + debit
+        prob_profit = _prob_finish_above(spot, breakeven, avg_iv, dte) if avg_iv > 0 else None
+        prob_max = _prob_finish_above(spot, short_strike, avg_iv, dte) if avg_iv > 0 else None
+    else:
+        breakeven = long_strike - debit
+        prob_profit = _prob_finish_below(spot, breakeven, avg_iv, dte) if avg_iv > 0 else None
+        prob_max = _prob_finish_below(spot, short_strike, avg_iv, dte) if avg_iv > 0 else None
+
+    delta_prob = short_delta_abs if short_delta_abs > 0 else None
+    # Blend model probability with short-delta proxy when both exist.
+    if prob_max is not None and delta_prob is not None:
+        prob_max = (0.65 * prob_max) + (0.35 * delta_prob)
+    elif prob_max is None and delta_prob is not None:
+        prob_max = delta_prob
+
+    if prob_profit is None:
+        # Fallback: estimate profit probability from max-profit probability and spread cost.
+        cost_hurdle = max(0.05, min(0.95, debit / width if width > 0 else 0.5))
+        if prob_max is not None:
+            prob_profit = max(0.0, min(0.99, prob_max + (1.0 - cost_hurdle) * 0.15))
+        else:
+            prob_profit = 0.5
+
+    if prob_max is None:
+        prob_max = max(0.0, min(prob_profit, 0.99))
+
+    prob_max = max(0.0, min(prob_max, prob_profit, 0.99))
+    prob_profit = max(prob_max, min(prob_profit, 0.995))
+
+    max_profit = max(width - debit, 0.0)
+    max_loss = max(debit, 0.0)
+    # Partial-profit region sits between breakeven and short strike.
+    partial_prob = max(0.0, prob_profit - prob_max)
+    partial_profit = max_profit * 0.35
+    ev = (prob_max * max_profit) + (partial_prob * partial_profit) - ((1.0 - prob_profit) * max_loss)
+
+    return {
+        'avg_iv_used': round(avg_iv, 4) if avg_iv > 0 else 0.0,
+        'breakeven': round(breakeven, 4),
+        'win_prob': round(prob_profit, 4),
+        'max_profit_prob': round(prob_max, 4),
+        'expected_value': round(ev, 4),
+    }
 
 
 def detect_available_widths(strikes: List[float], spot: float) -> List[float]:
@@ -371,6 +469,7 @@ def build_itm_debit_spreads(
     spot: float,
     available_widths: List[float],
     expected_move: float = 0,
+    dte: int = 0,
 ) -> List[Dict]:
     """
     Bull call debit spread: long lower strike call, short higher strike call.
@@ -424,8 +523,20 @@ def build_itm_debit_spreads(
                 net_gamma = round(long_gamma - short_gamma, 6)
 
             short_delta_abs = abs(short_q.get("delta") or 0)
-            win_prob = round(min(short_delta_abs, 0.99), 4) if short_delta_abs > 0 else 0.5
-            ev = round((win_prob * max_profit) - ((1 - win_prob) * max_loss), 4)
+            quality = estimate_vertical_trade_quality(
+                side="bull",
+                spot=spot,
+                long_strike=long_k,
+                short_strike=short_k,
+                width=width,
+                debit=debit,
+                dte=dte,
+                long_iv=long_q.get("iv"),
+                short_iv=short_q.get("iv"),
+                short_delta_abs=short_delta_abs,
+            )
+            win_prob = quality["win_prob"]
+            ev = quality["expected_value"]
 
             em_proximity = None
             em_zone = "unknown"
@@ -452,11 +563,19 @@ def build_itm_debit_spreads(
                 "short_delta":    short_q.get("delta"),
                 "long_oi":        long_q.get("oi"),
                 "short_oi":       short_q.get("oi"),
+                "long_bid":       long_q.get("bid"),
+                "long_ask":       long_q.get("ask"),
+                "short_bid":      short_q.get("bid"),
+                "short_ask":      short_q.get("ask"),
+                "long_spread_pct": long_q.get("spread_pct"),
+                "short_spread_pct": short_q.get("spread_pct"),
                 "net_theta":      net_theta,
                 "net_vega":       net_vega,
                 "net_delta":      net_delta,
                 "net_gamma":      net_gamma,
                 "win_prob":       win_prob,
+                "max_profit_prob": quality.get("max_profit_prob"),
+                "breakeven":      quality.get("breakeven"),
                 "expected_value": ev,
                 "em_proximity":   em_proximity,
                 "em_zone":        em_zone,
@@ -474,6 +593,7 @@ def build_itm_bear_put_spreads(
     spot: float,
     available_widths: List[float],
     expected_move: float = 0,
+    dte: int = 0,
 ) -> List[Dict]:
     """
     Bear put debit spread: long higher strike put, short lower strike put.
@@ -527,9 +647,22 @@ def build_itm_bear_put_spreads(
                 net_gamma = round(long_gamma - short_gamma, 6)
 
             # For bear put: short is the less ITM leg (lower strike)
+            # For bear put: short is the less ITM leg (lower strike)
             short_delta_abs = abs(short_q.get("delta") or 0)
-            win_prob = round(min(short_delta_abs, 0.99), 4) if short_delta_abs > 0 else 0.5
-            ev = round((win_prob * max_profit) - ((1 - win_prob) * max_loss), 4)
+            quality = estimate_vertical_trade_quality(
+                side="bear",
+                spot=spot,
+                long_strike=long_k,
+                short_strike=short_k,
+                width=width,
+                debit=debit,
+                dte=dte,
+                long_iv=long_q.get("iv"),
+                short_iv=short_q.get("iv"),
+                short_delta_abs=short_delta_abs,
+            )
+            win_prob = quality["win_prob"]
+            ev = quality["expected_value"]
 
             # EM zone: short strike should be within EM above spot
             em_proximity = None
@@ -557,11 +690,19 @@ def build_itm_bear_put_spreads(
                 "short_delta":    short_q.get("delta"),
                 "long_oi":        long_q.get("oi"),
                 "short_oi":       short_q.get("oi"),
+                "long_bid":       long_q.get("bid"),
+                "long_ask":       long_q.get("ask"),
+                "short_bid":      short_q.get("bid"),
+                "short_ask":      short_q.get("ask"),
+                "long_spread_pct": long_q.get("spread_pct"),
+                "short_spread_pct": short_q.get("spread_pct"),
                 "net_theta":      net_theta,
                 "net_vega":       net_vega,
                 "net_delta":      net_delta,
                 "net_gamma":      net_gamma,
                 "win_prob":       win_prob,
+                "max_profit_prob": quality.get("max_profit_prob"),
+                "breakeven":      quality.get("breakeven"),
                 "expected_value": ev,
                 "em_proximity":   em_proximity,
                 "em_zone":        em_zone,
@@ -613,17 +754,22 @@ def rank_candidates(candidates: List[Dict], iv_edge_label: str = "NEUTRAL") -> L
         c["ev_after_slippage"] = round(ev_after_slippage, 4)
         c["est_slippage"] = round(est_slippage, 4)
 
-        if ev_after_slippage <= SLIPPAGE_MIN_EV_AFTER and ev_raw > 0:
-            c["_rejected"] = "slippage"
+        if ev_after_slippage <= SLIPPAGE_MIN_EV_AFTER:
+            c["_rejected"] = "slippage_or_negative_ev"
             continue
 
         # ── Factor scores (each 0-1) ──
-        # EV
-        ev_score = max(0, (ev_raw / ev_max + 1) / 2)  # normalize to 0-1
+        # EV (after estimated slippage matters more than raw EV)
+        ev_score = max(0, (ev_after_slippage / ev_max + 1) / 2)
+        if ev_after_slippage <= 0:
+            ev_score = 0
 
-        # Win probability
+        # Win probability / payout sanity
         wp = c.get("win_prob", 0.5)
         wp_score = min(wp, 1.0)
+        breakeven_prob_needed = max(0.05, min(0.95, c.get("debit", 0) / max(c.get("width", 1.0), 0.01)))
+        if wp < breakeven_prob_needed:
+            wp_score *= 0.7
 
         # Liquidity (fewer warnings = better, OI matters)
         warn_count = len(warnings)
@@ -653,9 +799,12 @@ def rank_candidates(candidates: List[Dict], iv_edge_label: str = "NEUTRAL") -> L
         else:
             em_score = 0.4
 
-        # Width efficiency
+        # Width efficiency + cost discipline
         width = c.get("width", 5)
-        width_score = 0.9 if width <= 1.0 else 0.7 if width <= 2.5 else 0.4
+        width_score = 0.95 if width <= 1.0 else 0.78 if width <= 2.5 else 0.52 if width <= 5.0 else 0.35
+        cost_pct = (c.get("cost_pct", 100) or 100) / 100.0
+        if cost_pct >= 0.68:
+            width_score *= 0.8
 
         # ── Composite ──
         composite = (
@@ -667,6 +816,11 @@ def rank_candidates(candidates: List[Dict], iv_edge_label: str = "NEUTRAL") -> L
             width_score * RANK_WEIGHT_WIDTH_EFF
         )
         c["rank_score"] = round(composite, 4)
+        c["rank_context"] = {
+            "ev_after_slippage": round(ev_after_slippage, 4),
+            "breakeven_prob_needed": round(breakeven_prob_needed, 4),
+            "wp_minus_hurdle": round(wp - breakeven_prob_needed, 4),
+        }
 
         if composite >= RANK_MIN_SCORE:
             scored.append(c)
@@ -766,6 +920,25 @@ def compute_confidence(
             score += 5
             reasons.append(f"OK RoR ({ror:.2f})")
 
+        ev_after = trade.get("ev_after_slippage", trade.get("expected_value", 0))
+        if ev_after > 0.05:
+            score += 6
+            reasons.append(f"Positive EV after slippage (${ev_after:.2f})")
+        elif ev_after > 0:
+            score += 2
+            reasons.append(f"Slightly positive EV (${ev_after:.2f})")
+        else:
+            score -= 10
+            reasons.append(f"Negative EV after slippage (${ev_after:.2f})")
+
+        wp = trade.get("win_prob", 0.5)
+        if wp >= 0.60:
+            score += 5
+            reasons.append(f"Good profit probability ({wp:.0%})")
+        elif wp < 0.50:
+            score -= 6
+            reasons.append(f"Low profit probability ({wp:.0%})")
+
         cost_pct = trade.get("cost_pct", 100)
         if cost_pct <= 55:
             score += 10
@@ -858,6 +1031,22 @@ def compute_confidence(
         if ror >= 0.50:
             score += 5
             reasons.append(f"Strong RoR ({ror:.2f})")
+
+        ev_after = trade.get("ev_after_slippage", trade.get("expected_value", 0))
+        if ev_after > 0.05:
+            score += 4
+            reasons.append(f"Positive EV after slippage (${ev_after:.2f})")
+        elif ev_after <= 0:
+            score -= 8
+            reasons.append(f"Negative EV after slippage (${ev_after:.2f})")
+
+        wp = trade.get("win_prob", 0.5)
+        if wp >= 0.60:
+            score += 4
+            reasons.append(f"Good profit probability ({wp:.0%})")
+        elif wp < 0.50:
+            score -= 5
+            reasons.append(f"Low profit probability ({wp:.0%})")
 
         warn_count = len(trade.get("warnings", []))
         if warn_count:
@@ -1084,7 +1273,7 @@ def recommend_trade(
             result["reason"] = "No valid widths available from put strike increments"
             return result
 
-        candidates = build_itm_bear_put_spreads(quotes, spot, available_widths, expected_move)
+        candidates = build_itm_bear_put_spreads(quotes, spot, available_widths, expected_move, dte=dte)
         spread_side = "put"
         spread_label = "BEAR PUT"
     else:
@@ -1098,7 +1287,7 @@ def recommend_trade(
             result["reason"] = "No valid widths available from call strike increments"
             return result
 
-        candidates = build_itm_debit_spreads(quotes, spot, available_widths, expected_move)
+        candidates = build_itm_debit_spreads(quotes, spot, available_widths, expected_move, dte=dte)
         spread_side = "call"
         spread_label = "BULL CALL"
 
@@ -1148,14 +1337,13 @@ def recommend_trade(
         result["conf_reasons"] = conf_reasons
         return result
 
-    # ── Win probability gate (v3.7) ──
-    # Short leg delta must be >= MIN_WIN_PROBABILITY.
-    # Prevents taking spreads where the short strike is unlikely to stay ITM.
+    # ── Win probability gate (v4.4) ──
+    # Uses approximate profit probability at expiry, not just short-leg delta.
     win_prob = best.get("win_prob", 0)
     if win_prob < MIN_WIN_PROBABILITY:
         result["reason"] = (
-            f"Win probability {win_prob:.0%} below {MIN_WIN_PROBABILITY:.0%} minimum "
-            f"(short delta too low — strike not ITM enough)"
+            f"Profit probability {win_prob:.0%} below {MIN_WIN_PROBABILITY:.0%} minimum "
+            f"(breakeven odds too weak for this spread)"
         )
         result["confidence"] = confidence
         result["conf_reasons"] = conf_reasons
@@ -1253,143 +1441,101 @@ def format_trade_card(rec: Dict) -> str:
     ticker       = rec["ticker"]
     tier         = rec.get("tier", "?")
     conf         = rec.get("confidence", 0)
-    spread_label = rec.get("spread_label", "BULL CALL")
     direction    = rec.get("direction", "bull")
     tier_emoji   = "🥇" if tier == "1" else "🥈"
-    dir_emoji    = "🐻" if direction == "bear" else "🐂"
+    dir_word     = "Bearish" if direction == "bear" else "Bullish"
+    opt_type     = "Put" if direction == "bear" else "Call"
+
+    risk_per = round(trade['debit'] * 100, 2)
+    max_profit_per = round(trade['max_profit'] * 100, 2)
+    contract_line = f"BUY {trade['long']}/{trade['short']} {opt_type} Debit Spread"
+    em = rec.get("expected_move", 0)
+
+    why = []
+    if trade.get("em_zone") == "inside":
+        why.append("short strike is still inside the expected move")
+    if trade.get("width", 0) <= 1.0:
+        why.append("it uses the tightest width available")
+    elif trade.get("width", 0) <= 2.5:
+        why.append("it keeps width relatively conservative")
+    if trade.get("long_itm", 0) > 0:
+        why.append("the long leg starts ITM to give the trade more room")
+    if rec.get("vol_edge", {}).get("edge_label") == "BUYER":
+        why.append("IV vs RV is favorable for a debit buyer")
+    if not why:
+        why.append("it is a defined-risk way to express the directional view")
+
+    risk_notes = []
+    if trade.get("expected_value", 0) <= 0:
+        risk_notes.append("edge is thin at this fill")
+    risk_notes.extend(trade.get("warnings", [])[:2])
+    if not risk_notes:
+        risk_notes.append("avoid chasing a poor fill")
 
     lines = [
-        f"{tier_emoji} {ticker} — {dir_emoji} {spread_label} DEBIT SPREAD",
-        f"Signal: Tier {tier} | Confidence: {conf}/100",
-        f"Spot: ${rec['spot']:.2f} | DTE: {rec['dte']} ({rec['exp']})",
+        f"{tier_emoji} {ticker} — {dir_word} Trade",
+        f"Contract: {contract_line}",
+        f"Exp: {rec['exp']} | DTE: {rec['dte']} | Confidence: {conf}/100",
+        f"Cost: ${trade['debit']:.2f} (${risk_per:.0f} max risk) | Max Profit: ${trade['max_profit']:.2f} (${max_profit_per:.0f})",
     ]
 
-    # Expected Move
-    em = rec.get("expected_move", 0)
     if EM_DISPLAY_ON_CARD and em > 0:
         em_low  = round(rec["spot"] - em, 2)
         em_high = round(rec["spot"] + em, 2)
-        lines.append(f"Expected Move: ±${em:.2f} ({em_low} – {em_high})")
+        lines.append(f"Expected Move: ±${em:.2f} (${em_low:.2f} – ${em_high:.2f})")
 
-    lines.append("")
-
-    # Legs
-    opt_type = "put" if direction == "bear" else "call"
     lines += [
-        f"Long:  ${trade['long']} (${trade['long_itm']:.2f} ITM {opt_type})",
-        f"Short: ${trade['short']} (${trade['short_itm']:.2f} ITM {opt_type})",
-        f"Width: ${trade['width']:.2f} | Cost: ${trade['debit']:.2f} ({trade['cost_pct']:.0f}%)",
-        f"Max Profit: ${trade['max_profit']:.2f} | RoR: {trade['ror']:.0%}",
+        "",
+        "Why this trade:",
+        f"  • {'; '.join(why[:3])}.",
+        "",
+        "Plan:",
+        f"  • Work the entry near a fair fill around ${trade['debit']:.2f}.",
+        f"  • First target: ${exits['same_day']['sell_at']:.2f} (+30%).",
+        f"  • Next target: ${exits['next_day']['sell_at']:.2f} (+35%).",
+        f"  • Extended target: ${exits['extended']['sell_at']:.2f} (+50%).",
+    ]
+    if rec.get("stop_price"):
+        lines.append(f"  • Stop: ${rec['stop_price']:.2f} ({rec['stop_note']}).")
+    else:
+        lines.append(f"  • Stop: {rec['stop_note']}.")
+
+    lines += [
+        "",
+        f"Main risk: {'; '.join(risk_notes[:2])}.",
+        "",
+        "Data:",
+        f"  Width ${trade['width']:.2f} | Long {trade['long']} / Short {trade['short']}",
+        f"  ITM: long ${trade['long_itm']:.2f} | short ${trade['short_itm']:.2f}",
+        f"  RoR {trade['ror']:.0%} | Win Prob {trade.get('win_prob', 0):.0%} | EV ${trade.get('expected_value', 0):.2f}/contract",
     ]
 
-    # Win prob / EV
-    wp = trade.get("win_prob", 0)
-    ev = trade.get("expected_value", 0)
-    if wp > 0:
-        ev_emoji = "🟢" if ev > 0 else "🔴"
-        lines.append(f"Win Prob: {wp:.0%} | EV: {ev_emoji} ${ev:.2f}/contract")
-
-    # EM zone
-    em_zone = trade.get("em_zone", "unknown")
-    em_prox = trade.get("em_proximity")
-    if em_zone != "unknown" and em_prox is not None:
-        zone_emoji = "✅" if em_zone == "inside" else "⚠️"
-        lines.append(f"EM Zone: {zone_emoji} Short strike {em_zone} EM (${em_prox:+.2f} from boundary)")
-
-    lines.append("")
-
-    # Vol edge
     vol_edge = rec.get("vol_edge", {})
     if IV_RV_DISPLAY_ON_CARD and vol_edge.get("edge_label") and vol_edge["edge_label"] != "UNKNOWN":
         lines.append(
-            f"Vol Edge: {vol_edge['edge_emoji']} {vol_edge['edge_label']} "
-            f"(IV {vol_edge.get('iv_pct', 0):.0f}% vs RV {vol_edge.get('rv_pct', 0):.0f}% | "
-            f"spread {vol_edge.get('edge_pct', 0):+.1f}pp)"
+            f"  Vol: {vol_edge['edge_label']} ({vol_edge.get('iv_pct', 0):.0f}% IV vs {vol_edge.get('rv_pct', 0):.0f}% RV | {vol_edge.get('edge_pct', 0):+.1f}pp)"
         )
 
-    # Regime — single line, no trailing blank before sizing
     regime = rec.get("regime", {})
     if regime.get("label"):
-        lines.append(
-            f"Regime: {regime.get('emoji', '⚪')} {regime['label']} "
-            f"(VIX {regime.get('vix', 0):.0f} | ADX {regime.get('adx', 0):.0f})"
-        )
+        lines.append(f"  Regime: {regime.get('label')} (VIX {regime.get('vix', 0):.0f} | ADX {regime.get('adx', 0):.0f})")
 
-    lines.append("")
-
-    # Greeks
     if trade.get("net_theta") is not None:
         parts = []
         if trade.get("net_delta") is not None: parts.append(f"Δ {trade['net_delta']:.3f}")
         if trade.get("net_gamma") is not None: parts.append(f"Γ {trade['net_gamma']:.4f}")
         parts.append(f"Θ ${trade['net_theta']:.3f}/day")
-        if trade.get("net_vega") is not None:  parts.append(f"V ${trade['net_vega']:.3f}/pt")
-        lines.append(" | ".join(parts))
+        if trade.get("net_vega") is not None: parts.append(f"V ${trade['net_vega']:.3f}/pt")
+        lines.append("  " + " | ".join(parts))
 
-        # Dynamic exit hints
-        dynamic_exits = []
-        nd = trade.get("net_delta")
-        ng = trade.get("net_gamma")
-        if nd is not None and abs(nd) > 0.85:
-            dynamic_exits.append("Delta > 0.85 → close early (diminishing returns)")
-        if ng is not None and abs(ng) > 0.05 and rec.get("dte", 5) <= 1:
-            dynamic_exits.append("Gamma spike on 0-1 DTE → tighten stop (pin risk)")
-        if trade.get("net_vega") is not None and abs(trade["net_vega"]) > 0.03:
-            dynamic_exits.append("IV crush >5pts → close (vega drag)")
-        if dynamic_exits:
-            lines.append("⚡ " + " | ".join(dynamic_exits))
-
-        lines.append("")
-
-    # Sizing — single consolidated line
-    lines.append(f"Size: {rec['sizing_note']}")
-    lines.append("")
-
-    # Exit targets
-    lines += [
-        "📊 Exit Targets:",
-        f"  Same Day (30%): sell at ${exits['same_day']['sell_at']:.2f} → +${exits['same_day']['profit_total']:.0f}",
-        f"  Next Day (35%): sell at ${exits['next_day']['sell_at']:.2f} → +${exits['next_day']['profit_total']:.0f}",
-        f"  Extended (50%): sell at ${exits['extended']['sell_at']:.2f} → +${exits['extended']['profit_total']:.0f}",
-    ]
-
-    # Stop
-    if rec.get("stop_price"):
-        stop_note = rec.get('stop_note', '').strip()
-        stop_note = re.sub(r'^Stop\s+at\s+\$?[0-9.]+\s*', '', stop_note, flags=re.IGNORECASE)
-        lines.append(f"  Stop: ${rec['stop_price']:.2f} ({stop_note or 'risk stop'})")
-    else:
-        lines.append(f"  {rec['stop_note']}")
-
-    lines.append("")
-
-    # Width ladder
     ladder = rec.get("ladder", [])
     if len(ladder) > 1:
-        lines.append("📐 Width Options:")
-        for c in ladder:
-            star  = " ⭐" if c["long"] == trade["long"] and c["short"] == trade["short"] else ""
-            ev_c  = c.get("expected_value", 0)
-            wp_c  = c.get("win_prob", 0)
-            lines.append(
-                f"  ${c['width']:.2f}w | ${c['debit']:.2f} ({c['cost_pct']:.0f}%) | "
-                f"EV ${ev_c:.2f} | {wp_c:.0%} win | {c['long']}/{c['short']}{star}"
-            )
-        lines.append("")
+        lines.append("  Width ladder: " + " | ".join(f"${c['width']:.2f}:{c['long']}/{c['short']}" for c in ladder[:3]))
 
-    # Liquidity warnings
-    if trade.get("warnings"):
-        lines.append("⚠️ " + "; ".join(trade["warnings"][:3]))
-        lines.append("")
-
-    # Confidence breakdown — max 3 items, each on own line for readability
     if rec.get("conf_reasons"):
-        reasons_short = rec["conf_reasons"][:3]
-        lines.append("🧠 " + " | ".join(reasons_short))
-        lines.append("")
+        lines.append("  Why confidence: " + " | ".join(rec["conf_reasons"][:3]))
 
-    # Footer — always last
-    lines.append("— Not financial advice —")
+    lines += ["", f"Size: {rec['sizing_note']}", "", "— Not financial advice —"]
     return "\n".join(lines)
 
 
