@@ -771,16 +771,30 @@ def rank_candidates(candidates: List[Dict], iv_edge_label: str = "NEUTRAL") -> L
         if wp < breakeven_prob_needed:
             wp_score *= 0.7
 
-        # Liquidity (fewer warnings = better, OI matters)
+        # Liquidity (fewer warnings = better, OI + spread quality matter)
         warn_count = len(warnings)
-        liq_score = max(0, 1.0 - warn_count * 0.25)
         long_oi = c.get("long_oi", 0) or 0
         short_oi = c.get("short_oi", 0) or 0
         avg_oi = (long_oi + short_oi) / 2
+        liq_score = max(0, 1.0 - warn_count * 0.30)
         if avg_oi >= 5000:
-            liq_score = min(1.0, liq_score + 0.2)
+            liq_score = min(1.0, liq_score + 0.18)
         elif avg_oi >= 2000:
-            liq_score = min(1.0, liq_score + 0.1)
+            liq_score = min(1.0, liq_score + 0.08)
+        elif avg_oi < 1000:
+            liq_score -= 0.12
+        if spread_pct_avg >= 0.20:
+            liq_score -= 0.22
+        elif spread_pct_avg >= 0.12:
+            liq_score -= 0.12
+        elif spread_pct_avg >= 0.08:
+            liq_score -= 0.06
+        liq_score = max(0.0, min(1.0, liq_score))
+
+        # Thin liquidity plus thin edge should fail fast.
+        if avg_oi < 750 and warn_count >= 2 and ev_after_slippage < 0.03:
+            c["_rejected"] = "thin_liquidity"
+            continue
 
         # IV edge
         iv_score = 0.5  # neutral
@@ -909,48 +923,74 @@ def compute_confidence(
     )
 
     if is_manual:
-        score = 55
+        score = 50
         reasons.append("Manual check (no signal)")
 
         ror = trade.get("ror", 0)
-        if ror >= 0.50:
-            score += 10
+        if ror >= 0.75:
+            score += 9
             reasons.append(f"Strong RoR ({ror:.2f})")
-        elif ror >= 0.30:
+        elif ror >= 0.45:
             score += 5
             reasons.append(f"OK RoR ({ror:.2f})")
 
         ev_after = trade.get("ev_after_slippage", trade.get("expected_value", 0))
-        if ev_after > 0.05:
-            score += 6
+        if ev_after >= 0.10:
+            score += 7
+            reasons.append(f"Positive EV after slippage (${ev_after:.2f})")
+        elif ev_after >= 0.03:
+            score += 3
             reasons.append(f"Positive EV after slippage (${ev_after:.2f})")
         elif ev_after > 0:
-            score += 2
-            reasons.append(f"Slightly positive EV (${ev_after:.2f})")
+            score += 0
+            reasons.append(f"Thin EV (${ev_after:.2f})")
         else:
-            score -= 10
+            score -= 12
             reasons.append(f"Negative EV after slippage (${ev_after:.2f})")
 
         wp = trade.get("win_prob", 0.5)
-        if wp >= 0.60:
-            score += 5
+        if wp >= 0.70:
+            score += 6
             reasons.append(f"Good profit probability ({wp:.0%})")
-        elif wp < 0.50:
-            score -= 6
+        elif wp >= 0.60:
+            score += 3
+            reasons.append(f"OK profit probability ({wp:.0%})")
+        elif wp < 0.52:
+            score -= 7
             reasons.append(f"Low profit probability ({wp:.0%})")
 
         cost_pct = trade.get("cost_pct", 100)
-        if cost_pct <= 55:
-            score += 10
+        if cost_pct <= 50:
+            score += 8
             reasons.append(f"Great pricing ({cost_pct:.0f}%)")
-        elif cost_pct <= 65:
-            score += 5
+        elif cost_pct <= 60:
+            score += 4
             reasons.append(f"Good pricing ({cost_pct:.0f}%)")
+        elif cost_pct >= 68:
+            score -= 4
+            reasons.append(f"Rich pricing ({cost_pct:.0f}%)")
 
         warn_count = len(trade.get("warnings", []))
         if warn_count:
-            score -= warn_count * 5
+            score -= warn_count * 6
             reasons.append(f"{warn_count} liquidity warning(s)")
+
+        avg_oi = ((trade.get("long_oi", 0) or 0) + (trade.get("short_oi", 0) or 0)) / 2
+        if avg_oi < 750:
+            score -= 8
+            reasons.append("Thin open interest")
+        elif avg_oi < 1500:
+            score -= 4
+            reasons.append("Marginal open interest")
+
+        spread_pcts = [p for p in (trade.get("long_spread_pct"), trade.get("short_spread_pct")) if p is not None]
+        avg_spread_pct = (sum(spread_pcts) / len(spread_pcts)) if spread_pcts else 0
+        if avg_spread_pct >= 0.20:
+            score -= 8
+            reasons.append("Wide bid/ask")
+        elif avg_spread_pct >= 0.12:
+            score -= 4
+            reasons.append("Moderate bid/ask")
 
     else:
         score = 30
@@ -1444,7 +1484,7 @@ def format_trade_card(rec: Dict) -> str:
         conf   = rec.get("confidence")
         lines  = [f"❌ {rec.get('ticker', '?')} — NO TRADE", f"Reason: {reason}"]
         if conf is not None:
-            lines.append(f"Confidence: {conf}/100")
+            lines.append(f"💪 Confidence: {conf}/100")
         lines.append("— Not financial advice —")
         return "\n".join(lines)
 
@@ -1486,37 +1526,37 @@ def format_trade_card(rec: Dict) -> str:
 
     lines = [
         f"{tier_emoji} {ticker} — {dir_word} Trade",
-        f"Contract: {contract_line}",
-        f"Exp: {rec['exp']} | DTE: {rec['dte']} | Confidence: {conf}/100",
-        f"Cost: ${trade['debit']:.2f} (${risk_per:.0f} max risk) | Max Profit: ${trade['max_profit']:.2f} (${max_profit_per:.0f})",
+        f"🎯 Contract: {contract_line}",
+        f"📅 Exp: {rec['exp']} | DTE: {rec['dte']} | 💪 Confidence: {conf}/100",
+        f"💵 Cost: ${trade['debit']:.2f} (${risk_per:.0f} max risk) | Max Profit: ${trade['max_profit']:.2f} (${max_profit_per:.0f})",
     ]
 
     if EM_DISPLAY_ON_CARD and em > 0:
         em_low  = round(rec["spot"] - em, 2)
         em_high = round(rec["spot"] + em, 2)
-        lines.append(f"Expected Move: ±${em:.2f} (${em_low:.2f} – ${em_high:.2f})")
+        lines.append(f"📐 Expected Move: ±${em:.2f} (${em_low:.2f} – ${em_high:.2f})")
 
     lines += [
         "",
-        "Why this trade:",
+        "🧠 Why this trade:",
         f"  • {'; '.join(why[:3])}.",
         "",
-        "Plan:",
+        "📋 Plan:",
         f"  • Work the entry near a fair fill around ${trade['debit']:.2f}.",
         f"  • First target: ${exits['same_day']['sell_at']:.2f} (+30%).",
         f"  • Next target: ${exits['next_day']['sell_at']:.2f} (+35%).",
         f"  • Extended target: ${exits['extended']['sell_at']:.2f} (+50%).",
     ]
     if rec.get("stop_price"):
-        lines.append(f"  • Stop: ${rec['stop_price']:.2f} ({rec['stop_note']}).")
+        lines.append(f"  • Stop: ${rec['stop_price']:.2f} ({STOP_LOSS_PCT:.0%} loss).")
     else:
         lines.append(f"  • Stop: {rec['stop_note']}.")
 
     lines += [
         "",
-        f"Main risk: {'; '.join(risk_notes[:2])}.",
+        f"⚠️ Main risk: {'; '.join(risk_notes[:2])}.",
         "",
-        "Data:",
+        "📦 Data:",
         f"  Width ${trade['width']:.2f} | Long {trade['long']} / Short {trade['short']}",
         f"  ITM: long ${trade['long_itm']:.2f} | short ${trade['short_itm']:.2f}",
         f"  RoR {trade['ror']:.0%} | Win Prob {trade.get('win_prob', 0):.0%} | EV ${trade.get('expected_value', 0):.2f}/contract",
@@ -1545,7 +1585,7 @@ def format_trade_card(rec: Dict) -> str:
         lines.append("  Width ladder: " + " | ".join(f"${c['width']:.2f}:{c['long']}/{c['short']}" for c in ladder[:3]))
 
     if rec.get("conf_reasons"):
-        lines.append("  Why confidence: " + " | ".join(rec["conf_reasons"][:3]))
+        lines.append("💭 Why confidence: " + " | ".join(rec["conf_reasons"][:4]))
 
     lines += ["", f"Size: {rec['sizing_note']}", "", "— Not financial advice —"]
     return "\n".join(lines)
