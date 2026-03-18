@@ -136,16 +136,6 @@ SIGNAL_WARN_CONF_PENALTY      = int(os.getenv("SIGNAL_WARN_CONF_PENALTY", "6") o
 SIGNAL_MODERATE_CONF_PENALTY  = int(os.getenv("SIGNAL_MODERATE_CONF_PENALTY", "12") or 12)
 SIGNAL_STALE_AFTER_SEC        = int(os.getenv("SIGNAL_STALE_AFTER_SEC", "900") or 900)
 
-# Hot-path performance controls
-HOT_PATH_SKIP_EARNINGS        = (os.getenv("HOT_PATH_SKIP_EARNINGS", "1").strip().lower() not in ("0", "false", "no"))
-BURST_QUEUE_DEPTH             = int(os.getenv("BURST_QUEUE_DEPTH", "6") or 6)
-SCALP_NORMAL_MAX_EXPS         = int(os.getenv("SCALP_NORMAL_MAX_EXPS", "3") or 3)
-SCALP_BURST_MAX_EXPS_T1       = int(os.getenv("SCALP_BURST_MAX_EXPS_T1", "2") or 2)
-SCALP_BURST_MAX_EXPS_T2       = int(os.getenv("SCALP_BURST_MAX_EXPS_T2", "1") or 1)
-PREFETCH_MAX_EXPS             = int(os.getenv("PREFETCH_MAX_EXPS", "1") or 1)
-PREFETCH_THREADS              = int(os.getenv("PREFETCH_THREADS", "2") or 2)
-SHALLOW_CHAIN_STRIKE_LIMIT    = int(os.getenv("SHALLOW_CHAIN_STRIKE_LIMIT", "12") or 12)
-
 TELEGRAM_PORTFOLIO_CHAT_ID     = os.getenv("TELEGRAM_PORTFOLIO_CHAT_ID",     "").strip()
 TELEGRAM_MOM_PORTFOLIO_CHAT_ID = os.getenv("TELEGRAM_MOM_PORTFOLIO_CHAT_ID", "").strip()
 
@@ -194,52 +184,6 @@ class _MemStore:
 
 
 _mem_store = _MemStore()
-
-
-_deadline_local = threading.local()
-
-
-def _set_deadline(seconds_from_now: float | None):
-    if seconds_from_now is None:
-        _deadline_local.ts = None
-    else:
-        _deadline_local.ts = time.monotonic() + max(0.01, float(seconds_from_now))
-
-
-def _clear_deadline():
-    _deadline_local.ts = None
-
-
-def _deadline_remaining() -> float | None:
-    ts = getattr(_deadline_local, "ts", None)
-    if ts is None:
-        return None
-    return ts - time.monotonic()
-
-
-def _ensure_deadline(stage: str = ""):
-    rem = _deadline_remaining()
-    if rem is not None and rem <= 0:
-        raise TimeoutError(f"deadline exceeded{': ' + stage if stage else ''}")
-
-
-def _get_queue_depth() -> int:
-    r = _get_redis()
-    try:
-        return int(r.llen(REDIS_QUEUE_KEY)) if r else int(_mem_signal_queue.qsize())
-    except Exception:
-        return int(_mem_signal_queue.qsize())
-
-
-def _under_queue_pressure(depth: int | None = None) -> bool:
-    d = _get_queue_depth() if depth is None else int(depth)
-    return d >= BURST_QUEUE_DEPTH
-
-
-def _max_expirations_for_signal(tier: str = "2", queue_depth: int | None = None) -> int:
-    if _under_queue_pressure(queue_depth):
-        return max(1, SCALP_BURST_MAX_EXPS_T1 if str(tier) == "1" else SCALP_BURST_MAX_EXPS_T2)
-    return max(1, SCALP_NORMAL_MAX_EXPS)
 
 
 def _get_redis():
@@ -371,11 +315,14 @@ def _prefetch_ticker(ticker: str):
         # 1. Spot price
         spot = get_spot(ticker)
 
-        # 2. Options chains — shallow prefetch only; workers can deepen later if needed
-        chains = get_options_chain(ticker, max_expirations=PREFETCH_MAX_EXPS)
+        # 2. Options chains (the slowest part — multiple expirations)
+        chains = get_options_chain(ticker)
 
-        # 3. Skip earnings in hot-path prefetch; resolve later only for survivors
-        enrichment = {"has_earnings": False, "earnings_warn": None, "deferred": True}
+        # 3. Enrichment (earnings check) — with short timeout to avoid Finnhub stalls
+        try:
+            enrichment = enrich_ticker(ticker)
+        except Exception:
+            enrichment = {"has_earnings": False, "earnings_warn": None}
 
         # 4. Daily candles for RV
         candle_closes = get_daily_candles(ticker, days=RV_LOOKBACK_DAYS + 5)
@@ -428,8 +375,8 @@ def _prefetch_wave(tickers: list):
     log.info(f"Wave prefetch: fetching {len(to_fetch)} tickers "
              f"({len(unique) - len(to_fetch)} already cached)")
 
-    # Keep prefetch intentionally shallow; too much parallelism hurts bursts more than it helps.
-    with ThreadPoolExecutor(max_workers=max(1, min(PREFETCH_THREADS, len(to_fetch)))) as pool:
+    # Use max 4 threads to avoid API rate limits, but still parallel
+    with ThreadPoolExecutor(max_workers=min(4, len(to_fetch))) as pool:
         pool.map(_prefetch_ticker, to_fetch)
 
     log.info(f"Wave prefetch complete: {len(to_fetch)} tickers ready")
@@ -950,14 +897,26 @@ _queue_worker_threads = _start_workers()
 
 def check_ticker_with_timeout(ticker, direction="bull", webhook_data=None, timeout_sec=None):
     timeout_sec = timeout_sec if timeout_sec is not None else CHECK_TICKER_TIMEOUT_SEC
-    try:
-        _set_deadline(timeout_sec)
-        return check_ticker(ticker, direction=direction, webhook_data=webhook_data)
-    except TimeoutError:
+    result = {}
+    exc_holder = []
+
+    def _run():
+        try:
+            result.update(check_ticker(ticker, direction=direction, webhook_data=webhook_data))
+        except Exception as e:
+            exc_holder.append(e)
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(timeout=timeout_sec)
+
+    if t.is_alive():
         log.error(f"check_ticker({ticker}) TIMED OUT after {timeout_sec}s")
         return {"ticker": ticker, "ok": False, "posted": False, "error": "timeout", "reason": "timeout"}
-    finally:
-        _clear_deadline()
+
+    if exc_holder:
+        raise exc_holder[0]
+    return result
 
 
 # ─────────────────────────────────────────────────────────
@@ -1006,17 +965,9 @@ def get_portfolio_chat_id(account: str) -> str:
 def md_get(url, params=None):
     if not MARKETDATA_TOKEN:
         raise RuntimeError("MARKETDATA_TOKEN not set")
-    _ensure_deadline("before md_get")
-    timeout = 8.0
-    rem = _deadline_remaining()
-    if rem is not None:
-        timeout = max(1.0, min(timeout, rem - 0.25))
-        if timeout <= 0.5:
-            raise TimeoutError("deadline exceeded before request")
     r = requests.get(url, headers={"Authorization": f"Bearer {MARKETDATA_TOKEN}"},
-                     params=params or {}, timeout=timeout)
+                     params=params or {}, timeout=8)
     r.raise_for_status()
-    _ensure_deadline("after md_get")
     return r.json()
 
 # v4.1: Cached API layer — reduces duplicate API calls by 70-90%
@@ -1123,8 +1074,7 @@ def _is_http_429(exc: Exception) -> bool:
 # OPTIONS CHAIN — SCALP (0-10 DTE)
 # ─────────────────────────────────────────────────────────
 
-def get_options_chain(ticker: str, max_expirations: int | None = None, side: str | None = None,
-                      strike_limit: int | None = None, contract_range: str | None = None) -> list:
+def get_options_chain(ticker: str) -> list:
     from trading_rules import MAX_EXPIRATIONS_TO_PULL
     ticker = ticker.strip().upper()
     exps   = get_expirations(ticker)
@@ -1153,21 +1103,13 @@ def get_options_chain(ticker: str, max_expirations: int | None = None, side: str
     if not valid_exps:
         raise RuntimeError(f"No usable expirations for {ticker}")
 
-    exps_to_fetch = valid_exps[:(max_expirations or MAX_EXPIRATIONS_TO_PULL)]
+    exps_to_fetch = valid_exps[:MAX_EXPIRATIONS_TO_PULL]
     results = []
     saw_rate_limit = False
 
     for dte, exp in exps_to_fetch:
         try:
-            _ensure_deadline(f"chain {ticker} {exp}")
-            params = {"expiration": exp}
-            if side:
-                params["side"] = side
-            if strike_limit:
-                params["strike_limit"] = strike_limit
-            if contract_range:
-                params["range"] = contract_range
-            data = md_get(f"https://api.marketdata.app/v1/options/chain/{ticker}/", params)
+            data = md_get(f"https://api.marketdata.app/v1/options/chain/{ticker}/", {"expiration": exp})
             if not isinstance(data, dict) or data.get("s") != "ok":
                 continue
             sym_list = data.get("optionSymbol") or []
@@ -1215,29 +1157,6 @@ def get_options_chain(ticker: str, max_expirations: int | None = None, side: str
             raise RuntimeError(f"Rate limit hit while fetching options chain for {ticker}. Try again shortly.")
         raise RuntimeError(f"No valid chains fetched for {ticker}")
     return results
-
-
-def _get_options_chain_for_signal(ticker: str, direction: str, tier: str = "2", queue_depth: int | None = None) -> list:
-    """
-    Fast first pass for TV/scalp signals.
-    Use fewer expirations during bursts and ask the provider for only the relevant side.
-    Falls back to the normal broad fetch if the shallow request returns nothing.
-    """
-    max_exps = _max_expirations_for_signal(tier=tier, queue_depth=queue_depth)
-    side = "call" if str(direction).lower() == "bull" else "put"
-    try:
-        chains = get_options_chain(
-            ticker,
-            max_expirations=max_exps,
-            side=side,
-            strike_limit=SHALLOW_CHAIN_STRIKE_LIMIT,
-            contract_range="itm",
-        )
-        if chains:
-            return chains
-    except Exception as e:
-        log.warning(f"{ticker}: shallow chain scan failed, retrying broad fetch: {e}")
-    return get_options_chain(ticker, max_expirations=max_exps)
 
 
 # ─────────────────────────────────────────────────────────
@@ -1814,17 +1733,13 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
     webhook_data = webhook_data or {"bias": direction, "tier": "2"}
 
     try:
-        _ensure_deadline("check_ticker start")
-        queue_depth = _get_queue_depth()
-        tier = str((webhook_data or {}).get("tier", "2"))
         # v4.3: Smart prefetch-aware data loading
         # If a prefetch wave is in progress, wait for this ticker's data
         # rather than hitting APIs independently and causing rate limit cascades
         cached = _prefetch_get(ticker)
         if not cached and _prefetch_thread_active:
-            wait_cap = 8 if _under_queue_pressure(queue_depth) else PREFETCH_WORKER_WAIT_SEC
             wait_start = time.time()
-            while (time.time() - wait_start) < wait_cap:
+            while (time.time() - wait_start) < PREFETCH_WORKER_WAIT_SEC:
                 time.sleep(2)
                 cached = _prefetch_get(ticker)
                 if cached:
@@ -1847,21 +1762,13 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
             log.info(f"check_ticker({ticker}): using prefetch cache")
         else:
             # No cache — fetch live once, then store so the opposite side of /check can reuse it.
-            _ensure_deadline("fetch spot")
-            spot = get_spot(ticker)
-            _ensure_deadline("fetch chains")
-            chains = _get_options_chain_for_signal(ticker, direction=direction, tier=tier, queue_depth=queue_depth)
-            enrichment = {"has_earnings": False, "earnings_warn": None, "deferred": HOT_PATH_SKIP_EARNINGS}
-            if HOT_PATH_SKIP_EARNINGS:
-                has_earnings = False
-                earnings_warn = None
-            else:
-                try:
-                    enrichment = enrich_ticker(ticker)
-                except Exception:
-                    enrichment = {"has_earnings": False, "earnings_warn": None}
-                has_earnings = enrichment.get("has_earnings", False)
-                earnings_warn = enrichment.get("earnings_warn")
+            spot = get_spot(ticker); chains = get_options_chain(ticker)
+            try:
+                enrichment = enrich_ticker(ticker)
+            except Exception:
+                enrichment = {"has_earnings": False, "earnings_warn": None}
+            has_earnings = enrichment.get("has_earnings", False)
+            earnings_warn = enrichment.get("earnings_warn")
             candle_closes = get_daily_candles(ticker, days=RV_LOOKBACK_DAYS + 5)
             regime = get_current_regime()
             v4_flow = _run_v4_prefilter(ticker, spot, chains, candle_closes)
@@ -1898,7 +1805,6 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
 
         all_recs = []; all_reasons = []
         for exp, dte, contracts in chains:
-            _ensure_deadline(f"evaluate {ticker} {exp}")
             rec = recommend_trade(
                 ticker=ticker, spot=spot, contracts=contracts, dte=dte,
                 expiration=exp, webhook_data=webhook_data,
@@ -1921,23 +1827,6 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
             trade_journal.log_signal(ticker, webhook_data, outcome="rejected", reason=combined_reason[:200])
             return {"ticker": ticker, "ok": False, "posted": False,
                     "reason": combined_reason, "confidence": None}
-
-        if HOT_PATH_SKIP_EARNINGS and NO_EARNINGS_WEEK:
-            try:
-                _ensure_deadline("deferred earnings")
-                enrichment = enrich_ticker(ticker)
-                has_earnings = enrichment.get("has_earnings", False)
-                earnings_warn = enrichment.get("earnings_warn")
-                if has_earnings:
-                    reason = earnings_warn or "earnings in restricted window"
-                    trade_journal.log_signal(ticker, webhook_data, outcome="rejected", reason=reason[:200])
-                    return {"ticker": ticker, "ok": False, "posted": False,
-                            "reason": reason, "confidence": None,
-                            "signal_validation": signal_validation}
-            except TimeoutError:
-                raise
-            except Exception as e:
-                log.warning(f"{ticker}: deferred earnings lookup failed — continuing without block ({e})")
 
         def rec_score(r):
             trade = r.get("trade", {}); ror = trade.get("ror", 0)
@@ -3255,10 +3144,80 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
             card_title = f"TRADE SETUP ({effective_dte_label})"
 
         def no_trade(reason, emoji="⚪"):
-            post_to_telegram(
-                f"🎯 {ticker} — {card_title}  |  Exp: {exp_short}\n"
-                f"{emoji} NO TRADE — {reason}\n— Not financial advice —")
-            log.info(f"Trade card blocked: {ticker} | {reason}")
+            call_wall = walls.get("call_wall") if walls else None
+            put_wall = walls.get("put_wall") if walls else None
+            gamma_wall = walls.get("gamma_wall") if walls else None
+            flip_side = None
+            if flip is not None:
+                flip_side = "above" if spot >= flip else "below"
+
+            accel_up = flip or gamma_wall or call_wall or em.get("bull_1sd")
+            accel_dn = flip or gamma_wall or put_wall or em.get("bear_1sd")
+            reclaim_level = flip or gamma_wall or put_wall or spot
+            fail_level = flip or gamma_wall or call_wall or spot
+
+            range_lo = None
+            range_hi = None
+            if put_wall is not None and call_wall is not None:
+                range_lo, range_hi = put_wall, call_wall
+            elif em.get("bear_1sd") is not None and em.get("bull_1sd") is not None:
+                range_lo, range_hi = em.get("bear_1sd"), em.get("bull_1sd")
+
+            structure_lines = [
+                f"🎯 {ticker} — Dealer EM Brief ({effective_dte_label})  |  Exp: {exp_short}",
+                f"{emoji} No spread passed filters — {reason}",
+                f"Spot ${spot:.2f}  |  Bias {direction} (score {score:+d}/14)",
+                f"Expected move: ±${em['em_1sd']:.2f}  ({em['bear_1sd']:.2f} – {em['bull_1sd']:.2f})",
+            ]
+
+            if unified_regime:
+                structure_lines.append(f"Regime: {unified_regime.get('label', 'UNKNOWN')}")
+
+            if flip is not None or call_wall is not None or put_wall is not None or gamma_wall is not None:
+                structure_lines += ["", "📍 Key levels"]
+                if flip is not None:
+                    structure_lines.append(f"  • Gamma flip: ${flip:.2f} ({flip_side})")
+                if call_wall is not None:
+                    structure_lines.append(f"  • Call wall / resistance: ${call_wall:.2f}")
+                if put_wall is not None:
+                    structure_lines.append(f"  • Put wall / support: ${put_wall:.2f}")
+                if gamma_wall is not None:
+                    structure_lines.append(f"  • Gamma wall: ${gamma_wall:.2f}")
+                if range_lo is not None and range_hi is not None:
+                    structure_lines.append(f"  • Likely pin / balance zone: ${range_lo:.2f} – ${range_hi:.2f}")
+
+            structure_lines += ["", "⚙️ Trigger map"]
+            if accel_up is not None:
+                up_line = f"  • Above ${accel_up:.2f}: upside can accelerate toward ${em['bull_1sd']:.2f}"
+                if call_wall is not None and call_wall > em['bull_1sd']:
+                    up_line += f" then ${call_wall:.2f}"
+                structure_lines.append(up_line)
+            if accel_dn is not None:
+                dn_line = f"  • Below ${accel_dn:.2f}: downside can accelerate toward ${em['bear_1sd']:.2f}"
+                if put_wall is not None and put_wall < em['bear_1sd']:
+                    dn_line += f" then ${put_wall:.2f}"
+                structure_lines.append(dn_line)
+            if reclaim_level is not None:
+                structure_lines.append(f"  • Reclaim ${reclaim_level:.2f}: improves bullish structure")
+            if fail_level is not None:
+                structure_lines.append(f"  • Lose ${fail_level:.2f}: increases bearish pressure")
+
+            if eng:
+                gex_icon = "🧲" if tgex >= 0 else "⚡"
+                gex_mode = "mean-reverting / suppressive" if tgex >= 0 else "trend / amplifying"
+                structure_lines += ["", "📊 Dealer positioning",
+                    f"  • {gex_icon} GEX: {'+' if tgex >= 0 else ''}{tgex:.1f}M → {gex_mode}",
+                    f"  • DEX: {'+' if dex >= 0 else ''}{dex:.1f}M",
+                    f"  • Charm: {'+' if charm_m >= 0 else ''}{charm_m:.1f}M",
+                ]
+
+            if cagf:
+                structure_lines.append(f"  • Flow lean: {cagf.get('direction', 'NEUTRAL')} | Trend-day prob {cagf.get('trend_day_probability', 0):.0%}")
+
+            structure_lines.append("")
+            structure_lines.append("— Not financial advice —")
+            post_to_telegram("\n".join(structure_lines))
+            log.info(f"Trade card blocked (brief posted): {ticker} | {reason}")
 
         # ══════ GATE CHECKS ══════
 
@@ -3790,7 +3749,7 @@ threading.Thread(target=_em_scheduler, daemon=True, name="em-scheduler").start()
 
 
 # ─────────────────────────────────────────────────────────
-# STARTUP - 
+# STARTUP
 # ─────────────────────────────────────────────────────────
 
 with app.app_context():
