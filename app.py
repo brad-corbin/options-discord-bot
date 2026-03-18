@@ -38,6 +38,7 @@ import threading
 import queue
 import portfolio
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
@@ -125,6 +126,15 @@ BOT_URL             = os.getenv("BOT_URL",             "").strip()
 REDIS_URL           = os.getenv("REDIS_URL",           "").strip()
 SCAN_WORKERS        = int(os.getenv("SCAN_WORKERS", "4") or 4)
 DEDUP_TTL_SECONDS   = int(os.getenv("DEDUP_TTL_SECONDS", "3600") or 3600)
+
+# Live validation: TradingView is the trigger, bot data is the source of truth
+SCALP_SIGNAL_WARN_DRIFT_PCT   = float(os.getenv("SCALP_SIGNAL_WARN_DRIFT_PCT", "0.20") or 0.20)
+SCALP_SIGNAL_REJECT_DRIFT_PCT = float(os.getenv("SCALP_SIGNAL_REJECT_DRIFT_PCT", "0.35") or 0.35)
+SWING_SIGNAL_WARN_DRIFT_PCT   = float(os.getenv("SWING_SIGNAL_WARN_DRIFT_PCT", "0.45") or 0.45)
+SWING_SIGNAL_REJECT_DRIFT_PCT = float(os.getenv("SWING_SIGNAL_REJECT_DRIFT_PCT", "0.75") or 0.75)
+SIGNAL_WARN_CONF_PENALTY      = int(os.getenv("SIGNAL_WARN_CONF_PENALTY", "6") or 6)
+SIGNAL_MODERATE_CONF_PENALTY  = int(os.getenv("SIGNAL_MODERATE_CONF_PENALTY", "12") or 12)
+SIGNAL_STALE_AFTER_SEC        = int(os.getenv("SIGNAL_STALE_AFTER_SEC", "900") or 900)
 
 TELEGRAM_PORTFOLIO_CHAT_ID     = os.getenv("TELEGRAM_PORTFOLIO_CHAT_ID",     "").strip()
 TELEGRAM_MOM_PORTFOLIO_CHAT_ID = os.getenv("TELEGRAM_MOM_PORTFOLIO_CHAT_ID", "").strip()
@@ -1639,6 +1649,85 @@ def _run_v4_prefilter(ticker: str, spot: float, chains: list, candle_closes: lis
 # CHECK TICKER — scalp engine (0-10 DTE) + v4 flow quality gate
 # ─────────────────────────────────────────────────────────
 
+def _signal_validation_thresholds(webhook_data: dict) -> tuple[float, float]:
+    timeframe = str((webhook_data or {}).get("timeframe") or "").lower()
+    is_swing = any(tag in timeframe for tag in ("d", "w", "day", "week")) or bool((webhook_data or {}).get("is_swing"))
+    if is_swing:
+        return SWING_SIGNAL_WARN_DRIFT_PCT, SWING_SIGNAL_REJECT_DRIFT_PCT
+    return SCALP_SIGNAL_WARN_DRIFT_PCT, SCALP_SIGNAL_REJECT_DRIFT_PCT
+
+
+def _validate_live_signal(ticker: str, live_spot: float, webhook_data: dict | None) -> dict:
+    webhook_data = webhook_data or {}
+    alert_close = as_float(webhook_data.get("close"), 0.0)
+    received_at = as_float(webhook_data.get("received_at_epoch"), 0.0)
+    now_ts = time.time()
+    signal_age_sec = max(0, int(now_ts - received_at)) if received_at else None
+    warn_pct, reject_pct = _signal_validation_thresholds(webhook_data)
+
+    result = {
+        "ok": True,
+        "label": "LIVE_OK",
+        "reason": "",
+        "signal_age_sec": signal_age_sec,
+        "alert_close": alert_close if alert_close > 0 else None,
+        "live_spot": live_spot,
+        "drift_pct": None,
+        "warn_threshold_pct": warn_pct,
+        "reject_threshold_pct": reject_pct,
+        "confidence_penalty": 0,
+        "card_note": "",
+    }
+
+    if alert_close <= 0 or live_spot <= 0:
+        result["label"] = "NO_REFERENCE"
+        result["reason"] = "Missing alert close or live spot for validation"
+        result["card_note"] = "🟡 Signal validation: alert close unavailable — trade priced from live data only."
+        return result
+
+    drift_pct = abs((live_spot - alert_close) / alert_close) * 100.0
+    result["drift_pct"] = round(drift_pct, 3)
+
+    if signal_age_sec is not None and signal_age_sec > SIGNAL_STALE_AFTER_SEC:
+        result.update({
+            "ok": False,
+            "label": "STALE_SIGNAL",
+            "reason": f"Signal stale ({signal_age_sec}s old > {SIGNAL_STALE_AFTER_SEC}s)",
+            "card_note": f"🚫 Signal validation: stale alert ({signal_age_sec}s old).",
+        })
+        return result
+
+    if drift_pct >= reject_pct:
+        result.update({
+            "ok": False,
+            "label": "DRIFT_REJECT",
+            "reason": f"Live spot drift {drift_pct:.2f}% exceeded reject threshold {reject_pct:.2f}%",
+            "card_note": f"🚫 Signal validation: live spot moved {drift_pct:.2f}% from TV alert (${alert_close:.2f} → ${live_spot:.2f}).",
+        })
+        return result
+
+    if drift_pct >= warn_pct:
+        result.update({
+            "label": "DRIFT_WARN",
+            "reason": f"Live spot drift {drift_pct:.2f}% exceeded warn threshold {warn_pct:.2f}%",
+            "confidence_penalty": SIGNAL_MODERATE_CONF_PENALTY,
+            "card_note": f"🟡 Signal validation: live spot drift {drift_pct:.2f}% vs TV alert (${alert_close:.2f} → ${live_spot:.2f}); confidence reduced.",
+        })
+        return result
+
+    if drift_pct >= (warn_pct * 0.5):
+        result.update({
+            "label": "DRIFT_LIGHT",
+            "reason": f"Live spot drift {drift_pct:.2f}% is elevated but within limits",
+            "confidence_penalty": SIGNAL_WARN_CONF_PENALTY,
+            "card_note": f"🟢 Signal validation: live spot drift only {drift_pct:.2f}% from TV alert (${alert_close:.2f} → ${live_spot:.2f}).",
+        })
+        return result
+
+    result["card_note"] = f"🟢 Signal validation: TV ${alert_close:.2f} vs live ${live_spot:.2f} ({drift_pct:.2f}% drift)."
+    return result
+
+
 def check_ticker(ticker, direction="bull", webhook_data=None):
     ticker = ticker.strip().upper()
     webhook_data = webhook_data or {"bias": direction, "tier": "2"}
@@ -1698,6 +1787,22 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
                  f"earnings={has_earnings} candles={len(candle_closes)} direction={direction}"
                  f"{' v4=' + v4_flow.get('composite_regime', '?') if v4_flow else ''}")
 
+        signal_validation = _validate_live_signal(ticker, spot, webhook_data)
+        webhook_data = dict(webhook_data or {})
+        webhook_data["live_spot"] = spot
+        webhook_data["signal_validation"] = signal_validation
+
+        if not signal_validation.get("ok", True):
+            reason = signal_validation.get("reason") or "signal validation failed"
+            trade_journal.log_signal(ticker, webhook_data, outcome="rejected", reason=reason[:200])
+            log.info(f"check_ticker({ticker}): rejected by validation — {reason}")
+            return {
+                "ticker": ticker, "ok": False, "posted": False,
+                "reason": reason,
+                "confidence": None,
+                "signal_validation": signal_validation,
+            }
+
         all_recs = []; all_reasons = []
         for exp, dte, contracts in chains:
             rec = recommend_trade(
@@ -1738,6 +1843,13 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
             if r.get("exp") not in seen_exps:
                 seen_exps.add(r.get("exp")); other_exps.append(r)
 
+        penalty = int((signal_validation or {}).get("confidence_penalty") or 0)
+        if penalty > 0:
+            base_conf = int(best_rec.get("confidence", 0) or 0)
+            best_rec["confidence_pre_validation"] = base_conf
+            best_rec["confidence"] = max(0, base_conf - penalty)
+            best_rec["signal_validation_penalty"] = penalty
+
         trade = best_rec.get("trade", {})
 
         if is_duplicate_trade(ticker, direction, trade.get("short"), trade.get("long")):
@@ -1750,6 +1862,9 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
         )
 
         card = format_trade_card(best_rec)
+        validation_note = (signal_validation or {}).get("card_note")
+        if validation_note:
+            card = validation_note + "\n\n" + card
 
         if not risk_result["allowed"]:
             block_reasons = "; ".join(risk_result["blocks"])
@@ -1784,6 +1899,7 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
             "ticker": ticker, "ok": True, "posted": True, "card": card,
             "confidence": best_rec.get("confidence"), "trade": trade,
             "expirations_checked": len(chains),
+            "signal_validation": signal_validation,
         }
     except Exception as e:
         log.error(f"check_ticker({ticker}): {type(e).__name__}: {e}")
@@ -1824,6 +1940,13 @@ def debug():
         "PORTFOLIO_CHANNEL_set": bool(TELEGRAM_PORTFOLIO_CHAT_ID),
         "MOM_CHANNEL_set": bool(TELEGRAM_MOM_PORTFOLIO_CHAT_ID),
         "API_CACHE": _cached_md.get_stats(),
+        "SIGNAL_VALIDATION": {
+            "SCALP_WARN_PCT": SCALP_SIGNAL_WARN_DRIFT_PCT,
+            "SCALP_REJECT_PCT": SCALP_SIGNAL_REJECT_DRIFT_PCT,
+            "SWING_WARN_PCT": SWING_SIGNAL_WARN_DRIFT_PCT,
+            "SWING_REJECT_PCT": SWING_SIGNAL_REJECT_DRIFT_PCT,
+            "STALE_AFTER_SEC": SIGNAL_STALE_AFTER_SEC,
+        },
     })
 
 @app.route("/tgtest", methods=["GET"])
@@ -1905,6 +2028,7 @@ def tv_webhook():
 
     webhook_data = {
         "tier": tier, "bias": bias, "close": close, "time": data.get("time", ""),
+        "received_at_epoch": time.time(),
         "ema5": as_float(data.get("ema5")), "ema12": as_float(data.get("ema12")),
         "ema_dist_pct": as_float(data.get("ema_dist_pct")),
         "macd_hist": as_float(data.get("macd_hist")),
@@ -1975,6 +2099,7 @@ def swing_webhook():
 
     webhook_data = {
         "tier": tier, "bias": bias, "close": close, "time": data.get("time", ""),
+        "received_at_epoch": time.time(),
         "fib_level": data.get("fib_level", "61.8"),
         "fib_distance_pct": as_float(data.get("fib_distance_pct"), 2.0),
         "fib_high": as_float(data.get("fib_high")), "fib_low": as_float(data.get("fib_low")),
