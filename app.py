@@ -3045,7 +3045,7 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
                 spread_type=spread_type, long_label=long_label,
                 short_label=short_label, stop_level=stop_level,
                 effective_dte_label=effective_dte_label, size_pct=size_pct,
-                walls=walls or {}, expiry_label=expiry,
+                walls=walls or {}, expiry_label=expiration,
             )
             post_to_telegram(dc)
             try:
