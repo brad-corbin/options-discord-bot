@@ -1302,6 +1302,27 @@ def _pick_wheel_short(contract_rows: list, side: str, spot: float, em: dict, wal
     }
 
 
+def _wheel_label_from_delta(delta: float | None, option_type: str) -> tuple[str, str]:
+    d = abs(delta or 0.0)
+    if d <= 0.18:
+        return "Conservative", "🟢"
+    if d <= 0.30:
+        return "Balanced", "🟡"
+    return "Aggressive", "🔴"
+
+
+def _wheel_premium_quality(credit: float | None, spot: float | None) -> tuple[str, str]:
+    try:
+        ratio = (credit or 0.0) / max(spot or 0.0, 0.01)
+    except Exception:
+        ratio = 0.0
+    if ratio >= 0.035:
+        return "Strong", "🟢"
+    if ratio >= 0.015:
+        return "Fair", "🟡"
+    return "Light", "⚪"
+
+
 def _build_wheel_focus_block(ticker: str, expiry: str, spot: float, em: dict, walls: dict):
     """Return wheel-focused lines for /monitorlong using the selected buffered expiry."""
     try:
@@ -1316,32 +1337,41 @@ def _build_wheel_focus_block(ticker: str, expiry: str, spot: float, em: dict, wa
     cc = _pick_wheel_short(contracts, "call", spot, em, walls or {}, adjusted_basis=adjusted_basis)
     csp = _pick_wheel_short(contracts, "put", spot, em, walls or {}, adjusted_basis=None)
 
-    lines = ["", "Wheel Focus (30 DTE style):"]
+    lines = ["", "🔄 Wheel Focus (30 DTE style):"]
     stage = wheel.get("stage", "ACTIVE")
     stage_emoji = wheel.get("stage_emoji", "🔄")
-    shares = wheel.get("shares") or 0
     basis_txt = f" | Adjusted basis: ${adjusted_basis:.2f}" if adjusted_basis is not None else ""
     lines.append(f"  {stage_emoji} Stage: {stage}{basis_txt}")
 
     if wheel.get("has_shares") and cc:
+        fit, fit_emoji = _wheel_label_from_delta(cc.get("delta"), "call")
+        prem, prem_emoji = _wheel_premium_quality(cc.get("credit"), spot)
         basis_guard = f" above basis ${adjusted_basis:.2f}" if adjusted_basis is not None else " above spot"
         lines.append(
             f"  📞 Preferred CC: Sell {ticker} {expiry} ${cc['strike']:.1f}C for ~${cc['credit']:.2f} credit "
             f"(Δ {cc['delta']:.2f}, OI {cc['oi']})"
         )
-        lines.append(f"     Why: keeps the call{basis_guard} and near resistance/upper range without reaching too far.")
+        lines.append(f"     Why: keeps the call{basis_guard} and nearer the upper expected-move / resistance zone without capping too early.")
+        lines.append(f"     ⚖️ Wheel fit: {fit_emoji} {fit} | 💵 Premium quality: {prem_emoji} {prem}")
     elif cc:
+        fit, fit_emoji = _wheel_label_from_delta(cc.get("delta"), "call")
+        prem, prem_emoji = _wheel_premium_quality(cc.get("credit"), spot)
         lines.append(
             f"  📞 CC watch: {ticker} {expiry} ${cc['strike']:.1f}C ~${cc['credit']:.2f} credit "
             f"(Δ {cc['delta']:.2f}, OI {cc['oi']})"
         )
+        lines.append("     Why: sits above spot and closer to the upper expected-move / resistance area, which gives upside room before assignment risk climbs.")
+        lines.append(f"     ⚖️ Wheel fit: {fit_emoji} {fit} | 💵 Premium quality: {prem_emoji} {prem}")
 
     if csp:
+        fit, fit_emoji = _wheel_label_from_delta(csp.get("delta"), "put")
+        prem, prem_emoji = _wheel_premium_quality(csp.get("credit"), spot)
         lines.append(
             f"  🔻 Preferred CSP: Sell {ticker} {expiry} ${csp['strike']:.1f}P for ~${csp['credit']:.2f} credit "
             f"(Δ {csp['delta']:.2f}, OI {csp['oi']})"
         )
         lines.append("     Why: places the strike under spot and closer to support / lower expected-move territory.")
+        lines.append(f"     ⚖️ Wheel fit: {fit_emoji} {fit} | 💵 Premium quality: {prem_emoji} {prem}")
 
     if not cc and not csp:
         lines.append("  No clean 30 DTE wheel strikes found on this chain.")
@@ -3371,10 +3401,10 @@ def _post_monitor_card(ticker: str, mode: str):
 
         lines = [
             f"{mode_emoji} {ticker} — {mode_label}",
-            f"Spot: ${spot:.2f} | IV: {iv_emoji} {iv_pct:.1f}% | Exp: {expiration} ({dte} DTE)",
-            f"Bias: {simple_dir} | Confidence: {conf_label} ({conf_score:.0%}){downgrade_note}",
+            f"🎯 Spot / Exp: ${spot:.2f} | IV: {iv_emoji} {iv_pct:.1f}% | Exp: {expiration} ({dte} DTE)",
+            f"📈 Bias: {simple_dir} | 💪 Confidence: {conf_label} ({conf_score:.0%}){downgrade_note}",
             "",
-            "What matters:",
+            "🧠 What matters:",
         ]
         for item in reason_lines[:3]:
             lines.append(f"  • {item}")
@@ -3383,15 +3413,15 @@ def _post_monitor_card(ticker: str, mode: str):
 
         lines += [
             "",
-            f"Gamma note: {flip_line}",
+            f"☢️ Gamma note: {flip_line}",
             "",
-            "Expected Move (~21-day thesis):" if mode == "long" else f"Expected Move ({thesis_days}-day view):",
+            "📐 Expected Move (~21-day thesis):" if mode == "long" else f"📐 Expected Move ({thesis_days}-day view):",
             f"  1σ: ${em['bear_1sd']:.2f} → ${em['bull_1sd']:.2f} (±${em['em_1sd']:.2f})",
             f"  2σ: ${em['bear_2sd']:.2f} → ${em['bull_2sd']:.2f}",
             "",
-            f"Bottom line: {verdict}",
+            f"💡 Bottom line: {verdict}",
             "",
-            "Data:",
+            "📦 Data:",
         ]
 
         if put_wall is not None:
