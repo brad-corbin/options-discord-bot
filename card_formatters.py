@@ -473,6 +473,7 @@ def format_decision_card(
     size_pct: int = 0,
     walls: Optional[dict] = None,
     expiry_label: str = "",
+    est_cost: Optional[float] = None,
 ) -> str:
     """Decision-first Telegram card with the contract shown immediately."""
     direction = bias.get("direction", "NEUTRAL")
@@ -518,8 +519,6 @@ def format_decision_card(
     if spread_type and long_label and short_label:
         exp_part = f" {expiry_label}" if expiry_label else ""
         contract_line = f"Buy {ticker}{exp_part} {long_label} / Sell {ticker}{exp_part} {short_label}"
-        if effective_dte_label:
-            contract_line += f"  ({effective_dte_label})"
     elif dte_rec and dte_rec.get("primary"):
         p = dte_rec["primary"]
         contract_line = f"Best fit today: {p['label']}"
@@ -533,13 +532,15 @@ def format_decision_card(
 
     lines = [
         f"📊 {ticker} — Trade Decision",
-        f"**Trade:** {contract_line}",
-        f"**Bias:** 📈 {plain_dir} | Confidence: 💪 {conf_label} ({conf_score:.0%})",
-        f"**Expected Move:** ${bear_1sd:.2f} → ${bull_1sd:.2f} (±${em_1sd:.2f})" if em_1sd else "**Expected Move:** unavailable",
-        f"**🧠 Why take it:** {reasons[0]}.",
+        f"🎯 Trade: {contract_line}",
+        f"📈 Bias: {plain_dir} | 💪 Confidence: {conf_label} ({conf_score:.0%})",
+        f"📐 Expected Move: ${bear_1sd:.2f} → ${bull_1sd:.2f} (±${em_1sd:.2f})" if em_1sd else "📐 Expected Move: unavailable",
     ]
+    if est_cost is not None and est_cost > 0:
+        lines.append(f"💵 Pricing: est. net debit ~${est_cost:.2f} per spread")
+    lines.append(f"🧠 Why take it: {reasons[0]}.")
     if len(reasons) > 1:
-        lines.append(f"**💭 Why this contract:** {reasons[1]}.")
+        lines.append(f"💭 Why this contract: {reasons[1]}.")
     if flip:
         if spot >= flip:
             flip_line = f"Gamma Flip: ${flip:.2f} — price is above it now. A break below can weaken bullish holds and increase chop."
@@ -548,14 +549,14 @@ def format_decision_card(
         if dist_flip_pct is not None and dist_flip_pct >= 2.5:
             side = "overhead" if flip > spot else "below"
             flip_line += f" It is fairly far {side}, so use it more as a regime line than a tight trigger."
-        lines.append(f"**☢️ Gamma Flip:** " + flip_line.replace("Gamma Flip: ", ""))
+        lines.append(f"☢️ Gamma Flip: " + flip_line.replace("Gamma Flip: ", ""))
     else:
-        lines.append("**☢️ Gamma Flip:** not available on this chain.")
+        lines.append("☢️ Gamma Flip: not available on this chain.")
 
     if stop_level:
-        lines.append(f"**📋 Plan:** entry near ${spot:.2f}; risk gets worse through ${stop_level:.2f}; size {size_pct}% of normal.")
+        lines.append(f"📋 Plan: entry near ${spot:.2f}; risk gets worse through ${stop_level:.2f}; size {size_pct}% of normal.")
     else:
-        lines.append(f"**📋 Plan:** entry near ${spot:.2f}; size {size_pct}% of normal and wait for confirmation.")
+        lines.append(f"📋 Plan: entry near ${spot:.2f}; size {size_pct}% of normal and wait for confirmation.")
 
     data_parts = []
     if put_wall is not None:
@@ -565,7 +566,7 @@ def format_decision_card(
     if gamma_wall is not None:
         data_parts.append(f"Gamma Wall ${gamma_wall:.2f}")
     if data_parts:
-        lines.append("**📦 Data:** " + " | ".join(data_parts))
+        lines.append("📦 Data: " + " | ".join(data_parts))
 
     lines += ["", "— Not financial advice —"]
     return "\n".join(lines)
