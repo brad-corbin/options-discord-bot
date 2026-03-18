@@ -1174,6 +1174,180 @@ def get_options_chain_swing(ticker: str) -> list:
     return results
 
 
+def _get_contracts_for_expiry(ticker: str, exp: str) -> list:
+    """Fetch a single-expiry chain snapshot for wheel/monitor suggestions."""
+    data = md_get(f"https://api.marketdata.app/v1/options/chain/{ticker}/", {"expiration": exp})
+    if not isinstance(data, dict) or data.get("s") != "ok":
+        return []
+    sym_list = data.get("optionSymbol") or []
+    if not sym_list:
+        return []
+    n = len(sym_list)
+
+    def col(name, default=None):
+        v = data.get(name, default)
+        return v if isinstance(v, list) else [default] * n
+
+    contracts = []
+    sides = col("side", "")
+    for i in range(n):
+        right = (sides[i] or "").lower().strip()
+        right = "call" if right in ("c", "call") else "put" if right in ("p", "put") else right
+        bid = as_float(col("bid", None)[i], None)
+        ask = as_float(col("ask", None)[i], None)
+        mid = as_float(col("mid", None)[i], None)
+        strike = as_float(col("strike", None)[i], None)
+        if strike is None:
+            continue
+        contracts.append({
+            "optionSymbol": col("optionSymbol", "")[i],
+            "right": right,
+            "strike": strike,
+            "expiration": exp,
+            "openInterest": as_int(col("openInterest", 0)[i], 0),
+            "volume": as_int(col("volume", 0)[i], 0),
+            "iv": as_float(col("iv", None)[i], None),
+            "delta": as_float(col("delta", None)[i], None),
+            "bid": bid,
+            "ask": ask,
+            "mid": mid,
+        })
+    return contracts
+
+
+def _wheel_est_credit(contract: dict) -> float | None:
+    bid = contract.get("bid")
+    ask = contract.get("ask")
+    mid = contract.get("mid")
+    vals = [v for v in (bid, ask, mid) if isinstance(v, (int, float)) and v > 0]
+    if not vals:
+        return None
+    if bid and mid:
+        return round((bid + mid) / 2.0, 2)
+    if mid:
+        return round(mid, 2)
+    return round(bid or ask or 0.0, 2)
+
+
+def _score_wheel_candidate(c: dict, target_delta: float, liquidity_floor: int = 50) -> float:
+    oi = c.get("openInterest") or 0
+    vol = c.get("volume") or 0
+    delta = abs(c.get("delta") or 0.0)
+    bid = c.get("bid") or 0.0
+    ask = c.get("ask") or 0.0
+    spread_pen = 0.0
+    if bid > 0 and ask >= bid:
+        mid = max((bid + ask) / 2.0, 0.01)
+        spread_pen = max(0.0, (ask - bid) / mid)
+    liq_bonus = min((oi + vol) / max(liquidity_floor, 1), 2.0)
+    return -abs(delta - target_delta) + 0.20 * liq_bonus - 0.15 * spread_pen
+
+
+def _pick_wheel_short(contract_rows: list, side: str, spot: float, em: dict, walls: dict, adjusted_basis=None):
+    side = side.lower().strip()
+    candidates = []
+    target_delta = 0.22
+    for c in contract_rows:
+        if c.get("right") != side:
+            continue
+        strike = c.get("strike")
+        if strike is None:
+            continue
+        credit = _wheel_est_credit(c)
+        if credit is None or credit < 0.05:
+            continue
+        oi = c.get("openInterest") or 0
+        delta = abs(c.get("delta") or 0.0)
+        if side == "call":
+            if strike <= spot:
+                continue
+            if adjusted_basis is not None and strike < adjusted_basis:
+                continue
+            structural_ok = strike >= max((adjusted_basis or 0), spot + 0.35 * (em.get("em_1sd") or 0))
+            if walls.get("call_wall"):
+                structural_ok = structural_ok or strike >= walls.get("call_wall")
+        else:
+            if strike >= spot:
+                continue
+            structural_ok = strike <= spot - 0.30 * (em.get("em_1sd") or 0)
+            if walls.get("put_wall"):
+                structural_ok = structural_ok or strike <= walls.get("put_wall")
+        if delta and not (0.10 <= delta <= 0.40):
+            continue
+        score = _score_wheel_candidate(c, target_delta)
+        if structural_ok:
+            score += 0.30
+        if oi < 25:
+            score -= 0.40
+        candidates.append((score, c, credit))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    _, c, credit = candidates[0]
+    strike = c.get("strike")
+    delta = abs(c.get("delta") or 0.0)
+    oi = c.get("openInterest") or 0
+    bid = c.get("bid") or 0.0
+    ask = c.get("ask") or 0.0
+    mid = c.get("mid") or 0.0
+    return {
+        "strike": strike,
+        "credit": credit,
+        "delta": delta,
+        "oi": oi,
+        "bid": bid,
+        "ask": ask,
+        "mid": mid,
+        "expiration": c.get("expiration"),
+    }
+
+
+def _build_wheel_focus_block(ticker: str, expiry: str, spot: float, em: dict, walls: dict):
+    """Return wheel-focused lines for /monitorlong using the selected buffered expiry."""
+    try:
+        wheel = risk_manager.calc_wheel_pnl(ticker, account="brad")
+    except Exception:
+        wheel = {"has_shares": False, "adjusted_basis": None, "stage": "ACTIVE", "stage_emoji": "🔄", "shares": 0}
+    contracts = _get_contracts_for_expiry(ticker, expiry)
+    if not contracts:
+        return []
+
+    adjusted_basis = wheel.get("adjusted_basis")
+    cc = _pick_wheel_short(contracts, "call", spot, em, walls or {}, adjusted_basis=adjusted_basis)
+    csp = _pick_wheel_short(contracts, "put", spot, em, walls or {}, adjusted_basis=None)
+
+    lines = ["", "Wheel Focus (30 DTE style):"]
+    stage = wheel.get("stage", "ACTIVE")
+    stage_emoji = wheel.get("stage_emoji", "🔄")
+    shares = wheel.get("shares") or 0
+    basis_txt = f" | Adjusted basis: ${adjusted_basis:.2f}" if adjusted_basis is not None else ""
+    lines.append(f"  {stage_emoji} Stage: {stage}{basis_txt}")
+
+    if wheel.get("has_shares") and cc:
+        basis_guard = f" above basis ${adjusted_basis:.2f}" if adjusted_basis is not None else " above spot"
+        lines.append(
+            f"  📞 Preferred CC: Sell {ticker} {expiry} ${cc['strike']:.1f}C for ~${cc['credit']:.2f} credit "
+            f"(Δ {cc['delta']:.2f}, OI {cc['oi']})"
+        )
+        lines.append(f"     Why: keeps the call{basis_guard} and near resistance/upper range without reaching too far.")
+    elif cc:
+        lines.append(
+            f"  📞 CC watch: {ticker} {expiry} ${cc['strike']:.1f}C ~${cc['credit']:.2f} credit "
+            f"(Δ {cc['delta']:.2f}, OI {cc['oi']})"
+        )
+
+    if csp:
+        lines.append(
+            f"  🔻 Preferred CSP: Sell {ticker} {expiry} ${csp['strike']:.1f}P for ~${csp['credit']:.2f} credit "
+            f"(Δ {csp['delta']:.2f}, OI {csp['oi']})"
+        )
+        lines.append("     Why: places the strike under spot and closer to support / lower expected-move territory.")
+
+    if not cc and not csp:
+        lines.append("  No clean 30 DTE wheel strikes found on this chain.")
+    return lines
+
+
 # ─────────────────────────────────────────────────────────
 # IV RANK HELPER
 # ─────────────────────────────────────────────────────────
@@ -3235,6 +3409,8 @@ def _post_monitor_card(ticker: str, mode: str):
             if vr_line:
                 lines.append(f"  Vol: {vr_line}")
         lines.append(f"  IV note: {iv_note}")
+        if mode == "long":
+            lines += _build_wheel_focus_block(ticker, expiration, spot, em, walls or {})
         lines += ["", "📌 Monitoring only — no trade.", "— Not financial advice —"]
 
         post_to_telegram("\n".join(lines))
