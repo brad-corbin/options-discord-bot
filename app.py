@@ -1302,6 +1302,12 @@ def _pick_wheel_short(contract_rows: list, side: str, spot: float, em: dict, wal
     }
 
 
+
+def _wheel_pop_from_delta(delta: float | None) -> int:
+    d = abs(delta or 0.0)
+    pop = max(0.0, min(1.0, 1.0 - d))
+    return int(round(pop * 100))
+
 def _wheel_label_from_delta(delta: float | None, option_type: str) -> tuple[str, str]:
     d = abs(delta or 0.0)
     if d <= 0.18:
@@ -1349,7 +1355,7 @@ def _build_wheel_focus_block(ticker: str, expiry: str, spot: float, em: dict, wa
         basis_guard = f" above basis ${adjusted_basis:.2f}" if adjusted_basis is not None else " above spot"
         lines.append(
             f"  📞 Preferred CC: Sell {ticker} {expiry} ${cc['strike']:.1f}C for ~${cc['credit']:.2f} credit "
-            f"(Δ {cc['delta']:.2f}, OI {cc['oi']})"
+            f"(Δ {cc['delta']:.2f}, POP {_wheel_pop_from_delta(cc.get('delta'))}%, OI {cc['oi']})"
         )
         lines.append(f"     Why: keeps the call{basis_guard} and nearer the upper expected-move / resistance zone without capping too early.")
         lines.append(f"     ⚖️ Wheel fit: {fit_emoji} {fit} | 💵 Premium quality: {prem_emoji} {prem}")
@@ -1358,7 +1364,7 @@ def _build_wheel_focus_block(ticker: str, expiry: str, spot: float, em: dict, wa
         prem, prem_emoji = _wheel_premium_quality(cc.get("credit"), spot)
         lines.append(
             f"  📞 CC watch: {ticker} {expiry} ${cc['strike']:.1f}C ~${cc['credit']:.2f} credit "
-            f"(Δ {cc['delta']:.2f}, OI {cc['oi']})"
+            f"(Δ {cc['delta']:.2f}, POP {_wheel_pop_from_delta(cc.get('delta'))}%, OI {cc['oi']})"
         )
         lines.append("     Why: sits above spot and closer to the upper expected-move / resistance area, which gives upside room before assignment risk climbs.")
         lines.append(f"     ⚖️ Wheel fit: {fit_emoji} {fit} | 💵 Premium quality: {prem_emoji} {prem}")
@@ -1368,7 +1374,7 @@ def _build_wheel_focus_block(ticker: str, expiry: str, spot: float, em: dict, wa
         prem, prem_emoji = _wheel_premium_quality(csp.get("credit"), spot)
         lines.append(
             f"  🔻 Preferred CSP: Sell {ticker} {expiry} ${csp['strike']:.1f}P for ~${csp['credit']:.2f} credit "
-            f"(Δ {csp['delta']:.2f}, OI {csp['oi']})"
+            f"(Δ {csp['delta']:.2f}, POP {_wheel_pop_from_delta(csp.get('delta'))}%, OI {csp['oi']})"
         )
         lines.append("     Why: places the strike under spot and closer to support / lower expected-move territory.")
         lines.append(f"     ⚖️ Wheel fit: {fit_emoji} {fit} | 💵 Premium quality: {prem_emoji} {prem}")
