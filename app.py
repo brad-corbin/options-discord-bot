@@ -3180,6 +3180,21 @@ def _post_monitor_card(ticker: str, mode: str):
 
         if not reason_lines:
             reason_lines.append(verdict)
+
+        if flip is None:
+            flip_line = "Gamma flip unavailable for this chain."
+        else:
+            if dist_flip_pct is not None and dist_flip_pct >= 2.5:
+                if spot >= flip:
+                    flip_line = f"Gamma Flip: ${flip:.2f} — price is above it now. It is fairly far from spot, so treat it more like a regime line than a tight trigger. A clean break back below can make bullish holds less reliable."
+                else:
+                    flip_line = f"Gamma Flip: ${flip:.2f} — price is below it now. It is fairly far from spot, so treat it more like a regime line than a tight trigger. A reclaim back above usually makes bearish holds less reliable."
+            else:
+                if spot >= flip:
+                    flip_line = f"Gamma Flip: ${flip:.2f} — price is above it now. A break below can weaken bullish holds and increase chop."
+                else:
+                    flip_line = f"Gamma Flip: ${flip:.2f} — price is below it now. A reclaim above can weaken bearish holds and increase chop."
+
         lines = [
             f"{mode_emoji} {ticker} — {mode_label}",
             f"Spot: ${spot:.2f} | IV: {iv_emoji} {iv_pct:.1f}% | Exp: {expiration} ({dte} DTE)",
