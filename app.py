@@ -2606,8 +2606,7 @@ def _post_em_card(ticker: str, session: str):
             lines.append(f"  {arrow}  {text}")
         lines += ["═" * 32, "", f"💡 {iv_note}", "— Not financial advice —"]
 
-        post_to_telegram("\n".join(lines))
-        log.info(f"EM card posted: {ticker} | {session_label} | spot={spot} | IV={iv_pct:.1f}% | "
+        log.info(f"EM snapshot built: {ticker} | {session_label} | spot={spot} | IV={iv_pct:.1f}% | "
                  f"EM=±${em['em_1sd']} | score={bias['score']} | lean={bias['direction']} | "
                  f"conf={v4_result.get('confidence', {}).get('label', '?')}")
 
@@ -2617,21 +2616,9 @@ def _post_em_card(ticker: str, session: str):
         # ── v4.3: Resolve unified regime for trade card + plain cards ──
         unified_regime = resolve_unified_regime(eng or {}, cagf, spot)
 
-        # ── v4.3: Post plain English card ──
-        try:
-            plain_card = format_plain_english_card(
-                ticker=ticker, spot=spot, iv=iv, em=em, bias=bias,
-                eng=eng or {}, regime=unified_regime, cagf=cagf,
-                dte_rec=dte_rec, pcr=pcr, v4_result=v4_result,
-                session_label=session_label, target_date=target_date_str,
-                is_next_day=is_afternoon,
-            )
-            post_to_telegram(plain_card)
-        except Exception as e:
-            log.warning(f"Plain English card failed for {ticker}: {e}")
-
-        # NOTE: Decision card is posted by _post_trade_card (with trade details)
-        # rather than here, to avoid a duplicate without execution info.
+        # NOTE: The live /em user-facing output is intentionally compressed.
+        # We keep the full institutional snapshot for internal logging/backtests,
+        # then post a single decision-first card via _post_trade_card.
 
         # ── Compute session progress for trade card timing gates ──
         _mkt_open_ct = now_ct.replace(hour=8, minute=30, second=0, microsecond=0)
@@ -3042,15 +3029,14 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
             "━" * 32, "— Not financial advice —",
         ]
 
-        post_to_telegram("\n".join(lines))
-        log.info(f"Trade card: {ticker} | {direction} | {effective_dte_label} | "
+        log.info(f"Trade setup built: {ticker} | {direction} | {effective_dte_label} | "
                  f"{spread_type} {long_label}/{short_label} | "
                  f"width=${actual_width} (EM 1σ=${em_1sd:.2f}) | "
                  f"size={size_pct}% | dte_upgraded={dte_was_upgraded} | "
                  f"regime={unified_regime.get('label', '?') if unified_regime else '?'} | "
                  f"conf={v4_result.get('confidence', {}).get('label', '?') if v4_result else 'N/A'}")
 
-        # ── v4.3: Post decision card with trade details ──
+        # ── v4.3: Post a single decision-first card and cache it for /tradecard ──
         try:
             dc = format_decision_card(
                 ticker=ticker, spot=spot, em=em, bias=bias,
@@ -3059,8 +3045,14 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
                 spread_type=spread_type, long_label=long_label,
                 short_label=short_label, stop_level=stop_level,
                 effective_dte_label=effective_dte_label, size_pct=size_pct,
+                walls=walls or {},
             )
             post_to_telegram(dc)
+            try:
+                cache_key = f"tradecard:{ticker.upper()}"
+                store_set(cache_key, dc, ttl=DIGEST_CARD_CACHE_TTL_SEC)
+            except Exception:
+                pass
         except Exception as e:
             log.warning(f"Decision card failed for {ticker}: {e}")
 
@@ -3138,31 +3130,56 @@ def _post_monitor_card(ticker: str, mode: str):
         gamma_wall = walls.get("gamma_wall") if walls else None
 
         reason_lines = []
-        if dex < -0.25:
-            reason_lines.append("Dealers are short delta, so rallies can attract mechanical buying.")
-        elif dex > 0.25:
-            reason_lines.append("Dealers are long delta, so rallies may face hedging-related selling.")
-        if charm_m > 0:
-            reason_lines.append("Charm is supportive, which can help upside drift as time passes.")
-        elif charm_m < 0:
-            reason_lines.append("Charm is a headwind, so time decay may add pressure.")
-        if flip is not None:
-            if spot >= flip:
-                reason_lines.append(f"Price is above gamma flip ${flip:.2f}; staying above it usually keeps bullish holds cleaner.")
-            else:
-                reason_lines.append(f"Price is below gamma flip ${flip:.2f}; staying below it can make moves more unstable.")
+        counter_lines = []
+        dist_flip_pct = None
+        if flip is not None and spot:
+            dist_flip_pct = abs((flip - spot) / spot) * 100
+
+        if simple_dir == "Bullish":
+            if dex < -0.25:
+                reason_lines.append("Dealers are short delta, so rallies can attract mechanical buying.")
+            if charm_m > 0:
+                reason_lines.append("Charm is supportive, which can help upside drift as time passes.")
+            if put_wall is not None and put_wall < spot:
+                reason_lines.append(f"Put wall near ${put_wall:.2f} can act as support on pullbacks.")
+            if flip is not None:
+                if spot >= flip:
+                    reason_lines.append(f"Price is above gamma flip ${flip:.2f}; holding above it usually keeps bullish trades cleaner.")
+                else:
+                    counter_lines.append(f"Price is still below gamma flip ${flip:.2f}, so bullish follow-through needs more confirmation.")
+            if dex > 0.25:
+                counter_lines.append("Dealers are long delta, so upside can face hedging-related selling.")
+            if charm_m < 0:
+                counter_lines.append("Charm is a headwind, so time decay may add pressure.")
+        elif simple_dir == "Bearish":
+            if dex > 0.25:
+                reason_lines.append("Dealers are long delta, so rallies can meet hedging-related selling pressure.")
+            if charm_m < 0:
+                reason_lines.append("Charm is a headwind, so time decay can add downside pressure.")
+            if call_wall is not None and call_wall > spot:
+                reason_lines.append(f"Call wall near ${call_wall:.2f} can act as resistance on bounces.")
+            if flip is not None:
+                if spot <= flip:
+                    reason_lines.append(f"Price is below gamma flip ${flip:.2f}; staying below it usually keeps bearish trades cleaner.")
+                else:
+                    counter_lines.append(f"Price is above gamma flip ${flip:.2f}, so bearish follow-through needs more confirmation.")
+            if dex < -0.25:
+                counter_lines.append("Dealers are short delta, so sharp rallies can attract mechanical buying.")
+            if charm_m > 0:
+                counter_lines.append("Charm is supportive, which can help upside drift if price stabilizes.")
+        else:
+            if flip is not None:
+                if spot >= flip:
+                    reason_lines.append(f"Price is above gamma flip ${flip:.2f}; holding above it keeps upside conditions steadier.")
+                else:
+                    reason_lines.append(f"Price is below gamma flip ${flip:.2f}; staying below it can make moves more unstable.")
+            if abs(dex) > 0.25:
+                reason_lines.append("Dealer delta positioning is strong enough to matter on sharp moves.")
+            if abs(charm_m) > 0:
+                reason_lines.append("Charm flow is active, so time decay can still influence direction.")
+
         if not reason_lines:
             reason_lines.append(verdict)
-
-        flip_line = "Gamma flip unavailable for this chain."
-        if flip is not None:
-            if spot >= flip:
-                flip_line = (f"Gamma Flip: ${flip:.2f} — price is above it now. "
-                             f"A clean break below can weaken bullish holds and increase chop.")
-            else:
-                flip_line = (f"Gamma Flip: ${flip:.2f} — price is below it now. "
-                             f"A reclaim back above it usually makes bearish holds less reliable.")
-
         lines = [
             f"{mode_emoji} {ticker} — {mode_label}",
             f"Spot: ${spot:.2f} | IV: {iv_emoji} {iv_pct:.1f}% | Exp: {expiration} ({dte} DTE)",
@@ -3172,6 +3189,8 @@ def _post_monitor_card(ticker: str, mode: str):
         ]
         for item in reason_lines[:3]:
             lines.append(f"  • {item}")
+        if counter_lines:
+            lines.append(f"  • Counterpoint: {counter_lines[0]}")
 
         lines += [
             "",
