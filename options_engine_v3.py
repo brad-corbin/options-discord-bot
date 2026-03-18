@@ -548,11 +548,27 @@ def build_itm_debit_spreads(
             next_day_target = round(debit * (1 + NEXT_DAY_EXIT_PCT), 2)
             extended_target = round(debit * (1 + EXTENDED_HOLD_EXIT_PCT), 2)
 
+            natural_debit = None
+            if long_q.get("ask") is not None and short_q.get("bid") is not None:
+                try:
+                    natural_debit = max(0.0, float(long_q.get("ask") or 0) - float(short_q.get("bid") or 0))
+                except Exception:
+                    natural_debit = None
+
+            natural_debit = None
+            if long_q.get("ask") is not None and short_q.get("bid") is not None:
+                try:
+                    natural_debit = max(0.0, float(long_q.get("ask") or 0) - float(short_q.get("bid") or 0))
+                except Exception:
+                    natural_debit = None
+
             candidates.append({
                 "long":           long_k,
                 "short":          short_k,
                 "width":          width,
                 "debit":          round(debit, 2),
+                "natural_debit":  round(natural_debit, 2) if natural_debit is not None else None,
+                "natural_debit":  round(natural_debit, 2) if natural_debit is not None else None,
                 "cost_pct":       round(cost_pct * 100, 1),
                 "max_profit":     round(max_profit, 2),
                 "max_loss":       round(max_loss, 2),
@@ -754,6 +770,12 @@ def rank_candidates(candidates: List[Dict], iv_edge_label: str = "NEUTRAL") -> L
         c["ev_after_slippage"] = round(ev_after_slippage, 4)
         c["est_slippage"] = round(est_slippage, 4)
 
+        natural_debit = c.get("natural_debit")
+        display_debit = debit + est_slippage
+        if natural_debit is not None:
+            display_debit = min(float(natural_debit), display_debit)
+        c["display_debit"] = round(display_debit, 2)
+
         if ev_after_slippage <= SLIPPAGE_MIN_EV_AFTER:
             c["_rejected"] = "slippage_or_negative_ev"
             continue
@@ -867,7 +889,7 @@ def compute_stop_loss(
 ) -> Tuple[Optional[float], str]:
     if USE_STOP_LOSS_ALL or ticker.upper() in HIGH_VOLUME_TICKERS:
         stop_price = round(debit * (1 - STOP_LOSS_PCT), 2)
-        return stop_price, f"Stop at ${stop_price:.2f} ({STOP_LOSS_PCT:.0%} loss)"
+        return stop_price, f"{STOP_LOSS_PCT:.0%} loss"
     else:
         return None, "No stop (low-vol ticker — manage manually)"
 
@@ -909,12 +931,12 @@ def compute_confidence(
     )
 
     if is_manual:
-        score = 55
+        score = 53
         reasons.append("Manual check (no signal)")
 
         ror = trade.get("ror", 0)
         if ror >= 0.50:
-            score += 10
+            score += 8
             reasons.append(f"Strong RoR ({ror:.2f})")
         elif ror >= 0.30:
             score += 5
@@ -922,10 +944,10 @@ def compute_confidence(
 
         ev_after = trade.get("ev_after_slippage", trade.get("expected_value", 0))
         if ev_after > 0.05:
-            score += 6
+            score += 4
             reasons.append(f"Positive EV after slippage (${ev_after:.2f})")
         elif ev_after > 0:
-            score += 2
+            score += 1
             reasons.append(f"Slightly positive EV (${ev_after:.2f})")
         else:
             score -= 10
@@ -933,7 +955,7 @@ def compute_confidence(
 
         wp = trade.get("win_prob", 0.5)
         if wp >= 0.60:
-            score += 5
+            score += 4
             reasons.append(f"Good profit probability ({wp:.0%})")
         elif wp < 0.50:
             score -= 6
@@ -941,15 +963,15 @@ def compute_confidence(
 
         cost_pct = trade.get("cost_pct", 100)
         if cost_pct <= 55:
-            score += 10
+            score += 8
             reasons.append(f"Great pricing ({cost_pct:.0f}%)")
         elif cost_pct <= 65:
-            score += 5
+            score += 4
             reasons.append(f"Good pricing ({cost_pct:.0f}%)")
 
         warn_count = len(trade.get("warnings", []))
         if warn_count:
-            score -= warn_count * 5
+            score -= warn_count * 4
             reasons.append(f"{warn_count} liquidity warning(s)")
 
     else:
@@ -1196,6 +1218,11 @@ def compute_confidence(
     if has_dividend:
         score += CONFIDENCE_PENALTIES["dividend_in_dte"]
         reasons.append("DIVIDEND IN DTE — BLOCKED")
+
+    if is_manual:
+        score = min(score, 84)
+    else:
+        score = min(score, 96)
 
     score = max(0, min(100, score))
     return score, reasons
@@ -1454,9 +1481,9 @@ def format_trade_card(rec: Dict) -> str:
     tier         = rec.get("tier", "?")
     conf         = rec.get("confidence", 0)
     direction    = rec.get("direction", "bull")
-    tier_emoji   = "🥇" if tier == "1" else "🥈"
-    dir_word     = "Bearish" if direction == "bear" else "Bullish"
-    opt_type     = "Put" if direction == "bear" else "Call"
+    dir_word     = "Bullish" if direction == "bull" else "Bearish"
+    opt_type     = "Call" if direction == "bull" else "Put"
+    tier_emoji   = "🥇" if str(tier) == "1" else "🥈"
 
     risk_per = round(trade['debit'] * 100, 2)
     max_profit_per = round(trade['max_profit'] * 100, 2)
@@ -1484,25 +1511,26 @@ def format_trade_card(rec: Dict) -> str:
     if not risk_notes:
         risk_notes.append("avoid chasing a poor fill")
 
+    display_debit = trade.get("display_debit", trade.get("debit"))
     lines = [
         f"{tier_emoji} {ticker} — {dir_word} Trade",
-        f"Contract: {contract_line}",
-        f"Exp: {rec['exp']} | DTE: {rec['dte']} | Confidence: {conf}/100",
-        f"Cost: ${trade['debit']:.2f} (${risk_per:.0f} max risk) | Max Profit: ${trade['max_profit']:.2f} (${max_profit_per:.0f})",
+        f"🎯 Contract: {contract_line}",
+        f"📅 Exp: {rec['exp']} | DTE: {rec['dte']} | 💪 Confidence: {conf}/100",
+        f"💵 Cost: ~${display_debit:.2f} est. fill (${risk_per:.0f} max risk) | Max Profit: ${trade['max_profit']:.2f} (${max_profit_per:.0f})",
     ]
 
     if EM_DISPLAY_ON_CARD and em > 0:
         em_low  = round(rec["spot"] - em, 2)
         em_high = round(rec["spot"] + em, 2)
-        lines.append(f"Expected Move: ±${em:.2f} (${em_low:.2f} – ${em_high:.2f})")
+        lines.append(f"📐 Expected Move: ±${em:.2f} (${em_low:.2f} – ${em_high:.2f})")
 
     lines += [
         "",
-        "Why this trade:",
+        "🧠 Why this trade:",
         f"  • {'; '.join(why[:3])}.",
         "",
-        "Plan:",
-        f"  • Work the entry near a fair fill around ${trade['debit']:.2f}.",
+        "📋 Plan:",
+        f"  • Work the entry near a fair fill around ~${display_debit:.2f}.",
         f"  • First target: ${exits['same_day']['sell_at']:.2f} (+30%).",
         f"  • Next target: ${exits['next_day']['sell_at']:.2f} (+35%).",
         f"  • Extended target: ${exits['extended']['sell_at']:.2f} (+50%).",
@@ -1514,13 +1542,25 @@ def format_trade_card(rec: Dict) -> str:
 
     lines += [
         "",
-        f"Main risk: {'; '.join(risk_notes[:2])}.",
+        f"⚠️ Main risk: {'; '.join(risk_notes[:2])}.",
         "",
-        "Data:",
+        "📦 Data:",
         f"  Width ${trade['width']:.2f} | Long {trade['long']} / Short {trade['short']}",
         f"  ITM: long ${trade['long_itm']:.2f} | short ${trade['short_itm']:.2f}",
         f"  RoR {trade['ror']:.0%} | Win Prob {trade.get('win_prob', 0):.0%} | EV ${trade.get('expected_value', 0):.2f}/contract",
     ]
+
+    if trade.get("long_bid") is not None and trade.get("long_ask") is not None and trade.get("short_bid") is not None and trade.get("short_ask") is not None:
+        mid_txt = trade.get("debit", 0)
+        nat_txt = trade.get("natural_debit")
+        if nat_txt is not None:
+            lines.append(
+                f"  Chain: long {trade['long_bid']:.2f}/{trade['long_ask']:.2f} | short {trade['short_bid']:.2f}/{trade['short_ask']:.2f} | mid ${mid_txt:.2f} / natural ${nat_txt:.2f}"
+            )
+        else:
+            lines.append(
+                f"  Chain: long {trade['long_bid']:.2f}/{trade['long_ask']:.2f} | short {trade['short_bid']:.2f}/{trade['short_ask']:.2f} | mid ${mid_txt:.2f}"
+            )
 
     vol_edge = rec.get("vol_edge", {})
     if IV_RV_DISPLAY_ON_CARD and vol_edge.get("edge_label") and vol_edge["edge_label"] != "UNKNOWN":
@@ -1540,12 +1580,8 @@ def format_trade_card(rec: Dict) -> str:
         if trade.get("net_vega") is not None: parts.append(f"V ${trade['net_vega']:.3f}/pt")
         lines.append("  " + " | ".join(parts))
 
-    ladder = rec.get("ladder", [])
-    if len(ladder) > 1:
-        lines.append("  Width ladder: " + " | ".join(f"${c['width']:.2f}:{c['long']}/{c['short']}" for c in ladder[:3]))
-
     if rec.get("conf_reasons"):
-        lines.append("  Why confidence: " + " | ".join(rec["conf_reasons"][:3]))
+        lines.append("💭 Why confidence: " + " | ".join(rec["conf_reasons"][:3]))
 
     lines += ["", f"Size: {rec['sizing_note']}", "", "— Not financial advice —"]
     return "\n".join(lines)
