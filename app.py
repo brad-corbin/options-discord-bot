@@ -33,6 +33,7 @@ import time
 import math
 import json
 import hashlib
+import base64
 import logging
 import csv
 import threading
@@ -152,6 +153,13 @@ DIAGNOSTIC_CHAT_ID = os.getenv("DIAGNOSTIC_CHAT_ID", "").strip()
 AUTO_LOG_DIR = os.getenv("AUTO_LOG_DIR", "/mnt/data/bot_logs").strip() or "/mnt/data/bot_logs"
 AUTO_LOG_ENABLE = os.getenv("AUTO_LOG_ENABLE", "1").strip().lower() not in ("0", "false", "no", "off")
 AUTO_LOG_DIAGNOSTICS = os.getenv("AUTO_LOG_DIAGNOSTICS", "0").strip().lower() in ("1", "true", "yes", "on")
+GOOGLE_SHEETS_ENABLE = os.getenv("GOOGLE_SHEETS_ENABLE", "0").strip().lower() in ("1", "true", "yes", "on")
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "1bXyAVQ8dB-dTyFVN6uv6PVtuphwRZ6VjIp2W9dcm9iw").strip()
+GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "").strip()
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+GOOGLE_SHEET_SIGNAL_TAB = os.getenv("GOOGLE_SHEET_SIGNAL_TAB", "signal_decisions").strip() or "signal_decisions"
+GOOGLE_SHEET_EM_TAB = os.getenv("GOOGLE_SHEET_EM_TAB", "em_predictions").strip() or "em_predictions"
+GOOGLE_SHEET_RECON_TAB = os.getenv("GOOGLE_SHEET_RECON_TAB", "em_reconciliation").strip() or "em_reconciliation"
 
 # ─────────────────────────────────────────────────────────
 # REDIS
@@ -232,8 +240,136 @@ def _append_csv_row(filename: str, fieldnames: list, row: dict):
                 if not exists or os.path.getsize(path) == 0:
                     writer.writeheader()
                 writer.writerow(safe_row)
+        _append_google_sheet_row(filename, fieldnames, safe_row)
     except Exception as e:
         log.warning(f"CSV auto-log failed ({filename}): {e}")
+
+
+_google_sheets_lock = threading.Lock()
+_google_sheets_token_cache = {"token": None, "exp": 0}
+_google_sheets_header_tabs = set()
+_google_sheets_sa_cache = None
+
+
+def _tab_for_filename(filename: str) -> str:
+    mapping = {
+        "signal_decisions.csv": GOOGLE_SHEET_SIGNAL_TAB,
+        "em_predictions.csv": GOOGLE_SHEET_EM_TAB,
+        "em_reconciliation.csv": GOOGLE_SHEET_RECON_TAB,
+    }
+    return mapping.get(filename, "")
+
+
+def _load_google_service_account() -> dict | None:
+    global _google_sheets_sa_cache
+    if _google_sheets_sa_cache is not None:
+        return _google_sheets_sa_cache
+    raw = GOOGLE_SERVICE_ACCOUNT_JSON
+    try:
+        if raw:
+            _google_sheets_sa_cache = json.loads(raw)
+            return _google_sheets_sa_cache
+        if GOOGLE_SERVICE_ACCOUNT_FILE and os.path.exists(GOOGLE_SERVICE_ACCOUNT_FILE):
+            with open(GOOGLE_SERVICE_ACCOUNT_FILE, "r", encoding="utf-8") as f:
+                _google_sheets_sa_cache = json.load(f)
+                return _google_sheets_sa_cache
+        default_path = "/mnt/data/corbin-bot-tracking-0249b119c63f.json"
+        if os.path.exists(default_path):
+            with open(default_path, "r", encoding="utf-8") as f:
+                _google_sheets_sa_cache = json.load(f)
+                return _google_sheets_sa_cache
+    except Exception as e:
+        log.warning(f"Google Sheets credentials load failed: {e}")
+    return None
+
+
+def _get_google_access_token() -> str | None:
+    if not GOOGLE_SHEETS_ENABLE or not GOOGLE_SHEET_ID:
+        return None
+    now = int(time.time())
+    cached = _google_sheets_token_cache
+    if cached.get("token") and now < int(cached.get("exp", 0)) - 60:
+        return cached["token"]
+    sa = _load_google_service_account()
+    if not sa:
+        return None
+    try:
+        issued = int(time.time())
+        payload = {
+            "iss": sa["client_email"],
+            "scope": "https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive.file",
+            "aud": sa.get("token_uri", "https://oauth2.googleapis.com/token"),
+            "iat": issued,
+            "exp": issued + 3600,
+        }
+        assertion = jwt.encode(payload, sa["private_key"], algorithm="RS256")
+        resp = requests.post(
+            sa.get("token_uri", "https://oauth2.googleapis.com/token"),
+            data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                "assertion": assertion,
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        token = data.get("access_token")
+        exp = issued + int(data.get("expires_in", 3600))
+        if token:
+            _google_sheets_token_cache.update({"token": token, "exp": exp})
+            return token
+    except Exception as e:
+        log.warning(f"Google Sheets token fetch failed: {e}")
+    return None
+
+
+def _sheet_headers_exist(tab: str, token: str) -> bool:
+    try:
+        url = f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEET_ID}/values/{requests.utils.quote(tab + '!1:1', safe='') }"
+        resp = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=10)
+        resp.raise_for_status()
+        values = resp.json().get("values", [])
+        return bool(values and any((str(x).strip() for x in values[0])))
+    except Exception as e:
+        log.warning(f"Google Sheets header check failed for {tab}: {e}")
+        return True
+
+
+def _append_google_sheet_values(tab: str, values: list, token: str) -> bool:
+    try:
+        rng = requests.utils.quote(f"{tab}!A:A", safe="!")
+        url = f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEET_ID}/values/{rng}:append"
+        resp = requests.post(
+            url,
+            params={"valueInputOption": "USER_ENTERED", "insertDataOption": "INSERT_ROWS"},
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json={"values": values},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        return True
+    except Exception as e:
+        log.warning(f"Google Sheets append failed for {tab}: {e}")
+        return False
+
+
+def _append_google_sheet_row(filename: str, fieldnames: list, row: dict):
+    tab = _tab_for_filename(filename)
+    if not (GOOGLE_SHEETS_ENABLE and tab and GOOGLE_SHEET_ID):
+        return
+    token = _get_google_access_token()
+    if not token:
+        return
+    values = [[row.get(k) for k in fieldnames]]
+    try:
+        with _google_sheets_lock:
+            if tab not in _google_sheets_header_tabs:
+                if not _sheet_headers_exist(tab, token):
+                    _append_google_sheet_values(tab, [fieldnames], token)
+                _google_sheets_header_tabs.add(tab)
+            _append_google_sheet_values(tab, values, token)
+    except Exception as e:
+        log.warning(f"Google Sheets row sync failed for {filename}: {e}")
 
 
 def _post_diagnostic(text: str):
