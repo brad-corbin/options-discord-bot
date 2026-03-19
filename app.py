@@ -3886,6 +3886,10 @@ def _calc_pcr(oi_list, vol_l, sides, n):
 def _get_vix_data():
     return _cached_md.get_vix_data(as_float_fn=as_float)
 
+def _discover_vix_market_snapshot():
+    """Alias kept for call sites in _get_0dte_iv and _get_chain_iv_for_expiry."""
+    return _get_vix_data() or {}
+
 
 # ─────────────────────────────────────────────────────────
 # _calc_bias — KEPT AS-IS (14-signal scoring system)
