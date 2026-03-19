@@ -740,7 +740,22 @@ class ExposureEngine:
             else: b["put_oi"]+=x["oi"];b["put_vol"]+=x["volume"];b["put_oi_change"]+=x["oi_change"]or 0
         ek=["gex","dex","vanna_exp","charm_exp","volga_exp","speed_exp","theta_exp","rho_exp"]
         net={k:sum(x[k]for x in enriched)for k in ek}
-        cw=max(bs,key=lambda k:bs[k]["call_oi"],default=None);pw=max(bs,key=lambda k:bs[k]["put_oi"],default=None)
+        # Fix #12: walls use GEX-weighted OI rather than raw OI for better level identification.
+        # A strike with moderate OI but high gamma (near ATM) is a stronger wall than
+        # a far-OTM strike with enormous but low-gamma open interest.
+        def _weighted_call_wall():
+            best=None;best_val=0
+            for k,v in bs.items():
+                val=v["call_oi"]*max(abs(v["gex"]),1e-8)
+                if val>best_val: best_val=val;best=k
+            return best
+        def _weighted_put_wall():
+            best=None;best_val=0
+            for k,v in bs.items():
+                val=v["put_oi"]*max(abs(v["gex"]),1e-8)
+                if val>best_val: best_val=val;best=k
+            return best
+        cw=_weighted_call_wall();pw=_weighted_put_wall()
         gw=max(bs,key=lambda k:abs(bs[k]["gex"]),default=None);vt=max(bs,key=lambda k:abs(bs[k]["volga"]),default=None)
         return{"enriched":enriched,"by_strike":bs,"net":{"gex":net["gex"],"dex":net["dex"],"vanna":net["vanna_exp"],"charm":net["charm_exp"],"volga":net["volga_exp"],"speed":net["speed_exp"],"theta":net["theta_exp"],"rho":net["rho_exp"]},"walls":{"call_wall":cw,"put_wall":pw,"gamma_wall":gw,"vol_trigger":vt},"units":UNITS}
     def _mk(self,r,sp,dto=0):
@@ -894,10 +909,17 @@ class UnifiedIVSurface:
     """Uses ExposureEngine.resolve_iv() so ladder + exposure share same IV."""
     def __init__(self,rows,engine): self.rows=rows;self.engine=engine
     def representative_iv(self,spot):
+        # Fix #14: Use sqrt(1/dte) weighting instead of 1/dte.
+        # This still favours near-term IVs but prevents a 1-DTE contract from
+        # getting 30x the weight of a 30-DTE contract (which distorts representative IV).
+        # sqrt(1/1)=1.0  vs  sqrt(1/30)=0.18  — a 5.4x ratio instead of 30x.
+        import math as _m
         ws=tw=0
         for r in self.rows:
             T=year_fraction(r.days_to_exp);iv=self.engine.resolve_iv(spot,r.strike,T,r.dividend_yield,r.iv)
-            mp=abs(r.strike-spot)/max(spot,1e-8);dw=1/(1+10*mp);tw_=1/max(r.days_to_exp,1);ow=max(r.open_interest,1)
+            mp=abs(r.strike-spot)/max(spot,1e-8);dw=1/(1+10*mp)
+            tw_=_m.sqrt(1/max(r.days_to_exp,1))  # gentler time-weighting
+            ow=max(r.open_interest,1)
             w=dw*tw_*ow;ws+=iv*w;tw+=w
         return ws/max(tw,1e-8)
     def representative_dte(self):
@@ -1029,9 +1051,16 @@ class InstitutionalExpectationEngine:
         self.r=r;self.ee=ExposureEngine(r=r,vol_surface=vol_surface,sabr_params=sabr_params)
     def _bl(self,s): return"UPSIDE"if s>=0.35 else("DOWNSIDE"if s<=-0.35 else"NEUTRAL")
     def _gl(self,g): return"NEG GAMMA / TRENDING"if g<0 else"POS GAMMA / SUPPRESSIVE"
-    def _ps(self,net,spot,pos):
-        dc=clamp(net["dex"]/max(spot*6e6,1),-0.55,0.55);vc=clamp(net["vanna"]/max(spot*6e6,1),-0.25,0.25)
-        cc=clamp(net["charm"]/max(spot*6e6,1),-0.20,0.20);pc=clamp(pos["net_opening_bias"],-0.25,0.25)
+    def _ps(self,net,spot,pos,rows=None):
+        # Scale by chain-level dollar-weighted OI so the normalizer adapts to
+        # chain depth rather than assuming ~M DEX (only correct for large-caps).
+        if rows:
+            chain_scale = max(sum(r.open_interest*r.underlying_price*r.contract_size
+                                  for r in rows),spot*1e4)
+        else:
+            chain_scale = max(spot*6e6,1)
+        dc=clamp(net["dex"]/chain_scale,-0.55,0.55);vc=clamp(net["vanna"]/chain_scale,-0.25,0.25)
+        cc=clamp(net["charm"]/chain_scale,-0.20,0.20);pc=clamp(pos["net_opening_bias"],-0.25,0.25)
         return clamp(0.45*dc+0.25*vc+0.15*cc+0.15*pc,-1,1)
     def _grid(self,spot,pct=0.12,steps=121):
         lo=spot*(1-pct);hi=spot*(1+pct);st=(hi-lo)/max(steps-1,1)
@@ -1090,7 +1119,7 @@ class InstitutionalExpectationEngine:
         rm=VolatilityRegimeEngine.regime_multiplier(aiv,rv20)
         sm=1.0
         if ctx.is_0dte: sm=0.85+0.30*clamp(1-ctx.session_progress,0,1)
-        a1s=a1b*fm*lm*rm*sm;pr=self._ps(exp["net"],ctx.spot,pos);bias=self._bl(pr)
+        a1s=a1b*fm*lm*rm*sm;pr=self._ps(exp["net"],ctx.spot,pos,rows=nr);bias=self._bl(pr)
         cs=a1s*0.40*pr;ec=ctx.spot+cs
         grid=self._grid(ctx.spot);gf=self.ee.gamma_flip(nr,grid);vf=self.ee.vanna_flip(nr,grid)
         # Item 10: Touch routing for ladder
