@@ -102,7 +102,9 @@ from unified_models import (
     build_shared_model_snapshot as _um_build_shared_model_snapshot,
     format_shared_snapshot_lines as _um_format_shared_snapshot_lines,
     classify_rejection_bucket as _um_classify_rejection_bucket,
+    apply_effective_regime_gate_to_rec as _um_apply_effective_regime_gate_to_rec,
 )
+from options_exposure import implied_vol as _solve_implied_vol
 from em_reconciler import (
     reconcile_em_predictions,
     compute_accuracy_stats,
@@ -498,6 +500,10 @@ def _log_signal_dataset_event(ticker: str, webhook_data: dict, outcome: str, rea
             "vix": (regime or {}).get("vix") if isinstance(regime, dict) else None,
             "adx": (regime or {}).get("adx") if isinstance(regime, dict) else None,
             "dealer_regime": ((best_rec or {}).get("shared_model_snapshot") or {}).get("dealer_regime", {}).get("label") if isinstance((best_rec or {}).get("shared_model_snapshot"), dict) else None,
+            "dealer_effective_regime": ((best_rec or {}).get("shared_model_snapshot") or {}).get("effective_regime", {}).get("label") if isinstance((best_rec or {}).get("shared_model_snapshot"), dict) else None,
+            "dealer_horizon_label": ((best_rec or {}).get("shared_model_snapshot") or {}).get("effective_regime", {}).get("horizon_label") if isinstance((best_rec or {}).get("shared_model_snapshot"), dict) else None,
+            "dealer_entry_allowed": ((best_rec or {}).get("shared_model_snapshot") or {}).get("effective_regime", {}).get("entry_allowed") if isinstance((best_rec or {}).get("shared_model_snapshot"), dict) else None,
+            "dealer_trigger_required": ((best_rec or {}).get("shared_model_snapshot") or {}).get("effective_regime", {}).get("requires_trigger") if isinstance((best_rec or {}).get("shared_model_snapshot"), dict) else None,
             "dealer_source": ((best_rec or {}).get("shared_model_snapshot") or {}).get("dealer_regime", {}).get("source") if isinstance((best_rec or {}).get("shared_model_snapshot"), dict) else None,
             "dealer_flip_price": ((best_rec or {}).get("shared_model_snapshot") or {}).get("dealer_regime", {}).get("flip_price") if isinstance((best_rec or {}).get("shared_model_snapshot"), dict) else None,
             "dealer_spot_vs_flip": ((best_rec or {}).get("shared_model_snapshot") or {}).get("dealer_regime", {}).get("spot_vs_flip") if isinstance((best_rec or {}).get("shared_model_snapshot"), dict) else None,
@@ -520,7 +526,7 @@ def _log_signal_dataset_event(ticker: str, webhook_data: dict, outcome: str, rea
             "structure_outer_bracket_low": (best_rec or {}).get("structure_outer_bracket_low"),
             "structure_outer_bracket_high": (best_rec or {}).get("structure_outer_bracket_high"),
             "structure_confluence": (best_rec or {}).get("structure_confluence"),
-            "log_schema": "v5_unified",
+            "log_schema": "v6_effective_regime",
         }
         fieldnames = list(row.keys())
         _append_csv_row("signal_decisions.csv", fieldnames, row)
@@ -999,8 +1005,8 @@ def _process_job(worker_id: int, job: dict):
                 _bars = _get_ohlc_bars(ticker, days=65)
                 _adv, _ = _estimate_liquidity(ticker, _spot)
                 _closes = get_daily_candles(ticker, days=60)
-                _vix_data = _discover_vix_market_snapshot()
-                _vix_val = as_float((_vix_data or {}).get("vix"), 0.0)
+                _vix_data = _get_vix_data()
+                _vix_val = _vix_data.get("vix", 20) if _vix_data else 20
 
                 # Run a quick v4 snapshot for dealer flows
                 from datetime import date as _date
@@ -1349,32 +1355,22 @@ def get_expirations(ticker: str) -> list:
 def get_daily_candles(ticker: str, days: int = 30) -> list:
     return _cached_md.get_daily_candles(ticker, days)
 
-def _fetch_yahoo_quote_value(symbol: str) -> float | None:
+def get_vix() -> float:
     try:
-        sym = requests.utils.quote(symbol, safe="")
-        resp = requests.get(
-            f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}",
-            params={"interval": "1d", "range": "1d", "includePrePost": "false"},
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=5,
-        )
+        resp = requests.get("https://query1.finance.yahoo.com/v8/finance/chart/%5EVIX",
+                           params={"interval": "1d", "range": "1d"},
+                           headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
         resp.raise_for_status()
-        result = (((resp.json() or {}).get("chart") or {}).get("result") or [None])[0] or {}
-        meta = result.get("meta") or {}
-        for field in ("regularMarketPrice", "previousClose", "chartPreviousClose"):
-            v = as_float(meta.get(field), 0.0)
-            if v > 0:
-                return v
-        quotes = (((result.get("indicators") or {}).get("quote") or [None])[0] or {})
-        closes = [as_float(x, 0.0) for x in (quotes.get("close") or []) if as_float(x, 0.0) > 0]
-        if closes:
-            return float(closes[-1])
+        result = resp.json().get("chart", {}).get("result", [])
+        if result:
+            meta = result[0].get("meta", {})
+            for field in ("regularMarketPrice", "previousClose", "chartPreviousClose"):
+                v = as_float(meta.get(field), 0.0)
+                if v > 0:
+                    log.info(f"VIX from Yahoo Finance: {v:.2f}")
+                    return v
     except Exception as e:
-        log.debug(f"Yahoo quote fetch failed for {symbol}: {e}")
-    return None
-
-
-def _infer_vix_proxy_from_spy_iv() -> float | None:
+        log.warning(f"VIX Yahoo fetch failed: {e}")
     try:
         spy_chains = get_options_chain_swing("SPY")
         ivs = []
@@ -1389,99 +1385,7 @@ def _infer_vix_proxy_from_spy_iv() -> float | None:
             return proxy
     except Exception as e:
         log.warning(f"VIX SPY-IV fallback failed: {e}")
-    return None
-
-
-def _discover_vix_market_snapshot(force: bool = False) -> dict:
-    now = time.time()
-    cached = _vol_regime_market_cache.get("market_snapshot")
-    ttl = _vol_regime_market_cache.get("market_snapshot_ttl", 0)
-    ts = _vol_regime_market_cache.get("market_snapshot_ts", 0)
-    if (not force) and cached and (now - ts) < ttl:
-        return dict(cached)
-
-    market = {}
-    try:
-        market = _get_vix_data() or {}
-    except Exception as e:
-        log.debug(f"MarketData VIX fetch failed: {e}")
-        market = {}
-
-    out = {
-        "vix": None,
-        "vix9d": None,
-        "term": "unknown",
-        "source": "unknown",
-        "inferred": False,
-    }
-
-    md_vix = as_float((market or {}).get("vix"), 0.0)
-    md_vix9d = as_float((market or {}).get("vix9d"), 0.0)
-    if md_vix > 0:
-        out.update({
-            "vix": round(md_vix, 2),
-            "vix9d": round(md_vix9d, 2) if md_vix9d > 0 else None,
-            "term": str((market or {}).get("term") or "unknown").lower(),
-            "source": "marketdata",
-            "inferred": False,
-        })
-
-    y_vix = _fetch_yahoo_quote_value("^VIX")
-    y_vix9d = _fetch_yahoo_quote_value("^VIX9D")
-    if out["vix"] is not None and y_vix is not None and y_vix > 0:
-        if abs(float(out["vix"]) - float(y_vix)) >= 2.5:
-            log.warning(
-                f"VIX source disagreement — MarketData {out['vix']:.2f} vs Yahoo {y_vix:.2f}; using Yahoo override"
-            )
-            out.update({
-                "vix": round(y_vix, 2),
-                "vix9d": round(y_vix9d, 2) if y_vix9d is not None and y_vix9d > 0 else out.get("vix9d"),
-                "source": "yahoo_override",
-                "inferred": False,
-            })
-        elif out.get("vix9d") is None and y_vix9d is not None and y_vix9d > 0:
-            out["vix9d"] = round(y_vix9d, 2)
-
-    if out["vix"] is None and y_vix is not None and y_vix > 0:
-        out.update({
-            "vix": round(y_vix, 2),
-            "vix9d": round(y_vix9d, 2) if y_vix9d is not None and y_vix9d > 0 else None,
-            "source": "yahoo",
-            "inferred": False,
-        })
-
-    if out["vix"] is None:
-        proxy = _infer_vix_proxy_from_spy_iv()
-        if proxy is not None and proxy > 0:
-            out.update({
-                "vix": round(proxy, 2),
-                "vix9d": None,
-                "source": "spy_iv_proxy",
-                "inferred": True,
-            })
-
-    if out["term"] == "unknown" and out.get("vix") is not None and out.get("vix9d") is not None:
-        slope = float(out["vix9d"]) - float(out["vix"])
-        if slope < -0.75:
-            out["term"] = "normal"
-        elif slope > 0.75:
-            out["term"] = "inverted"
-        else:
-            out["term"] = "flat"
-
-    ttl = 60 if out.get("vix") is not None else 30
-    _vol_regime_market_cache["market_snapshot"] = dict(out)
-    _vol_regime_market_cache["market_snapshot_ts"] = now
-    _vol_regime_market_cache["market_snapshot_ttl"] = ttl
-    return out
-
-
-def get_vix() -> float:
-    snap = _discover_vix_market_snapshot()
-    vix = as_float((snap or {}).get("vix"), 0.0)
-    if vix > 0:
-        return vix
-    log.warning("VIX unavailable — returning 20.0 as legacy fallback")
+    log.warning("VIX unavailable — returning 20.0 as neutral default")
     return 20.0
 
 
@@ -1608,10 +1512,10 @@ def get_canonical_vol_regime(ticker: str = "SPY", candle_closes: list | None = N
     cache_key = ticker
     now = time.time()
     cached = _vol_regime_symbol_cache.get(cache_key)
-    if cached and (now - cached.get("ts", 0)) < cached.get("ttl", 300):
+    if cached and (now - cached.get("ts", 0)) < 300:
         return cached.get("data", {})
 
-    market = _discover_vix_market_snapshot()
+    market = _get_vix_data() or {}
     closes = candle_closes or get_daily_candles(ticker, days=30) or get_daily_candles("SPY", days=30)
     result = _um_build_canonical_vol_regime(
         ticker=ticker,
@@ -1622,8 +1526,7 @@ def get_canonical_vol_regime(ticker: str = "SPY", candle_closes: list | None = N
         get_vvix_value_fn=_get_vvix_value,
         now_ts=now,
     )
-    ttl = 300 if result.get("has_live_vix") else 60
-    _vol_regime_symbol_cache[cache_key] = {"data": result, "ts": now, "ttl": ttl}
+    _vol_regime_symbol_cache[cache_key] = {"data": result, "ts": now}
     return result
 
 
@@ -2526,19 +2429,57 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
 
         best_rec = _apply_canonical_vol_overlay_to_rec(best_rec, vol_regime, mode="scalp")
         best_rec = _apply_canonical_structure_overlay_to_rec(best_rec, structure_ctx, mode="scalp")
-        dealer_snapshot = {
-            "label": (v4_flow or {}).get("composite_regime") or "UNKNOWN",
-            "description": (v4_flow or {}).get("confidence_label") or "v4 flow composite",
-        }
         best_rec["shared_model_snapshot"] = _um_build_shared_model_snapshot(
             ticker=ticker,
             spot=spot,
-            dealer_regime=dealer_snapshot,
             vol_regime=vol_regime,
             structure_ctx=structure_ctx,
             rec=best_rec,
             v4_flow=v4_flow,
+            mode="scalp",
         )
+        has_confirmed_trigger = bool((webhook_data or {}).get("source") != "check" and (signal_validation or {}).get("ok"))
+        eff_allowed, eff_reason, best_rec = _um_apply_effective_regime_gate_to_rec(
+            best_rec,
+            best_rec.get("shared_model_snapshot"),
+            mode="scalp",
+            has_confirmed_trigger=has_confirmed_trigger,
+        )
+        best_rec["shared_model_snapshot"] = _um_build_shared_model_snapshot(
+            ticker=ticker,
+            spot=spot,
+            vol_regime=vol_regime,
+            structure_ctx=structure_ctx,
+            rec=best_rec,
+            v4_flow=v4_flow,
+            mode="scalp",
+        )
+        if not eff_allowed:
+            best_rec["ok"] = False
+            best_rec["reason"] = eff_reason
+            best_rec["rejection_bucket"] = best_rec.get("rejection_bucket") or "effective_regime_block"
+            trade_journal.log_signal(ticker, webhook_data, outcome="rejected", reason=eff_reason[:200])
+            _log_signal_dataset_event(
+                ticker,
+                webhook_data,
+                outcome="rejected_effective_regime",
+                reason=eff_reason,
+                best_rec=best_rec,
+                signal_validation=signal_validation,
+                regime=regime,
+                v4_flow=v4_flow,
+                spot=spot,
+                expirations_checked=len(chains),
+                vol_regime=vol_regime,
+            )
+            card = format_trade_card(best_rec)
+            shared_lines = _um_format_shared_snapshot_lines(best_rec.get("shared_model_snapshot"))
+            if shared_lines:
+                card += "\n\n" + "\n".join(shared_lines)
+            validation_note = (signal_validation or {}).get("card_note")
+            if validation_note:
+                card = validation_note + "\n\n" + card
+            return {"ticker": ticker, "ok": False, "posted": True, "card": card, "reason": eff_reason, "confidence": best_rec.get("confidence")}
         trade = best_rec.get("trade", {})
 
         if is_duplicate_trade(ticker, direction, trade.get("short"), trade.get("long")):
@@ -3105,16 +3046,29 @@ def _get_0dte_iv(ticker: str, target_date_str: str = None) -> tuple:
         # ── Save current OI as reference for next run ──
         _oi_cache.save_snapshot(ticker, target, data)
 
-        if v4.get("error") or v4.get("iv") is None:
+        iv_meta = {"iv": v4.get("iv"), "source": "institutional_snapshot", "inferred": False, "notes": []}
+        if v4.get("iv") is None:
+            iv_meta = _infer_expiry_iv_with_fallbacks(ticker, target, dte, data, spot)
+            if iv_meta.get("iv"):
+                log.info(f"{ticker} {target}: IV fallback {iv_meta.get('source')} -> {float(iv_meta['iv']) * 100:.1f}%")
+            elif v4.get("error"):
+                return empty
+            else:
+                return empty
+
+        final_iv = iv_meta.get("iv")
+        if final_iv is None:
             return empty
 
+        v4["iv"] = final_iv
+        v4["iv_meta"] = iv_meta
         vix = _discover_vix_market_snapshot()
         enriched_walls = _derive_structure_levels_from_chain(data, spot, v4.get("walls", {}), v4.get("engine_result", {}))
 
         return (
-            v4["iv"], spot, target,
-            v4["engine_result"], enriched_walls,
-            v4["skew"], v4["pcr"], vix,
+            final_iv, spot, target,
+            v4.get("engine_result", {}), enriched_walls,
+            v4.get("skew", {}), v4.get("pcr", {}), vix,
             v4,
         )
 
@@ -3138,6 +3092,104 @@ def _get_chain_for_expiry(ticker: str, target_date_str: str) -> tuple:
     except Exception as e:
         log.warning(f"Chain fetch failed for {ticker} exp={target_date_str}: {e}")
         return None, None, None
+
+
+def _option_mid_price(contract: dict) -> float | None:
+    try:
+        bid = as_float(contract.get("bid"), 0.0)
+        ask = as_float(contract.get("ask"), 0.0)
+        last = as_float(contract.get("last") or contract.get("lastPrice"), 0.0)
+        mid = 0.0
+        if bid > 0 and ask > 0:
+            mid = (bid + ask) / 2.0
+        elif ask > 0:
+            mid = ask
+        elif bid > 0:
+            mid = bid
+        elif last > 0:
+            mid = last
+        return mid if mid > 0 else None
+    except Exception:
+        return None
+
+
+def _iter_chain_contract_rows(chain_data: dict) -> list:
+    try:
+        return build_option_rows(chain_data or {}) or []
+    except Exception:
+        return []
+
+
+def _infer_expiry_iv_from_rows(rows: list, spot: float, dte: float) -> dict:
+    rows = rows or []
+    direct = []
+    nearby = []
+    solver = []
+    if not spot or not rows:
+        return {"iv": None, "source": "none", "inferred": False, "notes": ["no rows"]}
+
+    band = max(float(spot) * 0.03, 1.0)
+    for row in rows:
+        strike = as_float(row.get("strike"), 0.0)
+        if strike <= 0:
+            continue
+        dist = abs(strike - spot)
+        iv = as_float(row.get("iv") or row.get("impliedVolatility"), 0.0)
+        if 0.05 < iv < 3.0:
+            nearby.append((dist, iv))
+            if dist <= band:
+                direct.append(iv)
+            continue
+
+        mid = _option_mid_price(row)
+        if mid is None:
+            continue
+        side = _normalize_option_side(row.get("side") or row.get("option_type") or row.get("type"))
+        if side not in ("call", "put"):
+            continue
+        try:
+            sigma = _solve_implied_vol(side, float(spot), float(strike), max(float(dte), 0.5) / 365.0, 0.0, 0.0, float(mid))
+            if 0.05 < sigma < 3.0:
+                solver.append((dist, sigma))
+        except Exception:
+            continue
+
+    if len(direct) >= 3:
+        return {"iv": sum(direct) / len(direct), "source": "chain_atm_iv", "inferred": False, "notes": [f"ATM direct IVs={len(direct)}"]}
+    if nearby:
+        nearby.sort(key=lambda x: x[0])
+        vals = [iv for _, iv in nearby[: min(8, len(nearby))]]
+        return {"iv": sum(vals) / len(vals), "source": "chain_nearby_iv", "inferred": True, "notes": [f"direct IV fallback count={len(vals)}"]}
+    if solver:
+        solver.sort(key=lambda x: x[0])
+        vals = [iv for _, iv in solver[: min(6, len(solver))]]
+        return {"iv": sum(vals) / len(vals), "source": "chain_solver_iv", "inferred": True, "notes": [f"solver IV count={len(vals)}"]}
+    return {"iv": None, "source": "none", "inferred": False, "notes": ["no IV fallback succeeded"]}
+
+
+def _infer_expiry_iv_with_fallbacks(ticker: str, target_date_str: str, dte: float, chain_data: dict, spot: float) -> dict:
+    rows = _iter_chain_contract_rows(chain_data)
+    meta = _infer_expiry_iv_from_rows(rows, spot, dte)
+    if meta.get("iv"):
+        return meta
+
+    try:
+        swing_chains = get_options_chain_swing(ticker)
+    except Exception:
+        swing_chains = []
+    nearest = None
+    for exp, other_dte, contracts in swing_chains:
+        if str(exp) == str(target_date_str):
+            continue
+        rows2 = list(contracts or [])
+        proxy = _infer_expiry_iv_from_rows(rows2, spot, other_dte)
+        if proxy.get("iv"):
+            nearest = proxy
+            nearest["source"] = "nearest_expiry_proxy"
+            nearest["inferred"] = True
+            nearest.setdefault("notes", []).append(f"proxy_from={exp}")
+            break
+    return nearest or meta
 
 
 def _get_chain_iv_for_expiry(ticker: str, target_date_str: str, dte: float) -> tuple:
@@ -3165,13 +3217,26 @@ def _get_chain_iv_for_expiry(ticker: str, target_date_str: str, dte: float) -> t
         # ── Save OI snapshot ──
         _oi_cache.save_snapshot(ticker, target, data)
 
-        if v4.get("error") or v4.get("iv") is None:
+        iv_meta = {"iv": v4.get("iv"), "source": "institutional_snapshot", "inferred": False, "notes": []}
+        if v4.get("iv") is None:
+            iv_meta = _infer_expiry_iv_with_fallbacks(ticker, target, dte, data, spot)
+            if iv_meta.get("iv"):
+                log.info(f"{ticker} {target}: IV fallback {iv_meta.get('source')} -> {float(iv_meta['iv']) * 100:.1f}%")
+            elif v4.get("error"):
+                return empty
+            else:
+                return empty
+
+        final_iv = iv_meta.get("iv")
+        if final_iv is None:
             return empty
 
+        v4["iv"] = final_iv
+        v4["iv_meta"] = iv_meta
         vix = _discover_vix_market_snapshot()
         enriched_walls = _derive_structure_levels_from_chain(data, spot, v4.get("walls", {}), v4.get("engine_result", {}))
-        return (v4["iv"], spot, target, v4["engine_result"], enriched_walls,
-                v4["skew"], v4["pcr"], vix, v4)
+        return (final_iv, spot, target, v4.get("engine_result", {}), enriched_walls,
+                v4.get("skew", {}), v4.get("pcr", {}), vix, v4)
     except Exception as e:
         log.warning(f"Chain IV fetch failed for {ticker} exp={target_date_str}: {e}")
         return empty
@@ -4181,7 +4246,7 @@ def _post_em_card(ticker: str, session: str):
             if v4_result and v4_result.get("vol_regime"):
                 _rv = v4_result["vol_regime"].get("realized_vol_20d", 0) or 0
 
-            _vix_val = as_float((vix or {}).get("vix"), 0.0)
+            _vix_val = vix.get("vix", 20) if vix else 20
 
             # Get ADV for normalization
             _adv, _ = _estimate_liquidity(ticker, spot)
@@ -4333,7 +4398,7 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
         flip = eng.get("flip_price") if eng else None
         charm_m = eng.get("charm", 0) if eng else 0
         neg_gex = tgex < 0
-        v = as_float((vix or {}).get("vix"), 0.0)
+        v = vix.get("vix", 20) if vix else 20
         exp_short = expiration[5:] if expiration else "?"
 
         # ── CT timestamp (v4.2 fix) ──
@@ -4531,11 +4596,33 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
                     lines.append(f"• Reclaim above gamma flip: {_fmt_money(regime_shift_up)}")
                 if regime_shift_dn is not None:
                     lines.append(f"• Lose gamma flip: {_fmt_money(regime_shift_dn)}")
-            if canonical_vol:
-                lines.append(f"🌡️ Volatility Regime: {_format_canonical_vol_line(canonical_vol)}")
-                lines.append(f"🪖 Posture: {canonical_vol.get('posture','')}")
+            em_shared_rec = {
+                "ticker": ticker,
+                "spot": spot,
+                "structure_overlay_score": 0 if pin_favored else None,
+                "structure_local_support": struct_s,
+                "structure_local_resistance": struct_r,
+                "structure_balance_zone_low": local_walls.get("local_balance_zone_low"),
+                "structure_balance_zone_high": local_walls.get("local_balance_zone_high"),
+                "structure_outer_bracket_low": local_walls.get("outer_bracket_low"),
+                "structure_outer_bracket_high": local_walls.get("outer_bracket_high"),
+                "structure_confluence": local_walls.get("structure_confluence"),
+            }
+            em_snapshot = _um_build_shared_model_snapshot(
+                ticker=ticker,
+                spot=spot,
+                dealer_regime=unified_regime,
+                vol_regime=canonical_vol,
+                structure_ctx={"ticker": ticker, "spot": spot, "price_structure": local_walls},
+                rec=em_shared_rec,
+                eng=eng,
+                cagf=cagf,
+                walls=local_walls,
+                mode="em",
+                horizon_label=effective_dte_label,
+            )
+            lines.extend(_um_format_shared_snapshot_lines(em_snapshot))
             lines += [
-                f"⚙️ Regime: {regime_line}",
                 "— Not financial advice —",
             ]
             post_to_telegram("\n".join(lines))
@@ -4869,10 +4956,38 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
                 effective_dte_label=effective_dte_label, size_pct=size_pct,
                 walls=walls or {}, expiry_label=expiration, est_cost=cost_est,
             )
-            post_to_telegram(dc)
+            decision_rec = {
+                "ticker": ticker,
+                "spot": spot,
+                "posture": canonical_vol.get("posture") if canonical_vol else None,
+                "structure_overlay_score": 0 if local_pin or near_max_pain else None,
+                "structure_local_support": local_struct.get("local_support_1") if isinstance(local_struct, dict) else None,
+                "structure_local_resistance": local_struct.get("local_resistance_1") if isinstance(local_struct, dict) else None,
+                "structure_balance_zone_low": local_struct.get("local_balance_zone_low") if isinstance(local_struct, dict) else None,
+                "structure_balance_zone_high": local_struct.get("local_balance_zone_high") if isinstance(local_struct, dict) else None,
+                "structure_outer_bracket_low": local_struct.get("outer_bracket_low") if isinstance(local_struct, dict) else None,
+                "structure_outer_bracket_high": local_struct.get("outer_bracket_high") if isinstance(local_struct, dict) else None,
+                "structure_confluence": local_struct.get("structure_confluence") if isinstance(local_struct, dict) else None,
+            }
+            decision_snapshot = _um_build_shared_model_snapshot(
+                ticker=ticker,
+                spot=spot,
+                dealer_regime=unified_regime,
+                vol_regime=canonical_vol,
+                structure_ctx={"ticker": ticker, "spot": spot, "price_structure": local_struct},
+                rec=decision_rec,
+                eng=eng,
+                cagf=cagf,
+                walls=walls,
+                mode="scalp",
+                horizon_label=effective_dte_label,
+            )
+            decision_lines = _um_format_shared_snapshot_lines(decision_snapshot)
+            final_dc = dc + ("\n\n" + "\n".join(decision_lines) if decision_lines else "")
+            post_to_telegram(final_dc)
             try:
                 cache_key = f"tradecard:{ticker.upper()}"
-                store_set(cache_key, dc, ttl=DIGEST_CARD_CACHE_TTL_SEC)
+                store_set(cache_key, final_dc, ttl=DIGEST_CARD_CACHE_TTL_SEC)
             except Exception:
                 pass
         except Exception as e:
@@ -4882,7 +4997,7 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
         log.error(f"Trade card error for {ticker}: {e}", exc_info=True)
 
 
-def _append_shared_regime_lines(lines: list, canonical_vol: dict = None, unified_regime: dict = None, management_note: str = "", structure_ctx: dict = None, rec: dict = None, eng: dict = None, cagf: dict = None, v4_flow: dict = None, walls: dict = None):
+def _append_shared_regime_lines(lines: list, canonical_vol: dict = None, unified_regime: dict = None, management_note: str = "", structure_ctx: dict = None, rec: dict = None, eng: dict = None, cagf: dict = None, v4_flow: dict = None, walls: dict = None, mode: str = "scalp", horizon_label: str = None):
     snap = _um_build_shared_model_snapshot(
         ticker=(rec or {}).get("ticker") or (structure_ctx or {}).get("ticker") or "",
         spot=float((rec or {}).get("spot") or (structure_ctx or {}).get("spot") or 0.0),
@@ -4894,6 +5009,8 @@ def _append_shared_regime_lines(lines: list, canonical_vol: dict = None, unified
         cagf=cagf,
         v4_flow=v4_flow,
         walls=walls,
+        mode=mode,
+        horizon_label=horizon_label,
     )
     lines.extend(_um_format_shared_snapshot_lines(snap))
     if management_note:
@@ -4999,11 +5116,11 @@ def _post_checkswing_card(ticker: str, forced_direction: str = None):
             shared_fail_snapshot = _um_build_shared_model_snapshot(
                 ticker=ticker,
                 spot=spot,
-                dealer_regime={"label": (v4_flow or {}).get("composite_regime") or "UNKNOWN", "description": "manual swing check"},
                 vol_regime=canonical_vol,
                 structure_ctx=structure_ctx,
                 rec={},
                 v4_flow=v4_flow,
+                mode="swing",
             )
             fail_lines = _um_format_shared_snapshot_lines(shared_fail_snapshot)
             if fail_lines:
@@ -5042,16 +5159,58 @@ def _post_checkswing_card(ticker: str, forced_direction: str = None):
         rec["shared_model_snapshot"] = _um_build_shared_model_snapshot(
             ticker=ticker,
             spot=spot,
-            dealer_regime=unified_regime,
             vol_regime=canonical_vol,
             structure_ctx=structure_ctx,
             rec=rec,
             eng=eng,
             walls=walls,
+            mode="swing",
         )
+        eff_allowed, eff_reason, rec = _um_apply_effective_regime_gate_to_rec(
+            rec,
+            rec.get("shared_model_snapshot"),
+            mode="swing",
+            has_confirmed_trigger=False,
+        )
+        rec["shared_model_snapshot"] = _um_build_shared_model_snapshot(
+            ticker=ticker,
+            spot=spot,
+            vol_regime=canonical_vol,
+            structure_ctx=structure_ctx,
+            rec=rec,
+            eng=eng,
+            walls=walls,
+            mode="swing",
+        )
+        if not eff_allowed:
+            reason = eff_reason or "Effective regime blocks fresh swing entry here."
+            parts = [
+                f"❌ {ticker} — NO SWING SETUP",
+                f"🧪 Checked: {(forced_direction or rec.get('direction') or 'both').upper()} | Spot: ${spot:.2f}",
+                f"🔎 Closest fail: {'🐂' if rec.get('direction') == 'bull' else '🐻'} {str(rec.get('direction') or '').upper()} — {reason}",
+                "",
+            ]
+            parts.extend(_um_format_shared_snapshot_lines(rec.get("shared_model_snapshot")))
+            parts.append("")
+            parts.append("— Not financial advice —")
+            post_to_telegram("\n".join([p for p in parts if p is not None]))
+            try:
+                _log_signal_dataset_event(
+                    ticker=ticker,
+                    webhook_data={"type": "swing", "source": "check", "bias": rec.get("direction"), "requested_bias": forced_direction or rec.get("direction"), "tier": rec.get("tier", "manual"), "manual_scoreable": rec.get("scoreable")},
+                    outcome="rejected_effective_regime",
+                    reason=reason,
+                    best_rec=rec,
+                    spot=spot,
+                    expirations_checked=len(chains),
+                    vol_regime=canonical_vol,
+                )
+            except Exception:
+                pass
+            return
         card = format_swing_card(rec)
         extras = []
-        _append_shared_regime_lines(extras, canonical_vol, unified_regime, structure_ctx=structure_ctx, rec=rec, eng=eng, walls=walls)
+        _append_shared_regime_lines(extras, canonical_vol, unified_regime, structure_ctx=structure_ctx, rec=rec, eng=eng, walls=walls, mode="swing")
         final_card = card + ("\n\n" + "\n".join(extras) if extras else "")
         post_to_telegram(final_card)
         try:
@@ -5276,6 +5435,7 @@ def _post_monitor_card(ticker: str, mode: str):
             cagf=cagf,
             v4_flow=v4_flow,
             walls=walls,
+            mode="monitor_long" if mode == "long" else "monitor_short",
         )
         if mode == "long":
             lines += _build_wheel_focus_block(ticker, expiration, spot, em, walls or {})
