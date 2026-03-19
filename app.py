@@ -999,8 +999,8 @@ def _process_job(worker_id: int, job: dict):
                 _bars = _get_ohlc_bars(ticker, days=65)
                 _adv, _ = _estimate_liquidity(ticker, _spot)
                 _closes = get_daily_candles(ticker, days=60)
-                _vix_data = _get_vix_data()
-                _vix_val = _vix_data.get("vix", 20) if _vix_data else 20
+                _vix_data = _discover_vix_market_snapshot()
+                _vix_val = as_float((_vix_data or {}).get("vix"), 0.0)
 
                 # Run a quick v4 snapshot for dealer flows
                 from datetime import date as _date
@@ -1349,22 +1349,32 @@ def get_expirations(ticker: str) -> list:
 def get_daily_candles(ticker: str, days: int = 30) -> list:
     return _cached_md.get_daily_candles(ticker, days)
 
-def get_vix() -> float:
+def _fetch_yahoo_quote_value(symbol: str) -> float | None:
     try:
-        resp = requests.get("https://query1.finance.yahoo.com/v8/finance/chart/%5EVIX",
-                           params={"interval": "1d", "range": "1d"},
-                           headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
+        sym = requests.utils.quote(symbol, safe="")
+        resp = requests.get(
+            f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}",
+            params={"interval": "1d", "range": "1d", "includePrePost": "false"},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=5,
+        )
         resp.raise_for_status()
-        result = resp.json().get("chart", {}).get("result", [])
-        if result:
-            meta = result[0].get("meta", {})
-            for field in ("regularMarketPrice", "previousClose", "chartPreviousClose"):
-                v = as_float(meta.get(field), 0.0)
-                if v > 0:
-                    log.info(f"VIX from Yahoo Finance: {v:.2f}")
-                    return v
+        result = (((resp.json() or {}).get("chart") or {}).get("result") or [None])[0] or {}
+        meta = result.get("meta") or {}
+        for field in ("regularMarketPrice", "previousClose", "chartPreviousClose"):
+            v = as_float(meta.get(field), 0.0)
+            if v > 0:
+                return v
+        quotes = (((result.get("indicators") or {}).get("quote") or [None])[0] or {})
+        closes = [as_float(x, 0.0) for x in (quotes.get("close") or []) if as_float(x, 0.0) > 0]
+        if closes:
+            return float(closes[-1])
     except Exception as e:
-        log.warning(f"VIX Yahoo fetch failed: {e}")
+        log.debug(f"Yahoo quote fetch failed for {symbol}: {e}")
+    return None
+
+
+def _infer_vix_proxy_from_spy_iv() -> float | None:
     try:
         spy_chains = get_options_chain_swing("SPY")
         ivs = []
@@ -1379,7 +1389,99 @@ def get_vix() -> float:
             return proxy
     except Exception as e:
         log.warning(f"VIX SPY-IV fallback failed: {e}")
-    log.warning("VIX unavailable — returning 20.0 as neutral default")
+    return None
+
+
+def _discover_vix_market_snapshot(force: bool = False) -> dict:
+    now = time.time()
+    cached = _vol_regime_market_cache.get("market_snapshot")
+    ttl = _vol_regime_market_cache.get("market_snapshot_ttl", 0)
+    ts = _vol_regime_market_cache.get("market_snapshot_ts", 0)
+    if (not force) and cached and (now - ts) < ttl:
+        return dict(cached)
+
+    market = {}
+    try:
+        market = _get_vix_data() or {}
+    except Exception as e:
+        log.debug(f"MarketData VIX fetch failed: {e}")
+        market = {}
+
+    out = {
+        "vix": None,
+        "vix9d": None,
+        "term": "unknown",
+        "source": "unknown",
+        "inferred": False,
+    }
+
+    md_vix = as_float((market or {}).get("vix"), 0.0)
+    md_vix9d = as_float((market or {}).get("vix9d"), 0.0)
+    if md_vix > 0:
+        out.update({
+            "vix": round(md_vix, 2),
+            "vix9d": round(md_vix9d, 2) if md_vix9d > 0 else None,
+            "term": str((market or {}).get("term") or "unknown").lower(),
+            "source": "marketdata",
+            "inferred": False,
+        })
+
+    y_vix = _fetch_yahoo_quote_value("^VIX")
+    y_vix9d = _fetch_yahoo_quote_value("^VIX9D")
+    if out["vix"] is not None and y_vix is not None and y_vix > 0:
+        if abs(float(out["vix"]) - float(y_vix)) >= 2.5:
+            log.warning(
+                f"VIX source disagreement — MarketData {out['vix']:.2f} vs Yahoo {y_vix:.2f}; using Yahoo override"
+            )
+            out.update({
+                "vix": round(y_vix, 2),
+                "vix9d": round(y_vix9d, 2) if y_vix9d is not None and y_vix9d > 0 else out.get("vix9d"),
+                "source": "yahoo_override",
+                "inferred": False,
+            })
+        elif out.get("vix9d") is None and y_vix9d is not None and y_vix9d > 0:
+            out["vix9d"] = round(y_vix9d, 2)
+
+    if out["vix"] is None and y_vix is not None and y_vix > 0:
+        out.update({
+            "vix": round(y_vix, 2),
+            "vix9d": round(y_vix9d, 2) if y_vix9d is not None and y_vix9d > 0 else None,
+            "source": "yahoo",
+            "inferred": False,
+        })
+
+    if out["vix"] is None:
+        proxy = _infer_vix_proxy_from_spy_iv()
+        if proxy is not None and proxy > 0:
+            out.update({
+                "vix": round(proxy, 2),
+                "vix9d": None,
+                "source": "spy_iv_proxy",
+                "inferred": True,
+            })
+
+    if out["term"] == "unknown" and out.get("vix") is not None and out.get("vix9d") is not None:
+        slope = float(out["vix9d"]) - float(out["vix"])
+        if slope < -0.75:
+            out["term"] = "normal"
+        elif slope > 0.75:
+            out["term"] = "inverted"
+        else:
+            out["term"] = "flat"
+
+    ttl = 60 if out.get("vix") is not None else 30
+    _vol_regime_market_cache["market_snapshot"] = dict(out)
+    _vol_regime_market_cache["market_snapshot_ts"] = now
+    _vol_regime_market_cache["market_snapshot_ttl"] = ttl
+    return out
+
+
+def get_vix() -> float:
+    snap = _discover_vix_market_snapshot()
+    vix = as_float((snap or {}).get("vix"), 0.0)
+    if vix > 0:
+        return vix
+    log.warning("VIX unavailable — returning 20.0 as legacy fallback")
     return 20.0
 
 
@@ -1506,10 +1608,10 @@ def get_canonical_vol_regime(ticker: str = "SPY", candle_closes: list | None = N
     cache_key = ticker
     now = time.time()
     cached = _vol_regime_symbol_cache.get(cache_key)
-    if cached and (now - cached.get("ts", 0)) < 300:
+    if cached and (now - cached.get("ts", 0)) < cached.get("ttl", 300):
         return cached.get("data", {})
 
-    market = _get_vix_data() or {}
+    market = _discover_vix_market_snapshot()
     closes = candle_closes or get_daily_candles(ticker, days=30) or get_daily_candles("SPY", days=30)
     result = _um_build_canonical_vol_regime(
         ticker=ticker,
@@ -1520,7 +1622,8 @@ def get_canonical_vol_regime(ticker: str = "SPY", candle_closes: list | None = N
         get_vvix_value_fn=_get_vvix_value,
         now_ts=now,
     )
-    _vol_regime_symbol_cache[cache_key] = {"data": result, "ts": now}
+    ttl = 300 if result.get("has_live_vix") else 60
+    _vol_regime_symbol_cache[cache_key] = {"data": result, "ts": now, "ttl": ttl}
     return result
 
 
@@ -3005,7 +3108,7 @@ def _get_0dte_iv(ticker: str, target_date_str: str = None) -> tuple:
         if v4.get("error") or v4.get("iv") is None:
             return empty
 
-        vix = _get_vix_data()
+        vix = _discover_vix_market_snapshot()
         enriched_walls = _derive_structure_levels_from_chain(data, spot, v4.get("walls", {}), v4.get("engine_result", {}))
 
         return (
@@ -3065,7 +3168,7 @@ def _get_chain_iv_for_expiry(ticker: str, target_date_str: str, dte: float) -> t
         if v4.get("error") or v4.get("iv") is None:
             return empty
 
-        vix = _get_vix_data()
+        vix = _discover_vix_market_snapshot()
         enriched_walls = _derive_structure_levels_from_chain(data, spot, v4.get("walls", {}), v4.get("engine_result", {}))
         return (v4["iv"], spot, target, v4["engine_result"], enriched_walls,
                 v4["skew"], v4["pcr"], vix, v4)
@@ -4078,7 +4181,7 @@ def _post_em_card(ticker: str, session: str):
             if v4_result and v4_result.get("vol_regime"):
                 _rv = v4_result["vol_regime"].get("realized_vol_20d", 0) or 0
 
-            _vix_val = vix.get("vix", 20) if vix else 20
+            _vix_val = as_float((vix or {}).get("vix"), 0.0)
 
             # Get ADV for normalization
             _adv, _ = _estimate_liquidity(ticker, spot)
@@ -4230,7 +4333,7 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
         flip = eng.get("flip_price") if eng else None
         charm_m = eng.get("charm", 0) if eng else 0
         neg_gex = tgex < 0
-        v = vix.get("vix", 20) if vix else 20
+        v = as_float((vix or {}).get("vix"), 0.0)
         exp_short = expiration[5:] if expiration else "?"
 
         # ── CT timestamp (v4.2 fix) ──
