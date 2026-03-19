@@ -7,13 +7,22 @@ import json
 import logging
 import math
 import os
+import time
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Callable
+
+import requests
+import jwt
 
 log = logging.getLogger(__name__)
 
 AUTO_LOG_DIR = os.getenv("AUTO_LOG_DIR", "/mnt/data/bot_logs").strip() or "/mnt/data/bot_logs"
 AUTO_LOG_ENABLE = os.getenv("AUTO_LOG_ENABLE", "1").strip().lower() not in ("0", "false", "no", "off")
+GOOGLE_SHEETS_ENABLE = os.getenv("GOOGLE_SHEETS_ENABLE", "0").strip().lower() in ("1", "true", "yes", "on")
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "1bXyAVQ8dB-dTyFVN6uv6PVtuphwRZ6VjIp2W9dcm9iw").strip()
+GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "").strip()
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+GOOGLE_SHEET_RECON_TAB = os.getenv("GOOGLE_SHEET_RECON_TAB", "em_reconciliation").strip() or "em_reconciliation"
 
 
 def _ensure_log_dir():
@@ -30,13 +39,121 @@ def _append_csv_row(filename: str, fieldnames: List[str], row: Dict):
         _ensure_log_dir()
         path = os.path.join(AUTO_LOG_DIR, filename)
         exists = os.path.exists(path)
+        safe_row = {k: row.get(k) for k in fieldnames}
         with open(path, "a", encoding="utf-8", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             if not exists or os.path.getsize(path) == 0:
                 writer.writeheader()
-            writer.writerow({k: row.get(k) for k in fieldnames})
+            writer.writerow(safe_row)
+        _append_google_sheet_row(fieldnames, safe_row)
     except Exception as e:
         log.warning(f"Reconciler CSV auto-log failed ({filename}): {e}")
+
+
+_google_sheets_token_cache = {"token": None, "exp": 0}
+_google_sheets_sa_cache = None
+_google_sheets_headers_ok = False
+
+
+def _load_google_service_account() -> Optional[Dict]:
+    global _google_sheets_sa_cache
+    if _google_sheets_sa_cache is not None:
+        return _google_sheets_sa_cache
+    try:
+        if GOOGLE_SERVICE_ACCOUNT_JSON:
+            _google_sheets_sa_cache = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+            return _google_sheets_sa_cache
+        if GOOGLE_SERVICE_ACCOUNT_FILE and os.path.exists(GOOGLE_SERVICE_ACCOUNT_FILE):
+            with open(GOOGLE_SERVICE_ACCOUNT_FILE, "r", encoding="utf-8") as f:
+                _google_sheets_sa_cache = json.load(f)
+                return _google_sheets_sa_cache
+        default_path = "/mnt/data/corbin-bot-tracking-0249b119c63f.json"
+        if os.path.exists(default_path):
+            with open(default_path, "r", encoding="utf-8") as f:
+                _google_sheets_sa_cache = json.load(f)
+                return _google_sheets_sa_cache
+    except Exception as e:
+        log.warning(f"Reconciler Google Sheets credentials load failed: {e}")
+    return None
+
+
+def _get_google_access_token() -> Optional[str]:
+    if not GOOGLE_SHEETS_ENABLE or not GOOGLE_SHEET_ID:
+        return None
+    now = int(time.time())
+    if _google_sheets_token_cache.get("token") and now < int(_google_sheets_token_cache.get("exp", 0)) - 60:
+        return _google_sheets_token_cache["token"]
+    sa = _load_google_service_account()
+    if not sa:
+        return None
+    try:
+        issued = int(time.time())
+        payload = {
+            "iss": sa["client_email"],
+            "scope": "https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive.file",
+            "aud": sa.get("token_uri", "https://oauth2.googleapis.com/token"),
+            "iat": issued,
+            "exp": issued + 3600,
+        }
+        assertion = jwt.encode(payload, sa["private_key"], algorithm="RS256")
+        resp = requests.post(
+            sa.get("token_uri", "https://oauth2.googleapis.com/token"),
+            data={"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer", "assertion": assertion},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        token = data.get("access_token")
+        if token:
+            _google_sheets_token_cache.update({"token": token, "exp": issued + int(data.get("expires_in", 3600))})
+            return token
+    except Exception as e:
+        log.warning(f"Reconciler Google Sheets token fetch failed: {e}")
+    return None
+
+
+def _append_google_sheet_values(values: List[List], token: str) -> bool:
+    try:
+        rng = requests.utils.quote(f"{GOOGLE_SHEET_RECON_TAB}!A:A", safe="!")
+        url = f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEET_ID}/values/{rng}:append"
+        resp = requests.post(
+            url,
+            params={"valueInputOption": "USER_ENTERED", "insertDataOption": "INSERT_ROWS"},
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json={"values": values},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        return True
+    except Exception as e:
+        log.warning(f"Reconciler Google Sheets append failed: {e}")
+        return False
+
+
+def _sheet_headers_exist(token: str) -> bool:
+    try:
+        url = f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEET_ID}/values/{requests.utils.quote(GOOGLE_SHEET_RECON_TAB + '!1:1', safe='')}"
+        resp = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=10)
+        resp.raise_for_status()
+        vals = resp.json().get("values", [])
+        return bool(vals and any((str(x).strip() for x in vals[0])))
+    except Exception as e:
+        log.warning(f"Reconciler Google Sheets header check failed: {e}")
+        return True
+
+
+def _append_google_sheet_row(fieldnames: List[str], row: Dict):
+    global _google_sheets_headers_ok
+    if not GOOGLE_SHEETS_ENABLE:
+        return
+    token = _get_google_access_token()
+    if not token:
+        return
+    if not _google_sheets_headers_ok:
+        if not _sheet_headers_exist(token):
+            _append_google_sheet_values([fieldnames], token)
+        _google_sheets_headers_ok = True
+    _append_google_sheet_values([[row.get(k) for k in fieldnames]], token)
 
 
 def _buffer_multiplier(snapshot_quality: Optional[str]) -> float:
