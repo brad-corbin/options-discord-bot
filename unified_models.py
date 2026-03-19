@@ -118,24 +118,15 @@ def build_canonical_vol_regime(
     now_ts = now_ts or time.time()
     market = market or {}
 
-    raw_vix = market.get("vix")
-    vix = _as_float(raw_vix, None)
-    if vix is not None and vix <= 0:
-        vix = None
-
-    vix9d = _as_float(market.get("vix9d"), None)
-    if vix9d is not None and vix9d <= 0:
-        vix9d = None
-    if vix9d is None and fetch_vix9d_fn:
+    vix = _as_float(market.get("vix"), 20.0)
+    vix9d = _as_float(market.get("vix9d"), 0.0)
+    if not vix9d and fetch_vix9d_fn:
         try:
-            vix9d = _as_float(fetch_vix9d_fn("^VIX9D"), None)
-            if vix9d is not None and vix9d <= 0:
-                vix9d = None
+            vix9d = _as_float(fetch_vix9d_fn("^VIX9D"), 0.0)
         except Exception:
-            vix9d = None
-
+            vix9d = 0.0
     term = (market.get("term") or "unknown").lower()
-    if term == "unknown" and vix is not None and vix9d is not None:
+    if term == "unknown" and vix and vix9d:
         slope = vix9d - vix
         if slope < -0.75:
             term = "normal"
@@ -150,7 +141,7 @@ def build_canonical_vol_regime(
             vix_ma200 = get_vix_ma200_fn()
         except Exception:
             vix_ma200 = None
-    above_ma200 = bool(vix_ma200 is not None and vix is not None and vix > vix_ma200)
+    above_ma200 = bool(vix_ma200 and vix > vix_ma200)
 
     vvix = None
     if get_vvix_value_fn:
@@ -162,90 +153,80 @@ def build_canonical_vol_regime(
     closes = candle_closes or []
     rv5 = _calc_ann_rv_from_closes(closes, 5)
     rv20 = _calc_ann_rv_from_closes(closes, 20)
-    vvix_warning = bool(vvix and vvix >= 120)
-    rv_spike = bool(rv5 and rv20 and rv5 > (rv20 * 1.35))
-    source = str(market.get("source") or "unknown")
-    inferred = bool(market.get("inferred"))
 
-    if vix is None:
-        label = "UNKNOWN"
-        base = "UNKNOWN"
-        caution = 1 if (vvix_warning or rv_spike) else 0
-        size_mult = 0.75
-        posture = "Volatility regime unavailable. Reduce size until live vol inputs recover."
-        confidence = "LOW"
-        emoji = "⚪"
-        transition_warning = False
+    if vix < 15:
+        base = "LOW"
+        caution = 0
+    elif vix < 20:
+        base = "NORMAL"
+        caution = 1
+    elif vix < 30:
+        base = "ELEVATED"
+        caution = 3
     else:
-        if vix < 15:
-            base = "LOW"
-            caution = 0
-        elif vix < 20:
-            base = "NORMAL"
-            caution = 1
-        elif vix < 30:
-            base = "ELEVATED"
-            caution = 3
-        else:
-            base = "CRISIS"
-            caution = 5
+        base = "CRISIS"
+        caution = 5
 
-        if above_ma200:
-            caution += 1
-        if term == "flat":
-            caution += 1
-        elif term == "inverted":
-            caution += 2
-        if vvix_warning:
-            caution += 1
-        if rv_spike:
-            caution += 1
+    if above_ma200:
+        caution += 1
+    if term == "flat":
+        caution += 1
+    elif term == "inverted":
+        caution += 2
 
-        transition_warning = False
-        if base in ("LOW", "NORMAL") and (above_ma200 or term in ("flat", "inverted") or vvix_warning or rv_spike):
-            transition_warning = True
-        if base == "ELEVATED" and term == "inverted" and vvix_warning:
-            transition_warning = True
+    vvix_warning = bool(vvix and vvix >= 120)
+    if vvix_warning:
+        caution += 1
 
-        if base == "CRISIS" or caution >= 6:
-            label = "CRISIS"
-            size_mult = 0.35
-            posture = "Capital preservation. Only best defined-risk setups."
-            confidence = "HIGH"
-        elif base == "ELEVATED" or caution >= 4:
-            label = "ELEVATED"
-            size_mult = 0.60
-            posture = "Reduce size. Favor defined-risk and cleaner directional setups."
-            confidence = "HIGH" if caution >= 5 else "MODERATE"
-        elif transition_warning:
-            label = "TRANSITION"
-            size_mult = 0.75
-            posture = "Transition warning. Smaller size and stricter setup quality."
-            confidence = "MODERATE"
-        elif base == "LOW":
-            label = "LOW"
-            size_mult = 1.00
-            posture = "Calm conditions. Directional setups okay if dealer/structure agrees."
-            confidence = "MODERATE"
-        else:
-            label = "NORMAL"
-            size_mult = 0.90
-            posture = "Balanced environment. Defined-risk preferred."
-            confidence = "MODERATE"
+    rv_spike = bool(rv5 and rv20 and rv5 > (rv20 * 1.35))
+    if rv_spike:
+        caution += 1
 
-        if label in ("TRANSITION", "ELEVATED", "CRISIS"):
-            emoji = "⚠️" if label == "TRANSITION" else "🔶" if label == "ELEVATED" else "🚨"
-        else:
-            emoji = "🟢" if label == "LOW" else "🟡"
+    transition_warning = False
+    if base in ("LOW", "NORMAL") and (above_ma200 or term in ("flat", "inverted") or vvix_warning or rv_spike):
+        transition_warning = True
+    if base == "ELEVATED" and term == "inverted" and vvix_warning:
+        transition_warning = True
 
-    term_slope = (vix9d - vix) if (vix9d is not None and vix is not None) else None
+    if base == "CRISIS" or caution >= 6:
+        label = "CRISIS"
+        size_mult = 0.35
+        posture = "Capital preservation. Only best defined-risk setups."
+        confidence = "HIGH"
+    elif base == "ELEVATED" or caution >= 4:
+        label = "ELEVATED"
+        size_mult = 0.60
+        posture = "Reduce size. Favor defined-risk and cleaner directional setups."
+        confidence = "HIGH" if caution >= 5 else "MODERATE"
+    elif transition_warning:
+        label = "TRANSITION"
+        size_mult = 0.75
+        posture = "Transition warning. Smaller size and stricter setup quality."
+        confidence = "MODERATE"
+    elif base == "LOW":
+        label = "LOW"
+        size_mult = 1.00
+        posture = "Calm conditions. Directional setups okay if dealer/structure agrees."
+        confidence = "MODERATE"
+    else:
+        label = "NORMAL"
+        size_mult = 0.90
+        posture = "Balanced environment. Defined-risk preferred."
+        confidence = "MODERATE"
+
+    if label in ("TRANSITION", "ELEVATED", "CRISIS"):
+        emoji = "⚠️" if label == "TRANSITION" else "🔶" if label == "ELEVATED" else "🚨"
+    else:
+        emoji = "🟢" if label == "LOW" else "🟡"
+
+    term_slope = (vix9d - vix) if (vix9d and vix) else None
     return {
         "ticker": ticker,
         "label": label,
         "base": base,
         "emoji": emoji,
-        "vix": round(vix, 2) if vix is not None else None,
-        "vix9d": round(vix9d, 2) if vix9d is not None else None,
+        "vix": vix,
+        "vix9d": vix9d if vix9d > 0 else None,
         "term_structure": term,
         "term_slope": round(term_slope, 2) if term_slope is not None else None,
         "vix_ma200": round(vix_ma200, 2) if vix_ma200 else None,
@@ -261,9 +242,6 @@ def build_canonical_vol_regime(
         "posture": posture,
         "description": posture,
         "confidence": confidence,
-        "source": source,
-        "inferred": inferred,
-        "has_live_vix": vix is not None,
         "ts": now_ts,
     }
 
@@ -276,8 +254,6 @@ def format_canonical_vol_line(vol_regime: dict) -> str:
     vix = vol_regime.get("vix")
     if vix is not None:
         bits.append(f"VIX {vix:.1f}")
-    else:
-        bits.append("VIX unavailable")
     if vol_regime.get("above_ma200"):
         bits.append("> MA200")
     term = vol_regime.get("term_structure")
@@ -288,11 +264,6 @@ def format_canonical_vol_line(vol_regime: dict) -> str:
         bits.append(f"VVIX {vvix:.0f}")
     if vol_regime.get("transition_warning"):
         bits.append("transition warning")
-    source = vol_regime.get("source")
-    if source and source not in ("unknown", ""):
-        bits.append(f"src {source}")
-    if vol_regime.get("inferred"):
-        bits.append("proxy")
     return " | ".join(bits)
 
 
@@ -325,7 +296,6 @@ def resolve_canonical_dealer_regime(
         "gex_raw_negative": gex_negative,
         "flip_price": flip,
         "spot_vs_flip": "unknown",
-        "confidence": "LOW",
     }
 
     if flip and spot > 0:
@@ -369,19 +339,31 @@ def resolve_canonical_dealer_regime(
                 "allows_credit_spreads": True,
             })
     elif v4_regime and v4_regime != "UNKNOWN":
-        mapped = v4_regime if v4_regime in ("TRENDING", "SUPPRESSING", "MIXED", "NEUTRAL") else "NEUTRAL"
-        desc_map = {
-            "TRENDING": "v4 composite says dealer positioning is amplifying moves.",
-            "SUPPRESSING": "v4 composite says dealer positioning is suppressing moves.",
-            "MIXED": "v4 composite shows mixed dealer conditions.",
-            "NEUTRAL": "v4 composite shows no strong dealer regime edge.",
-        }
+        raw_label = v4_regime
+        mapped = raw_label
+        desc = "v4 composite dealer regime."
+        allows_debit = True
+        allows_credit = True
+
+        if "PIN" in raw_label or raw_label.startswith("SUPPRESSING"):
+            desc = "v4 composite says price is pinned / suppressing near dealer structure."
+            allows_debit = False
+            allows_credit = True
+        elif "TREND" in raw_label or "EXPLOSIVE" in raw_label:
+            desc = "v4 composite says dealer positioning is amplifying moves."
+            allows_debit = True
+            allows_credit = False
+        elif raw_label == "MIXED":
+            desc = "v4 composite shows mixed dealer conditions."
+        elif raw_label == "NEUTRAL":
+            desc = "v4 composite shows no strong dealer regime edge."
+
         result.update({
             "label": mapped,
             "source": "v4 composite",
-            "description": desc_map.get(mapped, "v4 composite dealer regime."),
-            "allows_debit_spreads": mapped in ("TRENDING", "MIXED", "NEUTRAL"),
-            "allows_credit_spreads": mapped in ("SUPPRESSING", "MIXED", "NEUTRAL"),
+            "description": desc,
+            "allows_debit_spreads": allows_debit,
+            "allows_credit_spreads": allows_credit,
         })
     elif eng:
         if gex_negative:
@@ -450,15 +432,13 @@ def build_canonical_dealer_snapshot(
     pin_zone_low = put_wall if put_wall is not None else max_pain
     pin_zone_high = call_wall if call_wall is not None else max_pain
 
-    label = str(regime.get("label") or regime.get("regime") or "UNKNOWN").upper()
-    description = regime.get("description") or ""
     out = {
         "ticker": ticker,
         "spot": spot,
-        "label": label,
-        "regime": label,
+        "label": str(regime.get("label") or regime.get("regime") or "UNKNOWN").upper(),
+        "regime": str(regime.get("label") or regime.get("regime") or "UNKNOWN").upper(),
         "source": regime.get("source") or "unknown",
-        "description": description,
+        "description": regime.get("description") or "",
         "allows_debit_spreads": regime.get("allows_debit_spreads", True),
         "allows_credit_spreads": regime.get("allows_credit_spreads", True),
         "gex_raw_negative": bool(regime.get("gex_raw_negative", _as_float(v4_flow.get("gex"), _as_float(eng.get("gex"), 0.0)) < 0)),
@@ -481,16 +461,226 @@ def build_canonical_dealer_snapshot(
         "downgrades": list(v4_flow.get("downgrades") or []),
     }
 
-    if out["label"] == "UNKNOWN":
-        has_structure = any(out.get(k) is not None for k in ("flip_price", "max_pain", "call_wall", "put_wall", "gamma_wall"))
-        if has_structure:
-            out["description"] = "Structure available; regime confidence low."
-            if out.get("source") in (None, "unknown", "none"):
-                out["source"] = "dealer structure"
     near_threshold = max(float(spot or 0) * 0.0025, 0.75) if spot else 0.75
     out["near_flip"] = bool(out.get("flip_price") is not None and out.get("distance_to_flip") is not None and out.get("distance_to_flip") <= near_threshold)
     out["near_max_pain"] = bool(out.get("max_pain") is not None and abs(float(spot or 0) - float(out.get("max_pain"))) <= near_threshold) if spot and out.get("max_pain") is not None else False
     return out
+
+
+def _dealer_horizon_label(mode: str = "scalp", horizon_label: Optional[str] = None) -> str:
+    if horizon_label:
+        return str(horizon_label)
+    mode = str(mode or "scalp").lower()
+    mapping = {
+        "em": "front expiry",
+        "scalp": "front expiry",
+        "swing": "7-14 DTE",
+        "monitor_long": "~21 DTE",
+        "monitor_short": "position expiry",
+        "monitor": "position expiry",
+    }
+    return mapping.get(mode, mode.replace("_", " "))
+
+
+def resolve_effective_trade_regime(
+    dealer_snapshot: Optional[dict],
+    structure: Optional[dict] = None,
+    vol_regime: Optional[dict] = None,
+    mode: str = "scalp",
+    spot: float = 0.0,
+    horizon_label: Optional[str] = None,
+) -> dict:
+    dealer_snapshot = dealer_snapshot or {}
+    structure = structure or {}
+    vol_regime = vol_regime or {}
+    raw_label = str(dealer_snapshot.get("label") or dealer_snapshot.get("regime") or "UNKNOWN").upper()
+    horizon = _dealer_horizon_label(mode, horizon_label)
+
+    structure_score = structure.get("overlay_score")
+    try:
+        structure_score = int(structure_score) if structure_score is not None else None
+    except Exception:
+        structure_score = None
+
+    balance_low = _as_float(structure.get("balance_zone_low"), None)
+    balance_high = _as_float(structure.get("balance_zone_high"), None)
+    outer_low = _as_float(structure.get("outer_bracket_low"), None)
+    outer_high = _as_float(structure.get("outer_bracket_high"), None)
+    confluence = structure.get("confluence")
+
+    pin_low = _as_float(dealer_snapshot.get("pin_zone_low"), None)
+    pin_high = _as_float(dealer_snapshot.get("pin_zone_high"), None)
+    call_wall = _as_float(dealer_snapshot.get("call_wall"), None)
+    put_wall = _as_float(dealer_snapshot.get("put_wall"), None)
+    max_pain = _as_float(dealer_snapshot.get("max_pain"), None)
+
+    near_threshold = max(float(spot or 0) * 0.0035, 0.75) if spot else 0.75
+    inside_balance = bool(balance_low is not None and balance_high is not None and balance_low <= spot <= balance_high)
+    inside_pin = bool(pin_low is not None and pin_high is not None and pin_low <= spot <= pin_high)
+    near_call_wall = bool(call_wall is not None and abs(float(call_wall) - float(spot or 0)) <= near_threshold)
+    near_put_wall = bool(put_wall is not None and abs(float(put_wall) - float(spot or 0)) <= near_threshold)
+    near_wall = near_call_wall or near_put_wall
+    near_max_pain = bool(max_pain is not None and abs(float(max_pain) - float(spot or 0)) <= near_threshold)
+
+    reasons = []
+    effective_label = raw_label
+    entry_allowed = True
+    requires_trigger = False
+    posture_mult = 1.0
+    confidence_cap = None
+
+    pin_like_raw = any(tok in raw_label for tok in ("PIN", "SUPPRESSING"))
+    trend_like_raw = any(tok in raw_label for tok in ("TREND", "EXPLOSIVE"))
+
+    if inside_balance:
+        reasons.append("inside local balance zone")
+    if inside_pin:
+        reasons.append("inside dealer pin zone")
+    if near_max_pain:
+        reasons.append("near max pain")
+    if near_wall:
+        reasons.append("near dealer wall")
+
+    if inside_balance and (inside_pin or near_max_pain or near_wall):
+        effective_label = "PIN / RANGE"
+        entry_allowed = False
+        requires_trigger = True
+        posture_mult = 0.65 if mode == "scalp" else 0.75
+        confidence_cap = 49 if (structure_score is not None and structure_score <= -4) else 52
+    elif pin_like_raw:
+        effective_label = "PIN / RANGE"
+        requires_trigger = True
+        posture_mult = 0.75 if mode == "scalp" else 0.85
+        confidence_cap = 52
+        if structure_score is not None and structure_score <= -4:
+            entry_allowed = False
+            confidence_cap = 49
+    elif inside_balance and (structure_score is None or structure_score <= 0):
+        effective_label = "RANGE"
+        requires_trigger = True
+        posture_mult = 0.80 if mode == "scalp" else 0.90
+        confidence_cap = 54
+    elif trend_like_raw:
+        effective_label = raw_label
+    elif raw_label == "UNKNOWN" and (inside_balance or inside_pin or near_max_pain):
+        effective_label = "PIN / RANGE"
+        requires_trigger = True
+        posture_mult = 0.75
+        confidence_cap = 52
+
+    vol_label = str(vol_regime.get("label") or "").upper()
+    if vol_label in ("ELEVATED", "CRISIS"):
+        posture_mult *= 0.85 if mode in ("scalp", "swing") else 0.95
+        if confidence_cap is None:
+            confidence_cap = 60 if vol_label == "ELEVATED" else 55
+        elif vol_label == "CRISIS":
+            confidence_cap = min(confidence_cap, 50)
+
+    if effective_label in ("PIN / RANGE", "RANGE"):
+        description = "Spot is still trapped near balance / pin structure. Favor watchlist mode until a clean break confirms direction."
+    elif trend_like_raw:
+        description = dealer_snapshot.get("description") or "Dealer positioning still favors directional follow-through."
+    else:
+        description = dealer_snapshot.get("description") or "No strong trade-regime override."
+
+    if reasons:
+        description += " Context: " + ", ".join(dict.fromkeys(reasons)) + "."
+
+    posture = dealer_snapshot.get("posture") or vol_regime.get("posture")
+    if effective_label in ("PIN / RANGE", "RANGE"):
+        posture = "Reduce size. Wait for a clean break beyond local structure before treating this as directional."
+
+    return {
+        "label": effective_label,
+        "raw_label": raw_label,
+        "description": description,
+        "entry_allowed": entry_allowed,
+        "requires_trigger": requires_trigger,
+        "posture_mult": round(posture_mult, 2),
+        "confidence_cap": confidence_cap,
+        "reason_bits": reasons,
+        "horizon_label": horizon,
+        "inside_balance": inside_balance,
+        "inside_pin": inside_pin,
+        "near_max_pain": near_max_pain,
+        "near_wall": near_wall,
+        "structure_score": structure_score,
+        "confluence": confluence,
+        "outer_bracket_low": outer_low,
+        "outer_bracket_high": outer_high,
+        "posture": posture,
+    }
+
+
+def apply_effective_regime_gate_to_rec(
+    rec: dict,
+    shared_snapshot: Optional[dict],
+    mode: str = "scalp",
+    has_confirmed_trigger: bool = False,
+) -> tuple[bool, str, dict]:
+    rec = rec or {}
+    snap = shared_snapshot or {}
+    effective = snap.get("effective_regime") or {}
+    if not effective:
+        return True, "", rec
+
+    rec["effective_regime"] = effective
+    rec["dealer_horizon_label"] = effective.get("horizon_label")
+    rec["effective_regime_label"] = effective.get("label")
+    rec["effective_regime_requires_trigger"] = effective.get("requires_trigger")
+
+    cap = effective.get("confidence_cap")
+    current_conf = rec.get("confidence")
+    if cap is not None and current_conf is not None:
+        try:
+            current_conf = int(current_conf)
+            cap = int(cap)
+            if current_conf > cap:
+                rec.setdefault("confidence_pre_effective_regime", current_conf)
+                rec["confidence"] = cap
+        except Exception:
+            pass
+
+    posture_mult = _as_float(effective.get("posture_mult"), 1.0)
+    if posture_mult > 0 and posture_mult < 1.0 and rec.get("contracts") is not None:
+        try:
+            orig_contracts = int(rec.get("contracts") or 0)
+            adj = max(1, int(math.floor(orig_contracts * posture_mult)))
+            if adj < orig_contracts:
+                rec.setdefault("contracts_pre_effective_regime", orig_contracts)
+                rec["contracts"] = adj
+        except Exception:
+            pass
+
+    if effective.get("posture"):
+        rec["posture"] = effective.get("posture")
+
+    structure_score = effective.get("structure_score")
+    if structure_score is None:
+        structure_score = rec.get("structure_overlay_score")
+    try:
+        structure_score = int(structure_score) if structure_score is not None else None
+    except Exception:
+        structure_score = None
+
+    conf_now = rec.get("confidence")
+    try:
+        conf_now = int(conf_now) if conf_now is not None else None
+    except Exception:
+        conf_now = None
+
+    should_block = False
+    block_reason = ""
+    if mode in ("scalp", "swing"):
+        if effective.get("requires_trigger") and not has_confirmed_trigger:
+            if (structure_score is not None and structure_score <= -4) or (conf_now is not None and conf_now < 50):
+                should_block = True
+                block_reason = effective.get("description") or "Trigger required while price is pinned / range-bound."
+        if not effective.get("entry_allowed", True) and not has_confirmed_trigger and not should_block:
+            should_block = True
+            block_reason = effective.get("description") or "Effective regime blocks fresh directional entry here."
+
+    return (not should_block), block_reason, rec
 
 
 def apply_vol_overlay_to_rec(rec: dict, vol_regime: dict, mode: str = "scalp") -> dict:
@@ -970,9 +1160,33 @@ def build_manual_swing_signal_context(ticker: str, spot: float, rows: list, dire
 
 
 
-def build_shared_model_snapshot(ticker: str, spot: float, dealer_regime: Optional[dict] = None, vol_regime: Optional[dict] = None, structure_ctx: Optional[dict] = None, rec: Optional[dict] = None, eng: Optional[dict] = None, cagf: Optional[dict] = None, v4_flow: Optional[dict] = None, walls: Optional[dict] = None) -> dict:
+def build_shared_model_snapshot(
+    ticker: str,
+    spot: float,
+    dealer_regime: Optional[dict] = None,
+    vol_regime: Optional[dict] = None,
+    structure_ctx: Optional[dict] = None,
+    rec: Optional[dict] = None,
+    eng: Optional[dict] = None,
+    cagf: Optional[dict] = None,
+    v4_flow: Optional[dict] = None,
+    walls: Optional[dict] = None,
+    mode: str = "scalp",
+    horizon_label: Optional[str] = None,
+) -> dict:
     rec = rec or {}
     ps = ((structure_ctx or {}).get("price_structure") or {})
+    structure = {
+        "overlay_score": rec.get("structure_overlay_score"),
+        "local_support": rec.get("structure_local_support") if rec.get("structure_local_support") is not None else ps.get("local_support_1"),
+        "local_resistance": rec.get("structure_local_resistance") if rec.get("structure_local_resistance") is not None else ps.get("local_resistance_1"),
+        "balance_zone_low": rec.get("structure_balance_zone_low") if rec.get("structure_balance_zone_low") is not None else ps.get("local_balance_zone_low"),
+        "balance_zone_high": rec.get("structure_balance_zone_high") if rec.get("structure_balance_zone_high") is not None else ps.get("local_balance_zone_high"),
+        "outer_bracket_low": rec.get("structure_outer_bracket_low") if rec.get("structure_outer_bracket_low") is not None else ps.get("outer_bracket_low"),
+        "outer_bracket_high": rec.get("structure_outer_bracket_high") if rec.get("structure_outer_bracket_high") is not None else ps.get("outer_bracket_high"),
+        "confluence": rec.get("structure_confluence") if rec.get("structure_confluence") is not None else ps.get("structure_confluence"),
+        "rejection_bucket": rec.get("structure_rejection_bucket"),
+    }
     dealer_snapshot = build_canonical_dealer_snapshot(
         ticker=ticker,
         spot=spot,
@@ -982,23 +1196,25 @@ def build_shared_model_snapshot(ticker: str, spot: float, dealer_regime: Optiona
         walls=walls,
         dealer_regime=dealer_regime,
     )
+    effective_regime = resolve_effective_trade_regime(
+        dealer_snapshot=dealer_snapshot,
+        structure=structure,
+        vol_regime=vol_regime or {},
+        mode=mode,
+        spot=spot,
+        horizon_label=horizon_label,
+    )
+    posture = (rec or {}).get("posture") or effective_regime.get("posture") or (vol_regime or {}).get("posture")
     return {
         "ticker": ticker,
         "spot": spot,
+        "mode": mode,
+        "horizon_label": effective_regime.get("horizon_label") or _dealer_horizon_label(mode, horizon_label),
         "dealer_regime": dealer_snapshot,
+        "effective_regime": effective_regime,
         "vol_regime": vol_regime or {},
-        "posture": (rec or {}).get("posture") or (vol_regime or {}).get("posture"),
-        "structure": {
-            "overlay_score": rec.get("structure_overlay_score"),
-            "local_support": rec.get("structure_local_support") if rec.get("structure_local_support") is not None else ps.get("local_support_1"),
-            "local_resistance": rec.get("structure_local_resistance") if rec.get("structure_local_resistance") is not None else ps.get("local_resistance_1"),
-            "balance_zone_low": rec.get("structure_balance_zone_low") if rec.get("structure_balance_zone_low") is not None else ps.get("local_balance_zone_low"),
-            "balance_zone_high": rec.get("structure_balance_zone_high") if rec.get("structure_balance_zone_high") is not None else ps.get("local_balance_zone_high"),
-            "outer_bracket_low": rec.get("structure_outer_bracket_low") if rec.get("structure_outer_bracket_low") is not None else ps.get("outer_bracket_low"),
-            "outer_bracket_high": rec.get("structure_outer_bracket_high") if rec.get("structure_outer_bracket_high") is not None else ps.get("outer_bracket_high"),
-            "confluence": rec.get("structure_confluence") if rec.get("structure_confluence") is not None else ps.get("structure_confluence"),
-            "rejection_bucket": rec.get("structure_rejection_bucket"),
-        },
+        "posture": posture,
+        "structure": structure,
     }
 
 
@@ -1007,13 +1223,30 @@ def format_shared_snapshot_lines(shared_snapshot: Optional[dict]) -> List[str]:
     snap = shared_snapshot or {}
     lines: List[str] = []
     dealer = snap.get("dealer_regime") or {}
-    if dealer:
-        label = str(dealer.get("label") or dealer.get("regime") or "UNKNOWN").upper()
-        desc = dealer.get("description") or dealer.get("source") or ""
-        line = f"⚙️ Dealer Regime: {label}"
+    effective = snap.get("effective_regime") or {}
+    horizon = effective.get("horizon_label") or snap.get("horizon_label") or "front expiry"
+    if effective:
+        label = str(effective.get("label") or dealer.get("label") or dealer.get("regime") or "UNKNOWN").upper()
+        desc = effective.get("description") or dealer.get("description") or dealer.get("source") or ""
+        line = f"⚙️ Dealer Regime ({horizon}): {label}"
         if desc:
             line += f" — {desc}"
         lines.append(line)
+        raw_label = str(effective.get("raw_label") or dealer.get("label") or dealer.get("regime") or "UNKNOWN").upper()
+        if raw_label and raw_label != label:
+            raw_source = dealer.get("source") or "unknown"
+            lines.append(f"🧭 Raw Dealer Flow: {raw_label} ({raw_source})")
+        if effective.get("requires_trigger"):
+            lines.append("🚦 Entry filter: trigger required beyond local structure before treating this as directional.")
+    elif dealer:
+        label = str(dealer.get("label") or dealer.get("regime") or "UNKNOWN").upper()
+        desc = dealer.get("description") or dealer.get("source") or ""
+        line = f"⚙️ Dealer Regime ({horizon}): {label}"
+        if desc:
+            line += f" — {desc}"
+        lines.append(line)
+
+    if dealer:
         dealer_bits: List[str] = []
         if dealer.get("spot_vs_flip") in ("above", "below"):
             dealer_bits.append(f"spot {dealer.get('spot_vs_flip')} flip")
