@@ -473,7 +473,11 @@ def _log_signal_dataset_event(ticker: str, webhook_data: dict, outcome: str, rea
             "vol_term_structure": (vol_regime or {}).get("term_structure") if isinstance(vol_regime, dict) else None,
             "vol_vvix": (vol_regime or {}).get("vvix") if isinstance(vol_regime, dict) else None,
             "vol_size_mult": (vol_regime or {}).get("size_mult") if isinstance(vol_regime, dict) else None,
-            "log_schema": "v2",
+            "structure_overlay_score": (best_rec or {}).get("structure_overlay_score"),
+            "structure_local_support": (best_rec or {}).get("structure_local_support"),
+            "structure_local_resistance": (best_rec or {}).get("structure_local_resistance"),
+            "structure_confluence": (best_rec or {}).get("structure_confluence"),
+            "log_schema": "v3",
         }
         fieldnames = list(row.keys())
         _append_csv_row("signal_decisions.csv", fieldnames, row)
@@ -1095,13 +1099,18 @@ def _process_job(worker_id: int, job: dict):
         candles = get_daily_candles(ticker, days=252)
         vol_regime = get_canonical_vol_regime(ticker, candles)
         iv_rank = _estimate_iv_rank(chains, candles)
+        structure_ctx = _build_canonical_structure_context(ticker, spot, _get_daily_ohlcv_rows(ticker, days=90))
         webhook_data = dict(webhook_data or {})
         webhook_data["vol_regime_module"] = vol_regime
+        if webhook_data.get("source") == "check" or webhook_data.get("tier") == "manual":
+            manual_ctx = _compute_manual_swing_signal_context(ticker, spot, _get_daily_ohlcv_rows(ticker, days=90), webhook_data.get("bias") or bias, structure_ctx)
+            webhook_data.update(manual_ctx)
         rec = recommend_swing_trade(
             ticker=ticker, spot=spot, chains=chains,
             webhook_data=webhook_data, iv_rank=iv_rank,
         )
         rec = _apply_canonical_vol_overlay_to_rec(rec, vol_regime, mode="swing") if rec.get("ok") else rec
+        rec = _apply_canonical_structure_overlay_to_rec(rec, structure_ctx, mode="swing") if rec.get("ok") else rec
         base["confidence"] = rec.get("confidence")
         if rec.get("ok") and vol_regime.get("label") == "CRISIS" and int(rec.get("confidence") or 0) < 80:
             rec = {"ok": False, "reason": "CRISIS volatility regime — swing setups require exceptional confidence", "confidence": rec.get("confidence")}
@@ -1622,6 +1631,250 @@ def _apply_canonical_vol_overlay_to_rec(rec: dict, vol_regime: dict, mode: str =
     note = _format_canonical_vol_line(vol_regime)
     if note:
         rec["vol_regime_note"] = f"🌡️ Volatility overlay: {note}. Posture: {vol_regime.get('posture','')}"
+    return rec
+
+
+def _ema(values, length: int):
+    vals = [float(v) for v in (values or []) if v is not None]
+    if not vals:
+        return None
+    alpha = 2.0 / (length + 1.0)
+    ema = vals[0]
+    for v in vals[1:]:
+        ema = alpha * v + (1 - alpha) * ema
+    return ema
+
+
+def _rsi(values, length: int = 14):
+    vals = [float(v) for v in (values or []) if v is not None]
+    if len(vals) < length + 1:
+        return None
+    gains = []
+    losses = []
+    for i in range(1, len(vals)):
+        d = vals[i] - vals[i-1]
+        gains.append(max(d, 0.0))
+        losses.append(max(-d, 0.0))
+    avg_gain = sum(gains[:length]) / length
+    avg_loss = sum(losses[:length]) / length
+    for i in range(length, len(gains)):
+        avg_gain = (avg_gain * (length - 1) + gains[i]) / length
+        avg_loss = (avg_loss * (length - 1) + losses[i]) / length
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def _mfi(rows, length: int = 14):
+    rows = rows or []
+    if len(rows) < length + 1:
+        return None
+    pos = []
+    neg = []
+    prev_tp = None
+    for r in rows:
+        tp = (float(r['high']) + float(r['low']) + float(r['close'])) / 3.0
+        mf = tp * float(r.get('volume') or 0.0)
+        if prev_tp is not None:
+            if tp > prev_tp:
+                pos.append(mf); neg.append(0.0)
+            elif tp < prev_tp:
+                pos.append(0.0); neg.append(mf)
+            else:
+                pos.append(0.0); neg.append(0.0)
+        prev_tp = tp
+    if len(pos) < length:
+        return None
+    pmf = sum(pos[-length:]); nmf = sum(neg[-length:])
+    if nmf == 0:
+        return 100.0
+    ratio = pmf / nmf
+    return 100.0 - (100.0 / (1.0 + ratio))
+
+
+def _compute_manual_swing_signal_context(ticker: str, spot: float, rows: list, direction: str, structure_ctx: dict | None = None) -> dict:
+    rows = rows or []
+    closes = [r.get('close') for r in rows if r.get('close') is not None]
+    vols = [float(r.get('volume') or 0.0) for r in rows]
+    daily_fast = _ema(closes[-34:], 8) if len(closes) >= 8 else None
+    daily_slow = _ema(closes[-55:], 21) if len(closes) >= 21 else None
+    daily_prev_fast = _ema(closes[-35:-1], 8) if len(closes) >= 9 else daily_fast
+    daily_prev_slow = _ema(closes[-56:-1], 21) if len(closes) >= 22 else daily_slow
+    daily_bull = bool(daily_fast is not None and daily_slow is not None and daily_fast > daily_slow)
+    daily_gap = abs((daily_fast or 0) - (daily_slow or 0))
+    daily_prev_gap = abs((daily_prev_fast or 0) - (daily_prev_slow or 0))
+    htf_confirmed = daily_gap >= daily_prev_gap * 0.98 if daily_fast is not None and daily_slow is not None else False
+    htf_converging = daily_gap < daily_prev_gap if daily_fast is not None and daily_slow is not None else False
+
+    weekly_closes = [closes[i] for i in range(4, len(closes), 5)] if len(closes) >= 10 else closes[::5]
+    weekly_fast = _ema(weekly_closes[-20:], 5) if len(weekly_closes) >= 5 else None
+    weekly_slow = _ema(weekly_closes[-40:], 20) if len(weekly_closes) >= 20 else None
+    weekly_bull = bool(weekly_fast is not None and weekly_slow is not None and weekly_fast > weekly_slow)
+    weekly_bear = bool(weekly_fast is not None and weekly_slow is not None and weekly_fast < weekly_slow)
+
+    vol_contracting = False
+    if len(vols) >= 20:
+        recent = sum(vols[-5:]) / max(1, len(vols[-5:]))
+        base = sum(vols[-20:]) / 20.0
+        vol_contracting = recent < (base * 0.92)
+
+    rsi_val = _rsi(closes, 14)
+    mfi_val = _mfi(rows, 14)
+    rsi_mfi_bull = ((rsi_val or 50.0) + (mfi_val or 50.0)) / 2.0 >= 50.0
+
+    fib_level = '61.8'
+    fib_distance_pct = 2.0
+    ps = (structure_ctx or {}).get('price_structure') or {}
+    fib_map = []
+    for lbl, key in [('38.2','fib_382'),('50.0','fib_500'),('61.8','fib_618'),('78.6','fib_786')]:
+        val = ps.get(key)
+        if val:
+            fib_map.append((lbl, float(val)))
+    if fib_map:
+        lbl, val = min(fib_map, key=lambda x: abs(x[1]-spot))
+        fib_level = lbl
+        fib_distance_pct = abs(val - spot) / max(spot, 0.01) * 100.0
+    else:
+        # derive from nearest existing fib support/resistance if detailed levels absent
+        fib_levels = []
+        for lbl,key in [('38.2','fib_support'),('61.8','fib_resistance')]:
+            val = ps.get(key)
+            if val:
+                fib_levels.append((lbl, float(val)))
+        if fib_levels:
+            lbl, val = min(fib_levels, key=lambda x: abs(x[1]-spot))
+            fib_level = lbl
+            fib_distance_pct = abs(val - spot) / max(spot, 0.01) * 100.0
+
+    tier = '1' if fib_distance_pct <= 0.8 and ((direction=='bull' and weekly_bull) or (direction=='bear' and weekly_bear)) else '2'
+    return {
+        'type': 'swing',
+        'source': 'check',
+        'bias': direction,
+        'tier': tier,
+        'fib_level': fib_level,
+        'fib_distance_pct': round(fib_distance_pct, 3),
+        'weekly_bull': weekly_bull,
+        'weekly_bear': weekly_bear,
+        'htf_confirmed': bool(htf_confirmed),
+        'htf_converging': bool(htf_converging),
+        'daily_bull': daily_bull,
+        'rsi_mfi_bull': bool(rsi_mfi_bull),
+        'vol_contracting': bool(vol_contracting),
+    }
+
+
+def _build_canonical_structure_context(ticker: str, spot: float, rows: list | None = None) -> dict:
+    ps = _compute_price_structure_levels(ticker, spot, days=90)
+    # add explicit fib ladder values for manual swing context
+    rows = rows if rows is not None else _get_daily_ohlcv_rows(ticker, days=90)
+    highs = [r['high'] for r in rows or []]
+    lows = [r['low'] for r in rows or []]
+    if highs and lows:
+        lookback = min(len(rows), 34)
+        hi = max(highs[-lookback:]); lo = min(lows[-lookback:])
+        if hi > lo:
+            for ratio, key in [(0.382,'fib_382'),(0.5,'fib_500'),(0.618,'fib_618'),(0.786,'fib_786')]:
+                ps[key] = lo + (hi - lo) * ratio
+    return {'ticker': ticker, 'spot': spot, 'price_structure': ps}
+
+
+def _apply_canonical_structure_overlay_to_rec(rec: dict, structure_ctx: dict | None, mode: str = 'scalp') -> dict:
+    rec = rec or {}
+    ps = ((structure_ctx or {}).get('price_structure') or {})
+    if not ps:
+        return rec
+    trade = rec.get('trade') or {}
+    spot = float(rec.get('spot') or (structure_ctx or {}).get('spot') or 0.0)
+    direction = (rec.get('direction') or rec.get('bias') or '').lower()
+    em_amt = float((rec.get('em_data') or {}).get('expected_move') or ((rec.get('swing_em') or {}).get('em_1sd') or 0.0) or 0.0)
+    local_r = ps.get('local_resistance_1')
+    local_s = ps.get('local_support_1')
+    pivot = ps.get('pivot')
+    fib_sup = ps.get('fib_support')
+    fib_res = ps.get('fib_resistance')
+    vpoc = ps.get('vpoc')
+    pin_low = ps.get('pin_zone_low') if ps.get('pin_zone_low') is not None else local_s
+    pin_high = ps.get('pin_zone_high') if ps.get('pin_zone_high') is not None else local_r
+    notes = []
+    delta = 0
+    opp_near = max(spot * (0.007 if mode == 'scalp' else 0.012), em_amt * (0.35 if mode == 'scalp' else 0.50)) if spot else 0
+    sup_near = max(spot * 0.006, em_amt * 0.30) if spot else 0
+    near_pin = False
+    if pin_low is not None and pin_high is not None and pin_low < spot < pin_high and em_amt > 0:
+        near_pin = (pin_high - pin_low) <= (2.2 * em_amt if mode == 'scalp' else 2.8 * em_amt)
+    if direction == 'bull':
+        if local_r is not None and local_r > spot:
+            d = local_r - spot
+            if d <= opp_near:
+                delta -= 8 if mode == 'scalp' else 10
+                notes.append(f"Local resistance close ({_fmt_money(local_r)})")
+            elif em_amt > 0 and d <= em_amt * 0.9:
+                delta -= 4
+                notes.append(f"Resistance sits inside move path ({_fmt_money(local_r)})")
+        if local_s is not None and spot > local_s and (spot - local_s) <= sup_near:
+            delta += 3
+            notes.append(f"Nearby structure support ({_fmt_money(local_s)})")
+        if pivot is not None:
+            if spot >= pivot:
+                delta += 2; notes.append("Holding above pivot")
+            else:
+                delta -= 2; notes.append("Below pivot")
+        if fib_sup is not None and spot >= fib_sup and (spot - fib_sup) <= sup_near:
+            delta += 2; notes.append(f"Near Fib support ({_fmt_money(fib_sup)})")
+        if vpoc is not None:
+            if vpoc < spot:
+                delta += 1; notes.append("Trading above acceptance")
+            elif vpoc > spot:
+                delta -= 1; notes.append("Acceptance above price")
+    elif direction == 'bear':
+        if local_s is not None and local_s < spot:
+            d = spot - local_s
+            if d <= opp_near:
+                delta -= 8 if mode == 'scalp' else 10
+                notes.append(f"Local support close ({_fmt_money(local_s)})")
+            elif em_amt > 0 and d <= em_amt * 0.9:
+                delta -= 4
+                notes.append(f"Support sits inside move path ({_fmt_money(local_s)})")
+        if local_r is not None and local_r > spot and (local_r - spot) <= sup_near:
+            delta += 3
+            notes.append(f"Nearby structure resistance ({_fmt_money(local_r)})")
+        if pivot is not None:
+            if spot <= pivot:
+                delta += 2; notes.append("Holding below pivot")
+            else:
+                delta -= 2; notes.append("Above pivot")
+        if fib_res is not None and spot <= fib_res and (fib_res - spot) <= sup_near:
+            delta += 2; notes.append(f"Near Fib resistance ({_fmt_money(fib_res)})")
+        if vpoc is not None:
+            if vpoc > spot:
+                delta += 1; notes.append("Trading below acceptance")
+            elif vpoc < spot:
+                delta -= 1; notes.append("Acceptance below price")
+    if near_pin:
+        delta -= 4 if mode == 'scalp' else 5
+        notes.append('Tight local balance zone / pin risk')
+    conf_base = rec.get('confidence')
+    if conf_base is not None:
+        base = int(conf_base or 0)
+        rec.setdefault('confidence_pre_structure', base)
+        rec['confidence'] = max(0, min(100, base + int(delta)))
+    contracts = rec.get('contracts')
+    if contracts is not None and delta <= -8:
+        try:
+            rec['contracts_pre_structure'] = contracts
+            rec['contracts'] = max(1, int(math.floor(float(contracts) * 0.85)))
+        except Exception:
+            pass
+    if notes:
+        existing = list(rec.get('conf_reasons') or [])
+        rec['conf_reasons'] = existing + notes[:3]
+        rec['structure_note'] = '🧱 Structure: ' + ' | '.join(notes[:3])
+    rec['structure_overlay_score'] = int(delta)
+    rec['structure_local_support'] = local_s
+    rec['structure_local_resistance'] = local_r
+    rec['structure_confluence'] = ps.get('structure_confluence')
     return rec
 
 
@@ -2366,6 +2619,7 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
             })
             log.info(f"check_ticker({ticker}): live fetch cached for reuse")
         has_dividend = False
+        structure_ctx = _build_canonical_structure_context(ticker, spot, _get_daily_ohlcv_rows(ticker, days=90))
 
         log.info(f"check_ticker({ticker}): spot={spot} expirations={len(chains)} "
                  f"earnings={has_earnings} candles={len(candle_closes)} direction={direction}"
@@ -2400,6 +2654,7 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
                 v4_flow=v4_flow,
             )
             if rec.get("ok"):
+                rec = _apply_canonical_structure_overlay_to_rec(rec, structure_ctx, mode="scalp")
                 all_recs.append(rec)
                 log.info(f"  {exp} (DTE {dte}): ✅ {direction} trade found")
             else:
@@ -2421,7 +2676,9 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
             width = trade.get("width", 5); dte_val = r.get("dte", 5)
             width_bonus = 0.3 if width <= 1.0 else 0.1 if width <= 2.5 else 0
             dte_bonus = 0.1 * (1.0 / (1 + abs(dte_val - TARGET_DTE)))
-            return ror + width_bonus + dte_bonus
+            conf_bonus = (float(r.get("confidence") or 0) / 100.0) * 0.8
+            struct_bonus = (float(r.get("structure_overlay_score") or 0) / 100.0)
+            return ror + width_bonus + dte_bonus + conf_bonus + struct_bonus
 
         all_recs.sort(key=rec_score, reverse=True)
         best_rec = all_recs[0]
@@ -2439,6 +2696,7 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
             best_rec["signal_validation_penalty"] = penalty
 
         best_rec = _apply_canonical_vol_overlay_to_rec(best_rec, vol_regime, mode="scalp")
+        best_rec = _apply_canonical_structure_overlay_to_rec(best_rec, structure_ctx, mode="scalp")
         trade = best_rec.get("trade", {})
 
         if is_duplicate_trade(ticker, direction, trade.get("short"), trade.get("long")):
@@ -2452,6 +2710,8 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
         )
 
         card = format_trade_card(best_rec)
+        if best_rec.get("structure_note"):
+            card = best_rec["structure_note"] + "\n\n" + card
         validation_note = (signal_validation or {}).get("card_note")
         if validation_note:
             card = validation_note + "\n\n" + card
@@ -4739,6 +4999,8 @@ def _post_checkswing_card(ticker: str, forced_direction: str = None):
             post_to_telegram(f"❌ {ticker} — NO SWING SETUP\nReason: no options chain data in 7-60 DTE range\n\n— Not financial advice —")
             return
         candles = get_daily_candles(ticker, days=252)
+        raw_rows = _get_daily_ohlcv_rows(ticker, days=90)
+        structure_ctx = _build_canonical_structure_context(ticker, spot, raw_rows)
         iv_rank = _estimate_iv_rank(chains, candles)
         canonical_vol = get_canonical_vol_regime(ticker, candle_closes=candles)
         current_regime = get_current_regime()
@@ -4747,9 +5009,11 @@ def _post_checkswing_card(ticker: str, forced_direction: str = None):
         valid = []
         rejects = []
         for direction in directions:
-            wd = {"type": "swing", "source": "check", "bias": direction, "tier": "manual"}
+            wd = _compute_manual_swing_signal_context(ticker, spot, raw_rows, direction, structure_ctx)
+            wd.update({"type": "swing", "source": "check"})
             rec = recommend_swing_trade(ticker=ticker, spot=spot, chains=chains, webhook_data=wd, iv_rank=iv_rank)
             rec = _apply_canonical_vol_overlay_to_rec(rec, canonical_vol, mode="swing")
+            rec = _apply_canonical_structure_overlay_to_rec(rec, structure_ctx, mode="swing") if rec.get("ok") else rec
             if rec.get("ok"):
                 valid.append(rec)
             else:
@@ -4812,6 +5076,9 @@ def _post_checkswing_card(ticker: str, forced_direction: str = None):
             eng, walls = {}, {}
         unified_regime = resolve_unified_regime(eng or {}, None, spot)
         card = format_swing_card(rec)
+        prepend = []
+        if rec.get("structure_note"):
+            prepend.append(rec["structure_note"])
         extras = []
         _append_shared_regime_lines(extras, canonical_vol, unified_regime)
         final_card = card + "\n\n" + "\n".join(extras)
