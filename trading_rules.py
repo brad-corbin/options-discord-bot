@@ -43,7 +43,7 @@ MIN_DTE                  = 0
 MAX_DTE                  = 10
 TARGET_DTE               = 3
 MAX_EXPIRATIONS_TO_PULL  = 4
-CHECK_TICKER_TIMEOUT_SEC     = 45    # Reduced from 75s — CAT 75s timeout wasted worker-3
+CHECK_TICKER_TIMEOUT_SEC     = 90    # 90s: allows up to 75s prefetch wait + ~15s processing
 NO_ENTRY_FIRST_MINUTES       = 15
 
 # ─────────────────────────────────────────────────────────
@@ -195,7 +195,7 @@ EM_DISPLAY_ON_CARD       = True
 IV_RV_DISPLAY_ON_CARD    = True
 IV_RANK_LOW              = 20
 IV_RANK_HIGH             = 70
-RV_LOOKBACK_DAYS         = 20
+RV_LOOKBACK_DAYS         = 60  # 60 days needed for RV, IV rank (was 20 — too few for get_iv_rank_from_closes)
 RV_ANNUALIZE_FACTOR      = 252
 IV_RV_BUYER_EDGE_PCT     = -5.0
 IV_RV_SELLER_EDGE_PCT    = 5.0
