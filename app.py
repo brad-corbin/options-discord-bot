@@ -4682,7 +4682,7 @@ def _post_checkswing_card(ticker: str, forced_direction: str = None):
             return
         candles = get_daily_candles(ticker, days=252)
         iv_rank = _estimate_iv_rank(chains, candles)
-        canonical_vol = _get_canonical_vol_regime(ticker, candle_closes=candles)
+        canonical_vol = get_canonical_vol_regime(ticker, candle_closes=candles)
         directions = [forced_direction] if forced_direction else ["bull", "bear"]
         valid = []
         rejects = []
@@ -4775,7 +4775,7 @@ def _post_monitor_card(ticker: str, mode: str):
 
         liquid = _is_liquid(ticker)
         candles = get_daily_candles(ticker, days=252)
-        canonical_vol = _get_canonical_vol_regime(ticker, candle_closes=candles)
+        canonical_vol = get_canonical_vol_regime(ticker, candle_closes=candles)
         result_tuple = _get_chain_iv_for_expiry(ticker, expiry, dte)
         iv, spot, expiration = result_tuple[0], result_tuple[1], result_tuple[2]
         eng, walls, skew, pcr, vix = result_tuple[3], result_tuple[4], result_tuple[5], result_tuple[6], result_tuple[7]
