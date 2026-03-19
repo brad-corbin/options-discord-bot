@@ -270,16 +270,20 @@ def _load_google_service_account() -> dict | None:
     try:
         if raw:
             _google_sheets_sa_cache = json.loads(raw)
+            log.info(f"Google Sheets service account loaded from env: {_google_sheets_sa_cache.get('client_email','?')}")
             return _google_sheets_sa_cache
         if GOOGLE_SERVICE_ACCOUNT_FILE and os.path.exists(GOOGLE_SERVICE_ACCOUNT_FILE):
             with open(GOOGLE_SERVICE_ACCOUNT_FILE, "r", encoding="utf-8") as f:
                 _google_sheets_sa_cache = json.load(f)
+                log.info(f"Google Sheets service account loaded from file: {_google_sheets_sa_cache.get('client_email','?')}")
                 return _google_sheets_sa_cache
         default_path = "/mnt/data/corbin-bot-tracking-0249b119c63f.json"
         if os.path.exists(default_path):
             with open(default_path, "r", encoding="utf-8") as f:
                 _google_sheets_sa_cache = json.load(f)
+                log.info(f"Google Sheets service account loaded from default file: {_google_sheets_sa_cache.get('client_email','?')}")
                 return _google_sheets_sa_cache
+        log.warning("Google Sheets credentials not found in env or file.")
     except Exception as e:
         log.warning(f"Google Sheets credentials load failed: {e}")
     return None
@@ -287,6 +291,7 @@ def _load_google_service_account() -> dict | None:
 
 def _get_google_access_token() -> str | None:
     if not GOOGLE_SHEETS_ENABLE or not GOOGLE_SHEET_ID:
+        log.info("Google Sheets token fetch skipped: disabled or sheet id missing")
         return None
     now = int(time.time())
     cached = _google_sheets_token_cache
@@ -319,6 +324,7 @@ def _get_google_access_token() -> str | None:
         exp = issued + int(data.get("expires_in", 3600))
         if token:
             _google_sheets_token_cache.update({"token": token, "exp": exp})
+            log.info("Google Sheets token acquired successfully")
             return token
     except Exception as e:
         log.warning(f"Google Sheets token fetch failed: {e}")
