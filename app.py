@@ -4671,6 +4671,33 @@ def _append_shared_regime_lines(lines: list, canonical_vol: dict = None, unified
     return lines
 
 
+def _summarize_swing_reject_reason(reason: str) -> str:
+    reason = (reason or "").strip()
+    if not reason:
+        return "No valid swing spread found"
+    lines = [ln.strip() for ln in reason.splitlines() if ln.strip()]
+    if not lines:
+        return reason[:180]
+    if len(lines) == 1:
+        return lines[0][:180]
+    head = lines[0]
+    detail = lines[1]
+    return f"{head} — {detail}"[:220]
+
+
+def _swing_reject_rank(reason: str) -> int:
+    r = (reason or "").lower()
+    if "confidence" in r or "win prob" in r:
+        return 4
+    if "slippage" in r or "negative ev" in r or "fair value" in r:
+        return 3
+    if "no valid spreads" in r:
+        return 2
+    if "not enough" in r or "no expirations" in r:
+        return 1
+    return 0
+
+
 def _post_checkswing_card(ticker: str, forced_direction: str = None):
     try:
         from swing_engine import recommend_swing_trade, format_swing_card
@@ -4695,14 +4722,29 @@ def _post_checkswing_card(ticker: str, forced_direction: str = None):
             else:
                 rejects.append((direction, rec.get("reason", "no valid setup")))
         if not valid:
-            parts = [f"❌ {ticker} — NO SWING SETUP"]
-            for direction, reason in rejects:
-                emoji = "🐂" if direction == "bull" else "🐻"
-                parts.append(f"{emoji} {direction.upper()}: {reason}")
+            checked = forced_direction.upper() if forced_direction else "BOTH"
+            parts = [f"❌ {ticker} — NO SWING SETUP", f"🧪 Checked: {checked} | Spot: ${spot:.2f}"]
+
+            ranked_rejects = sorted(rejects, key=lambda dr: (_swing_reject_rank(dr[1]), -len(dr[1] or "")), reverse=True)
+            if ranked_rejects:
+                best_dir, best_reason = ranked_rejects[0]
+                best_emoji = "🐂" if best_dir == "bull" else "🐻"
+                parts.append(f"🔎 Closest fail: {best_emoji} {best_dir.upper()} — {_summarize_swing_reject_reason(best_reason)}")
+
+            if len(rejects) > 1:
+                parts.append("")
+                parts.append("📋 Side-by-side")
+                for direction, reason in rejects:
+                    emoji = "🐂" if direction == "bull" else "🐻"
+                    parts.append(f"• {emoji} {direction.upper()}: {_summarize_swing_reject_reason(reason)}")
+
             if canonical_vol:
                 parts.append("")
                 parts.append(f"🌡️ Volatility Regime: {_format_canonical_vol_line(canonical_vol)}")
-                parts.append(f"🪖 Posture: {canonical_vol.get('posture','')}")
+                posture = canonical_vol.get('posture', '')
+                if posture:
+                    parts.append(f"🪖 Posture: {posture}")
+
             parts.append("")
             parts.append("— Not financial advice —")
             post_to_telegram("\n".join(parts))
@@ -4711,7 +4753,7 @@ def _post_checkswing_card(ticker: str, forced_direction: str = None):
                     ticker=ticker,
                     webhook_data={"type": "swing", "source": "check", "bias": forced_direction or "both", "tier": "manual"},
                     outcome="rejected_no_setup",
-                    reason=" | ".join(f"{d}:{r}" for d, r in rejects)[:300],
+                    reason=" | ".join(f"{d}:{_summarize_swing_reject_reason(r)}" for d, r in rejects)[:300],
                     spot=spot,
                     expirations_checked=len(chains),
                     vol_regime=canonical_vol,
