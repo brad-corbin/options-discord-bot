@@ -4691,23 +4691,41 @@ def _summarize_swing_reject_reason(reason: str) -> str:
     lines = [ln.strip() for ln in reason.splitlines() if ln.strip()]
     if not lines:
         return reason[:180]
-    if len(lines) == 1:
-        return lines[0][:180]
+
     head = lines[0]
-    detail = lines[1]
-    return f"{head} — {detail}"[:220]
+    detail = lines[1] if len(lines) > 1 else ""
+    combined = f"{head} — {detail}".strip(" —")
+    lc = combined.lower()
+
+    # Manual /checkswing often has no TradingView-style signal context, so a raw
+    # 0/100 confidence read is misleading. Call that out explicitly.
+    if "confidence 0/100 below" in lc:
+        return "No scoreable swing candidate survived manual-thesis scoring"
+    if "confidence" in lc and "/100 below" in lc:
+        return combined[:220]
+    if "win prob" in lc and "below" in lc:
+        return combined[:220]
+    if "slippage" in lc or "negative ev" in lc or "fair value" in lc:
+        return combined[:220]
+    if "no valid spreads" in lc:
+        return combined[:220]
+    if "not enough" in lc:
+        return combined[:220]
+    return combined[:220]
 
 
 def _swing_reject_rank(reason: str) -> int:
     r = (reason or "").lower()
+    if "confidence 0/100 below" in r:
+        return 1
     if "confidence" in r or "win prob" in r:
         return 4
     if "slippage" in r or "negative ev" in r or "fair value" in r:
-        return 3
+        return 5
     if "no valid spreads" in r:
-        return 2
+        return 3
     if "not enough" in r or "no expirations" in r:
-        return 1
+        return 2
     return 0
 
 
@@ -4752,6 +4770,10 @@ def _post_checkswing_card(ticker: str, forced_direction: str = None):
                 for direction, reason in rejects:
                     emoji = "🐂" if direction == "bull" else "🐻"
                     parts.append(f"• {emoji} {direction.upper()}: {_summarize_swing_reject_reason(reason)}")
+
+            if all(rejects) and all("confidence 0/100 below" in (r or "").lower() for _, r in rejects):
+                parts.append("")
+                parts.append("ℹ️ Note: manual swing checks do not have full alert-context scoring, so these were unscored / unconvincing rather than true 0-confidence setups.")
 
             if canonical_vol:
                 parts.append("")
