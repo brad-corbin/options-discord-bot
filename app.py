@@ -116,6 +116,13 @@ from em_reconciler import (
 import risk_manager
 import trade_journal
 
+# ── v4.3: Thesis Monitor ──
+from thesis_monitor import (
+    get_engine as get_thesis_engine,
+    init_daemon as init_thesis_daemon,
+    build_thesis_from_em_card,
+)
+
 # OI cache will be initialized after store_get/store_set are defined
 _oi_cache = None
 
@@ -3008,6 +3015,7 @@ def telegram_webhook(secret):
             get_regime_fn=get_current_regime,
             post_em_card_fn=_post_em_card, post_monitor_card_fn=_post_monitor_card,
             post_checkswing_card_fn=_post_checkswing_card,
+            thesis_engine=get_thesis_engine(),
         )
 
     threading.Thread(target=run_command, daemon=True).start()
@@ -4746,6 +4754,36 @@ def _post_em_card(ticker: str, session: str):
         _elapsed_secs = max(0, (now_ct - _mkt_open_ct).total_seconds())
         _sess_progress = min(1.0, _elapsed_secs / _session_secs) if _session_secs > 0 else 0.5
 
+        # ── Thesis Monitor: store thesis for continuous monitoring ──
+        try:
+            _prior_close = None
+            _daily = get_daily_candles(ticker, days=3)
+            if _daily and len(_daily) >= 2:
+                _prior_close = _daily[-2] if isinstance(_daily[-2], (int, float)) else None
+
+            _thesis_chain_struct = _derive_structure_levels_from_chain({}, spot, walls or {}, eng or {})
+            _thesis_price_struct = _compute_price_structure_levels(ticker, spot, days=90)
+            _thesis_local_walls = _merge_price_structure_with_walls(_thesis_price_struct, _thesis_chain_struct, spot, em)
+
+            _thesis = build_thesis_from_em_card(
+                ticker=ticker,
+                spot=spot,
+                bias=bias,
+                eng=eng or {},
+                em=em,
+                walls=walls or {},
+                cagf=cagf,
+                vix=vix or {},
+                v4_result=v4_result,
+                session_label=session_label,
+                local_walls=_thesis_local_walls,
+                prior_day_close=_prior_close,
+            )
+            get_thesis_engine().store_thesis(ticker, _thesis)
+            log.info(f"Thesis stored for monitoring: {ticker} | {session_label}")
+        except Exception as _te:
+            log.warning(f"Thesis store failed for {ticker}: {_te}")
+
         _post_trade_card(
             ticker=ticker, spot=spot, expiration=expiration,
             eng=eng or {}, walls=walls or {}, bias=bias, em=em,
@@ -5017,6 +5055,19 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
             lines += [
                 "— Not financial advice —",
             ]
+            # ── Thesis Monitor: store thesis even when no trade qualifies ──
+            try:
+                _nt_thesis = build_thesis_from_em_card(
+                    ticker=ticker, spot=spot, bias=bias,
+                    eng=eng or {}, em=em, walls=walls or {},
+                    cagf=cagf, vix=vix or {},
+                    v4_result=v4_result,
+                    session_label=effective_dte_label,
+                    local_walls=local_walls,
+                )
+                get_thesis_engine().store_thesis(ticker, _nt_thesis)
+            except Exception:
+                pass
             post_to_telegram("\n".join(lines))
             log.info(f"Trade card blocked: {ticker} | {reason}")
 
@@ -5900,6 +5951,9 @@ with app.app_context():
     trade_journal.init_store(store_get, store_set)
     _oi_cache = OICache(store_get, store_set)
     log.info(f"OI cache initialized (Redis: {_get_redis() is not None})")
+    # ── Thesis Monitor Daemon ──
+    _thesis_daemon = init_thesis_daemon(get_spot_fn=get_spot, post_fn=post_to_telegram)
+    log.info("Thesis monitor daemon started")
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
