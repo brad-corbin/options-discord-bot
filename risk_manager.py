@@ -267,7 +267,23 @@ def classify_regime(
 
     # ADX regime
     if adx is None and spy_candles and len(spy_candles) >= 20:
-        adx = _compute_adx(spy_candles, period=14)
+        # spy_candles may be plain closes or OHLC tuples — handle both
+        if spy_candles and isinstance(spy_candles[0], (list, tuple)) and len(spy_candles[0]) >= 4:
+            # OHLC tuples: (open, high, low, close) or dicts
+            try:
+                if isinstance(spy_candles[0], dict):
+                    _h = [b.get("h") or b.get("high") for b in spy_candles]
+                    _l = [b.get("l") or b.get("low")  for b in spy_candles]
+                    _c = [b.get("c") or b.get("close") for b in spy_candles]
+                else:
+                    _h = [b[1] for b in spy_candles]
+                    _l = [b[2] for b in spy_candles]
+                    _c = [b[3] for b in spy_candles]
+                adx = _compute_adx(_c, period=14, highs=_h, lows=_l)
+            except Exception:
+                adx = _compute_adx(spy_candles, period=14)
+        else:
+            adx = _compute_adx(spy_candles, period=14)
 
     adx = adx or 0
     if adx <= 0:
@@ -316,43 +332,86 @@ def classify_regime(
     }
 
 
-def _compute_adx(closes: List[float], period: int = 14) -> float:
+def _compute_adx(
+    closes: List[float],
+    period: int = 14,
+    highs: List[float] = None,
+    lows: List[float] = None,
+) -> float:
     """
-    Compute ADX from daily closes (close-to-close approximation).
-    Returns current ADX value (0-100).
+    Compute ADX using proper Wilder method.
+
+    Preferred: pass highs and lows for accurate True Range and Directional Movement.
+    Fallback: close-only mode (less accurate, ~40% lower values than OHLC ADX).
+    When using close-only, thresholds REGIME_ADX_CHOPPY/TRENDING are adjusted by
+    the caller — or use highs/lows when available from OHLC bars.
+
+    Args:
+        closes: Daily close prices (required).
+        period: ADX smoothing period (default 14).
+        highs:  Daily high prices (optional, improves accuracy significantly).
+        lows:   Daily low prices  (optional, improves accuracy significantly).
     """
-    if len(closes) < period + 2:
+    n_bars = len(closes)
+    if n_bars < period + 2:
         return 0.0
 
-    changes = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    has_ohlc = (
+        highs is not None and lows is not None
+        and len(highs) == n_bars and len(lows) == n_bars
+    )
 
     plus_dm  = []
     minus_dm = []
     tr_list  = []
 
-    for i in range(1, len(changes)):
-        up_move   = changes[i] if changes[i] > 0 else 0
-        down_move = abs(changes[i]) if changes[i] < 0 else 0
+    # Fix #16: start at index 1 (not 2) — process all available bars
+    for i in range(1, n_bars):
+        if has_ohlc:
+            # Standard True Range: max of three ranges
+            hl   = highs[i] - lows[i]
+            hpc  = abs(highs[i] - closes[i - 1])
+            lpc  = abs(lows[i]  - closes[i - 1])
+            tr   = max(hl, hpc, lpc)
 
-        if up_move > down_move:
-            plus_dm.append(up_move)
-            minus_dm.append(0)
+            # Directional Movement
+            up_move   = max(highs[i] - highs[i - 1], 0)
+            down_move = max(lows[i - 1] - lows[i], 0)
+
+            if up_move > down_move:
+                plus_dm.append(up_move)
+                minus_dm.append(0.0)
+            elif down_move > up_move:
+                plus_dm.append(0.0)
+                minus_dm.append(down_move)
+            else:
+                plus_dm.append(0.0)
+                minus_dm.append(0.0)
         else:
-            plus_dm.append(0)
-            minus_dm.append(down_move)
+            # Close-only fallback (less accurate but consistent)
+            change    = closes[i] - closes[i - 1]
+            tr        = abs(change)
+            up_move   = change if change > 0 else 0.0
+            down_move = abs(change) if change < 0 else 0.0
+            if up_move > down_move:
+                plus_dm.append(up_move)
+                minus_dm.append(0.0)
+            else:
+                plus_dm.append(0.0)
+                minus_dm.append(down_move)
 
-        tr = abs(changes[i])
-        tr_list.append(max(tr, 0.01))
+        tr_list.append(max(tr, 1e-8))
 
     if len(tr_list) < period:
         return 0.0
 
-    def wilder_smooth(data, p):
+    def wilder_smooth(data: List[float], p: int) -> List[float]:
+        """Wilder smoothing: SMA seed then recursive EMA-like update."""
         if len(data) < p:
             return []
         smoothed = [sum(data[:p]) / p]
-        for i in range(p, len(data)):
-            smoothed.append((smoothed[-1] * (p - 1) + data[i]) / p)
+        for val in data[p:]:
+            smoothed.append((smoothed[-1] * (p - 1) + val) / p)
         return smoothed
 
     smooth_plus  = wilder_smooth(plus_dm,  period)
@@ -364,7 +423,6 @@ def _compute_adx(closes: List[float], period: int = 14) -> float:
 
     dx_list = []
     n = min(len(smooth_plus), len(smooth_minus), len(smooth_tr))
-
     for i in range(n):
         atr = smooth_tr[i]
         if atr <= 0:
@@ -372,13 +430,13 @@ def _compute_adx(closes: List[float], period: int = 14) -> float:
         di_plus  = (smooth_plus[i]  / atr) * 100
         di_minus = (smooth_minus[i] / atr) * 100
         di_sum   = di_plus + di_minus
-
         if di_sum > 0:
-            dx = abs(di_plus - di_minus) / di_sum * 100
-            dx_list.append(dx)
+            dx_list.append(abs(di_plus - di_minus) / di_sum * 100)
 
+    if not dx_list:
+        return 0.0
     if len(dx_list) < period:
-        return sum(dx_list) / max(len(dx_list), 1)
+        return round(sum(dx_list) / len(dx_list), 2)
 
     adx_values = wilder_smooth(dx_list, period)
     return round(adx_values[-1], 2) if adx_values else 0.0
