@@ -4891,24 +4891,24 @@ def _build_action_block(
     if struct_s is not None:
         if gex_positive:
             lines.append(
-                f"  IF price breaks below ${struct_s:.2f} AND fails to continue (2-3 candles)"
+                f"  IF price breaks below ${struct_s:.2f} AND fails to continue (2-3 five-minute candles)"
                 f" AND reclaims it → GO LONG (squeeze). Shorts get trapped. Stop below ${struct_s:.2f}."
             )
         else:
             lines.append(
-                f"  IF price breaks below ${struct_s:.2f} WITH large candles"
-                f" AND continues → SHORT is valid. Stop above ${struct_s:.2f}."
+                f"  IF price breaks below ${struct_s:.2f} WITH large 5m candles"
+                f" AND continues lower → SHORT is valid. Stop above ${struct_s:.2f}."
             )
 
     if struct_r is not None:
         if gex_positive:
             lines.append(
-                f"  IF price breaks above ${struct_r:.2f} AND fails to continue"
+                f"  IF price breaks above ${struct_r:.2f} AND fails to continue (2-3 five-minute candles)"
                 f" AND loses it → GO SHORT (fade). Longs get trapped. Stop above ${struct_r:.2f}."
             )
         else:
             lines.append(
-                f"  IF price breaks above ${struct_r:.2f} WITH momentum"
+                f"  IF price breaks above ${struct_r:.2f} WITH momentum on 5m candles"
                 f" AND holds → LONG is valid. Stop below ${struct_r:.2f}."
             )
 
@@ -4926,10 +4926,10 @@ def _build_action_block(
 
     # ── Momentum filter ──
     lines.append("")
-    lines.append("⚠️ MOMENTUM RULES:")
-    lines.append("  A break is ONLY valid with large candles + continuation.")
+    lines.append("⚠️ MOMENTUM RULES (on 5m chart):")
+    lines.append("  A break is ONLY valid with large 5m candles + continuation on the next candle.")
     lines.append("  Small candles breaking a level = likely a TRAP. Wait for the failure.")
-    lines.append("  If your trade's momentum fades (moves get smaller) → tighten or exit.")
+    lines.append("  If your trade's momentum fades (5m candles getting smaller) → tighten or exit.")
 
     # ── Pin zone behavior ──
     if pin_low is not None and pin_high is not None and gex_positive:
