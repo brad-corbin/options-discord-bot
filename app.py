@@ -2574,6 +2574,7 @@ def telegram_webhook(secret):
             get_portfolio_chat_id_fn=get_portfolio_chat_id,
             get_regime_fn=get_current_regime,
             post_em_card_fn=_post_em_card, post_monitor_card_fn=_post_monitor_card,
+            post_checkswing_card_fn=_post_checkswing_card,
         )
 
     threading.Thread(target=run_command, daemon=True).start()
@@ -4657,6 +4658,101 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
         log.error(f"Trade card error for {ticker}: {e}", exc_info=True)
 
 
+def _append_shared_regime_lines(lines: list, canonical_vol: dict = None, unified_regime: dict = None, management_note: str = ""):
+    if canonical_vol:
+        lines.append(f"🌡️ Volatility Regime: {_format_canonical_vol_line(canonical_vol)}")
+        posture = canonical_vol.get("posture")
+        if posture:
+            lines.append(f"🪖 Posture: {posture}")
+    if unified_regime:
+        lines.append(f"⚙️ Dealer Regime: {_format_unified_regime_line(unified_regime)}")
+    if management_note:
+        lines.append(f"🛠️ Management focus: {management_note}")
+    return lines
+
+
+def _post_checkswing_card(ticker: str, forced_direction: str = None):
+    try:
+        from swing_engine import recommend_swing_trade, format_swing_card
+        ticker = ticker.upper()
+        spot = get_spot(ticker)
+        chains = get_options_chain_swing(ticker)
+        if not chains:
+            post_to_telegram(f"❌ {ticker} — NO SWING SETUP\nReason: no options chain data in 7-60 DTE range\n\n— Not financial advice —")
+            return
+        candles = get_daily_candles(ticker, days=252)
+        iv_rank = _estimate_iv_rank(chains, candles)
+        canonical_vol = _get_canonical_vol_regime(ticker, candle_closes=candles)
+        directions = [forced_direction] if forced_direction else ["bull", "bear"]
+        valid = []
+        rejects = []
+        for direction in directions:
+            wd = {"type": "swing", "source": "check", "bias": direction, "tier": "manual"}
+            rec = recommend_swing_trade(ticker=ticker, spot=spot, chains=chains, webhook_data=wd, iv_rank=iv_rank)
+            rec = _apply_canonical_vol_overlay_to_rec(rec, canonical_vol, mode="swing")
+            if rec.get("ok"):
+                valid.append(rec)
+            else:
+                rejects.append((direction, rec.get("reason", "no valid setup")))
+        if not valid:
+            parts = [f"❌ {ticker} — NO SWING SETUP"]
+            for direction, reason in rejects:
+                emoji = "🐂" if direction == "bull" else "🐻"
+                parts.append(f"{emoji} {direction.upper()}: {reason}")
+            if canonical_vol:
+                parts.append("")
+                parts.append(f"🌡️ Volatility Regime: {_format_canonical_vol_line(canonical_vol)}")
+                parts.append(f"🪖 Posture: {canonical_vol.get('posture','')}")
+            parts.append("")
+            parts.append("— Not financial advice —")
+            post_to_telegram("\n".join(parts))
+            try:
+                _log_signal_dataset_event(
+                    ticker=ticker,
+                    webhook_data={"type": "swing", "source": "check", "bias": forced_direction or "both", "tier": "manual"},
+                    outcome="rejected_no_setup",
+                    reason=" | ".join(f"{d}:{r}" for d, r in rejects)[:300],
+                    spot=spot,
+                    expirations_checked=len(chains),
+                    vol_regime=canonical_vol,
+                )
+            except Exception:
+                pass
+            return
+
+        valid.sort(key=lambda r: ((r.get("confidence") or 0), ((r.get("trade") or {}).get("expected_value") or 0), ((r.get("trade") or {}).get("ror") or 0)), reverse=True)
+        rec = valid[0]
+        expiration = rec.get("exp")
+        dte = rec.get("dte")
+        try:
+            result_tuple = _get_chain_iv_for_expiry(ticker, expiration, dte)
+            eng, walls = result_tuple[3], result_tuple[4]
+        except Exception:
+            eng, walls = {}, {}
+        unified_regime = resolve_unified_regime(eng or {}, None, spot)
+        card = format_swing_card(rec)
+        extras = []
+        _append_shared_regime_lines(extras, canonical_vol, unified_regime)
+        final_card = card + "\n\n" + "\n".join(extras)
+        post_to_telegram(final_card)
+        try:
+            _log_signal_dataset_event(
+                ticker=ticker,
+                webhook_data={"type": "swing", "source": "check", "bias": rec.get("direction"), "tier": rec.get("tier", "manual")},
+                outcome="trade_opened",
+                reason="",
+                best_rec=rec,
+                spot=spot,
+                expirations_checked=len(chains),
+                vol_regime=canonical_vol,
+            )
+        except Exception:
+            pass
+    except Exception as e:
+        log.error(f"/checkswing {ticker}: {e}", exc_info=True)
+        post_to_telegram(f"⚠️ Swing check failed for {ticker}: {type(e).__name__}")
+
+
 # ─────────────────────────────────────────────────────────────────────
 # _post_monitor_card — v4 INTEGRATED
 # ─────────────────────────────────────────────────────────────────────
@@ -4678,6 +4774,8 @@ def _post_monitor_card(ticker: str, mode: str):
             return
 
         liquid = _is_liquid(ticker)
+        candles = get_daily_candles(ticker, days=252)
+        canonical_vol = _get_canonical_vol_regime(ticker, candle_closes=candles)
         result_tuple = _get_chain_iv_for_expiry(ticker, expiry, dte)
         iv, spot, expiration = result_tuple[0], result_tuple[1], result_tuple[2]
         eng, walls, skew, pcr, vix = result_tuple[3], result_tuple[4], result_tuple[5], result_tuple[6], result_tuple[7]
@@ -4685,6 +4783,7 @@ def _post_monitor_card(ticker: str, mode: str):
 
         if not liquid:
             eng = {}
+        unified_regime = resolve_unified_regime(eng or {}, None, spot) if spot else {}
 
         if iv is None or spot is None:
             post_to_telegram(f"⚠️ {ticker}: could not fetch IV for {expiry} (DTE={dte})")
@@ -4832,9 +4931,17 @@ def _post_monitor_card(ticker: str, mode: str):
             if vr_line:
                 lines.append(f"  Vol: {vr_line}")
         lines.append(f"  IV note: {iv_note}")
+        lines.append("")
+        management_note = (
+            "Use this as a wheel/thesis monitor — not an automatic swing entry." if mode == "long"
+            else "Use this to decide whether to roll, trim, or close early if price breaks support/resistance."
+        )
+        _append_shared_regime_lines(lines, canonical_vol, unified_regime, management_note)
         if mode == "long":
             lines += _build_wheel_focus_block(ticker, expiration, spot, em, walls or {})
-        lines += ["", "📌 Monitoring only — no trade.", "— Not financial advice —"]
+            lines += ["", "📌 Monitoring / wheel management only — no swing entry.", "— Not financial advice —"]
+        else:
+            lines += ["", "📌 Monitoring only — manage existing trade / roll risk, not a fresh entry signal.", "— Not financial advice —"]
 
         post_to_telegram("\n".join(lines))
         log.info(f"Monitor card: {ticker} | mode={mode} | DTE={dte} | lean={bias['direction']} | conf={conf_label}")
