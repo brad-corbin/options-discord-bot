@@ -3918,18 +3918,44 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
             range_high = em.get('bull_1sd')
             struct_r = local_walls.get("local_resistance_1")
             struct_s = local_walls.get("local_support_1")
-            accel_up = struct_r or call_wall or range_high
-            accel_dn = struct_s or put_wall or range_low
             regime_line = _format_unified_regime_line(unified_regime)
             pin_low = local_walls.get("pin_zone_low")
             pin_high = local_walls.get("pin_zone_high")
             pivot = local_walls.get("pivot")
-            r1 = local_walls.get("r1"); s1 = local_walls.get("s1")
-            fib_r = local_walls.get("fib_resistance"); fib_s = local_walls.get("fib_support")
+            r1 = local_walls.get("r1")
+            s1 = local_walls.get("s1")
+            fib_r = local_walls.get("fib_resistance")
+            fib_s = local_walls.get("fib_support")
             vpoc = local_walls.get("vpoc")
+            em_1sd = em.get("em_1sd") or 0.0
+            pin_width = abs((pin_high or 0) - (pin_low or 0)) if pin_low is not None and pin_high is not None else None
+            max_pain_close = bool(max_pain is not None and em_1sd > 0 and abs(max_pain - spot) <= 0.35 * em_1sd)
+            tight_pin = bool(pin_width is not None and em_1sd > 0 and pin_width <= 2.2 * em_1sd)
+            pin_favored = tight_pin or max_pain_close
+
+            micro_up = struct_r
+            micro_dn = struct_s
+            range_break_up = pin_high or call_wall or range_high
+            range_break_dn = pin_low or put_wall or range_low
+            regime_shift_up = flip if flip is not None and flip > spot else None
+            regime_shift_dn = flip if flip is not None and flip < spot else None
+
+            headline_emoji = emoji
+            headline_text = reason
+            if pin_favored and abs(bias.get("score", 0)) <= 1:
+                headline_emoji = "⚪"
+                if pin_low is not None and pin_high is not None:
+                    zone_txt = f"{_fmt_money(pin_low)}–{_fmt_money(pin_high)}"
+                else:
+                    zone_txt = f"{_fmt_money(range_low)}–{_fmt_money(range_high)}"
+                if bias.get("direction") == "NEUTRAL":
+                    headline_text = f"RANGE / PIN RISK — no directional edge inside {zone_txt}."
+                else:
+                    headline_text = f"RANGE / PIN RISK — {bias.get('direction').lower()} lean too weak inside {zone_txt}."
+
             lines = [
                 f"🎯 {ticker} — DEALER EM BRIEF ({effective_dte_label})  |  Exp: {exp_short}",
-                f"{emoji} NO TRADE — {reason}",
+                f"{headline_emoji} NO TRADE — {headline_text}",
                 "",
                 f"🧭 Bias: {bias_line}",
                 f"📍 Spot: {_fmt_money(spot)}",
@@ -3958,20 +3984,38 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
                     pivot_line += f"  |  R1 {_fmt_money(r1)} / S1 {_fmt_money(s1)}"
                 lines.append(pivot_line)
             if fib_r is not None or fib_s is not None:
-                lines.append(f"🪜 Fib Zone: {_fmt_money(fib_s)} ↔ {_fmt_money(fib_r)}")
+                fib_left = _fmt_money(fib_s) if fib_s is not None else "n/a"
+                fib_right = _fmt_money(fib_r) if fib_r is not None else "n/a"
+                lines.append(f"🪜 Fib Zone: {fib_left} ↔ {fib_right}")
             if vpoc is not None:
                 lines.append(f"📊 VPOC / Acceptance: {_fmt_money(vpoc)}")
             if pin_low is not None and pin_high is not None:
-                pin_width = abs((pin_high or 0) - (pin_low or 0))
                 lines.append(f"📌 Pin Zone: {_fmt_money(pin_low)} – {_fmt_money(pin_high)}")
-                if (em.get("em_1sd") or 0) > 0 and pin_width <= 2.2 * (em.get("em_1sd") or 0):
+                if tight_pin:
                     lines.append("🤝 Neutral read: range / condor structure favored while price stays inside the pin zone.")
-            if max_pain is not None and (em.get("em_1sd") or 0) > 0:
-                if abs(max_pain - spot) <= 0.35 * (em.get("em_1sd") or 0):
-                    lines.append(f"🧲 Magnet: spot is trading close to Max Pain {_fmt_money(max_pain)}.")
+            if max_pain_close:
+                lines.append(f"🧲 Magnet: spot is trading close to Max Pain {_fmt_money(max_pain)}.")
+
+            if micro_up is not None or micro_dn is not None:
+                lines.append("")
+                lines.append("⚡ Micro triggers")
+                if micro_up is not None:
+                    lines.append(f"• Up: above {_fmt_money(micro_up)}")
+                if micro_dn is not None:
+                    lines.append(f"• Down: below {_fmt_money(micro_dn)}")
+            if range_break_up is not None or range_break_dn is not None:
+                lines.append("🧨 Range-break triggers")
+                if range_break_up is not None:
+                    lines.append(f"• Up: above {_fmt_money(range_break_up)}")
+                if range_break_dn is not None:
+                    lines.append(f"• Down: below {_fmt_money(range_break_dn)}")
+            if regime_shift_up is not None or regime_shift_dn is not None:
+                lines.append("🔄 Regime-shift trigger")
+                if regime_shift_up is not None:
+                    lines.append(f"• Reclaim above gamma flip: {_fmt_money(regime_shift_up)}")
+                if regime_shift_dn is not None:
+                    lines.append(f"• Lose gamma flip: {_fmt_money(regime_shift_dn)}")
             lines += [
-                f"🚦 Trigger Up: above {_fmt_money(accel_up)}",
-                f"🚦 Trigger Down: below {_fmt_money(accel_dn)}",
                 f"⚙️ Regime: {regime_line}",
                 "— Not financial advice —",
             ]
