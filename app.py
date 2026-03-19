@@ -427,7 +427,7 @@ def _post_diagnostic(text: str):
 
 def _log_signal_dataset_event(ticker: str, webhook_data: dict, outcome: str, reason: str = "", best_rec: dict = None,
                               signal_validation: dict = None, regime: dict = None, v4_flow: dict = None,
-                              spot: float = None, expirations_checked: int = None):
+                              spot: float = None, expirations_checked: int = None, vol_regime: dict = None):
     try:
         wd = dict(webhook_data or {})
         trade = (best_rec or {}).get("trade", {}) if best_rec else {}
@@ -466,7 +466,14 @@ def _log_signal_dataset_event(ticker: str, webhook_data: dict, outcome: str, rea
             "adx": (regime or {}).get("adx") if isinstance(regime, dict) else None,
             "v4_composite_regime": (v4_flow or {}).get("composite_regime") if isinstance(v4_flow, dict) else None,
             "v4_confidence_label": (v4_flow or {}).get("confidence_label") if isinstance(v4_flow, dict) else None,
-            "log_schema": "v1",
+            "vol_regime_label": (vol_regime or {}).get("label") if isinstance(vol_regime, dict) else None,
+            "vol_regime_base": (vol_regime or {}).get("base") if isinstance(vol_regime, dict) else None,
+            "vol_caution_score": (vol_regime or {}).get("caution_score") if isinstance(vol_regime, dict) else None,
+            "vol_transition_warning": (vol_regime or {}).get("transition_warning") if isinstance(vol_regime, dict) else None,
+            "vol_term_structure": (vol_regime or {}).get("term_structure") if isinstance(vol_regime, dict) else None,
+            "vol_vvix": (vol_regime or {}).get("vvix") if isinstance(vol_regime, dict) else None,
+            "vol_size_mult": (vol_regime or {}).get("size_mult") if isinstance(vol_regime, dict) else None,
+            "log_schema": "v2",
         }
         fieldnames = list(row.keys())
         _append_csv_row("signal_decisions.csv", fieldnames, row)
@@ -625,6 +632,7 @@ def _prefetch_ticker(ticker: str):
 
         # 5. Regime (cached globally, so this is fast after first call)
         regime = get_current_regime()
+        vol_regime = get_canonical_vol_regime(ticker, candle_closes)
 
         # 6. V4 prefilter (institutional snapshot)
         v4_flow = _run_v4_prefilter(ticker, spot, chains, candle_closes)
@@ -637,10 +645,11 @@ def _prefetch_ticker(ticker: str):
             "enrichment": enrichment,
             "candle_closes": candle_closes,
             "regime": regime,
+            "vol_regime": vol_regime,
             "v4_flow": v4_flow,
         })
 
-        log.info(f"Prefetch {ticker}: {len(chains)} exps, "
+        log.info(f"Prefetch {ticker}: {len(chains)} exps, vol={vol_regime.get('label','?')}, "
                  f"v4={v4_flow.get('composite_regime', '?') if v4_flow else 'N/A'}, "
                  f"{elapsed:.1f}s")
 
@@ -649,7 +658,7 @@ def _prefetch_ticker(ticker: str):
         # Store a minimal entry so workers don't re-fetch and also timeout
         _prefetch_set(ticker, {
             "spot": None, "chains": None, "enrichment": {},
-            "candle_closes": [], "regime": {}, "v4_flow": {},
+            "candle_closes": [], "regime": {}, "vol_regime": {}, "v4_flow": {},
             "error": str(e),
         })
 
@@ -1084,19 +1093,29 @@ def _process_job(worker_id: int, job: dict):
             return
 
         candles = get_daily_candles(ticker, days=252)
+        vol_regime = get_canonical_vol_regime(ticker, candles)
         iv_rank = _estimate_iv_rank(chains, candles)
+        webhook_data = dict(webhook_data or {})
+        webhook_data["vol_regime_module"] = vol_regime
         rec = recommend_swing_trade(
             ticker=ticker, spot=spot, chains=chains,
             webhook_data=webhook_data, iv_rank=iv_rank,
         )
+        rec = _apply_canonical_vol_overlay_to_rec(rec, vol_regime, mode="swing") if rec.get("ok") else rec
         base["confidence"] = rec.get("confidence")
+        if rec.get("ok") and vol_regime.get("label") == "CRISIS" and int(rec.get("confidence") or 0) < 80:
+            rec = {"ok": False, "reason": "CRISIS volatility regime — swing setups require exceptional confidence", "confidence": rec.get("confidence")}
+            base["confidence"] = rec.get("confidence")
 
         if not rec.get("ok"):
             base["reason"] = rec.get("reason", "no valid setup")
             _record_wave_result(base)
         else:
             base["outcome"] = "trade"
-            base["card"]    = format_swing_card(rec)
+            _swing_card = format_swing_card(rec)
+            if rec.get("vol_regime_note"):
+                _swing_card = rec["vol_regime_note"] + "\n\n" + _swing_card
+            base["card"]    = _swing_card
             _record_wave_result(base)
             log.info(f"Swing winner queued for digest: {ticker} {bias} conf={rec.get('confidence')}/100")
 
@@ -1338,6 +1357,259 @@ def _market_today_date():
         return datetime.now(ZoneInfo("America/Chicago")).date()
     except Exception:
         return datetime.now(timezone.utc).date()
+
+
+# ─────────────────────────────────────────────────────────
+# CANONICAL VOLATILITY REGIME MODULE
+# Shared overlay for EM, scalp, and swing.
+# Uses simple, robust signals only: VIX band, VIX vs 200DMA,
+# VIX9D/VIX term structure, VVIX warning, and realized vol context.
+# ─────────────────────────────────────────────────────────
+
+_vol_regime_market_cache = {"data": None, "ts": 0}
+_vol_regime_symbol_cache = {}
+
+
+def _fetch_yahoo_chart_closes(symbol: str, range_days: int = 450) -> list:
+    try:
+        sym = requests.utils.quote(symbol, safe="")
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}"
+        resp = requests.get(url, params={"range": f"{range_days}d", "interval": "1d", "includePrePost": "false"}, timeout=8)
+        resp.raise_for_status()
+        data = resp.json() or {}
+        result = (((data.get("chart") or {}).get("result") or [None])[0] or {})
+        quotes = (((result.get("indicators") or {}).get("quote") or [None])[0] or {})
+        closes = quotes.get("close") or []
+        out = []
+        for c in closes:
+            try:
+                if c is not None:
+                    out.append(float(c))
+            except Exception:
+                pass
+        return out
+    except Exception as e:
+        log.debug(f"Yahoo closes fetch failed for {symbol}: {e}")
+        return []
+
+
+def _fetch_yahoo_last(symbol: str) -> float | None:
+    try:
+        closes = _fetch_yahoo_chart_closes(symbol, range_days=10)
+        return float(closes[-1]) if closes else None
+    except Exception:
+        return None
+
+
+def _calc_ann_rv_from_closes(closes: list, window: int = 20) -> float | None:
+    try:
+        vals = [float(x) for x in closes if x is not None and float(x) > 0]
+        if len(vals) < window + 1:
+            return None
+        vals = vals[-(window + 1):]
+        rets = []
+        for i in range(1, len(vals)):
+            prev = vals[i - 1]
+            cur = vals[i]
+            if prev > 0 and cur > 0:
+                rets.append(math.log(cur / prev))
+        if len(rets) < max(3, window - 1):
+            return None
+        mean = sum(rets) / len(rets)
+        var = sum((r - mean) ** 2 for r in rets) / max(len(rets) - 1, 1)
+        return math.sqrt(var) * math.sqrt(252) * 100.0
+    except Exception:
+        return None
+
+
+def _get_vix_ma200() -> float | None:
+    now = time.time()
+    cached = _vol_regime_market_cache.get("vix_ma200")
+    ts = _vol_regime_market_cache.get("vix_ma200_ts", 0)
+    if cached is not None and (now - ts) < 3600:
+        return cached
+    closes = _fetch_yahoo_chart_closes("^VIX", range_days=420)
+    if len(closes) < 200:
+        return None
+    ma = sum(closes[-200:]) / 200.0
+    _vol_regime_market_cache["vix_ma200"] = ma
+    _vol_regime_market_cache["vix_ma200_ts"] = now
+    return ma
+
+
+def _get_vvix_value() -> float | None:
+    now = time.time()
+    cached = _vol_regime_market_cache.get("vvix")
+    ts = _vol_regime_market_cache.get("vvix_ts", 0)
+    if cached is not None and (now - ts) < 900:
+        return cached
+    vvix = _fetch_yahoo_last("^VVIX")
+    _vol_regime_market_cache["vvix"] = vvix
+    _vol_regime_market_cache["vvix_ts"] = now
+    return vvix
+
+
+def get_canonical_vol_regime(ticker: str = "SPY", candle_closes: list | None = None) -> dict:
+    ticker = (ticker or "SPY").upper()
+    cache_key = ticker
+    now = time.time()
+    cached = _vol_regime_symbol_cache.get(cache_key)
+    if cached and (now - cached.get("ts", 0)) < 300:
+        return cached.get("data", {})
+
+    market = _get_vix_data() or {}
+    vix = as_float(market.get("vix"), 20.0)
+    vix9d = as_float(market.get("vix9d"), 0.0)
+    term = (market.get("term") or "unknown").lower()
+    vix_ma200 = _get_vix_ma200()
+    above_ma200 = bool(vix_ma200 and vix > vix_ma200)
+    vvix = _get_vvix_value()
+
+    closes = candle_closes or get_daily_candles(ticker, days=30) or get_daily_candles("SPY", days=30)
+    rv5 = _calc_ann_rv_from_closes(closes, 5)
+    rv20 = _calc_ann_rv_from_closes(closes, 20)
+
+    if vix < 15:
+        base = "LOW"
+        caution = 0
+    elif vix < 20:
+        base = "NORMAL"
+        caution = 1
+    elif vix < 30:
+        base = "ELEVATED"
+        caution = 3
+    else:
+        base = "CRISIS"
+        caution = 5
+
+    if above_ma200:
+        caution += 1
+    if term == "flat":
+        caution += 1
+    elif term == "inverted":
+        caution += 2
+    vvix_warning = bool(vvix and vvix >= 120)
+    if vvix_warning:
+        caution += 1
+    rv_spike = bool(rv5 and rv20 and rv5 > (rv20 * 1.35))
+    if rv_spike:
+        caution += 1
+
+    transition_warning = False
+    if base in ("LOW", "NORMAL") and (above_ma200 or term in ("flat", "inverted") or vvix_warning or rv_spike):
+        transition_warning = True
+    if base == "ELEVATED" and term == "inverted" and vvix_warning:
+        transition_warning = True
+
+    if base == "CRISIS" or caution >= 6:
+        label = "CRISIS"
+        size_mult = 0.35
+        posture = "Capital preservation. Only best defined-risk setups."
+        confidence = "HIGH"
+    elif base == "ELEVATED" or caution >= 4:
+        label = "ELEVATED"
+        size_mult = 0.60
+        posture = "Reduce size. Favor defined-risk and cleaner directional setups."
+        confidence = "HIGH" if caution >= 5 else "MODERATE"
+    elif transition_warning:
+        label = "TRANSITION"
+        size_mult = 0.75
+        posture = "Transition warning. Smaller size and stricter setup quality."
+        confidence = "MODERATE"
+    elif base == "LOW":
+        label = "LOW"
+        size_mult = 1.00
+        posture = "Calm conditions. Directional setups okay if dealer/structure agrees."
+        confidence = "MODERATE"
+    else:
+        label = "NORMAL"
+        size_mult = 0.90
+        posture = "Balanced environment. Defined-risk preferred."
+        confidence = "MODERATE"
+
+    if label in ("TRANSITION", "ELEVATED", "CRISIS"):
+        emoji = "⚠️" if label == "TRANSITION" else "🔶" if label == "ELEVATED" else "🚨"
+    else:
+        emoji = "🟢" if label == "LOW" else "🟡"
+
+    term_slope = (vix9d - vix) if (vix9d and vix) else None
+    description = posture
+    result = {
+        "label": label,
+        "base": base,
+        "emoji": emoji,
+        "vix": vix,
+        "vix9d": vix9d if vix9d > 0 else None,
+        "term_structure": term,
+        "term_slope": round(term_slope, 2) if term_slope is not None else None,
+        "vix_ma200": round(vix_ma200, 2) if vix_ma200 else None,
+        "above_ma200": above_ma200,
+        "vvix": round(vvix, 1) if vvix else None,
+        "vvix_warning": vvix_warning,
+        "rv5": round(rv5, 1) if rv5 else None,
+        "rv20": round(rv20, 1) if rv20 else None,
+        "rv_spike": rv_spike,
+        "transition_warning": transition_warning,
+        "caution_score": int(caution),
+        "size_mult": size_mult,
+        "posture": posture,
+        "description": description,
+        "confidence": confidence,
+        "ts": now,
+    }
+    _vol_regime_symbol_cache[cache_key] = {"data": result, "ts": now}
+    return result
+
+
+def _format_canonical_vol_line(vol_regime: dict) -> str:
+    if not vol_regime:
+        return ""
+    bits = [f"{vol_regime.get('emoji','🌡️')} {vol_regime.get('label','UNKNOWN')}"]
+    vix = vol_regime.get("vix")
+    if vix is not None:
+        bits.append(f"VIX {vix:.1f}")
+    if vol_regime.get("above_ma200"):
+        bits.append("> MA200")
+    term = vol_regime.get("term_structure")
+    if term and term != "unknown":
+        bits.append(f"term {term}")
+    vvix = vol_regime.get("vvix")
+    if vvix:
+        bits.append(f"VVIX {vvix:.0f}")
+    if vol_regime.get("transition_warning"):
+        bits.append("transition warning")
+    return " | ".join(bits)
+
+
+def _apply_canonical_vol_overlay_to_rec(rec: dict, vol_regime: dict, mode: str = "scalp") -> dict:
+    rec = rec or {}
+    if not vol_regime:
+        return rec
+    rec["canonical_vol_regime"] = vol_regime
+    base_conf = int(rec.get("confidence") or 0)
+    penalty = 0
+    if vol_regime.get("label") == "CRISIS":
+        penalty = 10 if mode == "scalp" else 8
+    elif vol_regime.get("label") == "ELEVATED":
+        penalty = 6 if mode == "scalp" else 4
+    elif vol_regime.get("label") == "TRANSITION":
+        penalty = 4 if mode == "scalp" else 3
+    if penalty:
+        rec.setdefault("confidence_pre_vol_regime", base_conf)
+        rec["confidence"] = max(0, base_conf - penalty)
+        rec["vol_regime_penalty"] = penalty
+    contracts = rec.get("contracts")
+    try:
+        if contracts is not None:
+            adj = max(1, int(math.floor(float(contracts) * float(vol_regime.get("size_mult", 1.0)))))
+            rec["contracts_pre_vol_regime"] = contracts
+            rec["contracts"] = adj
+    except Exception:
+        pass
+    note = _format_canonical_vol_line(vol_regime)
+    if note:
+        rec["vol_regime_note"] = f"🌡️ Volatility overlay: {note}. Posture: {vol_regime.get('posture','')}"
+    return rec
 
 
 def _dedupe_expirations_by_dte(valid_exps: list, max_per_dte: int = 1) -> list:
@@ -2052,6 +2324,7 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
             enrichment = cached.get("enrichment", {})
             candle_closes = cached.get("candle_closes", [])
             regime = cached.get("regime") or get_current_regime()
+            vol_regime = cached.get("vol_regime") or get_canonical_vol_regime(ticker, candle_closes)
             v4_flow = cached.get("v4_flow", {})
             has_earnings = enrichment.get("has_earnings", False)
             earnings_warn = enrichment.get("earnings_warn")
@@ -2067,6 +2340,7 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
             earnings_warn = enrichment.get("earnings_warn")
             candle_closes = get_daily_candles(ticker, days=RV_LOOKBACK_DAYS + 5)
             regime = get_current_regime()
+            vol_regime = get_canonical_vol_regime(ticker, candle_closes)
             v4_flow = _run_v4_prefilter(ticker, spot, chains, candle_closes)
             _prefetch_set(ticker, {
                 "spot": spot,
@@ -2074,6 +2348,7 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
                 "enrichment": enrichment,
                 "candle_closes": candle_closes,
                 "regime": regime,
+                "vol_regime": vol_regime,
                 "v4_flow": v4_flow,
             })
             log.info(f"check_ticker({ticker}): live fetch cached for reuse")
@@ -2081,17 +2356,19 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
 
         log.info(f"check_ticker({ticker}): spot={spot} expirations={len(chains)} "
                  f"earnings={has_earnings} candles={len(candle_closes)} direction={direction}"
+                 f" vol={vol_regime.get('label','?')}"
                  f"{' v4=' + v4_flow.get('composite_regime', '?') if v4_flow else ''}")
 
         signal_validation = _validate_live_signal(ticker, spot, webhook_data)
         webhook_data = dict(webhook_data or {})
         webhook_data["live_spot"] = spot
         webhook_data["signal_validation"] = signal_validation
+        webhook_data["vol_regime_module"] = vol_regime
 
         if not signal_validation.get("ok", True):
             reason = signal_validation.get("reason") or "signal validation failed"
             trade_journal.log_signal(ticker, webhook_data, outcome="rejected", reason=reason[:200])
-            _log_signal_dataset_event(ticker, webhook_data, outcome="rejected_validation", reason=reason, signal_validation=signal_validation, regime=regime, v4_flow=v4_flow, spot=spot, expirations_checked=len(chains) if chains else 0)
+            _log_signal_dataset_event(ticker, webhook_data, outcome="rejected_validation", reason=reason, signal_validation=signal_validation, regime=regime, v4_flow=v4_flow, spot=spot, expirations_checked=len(chains) if chains else 0, vol_regime=vol_regime)
             log.info(f"check_ticker({ticker}): rejected by validation — {reason}")
             return {
                 "ticker": ticker, "ok": False, "posted": False,
@@ -2122,7 +2399,7 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
             if all_reasons:
                 combined_reason += "\n" + "\n".join(all_reasons[:4])
             trade_journal.log_signal(ticker, webhook_data, outcome="rejected", reason=combined_reason[:200])
-            _log_signal_dataset_event(ticker, webhook_data, outcome="rejected_no_setup", reason=combined_reason, signal_validation=signal_validation, regime=regime, v4_flow=v4_flow, spot=spot, expirations_checked=len(chains))
+            _log_signal_dataset_event(ticker, webhook_data, outcome="rejected_no_setup", reason=combined_reason, signal_validation=signal_validation, regime=regime, v4_flow=v4_flow, spot=spot, expirations_checked=len(chains), vol_regime=vol_regime)
             return {"ticker": ticker, "ok": False, "posted": False,
                     "reason": combined_reason, "confidence": None}
 
@@ -2148,11 +2425,12 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
             best_rec["confidence"] = max(0, base_conf - penalty)
             best_rec["signal_validation_penalty"] = penalty
 
+        best_rec = _apply_canonical_vol_overlay_to_rec(best_rec, vol_regime, mode="scalp")
         trade = best_rec.get("trade", {})
 
         if is_duplicate_trade(ticker, direction, trade.get("short"), trade.get("long")):
             trade_journal.log_signal(ticker, webhook_data, outcome="duplicate", confidence=best_rec.get("confidence"))
-            _log_signal_dataset_event(ticker, webhook_data, outcome="duplicate", reason="Duplicate trade in dedup window", best_rec=best_rec, signal_validation=signal_validation, regime=regime, v4_flow=v4_flow, spot=spot, expirations_checked=len(chains))
+            _log_signal_dataset_event(ticker, webhook_data, outcome="duplicate", reason="Duplicate trade in dedup window", best_rec=best_rec, signal_validation=signal_validation, regime=regime, v4_flow=v4_flow, spot=spot, expirations_checked=len(chains), vol_regime=vol_regime)
             return {"ticker": ticker, "ok": True, "posted": False, "reason": "Duplicate trade in dedup window"}
 
         risk_result = risk_manager.check_risk_limits(
@@ -2190,7 +2468,7 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
             outcome="trade_opened" if risk_result["allowed"] else "risk_blocked",
             reason=("; ".join(risk_result.get("blocks", [])) if not risk_result["allowed"] else ""),
             best_rec=best_rec, signal_validation=signal_validation, regime=regime, v4_flow=v4_flow,
-            spot=spot, expirations_checked=len(chains)
+            spot=spot, expirations_checked=len(chains), vol_regime=vol_regime
         )
 
         # v4.3: Cache card for /tradecard retrieval (same as wave digest path)
@@ -3449,7 +3727,7 @@ def _find_expiry_closest_to_21(ticker):
 # against actual EOD prices and compute hit rates over time.
 # ─────────────────────────────────────────────────────────────────────
 
-def _log_em_prediction(ticker: str, session: str, spot: float, em: dict, bias: dict, v4_result: dict, walls: dict = None, eng: dict = None, cagf: dict = None):
+def _log_em_prediction(ticker: str, session: str, spot: float, em: dict, bias: dict, v4_result: dict, walls: dict = None, eng: dict = None, cagf: dict = None, vol_regime: dict = None):
     """
     Log EM prediction to Redis and to an auto-tracked dataset for later tuning.
     Key: em_log:{date}:{ticker}:{session}
@@ -3508,6 +3786,13 @@ def _log_em_prediction(ticker: str, session: str, spot: float, em: dict, bias: d
             "cagf_direction": (cagf or {}).get("direction"),
             "cagf_regime": (cagf or {}).get("regime"),
             "trend_day_probability": (cagf or {}).get("trend_day_probability"),
+            "vol_regime_label": (vol_regime or {}).get("label"),
+            "vol_regime_base": (vol_regime or {}).get("base"),
+            "vol_caution_score": (vol_regime or {}).get("caution_score"),
+            "vol_transition_warning": (vol_regime or {}).get("transition_warning"),
+            "vol_term_structure": (vol_regime or {}).get("term_structure"),
+            "vol_vvix": (vol_regime or {}).get("vvix"),
+            "vol_size_mult": (vol_regime or {}).get("size_mult"),
             "eod_price": None,
             "reconciled": False,
         }
@@ -3520,7 +3805,8 @@ def _log_em_prediction(ticker: str, session: str, spot: float, em: dict, bias: d
             "pin_zone_low","pin_zone_high","pivot","r1","s1","r2","s2","swing_high","swing_low",
             "fib_resistance","fib_support","vp_resistance","vp_support","vpoc","local_resistance_1","local_support_1",
             "local_resistance_sources","local_support_sources","structure_confluence",
-            "cagf_direction","cagf_regime","trend_day_probability"
+            "cagf_direction","cagf_regime","trend_day_probability",
+            "vol_regime_label","vol_regime_base","vol_caution_score","vol_transition_warning","vol_term_structure","vol_vvix","vol_size_mult"
         ]
         _append_csv_row("em_predictions.csv", fieldnames, entry)
         _append_jsonl("em_predictions.jsonl", entry)
@@ -3576,6 +3862,7 @@ def _post_em_card(ticker: str, session: str):
         em = _calc_intraday_em(spot, iv, hours_for_em)
         if not em: return
 
+        vol_regime = get_canonical_vol_regime(ticker, get_daily_candles(ticker, days=30))
         bias = _calc_bias(spot, em, walls or {}, skew or {}, eng or {}, pcr or {}, vix or {})
 
         iv_pct = iv * 100
@@ -3614,6 +3901,9 @@ def _post_em_card(ticker: str, session: str):
             vr_line = format_vol_regime_line(v4_result)
             if vr_line:
                 lines.append(f"Vol: {vr_line}")
+        cvr_line = _format_canonical_vol_line(vol_regime)
+        if cvr_line:
+            lines.append(f"Vol Overlay: {cvr_line}")
 
         # ══════ EXPECTED MOVE ══════
         lines += _format_em_block(em, spot, bias["score"])
@@ -3781,6 +4071,7 @@ def _post_em_card(ticker: str, session: str):
             cagf=cagf, dte_rec=dte_rec,
             now_ct=now_ct, session_progress=_sess_progress,
             is_next_day=is_afternoon, unified_regime=unified_regime,
+            canonical_vol=vol_regime,
         )
 
     except Exception as e:
@@ -3795,7 +4086,7 @@ def _post_em_card(ticker: str, session: str):
 def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
                      is_0dte=True, v4_result=None, cagf=None, dte_rec=None,
                      now_ct=None, session_progress=None, is_next_day=False,
-                     unified_regime=None):
+                     unified_regime=None, canonical_vol=None):
     """
     Trade recommendation card — v4.2.
     CAGF-integrated: respects DTE recommendation, session timing, and EM-aware strike placement.
@@ -4015,6 +4306,9 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
                     lines.append(f"• Reclaim above gamma flip: {_fmt_money(regime_shift_up)}")
                 if regime_shift_dn is not None:
                     lines.append(f"• Lose gamma flip: {_fmt_money(regime_shift_dn)}")
+            if canonical_vol:
+                lines.append(f"🌡️ Volatility Regime: {_format_canonical_vol_line(canonical_vol)}")
+                lines.append(f"🪖 Posture: {canonical_vol.get('posture','')}")
             lines += [
                 f"⚙️ Regime: {regime_line}",
                 "— Not financial advice —",
@@ -4086,6 +4380,14 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
         # G4 — VIX extreme
         if v >= 40:
             no_trade(f"VIX {v} extreme — stand aside.", "🚨")
+            return
+
+        # G4.5 — Canonical volatility overlay gate
+        if canonical_vol and canonical_vol.get("label") == "CRISIS" and abs(score) < 6:
+            no_trade(f"Vol regime {canonical_vol.get('label')} — directional setups must be exceptional.", "🚨")
+            return
+        if canonical_vol and canonical_vol.get("label") == "TRANSITION" and abs(score) < 2 and (local_pin or near_max_pain):
+            no_trade("Transition volatility regime + pin risk — wait for cleaner expansion.", "⚠️")
             return
 
         # G5 — Positive GEX + weak score
@@ -4251,6 +4553,9 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
         # ── v4: Confidence line ──
         if v4_result:
             lines.append(format_confidence_header(v4_result))
+        if canonical_vol:
+            lines.append(f"🌡️ Vol Regime: {_format_canonical_vol_line(canonical_vol)}")
+            lines.append(f"🪖 Posture: {canonical_vol.get('posture','')}")
 
         # ── v4.2: DTE upgrade notice ──
         if dte_was_upgraded:
