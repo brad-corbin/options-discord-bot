@@ -582,36 +582,32 @@ def compute_swing_confidence(
     swing_em: Dict = None,
     bs_data: Dict = None,
     direction: str = "bull",
+    manual_mode: bool = False,
 ) -> Tuple[int, List[str]]:
     """
     Swing-specific confidence scoring.
 
-    Weights Fib level quality heavily, then trend confirmation,
-    then B-S fair value, then IV environment.
-
-    v1.1: Base score lowered 30→20, penalties tightened, gate raised to 65.
-    A perfect T1 setup at exact 61.8% with all confirmations scores ~95-100.
-    A weak T2 at 38.2% with mixed signals scores ~45-55 — correctly blocked.
+    Manual /checkswing runs without full TradingView alert context,
+    so it uses the same score buckets but slightly softer penalties and
+    an added shared-structure contribution so viable manual setups can
+    still become scoreable.
     """
-    score = 20  # v1.1: lowered from 30 — signals must earn their score
+    score = 24 if manual_mode else 20
     reasons = list(fib_reasons)
     swing_em = swing_em or {}
     bs_data = bs_data or {}
     is_bear = direction == "bear"
 
-    # ── Fib level quality (already scored externally) ──
     score += fib_score
 
-    # ── Tier boost ──
     tier = webhook_data.get("tier", "2")
     if tier == "1":
         score += 15
         reasons.append("T1 swing signal")
     else:
-        score += 5
+        score += 6 if manual_mode else 5
         reasons.append("T2 swing signal")
 
-    # ── HTF trend ──
     if webhook_data.get("htf_confirmed"):
         score += 12
         reasons.append("Daily trend confirmed")
@@ -619,10 +615,9 @@ def compute_swing_confidence(
         score += 6
         reasons.append("Daily trend converging")
     else:
-        score -= 20  # v1.1: tightened from -15 — diverging trend is a serious problem
+        score -= 8 if manual_mode else 20
         reasons.append("Daily trend diverging")
 
-    # ── Weekly trend ──
     weekly_bull = webhook_data.get("weekly_bull", False)
     weekly_bear = webhook_data.get("weekly_bear", False)
     if is_bear:
@@ -630,50 +625,58 @@ def compute_swing_confidence(
             score += 15
             reasons.append("Weekly trend bearish (confirms bear)")
         elif weekly_bull:
-            score -= 15  # v1.1: tightened from -12
+            score -= 10 if manual_mode else 15
             reasons.append("Weekly trend bullish (fights bear)")
         else:
-            score -= 8   # flat weekly also penalized
+            score -= 4 if manual_mode else 8
             reasons.append("Weekly trend flat (no confirmation)")
     else:
         if weekly_bull:
             score += 15
             reasons.append("Weekly trend bullish (confirms bull)")
         elif weekly_bear:
-            score -= 15  # v1.1: tightened from -12
+            score -= 10 if manual_mode else 15
             reasons.append("Weekly trend bearish (fights bull)")
         else:
-            score -= 8
+            score -= 4 if manual_mode else 8
             reasons.append("Weekly trend flat (no confirmation)")
 
-    # ── Volume contraction (coiling before move) ──
-    # Required by Pine filter now, but still boosts score when present
     if webhook_data.get("vol_contracting"):
         score += 8
         reasons.append("Volume contracting (coiling)")
     else:
-        score -= 5   # v1.1: penalize if somehow not contracting
+        if not manual_mode:
+            score -= 5
         reasons.append("Volume not contracting")
 
-    # ── RSI/MFI direction ──
     rsi_mfi_bull = webhook_data.get("rsi_mfi_bull", False)
     if is_bear:
         if not rsi_mfi_bull:
             score += 5
             reasons.append("RSI+MFI selling")
         else:
-            score -= 5
+            score -= 4 if manual_mode else 5
             reasons.append("RSI+MFI buying (fights bear)")
     else:
         if rsi_mfi_bull:
             score += 5
             reasons.append("RSI+MFI buying")
         else:
-            score -= 5
+            score -= 4 if manual_mode else 5
             reasons.append("RSI+MFI selling (fights bull)")
 
-    # ── IV environment ──
-    # For swing debit spread buyers: low IV = cheap entry
+    structure_bias_score = int(webhook_data.get("structure_bias_score") or 0)
+    if structure_bias_score:
+        score += max(-10, min(10, structure_bias_score))
+        reasons.append(f"Shared structure {structure_bias_score:+d}")
+        for item in (webhook_data.get("structure_reasons") or [])[:2]:
+            reasons.append(item)
+
+    manual_quality = int(webhook_data.get("manual_quality") or 0)
+    if manual_mode and manual_quality > 0:
+        score += min(6, manual_quality)
+        reasons.append(f"Manual setup quality {manual_quality}/6")
+
     if iv_rank > 0:
         if iv_rank < 20:
             score += 12
@@ -682,10 +685,9 @@ def compute_swing_confidence(
             score += 6
             reasons.append(f"IV low (rank {iv_rank:.0f})")
         elif iv_rank > 70:
-            score -= 12  # v1.1: tightened from -10
+            score -= 10 if manual_mode else 12
             reasons.append(f"IV elevated (rank {iv_rank:.0f}) — expensive entry")
 
-    # ── B-S fair value ──
     bs_premium = trade.get("bs_premium_pct", 0)
     if bs_premium < 0:
         score += 8
@@ -694,10 +696,9 @@ def compute_swing_confidence(
         score += 4
         reasons.append(f"Spread near B-S fair value ({bs_premium:+.1f}%)")
     elif bs_premium > 10:
-        score -= 8   # v1.1: tightened from -6
+        score -= 6 if manual_mode else 8
         reasons.append(f"Spread above B-S fair value ({bs_premium:+.1f}%)")
 
-    # ── Win probability from B-S ──
     win_prob = trade.get("win_prob", 0)
     if win_prob >= 0.75:
         score += 8
@@ -706,16 +707,15 @@ def compute_swing_confidence(
         score += 4
         reasons.append(f"B-S win prob {win_prob:.0%}")
     elif win_prob < 0.60:
-        score -= 10  # v1.1: tightened from -8, aligned with 60% gate
+        score -= 8 if manual_mode else 10
         reasons.append(f"B-S win prob low ({win_prob:.0%})")
 
-    # ── EM zone ──
     em_zone = trade.get("em_zone", "unknown")
     if em_zone == "inside":
         score += 5
         reasons.append(f"Short strike inside {SWING_FORECAST_DAYS}-day EM")
     elif em_zone == "outside":
-        score -= 10  # v1.1: tightened from -8
+        score -= 8 if manual_mode else 10
         reasons.append(f"Short strike beyond {SWING_FORECAST_DAYS}-day EM")
 
     score = max(0, min(100, score))
@@ -763,42 +763,38 @@ def recommend_swing_trade(
 ) -> Dict[str, Any]:
     """
     Main entry point for swing trade recommendations.
-
-    Args:
-        ticker:       Ticker symbol
-        spot:         Current price
-        chains:       List of (exp, dte, contracts) tuples
-        webhook_data: Pine webhook payload (swing format)
-        iv_rank:      IV percentile rank (0-100)
-
-    Returns complete trade recommendation or rejection with reason.
     """
     webhook_data = webhook_data or {}
-    result = {"ok": False, "ticker": ticker, "spot": spot, "type": "swing"}
+    manual_mode = bool(webhook_data.get("manual_mode") or webhook_data.get("source") == "check")
+    result = {
+        "ok": False,
+        "ticker": ticker,
+        "spot": spot,
+        "type": "swing",
+        "scoreable": bool(webhook_data.get("manual_scoreable", True)),
+        "requested_direction": (webhook_data.get("bias") or "bull").lower(),
+        "matched_requested_direction": True,
+    }
 
     direction = (webhook_data.get("bias") or "bull").lower()
     if direction not in ("bull", "bear"):
         result["reason"] = f"Direction '{direction}' not allowed"
+        result["rejection_bucket"] = "invalid_direction"
         return result
 
-    fib_level       = str(webhook_data.get("fib_level", "61.8"))
-    fib_distance    = float(webhook_data.get("fib_distance_pct", 2.0))
-    weekly_bull     = webhook_data.get("weekly_bull", False)
-    weekly_bear     = webhook_data.get("weekly_bear", False)
-    weekly_ok       = weekly_bull if direction == "bull" else weekly_bear
-    daily_ok        = webhook_data.get("htf_confirmed") or webhook_data.get("htf_converging")
+    fib_level = str(webhook_data.get("fib_level", "61.8"))
+    fib_distance = float(webhook_data.get("fib_distance_pct", 2.0))
+    weekly_bull = webhook_data.get("weekly_bull", False)
+    weekly_bear = webhook_data.get("weekly_bear", False)
+    weekly_ok = weekly_bull if direction == "bull" else weekly_bear
+    daily_ok = webhook_data.get("htf_confirmed") or webhook_data.get("htf_converging")
 
-    # ── Score the Fib setup ──
     fib_score, fib_reasons = score_fib_level(
         fib_level, fib_distance, direction,
         weekly_confirmed=weekly_ok,
         daily_confirmed=bool(daily_ok),
     )
 
-    # ── Get average ATM IV from best chain ──
-    # Clamp to SWING_IV_MIN–SWING_IV_MAX to filter out deep-OTM/near-expiry
-    # IV explosions that would corrupt the EM and B-S calculations.
-    # Prefer ATM contracts (within SWING_IV_ATM_BAND_PCT of spot); fall back to all if needed.
     atm_iv = []
     all_iv = []
     for _, _, contracts in chains:
@@ -810,22 +806,20 @@ def recommend_swing_trade(
                 if strike > 0 and abs(strike - spot) / spot <= SWING_IV_ATM_BAND_PCT:
                     atm_iv.append(iv)
         if all_iv:
-            break  # use first (closest) expiry for IV reference
+            break
     iv_pool = atm_iv if len(atm_iv) >= 3 else all_iv
-    avg_iv = sum(iv_pool) / len(iv_pool) if iv_pool else 0.25  # fallback 25%
+    avg_iv = sum(iv_pool) / len(iv_pool) if iv_pool else 0.25
 
-    # ── Select best DTE ──
     sorted_chains = select_best_dte(chains, spot, avg_iv, fib_level)
     if not sorted_chains:
         result["reason"] = f"No expirations in {SWING_MIN_DTE}-{SWING_MAX_DTE} DTE range"
+        result["rejection_bucket"] = "data_or_chain_failure"
         return result
 
-    # ── Forecast-horizon expected move (21-day thesis, longer entry DTE allowed) ──
     swing_em = calc_swing_expected_move(spot, avg_iv, days=SWING_FORECAST_DAYS)
-
-    # ── Try chains in order until we find a good spread ──
     all_reasons = []
     best_rec = None
+    conf_gate = 58 if manual_mode else SWING_MIN_CONFIDENCE
 
     for exp, dte, contracts in sorted_chains[:SWING_MAX_EXPIRATIONS]:
         candidates = build_swing_spreads(
@@ -841,7 +835,6 @@ def recommend_swing_trade(
         ranked = rank_swing_candidates(candidates)
         best = ranked[0]
 
-        # Build width ladder
         ladder = []
         seen_w = set()
         for c in ranked:
@@ -849,11 +842,9 @@ def recommend_swing_trade(
                 seen_w.add(c["width"])
                 ladder.append(c)
 
-        # Position sizing
         tier = webhook_data.get("tier", "2")
         num_contracts, total_risk, sizing_note = compute_swing_size(best["debit"], tier)
 
-        # Confidence scoring
         confidence, conf_reasons = compute_swing_confidence(
             webhook_data, best,
             fib_score=fib_score,
@@ -861,15 +852,15 @@ def recommend_swing_trade(
             iv_rank=iv_rank,
             swing_em=swing_em,
             direction=direction,
+            manual_mode=manual_mode,
         )
 
-        if confidence < SWING_MIN_CONFIDENCE:
+        if confidence < conf_gate:
             all_reasons.append(
-                f"DTE {dte}: confidence {confidence}/100 below {SWING_MIN_CONFIDENCE}"
+                f"DTE {dte}: confidence {confidence}/100 below {conf_gate}"
             )
             continue
 
-        # ── Win probability gate (v1.1) ──
         win_prob = best.get("win_prob", 0)
         if win_prob < SWING_MIN_WIN_PROBABILITY:
             all_reasons.append(
@@ -877,17 +868,16 @@ def recommend_swing_trade(
             )
             continue
 
-        # ── Build exits ──
         exits = {
             "primary": {
                 "target_pct": "50%",
-                "sell_at":    best["exit_50pct"],
+                "sell_at": best["exit_50pct"],
                 "profit_per": round((best["exit_50pct"] - best["debit"]) * 100, 2),
                 "profit_total": round((best["exit_50pct"] - best["debit"]) * 100 * num_contracts, 2),
             },
             "extended": {
                 "target_pct": "75%",
-                "sell_at":    best["exit_75pct"],
+                "sell_at": best["exit_75pct"],
                 "profit_per": round((best["exit_75pct"] - best["debit"]) * 100, 2),
                 "profit_total": round((best["exit_75pct"] - best["debit"]) * 100 * num_contracts, 2),
             },
@@ -898,29 +888,33 @@ def recommend_swing_trade(
         }
 
         best_rec = {
-            "ok":            True,
-            "ticker":        ticker,
-            "spot":          spot,
-            "dte":           dte,
-            "exp":           exp,
-            "direction":     direction,
-            "spread_label":  "BEAR PUT" if direction == "bear" else "BULL CALL",
-            "trade":         best,
-            "ladder":        ladder,
-            "contracts":     num_contracts,
-            "total_risk":    total_risk,
-            "sizing_note":   sizing_note,
-            "exits":         exits,
-            "confidence":    confidence,
-            "conf_reasons":  conf_reasons,
-            "tier":          tier,
-            "fib_level":     fib_level,
-            "fib_distance":  fib_distance,
-            "fib_score":     fib_score,
-            "avg_iv":        avg_iv,
-            "iv_rank":       iv_rank,
-            "swing_em":      swing_em,
-            "webhook_data":  webhook_data,
+            "ok": True,
+            "ticker": ticker,
+            "spot": spot,
+            "dte": dte,
+            "exp": exp,
+            "direction": direction,
+            "requested_direction": direction,
+            "matched_requested_direction": True,
+            "scoreable": bool(webhook_data.get("manual_scoreable", True)),
+            "rejection_bucket": None,
+            "spread_label": "BEAR PUT" if direction == "bear" else "BULL CALL",
+            "trade": best,
+            "ladder": ladder,
+            "contracts": num_contracts,
+            "total_risk": total_risk,
+            "sizing_note": sizing_note,
+            "exits": exits,
+            "confidence": confidence,
+            "conf_reasons": conf_reasons,
+            "tier": tier,
+            "fib_level": fib_level,
+            "fib_distance": fib_distance,
+            "fib_score": fib_score,
+            "avg_iv": avg_iv,
+            "iv_rank": iv_rank,
+            "swing_em": swing_em,
+            "webhook_data": webhook_data,
         }
         break
 
@@ -929,6 +923,15 @@ def recommend_swing_trade(
         if all_reasons:
             combined += "\n" + "\n".join(all_reasons[:4])
         result["reason"] = combined
+        low = combined.lower()
+        if "confidence" in low and "below" in low:
+            result["rejection_bucket"] = "below_threshold"
+        elif "win prob" in low and "below" in low:
+            result["rejection_bucket"] = "win_prob_failure"
+        elif "no valid spreads" in low:
+            result["rejection_bucket"] = "no_valid_spreads"
+        else:
+            result["rejection_bucket"] = "other"
         return result
 
     return best_rec
