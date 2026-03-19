@@ -1460,7 +1460,20 @@ def get_canonical_vol_regime(ticker: str = "SPY", candle_closes: list | None = N
     market = _get_vix_data() or {}
     vix = as_float(market.get("vix"), 20.0)
     vix9d = as_float(market.get("vix9d"), 0.0)
+    if not vix9d:
+        try:
+            vix9d = as_float(_fetch_yahoo_last("^VIX9D"), 0.0)
+        except Exception:
+            vix9d = 0.0
     term = (market.get("term") or "unknown").lower()
+    if term == "unknown" and vix and vix9d:
+        slope = vix9d - vix
+        if slope < -0.75:
+            term = "normal"
+        elif slope > 0.75:
+            term = "inverted"
+        else:
+            term = "flat"
     vix_ma200 = _get_vix_ma200()
     above_ma200 = bool(vix_ma200 and vix > vix_ma200)
     vvix = _get_vvix_value()
@@ -4710,6 +4723,8 @@ def _post_checkswing_card(ticker: str, forced_direction: str = None):
         candles = get_daily_candles(ticker, days=252)
         iv_rank = _estimate_iv_rank(chains, candles)
         canonical_vol = get_canonical_vol_regime(ticker, candle_closes=candles)
+        current_regime = get_current_regime()
+        v4_flow = _run_v4_prefilter(ticker, spot, chains, candles)
         directions = [forced_direction] if forced_direction else ["bull", "bear"]
         valid = []
         rejects = []
@@ -4754,6 +4769,8 @@ def _post_checkswing_card(ticker: str, forced_direction: str = None):
                     webhook_data={"type": "swing", "source": "check", "bias": forced_direction or "both", "tier": "manual"},
                     outcome="rejected_no_setup",
                     reason=" | ".join(f"{d}:{_summarize_swing_reject_reason(r)}" for d, r in rejects)[:300],
+                    regime=current_regime,
+                    v4_flow=v4_flow,
                     spot=spot,
                     expirations_checked=len(chains),
                     vol_regime=canonical_vol,
