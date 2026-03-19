@@ -674,11 +674,26 @@ def _prefetch_ticker(ticker: str):
         # 2. Options chains (the slowest part — multiple expirations)
         chains = get_options_chain(ticker)
 
-        # 3. Enrichment (earnings check) — with short timeout to avoid Finnhub stalls
+        # 3. Enrichment (earnings check) — run in a thread with strict deadline.
+        # Finnhub regularly stalls for 4s+. With 6 concurrent workers that's 24s
+        # of wasted budget before the chain fetch even completes. We cap it at 2s:
+        # if Finnhub hasn't responded by then we skip earnings and continue.
+        enrichment = {"has_earnings": False, "earnings_warn": None}
         try:
-            enrichment = enrich_ticker(ticker)
+            import threading as _threading
+            _enrich_result = {}
+            def _fetch_enrich():
+                try:
+                    _enrich_result.update(enrich_ticker(ticker))
+                except Exception:
+                    pass
+            _et = _threading.Thread(target=_fetch_enrich, daemon=True)
+            _et.start()
+            _et.join(timeout=2.0)  # give Finnhub 2s max — don't burn prefetch budget
+            if _enrich_result:
+                enrichment = _enrich_result
         except Exception:
-            enrichment = {"has_earnings": False, "earnings_warn": None}
+            pass
 
         # 4. Daily candles for RV
         candle_closes = get_daily_candles(ticker, days=RV_LOOKBACK_DAYS + 5)
@@ -2241,12 +2256,17 @@ def _run_v4_prefilter(ticker: str, spot: float, chains: list, candle_closes: lis
 # CHECK TICKER — scalp engine (0-10 DTE) + v4 flow quality gate
 # ─────────────────────────────────────────────────────────
 
-def _signal_validation_thresholds(webhook_data: dict) -> tuple[float, float]:
+def _signal_validation_thresholds(webhook_data: dict) -> tuple[float, float, float]:
+    """Returns (warn_pct, reject_pct, hard_block_pct).
+
+    reject_pct -> warn + hard entry line (trade still proceeds, confidence docked).
+    hard_block_pct -> absolute block (setup structurally invalid at this drift).
+    """
     timeframe = str((webhook_data or {}).get("timeframe") or "").lower()
     is_swing = any(tag in timeframe for tag in ("d", "w", "day", "week")) or bool((webhook_data or {}).get("is_swing"))
     if is_swing:
-        return SWING_SIGNAL_WARN_DRIFT_PCT, SWING_SIGNAL_REJECT_DRIFT_PCT
-    return SCALP_SIGNAL_WARN_DRIFT_PCT, SCALP_SIGNAL_REJECT_DRIFT_PCT
+        return SWING_SIGNAL_WARN_DRIFT_PCT, SWING_SIGNAL_REJECT_DRIFT_PCT, SWING_SIGNAL_HARD_BLOCK_PCT
+    return SCALP_SIGNAL_WARN_DRIFT_PCT, SCALP_SIGNAL_REJECT_DRIFT_PCT, SCALP_SIGNAL_HARD_BLOCK_PCT
 
 
 def _validate_live_signal(ticker: str, live_spot: float, webhook_data: dict | None) -> dict:
@@ -2255,7 +2275,7 @@ def _validate_live_signal(ticker: str, live_spot: float, webhook_data: dict | No
     received_at = as_float(webhook_data.get("received_at_epoch"), 0.0)
     now_ts = time.time()
     signal_age_sec = max(0, int(now_ts - received_at)) if received_at else None
-    warn_pct, reject_pct = _signal_validation_thresholds(webhook_data)
+    warn_pct, reject_pct, hard_block_pct = _signal_validation_thresholds(webhook_data)
 
     result = {
         "ok": True,
@@ -2267,8 +2287,10 @@ def _validate_live_signal(ticker: str, live_spot: float, webhook_data: dict | No
         "drift_pct": None,
         "warn_threshold_pct": warn_pct,
         "reject_threshold_pct": reject_pct,
+        "hard_block_threshold_pct": hard_block_pct,
         "confidence_penalty": 0,
         "card_note": "",
+        "hard_entry_note": "",
     }
 
     if alert_close <= 0 or live_spot <= 0:
@@ -2289,12 +2311,46 @@ def _validate_live_signal(ticker: str, live_spot: float, webhook_data: dict | No
         })
         return result
 
-    if drift_pct > reject_pct:  # > not >= so exact-threshold drift is a warn, not a reject
+    # Absolute hard block — price has moved so far the setup is structurally gone.
+    if drift_pct > hard_block_pct:
         result.update({
             "ok": False,
-            "label": "DRIFT_REJECT",
-            "reason": f"Live spot drift {drift_pct:.2f}% exceeded reject threshold {reject_pct:.2f}%",
-            "card_note": f"🚫 Signal validation: live spot moved {drift_pct:.2f}% from TV alert (${alert_close:.2f} → ${live_spot:.2f}).",
+            "label": "HARD_BLOCK",
+            "reason": f"Drift {drift_pct:.2f}% exceeds hard block {hard_block_pct:.2f}% — setup invalid",
+            "card_note": (
+                f"🚫 Price moved too far from signal (${alert_close:.2f} → ${live_spot:.2f}, "
+                f"{drift_pct:.2f}%). Setup no longer valid."
+            ),
+        })
+        return result
+
+    # Soft reject — drift exceeded TV threshold but setup still potentially valid.
+    # Produce the card with a hard entry line instead of blocking.
+    if drift_pct > reject_pct:
+        is_bull_drift = live_spot > alert_close
+        buffer = round(alert_close * 0.0005, 2)
+        if is_bull_drift:
+            hard_entry = round(alert_close + buffer, 2)
+            entry_note = (
+                f"⏳ Price drifted {drift_pct:.2f}% above TV signal (${alert_close:.2f} → ${live_spot:.2f}). "
+                f"Wait for pullback — hard entry line: ${hard_entry:.2f}. "
+                f"Do not chase above ${live_spot:.2f}."
+            )
+        else:
+            hard_entry = round(alert_close - buffer, 2)
+            entry_note = (
+                f"⏳ Price drifted {drift_pct:.2f}% below TV signal (${alert_close:.2f} → ${live_spot:.2f}). "
+                f"Wait for bounce — hard entry line: ${hard_entry:.2f}. "
+                f"Do not chase below ${live_spot:.2f}."
+            )
+        result.update({
+            "ok": True,
+            "label": "DRIFT_WARN_ENTRY",
+            "reason": f"Drift {drift_pct:.2f}% — entry guidance given, confidence docked {SIGNAL_HARD_REJECT_CONF_PENALTY}pts",
+            "confidence_penalty": SIGNAL_HARD_REJECT_CONF_PENALTY,
+            "hard_entry_price": hard_entry,
+            "hard_entry_note": entry_note,
+            "card_note": entry_note,
         })
         return result
 
@@ -2356,10 +2412,23 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
         else:
             # No cache — fetch live once, then store so the opposite side of /check can reuse it.
             spot = get_spot(ticker); chains = get_options_chain(ticker)
+            # Non-blocking earnings check — same 2s cap as prefetch path.
+            enrichment = {"has_earnings": False, "earnings_warn": None}
             try:
-                enrichment = enrich_ticker(ticker)
+                import threading as _threading
+                _enrich_result = {}
+                def _fetch_enrich_live():
+                    try:
+                        _enrich_result.update(enrich_ticker(ticker))
+                    except Exception:
+                        pass
+                _et = _threading.Thread(target=_fetch_enrich_live, daemon=True)
+                _et.start()
+                _et.join(timeout=2.0)
+                if _enrich_result:
+                    enrichment = _enrich_result
             except Exception:
-                enrichment = {"has_earnings": False, "earnings_warn": None}
+                pass
             has_earnings = enrichment.get("has_earnings", False)
             earnings_warn = enrichment.get("earnings_warn")
             candle_closes = get_daily_candles(ticker, days=RV_LOOKBACK_DAYS + 5)
