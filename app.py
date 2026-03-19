@@ -92,6 +92,17 @@ from card_formatters import (
     resolve_unified_regime,
     regime_gate,
 )
+from unified_models import (
+    build_canonical_vol_regime as _um_build_canonical_vol_regime,
+    format_canonical_vol_line as _um_format_canonical_vol_line,
+    apply_vol_overlay_to_rec as _um_apply_vol_overlay_to_rec,
+    build_canonical_structure_context as _um_build_canonical_structure_context,
+    apply_structure_overlay_to_rec as _um_apply_structure_overlay_to_rec,
+    build_manual_swing_signal_context as _um_build_manual_swing_signal_context,
+    build_shared_model_snapshot as _um_build_shared_model_snapshot,
+    format_shared_snapshot_lines as _um_format_shared_snapshot_lines,
+    classify_rejection_bucket as _um_classify_rejection_bucket,
+)
 from em_reconciler import (
     reconcile_em_predictions,
     compute_accuracy_stats,
@@ -430,17 +441,37 @@ def _log_signal_dataset_event(ticker: str, webhook_data: dict, outcome: str, rea
                               spot: float = None, expirations_checked: int = None, vol_regime: dict = None):
     try:
         wd = dict(webhook_data or {})
+        best_rec = dict(best_rec or {})
         trade = (best_rec or {}).get("trade", {}) if best_rec else {}
+        requested_bias = wd.get("requested_bias") or wd.get("bias")
+        evaluated_bias = (best_rec or {}).get("direction") or wd.get("evaluated_bias") or wd.get("bias")
+        rejection_bucket = (
+            best_rec.get("rejection_bucket")
+            or best_rec.get("structure_rejection_bucket")
+            or _um_classify_rejection_bucket(reason or best_rec.get("reason", ""))
+        )
+        scoreable = best_rec.get("scoreable")
+        if scoreable is None:
+            scoreable = wd.get("manual_scoreable")
+        matched_requested_direction = best_rec.get("matched_requested_direction")
+        if matched_requested_direction is None and requested_bias and evaluated_bias and requested_bias != "both":
+            matched_requested_direction = str(requested_bias).lower() == str(evaluated_bias).lower()
         row = {
             "ts_utc": datetime.now(timezone.utc).isoformat(),
             "event": "signal_decision",
             "ticker": ticker,
             "mode": wd.get("type") or "scalp",
             "source": wd.get("source") or "tv",
+            "source_mode": f"{wd.get('source') or 'tv'}:{wd.get('type') or 'scalp'}",
             "bias": wd.get("bias"),
+            "requested_bias": requested_bias,
+            "evaluated_bias": evaluated_bias,
             "tier": wd.get("tier"),
             "outcome": outcome,
             "reason": (reason or "")[:300],
+            "rejection_bucket": rejection_bucket,
+            "candidate_scoreable": scoreable,
+            "matched_requested_direction": matched_requested_direction,
             "signal_time": wd.get("time"),
             "signal_price": wd.get("close"),
             "live_spot": spot if spot is not None else wd.get("live_spot"),
@@ -456,14 +487,17 @@ def _log_signal_dataset_event(ticker: str, webhook_data: dict, outcome: str, rea
             "width": trade.get("width"),
             "ror": trade.get("ror"),
             "win_prob": trade.get("win_prob"),
-            "ev_per_contract": trade.get("ev_per_contract"),
+            "ev_per_contract": trade.get("ev_per_contract") or trade.get("expected_value"),
             "confidence": (best_rec or {}).get("confidence"),
             "confidence_pre_validation": (best_rec or {}).get("confidence_pre_validation"),
+            "confidence_pre_structure": (best_rec or {}).get("confidence_pre_structure"),
+            "confidence_pre_vol_regime": (best_rec or {}).get("confidence_pre_vol_regime"),
             "contracts": (best_rec or {}).get("contracts"),
             "expirations_checked": expirations_checked,
             "regime": (regime or {}).get("regime") if isinstance(regime, dict) else None,
             "vix": (regime or {}).get("vix") if isinstance(regime, dict) else None,
             "adx": (regime or {}).get("adx") if isinstance(regime, dict) else None,
+            "dealer_regime": ((best_rec or {}).get("shared_model_snapshot") or {}).get("dealer_regime", {}).get("label") if isinstance((best_rec or {}).get("shared_model_snapshot"), dict) else None,
             "v4_composite_regime": (v4_flow or {}).get("composite_regime") if isinstance(v4_flow, dict) else None,
             "v4_confidence_label": (v4_flow or {}).get("confidence_label") if isinstance(v4_flow, dict) else None,
             "vol_regime_label": (vol_regime or {}).get("label") if isinstance(vol_regime, dict) else None,
@@ -473,20 +507,25 @@ def _log_signal_dataset_event(ticker: str, webhook_data: dict, outcome: str, rea
             "vol_term_structure": (vol_regime or {}).get("term_structure") if isinstance(vol_regime, dict) else None,
             "vol_vvix": (vol_regime or {}).get("vvix") if isinstance(vol_regime, dict) else None,
             "vol_size_mult": (vol_regime or {}).get("size_mult") if isinstance(vol_regime, dict) else None,
+            "posture": (best_rec or {}).get("posture") or ((vol_regime or {}).get("posture") if isinstance(vol_regime, dict) else None),
             "structure_overlay_score": (best_rec or {}).get("structure_overlay_score"),
             "structure_local_support": (best_rec or {}).get("structure_local_support"),
             "structure_local_resistance": (best_rec or {}).get("structure_local_resistance"),
+            "structure_balance_zone_low": (best_rec or {}).get("structure_balance_zone_low"),
+            "structure_balance_zone_high": (best_rec or {}).get("structure_balance_zone_high"),
+            "structure_outer_bracket_low": (best_rec or {}).get("structure_outer_bracket_low"),
+            "structure_outer_bracket_high": (best_rec or {}).get("structure_outer_bracket_high"),
             "structure_confluence": (best_rec or {}).get("structure_confluence"),
-            "log_schema": "v3",
+            "log_schema": "v4_unified",
         }
         fieldnames = list(row.keys())
         _append_csv_row("signal_decisions.csv", fieldnames, row)
         _append_jsonl("signal_decisions.jsonl", row)
 
         diag = (
-            f"🧪 {ticker} {str(wd.get('bias','')).upper()} T{wd.get('tier','?')} | {outcome}\n"
+            f"🧪 {ticker} {str(evaluated_bias or wd.get('bias', '')).upper()} T{wd.get('tier', '?')} | {outcome}\n"
             f"spot ${row['live_spot']} | drift {row['drift_pct']}% | conf {row['confidence']}\n"
-            f"reason: {row['reason'] or '—'}"
+            f"bucket: {row['rejection_bucket']} | reason: {row['reason'] or '—'}"
         )
         _post_diagnostic(diag)
     except Exception as e:
@@ -1467,171 +1506,26 @@ def get_canonical_vol_regime(ticker: str = "SPY", candle_closes: list | None = N
         return cached.get("data", {})
 
     market = _get_vix_data() or {}
-    vix = as_float(market.get("vix"), 20.0)
-    vix9d = as_float(market.get("vix9d"), 0.0)
-    if not vix9d:
-        try:
-            vix9d = as_float(_fetch_yahoo_last("^VIX9D"), 0.0)
-        except Exception:
-            vix9d = 0.0
-    term = (market.get("term") or "unknown").lower()
-    if term == "unknown" and vix and vix9d:
-        slope = vix9d - vix
-        if slope < -0.75:
-            term = "normal"
-        elif slope > 0.75:
-            term = "inverted"
-        else:
-            term = "flat"
-    vix_ma200 = _get_vix_ma200()
-    above_ma200 = bool(vix_ma200 and vix > vix_ma200)
-    vvix = _get_vvix_value()
-
     closes = candle_closes or get_daily_candles(ticker, days=30) or get_daily_candles("SPY", days=30)
-    rv5 = _calc_ann_rv_from_closes(closes, 5)
-    rv20 = _calc_ann_rv_from_closes(closes, 20)
-
-    if vix < 15:
-        base = "LOW"
-        caution = 0
-    elif vix < 20:
-        base = "NORMAL"
-        caution = 1
-    elif vix < 30:
-        base = "ELEVATED"
-        caution = 3
-    else:
-        base = "CRISIS"
-        caution = 5
-
-    if above_ma200:
-        caution += 1
-    if term == "flat":
-        caution += 1
-    elif term == "inverted":
-        caution += 2
-    vvix_warning = bool(vvix and vvix >= 120)
-    if vvix_warning:
-        caution += 1
-    rv_spike = bool(rv5 and rv20 and rv5 > (rv20 * 1.35))
-    if rv_spike:
-        caution += 1
-
-    transition_warning = False
-    if base in ("LOW", "NORMAL") and (above_ma200 or term in ("flat", "inverted") or vvix_warning or rv_spike):
-        transition_warning = True
-    if base == "ELEVATED" and term == "inverted" and vvix_warning:
-        transition_warning = True
-
-    if base == "CRISIS" or caution >= 6:
-        label = "CRISIS"
-        size_mult = 0.35
-        posture = "Capital preservation. Only best defined-risk setups."
-        confidence = "HIGH"
-    elif base == "ELEVATED" or caution >= 4:
-        label = "ELEVATED"
-        size_mult = 0.60
-        posture = "Reduce size. Favor defined-risk and cleaner directional setups."
-        confidence = "HIGH" if caution >= 5 else "MODERATE"
-    elif transition_warning:
-        label = "TRANSITION"
-        size_mult = 0.75
-        posture = "Transition warning. Smaller size and stricter setup quality."
-        confidence = "MODERATE"
-    elif base == "LOW":
-        label = "LOW"
-        size_mult = 1.00
-        posture = "Calm conditions. Directional setups okay if dealer/structure agrees."
-        confidence = "MODERATE"
-    else:
-        label = "NORMAL"
-        size_mult = 0.90
-        posture = "Balanced environment. Defined-risk preferred."
-        confidence = "MODERATE"
-
-    if label in ("TRANSITION", "ELEVATED", "CRISIS"):
-        emoji = "⚠️" if label == "TRANSITION" else "🔶" if label == "ELEVATED" else "🚨"
-    else:
-        emoji = "🟢" if label == "LOW" else "🟡"
-
-    term_slope = (vix9d - vix) if (vix9d and vix) else None
-    description = posture
-    result = {
-        "label": label,
-        "base": base,
-        "emoji": emoji,
-        "vix": vix,
-        "vix9d": vix9d if vix9d > 0 else None,
-        "term_structure": term,
-        "term_slope": round(term_slope, 2) if term_slope is not None else None,
-        "vix_ma200": round(vix_ma200, 2) if vix_ma200 else None,
-        "above_ma200": above_ma200,
-        "vvix": round(vvix, 1) if vvix else None,
-        "vvix_warning": vvix_warning,
-        "rv5": round(rv5, 1) if rv5 else None,
-        "rv20": round(rv20, 1) if rv20 else None,
-        "rv_spike": rv_spike,
-        "transition_warning": transition_warning,
-        "caution_score": int(caution),
-        "size_mult": size_mult,
-        "posture": posture,
-        "description": description,
-        "confidence": confidence,
-        "ts": now,
-    }
+    result = _um_build_canonical_vol_regime(
+        ticker=ticker,
+        candle_closes=closes,
+        market=market,
+        fetch_vix9d_fn=_fetch_yahoo_last,
+        get_vix_ma200_fn=_get_vix_ma200,
+        get_vvix_value_fn=_get_vvix_value,
+        now_ts=now,
+    )
     _vol_regime_symbol_cache[cache_key] = {"data": result, "ts": now}
     return result
 
 
 def _format_canonical_vol_line(vol_regime: dict) -> str:
-    if not vol_regime:
-        return ""
-    bits = [f"{vol_regime.get('emoji','🌡️')} {vol_regime.get('label','UNKNOWN')}"]
-    vix = vol_regime.get("vix")
-    if vix is not None:
-        bits.append(f"VIX {vix:.1f}")
-    if vol_regime.get("above_ma200"):
-        bits.append("> MA200")
-    term = vol_regime.get("term_structure")
-    if term and term != "unknown":
-        bits.append(f"term {term}")
-    vvix = vol_regime.get("vvix")
-    if vvix:
-        bits.append(f"VVIX {vvix:.0f}")
-    if vol_regime.get("transition_warning"):
-        bits.append("transition warning")
-    return " | ".join(bits)
+    return _um_format_canonical_vol_line(vol_regime)
 
 
 def _apply_canonical_vol_overlay_to_rec(rec: dict, vol_regime: dict, mode: str = "scalp") -> dict:
-    rec = rec or {}
-    if not vol_regime:
-        return rec
-    rec["canonical_vol_regime"] = vol_regime
-    base_conf = int(rec.get("confidence") or 0)
-    penalty = 0
-    if vol_regime.get("label") == "CRISIS":
-        penalty = 10 if mode == "scalp" else 8
-    elif vol_regime.get("label") == "ELEVATED":
-        penalty = 6 if mode == "scalp" else 4
-    elif vol_regime.get("label") == "TRANSITION":
-        penalty = 4 if mode == "scalp" else 3
-    if penalty:
-        rec.setdefault("confidence_pre_vol_regime", base_conf)
-        rec["confidence"] = max(0, base_conf - penalty)
-        rec["vol_regime_penalty"] = penalty
-    contracts = rec.get("contracts")
-    try:
-        if contracts is not None:
-            adj = max(1, int(math.floor(float(contracts) * float(vol_regime.get("size_mult", 1.0)))))
-            rec["contracts_pre_vol_regime"] = contracts
-            rec["contracts"] = adj
-    except Exception:
-        pass
-    note = _format_canonical_vol_line(vol_regime)
-    if note:
-        rec["vol_regime_note"] = f"🌡️ Volatility overlay: {note}. Posture: {vol_regime.get('posture','')}"
-    return rec
+    return _um_apply_vol_overlay_to_rec(rec, vol_regime, mode=mode)
 
 
 def _ema(values, length: int):
@@ -1694,188 +1588,16 @@ def _mfi(rows, length: int = 14):
 
 
 def _compute_manual_swing_signal_context(ticker: str, spot: float, rows: list, direction: str, structure_ctx: dict | None = None) -> dict:
-    rows = rows or []
-    closes = [r.get('close') for r in rows if r.get('close') is not None]
-    vols = [float(r.get('volume') or 0.0) for r in rows]
-    daily_fast = _ema(closes[-34:], 8) if len(closes) >= 8 else None
-    daily_slow = _ema(closes[-55:], 21) if len(closes) >= 21 else None
-    daily_prev_fast = _ema(closes[-35:-1], 8) if len(closes) >= 9 else daily_fast
-    daily_prev_slow = _ema(closes[-56:-1], 21) if len(closes) >= 22 else daily_slow
-    daily_bull = bool(daily_fast is not None and daily_slow is not None and daily_fast > daily_slow)
-    daily_gap = abs((daily_fast or 0) - (daily_slow or 0))
-    daily_prev_gap = abs((daily_prev_fast or 0) - (daily_prev_slow or 0))
-    htf_confirmed = daily_gap >= daily_prev_gap * 0.98 if daily_fast is not None and daily_slow is not None else False
-    htf_converging = daily_gap < daily_prev_gap if daily_fast is not None and daily_slow is not None else False
-
-    weekly_closes = [closes[i] for i in range(4, len(closes), 5)] if len(closes) >= 10 else closes[::5]
-    weekly_fast = _ema(weekly_closes[-20:], 5) if len(weekly_closes) >= 5 else None
-    weekly_slow = _ema(weekly_closes[-40:], 20) if len(weekly_closes) >= 20 else None
-    weekly_bull = bool(weekly_fast is not None and weekly_slow is not None and weekly_fast > weekly_slow)
-    weekly_bear = bool(weekly_fast is not None and weekly_slow is not None and weekly_fast < weekly_slow)
-
-    vol_contracting = False
-    if len(vols) >= 20:
-        recent = sum(vols[-5:]) / max(1, len(vols[-5:]))
-        base = sum(vols[-20:]) / 20.0
-        vol_contracting = recent < (base * 0.92)
-
-    rsi_val = _rsi(closes, 14)
-    mfi_val = _mfi(rows, 14)
-    rsi_mfi_bull = ((rsi_val or 50.0) + (mfi_val or 50.0)) / 2.0 >= 50.0
-
-    fib_level = '61.8'
-    fib_distance_pct = 2.0
-    ps = (structure_ctx or {}).get('price_structure') or {}
-    fib_map = []
-    for lbl, key in [('38.2','fib_382'),('50.0','fib_500'),('61.8','fib_618'),('78.6','fib_786')]:
-        val = ps.get(key)
-        if val:
-            fib_map.append((lbl, float(val)))
-    if fib_map:
-        lbl, val = min(fib_map, key=lambda x: abs(x[1]-spot))
-        fib_level = lbl
-        fib_distance_pct = abs(val - spot) / max(spot, 0.01) * 100.0
-    else:
-        # derive from nearest existing fib support/resistance if detailed levels absent
-        fib_levels = []
-        for lbl,key in [('38.2','fib_support'),('61.8','fib_resistance')]:
-            val = ps.get(key)
-            if val:
-                fib_levels.append((lbl, float(val)))
-        if fib_levels:
-            lbl, val = min(fib_levels, key=lambda x: abs(x[1]-spot))
-            fib_level = lbl
-            fib_distance_pct = abs(val - spot) / max(spot, 0.01) * 100.0
-
-    tier = '1' if fib_distance_pct <= 0.8 and ((direction=='bull' and weekly_bull) or (direction=='bear' and weekly_bear)) else '2'
-    return {
-        'type': 'swing',
-        'source': 'check',
-        'bias': direction,
-        'tier': tier,
-        'fib_level': fib_level,
-        'fib_distance_pct': round(fib_distance_pct, 3),
-        'weekly_bull': weekly_bull,
-        'weekly_bear': weekly_bear,
-        'htf_confirmed': bool(htf_confirmed),
-        'htf_converging': bool(htf_converging),
-        'daily_bull': daily_bull,
-        'rsi_mfi_bull': bool(rsi_mfi_bull),
-        'vol_contracting': bool(vol_contracting),
-    }
+    return _um_build_manual_swing_signal_context(ticker, spot, rows, direction, structure_ctx)
 
 
 def _build_canonical_structure_context(ticker: str, spot: float, rows: list | None = None) -> dict:
-    ps = _compute_price_structure_levels(ticker, spot, days=90)
-    # add explicit fib ladder values for manual swing context
     rows = rows if rows is not None else _get_daily_ohlcv_rows(ticker, days=90)
-    highs = [r['high'] for r in rows or []]
-    lows = [r['low'] for r in rows or []]
-    if highs and lows:
-        lookback = min(len(rows), 34)
-        hi = max(highs[-lookback:]); lo = min(lows[-lookback:])
-        if hi > lo:
-            for ratio, key in [(0.382,'fib_382'),(0.5,'fib_500'),(0.618,'fib_618'),(0.786,'fib_786')]:
-                ps[key] = lo + (hi - lo) * ratio
-    return {'ticker': ticker, 'spot': spot, 'price_structure': ps}
+    return _um_build_canonical_structure_context(ticker, spot, rows)
 
 
 def _apply_canonical_structure_overlay_to_rec(rec: dict, structure_ctx: dict | None, mode: str = 'scalp') -> dict:
-    rec = rec or {}
-    ps = ((structure_ctx or {}).get('price_structure') or {})
-    if not ps:
-        return rec
-    trade = rec.get('trade') or {}
-    spot = float(rec.get('spot') or (structure_ctx or {}).get('spot') or 0.0)
-    direction = (rec.get('direction') or rec.get('bias') or '').lower()
-    em_amt = float((rec.get('em_data') or {}).get('expected_move') or ((rec.get('swing_em') or {}).get('em_1sd') or 0.0) or 0.0)
-    local_r = ps.get('local_resistance_1')
-    local_s = ps.get('local_support_1')
-    pivot = ps.get('pivot')
-    fib_sup = ps.get('fib_support')
-    fib_res = ps.get('fib_resistance')
-    vpoc = ps.get('vpoc')
-    pin_low = ps.get('pin_zone_low') if ps.get('pin_zone_low') is not None else local_s
-    pin_high = ps.get('pin_zone_high') if ps.get('pin_zone_high') is not None else local_r
-    notes = []
-    delta = 0
-    opp_near = max(spot * (0.007 if mode == 'scalp' else 0.012), em_amt * (0.35 if mode == 'scalp' else 0.50)) if spot else 0
-    sup_near = max(spot * 0.006, em_amt * 0.30) if spot else 0
-    near_pin = False
-    if pin_low is not None and pin_high is not None and pin_low < spot < pin_high and em_amt > 0:
-        near_pin = (pin_high - pin_low) <= (2.2 * em_amt if mode == 'scalp' else 2.8 * em_amt)
-    if direction == 'bull':
-        if local_r is not None and local_r > spot:
-            d = local_r - spot
-            if d <= opp_near:
-                delta -= 8 if mode == 'scalp' else 10
-                notes.append(f"Local resistance close ({_fmt_money(local_r)})")
-            elif em_amt > 0 and d <= em_amt * 0.9:
-                delta -= 4
-                notes.append(f"Resistance sits inside move path ({_fmt_money(local_r)})")
-        if local_s is not None and spot > local_s and (spot - local_s) <= sup_near:
-            delta += 3
-            notes.append(f"Nearby structure support ({_fmt_money(local_s)})")
-        if pivot is not None:
-            if spot >= pivot:
-                delta += 2; notes.append("Holding above pivot")
-            else:
-                delta -= 2; notes.append("Below pivot")
-        if fib_sup is not None and spot >= fib_sup and (spot - fib_sup) <= sup_near:
-            delta += 2; notes.append(f"Near Fib support ({_fmt_money(fib_sup)})")
-        if vpoc is not None:
-            if vpoc < spot:
-                delta += 1; notes.append("Trading above acceptance")
-            elif vpoc > spot:
-                delta -= 1; notes.append("Acceptance above price")
-    elif direction == 'bear':
-        if local_s is not None and local_s < spot:
-            d = spot - local_s
-            if d <= opp_near:
-                delta -= 8 if mode == 'scalp' else 10
-                notes.append(f"Local support close ({_fmt_money(local_s)})")
-            elif em_amt > 0 and d <= em_amt * 0.9:
-                delta -= 4
-                notes.append(f"Support sits inside move path ({_fmt_money(local_s)})")
-        if local_r is not None and local_r > spot and (local_r - spot) <= sup_near:
-            delta += 3
-            notes.append(f"Nearby structure resistance ({_fmt_money(local_r)})")
-        if pivot is not None:
-            if spot <= pivot:
-                delta += 2; notes.append("Holding below pivot")
-            else:
-                delta -= 2; notes.append("Above pivot")
-        if fib_res is not None and spot <= fib_res and (fib_res - spot) <= sup_near:
-            delta += 2; notes.append(f"Near Fib resistance ({_fmt_money(fib_res)})")
-        if vpoc is not None:
-            if vpoc > spot:
-                delta += 1; notes.append("Trading below acceptance")
-            elif vpoc < spot:
-                delta -= 1; notes.append("Acceptance below price")
-    if near_pin:
-        delta -= 4 if mode == 'scalp' else 5
-        notes.append('Tight local balance zone / pin risk')
-    conf_base = rec.get('confidence')
-    if conf_base is not None:
-        base = int(conf_base or 0)
-        rec.setdefault('confidence_pre_structure', base)
-        rec['confidence'] = max(0, min(100, base + int(delta)))
-    contracts = rec.get('contracts')
-    if contracts is not None and delta <= -8:
-        try:
-            rec['contracts_pre_structure'] = contracts
-            rec['contracts'] = max(1, int(math.floor(float(contracts) * 0.85)))
-        except Exception:
-            pass
-    if notes:
-        existing = list(rec.get('conf_reasons') or [])
-        rec['conf_reasons'] = existing + notes[:3]
-        rec['structure_note'] = '🧱 Structure: ' + ' | '.join(notes[:3])
-    rec['structure_overlay_score'] = int(delta)
-    rec['structure_local_support'] = local_s
-    rec['structure_local_resistance'] = local_r
-    rec['structure_confluence'] = ps.get('structure_confluence')
-    return rec
+    return _um_apply_structure_overlay_to_rec(rec, structure_ctx, mode=mode)
 
 
 def _dedupe_expirations_by_dte(valid_exps: list, max_per_dte: int = 1) -> list:
@@ -2697,6 +2419,18 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
 
         best_rec = _apply_canonical_vol_overlay_to_rec(best_rec, vol_regime, mode="scalp")
         best_rec = _apply_canonical_structure_overlay_to_rec(best_rec, structure_ctx, mode="scalp")
+        dealer_snapshot = {
+            "label": (v4_flow or {}).get("composite_regime") or "UNKNOWN",
+            "description": (v4_flow or {}).get("confidence_label") or "v4 flow composite",
+        }
+        best_rec["shared_model_snapshot"] = _um_build_shared_model_snapshot(
+            ticker=ticker,
+            spot=spot,
+            dealer_regime=dealer_snapshot,
+            vol_regime=vol_regime,
+            structure_ctx=structure_ctx,
+            rec=best_rec,
+        )
         trade = best_rec.get("trade", {})
 
         if is_duplicate_trade(ticker, direction, trade.get("short"), trade.get("long")):
@@ -2710,8 +2444,9 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
         )
 
         card = format_trade_card(best_rec)
-        if best_rec.get("structure_note"):
-            card = best_rec["structure_note"] + "\n\n" + card
+        shared_lines = _um_format_shared_snapshot_lines(best_rec.get("shared_model_snapshot"))
+        if shared_lines:
+            card += "\n\n" + "\n".join(shared_lines)
         validation_note = (signal_validation or {}).get("card_note")
         if validation_note:
             card = validation_note + "\n\n" + card
@@ -4931,14 +4666,16 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
         log.error(f"Trade card error for {ticker}: {e}", exc_info=True)
 
 
-def _append_shared_regime_lines(lines: list, canonical_vol: dict = None, unified_regime: dict = None, management_note: str = ""):
-    if canonical_vol:
-        lines.append(f"🌡️ Volatility Regime: {_format_canonical_vol_line(canonical_vol)}")
-        posture = canonical_vol.get("posture")
-        if posture:
-            lines.append(f"🪖 Posture: {posture}")
-    if unified_regime:
-        lines.append(f"⚙️ Dealer Regime: {_format_unified_regime_line(unified_regime)}")
+def _append_shared_regime_lines(lines: list, canonical_vol: dict = None, unified_regime: dict = None, management_note: str = "", structure_ctx: dict = None, rec: dict = None):
+    snap = _um_build_shared_model_snapshot(
+        ticker=(rec or {}).get("ticker") or (structure_ctx or {}).get("ticker") or "",
+        spot=float((rec or {}).get("spot") or (structure_ctx or {}).get("spot") or 0.0),
+        dealer_regime=unified_regime,
+        vol_regime=canonical_vol,
+        structure_ctx=structure_ctx,
+        rec=rec,
+    )
+    lines.extend(_um_format_shared_snapshot_lines(snap))
     if management_note:
         lines.append(f"🛠️ Management focus: {management_note}")
     return lines
@@ -5039,12 +4776,18 @@ def _post_checkswing_card(ticker: str, forced_direction: str = None):
                 parts.append("")
                 parts.append("ℹ️ Note: manual swing checks do not have full alert-context scoring, so these were unscored / unconvincing rather than true 0-confidence setups.")
 
-            if canonical_vol:
+            shared_fail_snapshot = _um_build_shared_model_snapshot(
+                ticker=ticker,
+                spot=spot,
+                dealer_regime={"label": (v4_flow or {}).get("composite_regime") or "UNKNOWN", "description": "manual swing check"},
+                vol_regime=canonical_vol,
+                structure_ctx=structure_ctx,
+                rec={},
+            )
+            fail_lines = _um_format_shared_snapshot_lines(shared_fail_snapshot)
+            if fail_lines:
                 parts.append("")
-                parts.append(f"🌡️ Volatility Regime: {_format_canonical_vol_line(canonical_vol)}")
-                posture = canonical_vol.get('posture', '')
-                if posture:
-                    parts.append(f"🪖 Posture: {posture}")
+                parts.extend(fail_lines)
 
             parts.append("")
             parts.append("— Not financial advice —")
@@ -5052,7 +4795,7 @@ def _post_checkswing_card(ticker: str, forced_direction: str = None):
             try:
                 _log_signal_dataset_event(
                     ticker=ticker,
-                    webhook_data={"type": "swing", "source": "check", "bias": forced_direction or "both", "tier": "manual"},
+                    webhook_data={"type": "swing", "source": "check", "bias": forced_direction or "both", "requested_bias": forced_direction or "both", "tier": "manual", "manual_scoreable": bool(raw_rows and len(raw_rows) >= 25)},
                     outcome="rejected_no_setup",
                     reason=" | ".join(f"{d}:{_summarize_swing_reject_reason(r)}" for d, r in rejects)[:300],
                     regime=current_regime,
@@ -5075,18 +4818,23 @@ def _post_checkswing_card(ticker: str, forced_direction: str = None):
         except Exception:
             eng, walls = {}, {}
         unified_regime = resolve_unified_regime(eng or {}, None, spot)
+        rec["shared_model_snapshot"] = _um_build_shared_model_snapshot(
+            ticker=ticker,
+            spot=spot,
+            dealer_regime=unified_regime,
+            vol_regime=canonical_vol,
+            structure_ctx=structure_ctx,
+            rec=rec,
+        )
         card = format_swing_card(rec)
-        prepend = []
-        if rec.get("structure_note"):
-            prepend.append(rec["structure_note"])
         extras = []
-        _append_shared_regime_lines(extras, canonical_vol, unified_regime)
-        final_card = card + "\n\n" + "\n".join(extras)
+        _append_shared_regime_lines(extras, canonical_vol, unified_regime, structure_ctx=structure_ctx, rec=rec)
+        final_card = card + ("\n\n" + "\n".join(extras) if extras else "")
         post_to_telegram(final_card)
         try:
             _log_signal_dataset_event(
                 ticker=ticker,
-                webhook_data={"type": "swing", "source": "check", "bias": rec.get("direction"), "tier": rec.get("tier", "manual")},
+                webhook_data={"type": "swing", "source": "check", "bias": rec.get("direction"), "requested_bias": forced_direction or rec.get("direction"), "tier": rec.get("tier", "manual"), "manual_scoreable": rec.get("scoreable")},
                 outcome="trade_opened",
                 reason="",
                 best_rec=rec,
@@ -5132,6 +4880,7 @@ def _post_monitor_card(ticker: str, mode: str):
         if not liquid:
             eng = {}
         unified_regime = resolve_unified_regime(eng or {}, None, spot) if spot else {}
+        structure_ctx = _build_canonical_structure_context(ticker, spot, _get_daily_ohlcv_rows(ticker, days=90)) if spot else {}
 
         if iv is None or spot is None:
             post_to_telegram(f"⚠️ {ticker}: could not fetch IV for {expiry} (DTE={dte})")
@@ -5284,7 +5033,7 @@ def _post_monitor_card(ticker: str, mode: str):
             "Use this as a wheel/thesis monitor — not an automatic swing entry." if mode == "long"
             else "Use this to decide whether to roll, trim, or close early if price breaks support/resistance."
         )
-        _append_shared_regime_lines(lines, canonical_vol, unified_regime, management_note)
+        _append_shared_regime_lines(lines, canonical_vol, unified_regime, management_note, structure_ctx=structure_ctx)
         if mode == "long":
             lines += _build_wheel_focus_block(ticker, expiration, spot, em, walls or {})
             lines += ["", "📌 Monitoring / wheel management only — no swing entry.", "— Not financial advice —"]
