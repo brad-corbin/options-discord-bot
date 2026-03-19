@@ -118,15 +118,24 @@ def build_canonical_vol_regime(
     now_ts = now_ts or time.time()
     market = market or {}
 
-    vix = _as_float(market.get("vix"), 20.0)
-    vix9d = _as_float(market.get("vix9d"), 0.0)
-    if not vix9d and fetch_vix9d_fn:
+    raw_vix = market.get("vix")
+    vix = _as_float(raw_vix, None)
+    if vix is not None and vix <= 0:
+        vix = None
+
+    vix9d = _as_float(market.get("vix9d"), None)
+    if vix9d is not None and vix9d <= 0:
+        vix9d = None
+    if vix9d is None and fetch_vix9d_fn:
         try:
-            vix9d = _as_float(fetch_vix9d_fn("^VIX9D"), 0.0)
+            vix9d = _as_float(fetch_vix9d_fn("^VIX9D"), None)
+            if vix9d is not None and vix9d <= 0:
+                vix9d = None
         except Exception:
-            vix9d = 0.0
+            vix9d = None
+
     term = (market.get("term") or "unknown").lower()
-    if term == "unknown" and vix and vix9d:
+    if term == "unknown" and vix is not None and vix9d is not None:
         slope = vix9d - vix
         if slope < -0.75:
             term = "normal"
@@ -141,7 +150,7 @@ def build_canonical_vol_regime(
             vix_ma200 = get_vix_ma200_fn()
         except Exception:
             vix_ma200 = None
-    above_ma200 = bool(vix_ma200 and vix > vix_ma200)
+    above_ma200 = bool(vix_ma200 is not None and vix is not None and vix > vix_ma200)
 
     vvix = None
     if get_vvix_value_fn:
@@ -153,80 +162,90 @@ def build_canonical_vol_regime(
     closes = candle_closes or []
     rv5 = _calc_ann_rv_from_closes(closes, 5)
     rv20 = _calc_ann_rv_from_closes(closes, 20)
-
-    if vix < 15:
-        base = "LOW"
-        caution = 0
-    elif vix < 20:
-        base = "NORMAL"
-        caution = 1
-    elif vix < 30:
-        base = "ELEVATED"
-        caution = 3
-    else:
-        base = "CRISIS"
-        caution = 5
-
-    if above_ma200:
-        caution += 1
-    if term == "flat":
-        caution += 1
-    elif term == "inverted":
-        caution += 2
-
     vvix_warning = bool(vvix and vvix >= 120)
-    if vvix_warning:
-        caution += 1
-
     rv_spike = bool(rv5 and rv20 and rv5 > (rv20 * 1.35))
-    if rv_spike:
-        caution += 1
+    source = str(market.get("source") or "unknown")
+    inferred = bool(market.get("inferred"))
 
-    transition_warning = False
-    if base in ("LOW", "NORMAL") and (above_ma200 or term in ("flat", "inverted") or vvix_warning or rv_spike):
-        transition_warning = True
-    if base == "ELEVATED" and term == "inverted" and vvix_warning:
-        transition_warning = True
-
-    if base == "CRISIS" or caution >= 6:
-        label = "CRISIS"
-        size_mult = 0.35
-        posture = "Capital preservation. Only best defined-risk setups."
-        confidence = "HIGH"
-    elif base == "ELEVATED" or caution >= 4:
-        label = "ELEVATED"
-        size_mult = 0.60
-        posture = "Reduce size. Favor defined-risk and cleaner directional setups."
-        confidence = "HIGH" if caution >= 5 else "MODERATE"
-    elif transition_warning:
-        label = "TRANSITION"
+    if vix is None:
+        label = "UNKNOWN"
+        base = "UNKNOWN"
+        caution = 1 if (vvix_warning or rv_spike) else 0
         size_mult = 0.75
-        posture = "Transition warning. Smaller size and stricter setup quality."
-        confidence = "MODERATE"
-    elif base == "LOW":
-        label = "LOW"
-        size_mult = 1.00
-        posture = "Calm conditions. Directional setups okay if dealer/structure agrees."
-        confidence = "MODERATE"
+        posture = "Volatility regime unavailable. Reduce size until live vol inputs recover."
+        confidence = "LOW"
+        emoji = "⚪"
+        transition_warning = False
     else:
-        label = "NORMAL"
-        size_mult = 0.90
-        posture = "Balanced environment. Defined-risk preferred."
-        confidence = "MODERATE"
+        if vix < 15:
+            base = "LOW"
+            caution = 0
+        elif vix < 20:
+            base = "NORMAL"
+            caution = 1
+        elif vix < 30:
+            base = "ELEVATED"
+            caution = 3
+        else:
+            base = "CRISIS"
+            caution = 5
 
-    if label in ("TRANSITION", "ELEVATED", "CRISIS"):
-        emoji = "⚠️" if label == "TRANSITION" else "🔶" if label == "ELEVATED" else "🚨"
-    else:
-        emoji = "🟢" if label == "LOW" else "🟡"
+        if above_ma200:
+            caution += 1
+        if term == "flat":
+            caution += 1
+        elif term == "inverted":
+            caution += 2
+        if vvix_warning:
+            caution += 1
+        if rv_spike:
+            caution += 1
 
-    term_slope = (vix9d - vix) if (vix9d and vix) else None
+        transition_warning = False
+        if base in ("LOW", "NORMAL") and (above_ma200 or term in ("flat", "inverted") or vvix_warning or rv_spike):
+            transition_warning = True
+        if base == "ELEVATED" and term == "inverted" and vvix_warning:
+            transition_warning = True
+
+        if base == "CRISIS" or caution >= 6:
+            label = "CRISIS"
+            size_mult = 0.35
+            posture = "Capital preservation. Only best defined-risk setups."
+            confidence = "HIGH"
+        elif base == "ELEVATED" or caution >= 4:
+            label = "ELEVATED"
+            size_mult = 0.60
+            posture = "Reduce size. Favor defined-risk and cleaner directional setups."
+            confidence = "HIGH" if caution >= 5 else "MODERATE"
+        elif transition_warning:
+            label = "TRANSITION"
+            size_mult = 0.75
+            posture = "Transition warning. Smaller size and stricter setup quality."
+            confidence = "MODERATE"
+        elif base == "LOW":
+            label = "LOW"
+            size_mult = 1.00
+            posture = "Calm conditions. Directional setups okay if dealer/structure agrees."
+            confidence = "MODERATE"
+        else:
+            label = "NORMAL"
+            size_mult = 0.90
+            posture = "Balanced environment. Defined-risk preferred."
+            confidence = "MODERATE"
+
+        if label in ("TRANSITION", "ELEVATED", "CRISIS"):
+            emoji = "⚠️" if label == "TRANSITION" else "🔶" if label == "ELEVATED" else "🚨"
+        else:
+            emoji = "🟢" if label == "LOW" else "🟡"
+
+    term_slope = (vix9d - vix) if (vix9d is not None and vix is not None) else None
     return {
         "ticker": ticker,
         "label": label,
         "base": base,
         "emoji": emoji,
-        "vix": vix,
-        "vix9d": vix9d if vix9d > 0 else None,
+        "vix": round(vix, 2) if vix is not None else None,
+        "vix9d": round(vix9d, 2) if vix9d is not None else None,
         "term_structure": term,
         "term_slope": round(term_slope, 2) if term_slope is not None else None,
         "vix_ma200": round(vix_ma200, 2) if vix_ma200 else None,
@@ -242,6 +261,9 @@ def build_canonical_vol_regime(
         "posture": posture,
         "description": posture,
         "confidence": confidence,
+        "source": source,
+        "inferred": inferred,
+        "has_live_vix": vix is not None,
         "ts": now_ts,
     }
 
@@ -254,6 +276,8 @@ def format_canonical_vol_line(vol_regime: dict) -> str:
     vix = vol_regime.get("vix")
     if vix is not None:
         bits.append(f"VIX {vix:.1f}")
+    else:
+        bits.append("VIX unavailable")
     if vol_regime.get("above_ma200"):
         bits.append("> MA200")
     term = vol_regime.get("term_structure")
@@ -264,6 +288,11 @@ def format_canonical_vol_line(vol_regime: dict) -> str:
         bits.append(f"VVIX {vvix:.0f}")
     if vol_regime.get("transition_warning"):
         bits.append("transition warning")
+    source = vol_regime.get("source")
+    if source and source not in ("unknown", ""):
+        bits.append(f"src {source}")
+    if vol_regime.get("inferred"):
+        bits.append("proxy")
     return " | ".join(bits)
 
 
@@ -296,6 +325,7 @@ def resolve_canonical_dealer_regime(
         "gex_raw_negative": gex_negative,
         "flip_price": flip,
         "spot_vs_flip": "unknown",
+        "confidence": "LOW",
     }
 
     if flip and spot > 0:
@@ -420,13 +450,15 @@ def build_canonical_dealer_snapshot(
     pin_zone_low = put_wall if put_wall is not None else max_pain
     pin_zone_high = call_wall if call_wall is not None else max_pain
 
+    label = str(regime.get("label") or regime.get("regime") or "UNKNOWN").upper()
+    description = regime.get("description") or ""
     out = {
         "ticker": ticker,
         "spot": spot,
-        "label": str(regime.get("label") or regime.get("regime") or "UNKNOWN").upper(),
-        "regime": str(regime.get("label") or regime.get("regime") or "UNKNOWN").upper(),
+        "label": label,
+        "regime": label,
         "source": regime.get("source") or "unknown",
-        "description": regime.get("description") or "",
+        "description": description,
         "allows_debit_spreads": regime.get("allows_debit_spreads", True),
         "allows_credit_spreads": regime.get("allows_credit_spreads", True),
         "gex_raw_negative": bool(regime.get("gex_raw_negative", _as_float(v4_flow.get("gex"), _as_float(eng.get("gex"), 0.0)) < 0)),
@@ -449,6 +481,12 @@ def build_canonical_dealer_snapshot(
         "downgrades": list(v4_flow.get("downgrades") or []),
     }
 
+    if out["label"] == "UNKNOWN":
+        has_structure = any(out.get(k) is not None for k in ("flip_price", "max_pain", "call_wall", "put_wall", "gamma_wall"))
+        if has_structure:
+            out["description"] = "Structure available; regime confidence low."
+            if out.get("source") in (None, "unknown", "none"):
+                out["source"] = "dealer structure"
     near_threshold = max(float(spot or 0) * 0.0025, 0.75) if spot else 0.75
     out["near_flip"] = bool(out.get("flip_price") is not None and out.get("distance_to_flip") is not None and out.get("distance_to_flip") <= near_threshold)
     out["near_max_pain"] = bool(out.get("max_pain") is not None and abs(float(spot or 0) - float(out.get("max_pain"))) <= near_threshold) if spot and out.get("max_pain") is not None else False
