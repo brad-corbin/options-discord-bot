@@ -397,7 +397,7 @@ class ThesisMonitorEngine:
         elif state.status == "BREAK_IN_PROGRESS":
             guidance.append({
                 "text": "⏳ BREAK IN PROGRESS: A level was just broken. Do NOT trade yet — "
-                        "wait 2-3 candles for follow-through. If it fails and reclaims, that's the trade.",
+                        "wait 2-3 five-minute candles for follow-through. If it fails and reclaims, that's the trade.",
                 "type": "warning",
             })
 
