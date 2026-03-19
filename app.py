@@ -2730,16 +2730,39 @@ def _find_expiry_closest_to_21(ticker):
 # against actual EOD prices and compute hit rates over time.
 # ─────────────────────────────────────────────────────────────────────
 
-def _log_em_prediction(ticker: str, session: str, spot: float, em: dict, bias: dict, v4_result: dict):
+def _log_em_prediction(ticker: str, session: str, spot: float, em: dict, bias: dict, v4_result: dict,
+                       walls: dict = None, cagf: dict = None, eng: dict = None):
     """
     Log EM prediction to Redis for backtest analysis.
     Key: em_log:{date}:{ticker}:{session}
     Stored as JSON with prediction data. TTL: 90 days.
+    Includes dealer structure fields so we can score not only range calibration,
+    but also buffered direction, pin-risk, and range-bound / condor-style outcomes.
     """
     try:
         import json
+        walls = walls or {}
+        cagf = cagf or {}
+        eng = eng or {}
         now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         key = f"em_log:{now_str}:{ticker}:{session}"
+
+        em_1sd = em.get("em_1sd") or 0.0
+        idx_tickers = {"SPY", "QQQ", "SPX", "IWM", "DIA"}
+        if str(ticker).upper() in idx_tickers:
+            direction_buffer_abs = max(1.50, em_1sd * 0.20)
+        else:
+            direction_buffer_abs = max(0.50, em_1sd * 0.20)
+
+        gamma_flip = eng.get("flip_price")
+        call_wall = walls.get("call_wall")
+        put_wall = walls.get("put_wall")
+        gamma_wall = walls.get("gamma_wall")
+        accel_up = gamma_flip or gamma_wall or call_wall or em.get("bull_1sd")
+        accel_dn = gamma_flip or gamma_wall or put_wall or em.get("bear_1sd")
+        reclaim_level = gamma_flip or gamma_wall or put_wall or spot
+        fail_level = gamma_flip or gamma_wall or call_wall or spot
+
         entry = {
             "ticker": ticker,
             "date": now_str,
@@ -2752,14 +2775,28 @@ def _log_em_prediction(ticker: str, session: str, spot: float, em: dict, bias: d
             "bear_2sd": em.get("bear_2sd"),
             "bias_score": bias.get("score"),
             "bias_direction": bias.get("direction"),
+            "direction_buffer_abs": round(direction_buffer_abs, 2),
+            "gamma_flip": gamma_flip,
+            "call_wall": call_wall,
+            "put_wall": put_wall,
+            "gamma_wall": gamma_wall,
+            "accel_up": accel_up,
+            "accel_dn": accel_dn,
+            "reclaim_level": reclaim_level,
+            "fail_level": fail_level,
+            "cagf_direction": cagf.get("direction"),
+            "cagf_trend_probability": cagf.get("trend_day_probability"),
+            "pin_zone_width": (call_wall - put_wall) if (call_wall is not None and put_wall is not None) else None,
             "v4_confidence": v4_result.get("confidence", {}).get("label") if v4_result else None,
+            "v4_confidence_composite": v4_result.get("confidence", {}).get("composite") if v4_result else None,
             "v4_bias": v4_result.get("snapshot", {}).get("adjusted_expectation", {}).get("bias") if v4_result else None,
             "v4_regime": v4_result.get("snapshot", {}).get("regime", {}).get("regime") if v4_result else None,
-            # EOD price gets filled in later by a separate reconciler
             "eod_price": None,
+            "eod_high": None,
+            "eod_low": None,
             "reconciled": False,
         }
-        store_set(key, json.dumps(entry), ttl=90 * 86400)  # 90 day TTL
+        store_set(key, json.dumps(entry), ttl=90 * 86400)
         log.debug(f"EM prediction logged: {key}")
     except Exception as e:
         log.warning(f"EM prediction log failed: {e}")
@@ -2997,7 +3034,7 @@ def _post_em_card(ticker: str, session: str):
                  f"conf={v4_result.get('confidence', {}).get('label', '?')}")
 
         # ── EM accuracy logger: save prediction for backtest ──
-        _log_em_prediction(ticker, session, spot, em, bias, v4_result)
+        _log_em_prediction(ticker, session, spot, em, bias, v4_result, walls=walls, cagf=cagf, eng=eng or {})
 
         # ── v4.3: Resolve unified regime for trade card + plain cards ──
         unified_regime = resolve_unified_regime(eng or {}, cagf, spot)
