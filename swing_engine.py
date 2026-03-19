@@ -95,6 +95,7 @@ def black_scholes_price(
     iv: float,
     rate: float = 0.05,
     option_type: str = "call",
+    div_yield: float = 0.0,
 ) -> Dict:
     """
     Black-Scholes option pricing.
@@ -124,7 +125,7 @@ def black_scholes_price(
     sqrt_T = math.sqrt(T)
 
     try:
-        d1 = (math.log(spot / strike) + (rate + 0.5 * iv ** 2) * T) / (iv * sqrt_T)
+        d1 = (math.log(spot / strike) + (rate - div_yield + 0.5 * iv ** 2) * T) / (iv * sqrt_T)
         d2 = d1 - iv * sqrt_T
 
         nd1 = _norm_cdf(d1)
@@ -137,13 +138,15 @@ def black_scholes_price(
 
         discount = math.exp(-rate * T)
 
+        # Dividend-adjusted discount for delta
+        div_discount = math.exp(-div_yield * T)
         if option_type == "call":
-            price = spot * nd1 - strike * discount * nd2
-            delta = nd1
+            price = spot * div_discount * nd1 - strike * discount * nd2
+            delta = div_discount * nd1           # e^{-qT} * N(d1)
             prob_itm = nd2
         else:
-            price = strike * discount * nd2_neg - spot * nd1_neg
-            delta = nd1 - 1.0
+            price = strike * discount * nd2_neg - spot * div_discount * nd1_neg
+            delta = div_discount * (nd1 - 1.0)  # e^{-qT} * (N(d1) - 1)
             prob_itm = nd2_neg
 
         gamma = pdf_d1 / (spot * iv * sqrt_T)
@@ -244,7 +247,7 @@ def calc_swing_expected_move(
         return {}
 
     em_1sd = round(spot * iv * math.sqrt(days / 365.0), 2)
-    em_2sd = round(em_1sd * 2, 2)
+    em_2sd = round(em_1sd * 1.96, 2)  # 1.96σ = 95.0% confidence interval
 
     # Fib extension targets from current price
     extensions = {}
