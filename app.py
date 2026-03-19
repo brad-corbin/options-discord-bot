@@ -498,6 +498,10 @@ def _log_signal_dataset_event(ticker: str, webhook_data: dict, outcome: str, rea
             "vix": (regime or {}).get("vix") if isinstance(regime, dict) else None,
             "adx": (regime or {}).get("adx") if isinstance(regime, dict) else None,
             "dealer_regime": ((best_rec or {}).get("shared_model_snapshot") or {}).get("dealer_regime", {}).get("label") if isinstance((best_rec or {}).get("shared_model_snapshot"), dict) else None,
+            "dealer_source": ((best_rec or {}).get("shared_model_snapshot") or {}).get("dealer_regime", {}).get("source") if isinstance((best_rec or {}).get("shared_model_snapshot"), dict) else None,
+            "dealer_flip_price": ((best_rec or {}).get("shared_model_snapshot") or {}).get("dealer_regime", {}).get("flip_price") if isinstance((best_rec or {}).get("shared_model_snapshot"), dict) else None,
+            "dealer_spot_vs_flip": ((best_rec or {}).get("shared_model_snapshot") or {}).get("dealer_regime", {}).get("spot_vs_flip") if isinstance((best_rec or {}).get("shared_model_snapshot"), dict) else None,
+            "dealer_max_pain": ((best_rec or {}).get("shared_model_snapshot") or {}).get("dealer_regime", {}).get("max_pain") if isinstance((best_rec or {}).get("shared_model_snapshot"), dict) else None,
             "v4_composite_regime": (v4_flow or {}).get("composite_regime") if isinstance(v4_flow, dict) else None,
             "v4_confidence_label": (v4_flow or {}).get("confidence_label") if isinstance(v4_flow, dict) else None,
             "vol_regime_label": (vol_regime or {}).get("label") if isinstance(vol_regime, dict) else None,
@@ -516,7 +520,7 @@ def _log_signal_dataset_event(ticker: str, webhook_data: dict, outcome: str, rea
             "structure_outer_bracket_low": (best_rec or {}).get("structure_outer_bracket_low"),
             "structure_outer_bracket_high": (best_rec or {}).get("structure_outer_bracket_high"),
             "structure_confluence": (best_rec or {}).get("structure_confluence"),
-            "log_schema": "v4_unified",
+            "log_schema": "v5_unified",
         }
         fieldnames = list(row.keys())
         _append_csv_row("signal_decisions.csv", fieldnames, row)
@@ -2430,6 +2434,7 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
             vol_regime=vol_regime,
             structure_ctx=structure_ctx,
             rec=best_rec,
+            v4_flow=v4_flow,
         )
         trade = best_rec.get("trade", {})
 
@@ -4666,7 +4671,7 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
         log.error(f"Trade card error for {ticker}: {e}", exc_info=True)
 
 
-def _append_shared_regime_lines(lines: list, canonical_vol: dict = None, unified_regime: dict = None, management_note: str = "", structure_ctx: dict = None, rec: dict = None):
+def _append_shared_regime_lines(lines: list, canonical_vol: dict = None, unified_regime: dict = None, management_note: str = "", structure_ctx: dict = None, rec: dict = None, eng: dict = None, cagf: dict = None, v4_flow: dict = None, walls: dict = None):
     snap = _um_build_shared_model_snapshot(
         ticker=(rec or {}).get("ticker") or (structure_ctx or {}).get("ticker") or "",
         spot=float((rec or {}).get("spot") or (structure_ctx or {}).get("spot") or 0.0),
@@ -4674,6 +4679,10 @@ def _append_shared_regime_lines(lines: list, canonical_vol: dict = None, unified
         vol_regime=canonical_vol,
         structure_ctx=structure_ctx,
         rec=rec,
+        eng=eng,
+        cagf=cagf,
+        v4_flow=v4_flow,
+        walls=walls,
     )
     lines.extend(_um_format_shared_snapshot_lines(snap))
     if management_note:
@@ -4783,6 +4792,7 @@ def _post_checkswing_card(ticker: str, forced_direction: str = None):
                 vol_regime=canonical_vol,
                 structure_ctx=structure_ctx,
                 rec={},
+                v4_flow=v4_flow,
             )
             fail_lines = _um_format_shared_snapshot_lines(shared_fail_snapshot)
             if fail_lines:
@@ -4825,10 +4835,12 @@ def _post_checkswing_card(ticker: str, forced_direction: str = None):
             vol_regime=canonical_vol,
             structure_ctx=structure_ctx,
             rec=rec,
+            eng=eng,
+            walls=walls,
         )
         card = format_swing_card(rec)
         extras = []
-        _append_shared_regime_lines(extras, canonical_vol, unified_regime, structure_ctx=structure_ctx, rec=rec)
+        _append_shared_regime_lines(extras, canonical_vol, unified_regime, structure_ctx=structure_ctx, rec=rec, eng=eng, walls=walls)
         final_card = card + ("\n\n" + "\n".join(extras) if extras else "")
         post_to_telegram(final_card)
         try:
@@ -5033,7 +5045,7 @@ def _post_monitor_card(ticker: str, mode: str):
             "Use this as a wheel/thesis monitor — not an automatic swing entry." if mode == "long"
             else "Use this to decide whether to roll, trim, or close early if price breaks support/resistance."
         )
-        _append_shared_regime_lines(lines, canonical_vol, unified_regime, management_note, structure_ctx=structure_ctx)
+        _append_shared_regime_lines(lines, canonical_vol, unified_regime, management_note, structure_ctx=structure_ctx, eng=eng, cagf=cagf, walls=walls)
         if mode == "long":
             lines += _build_wheel_focus_block(ticker, expiration, spot, em, walls or {})
             lines += ["", "📌 Monitoring / wheel management only — no swing entry.", "— Not financial advice —"]
