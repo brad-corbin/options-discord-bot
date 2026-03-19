@@ -128,6 +128,7 @@ def handle_command(
     get_regime_fn=None,
     post_em_card_fn=None,
     post_monitor_card_fn=None,
+    post_checkswing_card_fn=None,
 ) -> None:
     if not is_authorized(user_id):
         send_reply(chat_id, "⛔ You are not authorized to use this bot.")
@@ -401,6 +402,42 @@ def handle_command(
         return
 
     # ─────────────────────────────────────
+    # /checkswing TICKER [bull|bear]
+    # ─────────────────────────────────────
+    if cmd in ("/checkswing", "/checkswing@omegabot"):
+        if not post_checkswing_card_fn:
+            reply("⚠️ Swing check function not wired — post_checkswing_card_fn missing.")
+            return
+        if not args:
+            reply(
+                "Usage: /checkswing GLD\n"
+                "       /checkswing GLD bull\n"
+                "       /checkswing GLD bear\n\n"
+                "Direction is optional. No direction = evaluate both sides and return the best valid swing setup."
+            )
+            return
+        ticker = args[0].upper()
+        forced_direction = None
+        if len(args) > 1:
+            d = args[1].lower()
+            if d not in ("bull", "bear"):
+                reply(f"⚠️ Direction must be 'bull' or 'bear', got '{d}'")
+                return
+            forced_direction = d
+        dir_label = forced_direction.upper() if forced_direction else "BULL + BEAR"
+        reply(f"🧭 Checking swing setup for {ticker} ({dir_label})...")
+
+        def run_check_swing():
+            try:
+                post_checkswing_card_fn(ticker, forced_direction)
+            except Exception as e:
+                log.error(f"/checkswing {ticker} {forced_direction or 'both'}: {e}")
+                reply(f"⚠️ Swing check error for {ticker}: {type(e).__name__}")
+
+        threading.Thread(target=run_check_swing, daemon=True).start()
+        return
+
+    # ─────────────────────────────────────
     # /tradecard TICKER — retrieve cached full trade card from digest
     # ─────────────────────────────────────
     if cmd in ("/tradecard", "/tradecard@omegabot"):
@@ -638,11 +675,12 @@ def handle_command(
             "/em SPY morning — specific ticker + session\n"
             "  Auto-fires: 8:45 AM CT (today) & 2:45 PM CT (next day)\n"
             "\n── Position Monitor ──\n"
-            "/monitorlong IREN — swing outlook, ~21-day thesis with buffered DTE\n"
-            "/monitorshort IREN — near-term outlook, nearest expiry\n"
-            "  Works on any symbol with liquid options\n"
-            "  Liquid symbols (SPY/QQQ/AAPL/NVDA etc): full dealer flow card\n"
-            "  Other symbols: simplified range + levels + lean\n"
+            "/monitorlong GLD — monitoring / wheel outlook with ~21-day thesis\n"
+            "/monitorshort GLD — near-term management view for roll / close-early decisions\n"
+            "/checkswing GLD — on-demand true swing setup check\n"
+            "/checkswing GLD bull — force bullish swing thesis only\n"
+            "  /monitorlong keeps wheel data and thesis context; /checkswing runs the actual swing engine.\n"
+            "  Works on any symbol with liquid options.\n"
             "\n── Portfolio (add -mom for mom's account) ──\n"
             "/hold add AAPL 100 @185.50 — add shares\n"
             "/hold remove AAPL — remove shares\n"
