@@ -34,6 +34,7 @@ import math
 import json
 import hashlib
 import logging
+import csv
 import threading
 import queue
 import portfolio
@@ -145,6 +146,14 @@ ACCOUNT_CHAT_IDS = {
 }
 
 # ─────────────────────────────────────────────────────────
+# DATASET / DIAGNOSTICS AUT0-LOGGING
+# ─────────────────────────────────────────────────────────
+DIAGNOSTIC_CHAT_ID = os.getenv("DIAGNOSTIC_CHAT_ID", "").strip()
+AUTO_LOG_DIR = os.getenv("AUTO_LOG_DIR", "/mnt/data/bot_logs").strip() or "/mnt/data/bot_logs"
+AUTO_LOG_ENABLE = os.getenv("AUTO_LOG_ENABLE", "1").strip().lower() not in ("0", "false", "no", "off")
+AUTO_LOG_DIAGNOSTICS = os.getenv("AUTO_LOG_DIAGNOSTICS", "0").strip().lower() in ("1", "true", "yes", "on")
+
+# ─────────────────────────────────────────────────────────
 # REDIS
 # ─────────────────────────────────────────────────────────
 _redis_client = None
@@ -184,6 +193,113 @@ class _MemStore:
 
 
 _mem_store = _MemStore()
+_csv_lock = threading.Lock()
+
+
+def _ensure_log_dir():
+    try:
+        os.makedirs(AUTO_LOG_DIR, exist_ok=True)
+    except Exception as e:
+        log.warning(f"Auto-log dir unavailable ({AUTO_LOG_DIR}): {e}")
+
+
+def _append_jsonl(filename: str, row: dict):
+    if not AUTO_LOG_ENABLE:
+        return
+    try:
+        _ensure_log_dir()
+        path = os.path.join(AUTO_LOG_DIR, filename)
+        payload = dict(row or {})
+        payload.setdefault("logged_at_utc", datetime.now(timezone.utc).isoformat())
+        with _csv_lock:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception as e:
+        log.warning(f"JSONL auto-log failed ({filename}): {e}")
+
+
+def _append_csv_row(filename: str, fieldnames: list, row: dict):
+    if not AUTO_LOG_ENABLE:
+        return
+    try:
+        _ensure_log_dir()
+        path = os.path.join(AUTO_LOG_DIR, filename)
+        safe_row = {k: row.get(k) for k in fieldnames}
+        exists = os.path.exists(path)
+        with _csv_lock:
+            with open(path, "a", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                if not exists or os.path.getsize(path) == 0:
+                    writer.writeheader()
+                writer.writerow(safe_row)
+    except Exception as e:
+        log.warning(f"CSV auto-log failed ({filename}): {e}")
+
+
+def _post_diagnostic(text: str):
+    if not (AUTO_LOG_DIAGNOSTICS and DIAGNOSTIC_CHAT_ID and text):
+        return
+    try:
+        post_to_telegram(text, chat_id=DIAGNOSTIC_CHAT_ID)
+    except Exception as e:
+        log.warning(f"Diagnostic post failed: {e}")
+
+
+def _log_signal_dataset_event(ticker: str, webhook_data: dict, outcome: str, reason: str = "", best_rec: dict = None,
+                              signal_validation: dict = None, regime: dict = None, v4_flow: dict = None,
+                              spot: float = None, expirations_checked: int = None):
+    try:
+        wd = dict(webhook_data or {})
+        trade = (best_rec or {}).get("trade", {}) if best_rec else {}
+        row = {
+            "ts_utc": datetime.now(timezone.utc).isoformat(),
+            "event": "signal_decision",
+            "ticker": ticker,
+            "mode": wd.get("type") or "scalp",
+            "source": wd.get("source") or "tv",
+            "bias": wd.get("bias"),
+            "tier": wd.get("tier"),
+            "outcome": outcome,
+            "reason": (reason or "")[:300],
+            "signal_time": wd.get("time"),
+            "signal_price": wd.get("close"),
+            "live_spot": spot if spot is not None else wd.get("live_spot"),
+            "signal_age_sec": (signal_validation or {}).get("signal_age_sec"),
+            "drift_pct": (signal_validation or {}).get("drift_pct"),
+            "validation_ok": (signal_validation or {}).get("ok"),
+            "validation_penalty": (signal_validation or {}).get("confidence_penalty"),
+            "expiration": (best_rec or {}).get("exp"),
+            "dte": (best_rec or {}).get("dte"),
+            "long_strike": trade.get("long"),
+            "short_strike": trade.get("short"),
+            "debit": trade.get("debit"),
+            "width": trade.get("width"),
+            "ror": trade.get("ror"),
+            "win_prob": trade.get("win_prob"),
+            "ev_per_contract": trade.get("ev_per_contract"),
+            "confidence": (best_rec or {}).get("confidence"),
+            "confidence_pre_validation": (best_rec or {}).get("confidence_pre_validation"),
+            "contracts": (best_rec or {}).get("contracts"),
+            "expirations_checked": expirations_checked,
+            "regime": (regime or {}).get("regime") if isinstance(regime, dict) else None,
+            "vix": (regime or {}).get("vix") if isinstance(regime, dict) else None,
+            "adx": (regime or {}).get("adx") if isinstance(regime, dict) else None,
+            "v4_composite_regime": (v4_flow or {}).get("composite_regime") if isinstance(v4_flow, dict) else None,
+            "v4_confidence_label": (v4_flow or {}).get("confidence_label") if isinstance(v4_flow, dict) else None,
+            "log_schema": "v1",
+        }
+        fieldnames = list(row.keys())
+        _append_csv_row("signal_decisions.csv", fieldnames, row)
+        _append_jsonl("signal_decisions.jsonl", row)
+
+        diag = (
+            f"🧪 {ticker} {str(wd.get('bias','')).upper()} T{wd.get('tier','?')} | {outcome}\n"
+            f"spot ${row['live_spot']} | drift {row['drift_pct']}% | conf {row['confidence']}\n"
+            f"reason: {row['reason'] or '—'}"
+        )
+        _post_diagnostic(diag)
+    except Exception as e:
+        log.warning(f"Signal dataset log failed for {ticker}: {e}")
 
 
 def _get_redis():
@@ -1795,6 +1911,7 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
         if not signal_validation.get("ok", True):
             reason = signal_validation.get("reason") or "signal validation failed"
             trade_journal.log_signal(ticker, webhook_data, outcome="rejected", reason=reason[:200])
+            _log_signal_dataset_event(ticker, webhook_data, outcome="rejected_validation", reason=reason, signal_validation=signal_validation, regime=regime, v4_flow=v4_flow, spot=spot, expirations_checked=len(chains) if chains else 0)
             log.info(f"check_ticker({ticker}): rejected by validation — {reason}")
             return {
                 "ticker": ticker, "ok": False, "posted": False,
@@ -1825,6 +1942,7 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
             if all_reasons:
                 combined_reason += "\n" + "\n".join(all_reasons[:4])
             trade_journal.log_signal(ticker, webhook_data, outcome="rejected", reason=combined_reason[:200])
+            _log_signal_dataset_event(ticker, webhook_data, outcome="rejected_no_setup", reason=combined_reason, signal_validation=signal_validation, regime=regime, v4_flow=v4_flow, spot=spot, expirations_checked=len(chains))
             return {"ticker": ticker, "ok": False, "posted": False,
                     "reason": combined_reason, "confidence": None}
 
@@ -1854,6 +1972,7 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
 
         if is_duplicate_trade(ticker, direction, trade.get("short"), trade.get("long")):
             trade_journal.log_signal(ticker, webhook_data, outcome="duplicate", confidence=best_rec.get("confidence"))
+            _log_signal_dataset_event(ticker, webhook_data, outcome="duplicate", reason="Duplicate trade in dedup window", best_rec=best_rec, signal_validation=signal_validation, regime=regime, v4_flow=v4_flow, spot=spot, expirations_checked=len(chains))
             return {"ticker": ticker, "ok": True, "posted": False, "reason": "Duplicate trade in dedup window"}
 
         risk_result = risk_manager.check_risk_limits(
@@ -1886,6 +2005,13 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
         trade_journal.log_signal(ticker, webhook_data,
             outcome="trade_opened" if risk_result["allowed"] else "risk_blocked",
             confidence=best_rec.get("confidence"))
+        _log_signal_dataset_event(
+            ticker, webhook_data,
+            outcome="trade_opened" if risk_result["allowed"] else "risk_blocked",
+            reason=("; ".join(risk_result.get("blocks", [])) if not risk_result["allowed"] else ""),
+            best_rec=best_rec, signal_validation=signal_validation, regime=regime, v4_flow=v4_flow,
+            spot=spot, expirations_checked=len(chains)
+        )
 
         # v4.3: Cache card for /tradecard retrieval (same as wave digest path)
         try:
@@ -2725,90 +2851,31 @@ def _find_expiry_closest_to_21(ticker):
 
 
 # ─────────────────────────────────────────────────────────────────────
-# EM STRUCTURE HELPERS
-# ─────────────────────────────────────────────────────────────────────
-
-def _calc_max_pain_from_by_strike(by_strike: dict | None) -> float | None:
-    """Estimate max pain from by-strike OI. Returns strike with minimum total payout."""
-    try:
-        if not by_strike:
-            return None
-        strikes = sorted(float(k) for k in by_strike.keys())
-        if not strikes:
-            return None
-        best_strike = None
-        best_payout = None
-        for settle in strikes:
-            payout = 0.0
-            for strike in strikes:
-                row = by_strike.get(strike) or by_strike.get(int(strike)) or by_strike.get(str(strike)) or {}
-                call_oi = as_float(row.get("call_oi"), 0.0)
-                put_oi = as_float(row.get("put_oi"), 0.0)
-                payout += max(settle - strike, 0.0) * call_oi
-                payout += max(strike - settle, 0.0) * put_oi
-            if best_payout is None or payout < best_payout:
-                best_payout = payout
-                best_strike = settle
-        return round(best_strike, 2) if best_strike is not None else None
-    except Exception:
-        return None
-
-
-def _ensure_max_pain_in_walls(walls: dict | None, v4_result: dict | None) -> dict:
-    walls = dict(walls or {})
-    if walls.get("max_pain") is not None:
-        return walls
-    by_strike = (v4_result or {}).get("by_strike") or {}
-    max_pain = _calc_max_pain_from_by_strike(by_strike)
-    if max_pain is not None:
-        walls["max_pain"] = max_pain
-    return walls
-
-
-# ─────────────────────────────────────────────────────────────────────
 # EM ACCURACY LOGGER — saves predictions for backtest analysis
 # Stores each EM card's prediction in Redis so we can compare
 # against actual EOD prices and compute hit rates over time.
 # ─────────────────────────────────────────────────────────────────────
 
-def _log_em_prediction(ticker: str, session: str, spot: float, em: dict, bias: dict, v4_result: dict,
-                       walls: dict = None, cagf: dict = None, eng: dict = None):
+def _log_em_prediction(ticker: str, session: str, spot: float, em: dict, bias: dict, v4_result: dict, walls: dict = None, eng: dict = None, cagf: dict = None):
     """
-    Log EM prediction to Redis for backtest analysis.
+    Log EM prediction to Redis and to an auto-tracked dataset for later tuning.
     Key: em_log:{date}:{ticker}:{session}
     Stored as JSON with prediction data. TTL: 90 days.
-    Includes dealer structure fields so we can score not only range calibration,
-    but also buffered direction, pin-risk, and range-bound / condor-style outcomes.
     """
     try:
-        import json
-        walls = _ensure_max_pain_in_walls(walls or {}, v4_result)
-        cagf = cagf or {}
-        eng = eng or {}
-        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        now_dt = datetime.now(timezone.utc)
+        now_str = now_dt.strftime("%Y-%m-%d")
         key = f"em_log:{now_str}:{ticker}:{session}"
-
-        em_1sd = as_float(em.get("em_1sd"), 0.0)
-        conf_label = ((v4_result or {}).get("confidence", {}) or {}).get("label") or "MODERATE"
-        conf_mult = {"HIGH": 0.18, "MODERATE": 0.12, "LOW": 0.08}.get(conf_label, 0.12)
-        idx_tickers = {"SPY", "QQQ", "SPX", "IWM", "DIA"}
-        floor = 0.75 if str(ticker).upper() in idx_tickers else 0.50
-        direction_buffer_abs = max(floor, em_1sd * conf_mult)
-
-        gamma_flip = eng.get("flip_price")
-        call_wall = walls.get("call_wall")
-        put_wall = walls.get("put_wall")
-        gamma_wall = walls.get("gamma_wall")
+        walls = walls or {}
+        eng = eng or {}
         max_pain = walls.get("max_pain")
-        accel_up = gamma_flip or gamma_wall or call_wall or em.get("bull_1sd")
-        accel_dn = gamma_flip or gamma_wall or put_wall or em.get("bear_1sd")
-        reclaim_level = gamma_flip or gamma_wall or put_wall or spot
-        fail_level = gamma_flip or gamma_wall or call_wall or spot
-
+        if max_pain is None:
+            max_pain = eng.get("max_pain")
         entry = {
             "ticker": ticker,
             "date": now_str,
             "session": session,
+            "logged_at_utc": now_dt.isoformat(),
             "spot_at_prediction": spot,
             "em_1sd": em.get("em_1sd"),
             "bull_1sd": em.get("bull_1sd"),
@@ -2817,29 +2884,33 @@ def _log_em_prediction(ticker: str, session: str, spot: float, em: dict, bias: d
             "bear_2sd": em.get("bear_2sd"),
             "bias_score": bias.get("score"),
             "bias_direction": bias.get("direction"),
-            "direction_buffer_abs": round(direction_buffer_abs, 2),
-            "gamma_flip": gamma_flip,
-            "call_wall": call_wall,
-            "put_wall": put_wall,
-            "gamma_wall": gamma_wall,
-            "max_pain": max_pain,
-            "accel_up": accel_up,
-            "accel_dn": accel_dn,
-            "reclaim_level": reclaim_level,
-            "fail_level": fail_level,
-            "cagf_direction": cagf.get("direction"),
-            "cagf_trend_probability": cagf.get("trend_day_probability"),
-            "pin_zone_width": (call_wall - put_wall) if (call_wall is not None and put_wall is not None) else None,
             "v4_confidence": v4_result.get("confidence", {}).get("label") if v4_result else None,
             "v4_confidence_composite": v4_result.get("confidence", {}).get("composite") if v4_result else None,
             "v4_bias": v4_result.get("snapshot", {}).get("adjusted_expectation", {}).get("bias") if v4_result else None,
             "v4_regime": v4_result.get("snapshot", {}).get("regime", {}).get("regime") if v4_result else None,
+            "gamma_flip": walls.get("gamma_flip") or eng.get("flip_price"),
+            "call_wall": walls.get("call_wall"),
+            "put_wall": walls.get("put_wall"),
+            "gamma_wall": walls.get("gamma_wall"),
+            "max_pain": max_pain,
+            "pin_zone_low": walls.get("put_wall"),
+            "pin_zone_high": walls.get("call_wall"),
+            "cagf_direction": (cagf or {}).get("direction"),
+            "cagf_regime": (cagf or {}).get("regime"),
+            "trend_day_probability": (cagf or {}).get("trend_day_probability"),
             "eod_price": None,
-            "eod_high": None,
-            "eod_low": None,
             "reconciled": False,
         }
-        store_set(key, json.dumps(entry), ttl=90 * 86400)
+        store_set(key, json.dumps(entry), ttl=90 * 86400)  # 90 day TTL
+
+        fieldnames = [
+            "logged_at_utc","date","session","ticker","spot_at_prediction","em_1sd","bull_1sd","bear_1sd",
+            "bull_2sd","bear_2sd","bias_score","bias_direction","v4_confidence","v4_confidence_composite",
+            "v4_bias","v4_regime","gamma_flip","call_wall","put_wall","gamma_wall","max_pain",
+            "pin_zone_low","pin_zone_high","cagf_direction","cagf_regime","trend_day_probability"
+        ]
+        _append_csv_row("em_predictions.csv", fieldnames, entry)
+        _append_jsonl("em_predictions.jsonl", entry)
         log.debug(f"EM prediction logged: {key}")
     except Exception as e:
         log.warning(f"EM prediction log failed: {e}")
@@ -2893,7 +2964,6 @@ def _post_em_card(ticker: str, session: str):
         em = _calc_intraday_em(spot, iv, hours_for_em)
         if not em: return
 
-        walls = _ensure_max_pain_in_walls(walls or {}, v4_result)
         bias = _calc_bias(spot, em, walls or {}, skew or {}, eng or {}, pcr or {}, vix or {})
 
         iv_pct = iv * 100
@@ -3040,10 +3110,6 @@ def _post_em_card(ticker: str, session: str):
             if "gamma_wall" in walls:
                 gw = walls["gamma_wall"]; gw_dist = ((gw - spot) / spot) * 100
                 lines.append(f"  🎯 Gamma Wall: ${gw:.0f}  ({gw_dist:+.1f}%)")
-            if "max_pain" in walls:
-                mp = walls["max_pain"]; mp_dist = ((mp - spot) / spot) * 100
-                mp_side = "above" if mp >= spot else "below"
-                lines.append(f"  🧲 Max Pain:   ${mp:.0f}  ({mp_side} spot, {mp_dist:+.1f}%)")
             if "call_top3" in walls:
                 lines.append(f"  📵 Resistance stack: {'  →  '.join(f'${x:.0f}' for x in walls['call_top3'])}")
             if "put_top3" in walls:
@@ -3082,7 +3148,7 @@ def _post_em_card(ticker: str, session: str):
                  f"conf={v4_result.get('confidence', {}).get('label', '?')}")
 
         # ── EM accuracy logger: save prediction for backtest ──
-        _log_em_prediction(ticker, session, spot, em, bias, v4_result, walls=walls, cagf=cagf, eng=eng or {})
+        _log_em_prediction(ticker, session, spot, em, bias, v4_result, walls=walls, eng=eng, cagf=cagf)
 
         # ── v4.3: Resolve unified regime for trade card + plain cards ──
         unified_regime = resolve_unified_regime(eng or {}, cagf, spot)
@@ -3229,83 +3295,10 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
             card_title = f"TRADE SETUP ({effective_dte_label})"
 
         def no_trade(reason, emoji="⚪"):
-            call_wall = walls.get("call_wall") if walls else None
-            put_wall = walls.get("put_wall") if walls else None
-            gamma_wall = walls.get("gamma_wall") if walls else None
-            max_pain = walls.get("max_pain") if walls else None
-            flip_side = None
-            if flip is not None:
-                flip_side = "above" if spot >= flip else "below"
-
-            accel_up = flip or gamma_wall or call_wall or em.get("bull_1sd")
-            accel_dn = flip or gamma_wall or put_wall or em.get("bear_1sd")
-            reclaim_level = flip or gamma_wall or put_wall or spot
-            fail_level = flip or gamma_wall or call_wall or spot
-
-            range_lo = None
-            range_hi = None
-            if put_wall is not None and call_wall is not None:
-                range_lo, range_hi = put_wall, call_wall
-            elif em.get("bear_1sd") is not None and em.get("bull_1sd") is not None:
-                range_lo, range_hi = em.get("bear_1sd"), em.get("bull_1sd")
-
-            structure_lines = [
-                f"🎯 {ticker} — Dealer EM Brief ({effective_dte_label})  |  Exp: {exp_short}",
-                f"{emoji} No spread passed filters — {reason}",
-                f"Spot ${spot:.2f}  |  Bias {direction} (score {score:+d}/14)",
-                f"Expected move: ±${em['em_1sd']:.2f}  ({em['bear_1sd']:.2f} – {em['bull_1sd']:.2f})",
-            ]
-
-            if unified_regime:
-                structure_lines.append(f"Regime: {unified_regime.get('label', 'UNKNOWN')}")
-
-            if flip is not None or call_wall is not None or put_wall is not None or gamma_wall is not None or max_pain is not None:
-                structure_lines += ["", "📍 Key levels"]
-                if flip is not None:
-                    structure_lines.append(f"  • Gamma flip: ${flip:.2f} ({flip_side})")
-                if call_wall is not None:
-                    structure_lines.append(f"  • Call wall / resistance: ${call_wall:.2f}")
-                if put_wall is not None:
-                    structure_lines.append(f"  • Put wall / support: ${put_wall:.2f}")
-                if gamma_wall is not None:
-                    structure_lines.append(f"  • Gamma wall: ${gamma_wall:.2f}")
-                if max_pain is not None:
-                    structure_lines.append(f"  • Max pain / magnet: ${max_pain:.2f}")
-                if range_lo is not None and range_hi is not None:
-                    structure_lines.append(f"  • Likely pin / balance zone: ${range_lo:.2f} – ${range_hi:.2f}")
-
-            structure_lines += ["", "⚙️ Trigger map"]
-            if accel_up is not None:
-                up_line = f"  • Above ${accel_up:.2f}: upside can accelerate toward ${em['bull_1sd']:.2f}"
-                if call_wall is not None and call_wall > em['bull_1sd']:
-                    up_line += f" then ${call_wall:.2f}"
-                structure_lines.append(up_line)
-            if accel_dn is not None:
-                dn_line = f"  • Below ${accel_dn:.2f}: downside can accelerate toward ${em['bear_1sd']:.2f}"
-                if put_wall is not None and put_wall < em['bear_1sd']:
-                    dn_line += f" then ${put_wall:.2f}"
-                structure_lines.append(dn_line)
-            if reclaim_level is not None:
-                structure_lines.append(f"  • Reclaim ${reclaim_level:.2f}: improves bullish structure")
-            if fail_level is not None:
-                structure_lines.append(f"  • Lose ${fail_level:.2f}: increases bearish pressure")
-
-            if eng:
-                gex_icon = "🧲" if tgex >= 0 else "⚡"
-                gex_mode = "mean-reverting / suppressive" if tgex >= 0 else "trend / amplifying"
-                structure_lines += ["", "📊 Dealer positioning",
-                    f"  • {gex_icon} GEX: {'+' if tgex >= 0 else ''}{tgex:.1f}M → {gex_mode}",
-                    f"  • DEX: {'+' if dex >= 0 else ''}{dex:.1f}M",
-                    f"  • Charm: {'+' if charm_m >= 0 else ''}{charm_m:.1f}M",
-                ]
-
-            if cagf:
-                structure_lines.append(f"  • Flow lean: {cagf.get('direction', 'NEUTRAL')} | Trend-day prob {cagf.get('trend_day_probability', 0):.0%}")
-
-            structure_lines.append("")
-            structure_lines.append("— Not financial advice —")
-            post_to_telegram("\n".join(structure_lines))
-            log.info(f"Trade card blocked (brief posted): {ticker} | {reason}")
+            post_to_telegram(
+                f"🎯 {ticker} — {card_title}  |  Exp: {exp_short}\n"
+                f"{emoji} NO TRADE — {reason}\n— Not financial advice —")
+            log.info(f"Trade card blocked: {ticker} | {reason}")
 
         # ══════ GATE CHECKS ══════
 
@@ -3669,11 +3662,9 @@ def _post_monitor_card(ticker: str, mode: str):
         vanna_m = eng.get("vanna", 0) if eng else 0
         charm_m = eng.get("charm", 0) if eng else 0
         flip = eng.get("flip_price") if eng else None
-        walls = _ensure_max_pain_in_walls(walls or {}, v4_result)
         call_wall = walls.get("call_wall") if walls else None
         put_wall = walls.get("put_wall") if walls else None
         gamma_wall = walls.get("gamma_wall") if walls else None
-        max_pain = walls.get("max_pain") if walls else None
 
         reason_lines = []
         counter_lines = []
@@ -3772,8 +3763,6 @@ def _post_monitor_card(ticker: str, mode: str):
             lines.append(f"  Call Wall / Resistance: ${call_wall:.2f}")
         if gamma_wall is not None:
             lines.append(f"  Gamma Wall: ${gamma_wall:.2f}")
-        if max_pain is not None:
-            lines.append(f"  Max Pain: ${max_pain:.2f}")
         if flip is not None:
             lines.append(f"  Gamma Flip: ${flip:.2f}")
         if liquid and eng:
