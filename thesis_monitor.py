@@ -1,28 +1,11 @@
 # thesis_monitor.py
 # ═══════════════════════════════════════════════════════════════════
-# v1.0 Thesis Monitor — Continuous Context-Aware Price Monitoring
+# v1.1 Thesis Monitor — Continuous Context-Aware Price Monitoring
 #
-# PROBLEM: EM cards fire at 8:45 AM and 2:45 PM CT but price moves
-# all day. Each new check starts fresh — no memory of what happened.
-# This means:
-#   - Failed breakdowns (the BEST intraday setup) go undetected
-#   - Momentum shifts mid-trade are invisible
-#   - The bot keeps calling "bullish" even as a breakout dies
-#   - Prior day context (squeeze into close, etc.) is lost
-#
-# SOLUTION: This module:
-#   1. Captures the thesis when an EM card fires
-#   2. Polls price on an interval (default 5 min)
-#   3. Tracks ALL price action against the original thesis
-#   4. Detects: failed moves, momentum decay, break attempts, traps
-#   5. Posts plain English alerts to Telegram
-#   6. Adjusts guidance based on time-of-day and GEX regime
-#
-# INTEGRATION:
-#   - app.py calls store_thesis() after each EM card
-#   - Background thread polls price via get_spot()
-#   - Alerts post to Telegram via post_to_telegram()
-#   - /monitor command shows status, /monitor stop disables
+# v1.1: IntradayLevelTracker — builds support/resistance from the
+#   prices the daemon already collects. Zero additional API calls.
+#   Detects: rejection zones, session high/low, consolidation edges,
+#   sharp-move origins (order blocks). Feeds into failed move engine.
 #
 # NOTE: Educational/demo code. Not financial advice.
 # ═══════════════════════════════════════════════════════════════════
@@ -48,6 +31,14 @@ MONITOR_MOMENTUM_LOOKBACK = 5            # number of price points for momentum c
 MONITOR_RECLAIM_THRESHOLD_PCT = 0.015    # 0.015% above/below level = reclaim
 MONITOR_STALL_THRESHOLD_PCT = 0.008      # moves < this = stalling
 MONITOR_ENABLED_TICKERS = ["SPY", "QQQ"]
+
+# Intraday level detection config
+INTRADAY_MIN_TOUCHES = 2                 # min times price must touch a zone to be a level
+INTRADAY_ZONE_TOLERANCE_PCT = 0.04       # 0.04% = ~$0.26 on SPY — how close counts as "same level"
+INTRADAY_MIN_PRICES_FOR_LEVELS = 6       # need ~30 min of data before detecting levels
+INTRADAY_SHARP_MOVE_THRESHOLD = 0.12     # 0.12% in one 5m candle = sharp move
+INTRADAY_CONSOLIDATION_CANDLES = 4       # 4 candles in tight range = consolidation
+INTRADAY_CONSOLIDATION_RANGE_PCT = 0.06  # range < 0.06% of price = tight
 
 
 # ─────────────────────────────────────────────────────────
@@ -109,7 +100,7 @@ class ThesisContext:
 class BreakAttempt:
     """Record of a price break at a level."""
     level: float
-    level_name: str          # e.g. "local_support", "range_break_down"
+    level_name: str          # e.g. "local_support", "intraday_support"
     direction: str           # "UP" or "DOWN"
     break_price: float
     break_time: float        # monotonic timestamp
@@ -118,18 +109,37 @@ class BreakAttempt:
 
 
 @dataclass
+class IntradayLevel:
+    """A support or resistance level discovered from intraday price action."""
+    price: float
+    kind: str                # "support" or "resistance"
+    source: str              # "rejection_zone", "session_high", "session_low",
+                             # "sharp_move_origin", "consolidation_edge"
+    touches: int = 0
+    first_seen_ts: float = 0.0
+    last_touched_ts: float = 0.0
+    active: bool = True
+
+
+@dataclass
 class MonitorState:
     """Evolving state tracked throughout the day."""
-    status: str = "FRESH"                  # FRESH, DEVELOPING, BREAK_IN_PROGRESS, FAILED_MOVE_ACTIVE, SQUEEZE_ACTIVE
-    momentum: str = "NEUTRAL"              # ACCELERATING_UP/DOWN, DRIFTING_UP/DOWN, STALLING, LOSING_UPSIDE/DOWNSIDE_MOMENTUM
+    status: str = "FRESH"
+    momentum: str = "NEUTRAL"
     above_gamma_flip: Optional[bool] = None
-    price_history: list = field(default_factory=list)  # [{price, time_str, ts_mono}]
-    break_attempts: list = field(default_factory=list)  # [BreakAttempt]
-    failed_moves: list = field(default_factory=list)    # [BreakAttempt] that failed
-    alert_history: dict = field(default_factory=dict)   # {alert_type: last_ts_mono}
+    price_history: list = field(default_factory=list)
+    break_attempts: list = field(default_factory=list)
+    failed_moves: list = field(default_factory=list)
+    alert_history: dict = field(default_factory=dict)
     last_guidance_ts: float = 0.0
     check_count: int = 0
     prior_day_applied: bool = False
+    # v1.1: Intraday levels
+    intraday_levels: list = field(default_factory=list)
+    session_high: Optional[float] = None
+    session_low: Optional[float] = None
+    session_high_time: str = ""
+    session_low_time: str = ""
 
 
 # ─────────────────────────────────────────────────────────
@@ -177,6 +187,169 @@ def _get_time_phase_ct() -> dict:
 
 
 # ─────────────────────────────────────────────────────────
+# INTRADAY LEVEL TRACKER — Zero API calls
+# ─────────────────────────────────────────────────────────
+
+class IntradayLevelTracker:
+    """Discovers intraday S/R from prices already being collected."""
+
+    @staticmethod
+    def update(state: MonitorState, price: float, now: float) -> List[dict]:
+        events = []
+        prices = [p["price"] for p in state.price_history]
+        n = len(prices)
+        if n < 2:
+            return events
+        spot = price
+        tol = spot * INTRADAY_ZONE_TOLERANCE_PCT / 100
+
+        # 1. Session high/low
+        current_high = max(prices)
+        current_low = min(prices)
+        if state.session_high is None or current_high > state.session_high:
+            state.session_high = current_high
+            for p in state.price_history:
+                if p["price"] == current_high:
+                    state.session_high_time = p.get("time_str", "")
+                    break
+            IntradayLevelTracker._upsert_level(state, current_high, "resistance", "session_high", now)
+        if state.session_low is None or current_low < state.session_low:
+            state.session_low = current_low
+            for p in state.price_history:
+                if p["price"] == current_low:
+                    state.session_low_time = p.get("time_str", "")
+                    break
+            IntradayLevelTracker._upsert_level(state, current_low, "support", "session_low", now)
+
+        if n < INTRADAY_MIN_PRICES_FOR_LEVELS:
+            return events
+
+        # 2. Rejection zones — prices touched 2+ times then moved away
+        zone_counts: Dict[float, list] = {}
+        for i, p in enumerate(prices):
+            placed = False
+            for rep in zone_counts:
+                if abs(p - rep) <= tol:
+                    zone_counts[rep].append(i)
+                    placed = True
+                    break
+            if not placed:
+                zone_counts[p] = [i]
+
+        for rep_price, indices in zone_counts.items():
+            if len(indices) < INTRADAY_MIN_TOUCHES:
+                continue
+            has_departure = False
+            for idx in indices:
+                subsequent = prices[idx + 1:idx + 4] if idx + 1 < n else []
+                for sp in subsequent:
+                    if abs(sp - rep_price) > tol * 2.5:
+                        has_departure = True
+                        break
+                if has_departure:
+                    break
+            if not has_departure:
+                continue
+
+            bounces_up = sum(1 for idx in indices if idx + 1 < n and prices[idx + 1] > rep_price + tol * 0.5)
+            bounces_down = sum(1 for idx in indices if idx + 1 < n and prices[idx + 1] < rep_price - tol * 0.5)
+
+            if bounces_up >= INTRADAY_MIN_TOUCHES:
+                if IntradayLevelTracker._upsert_level(state, rep_price, "support", "rejection_zone", now, touches=len(indices)):
+                    events.append({
+                        "msg": f"📍 NEW 5m SUPPORT at ${rep_price:.2f} ({len(indices)} touches, bounced up each time). "
+                               f"Watch for failed break below.",
+                        "type": "info", "priority": 3,
+                        "alert_key": f"id_sup_{rep_price:.2f}",
+                    })
+            if bounces_down >= INTRADAY_MIN_TOUCHES:
+                if IntradayLevelTracker._upsert_level(state, rep_price, "resistance", "rejection_zone", now, touches=len(indices)):
+                    events.append({
+                        "msg": f"📍 NEW 5m RESISTANCE at ${rep_price:.2f} ({len(indices)} touches, rejected down each time). "
+                               f"Watch for failed break above.",
+                        "type": "info", "priority": 3,
+                        "alert_key": f"id_res_{rep_price:.2f}",
+                    })
+
+        # 3. Sharp move origins (order block concept)
+        if n >= 3:
+            for i in range(max(n - 12, 1), n):
+                move = prices[i] - prices[i - 1]
+                move_pct = abs(move) / prices[i - 1] * 100
+                if move_pct >= INTRADAY_SHARP_MOVE_THRESHOLD:
+                    origin = prices[i - 1]
+                    if move > 0:
+                        if IntradayLevelTracker._upsert_level(state, origin, "support", "sharp_move_origin", now):
+                            events.append({
+                                "msg": f"📍 SHARP MOVE ORIGIN: Price rocketed up from ${origin:.2f}. "
+                                       f"Now intraday support — trapped shorts sit here.",
+                                "type": "info", "priority": 3,
+                                "alert_key": f"sharp_sup_{origin:.2f}",
+                            })
+                    else:
+                        if IntradayLevelTracker._upsert_level(state, origin, "resistance", "sharp_move_origin", now):
+                            events.append({
+                                "msg": f"📍 SHARP MOVE ORIGIN: Price dumped from ${origin:.2f}. "
+                                       f"Now intraday resistance — trapped longs sit here.",
+                                "type": "info", "priority": 3,
+                                "alert_key": f"sharp_res_{origin:.2f}",
+                            })
+
+        # 4. Consolidation edges
+        if n >= INTRADAY_CONSOLIDATION_CANDLES:
+            recent = prices[-INTRADAY_CONSOLIDATION_CANDLES:]
+            rng = max(recent) - min(recent)
+            rng_pct = rng / spot * 100
+            if rng_pct <= INTRADAY_CONSOLIDATION_RANGE_PCT and rng > 0:
+                cons_high = max(recent)
+                cons_low = min(recent)
+                IntradayLevelTracker._upsert_level(state, cons_high, "resistance", "consolidation_edge", now)
+                IntradayLevelTracker._upsert_level(state, cons_low, "support", "consolidation_edge", now)
+                events.append({
+                    "msg": f"📍 CONSOLIDATION: Flat between ${cons_low:.2f}–${cons_high:.2f} "
+                           f"for {INTRADAY_CONSOLIDATION_CANDLES * 5} min. Break with momentum is actionable.",
+                    "type": "info", "priority": 2,
+                    "alert_key": f"cons_{cons_low:.1f}_{cons_high:.1f}",
+                })
+
+        # Deactivate stale levels
+        for lvl in state.intraday_levels:
+            if not lvl.active:
+                continue
+            if abs(spot - lvl.price) > tol * 8 and (now - lvl.last_touched_ts) > 2700:
+                lvl.active = False
+
+        return events
+
+    @staticmethod
+    def _upsert_level(state, price, kind, source, now, touches=1):
+        tol = price * INTRADAY_ZONE_TOLERANCE_PCT / 100
+        for lvl in state.intraday_levels:
+            if abs(lvl.price - price) <= tol and lvl.kind == kind:
+                lvl.touches = max(lvl.touches, touches)
+                lvl.last_touched_ts = now
+                lvl.active = True
+                return False
+        state.intraday_levels.append(IntradayLevel(
+            price=round(price, 2), kind=kind, source=source,
+            touches=touches, first_seen_ts=now, last_touched_ts=now, active=True,
+        ))
+        return True
+
+    @staticmethod
+    def get_active_levels(state: MonitorState, price: float) -> dict:
+        active = [l for l in state.intraday_levels if l.active]
+        supports = sorted([l for l in active if l.kind == "support" and l.price < price], key=lambda l: price - l.price)
+        resistances = sorted([l for l in active if l.kind == "resistance" and l.price > price], key=lambda l: l.price - price)
+        return {
+            "support": supports[0] if supports else None,
+            "resistance": resistances[0] if resistances else None,
+            "all_support": supports[:3],
+            "all_resistance": resistances[:3],
+        }
+
+
+# ─────────────────────────────────────────────────────────
 # THESIS MONITOR ENGINE
 # ─────────────────────────────────────────────────────────
 
@@ -207,6 +380,13 @@ class ThesisMonitorEngine:
                     fm for fm in old_state.failed_moves
                     if (now - fm.break_time) < 1800
                 ]
+            # Preserve intraday levels from earlier in the session
+            if old_state and old_state.intraday_levels:
+                new_state.intraday_levels = [l for l in old_state.intraday_levels if l.active]
+                new_state.session_high = old_state.session_high
+                new_state.session_low = old_state.session_low
+                new_state.session_high_time = old_state.session_high_time
+                new_state.session_low_time = old_state.session_low_time
             self._states[ticker] = new_state
             log.info(f"Thesis stored: {ticker} | bias={thesis.bias} score={thesis.bias_score} "
                      f"gex={thesis.gex_sign} regime={thesis.regime}")
@@ -267,6 +447,10 @@ class ThesisMonitorEngine:
 
             # ── Momentum tracking ──
             events.extend(self._evaluate_momentum(state, price))
+
+            # ── v1.1: Update intraday levels from price history ──
+            intraday_events = IntradayLevelTracker.update(state, price, now)
+            events.extend(intraday_events)
 
             # ── Break attempt detection ──
             if prev_price is not None:
@@ -363,34 +547,67 @@ class ThesisMonitorEngine:
 
         # ── Momentum state ──
         momentum_map = {
-            "ACCELERATING_UP": ("🚀 Momentum ACCELERATING UP — moves getting bigger. Let winners run, trail stops.", "bullish"),
-            "ACCELERATING_DOWN": ("🚀 Momentum ACCELERATING DOWN — selling intensifying. Don't try to catch the knife.", "bearish"),
-            "LOSING_UPSIDE_MOMENTUM": ("⚠️ MOMENTUM WARNING: Price was going up but the last move was down. If long, tighten stops.", "warning"),
-            "LOSING_DOWNSIDE_MOMENTUM": ("⚠️ MOMENTUM WARNING: Price was going down but the last move was up. If short, tighten stops.", "warning"),
-            "STALLING": ("Price is STALLING — no clear direction. This is where traps happen. Wait for a decisive move.", "neutral"),
-            "DRIFTING_UP": ("Drifting higher — mild bullish pressure. Not enough for high conviction.", "info"),
-            "DRIFTING_DOWN": ("Drifting lower — mild bearish pressure. Not enough for high conviction.", "info"),
+            "ACCELERATING_UP": ("🚀 Momentum ACCELERATING UP — 5m candles getting bigger. Let winners run, trail stops.", "bullish"),
+            "ACCELERATING_DOWN": ("🚀 Momentum ACCELERATING DOWN — selling intensifying on 5m. Don't catch the knife.", "bearish"),
+            "LOSING_UPSIDE_MOMENTUM": ("⚠️ MOMENTUM WARNING: Last 5m candle went against the uptrend. If long, tighten stops.", "warning"),
+            "LOSING_DOWNSIDE_MOMENTUM": ("⚠️ MOMENTUM WARNING: Last 5m candle went against the downtrend. If short, tighten stops.", "warning"),
+            "STALLING": ("Price is STALLING on 5m — no clear direction. This is where traps happen. Wait for decisive candle.", "neutral"),
+            "DRIFTING_UP": ("Drifting higher on 5m — mild bullish pressure.", "info"),
+            "DRIFTING_DOWN": ("Drifting lower on 5m — mild bearish pressure.", "info"),
         }
         if state.momentum in momentum_map:
             text, mtype = momentum_map[state.momentum]
             guidance.append({"text": text, "type": mtype})
+
+        # ── v1.1: Intraday levels section ──
+        intraday = IntradayLevelTracker.get_active_levels(state, price)
+        id_sup = intraday["support"]
+        id_res = intraday["resistance"]
+
+        if id_sup or id_res:
+            guidance.append({"text": "— INTRADAY LEVELS (formed today from 5m price action) —", "type": "divider"})
+
+            if id_sup:
+                action = "Failed break below = squeeze long." if thesis.gex_sign == "positive" else "Break with momentum = valid short."
+                guidance.append({
+                    "text": f"Intraday support: ${id_sup.price:.2f} "
+                            f"({id_sup.source.replace('_', ' ')}, {id_sup.touches} touches). {action}",
+                    "type": "info",
+                })
+            if id_res:
+                action = "Failed break above = fade short." if thesis.gex_sign == "positive" else "Break with momentum = valid long."
+                guidance.append({
+                    "text": f"Intraday resistance: ${id_res.price:.2f} "
+                            f"({id_res.source.replace('_', ' ')}, {id_res.touches} touches). {action}",
+                    "type": "info",
+                })
+
+        # ── Session range ──
+        if state.session_high is not None and state.session_low is not None:
+            rng = state.session_high - state.session_low
+            guidance.append({
+                "text": f"Session range: ${state.session_low:.2f} ({state.session_low_time}) → "
+                        f"${state.session_high:.2f} ({state.session_high_time}) = ${rng:.2f} wide",
+                "type": "context",
+            })
 
         # ── Failed move setups (the key differentiator) ──
         if state.failed_moves:
             last_fail = state.failed_moves[-1]
             age_min = (time.monotonic() - last_fail.break_time) / 60
             if age_min < 30:  # still relevant
+                src_note = " (intraday level)" if "intraday" in last_fail.level_name else ""
                 if last_fail.direction == "DOWN":
                     guidance.append({
                         "text": f"🔥 ACTIVE SQUEEZE SETUP: Failed breakdown at ${last_fail.level:.2f} "
-                                f"({last_fail.level_name}) was reclaimed. Shorts are trapped. "
+                                f"({last_fail.level_name}{src_note}) was reclaimed. Shorts are trapped. "
                                 f"Bias flips LONG. Stop: below ${last_fail.level:.2f}.",
                         "type": "critical",
                     })
                 else:
                     guidance.append({
                         "text": f"🔥 ACTIVE FADE SETUP: Failed breakout at ${last_fail.level:.2f} "
-                                f"({last_fail.level_name}) was lost. Longs are trapped. "
+                                f"({last_fail.level_name}{src_note}) was lost. Longs are trapped. "
                                 f"Bias flips SHORT. Stop: above ${last_fail.level:.2f}.",
                         "type": "critical",
                     })
@@ -404,23 +621,28 @@ class ThesisMonitorEngine:
         # ── What to watch next ──
         guidance.append({"text": "— WHAT TO WATCH NEXT —", "type": "divider"})
 
-        if lvl.local_resistance is not None and lvl.local_support is not None:
-            dist_res = lvl.local_resistance - price
-            dist_sup = price - lvl.local_support
+        # Use intraday levels if available, fall back to daily
+        nearest_sup = id_sup.price if id_sup else lvl.local_support
+        nearest_res = id_res.price if id_res else lvl.local_resistance
+        sup_label = "intraday support" if id_sup else "daily support"
+        res_label = "intraday resistance" if id_res else "daily resistance"
+
+        if nearest_res is not None and nearest_sup is not None:
+            dist_res = nearest_res - price
+            dist_sup = price - nearest_sup
 
             if dist_res < dist_sup:
                 guidance.append({
-                    "text": f"Nearest test: Resistance at ${lvl.local_resistance:.2f} ({dist_res:.2f} away). "
-                            f"If it rejects → short toward ${lvl.local_support:.2f}. "
-                            f"If it breaks AND holds → long toward "
-                            f"${lvl.range_break_up or lvl.call_wall or lvl.em_high or lvl.local_resistance + 2:.2f}.",
+                    "text": f"Nearest test: {res_label} at ${nearest_res:.2f} ({dist_res:.2f} away). "
+                            f"If it rejects → short toward ${nearest_sup:.2f}. "
+                            f"If it breaks AND holds on 5m → long.",
                     "type": "info",
                 })
             else:
                 guidance.append({
-                    "text": f"Nearest test: Support at ${lvl.local_support:.2f} ({dist_sup:.2f} away). "
-                            f"If it bounces → long toward ${lvl.local_resistance:.2f}. "
-                            f"If it breaks AND fails → squeeze long (the best trade).",
+                    "text": f"Nearest test: {sup_label} at ${nearest_sup:.2f} ({dist_sup:.2f} away). "
+                            f"If it bounces → long toward ${nearest_res:.2f}. "
+                            f"If it breaks AND fails on 5m → squeeze long (the best trade).",
                     "type": "info",
                 })
 
@@ -492,16 +714,16 @@ class ThesisMonitorEngine:
 
     def _detect_breaks(self, thesis: ThesisContext, state: MonitorState,
                        price: float, prev_price: float, now: float) -> List[dict]:
-        """Detect when price crosses a key level."""
+        """Detect when price crosses a key level (daily OR intraday)."""
         events = []
         lvl = thesis.levels
 
         # Define level-pairs to watch: (level_value, level_name, is_support)
         watch_levels = []
         if lvl.local_support is not None:
-            watch_levels.append((lvl.local_support, "local_support", True))
+            watch_levels.append((lvl.local_support, "daily_support", True))
         if lvl.local_resistance is not None:
-            watch_levels.append((lvl.local_resistance, "local_resistance", False))
+            watch_levels.append((lvl.local_resistance, "daily_resistance", False))
         if lvl.range_break_down is not None and lvl.range_break_down != lvl.local_support:
             watch_levels.append((lvl.range_break_down, "range_break_down", True))
         if lvl.range_break_up is not None and lvl.range_break_up != lvl.local_resistance:
@@ -511,54 +733,75 @@ class ThesisMonitorEngine:
         if lvl.call_wall is not None and lvl.call_wall != lvl.local_resistance:
             watch_levels.append((lvl.call_wall, "call_wall", False))
 
+        # v1.1: Add active intraday levels (skip if too close to a daily level)
+        tol = price * INTRADAY_ZONE_TOLERANCE_PCT / 100
+        for il in state.intraday_levels:
+            if not il.active:
+                continue
+            too_close = any(abs(il.price - dlvl) <= tol for (dlvl, _, _) in watch_levels)
+            if too_close:
+                continue
+            if il.kind == "support":
+                watch_levels.append((il.price, f"intraday_support ({il.source.replace('_', ' ')})", True))
+            else:
+                watch_levels.append((il.price, f"intraday_resistance ({il.source.replace('_', ' ')})", False))
+
         for level, name, is_support in watch_levels:
             if is_support:
-                # Broke below support
                 if prev_price >= level and price < level:
-                    ba = BreakAttempt(
-                        level=level, level_name=name, direction="DOWN",
-                        break_price=price, break_time=now,
-                    )
+                    ba = BreakAttempt(level=level, level_name=name, direction="DOWN",
+                                     break_price=price, break_time=now)
                     state.break_attempts.append(ba)
                     state.status = "BREAK_IN_PROGRESS"
-
                     is_range = "range" in name
+                    is_intraday = "intraday" in name
                     if is_range:
                         events.append({
                             "msg": f"🚨 RANGE BREAK DOWN: Below ${level:.2f} ({name}). "
                                    f"If this fails to continue → SQUEEZE potential is high (GEX={thesis.gex_sign}).",
                             "type": "critical", "priority": 5,
-                            "alert_key": f"break_down_{name}",
+                            "alert_key": f"break_down_{name}_{level:.2f}",
+                        })
+                    elif is_intraday:
+                        events.append({
+                            "msg": f"🔻 INTRADAY BREAK: Price broke below ${level:.2f} ({name}). "
+                                   f"Watching 5m candles for follow-through or failure.",
+                            "type": "alert", "priority": 4,
+                            "alert_key": f"break_down_id_{level:.2f}",
                         })
                     else:
                         events.append({
                             "msg": f"🔻 BREAK ATTEMPT: Price broke below {name} ${level:.2f}. "
-                                   f"Watching for follow-through or failure.",
+                                   f"Watching 5m candles for follow-through or failure.",
                             "type": "alert", "priority": 4,
                             "alert_key": f"break_down_{name}",
                         })
             else:
-                # Broke above resistance
                 if prev_price <= level and price > level:
-                    ba = BreakAttempt(
-                        level=level, level_name=name, direction="UP",
-                        break_price=price, break_time=now,
-                    )
+                    ba = BreakAttempt(level=level, level_name=name, direction="UP",
+                                     break_price=price, break_time=now)
                     state.break_attempts.append(ba)
                     state.status = "BREAK_IN_PROGRESS"
-
                     is_range = "range" in name
+                    is_intraday = "intraday" in name
                     if is_range:
                         events.append({
                             "msg": f"🚨 RANGE BREAK UP: Above ${level:.2f} ({name}). "
                                    f"Watching for continuation or trap.",
                             "type": "critical", "priority": 5,
-                            "alert_key": f"break_up_{name}",
+                            "alert_key": f"break_up_{name}_{level:.2f}",
+                        })
+                    elif is_intraday:
+                        events.append({
+                            "msg": f"🔺 INTRADAY BREAK: Price broke above ${level:.2f} ({name}). "
+                                   f"Watching 5m candles for follow-through or failure.",
+                            "type": "alert", "priority": 4,
+                            "alert_key": f"break_up_id_{level:.2f}",
                         })
                     else:
                         events.append({
                             "msg": f"🔺 BREAK ATTEMPT: Price broke above {name} ${level:.2f}. "
-                                   f"Watching for follow-through or failure.",
+                                   f"Watching 5m candles for follow-through or failure.",
                             "type": "alert", "priority": 4,
                             "alert_key": f"break_up_{name}",
                         })
@@ -593,13 +836,15 @@ class ThesisMonitorEngine:
                 if thesis.gex_sign == "positive":
                     gex_note = " GEX+ amplifies mean reversion — squeeze probability is HIGH."
 
+                source_note = " (intraday level)" if "intraday" in ba.level_name else ""
+
                 events.append({
-                    "msg": f"🔥 FAILED BREAKDOWN at ${ba.level:.2f} ({ba.level_name}) — "
+                    "msg": f"🔥 FAILED BREAKDOWN at ${ba.level:.2f} ({ba.level_name}{source_note}) — "
                            f"price reclaimed to ${price:.2f}. "
                            f"Shorts are trapped below. SQUEEZE SETUP LONG. "
                            f"Stop: below ${ba.level:.2f}.{gex_note}",
                     "type": "critical", "priority": 5,
-                    "alert_key": f"failed_break_{ba.level_name}",
+                    "alert_key": f"failed_break_{ba.level:.2f}",
                 })
 
             elif ba.direction == "UP" and price < ba.level - reclaim_buffer:
@@ -612,8 +857,10 @@ class ThesisMonitorEngine:
                 if thesis.gex_sign == "positive":
                     gex_note = " GEX+ amplifies mean reversion — fade probability is HIGH."
 
+                source_note = " (intraday level)" if "intraday" in ba.level_name else ""
+
                 events.append({
-                    "msg": f"🔥 FAILED BREAKOUT at ${ba.level:.2f} ({ba.level_name}) — "
+                    "msg": f"🔥 FAILED BREAKOUT at ${ba.level:.2f} ({ba.level_name}{source_note}) — "
                            f"price fell back to ${price:.2f}. "
                            f"Longs are trapped above. FADE SETUP SHORT. "
                            f"Stop: above ${ba.level:.2f}.{gex_note}",
@@ -682,6 +929,20 @@ class ThesisMonitorEngine:
         if state:
             lines.append(f"Momentum: {state.momentum}")
             lines.append(f"Checks: {state.check_count}")
+
+            if state.session_high is not None and state.session_low is not None:
+                lines.append(f"Session: ${state.session_low:.2f} – ${state.session_high:.2f}")
+
+            active_levels = [l for l in state.intraday_levels if l.active]
+            if active_levels:
+                sup_levels = [l for l in active_levels if l.kind == "support"]
+                res_levels = [l for l in active_levels if l.kind == "resistance"]
+                lines.append(f"Intraday levels: {len(sup_levels)} support, {len(res_levels)} resistance")
+                for l in sorted(sup_levels, key=lambda x: x.price, reverse=True)[:2]:
+                    lines.append(f"  🟢 ${l.price:.2f} support ({l.source}, {l.touches}x)")
+                for l in sorted(res_levels, key=lambda x: x.price)[:2]:
+                    lines.append(f"  🔴 ${l.price:.2f} resistance ({l.source}, {l.touches}x)")
+
             if state.break_attempts:
                 active = [ba for ba in state.break_attempts
                           if not ba.detected_as_failed and (time.monotonic() - ba.break_time) < MONITOR_MAX_BREAK_AGE_SEC]
@@ -692,7 +953,7 @@ class ThesisMonitorEngine:
 
         tp = _get_time_phase_ct()
         lines.append(f"Phase: {tp['label']}")
-        lines.append(f"Polling: every {MONITOR_POLL_INTERVAL_SEC}s")
+        lines.append(f"Polling: every {MONITOR_POLL_INTERVAL_SEC}s (5m candles, intraday levels active)")
         return "\n".join(lines)
 
 
@@ -796,6 +1057,14 @@ class ThesisMonitorDaemon:
         # Add momentum context if relevant
         if state and state.momentum not in ("NEUTRAL", "STALLING"):
             lines.append(f"Momentum: {state.momentum.replace('_', ' ')}")
+
+        # Add nearest intraday levels for context
+        if state:
+            intraday = IntradayLevelTracker.get_active_levels(state, price)
+            if intraday["support"]:
+                lines.append(f"Nearest intraday support: ${intraday['support'].price:.2f}")
+            if intraday["resistance"]:
+                lines.append(f"Nearest intraday resistance: ${intraday['resistance'].price:.2f}")
 
         lines.append(f"")
         lines.append(f"Phase: {tp['label']} | Thesis: {thesis.bias} ({thesis.bias_score:+d}/14)")
