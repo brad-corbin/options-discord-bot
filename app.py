@@ -2789,10 +2789,16 @@ def _format_unified_regime_line(regime) -> str:
     return f"{label}{suffix} — {desc}" if desc else f"{label}{suffix}"
 
 
+
 def _derive_structure_levels_from_chain(data: dict, spot: float, base_walls: dict | None = None, eng: dict | None = None) -> dict:
     """
     Backfill structural levels from raw chain data so logging/output always has the same
     canonical fields even when the upstream snapshot omits some of them.
+
+    v5 refinement:
+    - prefer *local* walls nearest spot rather than global far-away OI maxima
+    - keep top3 local ladders for context
+    - narrow pin zone to actionable nearby support/resistance
     """
     walls = dict(base_walls or {})
     if not isinstance(data, dict):
@@ -2819,39 +2825,118 @@ def _derive_structure_levels_from_chain(data: dict, spot: float, base_walls: dic
             strike = as_float(strikes[i], None)
         except Exception:
             strike = None
-        if strike is None:
+        if strike is None or strike <= 0:
             continue
         side = _normalize_option_side(sides[i])
-        oi = as_int(ois[i], 0)
-        gamma = as_float(gammas[i], 0.0)
+        oi = max(as_int(ois[i], 0), 0)
+        gamma = abs(as_float(gammas[i], 0.0) or 0.0)
         row = by_strike.setdefault(strike, {"call_oi": 0, "put_oi": 0, "gamma_abs": 0.0})
         if side == "call":
             row["call_oi"] += oi
         elif side == "put":
             row["put_oi"] += oi
         if gamma and oi:
-            row["gamma_abs"] += abs(gamma) * max(oi, 0)
+            row["gamma_abs"] += gamma * oi
         unique_strikes.add(strike)
 
     if not by_strike:
         return walls
 
-    call_candidates = sorted([k for k, v in by_strike.items() if k > spot and v.get("call_oi", 0) > 0], key=lambda k: by_strike[k]["call_oi"], reverse=True)
-    put_candidates = sorted([k for k, v in by_strike.items() if k < spot and v.get("put_oi", 0) > 0], key=lambda k: by_strike[k]["put_oi"], reverse=True)
+    sorted_strikes = sorted(unique_strikes)
+    strike_steps = [b - a for a, b in zip(sorted_strikes, sorted_strikes[1:]) if b > a]
+    strike_step = min(strike_steps) if strike_steps else max(round(max(spot, 1) * 0.0025, 2), 0.5)
 
-    if call_candidates:
-        cw = walls.get("call_wall") or call_candidates[0]
-        walls["call_wall"] = cw
-        walls["call_wall_oi"] = by_strike.get(cw, {}).get("call_oi", by_strike[call_candidates[0]].get("call_oi", 0))
-        walls.setdefault("call_top3", sorted(call_candidates[:3]))
+    def _normalized_oi(side_key: str) -> float:
+        vals = [v.get(side_key, 0) for v in by_strike.values() if v.get(side_key, 0) > 0]
+        return max(vals) if vals else 1.0
 
-    if put_candidates:
-        pw = walls.get("put_wall") or put_candidates[0]
-        walls["put_wall"] = pw
-        walls["put_wall_oi"] = by_strike.get(pw, {}).get("put_oi", by_strike[put_candidates[0]].get("put_oi", 0))
-        walls.setdefault("put_top3", sorted(put_candidates[:3], reverse=True))
+    max_call_oi = _normalized_oi("call_oi")
+    max_put_oi = _normalized_oi("put_oi")
+    max_gamma_abs = max([v.get("gamma_abs", 0.0) for v in by_strike.values()] + [1.0])
 
-    if not walls.get("gamma_wall"):
+    # Search a local band around spot first. Fall back broader if needed.
+    local_band_abs = max(spot * 0.06, strike_step * 10)   # ~6% or 10 strikes
+    wider_band_abs = max(spot * 0.12, strike_step * 18)  # fallback if sparse
+
+    def _candidate_rows(side_key: str, above: bool, band_abs: float):
+        out = []
+        for strike in sorted_strikes:
+            if above and strike <= spot:
+                continue
+            if not above and strike >= spot:
+                continue
+            dist = abs(strike - spot)
+            if dist > band_abs:
+                continue
+            oi_val = by_strike[strike].get(side_key, 0)
+            if oi_val <= 0:
+                continue
+            out.append((strike, oi_val, dist))
+        return out
+
+    def _rank_wall_candidates(side_key: str, above: bool, band_abs: float, oi_norm: float):
+        rows = _candidate_rows(side_key, above, band_abs)
+        ranked = []
+        for strike, oi_val, dist in rows:
+            # proximity matters more than raw OI for actionable local walls.
+            proximity = 1.0 / (1.0 + (dist / max(band_abs, strike_step)))
+            oi_score = (oi_val / max(oi_norm, 1.0))
+            score = 0.62 * proximity + 0.38 * oi_score
+            ranked.append((score, strike, oi_val, dist))
+        ranked.sort(key=lambda x: (-x[0], x[3]))
+        return ranked
+
+    def _pick_local_wall(side_key: str, above: bool, oi_norm: float):
+        ranked = _rank_wall_candidates(side_key, above, local_band_abs, oi_norm)
+        if not ranked:
+            ranked = _rank_wall_candidates(side_key, above, wider_band_abs, oi_norm)
+        if not ranked:
+            return None, []
+        chosen = ranked[0][1]
+        top3 = [r[1] for r in ranked[:3]]
+        return chosen, top3
+
+    # Local actionable walls
+    chosen_call, call_top3 = _pick_local_wall("call_oi", True, max_call_oi)
+    chosen_put, put_top3 = _pick_local_wall("put_oi", False, max_put_oi)
+
+    # Preserve upstream walls only if they are near spot / actionable.
+    existing_call = as_float(walls.get("call_wall"), None)
+    existing_put = as_float(walls.get("put_wall"), None)
+    if existing_call is not None and existing_call > spot and abs(existing_call - spot) <= wider_band_abs:
+        chosen_call = existing_call
+    if existing_put is not None and existing_put < spot and abs(existing_put - spot) <= wider_band_abs:
+        chosen_put = existing_put
+
+    if chosen_call is not None:
+        walls["call_wall"] = chosen_call
+        walls["call_wall_oi"] = by_strike.get(chosen_call, {}).get("call_oi", 0)
+        walls["call_top3"] = sorted(set(call_top3 or [chosen_call]))
+    if chosen_put is not None:
+        walls["put_wall"] = chosen_put
+        walls["put_wall_oi"] = by_strike.get(chosen_put, {}).get("put_oi", 0)
+        walls["put_top3"] = sorted(set(put_top3 or [chosen_put]), reverse=True)
+
+    # Gamma wall: strongest local gamma node, not the broadest distant extreme.
+    gamma_ranked = []
+    gamma_band = max(spot * 0.05, strike_step * 8)
+    for strike in sorted_strikes:
+        gamma_abs = by_strike[strike].get("gamma_abs", 0.0)
+        if gamma_abs <= 0:
+            continue
+        dist = abs(strike - spot)
+        if dist > max(gamma_band, wider_band_abs):
+            continue
+        proximity = 1.0 / (1.0 + (dist / max(gamma_band, strike_step)))
+        gamma_score = (gamma_abs / max_gamma_abs)
+        score = 0.55 * proximity + 0.45 * gamma_score
+        gamma_ranked.append((score, strike, gamma_abs, dist))
+    gamma_ranked.sort(key=lambda x: (-x[0], x[3]))
+    if gamma_ranked:
+        gw = gamma_ranked[0][1]
+        walls["gamma_wall"] = gw
+        walls["gamma_wall_gex"] = gamma_ranked[0][2]
+    elif not walls.get("gamma_wall"):
         gamma_candidates = [k for k, v in by_strike.items() if v.get("gamma_abs", 0) > 0]
         if gamma_candidates:
             gw = max(gamma_candidates, key=lambda k: by_strike[k]["gamma_abs"])
@@ -2861,6 +2946,7 @@ def _derive_structure_levels_from_chain(data: dict, spot: float, base_walls: dic
     if not walls.get("gamma_flip") and eng and eng.get("flip_price") is not None:
         walls["gamma_flip"] = eng.get("flip_price")
 
+    # Max pain remains global by definition.
     if not walls.get("max_pain"):
         all_strikes = sorted(unique_strikes)
         best_strike = None
@@ -2880,10 +2966,16 @@ def _derive_structure_levels_from_chain(data: dict, spot: float, base_walls: dic
         if best_strike is not None:
             walls["max_pain"] = best_strike
 
-    if walls.get("put_wall") is not None:
-        walls["pin_zone_low"] = walls.get("put_wall")
-    if walls.get("call_wall") is not None:
-        walls["pin_zone_high"] = walls.get("call_wall")
+    # Actionable pin/range zone should be local, not broad full-chain extremes.
+    if chosen_put is not None:
+        walls["pin_zone_low"] = chosen_put
+    if chosen_call is not None:
+        walls["pin_zone_high"] = chosen_call
+
+    # Optional max pain proximity info for downstream decisions.
+    mp = as_float(walls.get("max_pain"), None)
+    if mp is not None and spot:
+        walls["max_pain_dist_pct"] = abs(mp - spot) / max(spot, 0.01) * 100.0
 
     return walls
 
@@ -3615,7 +3707,13 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
             if gamma_wall is not None:
                 lines.append(f"🎯 Gamma Wall: {_fmt_money(gamma_wall)}")
             if pin_low is not None and pin_high is not None:
+                pin_width = abs((pin_high or 0) - (pin_low or 0))
                 lines.append(f"📌 Pin Zone: {_fmt_money(pin_low)} – {_fmt_money(pin_high)}")
+                if (em.get("em_1sd") or 0) > 0 and pin_width <= 2.2 * (em.get("em_1sd") or 0):
+                    lines.append("🤝 Neutral read: range / condor structure favored while price stays inside the pin zone.")
+            if max_pain is not None and (em.get("em_1sd") or 0) > 0:
+                if abs(max_pain - spot) <= 0.35 * (em.get("em_1sd") or 0):
+                    lines.append(f"🧲 Magnet: spot is trading close to Max Pain {_fmt_money(max_pain)}.")
             lines += [
                 f"🚦 Trigger Up: above {_fmt_money(accel_up)}",
                 f"🚦 Trigger Down: below {_fmt_money(accel_dn)}",
@@ -3635,14 +3733,34 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
             no_trade(f"Data quality LOW ({conf_score:.0%}) — {dg_str}", "⚠️")
             return
 
+        local_struct = _derive_structure_levels_from_chain({}, spot, walls or {}, eng or {})
+        local_call = local_struct.get("call_wall")
+        local_put = local_struct.get("put_wall")
+        local_max_pain = local_struct.get("max_pain") or (eng or {}).get("max_pain")
+        em_1sd_now = em.get("em_1sd") or 0.0
+        local_pin = False
+        near_max_pain = False
+        if local_call is not None and local_put is not None and local_put < spot < local_call:
+            pin_width = abs(local_call - local_put)
+            if em_1sd_now > 0:
+                local_pin = pin_width <= (2.2 * em_1sd_now)
+        if local_max_pain is not None and em_1sd_now > 0:
+            near_max_pain = abs(local_max_pain - spot) <= (0.35 * em_1sd_now)
+
         # G1 — No directional edge
         if direction == "NEUTRAL":
-            no_trade(f"Bias NEUTRAL (score {score:+d}/14). No directional edge.", "⚪")
+            if local_pin or near_max_pain:
+                no_trade(f"Bias NEUTRAL (score {score:+d}/14). Pin / range risk favored.", "⚪")
+            else:
+                no_trade(f"Bias NEUTRAL (score {score:+d}/14). No directional edge.", "⚪")
             return
 
         # G2 — Edge too thin
         if direction in ("SLIGHT BULLISH", "SLIGHT BEARISH") and abs(score) < 2:
-            no_trade(f"Lean {direction} but score only {score:+d}/14 — edge too thin.", "🟡")
+            if local_pin or near_max_pain:
+                no_trade(f"Lean {direction} but score only {score:+d}/14 — pin risk too high.", "🟡")
+            else:
+                no_trade(f"Lean {direction} but score only {score:+d}/14 — edge too thin.", "🟡")
             return
 
         # G3 — Flip mismatch
