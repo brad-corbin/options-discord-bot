@@ -115,7 +115,7 @@ def get_iv_rank_from_candles(ticker: str, iv_current: float) -> Tuple[Optional[f
             if not returns:
                 continue
             mean_r = sum(returns) / len(returns)
-            variance = sum((r - mean_r) ** 2 for r in returns) / len(returns)
+            variance = sum((r - mean_r) ** 2 for r in returns) / (len(returns) - 1)  # Bessel correction
             rv = math.sqrt(variance * 252)
             rv_series.append(rv)
 
@@ -224,6 +224,50 @@ def get_earnings_warning(ticker: str, within_days: int = 5) -> Tuple[bool, Optio
 # ─────────────────────────────────────────────────────────
 # COMBINED ENRICHMENT  (single call from scan_ticker)
 # ─────────────────────────────────────────────────────────
+
+def get_iv_rank_from_closes(iv_current: float, closes: list) -> tuple:
+    """
+    Compute IV rank and percentile directly from pre-fetched closes.
+    Same math as get_iv_rank_from_candles but skips the HTTP fetch.
+    Returns (iv_rank, iv_percentile, hv20) or (None, None, None) on failure.
+    """
+    try:
+        import math as _math
+        if not closes or len(closes) < 32 or not iv_current or iv_current <= 0:
+            return None, None, None
+
+        rv_series = []
+        for i in range(30, len(closes)):
+            window = closes[i-30:i]
+            if len(window) < 2:
+                continue
+            returns = [_math.log(window[j] / window[j-1])
+                      for j in range(1, len(window))
+                      if window[j-1] > 0]
+            if not returns:
+                continue
+            mean_r = sum(returns) / len(returns)
+            variance = sum((r - mean_r) ** 2 for r in returns) / (len(returns) - 1)  # Bessel
+            rv = _math.sqrt(variance * 252)
+            rv_series.append(rv)
+
+        if len(rv_series) < 10:
+            return None, None, None
+
+        rv_min = min(rv_series)
+        rv_max = max(rv_series)
+        rng    = rv_max - rv_min
+        if rng <= 0:
+            return None, None, None
+
+        iv_rank = round(min(max((iv_current - rv_min) / rng * 100, 0), 100), 1)
+        below   = sum(1 for v in rv_series if v < iv_current)
+        iv_pct  = round(below / len(rv_series) * 100, 1)
+        hv20    = rv_series[-1] if rv_series else None
+        return iv_rank, iv_pct, hv20
+    except Exception:
+        return None, None, None
+
 
 def enrich_ticker(ticker: str) -> dict:
     """
