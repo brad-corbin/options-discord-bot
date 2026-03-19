@@ -129,6 +129,7 @@ def handle_command(
     post_em_card_fn=None,
     post_monitor_card_fn=None,
     post_checkswing_card_fn=None,
+    thesis_engine=None,
 ) -> None:
     if not is_authorized(user_id):
         send_reply(chat_id, "⛔ You are not authorized to use this bot.")
@@ -657,6 +658,76 @@ def handle_command(
             reply(f"⚠️ Cache stats error: {e}")
         return
 
+    # ─────────────────────────────────────
+    # /monitor — Thesis Monitor
+    # ─────────────────────────────────────
+    if cmd in ("/monitor", "/monitor@omegabot"):
+        if not thesis_engine:
+            reply("⚠️ Thesis monitor not initialized.")
+            return
+
+        if args and args[0].lower() == "stop":
+            from thesis_monitor import get_daemon
+            daemon = get_daemon()
+            if daemon:
+                daemon.stop()
+                reply("⏹️ Thesis monitor stopped. Alerts paused until /monitor start.")
+            else:
+                reply("⚠️ No monitor daemon running.")
+            return
+
+        if args and args[0].lower() == "start":
+            from thesis_monitor import get_daemon
+            daemon = get_daemon()
+            if daemon:
+                daemon.start()
+                reply("▶️ Thesis monitor started. Polling every 5 min during market hours.")
+            else:
+                reply("⚠️ Monitor daemon not initialized. Restart bot.")
+            return
+
+        if args and args[0].lower() == "guidance":
+            ticker = args[1].upper() if len(args) > 1 else "SPY"
+            try:
+                spot = get_spot_fn(ticker) if get_spot_fn else 0
+                if not spot or spot <= 0:
+                    reply(f"⚠️ Could not fetch spot price for {ticker}.")
+                    return
+                guidance = thesis_engine.build_guidance(ticker, spot)
+                # Also run evaluate to check for events
+                thesis_engine.evaluate(ticker, spot)
+                out_lines = [f"📡 {ticker} — THESIS GUIDANCE @ ${spot:.2f}", ""]
+                for item in guidance:
+                    if item["type"] == "divider":
+                        out_lines.append(f"\n{item['text']}")
+                    elif item["type"] == "critical":
+                        out_lines.append(f"🔥 {item['text']}")
+                    elif item["type"] == "warning":
+                        out_lines.append(f"⚠️ {item['text']}")
+                    elif item["type"] in ("bullish",):
+                        out_lines.append(f"🟢 {item['text']}")
+                    elif item["type"] in ("bearish",):
+                        out_lines.append(f"🔴 {item['text']}")
+                    elif item["type"] == "time":
+                        out_lines.append(f"🕐 {item['text']}")
+                    elif item["type"] == "context":
+                        out_lines.append(f"📋 {item['text']}")
+                    else:
+                        out_lines.append(f"  {item['text']}")
+                out_lines.append("")
+                out_lines.append("— Not financial advice —")
+                reply("\n".join(out_lines))
+            except Exception as e:
+                log.error(f"Monitor guidance error: {e}", exc_info=True)
+                reply(f"⚠️ Guidance error: {e}")
+            return
+
+        # Default: show status for all monitored tickers
+        tickers_to_show = [args[0].upper()] if args else ["SPY", "QQQ"]
+        for t in tickers_to_show:
+            reply(thesis_engine.format_status(t))
+        return
+
     if cmd in ("/help", "/help@omegabot", "/start"):
         reply(
             "🤖 Omega 3000 Commands:\n\n"
@@ -674,6 +745,15 @@ def handle_command(
             "/em afternoon — next day full-session EM\n"
             "/em SPY morning — specific ticker + session\n"
             "  Auto-fires: 8:45 AM CT (today) & 2:45 PM CT (next day)\n"
+            "\n── Thesis Monitor (NEW) ──\n"
+            "/monitor — show thesis status for SPY & QQQ\n"
+            "/monitor SPY — show status for specific ticker\n"
+            "/monitor guidance — plain English action guidance\n"
+            "/monitor guidance SPY — guidance for specific ticker\n"
+            "/monitor start — resume monitoring\n"
+            "/monitor stop — pause monitoring\n"
+            "  Auto-starts when /em fires. Polls every 5 min.\n"
+            "  Detects: failed breakdowns, momentum decay, trapped traders.\n"
             "\n── Position Monitor ──\n"
             "/monitorlong GLD — monitoring / wheel outlook with ~21-day thesis\n"
             "/monitorshort GLD — near-term management view for roll / close-early decisions\n"
