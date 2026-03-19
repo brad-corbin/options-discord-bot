@@ -3531,6 +3531,114 @@ def _estimate_liquidity(ticker: str, spot: float) -> tuple:
     return adv, spread
 
 
+
+def _get_ct_session_progress() -> float:
+    """Return regular-session progress in America/Chicago as 0.0..1.0."""
+    try:
+        import pytz
+        ct = pytz.timezone("America/Chicago")
+        now_ct = datetime.now(ct)
+        mkt_open = now_ct.replace(hour=8, minute=30, second=0, microsecond=0)
+        mkt_close = now_ct.replace(hour=15, minute=0, second=0, microsecond=0)
+        session_secs = (mkt_close - mkt_open).total_seconds()
+        elapsed = max(0.0, (now_ct - mkt_open).total_seconds())
+        return min(1.0, elapsed / session_secs) if session_secs > 0 else 0.5
+    except Exception:
+        return 0.5
+
+
+
+def _extract_v4_flow_snapshot(v4_result: dict, spot: float = 0.0) -> dict:
+    """Normalize a full v4 snapshot into the shared v4_flow shape."""
+    if not isinstance(v4_result, dict):
+        return {}
+
+    snap = v4_result.get("snapshot") or {}
+    confidence = snap.get("confidence") or v4_result.get("confidence") or {}
+    dealer = snap.get("dealer_flows") or v4_result.get("dealer_flows") or {}
+    regime = snap.get("regime") or v4_result.get("regime") or {}
+    adj = snap.get("adjusted_expectation") or v4_result.get("adjusted_expectation") or {}
+
+    out = {
+        "confidence_label": confidence.get("label", ""),
+        "confidence_score": confidence.get("composite", 0),
+        "gex": dealer.get("gex", 0),
+        "dex": dealer.get("dex", 0),
+        "vanna": dealer.get("vanna", 0),
+        "charm": dealer.get("charm", 0),
+        "bias": adj.get("bias", "NEUTRAL"),
+        "bias_score": adj.get("bias_score", 0),
+        "gamma_flip": dealer.get("gamma_flip") or dealer.get("flip_price"),
+        "spot": spot or v4_result.get("spot") or snap.get("spot") or 0,
+        "composite_regime": regime.get("regime", "") or regime.get("label", ""),
+        "downgrades": snap.get("downgrades") or v4_result.get("downgrades") or [],
+        "vol_regime_label": (snap.get("volatility_regime") or v4_result.get("vol_regime") or {}).get("label", ""),
+    }
+    return out
+
+
+
+def _compute_cagf_snapshot(
+    ticker: str,
+    spot: float,
+    iv: float,
+    eng: dict,
+    vix: dict | float | None = None,
+    v4_result: dict = None,
+    candle_closes: list = None,
+    adv: float = None,
+) -> dict:
+    """Reusable institutional-flow snapshot for EM/monitor/shared dealer regime logic."""
+    ticker = (ticker or "").upper().strip()
+    eng = eng or {}
+    if not ticker or not eng or ticker not in ("SPY", "QQQ", "SPX"):
+        return None
+    if iv is None or spot is None or spot <= 0:
+        return None
+
+    try:
+        vol_regime = {}
+        if isinstance(v4_result, dict):
+            vol_regime = v4_result.get("vol_regime") or v4_result.get("volatility_regime") or {}
+        rv = as_float(vol_regime.get("realized_vol_20d"), 0.0)
+        if rv <= 0:
+            closes = candle_closes or get_daily_candles(ticker, days=60)
+            canonical_vol = get_canonical_vol_regime(ticker, candle_closes=closes)
+            rv_pct = as_float((canonical_vol or {}).get("rv20"), 0.0)
+            rv = rv_pct / 100.0 if rv_pct > 0 else 0.0
+        else:
+            closes = candle_closes or get_daily_candles(ticker, days=60)
+
+        if adv is None:
+            adv, _ = _estimate_liquidity(ticker, spot)
+
+        if isinstance(vix, dict):
+            vix_val = as_float(vix.get("vix"), 20.0)
+        else:
+            vix_val = as_float(vix, 20.0)
+
+        return compute_cagf(
+            dealer_flows={
+                "gex": eng.get("gex", 0),
+                "dex": eng.get("dex", 0),
+                "vanna": eng.get("vanna", 0),
+                "charm": eng.get("charm", 0),
+                "gamma_flip": eng.get("flip_price") or eng.get("gamma_flip"),
+            },
+            iv=iv,
+            rv=rv,
+            spot=spot,
+            vix=vix_val,
+            session_progress=_get_ct_session_progress(),
+            adv=adv,
+            candle_closes=closes,
+            ticker=ticker,
+        )
+    except Exception as e:
+        log.warning(f"CAGF compute failed for {ticker}: {e}")
+        return None
+
+
 # v4.2: Per-cycle OHLC warning dedup.
 # api_cache.get_ohlc_bars logs a WARNING on every timeout, which produced
 # 32 identical lines for MA in today's run. We gate to one warning per
@@ -4888,10 +4996,20 @@ def _post_monitor_card(ticker: str, mode: str):
         iv, spot, expiration = result_tuple[0], result_tuple[1], result_tuple[2]
         eng, walls, skew, pcr, vix = result_tuple[3], result_tuple[4], result_tuple[5], result_tuple[6], result_tuple[7]
         v4_result = result_tuple[8] if len(result_tuple) > 8 else {}
+        v4_flow = _extract_v4_flow_snapshot(v4_result, spot)
 
         if not liquid:
             eng = {}
-        unified_regime = resolve_unified_regime(eng or {}, None, spot) if spot else {}
+        cagf = _compute_cagf_snapshot(
+            ticker=ticker,
+            spot=spot,
+            iv=iv,
+            eng=eng,
+            vix=vix,
+            v4_result=v4_result,
+            candle_closes=candles,
+        )
+        unified_regime = resolve_unified_regime(eng or {}, cagf, spot) if spot else {}
         structure_ctx = _build_canonical_structure_context(ticker, spot, _get_daily_ohlcv_rows(ticker, days=90)) if spot else {}
 
         if iv is None or spot is None:
@@ -5045,7 +5163,17 @@ def _post_monitor_card(ticker: str, mode: str):
             "Use this as a wheel/thesis monitor — not an automatic swing entry." if mode == "long"
             else "Use this to decide whether to roll, trim, or close early if price breaks support/resistance."
         )
-        _append_shared_regime_lines(lines, canonical_vol, unified_regime, management_note, structure_ctx=structure_ctx, eng=eng, cagf=cagf, walls=walls)
+        _append_shared_regime_lines(
+            lines,
+            canonical_vol,
+            unified_regime,
+            management_note,
+            structure_ctx=structure_ctx,
+            eng=eng,
+            cagf=cagf,
+            v4_flow=v4_flow,
+            walls=walls,
+        )
         if mode == "long":
             lines += _build_wheel_focus_block(ticker, expiration, spot, em, walls or {})
             lines += ["", "📌 Monitoring / wheel management only — no swing entry.", "— Not financial advice —"]
