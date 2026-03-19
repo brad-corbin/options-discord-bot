@@ -361,6 +361,8 @@ def _append_google_sheet_values(tab: str, values: list, token: str) -> bool:
         return False
 
 
+
+
 def _append_google_sheet_row(filename: str, fieldnames: list, row: dict):
     tab = _tab_for_filename(filename)
     if not (GOOGLE_SHEETS_ENABLE and tab and GOOGLE_SHEET_ID):
@@ -368,16 +370,43 @@ def _append_google_sheet_row(filename: str, fieldnames: list, row: dict):
     token = _get_google_access_token()
     if not token:
         return
+
+    def _fetch_headers(tab_name: str, bearer: str):
+        try:
+            rng = requests.utils.quote(f"{tab_name}!1:1", safe="!")
+            url = f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEET_ID}/values/{rng}"
+            resp = requests.get(url, headers={"Authorization": f"Bearer {bearer}"}, timeout=10)
+            resp.raise_for_status()
+            vals = resp.json().get("values", [])
+            return vals[0] if vals else []
+        except Exception as e:
+            log.warning(f"Google Sheets header fetch failed for {tab_name}: {e}")
+            return []
+
+    def _write_headers(tab_name: str, headers: list, bearer: str) -> bool:
+        try:
+            rng = requests.utils.quote(f"{tab_name}!1:1", safe="!")
+            url = f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEET_ID}/values/{rng}"
+            resp = requests.put(
+                url,
+                params={"valueInputOption": "USER_ENTERED"},
+                headers={"Authorization": f"Bearer {bearer}", "Content-Type": "application/json"},
+                json={"values": [headers]},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            return True
+        except Exception as e:
+            log.warning(f"Google Sheets header write failed for {tab_name}: {e}")
+            return False
+
     values = [[row.get(k) for k in fieldnames]]
     try:
         with _google_sheets_lock:
-            if tab not in _google_sheets_header_tabs:
-                if not _sheet_headers_exist(tab, token):
-                    if _append_google_sheet_values(tab, [fieldnames], token):
-                        log.info(f"Google Sheets header row written for tab '{tab}'")
-                    else:
-                        log.warning(f"Google Sheets header write failed for tab '{tab}'")
-                _google_sheets_header_tabs.add(tab)
+            current_headers = _fetch_headers(tab, token)
+            if current_headers != fieldnames:
+                if _write_headers(tab, fieldnames, token):
+                    log.info(f"Google Sheets headers synced for tab '{tab}' ({len(fieldnames)} cols)")
             ok = _append_google_sheet_values(tab, values, token)
             if ok:
                 log.info(f"Google Sheets append OK for tab '{tab}' (1 row)")
@@ -2771,6 +2800,190 @@ def _fmt_money(val, decimals: int = 2) -> str:
         return str(val)
 
 
+
+def _get_daily_ohlcv_rows(ticker: str, days: int = 90) -> list:
+    try:
+        from_date = (datetime.now(timezone.utc) - timedelta(days=max(days * 2, 45))).strftime("%Y-%m-%d")
+        raw = md_get(f"https://api.marketdata.app/v1/stocks/candles/D/{ticker}/", {"from": from_date})
+        if not raw or raw.get("s") != "ok":
+            return []
+        opens = raw.get("o") or []
+        highs = raw.get("h") or []
+        lows = raw.get("l") or []
+        closes = raw.get("c") or []
+        vols = raw.get("v") or []
+        ts = raw.get("t") or []
+        n = min(len(opens), len(highs), len(lows), len(closes), len(vols), len(ts))
+        rows = []
+        for i in range(max(0, n - days), n):
+            o = as_float(opens[i], None); h = as_float(highs[i], None)
+            l = as_float(lows[i], None); c = as_float(closes[i], None)
+            v = as_float(vols[i], 0.0)
+            if None in (o, h, l, c) or min(o, h, l, c) <= 0:
+                continue
+            rows.append({"open": o, "high": h, "low": l, "close": c, "volume": max(v, 0.0), "t": ts[i]})
+        return rows
+    except Exception as e:
+        log.warning(f"Daily OHLCV fetch failed for {ticker}: {e}")
+        return []
+
+
+def _compute_price_structure_levels(ticker: str, spot: float, days: int = 90) -> dict:
+    rows = _get_daily_ohlcv_rows(ticker, days=days)
+    out = {
+        "pivot": None, "r1": None, "s1": None, "r2": None, "s2": None,
+        "swing_high": None, "swing_low": None,
+        "fib_support": None, "fib_resistance": None,
+        "vp_support": None, "vp_resistance": None, "vpoc": None,
+        "local_support_1": None, "local_resistance_1": None,
+        "local_support_sources": None, "local_resistance_sources": None,
+        "structure_confluence": 0,
+    }
+    if not rows or len(rows) < 8 or not spot:
+        return out
+
+    highs = [r["high"] for r in rows]
+    lows = [r["low"] for r in rows]
+    closes = [r["close"] for r in rows]
+    vols = [r["volume"] for r in rows]
+    opens = [r["open"] for r in rows]
+
+    # Pivot points (previous completed daily bar)
+    prev = rows[-1]
+    pivot = (prev["high"] + prev["low"] + prev["close"]) / 3.0
+    r1 = 2 * pivot - prev["low"]
+    s1 = 2 * pivot - prev["high"]
+    rng = prev["high"] - prev["low"]
+    r2 = pivot + rng
+    s2 = pivot - rng
+    out.update({"pivot": pivot, "r1": r1, "s1": s1, "r2": r2, "s2": s2})
+
+    # Swing highs / lows (simple local extrema)
+    order = 3
+    swing_highs = []
+    swing_lows = []
+    for i in range(order, len(rows) - order):
+        h = highs[i]; l = lows[i]
+        if h >= max(highs[i - order:i + order + 1]):
+            swing_highs.append(h)
+        if l <= min(lows[i - order:i + order + 1]):
+            swing_lows.append(l)
+    out["swing_high"] = min([x for x in swing_highs if x > spot], default=None)
+    out["swing_low"] = max([x for x in swing_lows if x < spot], default=None)
+
+    # Fibonacci retracement over recent lookback window
+    lookback = min(len(rows), 34)
+    hi = max(highs[-lookback:])
+    lo = min(lows[-lookback:])
+    if hi > lo:
+        fib_ratios = [0.236, 0.382, 0.5, 0.618, 0.786]
+        fib_levels = sorted({lo + (hi - lo) * r for r in fib_ratios})
+        out["fib_support"] = max([lvl for lvl in fib_levels if lvl <= spot], default=None)
+        out["fib_resistance"] = min([lvl for lvl in fib_levels if lvl >= spot], default=None)
+
+    # Volume profile (daily close-volume acceptance by price bin)
+    if vols and max(vols) > 0:
+        pmin = min(lows); pmax = max(highs)
+        if pmax > pmin:
+            bin_count = 24
+            step = (pmax - pmin) / bin_count
+            if step > 0:
+                bins = [pmin + i * step for i in range(bin_count + 1)]
+                profile = [0.0 for _ in range(bin_count)]
+                for c, v in zip(closes, vols):
+                    idx = int(min(max((c - pmin) / step, 0), bin_count - 1))
+                    profile[idx] += v
+                mids = [pmin + (i + 0.5) * step for i in range(bin_count)]
+                if profile:
+                    out["vpoc"] = mids[max(range(len(profile)), key=lambda i: profile[i])]
+                    below = [(profile[i], mids[i]) for i in range(len(mids)) if mids[i] < spot]
+                    above = [(profile[i], mids[i]) for i in range(len(mids)) if mids[i] > spot]
+                    if below:
+                        out["vp_support"] = max(below, key=lambda x: x[0])[1]
+                    if above:
+                        out["vp_resistance"] = max(above, key=lambda x: x[0])[1]
+
+    supports = []
+    resistances = []
+    def add_level(kind: str, value):
+        if value is None:
+            return
+        value = float(value)
+        if value < spot:
+            supports.append((value, kind))
+        elif value > spot:
+            resistances.append((value, kind))
+
+    add_level("swing_low", out["swing_low"])
+    add_level("s1", out["s1"])
+    add_level("s2", out["s2"])
+    add_level("fib", out["fib_support"])
+    add_level("vp", out["vp_support"])
+    add_level("pivot", out["pivot"])
+
+    add_level("swing_high", out["swing_high"])
+    add_level("r1", out["r1"])
+    add_level("r2", out["r2"])
+    add_level("fib", out["fib_resistance"])
+    add_level("vp", out["vp_resistance"])
+    add_level("pivot", out["pivot"])
+
+    if supports:
+        supports.sort(key=lambda x: spot - x[0])
+        primary = supports[0][0]
+        tol = max(spot * 0.0035, 0.75)
+        srcs = [name for value, name in supports if abs(value - primary) <= tol]
+        out["local_support_1"] = primary
+        out["local_support_sources"] = " + ".join(sorted(set(srcs)))
+    if resistances:
+        resistances.sort(key=lambda x: x[0] - spot)
+        primary = resistances[0][0]
+        tol = max(spot * 0.0035, 0.75)
+        srcs = [name for value, name in resistances if abs(value - primary) <= tol]
+        out["local_resistance_1"] = primary
+        out["local_resistance_sources"] = " + ".join(sorted(set(srcs)))
+
+    out["structure_confluence"] = len([x for x in [out.get("local_support_sources"), out.get("local_resistance_sources")] if x])
+    return out
+
+
+def _merge_price_structure_with_walls(price_structure: dict, chain_structure: dict, spot: float, em: dict | None = None) -> dict:
+    merged = dict(chain_structure or {})
+    ps = dict(price_structure or {})
+    em_1sd = (em or {}).get("em_1sd") or 0.0
+    tol = max(spot * 0.004, 1.0)
+
+    call_wall = merged.get("call_wall")
+    put_wall = merged.get("put_wall")
+    gamma_wall = merged.get("gamma_wall")
+
+    if ps.get("local_resistance_1") is not None:
+        local_r = ps["local_resistance_1"]
+        if call_wall is None or call_wall <= spot or abs(call_wall - spot) > max((em_1sd * 2.5), spot * 0.12):
+            merged["call_wall"] = local_r
+        merged["local_resistance_1"] = local_r
+        merged["local_resistance_sources"] = ps.get("local_resistance_sources")
+    if ps.get("local_support_1") is not None:
+        local_s = ps["local_support_1"]
+        if put_wall is None or put_wall >= spot or abs(put_wall - spot) > max((em_1sd * 2.5), spot * 0.12):
+            merged["put_wall"] = local_s
+        merged["local_support_1"] = local_s
+        merged["local_support_sources"] = ps.get("local_support_sources")
+    if gamma_wall is None and ps.get("pivot") is not None:
+        merged["gamma_wall"] = ps.get("pivot")
+
+    for k in ("pivot", "r1", "s1", "r2", "s2", "swing_high", "swing_low", "fib_support", "fib_resistance", "vp_support", "vp_resistance", "vpoc", "structure_confluence"):
+        merged[k] = ps.get(k)
+
+    pin_low = merged.get("put_wall") or ps.get("local_support_1")
+    pin_high = merged.get("call_wall") or ps.get("local_resistance_1")
+    if pin_low is not None:
+        merged["pin_zone_low"] = pin_low
+    if pin_high is not None:
+        merged["pin_zone_high"] = pin_high
+    return merged
+
+
 def _format_unified_regime_line(regime) -> str:
     if not regime:
         return "UNKNOWN — no regime data"
@@ -3246,11 +3459,11 @@ def _log_em_prediction(ticker: str, session: str, spot: float, em: dict, bias: d
         now_dt = datetime.now(timezone.utc)
         now_str = now_dt.strftime("%Y-%m-%d")
         key = f"em_log:{now_str}:{ticker}:{session}"
-        walls = _derive_structure_levels_from_chain({}, spot, walls or {}, eng or {})
+        chain_struct = _derive_structure_levels_from_chain({}, spot, walls or {}, eng or {})
+        price_struct = _compute_price_structure_levels(ticker, spot, days=90)
+        struct = _merge_price_structure_with_walls(price_struct, chain_struct, spot, em)
         eng = eng or {}
-        max_pain = walls.get("max_pain")
-        if max_pain is None:
-            max_pain = eng.get("max_pain")
+        max_pain = struct.get("max_pain") or eng.get("max_pain")
         entry = {
             "ticker": ticker,
             "date": now_str,
@@ -3268,33 +3481,52 @@ def _log_em_prediction(ticker: str, session: str, spot: float, em: dict, bias: d
             "v4_confidence_composite": v4_result.get("confidence", {}).get("composite") if v4_result else None,
             "v4_bias": v4_result.get("snapshot", {}).get("adjusted_expectation", {}).get("bias") if v4_result else None,
             "v4_regime": v4_result.get("snapshot", {}).get("regime", {}).get("regime") if v4_result else None,
-            "gamma_flip": walls.get("gamma_flip") or eng.get("flip_price"),
-            "call_wall": walls.get("call_wall"),
-            "put_wall": walls.get("put_wall"),
-            "gamma_wall": walls.get("gamma_wall"),
+            "gamma_flip": struct.get("gamma_flip") or eng.get("flip_price"),
+            "call_wall": struct.get("call_wall"),
+            "put_wall": struct.get("put_wall"),
+            "gamma_wall": struct.get("gamma_wall"),
             "max_pain": max_pain,
-            "pin_zone_low": walls.get("put_wall"),
-            "pin_zone_high": walls.get("call_wall"),
+            "pin_zone_low": struct.get("pin_zone_low"),
+            "pin_zone_high": struct.get("pin_zone_high"),
+            "pivot": struct.get("pivot"),
+            "r1": struct.get("r1"),
+            "s1": struct.get("s1"),
+            "r2": struct.get("r2"),
+            "s2": struct.get("s2"),
+            "swing_high": struct.get("swing_high"),
+            "swing_low": struct.get("swing_low"),
+            "fib_resistance": struct.get("fib_resistance"),
+            "fib_support": struct.get("fib_support"),
+            "vp_resistance": struct.get("vp_resistance"),
+            "vp_support": struct.get("vp_support"),
+            "vpoc": struct.get("vpoc"),
+            "local_resistance_1": struct.get("local_resistance_1"),
+            "local_support_1": struct.get("local_support_1"),
+            "local_resistance_sources": struct.get("local_resistance_sources"),
+            "local_support_sources": struct.get("local_support_sources"),
+            "structure_confluence": struct.get("structure_confluence"),
             "cagf_direction": (cagf or {}).get("direction"),
             "cagf_regime": (cagf or {}).get("regime"),
             "trend_day_probability": (cagf or {}).get("trend_day_probability"),
             "eod_price": None,
             "reconciled": False,
         }
-        store_set(key, json.dumps(entry), ttl=90 * 86400)  # 90 day TTL
+        store_set(key, json.dumps(entry), ttl=90 * 86400)
 
         fieldnames = [
             "logged_at_utc","date","session","ticker","spot_at_prediction","em_1sd","bull_1sd","bear_1sd",
             "bull_2sd","bear_2sd","bias_score","bias_direction","v4_confidence","v4_confidence_composite",
             "v4_bias","v4_regime","gamma_flip","call_wall","put_wall","gamma_wall","max_pain",
-            "pin_zone_low","pin_zone_high","cagf_direction","cagf_regime","trend_day_probability"
+            "pin_zone_low","pin_zone_high","pivot","r1","s1","r2","s2","swing_high","swing_low",
+            "fib_resistance","fib_support","vp_resistance","vp_support","vpoc","local_resistance_1","local_support_1",
+            "local_resistance_sources","local_support_sources","structure_confluence",
+            "cagf_direction","cagf_regime","trend_day_probability"
         ]
         _append_csv_row("em_predictions.csv", fieldnames, entry)
         _append_jsonl("em_predictions.jsonl", entry)
         log.debug(f"EM prediction logged: {key}")
     except Exception as e:
         log.warning(f"EM prediction log failed: {e}")
-
 
 # ─────────────────────────────────────────────────────────────────────
 # _post_em_card — v4 INTEGRATED
@@ -3673,7 +3905,9 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
             card_title = f"TRADE SETUP ({effective_dte_label})"
 
         def no_trade(reason, emoji="🟡"):
-            local_walls = _derive_structure_levels_from_chain({}, spot, walls or {}, eng or {})
+            chain_struct = _derive_structure_levels_from_chain({}, spot, walls or {}, eng or {})
+            price_struct = _compute_price_structure_levels(ticker, spot, days=90)
+            local_walls = _merge_price_structure_with_walls(price_struct, chain_struct, spot, em)
             flip = local_walls.get("gamma_flip") or (eng or {}).get("flip_price")
             call_wall = local_walls.get("call_wall")
             put_wall = local_walls.get("put_wall")
@@ -3682,11 +3916,17 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
             bias_line = f"{bias['direction']} (score {bias['score']}/14)"
             range_low = em.get('bear_1sd')
             range_high = em.get('bull_1sd')
-            accel_up = call_wall or range_high
-            accel_dn = put_wall or range_low
+            struct_r = local_walls.get("local_resistance_1")
+            struct_s = local_walls.get("local_support_1")
+            accel_up = struct_r or call_wall or range_high
+            accel_dn = struct_s or put_wall or range_low
             regime_line = _format_unified_regime_line(unified_regime)
             pin_low = local_walls.get("pin_zone_low")
             pin_high = local_walls.get("pin_zone_high")
+            pivot = local_walls.get("pivot")
+            r1 = local_walls.get("r1"); s1 = local_walls.get("s1")
+            fib_r = local_walls.get("fib_resistance"); fib_s = local_walls.get("fib_support")
+            vpoc = local_walls.get("vpoc")
             lines = [
                 f"🎯 {ticker} — DEALER EM BRIEF ({effective_dte_label})  |  Exp: {exp_short}",
                 f"{emoji} NO TRADE — {reason}",
@@ -3706,6 +3946,21 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
                 lines.append(f"🛡️ Put Wall / Support: {_fmt_money(put_wall)}")
             if gamma_wall is not None:
                 lines.append(f"🎯 Gamma Wall: {_fmt_money(gamma_wall)}")
+            if struct_r is not None:
+                src_txt = local_walls.get("local_resistance_sources")
+                lines.append(f"🧱 Local Resistance: {_fmt_money(struct_r)}" + (f"  ({src_txt})" if src_txt else ""))
+            if struct_s is not None:
+                src_txt = local_walls.get("local_support_sources")
+                lines.append(f"🧱 Local Support: {_fmt_money(struct_s)}" + (f"  ({src_txt})" if src_txt else ""))
+            if pivot is not None:
+                pivot_line = f"🧭 Pivot: {_fmt_money(pivot)}"
+                if r1 is not None and s1 is not None:
+                    pivot_line += f"  |  R1 {_fmt_money(r1)} / S1 {_fmt_money(s1)}"
+                lines.append(pivot_line)
+            if fib_r is not None or fib_s is not None:
+                lines.append(f"🪜 Fib Zone: {_fmt_money(fib_s)} ↔ {_fmt_money(fib_r)}")
+            if vpoc is not None:
+                lines.append(f"📊 VPOC / Acceptance: {_fmt_money(vpoc)}")
             if pin_low is not None and pin_high is not None:
                 pin_width = abs((pin_high or 0) - (pin_low or 0))
                 lines.append(f"📌 Pin Zone: {_fmt_money(pin_low)} – {_fmt_money(pin_high)}")
@@ -3733,19 +3988,30 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
             no_trade(f"Data quality LOW ({conf_score:.0%}) — {dg_str}", "⚠️")
             return
 
-        local_struct = _derive_structure_levels_from_chain({}, spot, walls or {}, eng or {})
-        local_call = local_struct.get("call_wall")
-        local_put = local_struct.get("put_wall")
+        local_struct = _merge_price_structure_with_walls(
+            _compute_price_structure_levels(ticker, spot, days=90),
+            _derive_structure_levels_from_chain({}, spot, walls or {}, eng or {}),
+            spot,
+            em,
+        )
+        local_call = local_struct.get("local_resistance_1") or local_struct.get("call_wall")
+        local_put = local_struct.get("local_support_1") or local_struct.get("put_wall")
         local_max_pain = local_struct.get("max_pain") or (eng or {}).get("max_pain")
         em_1sd_now = em.get("em_1sd") or 0.0
         local_pin = False
         near_max_pain = False
+        near_opposing_structure = False
         if local_call is not None and local_put is not None and local_put < spot < local_call:
             pin_width = abs(local_call - local_put)
             if em_1sd_now > 0:
                 local_pin = pin_width <= (2.2 * em_1sd_now)
         if local_max_pain is not None and em_1sd_now > 0:
             near_max_pain = abs(local_max_pain - spot) <= (0.35 * em_1sd_now)
+        if em_1sd_now > 0:
+            if is_bull and local_call is not None:
+                near_opposing_structure = (local_call - spot) <= (0.35 * em_1sd_now)
+            elif (not is_bull) and local_put is not None:
+                near_opposing_structure = (spot - local_put) <= (0.35 * em_1sd_now)
 
         # G1 — No directional edge
         if direction == "NEUTRAL":
@@ -3759,6 +4025,8 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
         if direction in ("SLIGHT BULLISH", "SLIGHT BEARISH") and abs(score) < 2:
             if local_pin or near_max_pain:
                 no_trade(f"Lean {direction} but score only {score:+d}/14 — pin risk too high.", "🟡")
+            elif near_opposing_structure:
+                no_trade(f"Lean {direction} but nearby structure is too close to spot.", "🟡")
             else:
                 no_trade(f"Lean {direction} but score only {score:+d}/14 — edge too thin.", "🟡")
             return
