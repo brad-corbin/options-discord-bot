@@ -312,26 +312,28 @@ def get_avg_chain_iv(contracts: List[Dict], spot: float, side: str = "both") -> 
 # CHAIN DATA BUILDERS
 # ─────────────────────────────────────────────────────────
 
-def build_call_quotes(contracts: List[Dict], spot: float, ticker: str = "") -> Dict[float, Dict]:
-    """ITM calls: strikes BELOW spot. v4.1: hard liquidity filters with v4.3 relaxed fallback."""
-    # v4.1: Get tier-appropriate liquidity thresholds
+def build_call_quotes(contracts: List[Dict], spot: float, ticker: str = "", include_otm: bool = False) -> Dict[float, Dict]:
+    """Liquid call quotes. Default returns ITM-only for backward compatibility.
+    Set include_otm=True to return the full liquid call ladder for hybrid entry selection.
+    """
     _liq = get_liquidity_thresholds(ticker)
 
-    # v4.3: Try strict first, then relaxed if too few strikes pass
     for pass_name, mult in [("strict", 1.0), ("relaxed", 2.5)]:
         _liq_min_oi = max(int(_liq["min_oi"] / mult), 1)
         _liq_max_spread = _liq["max_spread"] * mult
         _liq_max_spread_pct = min(_liq["max_spread_pct"] * mult, 0.50)
 
         quotes = {}
-        filtered_reasons = {}  # track why strikes were filtered (for logging)
+        filtered_reasons = {}
         for c in contracts:
             right = (c.get("right") or "").lower()
             if right != "call":
                 continue
 
             strike = as_float(c.get("strike"), None)
-            if strike is None or strike >= spot:
+            if strike is None:
+                continue
+            if not include_otm and strike >= spot:
                 continue
 
             bid = as_float(c.get("bid"), None)
@@ -343,6 +345,7 @@ def build_call_quotes(contracts: List[Dict], spot: float, ticker: str = "") -> D
             iv  = as_float(c.get("iv"), None)
             theta = as_float(c.get("theta"), None)
             vega = as_float(c.get("vega"), None)
+            gamma = as_float(c.get("gamma"), None)
 
             if mid is None and bid is not None and ask is not None:
                 mid = (bid + ask) / 2.0
@@ -350,7 +353,6 @@ def build_call_quotes(contracts: List[Dict], spot: float, ticker: str = "") -> D
                 filtered_reasons[strike] = "no mid price"
                 continue
 
-            # Liquidity filters
             warnings = []
             spread_abs = (ask - bid) if (bid is not None and ask is not None) else 0
             spread_pct = spread_abs / mid if mid > 0 else 0
@@ -365,7 +367,6 @@ def build_call_quotes(contracts: List[Dict], spot: float, ticker: str = "") -> D
                 filtered_reasons[strike] = f"spread {spread_pct:.0%} > {_liq_max_spread_pct:.0%}"
                 continue
 
-            # Soft warnings for marginal liquidity
             if oi is not None and oi < _liq["min_oi"] * 2:
                 warnings.append(f"Marginal OI ({oi})")
             if spread_pct > _liq["max_spread_pct"] * 0.7:
@@ -374,8 +375,9 @@ def build_call_quotes(contracts: List[Dict], spot: float, ticker: str = "") -> D
             quotes[strike] = {
                 "strike": strike, "mid": mid, "bid": bid, "ask": ask,
                 "oi": oi, "volume": vol, "delta": delta, "iv": iv,
-                "theta": theta, "vega": vega,
-                "itm_amount": round(spot - strike, 2),
+                "theta": theta, "vega": vega, "gamma": gamma,
+                "itm_amount": round(max(spot - strike, 0.0), 2),
+                "otm_amount": round(max(strike - spot, 0.0), 2),
                 "spread_pct": round(spread_pct, 4),
                 "warnings": warnings,
             }
@@ -385,14 +387,13 @@ def build_call_quotes(contracts: List[Dict], spot: float, ticker: str = "") -> D
                 import logging as _log
                 _log.getLogger(__name__).info(
                     f"build_call_quotes({ticker}): relaxed pass found {len(quotes)} strikes "
-                    f"(strict found <2). Filters relaxed {mult:.1f}x."
+                    f"(strict found <2). Filters relaxed {mult:.1f}x. include_otm={include_otm}"
                 )
             if pass_name == "strict" and len(quotes) < 2 and filtered_reasons:
                 import logging as _log
-                # Log first 5 filtered strikes for debugging
                 top_filtered = sorted(filtered_reasons.items(), key=lambda x: -x[0])[:5]
                 _log.getLogger(__name__).info(
-                    f"build_call_quotes({ticker}): strict pass filtered all ITM calls. "
+                    f"build_call_quotes({ticker}): strict pass filtered all candidate calls. "
                     f"Top filtered: {', '.join(f'${k:.0f}:{v}' for k,v in top_filtered)}"
                 )
             return quotes
@@ -400,11 +401,12 @@ def build_call_quotes(contracts: List[Dict], spot: float, ticker: str = "") -> D
     return quotes
 
 
-def build_put_quotes(contracts: List[Dict], spot: float, ticker: str = "") -> Dict[float, Dict]:
-    """ITM puts: strikes ABOVE spot. v4.1: hard liquidity filters with v4.3 relaxed fallback."""
+def build_put_quotes(contracts: List[Dict], spot: float, ticker: str = "", include_otm: bool = False) -> Dict[float, Dict]:
+    """Liquid put quotes. Default returns ITM-only for backward compatibility.
+    Set include_otm=True to return the full liquid put ladder for hybrid entry selection.
+    """
     _liq = get_liquidity_thresholds(ticker)
 
-    # v4.3: Try strict first, then relaxed if too few strikes pass
     for pass_name, mult in [("strict", 1.0), ("relaxed", 2.5)]:
         _liq_min_oi = max(int(_liq["min_oi"] / mult), 1)
         _liq_max_spread = _liq["max_spread"] * mult
@@ -418,7 +420,9 @@ def build_put_quotes(contracts: List[Dict], spot: float, ticker: str = "") -> Di
                 continue
 
             strike = as_float(c.get("strike"), None)
-            if strike is None or strike <= spot:
+            if strike is None:
+                continue
+            if not include_otm and strike <= spot:
                 continue
 
             bid = as_float(c.get("bid"), None)
@@ -430,6 +434,7 @@ def build_put_quotes(contracts: List[Dict], spot: float, ticker: str = "") -> Di
             iv  = as_float(c.get("iv"), None)
             theta = as_float(c.get("theta"), None)
             vega = as_float(c.get("vega"), None)
+            gamma = as_float(c.get("gamma"), None)
 
             if mid is None and bid is not None and ask is not None:
                 mid = (bid + ask) / 2.0
@@ -437,7 +442,6 @@ def build_put_quotes(contracts: List[Dict], spot: float, ticker: str = "") -> Di
                 filtered_reasons[strike] = "no mid price"
                 continue
 
-            # Liquidity filters
             warnings = []
             spread_abs = (ask - bid) if (bid is not None and ask is not None) else 0
             spread_pct = spread_abs / mid if mid > 0 else 0
@@ -452,7 +456,6 @@ def build_put_quotes(contracts: List[Dict], spot: float, ticker: str = "") -> Di
                 filtered_reasons[strike] = f"spread {spread_pct:.0%} > {_liq_max_spread_pct:.0%}"
                 continue
 
-            # Soft warnings
             if oi is not None and oi < _liq["min_oi"] * 2:
                 warnings.append(f"Marginal OI ({oi})")
             if spread_pct > _liq["max_spread_pct"] * 0.7:
@@ -461,8 +464,9 @@ def build_put_quotes(contracts: List[Dict], spot: float, ticker: str = "") -> Di
             quotes[strike] = {
                 "strike": strike, "mid": mid, "bid": bid, "ask": ask,
                 "oi": oi, "volume": vol, "delta": delta, "iv": iv,
-                "theta": theta, "vega": vega,
-                "itm_amount": round(strike - spot, 2),
+                "theta": theta, "vega": vega, "gamma": gamma,
+                "itm_amount": round(max(strike - spot, 0.0), 2),
+                "otm_amount": round(max(spot - strike, 0.0), 2),
                 "spread_pct": round(spread_pct, 4),
                 "warnings": warnings,
             }
@@ -472,13 +476,13 @@ def build_put_quotes(contracts: List[Dict], spot: float, ticker: str = "") -> Di
                 import logging as _log
                 _log.getLogger(__name__).info(
                     f"build_put_quotes({ticker}): relaxed pass found {len(quotes)} strikes "
-                    f"(strict found <2). Filters relaxed {mult:.1f}x."
+                    f"(strict found <2). Filters relaxed {mult:.1f}x. include_otm={include_otm}"
                 )
             if pass_name == "strict" and len(quotes) < 2 and filtered_reasons:
                 import logging as _log
                 top_filtered = sorted(filtered_reasons.items())[:5]
                 _log.getLogger(__name__).info(
-                    f"build_put_quotes({ticker}): strict pass filtered all ITM puts. "
+                    f"build_put_quotes({ticker}): strict pass filtered all candidate puts. "
                     f"Top filtered: {', '.join(f'${k:.0f}:{v}' for k,v in top_filtered)}"
                 )
             return quotes
@@ -486,40 +490,296 @@ def build_put_quotes(contracts: List[Dict], spot: float, ticker: str = "") -> Di
     return quotes
 
 
+
 # ─────────────────────────────────────────────────────────
-# SPREAD CANDIDATE BUILDERS
+# HYBRID ENTRY HELPERS
 # ─────────────────────────────────────────────────────────
 
-def build_itm_debit_spreads(
+HYBRID_ENTRY_ENABLED = True
+HYBRID_ATM_BAND_PCT = 0.0035
+HYBRID_EARLY_MAX_COST_PCT = 0.50
+HYBRID_BALANCED_MAX_COST_PCT = 0.62
+HYBRID_EARLY_MIN_COST_PCT = 0.10
+HYBRID_BALANCED_MIN_COST_PCT = 0.15
+HYBRID_MAX_SHORT_OTM_EM_FRACTION = 0.60
+HYBRID_PROFILE_SIZE_MULTIPLIER = {
+    "conservative_itm": 1.00,
+    "balanced_transition": 0.85,
+    "early_atm": 0.70,
+}
+HYBRID_PROFILE_LABEL = {
+    "conservative_itm": "Conservative ITM",
+    "balanced_transition": "Balanced",
+    "early_atm": "Early ATM",
+}
+
+
+def _atm_band(spot: float) -> float:
+    return max(0.25, spot * HYBRID_ATM_BAND_PCT)
+
+
+def _classify_call_bucket(strike: float, spot: float, atm_band: float) -> str:
+    if strike < (spot - atm_band):
+        return "itm"
+    if strike <= (spot + atm_band):
+        return "atm"
+    return "otm"
+
+
+def _classify_put_bucket(strike: float, spot: float, atm_band: float) -> str:
+    if strike > (spot + atm_band):
+        return "itm"
+    if strike >= (spot - atm_band):
+        return "atm"
+    return "otm"
+
+
+def _profile_cost_bounds(profile: str) -> Tuple[float, float]:
+    if profile == "early_atm":
+        return HYBRID_EARLY_MIN_COST_PCT, min(MAX_COST_PCT_OF_WIDTH, HYBRID_EARLY_MAX_COST_PCT)
+    if profile == "balanced_transition":
+        return HYBRID_BALANCED_MIN_COST_PCT, min(MAX_COST_PCT_OF_WIDTH, HYBRID_BALANCED_MAX_COST_PCT)
+    return MIN_COST_PCT_OF_WIDTH, MAX_COST_PCT_OF_WIDTH
+
+
+def _profile_fit_multiplier(profile: str, aggression: str) -> float:
+    matrix = {
+        "conservative": {
+            "conservative_itm": 1.08,
+            "balanced_transition": 0.95,
+            "early_atm": 0.82,
+        },
+        "balanced": {
+            "conservative_itm": 0.99,
+            "balanced_transition": 1.08,
+            "early_atm": 0.92,
+        },
+        "early": {
+            "conservative_itm": 0.92,
+            "balanced_transition": 1.04,
+            "early_atm": 1.10,
+        },
+    }
+    return matrix.get(aggression, matrix["balanced"]).get(profile, 1.0)
+
+
+def _entry_size_multiplier(profile: str) -> float:
+    return HYBRID_PROFILE_SIZE_MULTIPLIER.get(profile, 1.0)
+
+
+def _dynamic_min_win_probability(profile: str, confidence: int) -> float:
+    floor = MIN_WIN_PROBABILITY
+    if profile == "balanced_transition" and confidence >= 65:
+        return max(0.42, floor - 0.03)
+    if profile == "early_atm" and confidence >= 72:
+        return max(0.38, floor - 0.07)
+    return floor
+
+
+def _determine_entry_plan(
+    webhook_data: Dict,
+    bias: str,
+    regime: Optional[Dict] = None,
+    v4_flow: Optional[Dict] = None,
+    vol_edge: Optional[Dict] = None,
+) -> Dict[str, Any]:
+    regime = regime or {}
+    v4_flow = v4_flow or {}
+    vol_edge = vol_edge or {}
+
+    score = 0.0
+    reasons = []
+    is_bear = bias == "bear"
+
+    tier = str(webhook_data.get("tier", "2") or "2")
+    if tier == "1":
+        score += 1.0
+        reasons.append("T1 signal")
+    else:
+        score += 0.3
+        reasons.append("T2/manual signal")
+
+    if webhook_data.get("htf_confirmed"):
+        score += 1.0
+        reasons.append("HTF confirmed")
+    elif webhook_data.get("htf_converging"):
+        score += 0.5
+        reasons.append("HTF converging")
+
+    daily_bull = bool(webhook_data.get("daily_bull", False))
+    if (not is_bear and daily_bull) or (is_bear and not daily_bull):
+        score += 0.9
+        reasons.append("daily trend aligned")
+    else:
+        score -= 0.6
+        reasons.append("daily trend fighting")
+
+    rsi_mfi_bull = bool(webhook_data.get("rsi_mfi_bull", False))
+    above_vwap = bool(webhook_data.get("above_vwap", False))
+    wt2 = as_float(webhook_data.get("wt2"), 0)
+    if not is_bear and rsi_mfi_bull:
+        score += 0.4
+        reasons.append("RSI/MFI aligned")
+    if is_bear and not rsi_mfi_bull:
+        score += 0.4
+        reasons.append("RSI/MFI aligned")
+    if not is_bear and above_vwap:
+        score += 0.4
+        reasons.append("VWAP aligned")
+    if is_bear and not above_vwap:
+        score += 0.4
+        reasons.append("VWAP aligned")
+    if not is_bear and wt2 < -30:
+        score += 0.4
+        reasons.append("wave oversold")
+    if is_bear and wt2 > 60:
+        score += 0.4
+        reasons.append("wave overbought")
+
+    if v4_flow:
+        v4_bias = (v4_flow.get("bias") or "").upper()
+        if (not is_bear and v4_bias == "UPSIDE") or (is_bear and v4_bias == "DOWNSIDE"):
+            score += 0.9
+            reasons.append("dealer flow aligned")
+        elif v4_bias in {"UPSIDE", "DOWNSIDE"}:
+            score -= 0.8
+            reasons.append("dealer flow fights")
+
+        gex = as_float(v4_flow.get("gex"), 0)
+        if gex < 0:
+            score += 0.45
+            reasons.append("negative GEX")
+        elif gex > 0:
+            score -= 0.35
+            reasons.append("positive GEX")
+
+        conf_label = (v4_flow.get("confidence_label") or "").upper()
+        if conf_label == "HIGH":
+            score += 0.25
+        elif conf_label == "LOW":
+            score -= 0.35
+
+    adx_regime = (regime.get("adx_regime") or "").upper()
+    vix_regime = (regime.get("vix_regime") or "").upper()
+    if adx_regime == "TRENDING":
+        score += 0.65
+        reasons.append("trending tape")
+    elif adx_regime == "CHOPPY":
+        score -= 0.85
+        reasons.append("choppy tape")
+
+    if vix_regime in {"LOW", "NORMAL"}:
+        score += 0.2
+    elif vix_regime == "CRISIS":
+        if is_bear:
+            score += 0.15
+        else:
+            score -= 0.65
+            reasons.append("fear tape vs bull")
+
+    edge_label = (vol_edge.get("edge_label") or "").upper()
+    if edge_label == "BUYER":
+        score += 0.25
+    elif edge_label == "SELLER":
+        score -= 0.15
+
+    if score >= 4.0:
+        aggression = "early"
+        preferred = ["early_atm", "balanced_transition", "conservative_itm"]
+    elif score >= 2.2:
+        aggression = "balanced"
+        preferred = ["balanced_transition", "conservative_itm", "early_atm"]
+    else:
+        aggression = "conservative"
+        preferred = ["conservative_itm", "balanced_transition", "early_atm"]
+
+    return {
+        "score": round(score, 2),
+        "aggression": aggression,
+        "preferred_profiles": preferred,
+        "reasons": reasons[:6],
+    }
+
+
+def _should_skip_call_profile(profile: str, long_k: float, short_k: float, spot: float, expected_move: float, atm_band: float) -> bool:
+    if profile not in {"conservative_itm", "balanced_transition", "early_atm"}:
+        return True
+    if profile == "early_atm":
+        max_short = spot + max(atm_band, expected_move * HYBRID_MAX_SHORT_OTM_EM_FRACTION if expected_move > 0 else atm_band * 2)
+        if short_k > max_short:
+            return True
+    if profile == "balanced_transition" and expected_move > 0:
+        max_short = spot + expected_move
+        if short_k > max_short:
+            return True
+    return False
+
+
+def _should_skip_put_profile(profile: str, long_k: float, short_k: float, spot: float, expected_move: float, atm_band: float) -> bool:
+    if profile not in {"conservative_itm", "balanced_transition", "early_atm"}:
+        return True
+    if profile == "early_atm":
+        min_short = spot - max(atm_band, expected_move * HYBRID_MAX_SHORT_OTM_EM_FRACTION if expected_move > 0 else atm_band * 2)
+        if short_k < min_short:
+            return True
+    if profile == "balanced_transition" and expected_move > 0:
+        min_short = spot - expected_move
+        if short_k < min_short:
+            return True
+    return False
+
+
+def _classify_bull_profile(long_k: float, short_k: float, spot: float, atm_band: float) -> Optional[Tuple[str, str, str]]:
+    long_bucket = _classify_call_bucket(long_k, spot, atm_band)
+    short_bucket = _classify_call_bucket(short_k, spot, atm_band)
+    if long_bucket == "itm" and short_bucket == "itm":
+        return "conservative_itm", long_bucket, short_bucket
+    if long_bucket == "itm" and short_bucket in {"atm", "otm"}:
+        return "balanced_transition", long_bucket, short_bucket
+    if long_bucket == "atm" and short_bucket == "otm":
+        return "early_atm", long_bucket, short_bucket
+    return None
+
+
+def _classify_bear_profile(long_k: float, short_k: float, spot: float, atm_band: float) -> Optional[Tuple[str, str, str]]:
+    long_bucket = _classify_put_bucket(long_k, spot, atm_band)
+    short_bucket = _classify_put_bucket(short_k, spot, atm_band)
+    if long_bucket == "itm" and short_bucket == "itm":
+        return "conservative_itm", long_bucket, short_bucket
+    if long_bucket == "itm" and short_bucket in {"atm", "otm"}:
+        return "balanced_transition", long_bucket, short_bucket
+    if long_bucket == "atm" and short_bucket == "otm":
+        return "early_atm", long_bucket, short_bucket
+    return None
+
+# ─────────────────────────────────────────────────────────
+
+def build_bull_call_spreads(
     quotes: Dict[float, Dict],
     spot: float,
     available_widths: List[float],
     expected_move: float = 0,
     dte: int = 0,
+    atm_band: float = 0.0,
 ) -> List[Dict]:
-    """
-    Bull call debit spread: long lower strike call, short higher strike call.
-    Both ITM (below spot).
-    """
     candidates = []
-    itm_strikes = sorted([k for k in quotes.keys()], reverse=True)
+    strikes = sorted(quotes.keys())
+    atm_band = atm_band or _atm_band(spot)
+    em_upper = (spot + expected_move) if expected_move > 0 else 0
 
-    if len(itm_strikes) < 2:
-        return candidates
-
-    em_lower = (spot - expected_move) if expected_move > 0 else 0
-
-    for long_k in itm_strikes:
+    for long_k in strikes:
         long_q = quotes[long_k]
-
         for width in available_widths:
             short_k = round(long_k + width, 2)
-
-            if short_k >= spot:
-                continue
-
             short_q = quotes.get(short_k)
             if short_q is None:
+                continue
+
+            profile_info = _classify_bull_profile(long_k, short_k, spot, atm_band)
+            if not profile_info:
+                continue
+            profile, long_bucket, short_bucket = profile_info
+            if _should_skip_call_profile(profile, long_k, short_k, spot, expected_move, atm_band):
                 continue
 
             debit = round(long_q["mid"] - short_q["mid"], 4)
@@ -527,9 +787,8 @@ def build_itm_debit_spreads(
                 continue
 
             cost_pct = debit / width
-            if cost_pct > MAX_COST_PCT_OF_WIDTH:
-                continue
-            if cost_pct < MIN_COST_PCT_OF_WIDTH:
+            min_cost, max_cost = _profile_cost_bounds(profile)
+            if cost_pct > max_cost or cost_pct < min_cost:
                 continue
 
             max_profit = round(width - debit, 4)
@@ -566,9 +825,9 @@ def build_itm_debit_spreads(
 
             em_proximity = None
             em_zone = "unknown"
-            if em_lower > 0:
-                em_proximity = round(short_k - em_lower, 2)
-                em_zone = "inside" if short_k >= em_lower else "outside"
+            if em_upper > 0:
+                em_proximity = round(em_upper - short_k, 2)
+                em_zone = "inside" if short_k <= em_upper else "outside"
 
             same_day_target = round(debit * (1 + SAME_DAY_EXIT_PCT), 2)
             next_day_target = round(debit * (1 + NEXT_DAY_EXIT_PCT), 2)
@@ -582,76 +841,76 @@ def build_itm_debit_spreads(
                     natural_debit = None
 
             candidates.append({
-                "long":           long_k,
-                "short":          short_k,
-                "width":          width,
-                "debit":          round(debit, 2),
-                "natural_debit":  round(natural_debit, 2) if natural_debit is not None else None,
-                "cost_pct":       round(cost_pct * 100, 1),
-                "max_profit":     round(max_profit, 2),
-                "max_loss":       round(max_loss, 2),
-                "ror":            ror,
-                "long_itm":       long_q["itm_amount"],
-                "short_itm":      short_q["itm_amount"],
-                "long_delta":     long_q.get("delta"),
-                "short_delta":    short_q.get("delta"),
-                "long_oi":        long_q.get("oi"),
-                "short_oi":       short_q.get("oi"),
-                "long_bid":       long_q.get("bid"),
-                "long_ask":       long_q.get("ask"),
-                "short_bid":      short_q.get("bid"),
-                "short_ask":      short_q.get("ask"),
+                "long": long_k,
+                "short": short_k,
+                "width": width,
+                "debit": round(debit, 2),
+                "natural_debit": round(natural_debit, 2) if natural_debit is not None else None,
+                "cost_pct": round(cost_pct * 100, 1),
+                "max_profit": round(max_profit, 2),
+                "max_loss": round(max_loss, 2),
+                "ror": ror,
+                "long_itm": long_q["itm_amount"],
+                "short_itm": short_q["itm_amount"],
+                "long_delta": long_q.get("delta"),
+                "short_delta": short_q.get("delta"),
+                "long_oi": long_q.get("oi"),
+                "short_oi": short_q.get("oi"),
+                "long_bid": long_q.get("bid"),
+                "long_ask": long_q.get("ask"),
+                "short_bid": short_q.get("bid"),
+                "short_ask": short_q.get("ask"),
                 "long_spread_pct": long_q.get("spread_pct"),
                 "short_spread_pct": short_q.get("spread_pct"),
-                "net_theta":      net_theta,
-                "net_vega":       net_vega,
-                "net_delta":      net_delta,
-                "net_gamma":      net_gamma,
-                "win_prob":       win_prob,
+                "net_theta": net_theta,
+                "net_vega": net_vega,
+                "net_delta": net_delta,
+                "net_gamma": net_gamma,
+                "win_prob": win_prob,
                 "max_profit_prob": quality.get("max_profit_prob"),
-                "breakeven":      quality.get("breakeven"),
+                "breakeven": quality.get("breakeven"),
                 "expected_value": ev,
-                "em_proximity":   em_proximity,
-                "em_zone":        em_zone,
-                "same_day_exit":  same_day_target,
-                "next_day_exit":  next_day_target,
-                "extended_exit":  extended_target,
-                "warnings":       long_q["warnings"] + short_q["warnings"],
+                "em_proximity": em_proximity,
+                "em_zone": em_zone,
+                "same_day_exit": same_day_target,
+                "next_day_exit": next_day_target,
+                "extended_exit": extended_target,
+                "entry_profile": profile,
+                "profile_label": HYBRID_PROFILE_LABEL.get(profile, profile),
+                "long_bucket": long_bucket,
+                "short_bucket": short_bucket,
+                "warnings": long_q["warnings"] + short_q["warnings"],
             })
 
     return candidates
 
 
-def build_itm_bear_put_spreads(
+def build_bear_put_spreads(
     quotes: Dict[float, Dict],
     spot: float,
     available_widths: List[float],
     expected_move: float = 0,
     dte: int = 0,
+    atm_band: float = 0.0,
 ) -> List[Dict]:
-    """
-    Bear put debit spread: long higher strike put, short lower strike put.
-    Both ITM (above spot). Mirror of bull call logic.
-    """
     candidates = []
-    itm_strikes = sorted([k for k in quotes.keys()])  # ascending
+    strikes = sorted(quotes.keys())
+    atm_band = atm_band or _atm_band(spot)
+    em_lower = (spot - expected_move) if expected_move > 0 else 0
 
-    if len(itm_strikes) < 2:
-        return candidates
-
-    em_upper = (spot + expected_move) if expected_move > 0 else 0
-
-    for long_k in itm_strikes:
+    for long_k in strikes:
         long_q = quotes[long_k]
-
         for width in available_widths:
-            short_k = round(long_k - width, 2)  # short = lower strike (less ITM)
-
-            if short_k <= spot:
-                continue
-
+            short_k = round(long_k - width, 2)
             short_q = quotes.get(short_k)
             if short_q is None:
+                continue
+
+            profile_info = _classify_bear_profile(long_k, short_k, spot, atm_band)
+            if not profile_info:
+                continue
+            profile, long_bucket, short_bucket = profile_info
+            if _should_skip_put_profile(profile, long_k, short_k, spot, expected_move, atm_band):
                 continue
 
             debit = round(long_q["mid"] - short_q["mid"], 4)
@@ -659,9 +918,8 @@ def build_itm_bear_put_spreads(
                 continue
 
             cost_pct = debit / width
-            if cost_pct > MAX_COST_PCT_OF_WIDTH:
-                continue
-            if cost_pct < MIN_COST_PCT_OF_WIDTH:
+            min_cost, max_cost = _profile_cost_bounds(profile)
+            if cost_pct > max_cost or cost_pct < min_cost:
                 continue
 
             max_profit = round(width - debit, 4)
@@ -680,8 +938,6 @@ def build_itm_bear_put_spreads(
             if long_gamma or short_gamma:
                 net_gamma = round(long_gamma - short_gamma, 6)
 
-            # For bear put: short is the less ITM leg (lower strike)
-            # For bear put: short is the less ITM leg (lower strike)
             short_delta_abs = abs(short_q.get("delta") or 0)
             quality = estimate_vertical_trade_quality(
                 side="bear",
@@ -698,88 +954,121 @@ def build_itm_bear_put_spreads(
             win_prob = quality["win_prob"]
             ev = quality["expected_value"]
 
-            # EM zone: short strike should be within EM above spot
             em_proximity = None
             em_zone = "unknown"
-            if em_upper > 0:
-                em_proximity = round(em_upper - short_k, 2)
-                em_zone = "inside" if short_k <= em_upper else "outside"
+            if em_lower > 0:
+                em_proximity = round(short_k - em_lower, 2)
+                em_zone = "inside" if short_k >= em_lower else "outside"
 
             same_day_target = round(debit * (1 + SAME_DAY_EXIT_PCT), 2)
             next_day_target = round(debit * (1 + NEXT_DAY_EXIT_PCT), 2)
             extended_target = round(debit * (1 + EXTENDED_HOLD_EXIT_PCT), 2)
 
+            natural_debit = None
+            if long_q.get("ask") is not None and short_q.get("bid") is not None:
+                try:
+                    natural_debit = max(0.0, float(long_q.get("ask") or 0) - float(short_q.get("bid") or 0))
+                except Exception:
+                    natural_debit = None
+
             candidates.append({
-                "long":           long_k,
-                "short":          short_k,
-                "width":          width,
-                "debit":          round(debit, 2),
-                "cost_pct":       round(cost_pct * 100, 1),
-                "max_profit":     round(max_profit, 2),
-                "max_loss":       round(max_loss, 2),
-                "ror":            ror,
-                "long_itm":       long_q["itm_amount"],
-                "short_itm":      short_q["itm_amount"],
-                "long_delta":     long_q.get("delta"),
-                "short_delta":    short_q.get("delta"),
-                "long_oi":        long_q.get("oi"),
-                "short_oi":       short_q.get("oi"),
-                "long_bid":       long_q.get("bid"),
-                "long_ask":       long_q.get("ask"),
-                "short_bid":      short_q.get("bid"),
-                "short_ask":      short_q.get("ask"),
+                "long": long_k,
+                "short": short_k,
+                "width": width,
+                "debit": round(debit, 2),
+                "natural_debit": round(natural_debit, 2) if natural_debit is not None else None,
+                "cost_pct": round(cost_pct * 100, 1),
+                "max_profit": round(max_profit, 2),
+                "max_loss": round(max_loss, 2),
+                "ror": ror,
+                "long_itm": long_q["itm_amount"],
+                "short_itm": short_q["itm_amount"],
+                "long_delta": long_q.get("delta"),
+                "short_delta": short_q.get("delta"),
+                "long_oi": long_q.get("oi"),
+                "short_oi": short_q.get("oi"),
+                "long_bid": long_q.get("bid"),
+                "long_ask": long_q.get("ask"),
+                "short_bid": short_q.get("bid"),
+                "short_ask": short_q.get("ask"),
                 "long_spread_pct": long_q.get("spread_pct"),
                 "short_spread_pct": short_q.get("spread_pct"),
-                "net_theta":      net_theta,
-                "net_vega":       net_vega,
-                "net_delta":      net_delta,
-                "net_gamma":      net_gamma,
-                "win_prob":       win_prob,
+                "net_theta": net_theta,
+                "net_vega": net_vega,
+                "net_delta": net_delta,
+                "net_gamma": net_gamma,
+                "win_prob": win_prob,
                 "max_profit_prob": quality.get("max_profit_prob"),
-                "breakeven":      quality.get("breakeven"),
+                "breakeven": quality.get("breakeven"),
                 "expected_value": ev,
-                "em_proximity":   em_proximity,
-                "em_zone":        em_zone,
-                "same_day_exit":  same_day_target,
-                "next_day_exit":  next_day_target,
-                "extended_exit":  extended_target,
-                "warnings":       long_q["warnings"] + short_q["warnings"],
+                "em_proximity": em_proximity,
+                "em_zone": em_zone,
+                "same_day_exit": same_day_target,
+                "next_day_exit": next_day_target,
+                "extended_exit": extended_target,
+                "entry_profile": profile,
+                "profile_label": HYBRID_PROFILE_LABEL.get(profile, profile),
+                "long_bucket": long_bucket,
+                "short_bucket": short_bucket,
+                "warnings": long_q["warnings"] + short_q["warnings"],
             })
 
     return candidates
+
+
+def build_itm_debit_spreads(
+    quotes: Dict[float, Dict],
+    spot: float,
+    available_widths: List[float],
+    expected_move: float = 0,
+    dte: int = 0,
+) -> List[Dict]:
+    """Backward-compatible wrapper for the conservative bull profile only."""
+    candidates = build_bull_call_spreads(quotes, spot, available_widths, expected_move, dte=dte, atm_band=_atm_band(spot))
+    return [c for c in candidates if c.get("entry_profile") == "conservative_itm"]
+
+
+def build_itm_bear_put_spreads(
+    quotes: Dict[float, Dict],
+    spot: float,
+    available_widths: List[float],
+    expected_move: float = 0,
+    dte: int = 0,
+) -> List[Dict]:
+    """Backward-compatible wrapper for the conservative bear profile only."""
+    candidates = build_bear_put_spreads(quotes, spot, available_widths, expected_move, dte=dte, atm_band=_atm_band(spot))
+    return [c for c in candidates if c.get("entry_profile") == "conservative_itm"]
+
 
 
 # ─────────────────────────────────────────────────────────
 # RANKING
 # ─────────────────────────────────────────────────────────
 
-def rank_candidates(candidates: List[Dict], iv_edge_label: str = "NEUTRAL") -> List[Dict]:
+def rank_candidates(candidates: List[Dict], iv_edge_label: str = "NEUTRAL", entry_plan: Dict = None) -> List[Dict]:
     """
-    v4.1: Composite scoring model.
-    Generates a normalized 0-1 score for each candidate using weighted factors:
-      EV (30%) + Win Prob (25%) + Liquidity (20%) + IV Edge (10%)
-      + EM Distance (10%) + Width Efficiency (5%)
-
-    Candidates below RANK_MIN_SCORE are filtered out.
-    Also applies slippage model: rejects if EV_after_slippage <= 0.
+    Composite scoring model with hybrid-entry preference.
+    Candidates are scored on quality, then nudged toward the entry profile
+    that best matches the current directional conviction.
     """
     if not candidates:
         return []
 
-    # Compute raw values for normalization
+    entry_plan = entry_plan or {}
+    aggression = entry_plan.get("aggression", "balanced")
+
     evs = [c.get("expected_value", 0) for c in candidates]
     ev_max = max(abs(e) for e in evs) if evs else 1.0
     ev_max = max(ev_max, 0.01)
 
     scored = []
     for c in candidates:
-        # ── Slippage model ──
         spread_pct_avg = 0
         long_spread = c.get("long_spread_pct", 0) or 0
         short_spread = c.get("short_spread_pct", 0) or 0
         if long_spread or short_spread:
             spread_pct_avg = (long_spread + short_spread) / 2
-        # Estimate slippage from bid-ask spread
+
         debit = c.get("debit", 0)
         warnings = c.get("warnings", [])
         est_slippage = debit * SLIPPAGE_SPREAD_FACTOR * spread_pct_avg if spread_pct_avg > 0 else 0.01
@@ -798,20 +1087,16 @@ def rank_candidates(candidates: List[Dict], iv_edge_label: str = "NEUTRAL") -> L
             c["_rejected"] = "slippage_or_negative_ev"
             continue
 
-        # ── Factor scores (each 0-1) ──
-        # EV (after estimated slippage matters more than raw EV)
         ev_score = max(0, (ev_after_slippage / ev_max + 1) / 2)
         if ev_after_slippage <= 0:
             ev_score = 0
 
-        # Win probability / payout sanity
         wp = c.get("win_prob", 0.5)
         wp_score = min(wp, 1.0)
         breakeven_prob_needed = max(0.05, min(0.95, c.get("debit", 0) / max(c.get("width", 1.0), 0.01)))
         if wp < breakeven_prob_needed:
             wp_score *= 0.7
 
-        # Liquidity (fewer warnings = better, OI matters)
         warn_count = len(warnings)
         liq_score = max(0, 1.0 - warn_count * 0.25)
         long_oi = c.get("long_oi", 0) or 0
@@ -822,31 +1107,31 @@ def rank_candidates(candidates: List[Dict], iv_edge_label: str = "NEUTRAL") -> L
         elif avg_oi >= 2000:
             liq_score = min(1.0, liq_score + 0.1)
 
-        # IV edge
-        iv_score = 0.5  # neutral
+        iv_score = 0.5
         if iv_edge_label == "BUYER":
             iv_score = 0.85
         elif iv_edge_label == "SELLER":
             iv_score = 0.15
 
-        # EM distance
         em_zone = c.get("em_zone", "unknown")
         em_prox = c.get("em_proximity")
         if em_zone == "inside" and em_prox is not None:
-            em_score = min(1.0, 0.6 + 0.4 * max(0, 1 - em_prox / 5.0))
+            em_score = min(1.0, 0.6 + 0.4 * max(0, 1 - abs(em_prox) / 5.0))
         elif em_zone == "outside":
             em_score = 0.2
         else:
             em_score = 0.4
 
-        # Width efficiency + cost discipline
         width = c.get("width", 5)
         width_score = 0.95 if width <= 1.0 else 0.78 if width <= 2.5 else 0.52 if width <= 5.0 else 0.35
         cost_pct = (c.get("cost_pct", 100) or 100) / 100.0
         if cost_pct >= 0.68:
             width_score *= 0.8
+        if c.get("entry_profile") == "early_atm" and cost_pct <= 0.35:
+            width_score = min(1.0, width_score + 0.10)
+        if c.get("entry_profile") == "balanced_transition" and cost_pct <= 0.50:
+            width_score = min(1.0, width_score + 0.05)
 
-        # ── Composite ──
         composite = (
             ev_score * RANK_WEIGHT_EV +
             wp_score * RANK_WEIGHT_WIN_PROB +
@@ -855,17 +1140,26 @@ def rank_candidates(candidates: List[Dict], iv_edge_label: str = "NEUTRAL") -> L
             em_score * RANK_WEIGHT_EM_DISTANCE +
             width_score * RANK_WEIGHT_WIDTH_EFF
         )
+
+        profile = c.get("entry_profile", "conservative_itm")
+        profile_mult = _profile_fit_multiplier(profile, aggression)
+        composite *= profile_mult
+
+        c["entry_fit_multiplier"] = round(profile_mult, 4)
         c["rank_score"] = round(composite, 4)
         c["rank_context"] = {
             "ev_after_slippage": round(ev_after_slippage, 4),
             "breakeven_prob_needed": round(breakeven_prob_needed, 4),
             "wp_minus_hurdle": round(wp - breakeven_prob_needed, 4),
+            "entry_aggression": aggression,
+            "entry_profile": profile,
         }
 
         if composite >= RANK_MIN_SCORE:
             scored.append(c)
 
     return sorted(scored, key=lambda c: c.get("rank_score", 0), reverse=True)
+
 
 
 # ─────────────────────────────────────────────────────────
@@ -1337,10 +1631,10 @@ def recommend_trade(
 ) -> Dict[str, Any]:
     """
     Main entry point. Returns a complete trade recommendation or rejection.
-    v3.6: supports both bull call and bear put debit spreads.
-    v3.9: accepts v4_flow from institutional engine for flow quality scoring.
-    v4.5: accepts vol_regime from build_canonical_vol_regime for full 6-input
-          vol scoring inside compute_confidence.
+    Phase 2 adds a hybrid entry framework:
+      - conservative_itm: both legs ITM
+      - balanced_transition: long ITM, short near/through spot
+      - early_atm: long ATM, short modest OTM
     """
     webhook_data = webhook_data or {}
     candle_closes = candle_closes or []
@@ -1365,7 +1659,6 @@ def recommend_trade(
         result["deal_breaker"] = "dividend"
         return result
 
-    # ── Vol / EM data ──
     avg_iv = get_avg_chain_iv(contracts, spot, side="call" if bias == "bull" else "put")
     expected_move = calc_expected_move(spot, avg_iv, dte) if avg_iv > 0 else 0.0
     rv = calc_realized_vol(candle_closes) if candle_closes else 0.0
@@ -1373,32 +1666,34 @@ def recommend_trade(
 
     em_data = {
         "expected_move": expected_move,
-        "spot":          spot,
-        "iv":            avg_iv,
-        "rv":            rv,
-        "dte":           dte,
+        "spot": spot,
+        "iv": avg_iv,
+        "rv": rv,
+        "dte": dte,
     }
 
-    # ── Route by direction ──
+    regime = regime or {}
+    entry_plan = _determine_entry_plan(webhook_data, bias, regime=regime, v4_flow=v4_flow, vol_edge=vol_edge)
+    atm_band = _atm_band(spot)
+
     if bias == "bear":
-        quotes = build_put_quotes(contracts, spot, ticker=ticker)
+        quotes = build_put_quotes(contracts, spot, ticker=ticker, include_otm=HYBRID_ENTRY_ENABLED)
         if len(quotes) < 2:
-            result["reason"] = f"Not enough ITM put strikes (need 2, found {len(quotes)})"
+            result["reason"] = f"Not enough liquid put strikes after hybrid filter (need 2, found {len(quotes)})"
             return result
 
-        itm_strike_list = sorted(quotes.keys())
-        available_widths = detect_available_widths(itm_strike_list, spot)
+        available_widths = detect_available_widths(sorted(quotes.keys()), spot)
         if not available_widths:
             result["reason"] = "No valid widths available from put strike increments"
             return result
 
-        candidates = build_itm_bear_put_spreads(quotes, spot, available_widths, expected_move, dte=dte)
+        candidates = build_bear_put_spreads(quotes, spot, available_widths, expected_move, dte=dte, atm_band=atm_band)
         spread_side = "put"
         spread_label = "BEAR PUT"
     else:
-        quotes = build_call_quotes(contracts, spot, ticker=ticker)
+        quotes = build_call_quotes(contracts, spot, ticker=ticker, include_otm=HYBRID_ENTRY_ENABLED)
         if len(quotes) < 2:
-            result["reason"] = f"Not enough ITM call strikes (need 2, found {len(quotes)})"
+            result["reason"] = f"Not enough liquid call strikes after hybrid filter (need 2, found {len(quotes)})"
             return result
 
         available_widths = detect_available_widths(list(quotes.keys()), spot)
@@ -1406,53 +1701,56 @@ def recommend_trade(
             result["reason"] = "No valid widths available from call strike increments"
             return result
 
-        candidates = build_itm_debit_spreads(quotes, spot, available_widths, expected_move, dte=dte)
+        candidates = build_bull_call_spreads(quotes, spot, available_widths, expected_move, dte=dte, atm_band=atm_band)
         spread_side = "call"
         spread_label = "BULL CALL"
 
     if not candidates:
         result["reason"] = (
-            f"No valid ITM debit spreads found "
-            f"(widths tried: {available_widths}, "
-            f"cost cap: {MAX_COST_PCT_OF_WIDTH:.0%}, "
-            f"ITM strikes: {len(quotes)})"
+            f"No valid hybrid debit spreads found "
+            f"(widths tried: {available_widths}, liquid strikes: {len(quotes)}, entry mode: {entry_plan.get('aggression')})"
         )
+        result["entry_plan"] = entry_plan
         return result
 
-    # ── Rank and pick best ──
-    ranked = rank_candidates(candidates, iv_edge_label=vol_edge.get("edge_label", "NEUTRAL") if vol_edge else "NEUTRAL")
+    ranked = rank_candidates(
+        candidates,
+        iv_edge_label=vol_edge.get("edge_label", "NEUTRAL") if vol_edge else "NEUTRAL",
+        entry_plan=entry_plan,
+    )
     if not ranked:
         rejected = {}
         for c in candidates:
             reason = c.get("_rejected", "filtered")
             rejected[reason] = rejected.get(reason, 0) + 1
         rej_txt = ", ".join(f"{k}:{v}" for k, v in sorted(rejected.items())) if rejected else "all filtered"
+        profiles = {}
+        for c in candidates:
+            p = c.get("entry_profile", "unknown")
+            profiles[p] = profiles.get(p, 0) + 1
+        profile_txt = ", ".join(f"{k}:{v}" for k, v in sorted(profiles.items()))
         result["reason"] = (
             f"No ranked {spread_label} spreads passed quality filters "
-            f"(widths tried: {available_widths}; rejects: {rej_txt})"
+            f"(widths tried: {available_widths}; profiles: {profile_txt}; rejects: {rej_txt})"
         )
         result["deal_breaker"] = "ranking_filters"
+        result["entry_plan"] = entry_plan
         return result
     best = ranked[0]
 
-    # ── Width ladder ──
     ladder = []
     seen_widths = set()
     for c in ranked:
-        w = c["width"]
+        w = (c["width"], c.get("entry_profile"))
         if w not in seen_widths:
             seen_widths.add(w)
             ladder.append(c)
 
-    # ── Position sizing ──
     tier = webhook_data.get("tier", "2")
     num_contracts, total_risk, sizing_note = compute_position_size(best["debit"], tier)
 
-    # ── Stop loss ──
     stop_price, stop_note = compute_stop_loss(ticker, best["debit"])
 
-    # ── Confidence scoring ──
-    regime = regime or {}
     confidence, conf_reasons = compute_confidence(
         webhook_data, best, has_earnings, has_dividend,
         vol_edge=vol_edge,
@@ -1467,35 +1765,41 @@ def recommend_trade(
         result["reason"] = f"Confidence {confidence}/100 below {MIN_CONFIDENCE_TO_TRADE} threshold"
         result["confidence"] = confidence
         result["conf_reasons"] = conf_reasons
+        result["entry_plan"] = entry_plan
         return result
 
-    # ── Win probability gate (v4.4) ──
-    # Uses approximate profit probability at expiry, not just short-leg delta.
     win_prob = best.get("win_prob", 0)
-    if win_prob < MIN_WIN_PROBABILITY:
+    min_win_prob_required = _dynamic_min_win_probability(best.get("entry_profile", "conservative_itm"), confidence)
+    if win_prob < min_win_prob_required:
         result["reason"] = (
-            f"Profit probability {win_prob:.0%} below {MIN_WIN_PROBABILITY:.0%} minimum "
-            f"(breakeven odds too weak for this spread)"
+            f"Profit probability {win_prob:.0%} below {min_win_prob_required:.0%} minimum "
+            f"for {best.get('profile_label', 'this entry mode')}"
         )
         result["confidence"] = confidence
         result["conf_reasons"] = conf_reasons
+        result["entry_plan"] = entry_plan
         return result
 
-    # ── Apply regime size multiplier ──
+    profile_size_mult = _entry_size_multiplier(best.get("entry_profile", "conservative_itm"))
     regime_size_mult = regime.get("size_mult", 1.0)
-    regime_note = ""
-    if regime_size_mult < 1.0 and regime_size_mult > 0:
-        num_contracts = max(1, int(num_contracts * regime_size_mult))
-        total_risk = num_contracts * best["debit"] * 100
-        regime_note = f" | Regime ×{regime_size_mult} (choppy — sized down)"
+    combined_size_mult = profile_size_mult * regime_size_mult
 
-    # Rebuild sizing note after regime adjustment — one contract count, no contradictions
+    sizing_tags = []
+    if profile_size_mult < 1.0:
+        sizing_tags.append(f"entry ×{profile_size_mult:.2f}")
+    if regime_size_mult < 1.0 and regime_size_mult > 0:
+        sizing_tags.append(f"regime ×{regime_size_mult:.2f}")
+
+    if combined_size_mult < 1.0 and combined_size_mult > 0:
+        num_contracts = max(1, int(num_contracts * combined_size_mult))
+        total_risk = num_contracts * best["debit"] * 100
+
+    regime_note = f" | {'; '.join(sizing_tags)}" if sizing_tags else ""
     sizing_note = (
         f"{num_contracts} contract(s) × ${best['debit']:.2f} = ${total_risk:.0f} risk "
         f"[max ${MAX_RISK_PER_TRADE_USD:.0f}, {MAX_RISK_PCT_ACCOUNT:.0%} acct]{regime_note}"
     )
 
-    # ── Exit targets ──
     exits = {
         "same_day": {
             "target_pct": f"{SAME_DAY_EXIT_PCT:.0%}",
@@ -1518,40 +1822,36 @@ def recommend_trade(
     }
 
     return {
-        "ok":               True,
-        "ticker":           ticker,
-        "spot":             spot,
-        "dte":              dte,
-        "exp":              expiration,
-        "direction":        bias,
-        "spread_type":      "debit",
-        "side":             spread_side,
-        "spread_label":     spread_label,
-
-        "trade":            best,
-        "ladder":           ladder,
-        "candidate_count":  len(candidates),
-
-        "contracts":        num_contracts,
-        "total_risk":       total_risk,
-        "sizing_note":      sizing_note,
-
-        "stop_price":       stop_price,
-        "stop_note":        stop_note,
-
-        "exits":            exits,
-
-        "confidence":       confidence,
-        "conf_reasons":     conf_reasons,
-
-        "tier":             tier,
-        "webhook_data":     webhook_data,
-
-        "expected_move":    expected_move,
-        "vol_edge":         vol_edge,
-        "em_data":          em_data,
-        "regime":           regime,
+        "ok": True,
+        "ticker": ticker,
+        "spot": spot,
+        "dte": dte,
+        "exp": expiration,
+        "direction": bias,
+        "spread_type": "debit",
+        "side": spread_side,
+        "spread_label": spread_label,
+        "trade": best,
+        "ladder": ladder,
+        "candidate_count": len(candidates),
+        "contracts": num_contracts,
+        "total_risk": total_risk,
+        "sizing_note": sizing_note,
+        "stop_price": stop_price,
+        "stop_note": stop_note,
+        "exits": exits,
+        "confidence": confidence,
+        "conf_reasons": conf_reasons,
+        "tier": tier,
+        "webhook_data": webhook_data,
+        "expected_move": expected_move,
+        "vol_edge": vol_edge,
+        "em_data": em_data,
+        "regime": regime,
+        "entry_plan": entry_plan,
+        "min_win_prob_required": min_win_prob_required,
     }
+
 
 
 # ─────────────────────────────────────────────────────────
@@ -1582,6 +1882,7 @@ def format_trade_card(rec: Dict) -> str:
     max_profit_per = round(trade['max_profit'] * 100, 2)
     contract_line = f"BUY {trade['long']}/{trade['short']} {opt_type} Debit Spread"
     em = rec.get("expected_move", 0)
+    entry_label = trade.get("profile_label", HYBRID_PROFILE_LABEL.get(trade.get("entry_profile"), "Conservative ITM"))
 
     why = []
     if trade.get("em_zone") == "inside":
@@ -1590,7 +1891,11 @@ def format_trade_card(rec: Dict) -> str:
         why.append("it uses the tightest width available")
     elif trade.get("width", 0) <= 2.5:
         why.append("it keeps width relatively conservative")
-    if trade.get("long_itm", 0) > 0:
+    if trade.get("entry_profile") == "early_atm":
+        why.append("it uses the earlier ATM profile to cut cost when conviction is stronger")
+    elif trade.get("entry_profile") == "balanced_transition":
+        why.append("it balances room for error with a lower debit than full ITM")
+    elif trade.get("long_itm", 0) > 0:
         why.append("the long leg starts ITM to give the trade more room")
     if rec.get("vol_edge", {}).get("edge_label") == "BUYER":
         why.append("IV vs RV is favorable for a debit buyer")
@@ -1608,7 +1913,7 @@ def format_trade_card(rec: Dict) -> str:
     lines = [
         f"{tier_emoji} {ticker} — {dir_word} Trade",
         f"🎯 Contract: {contract_line}",
-        f"📅 Exp: {rec['exp']} | DTE: {rec['dte']} | 💪 Confidence: {conf}/100",
+        f"📅 Exp: {rec['exp']} | DTE: {rec['dte']} | 💪 Confidence: {conf}/100 | Entry: {entry_label}",
         f"💵 Cost: ~${display_debit:.2f} est. fill (${risk_per:.0f} max risk) | Max Profit: ${trade['max_profit']:.2f} (${max_profit_per:.0f})",
     ]
 
@@ -1639,7 +1944,7 @@ def format_trade_card(rec: Dict) -> str:
         "",
         "📦 Data:",
         f"  Width ${trade['width']:.2f} | Long {trade['long']} / Short {trade['short']}",
-        f"  ITM: long ${trade['long_itm']:.2f} | short ${trade['short_itm']:.2f}",
+        f"  Buckets: long {trade.get('long_bucket', '?')} | short {trade.get('short_bucket', '?')} | ITM long ${trade['long_itm']:.2f} / short ${trade['short_itm']:.2f}",
         f"  RoR {trade['ror']:.0%} | Win Prob {trade.get('win_prob', 0):.0%} | EV ${trade.get('expected_value', 0):.2f}/contract",
     ]
 
