@@ -268,6 +268,193 @@ def format_canonical_vol_line(vol_regime: dict) -> str:
 
 
 
+def resolve_canonical_dealer_regime(
+    eng: Optional[dict] = None,
+    cagf: Optional[dict] = None,
+    spot: float = 0,
+    v4_flow: Optional[dict] = None,
+) -> dict:
+    """
+    Canonical dealer regime resolver used by EM/scalp/swing shared snapshots.
+    This mirrors the prior card formatter behavior but lives in the shared model
+    layer so all engines can consume the same regime object.
+    """
+    eng = eng or {}
+    cagf = cagf or {}
+    v4_flow = v4_flow or {}
+
+    gex = _as_float(v4_flow.get("gex"), _as_float(eng.get("gex"), 0.0))
+    flip = v4_flow.get("gamma_flip") or eng.get("flip_price") or eng.get("gamma_flip")
+    gex_negative = gex < 0
+
+    result = {
+        "label": "UNKNOWN",
+        "source": "none",
+        "description": "Insufficient data to determine regime.",
+        "allows_debit_spreads": True,
+        "allows_credit_spreads": True,
+        "gex_raw_negative": gex_negative,
+        "flip_price": flip,
+        "spot_vs_flip": "unknown",
+    }
+
+    if flip and spot > 0:
+        result["spot_vs_flip"] = "above" if spot > float(flip) else "below"
+
+    cagf_regime = str(cagf.get("regime") or "").upper()
+    v4_regime = str(v4_flow.get("composite_regime") or "").upper()
+    trend_prob = _as_float(cagf.get("trend_day_probability"), 0.0)
+
+    if cagf_regime and cagf_regime != "UNKNOWN":
+        if cagf_regime == "TRENDING":
+            result.update({
+                "label": "TRENDING",
+                "source": "institutional flow model",
+                "description": "Dealers are positioned for directional moves. Price trends tend to accelerate.",
+                "allows_debit_spreads": True,
+                "allows_credit_spreads": False,
+            })
+        elif cagf_regime == "SUPPRESSING":
+            desc = "Dealers suppress price moves in this zone. Ranges tend to hold."
+            label = "SUPPRESSING"
+            if gex_negative:
+                label = "MIXED"
+                desc = (
+                    "The flow model leans suppressing (above gamma flip), but raw dealer gamma is still negative. "
+                    "Moves may be dampened but breakout risk remains."
+                )
+            result.update({
+                "label": label,
+                "source": "institutional flow model",
+                "description": desc,
+                "allows_debit_spreads": trend_prob >= 0.45,
+                "allows_credit_spreads": True,
+            })
+        else:
+            result.update({
+                "label": "NEUTRAL",
+                "source": "institutional flow model",
+                "description": "No strong regime signal. Mixed conditions.",
+                "allows_debit_spreads": True,
+                "allows_credit_spreads": True,
+            })
+    elif v4_regime and v4_regime != "UNKNOWN":
+        mapped = v4_regime if v4_regime in ("TRENDING", "SUPPRESSING", "MIXED", "NEUTRAL") else "NEUTRAL"
+        desc_map = {
+            "TRENDING": "v4 composite says dealer positioning is amplifying moves.",
+            "SUPPRESSING": "v4 composite says dealer positioning is suppressing moves.",
+            "MIXED": "v4 composite shows mixed dealer conditions.",
+            "NEUTRAL": "v4 composite shows no strong dealer regime edge.",
+        }
+        result.update({
+            "label": mapped,
+            "source": "v4 composite",
+            "description": desc_map.get(mapped, "v4 composite dealer regime."),
+            "allows_debit_spreads": mapped in ("TRENDING", "MIXED", "NEUTRAL"),
+            "allows_credit_spreads": mapped in ("SUPPRESSING", "MIXED", "NEUTRAL"),
+        })
+    elif eng:
+        if gex_negative:
+            result.update({
+                "label": "TRENDING",
+                "source": "raw GEX",
+                "description": "Negative dealer gamma — moves can accelerate. Directional strategies are favored.",
+                "allows_debit_spreads": True,
+                "allows_credit_spreads": False,
+            })
+        else:
+            result.update({
+                "label": "SUPPRESSING",
+                "source": "raw GEX",
+                "description": "Positive dealer gamma — moves tend to be dampened. Range-bound strategies may work better.",
+                "allows_debit_spreads": False,
+                "allows_credit_spreads": True,
+            })
+
+    if result.get("label") in ("TRENDING", "SUPPRESSING") and v4_regime and v4_regime not in (result.get("label"), "UNKNOWN"):
+        result["description"] = f"{result.get('description', '')} v4 composite={v4_regime}.".strip()
+
+    return result
+
+
+def build_canonical_dealer_snapshot(
+    ticker: str,
+    spot: float,
+    eng: Optional[dict] = None,
+    cagf: Optional[dict] = None,
+    v4_flow: Optional[dict] = None,
+    walls: Optional[dict] = None,
+    dealer_regime: Optional[dict] = None,
+) -> dict:
+    """Owns raw dealer-structure creation for shared-model consumers."""
+    eng = eng or {}
+    cagf = cagf or {}
+    v4_flow = v4_flow or {}
+    walls = walls or {}
+
+    regime = dict(dealer_regime or {})
+    if not regime or not regime.get("label"):
+        regime = resolve_canonical_dealer_regime(eng=eng, cagf=cagf, spot=spot, v4_flow=v4_flow)
+    else:
+        regime.setdefault("flip_price", v4_flow.get("gamma_flip") or eng.get("flip_price") or eng.get("gamma_flip"))
+        if regime.get("flip_price") and spot > 0 and regime.get("spot_vs_flip") not in ("above", "below"):
+            regime["spot_vs_flip"] = "above" if spot > float(regime["flip_price"]) else "below"
+        regime.setdefault("source", "precomputed")
+        regime.setdefault("description", "")
+
+    flip = regime.get("flip_price") or v4_flow.get("gamma_flip") or eng.get("flip_price") or eng.get("gamma_flip")
+    max_pain = walls.get("max_pain")
+    if max_pain is None:
+        max_pain = eng.get("max_pain")
+
+    call_wall = walls.get("call_wall")
+    if call_wall is None:
+        call_wall = eng.get("call_wall")
+    put_wall = walls.get("put_wall")
+    if put_wall is None:
+        put_wall = eng.get("put_wall")
+    gamma_wall = walls.get("gamma_wall")
+    if gamma_wall is None:
+        gamma_wall = eng.get("gamma_wall") or flip
+
+    pin_zone_low = put_wall if put_wall is not None else max_pain
+    pin_zone_high = call_wall if call_wall is not None else max_pain
+
+    out = {
+        "ticker": ticker,
+        "spot": spot,
+        "label": str(regime.get("label") or regime.get("regime") or "UNKNOWN").upper(),
+        "regime": str(regime.get("label") or regime.get("regime") or "UNKNOWN").upper(),
+        "source": regime.get("source") or "unknown",
+        "description": regime.get("description") or "",
+        "allows_debit_spreads": regime.get("allows_debit_spreads", True),
+        "allows_credit_spreads": regime.get("allows_credit_spreads", True),
+        "gex_raw_negative": bool(regime.get("gex_raw_negative", _as_float(v4_flow.get("gex"), _as_float(eng.get("gex"), 0.0)) < 0)),
+        "flip_price": _as_float(flip, None),
+        "spot_vs_flip": regime.get("spot_vs_flip") or "unknown",
+        "distance_to_flip": round(abs(float(spot) - float(flip)), 2) if spot and flip is not None else None,
+        "gex": _as_float(v4_flow.get("gex"), _as_float(eng.get("gex"), None)),
+        "dex": _as_float(v4_flow.get("dex"), _as_float(eng.get("dex"), None)),
+        "vanna": _as_float(v4_flow.get("vanna"), _as_float(eng.get("vanna"), None)),
+        "charm": _as_float(v4_flow.get("charm"), _as_float(eng.get("charm"), None)),
+        "bias": v4_flow.get("bias") or cagf.get("bias") or None,
+        "bias_score": v4_flow.get("bias_score") if v4_flow.get("bias_score") is not None else cagf.get("bias_score"),
+        "max_pain": _as_float(max_pain, None),
+        "call_wall": _as_float(call_wall, None),
+        "put_wall": _as_float(put_wall, None),
+        "gamma_wall": _as_float(gamma_wall, None),
+        "pin_zone_low": _as_float(pin_zone_low, None),
+        "pin_zone_high": _as_float(pin_zone_high, None),
+        "confidence_label": v4_flow.get("confidence_label") or None,
+        "downgrades": list(v4_flow.get("downgrades") or []),
+    }
+
+    near_threshold = max(float(spot or 0) * 0.0025, 0.75) if spot else 0.75
+    out["near_flip"] = bool(out.get("flip_price") is not None and out.get("distance_to_flip") is not None and out.get("distance_to_flip") <= near_threshold)
+    out["near_max_pain"] = bool(out.get("max_pain") is not None and abs(float(spot or 0) - float(out.get("max_pain"))) <= near_threshold) if spot and out.get("max_pain") is not None else False
+    return out
+
+
 def apply_vol_overlay_to_rec(rec: dict, vol_regime: dict, mode: str = "scalp") -> dict:
     rec = rec or {}
     if not vol_regime:
@@ -745,13 +932,22 @@ def build_manual_swing_signal_context(ticker: str, spot: float, rows: list, dire
 
 
 
-def build_shared_model_snapshot(ticker: str, spot: float, dealer_regime: Optional[dict] = None, vol_regime: Optional[dict] = None, structure_ctx: Optional[dict] = None, rec: Optional[dict] = None) -> dict:
+def build_shared_model_snapshot(ticker: str, spot: float, dealer_regime: Optional[dict] = None, vol_regime: Optional[dict] = None, structure_ctx: Optional[dict] = None, rec: Optional[dict] = None, eng: Optional[dict] = None, cagf: Optional[dict] = None, v4_flow: Optional[dict] = None, walls: Optional[dict] = None) -> dict:
     rec = rec or {}
     ps = ((structure_ctx or {}).get("price_structure") or {})
+    dealer_snapshot = build_canonical_dealer_snapshot(
+        ticker=ticker,
+        spot=spot,
+        eng=eng,
+        cagf=cagf,
+        v4_flow=v4_flow,
+        walls=walls,
+        dealer_regime=dealer_regime,
+    )
     return {
         "ticker": ticker,
         "spot": spot,
-        "dealer_regime": dealer_regime or {},
+        "dealer_regime": dealer_snapshot,
         "vol_regime": vol_regime or {},
         "posture": (rec or {}).get("posture") or (vol_regime or {}).get("posture"),
         "structure": {
@@ -780,6 +976,19 @@ def format_shared_snapshot_lines(shared_snapshot: Optional[dict]) -> List[str]:
         if desc:
             line += f" — {desc}"
         lines.append(line)
+        dealer_bits: List[str] = []
+        if dealer.get("spot_vs_flip") in ("above", "below"):
+            dealer_bits.append(f"spot {dealer.get('spot_vs_flip')} flip")
+        if dealer.get("flip_price") is not None:
+            dealer_bits.append(f"flip {_fmt_money(dealer.get('flip_price'))}")
+        if dealer.get("max_pain") is not None:
+            dealer_bits.append(f"max pain {_fmt_money(dealer.get('max_pain'))}")
+        if dealer.get("put_wall") is not None or dealer.get("call_wall") is not None:
+            pw = _fmt_money(dealer.get("put_wall")) if dealer.get("put_wall") is not None else "—"
+            cw = _fmt_money(dealer.get("call_wall")) if dealer.get("call_wall") is not None else "—"
+            dealer_bits.append(f"walls {pw}/{cw}")
+        if dealer_bits:
+            lines.append("🏦 Dealer Structure: " + " | ".join(dealer_bits))
     vol = snap.get("vol_regime") or {}
     if vol:
         lines.append(f"🌡️ Volatility Regime: {format_canonical_vol_line(vol)}")
