@@ -250,7 +250,7 @@ REGIME_ADX_TRENDING      = 30.0
 REGIME_CRISIS_BLOCK      = True
 REGIME_ELEVATED_SIZE_MULT = 0.50
 REGIME_CHOPPY_SIZE_MULT  = 0.75
-REGIME_TRENDING_SIZE_MULT = 1.0
+REGIME_TRENDING_SIZE_MULT = 1.25  # Bonus sizing in trending low-vol regime
 
 
 # ═══════════════════════════════════════════════════════════
