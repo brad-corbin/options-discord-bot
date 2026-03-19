@@ -702,9 +702,8 @@ def apply_effective_regime_gate_to_rec(
     block_reason = ""
     if mode in ("scalp", "swing"):
         if effective.get("requires_trigger") and not has_confirmed_trigger:
-            if (structure_score is not None and structure_score <= -4) or (conf_now is not None and conf_now < 50):
-                should_block = True
-                block_reason = effective.get("description") or "Trigger required while price is pinned / range-bound."
+            should_block = True
+            block_reason = effective.get("description") or "Trigger required while price is pinned / range-bound."
         if not effective.get("entry_allowed", True) and not has_confirmed_trigger and not should_block:
             should_block = True
             block_reason = effective.get("description") or "Effective regime blocks fresh directional entry here."
