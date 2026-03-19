@@ -3967,7 +3967,7 @@ threading.Thread(target=_em_scheduler, daemon=True, name="em-scheduler").start()
 
 
 # ─────────────────────────────────────────────────────────
-# STARTUP
+# STARTUP 1
 # ─────────────────────────────────────────────────────────
 
 with app.app_context():
