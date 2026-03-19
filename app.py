@@ -2685,10 +2685,11 @@ def _get_0dte_iv(ticker: str, target_date_str: str = None) -> tuple:
             return empty
 
         vix = _get_vix_data()
+        enriched_walls = _derive_structure_levels_from_chain(data, spot, v4.get("walls", {}), v4.get("engine_result", {}))
 
         return (
             v4["iv"], spot, target,
-            v4["engine_result"], v4["walls"],
+            v4["engine_result"], enriched_walls,
             v4["skew"], v4["pcr"], vix,
             v4,
         )
@@ -2744,11 +2745,147 @@ def _get_chain_iv_for_expiry(ticker: str, target_date_str: str, dte: float) -> t
             return empty
 
         vix = _get_vix_data()
-        return (v4["iv"], spot, target, v4["engine_result"], v4["walls"],
+        enriched_walls = _derive_structure_levels_from_chain(data, spot, v4.get("walls", {}), v4.get("engine_result", {}))
+        return (v4["iv"], spot, target, v4["engine_result"], enriched_walls,
                 v4["skew"], v4["pcr"], vix, v4)
     except Exception as e:
         log.warning(f"Chain IV fetch failed for {ticker} exp={target_date_str}: {e}")
         return empty
+
+
+def _normalize_option_side(raw) -> str:
+    s = str(raw or "").lower().strip()
+    if s in ("c", "call"):
+        return "call"
+    if s in ("p", "put"):
+        return "put"
+    return s
+
+
+def _fmt_money(val, decimals: int = 2) -> str:
+    if val is None:
+        return "n/a"
+    try:
+        return f"${float(val):,.{decimals}f}"
+    except Exception:
+        return str(val)
+
+
+def _format_unified_regime_line(regime) -> str:
+    if not regime:
+        return "UNKNOWN — no regime data"
+    if isinstance(regime, str):
+        return regime
+    label = str(regime.get("label") or regime.get("regime") or "UNKNOWN").upper()
+    desc = str(regime.get("description") or "").strip()
+    source = str(regime.get("source") or "").strip()
+    spot_vs_flip = regime.get("spot_vs_flip")
+    extras = []
+    if spot_vs_flip in ("above", "below"):
+        extras.append(f"spot {spot_vs_flip} flip")
+    if source and source != "unknown":
+        extras.append(source)
+    suffix = f" ({', '.join(extras)})" if extras else ""
+    return f"{label}{suffix} — {desc}" if desc else f"{label}{suffix}"
+
+
+def _derive_structure_levels_from_chain(data: dict, spot: float, base_walls: dict | None = None, eng: dict | None = None) -> dict:
+    """
+    Backfill structural levels from raw chain data so logging/output always has the same
+    canonical fields even when the upstream snapshot omits some of them.
+    """
+    walls = dict(base_walls or {})
+    if not isinstance(data, dict):
+        return walls
+
+    sym_list = data.get("optionSymbol") or []
+    n = len(sym_list)
+    if n == 0:
+        return walls
+
+    def col(name, default=None):
+        v = data.get(name, default)
+        return v if isinstance(v, list) else [default] * n
+
+    strikes = col("strike", None)
+    sides = col("side", col("right", ""))
+    ois = col("openInterest", 0)
+    gammas = col("gamma", None)
+
+    by_strike = {}
+    unique_strikes = set()
+    for i in range(n):
+        try:
+            strike = as_float(strikes[i], None)
+        except Exception:
+            strike = None
+        if strike is None:
+            continue
+        side = _normalize_option_side(sides[i])
+        oi = as_int(ois[i], 0)
+        gamma = as_float(gammas[i], 0.0)
+        row = by_strike.setdefault(strike, {"call_oi": 0, "put_oi": 0, "gamma_abs": 0.0})
+        if side == "call":
+            row["call_oi"] += oi
+        elif side == "put":
+            row["put_oi"] += oi
+        if gamma and oi:
+            row["gamma_abs"] += abs(gamma) * max(oi, 0)
+        unique_strikes.add(strike)
+
+    if not by_strike:
+        return walls
+
+    call_candidates = sorted([k for k, v in by_strike.items() if k > spot and v.get("call_oi", 0) > 0], key=lambda k: by_strike[k]["call_oi"], reverse=True)
+    put_candidates = sorted([k for k, v in by_strike.items() if k < spot and v.get("put_oi", 0) > 0], key=lambda k: by_strike[k]["put_oi"], reverse=True)
+
+    if call_candidates:
+        cw = walls.get("call_wall") or call_candidates[0]
+        walls["call_wall"] = cw
+        walls["call_wall_oi"] = by_strike.get(cw, {}).get("call_oi", by_strike[call_candidates[0]].get("call_oi", 0))
+        walls.setdefault("call_top3", sorted(call_candidates[:3]))
+
+    if put_candidates:
+        pw = walls.get("put_wall") or put_candidates[0]
+        walls["put_wall"] = pw
+        walls["put_wall_oi"] = by_strike.get(pw, {}).get("put_oi", by_strike[put_candidates[0]].get("put_oi", 0))
+        walls.setdefault("put_top3", sorted(put_candidates[:3], reverse=True))
+
+    if not walls.get("gamma_wall"):
+        gamma_candidates = [k for k, v in by_strike.items() if v.get("gamma_abs", 0) > 0]
+        if gamma_candidates:
+            gw = max(gamma_candidates, key=lambda k: by_strike[k]["gamma_abs"])
+            walls["gamma_wall"] = gw
+            walls["gamma_wall_gex"] = by_strike[gw].get("gamma_abs", 0)
+
+    if not walls.get("gamma_flip") and eng and eng.get("flip_price") is not None:
+        walls["gamma_flip"] = eng.get("flip_price")
+
+    if not walls.get("max_pain"):
+        all_strikes = sorted(unique_strikes)
+        best_strike = None
+        best_payout = None
+        for settle in all_strikes:
+            payout = 0.0
+            for strike, row in by_strike.items():
+                call_oi = row.get("call_oi", 0)
+                put_oi = row.get("put_oi", 0)
+                if call_oi:
+                    payout += max(0.0, settle - strike) * call_oi * 100
+                if put_oi:
+                    payout += max(0.0, strike - settle) * put_oi * 100
+            if best_payout is None or payout < best_payout:
+                best_payout = payout
+                best_strike = settle
+        if best_strike is not None:
+            walls["max_pain"] = best_strike
+
+    if walls.get("put_wall") is not None:
+        walls["pin_zone_low"] = walls.get("put_wall")
+    if walls.get("call_wall") is not None:
+        walls["pin_zone_high"] = walls.get("call_wall")
+
+    return walls
 
 
 def _estimate_liquidity(ticker: str, spot: float) -> tuple:
@@ -3017,7 +3154,7 @@ def _log_em_prediction(ticker: str, session: str, spot: float, em: dict, bias: d
         now_dt = datetime.now(timezone.utc)
         now_str = now_dt.strftime("%Y-%m-%d")
         key = f"em_log:{now_str}:{ticker}:{session}"
-        walls = walls or {}
+        walls = _derive_structure_levels_from_chain({}, spot, walls or {}, eng or {})
         eng = eng or {}
         max_pain = walls.get("max_pain")
         if max_pain is None:
@@ -3443,35 +3580,46 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
         else:
             card_title = f"TRADE SETUP ({effective_dte_label})"
 
-        def no_trade(reason, emoji="⚪"):
-            flip = (walls or {}).get("gamma_flip") or (eng or {}).get("flip_price")
-            call_wall = (walls or {}).get("call_wall")
-            put_wall = (walls or {}).get("put_wall")
-            gamma_wall = (walls or {}).get("gamma_wall")
-            max_pain = (walls or {}).get("max_pain") or (eng or {}).get("max_pain")
+        def no_trade(reason, emoji="🟡"):
+            local_walls = _derive_structure_levels_from_chain({}, spot, walls or {}, eng or {})
+            flip = local_walls.get("gamma_flip") or (eng or {}).get("flip_price")
+            call_wall = local_walls.get("call_wall")
+            put_wall = local_walls.get("put_wall")
+            gamma_wall = local_walls.get("gamma_wall")
+            max_pain = local_walls.get("max_pain") or (eng or {}).get("max_pain")
             bias_line = f"{bias['direction']} (score {bias['score']}/14)"
             range_low = em.get('bear_1sd')
             range_high = em.get('bull_1sd')
             accel_up = call_wall or range_high
             accel_dn = put_wall or range_low
+            regime_line = _format_unified_regime_line(unified_regime)
+            pin_low = local_walls.get("pin_zone_low")
+            pin_high = local_walls.get("pin_zone_high")
             lines = [
                 f"🎯 {ticker} — DEALER EM BRIEF ({effective_dte_label})  |  Exp: {exp_short}",
                 f"{emoji} NO TRADE — {reason}",
-                f"Bias: {bias_line}",
-                f"Spot: ${spot:.2f} | 1σ: ${range_low} – ${range_high}",
+                "",
+                f"🧭 Bias: {bias_line}",
+                f"📍 Spot: {_fmt_money(spot)}",
+                f"📐 1σ Range: {_fmt_money(range_low)} – {_fmt_money(range_high)}",
             ]
             if flip is not None:
-                lines.append(f"Gamma Flip: ${flip}")
-            if call_wall is not None or put_wall is not None:
-                lines.append(f"Call Wall: ${call_wall} | Put Wall: ${put_wall}")
-            if gamma_wall is not None:
-                lines.append(f"Gamma Wall: ${gamma_wall}")
+                side_vs_flip = "above" if spot > flip else "below"
+                lines.append(f"🌀 Gamma Flip: {_fmt_money(flip)}  (spot {side_vs_flip})")
             if max_pain is not None:
-                lines.append(f"Max Pain: ${max_pain}")
+                lines.append(f"🧲 Max Pain: {_fmt_money(max_pain)}")
+            if call_wall is not None:
+                lines.append(f"📵 Call Wall / Resistance: {_fmt_money(call_wall)}")
+            if put_wall is not None:
+                lines.append(f"🛡️ Put Wall / Support: {_fmt_money(put_wall)}")
+            if gamma_wall is not None:
+                lines.append(f"🎯 Gamma Wall: {_fmt_money(gamma_wall)}")
+            if pin_low is not None and pin_high is not None:
+                lines.append(f"📌 Pin Zone: {_fmt_money(pin_low)} – {_fmt_money(pin_high)}")
             lines += [
-                f"Trigger Up: above ${accel_up}",
-                f"Trigger Down: below ${accel_dn}",
-                f"Regime: {unified_regime}",
+                f"🚦 Trigger Up: above {_fmt_money(accel_up)}",
+                f"🚦 Trigger Down: below {_fmt_money(accel_dn)}",
+                f"⚙️ Regime: {regime_line}",
                 "— Not financial advice —",
             ]
             post_to_telegram("\n".join(lines))
