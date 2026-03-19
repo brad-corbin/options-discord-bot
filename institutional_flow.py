@@ -185,7 +185,9 @@ def compute_cagf(
     if total_dealer_flow > 0 and adv_m > 0:
         flow_ratio = total_dealer_flow / adv_m
         # Direction from DEX: negative DEX = dealers short = buying fuel
-        dex_direction = -1 if dex < -0.25 else 1 if dex > 0.25 else 0
+        # Dealers short delta (dex < 0) = must buy on rallies = bullish pressure (+1)
+        # Dealers long delta (dex > 0) = must sell on drops  = bearish pressure (-1)
+        dex_direction = 1 if dex < -0.25 else -1 if dex > 0.25 else 0
         # Combined: large flow + directional DEX = strong liquidity pressure
         l_normalized = max(-1.0, min(1.0, flow_ratio * 100 * (dex_direction if dex_direction != 0 else (1 if charm > 0 else -1))))
     else:
