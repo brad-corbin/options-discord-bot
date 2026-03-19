@@ -61,6 +61,7 @@ from data_providers import (
 from trading_rules import (
     MIN_DTE, MAX_DTE, TARGET_DTE,
     MIN_CONFIDENCE_TO_TRADE,
+    MIN_WIN_PROBABILITY,
     ALLOWED_DIRECTIONS,
     NO_EARNINGS_WEEK,
     RV_LOOKBACK_DAYS,
@@ -154,6 +155,11 @@ SIGNAL_WARN_CONF_PENALTY        = int(os.getenv("SIGNAL_WARN_CONF_PENALTY",     
 SIGNAL_MODERATE_CONF_PENALTY    = int(os.getenv("SIGNAL_MODERATE_CONF_PENALTY",    "12")   or 12)
 SIGNAL_HARD_REJECT_CONF_PENALTY = int(os.getenv("SIGNAL_HARD_REJECT_CONF_PENALTY", "20")   or 20)
 SIGNAL_STALE_AFTER_SEC          = int(os.getenv("SIGNAL_STALE_AFTER_SEC",          "900")  or 900)
+PENDING_RECHECK_ENABLE         = os.getenv("PENDING_RECHECK_ENABLE",         "1").strip().lower() not in ("0", "false", "no", "off")
+PENDING_RECHECK_DELAYS_SEC     = os.getenv("PENDING_RECHECK_DELAYS_SEC",     "300,900,1800").strip() or "300,900,1800"
+PENDING_RECHECK_MAX_SIGNAL_AGE_SEC = int(os.getenv("PENDING_RECHECK_MAX_SIGNAL_AGE_SEC", "5400") or 5400)
+PENDING_TRIGGER_BUFFER_PCT     = float(os.getenv("PENDING_TRIGGER_BUFFER_PCT", "0.05") or 0.05)
+PENDING_RETRACE_GRACE_PCT      = float(os.getenv("PENDING_RETRACE_GRACE_PCT",  "0.03") or 0.03)
 
 TELEGRAM_PORTFOLIO_CHAT_ID     = os.getenv("TELEGRAM_PORTFOLIO_CHAT_ID",     "").strip()
 TELEGRAM_MOM_PORTFOLIO_CHAT_ID = os.getenv("TELEGRAM_MOM_PORTFOLIO_CHAT_ID", "").strip()
@@ -484,6 +490,14 @@ def _log_signal_dataset_event(ticker: str, webhook_data: dict, outcome: str, rea
             "drift_pct": (signal_validation or {}).get("drift_pct"),
             "validation_ok": (signal_validation or {}).get("ok"),
             "validation_penalty": (signal_validation or {}).get("confidence_penalty"),
+            "recheck_attempt": wd.get("recheck_attempt"),
+            "is_recheck": bool(wd.get("is_recheck")),
+            "recheck_age_allowed": (signal_validation or {}).get("recheck_age_allowed"),
+            "entry_trigger_kind": (best_rec or {}).get("entry_trigger_kind"),
+            "entry_trigger_price": (best_rec or {}).get("entry_trigger_price"),
+            "entry_trigger_confirmed": (best_rec or {}).get("entry_trigger_confirmed"),
+            "final_gate_ok": (best_rec or {}).get("final_gate_ok"),
+            "final_gate_reason": (best_rec or {}).get("final_gate_reason"),
             "expiration": (best_rec or {}).get("exp"),
             "dte": (best_rec or {}).get("dte"),
             "long_strike": trade.get("long"),
@@ -784,6 +798,7 @@ def _flush_wave_digest():
 
     immediate_cards = []   # full cards to post now
     digest_lines = []      # compact one-liners
+    pending_lines = []     # watchlist / recheck candidates
     skipped_lines = []     # rejected signals
 
     for r in results:
@@ -799,12 +814,11 @@ def _flush_wave_digest():
         conf_str = f"{conf}/100" if conf is not None else "—"
         type_label = "SWING" if job_type == "swing" else "TV"
 
-        if won and card:
-            # Cache the full card for /tradecard retrieval
+        if (won or r.get("outcome") == "pending") and card:
             cache_key = f"tradecard:{ticker.upper()}"
             store_set(cache_key, card, ttl=DIGEST_CARD_CACHE_TTL_SEC)
 
-            # Decide: immediate post or digest-only?
+        if won and card:
             is_immediate = (
                 (tier in IMMEDIATE_POST_TIER and conf is not None and conf >= IMMEDIATE_POST_MIN_CONF)
             )
@@ -814,17 +828,24 @@ def _flush_wave_digest():
                 digest_lines.append(f"  ✅ {ticker} T{tier} {dir_emoji} {conf_str} — POSTED ⬆️")
             else:
                 digest_lines.append(f"  📋 {ticker} T{tier} {dir_emoji} {conf_str} — /tradecard {ticker}")
+        elif r.get("outcome") == "pending":
+            reason = r.get("reason", "waiting on recheck")[:50]
+            pending_lines.append(f"  ⏳ {ticker} T{tier} {dir_emoji} {conf_str} — {reason}")
         else:
             reason = r.get("reason", "no setup")[:40]
             skipped_lines.append(f"  ❌ {ticker} T{tier} {dir_emoji} {conf_str} — {reason}")
 
     lines = []
-    if digest_lines or skipped_lines:
-        lines.append(f"📊 SIGNAL DIGEST ({len(digest_lines)} trades, {len(skipped_lines)} skipped)")
+    if digest_lines or pending_lines or skipped_lines:
+        lines.append(f"📊 SIGNAL DIGEST ({len(digest_lines)} trades, {len(pending_lines)} pending, {len(skipped_lines)} skipped)")
         lines.append("")
         if digest_lines:
             lines.append("── Trades ──")
             lines.extend(digest_lines)
+        if pending_lines:
+            lines.append("")
+            lines.append("── Pending / Recheck ──")
+            lines.extend(pending_lines)
         if skipped_lines:
             lines.append("")
             lines.append("── Skipped ──")
@@ -915,6 +936,59 @@ def _enqueue_signal(job_type: str, ticker: str, bias: str,
         except queue.Full:
             log.error(f"Memory queue still full — signal lost: {ticker} ({job_type})")
 
+
+
+def _pending_recheck_delays() -> list[int]:
+    out = []
+    raw = str(PENDING_RECHECK_DELAYS_SEC or "").strip()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.append(max(30, int(float(part))))
+        except Exception:
+            continue
+    return out or [300, 900, 1800]
+
+
+def _schedule_pending_recheck(ticker: str, bias: str, webhook_data: dict, reason: str = "") -> tuple[bool, int | None, int, int]:
+    if not PENDING_RECHECK_ENABLE:
+        return False, None, 0, 0
+
+    wd = dict(webhook_data or {})
+    if str(wd.get("source") or "").lower() == "check":
+        return False, None, int(wd.get("recheck_attempt") or 0), 0
+
+    delays = _pending_recheck_delays()
+    attempt = int(wd.get("recheck_attempt") or 0)
+    total = len(delays)
+    if attempt >= total:
+        return False, None, attempt, total
+
+    received_at = str(wd.get("received_at_epoch") or "na")
+    dedup_key = f"pending_recheck:{ticker}:{bias}:{received_at}:{attempt+1}"
+    if store_exists(dedup_key):
+        return False, delays[attempt], attempt, total
+    store_set(dedup_key, "1", ttl=max(delays[attempt] + 3600, 7200))
+
+    next_wd = dict(wd)
+    next_wd["recheck_attempt"] = attempt + 1
+    next_wd["allow_recheck_after_stale"] = True
+    next_wd["pending_reason"] = (reason or wd.get("pending_reason") or "")[:200]
+    next_wd["is_recheck"] = True
+
+    def _fire():
+        try:
+            time.sleep(delays[attempt])
+            signal_msg = f"Pending recheck {attempt+1}/{total}: {ticker} {bias.upper()}"
+            _enqueue_signal("tv", ticker, bias, next_wd, signal_msg)
+            log.info(f"Pending recheck enqueued: {ticker} {bias} attempt {attempt+1}/{total} after {delays[attempt]}s")
+        except Exception as e:
+            log.warning(f"Pending recheck failed for {ticker}: {e}")
+
+    threading.Thread(target=_fire, daemon=True, name=f"pending-recheck-{ticker}-{attempt+1}").start()
+    return True, delays[attempt], attempt, total
 
 # ─────────────────────────────────────────────────────────
 # PREFETCH COLLECTOR — v4.3
@@ -1133,6 +1207,12 @@ def _process_job(worker_id: int, job: dict):
             return
 
         if not rec.get("ok"):
+            if rec.get("pending"):
+                base["outcome"] = "pending"
+                base["reason"] = rec.get("reason", "pending recheck")
+                base["card"] = rec.get("card")
+                _record_wave_result(base)
+                return
             base["reason"] = rec.get("reason", "no valid spread")
             _record_wave_result(base)
             return
@@ -2279,6 +2359,8 @@ def _validate_live_signal(ticker: str, live_spot: float, webhook_data: dict | No
     now_ts = time.time()
     signal_age_sec = max(0, int(now_ts - received_at)) if received_at else None
     warn_pct, reject_pct, hard_block_pct = _signal_validation_thresholds(webhook_data)
+    allow_extended_recheck = bool(webhook_data.get("allow_recheck_after_stale") or webhook_data.get("recheck_attempt"))
+    stale_recheck_allowed = False
 
     result = {
         "ok": True,
@@ -2294,27 +2376,39 @@ def _validate_live_signal(ticker: str, live_spot: float, webhook_data: dict | No
         "confidence_penalty": 0,
         "card_note": "",
         "hard_entry_note": "",
+        "recheck_age_allowed": False,
     }
+
+    def _finish(payload: dict) -> dict:
+        payload["recheck_age_allowed"] = stale_recheck_allowed
+        if stale_recheck_allowed:
+            prefix = f"⏳ Planned recheck on older signal ({signal_age_sec}s old)."
+            existing = str(payload.get("card_note") or "").strip()
+            payload["card_note"] = (prefix + (" " + existing if existing else "")).strip()
+            payload["confidence_penalty"] = max(int(payload.get("confidence_penalty") or 0), SIGNAL_WARN_CONF_PENALTY)
+        return payload
 
     if alert_close <= 0 or live_spot <= 0:
         result["label"] = "NO_REFERENCE"
         result["reason"] = "Missing alert close or live spot for validation"
         result["card_note"] = "🟡 Signal validation: alert close unavailable — trade priced from live data only."
-        return result
+        return _finish(result)
 
     drift_pct = abs((live_spot - alert_close) / alert_close) * 100.0
     result["drift_pct"] = round(drift_pct, 3)
 
     if signal_age_sec is not None and signal_age_sec > SIGNAL_STALE_AFTER_SEC:
-        result.update({
-            "ok": False,
-            "label": "STALE_SIGNAL",
-            "reason": f"Signal stale ({signal_age_sec}s old > {SIGNAL_STALE_AFTER_SEC}s)",
-            "card_note": f"🚫 Signal validation: stale alert ({signal_age_sec}s old).",
-        })
-        return result
+        if allow_extended_recheck and signal_age_sec <= PENDING_RECHECK_MAX_SIGNAL_AGE_SEC:
+            stale_recheck_allowed = True
+        else:
+            result.update({
+                "ok": False,
+                "label": "STALE_SIGNAL",
+                "reason": f"Signal stale ({signal_age_sec}s old > {SIGNAL_STALE_AFTER_SEC}s)",
+                "card_note": f"🚫 Signal validation: stale alert ({signal_age_sec}s old).",
+            })
+            return _finish(result)
 
-    # Absolute hard block — price has moved so far the setup is structurally gone.
     if drift_pct > hard_block_pct:
         result.update({
             "ok": False,
@@ -2325,10 +2419,8 @@ def _validate_live_signal(ticker: str, live_spot: float, webhook_data: dict | No
                 f"{drift_pct:.2f}%). Setup no longer valid."
             ),
         })
-        return result
+        return _finish(result)
 
-    # Soft reject — drift exceeded TV threshold but setup still potentially valid.
-    # Produce the card with a hard entry line instead of blocking.
     if drift_pct > reject_pct:
         is_bull_drift = live_spot > alert_close
         buffer = round(alert_close * 0.0005, 2)
@@ -2355,7 +2447,7 @@ def _validate_live_signal(ticker: str, live_spot: float, webhook_data: dict | No
             "hard_entry_note": entry_note,
             "card_note": entry_note,
         })
-        return result
+        return _finish(result)
 
     if drift_pct >= warn_pct:
         result.update({
@@ -2364,7 +2456,7 @@ def _validate_live_signal(ticker: str, live_spot: float, webhook_data: dict | No
             "confidence_penalty": SIGNAL_MODERATE_CONF_PENALTY,
             "card_note": f"🟡 Signal validation: live spot drift {drift_pct:.2f}% vs TV alert (${alert_close:.2f} → ${live_spot:.2f}); confidence reduced.",
         })
-        return result
+        return _finish(result)
 
     if drift_pct >= (warn_pct * 0.5):
         result.update({
@@ -2373,10 +2465,121 @@ def _validate_live_signal(ticker: str, live_spot: float, webhook_data: dict | No
             "confidence_penalty": SIGNAL_WARN_CONF_PENALTY,
             "card_note": f"🟢 Signal validation: live spot drift only {drift_pct:.2f}% from TV alert (${alert_close:.2f} → ${live_spot:.2f}).",
         })
-        return result
+        return _finish(result)
 
     result["card_note"] = f"🟢 Signal validation: TV ${alert_close:.2f} vs live ${live_spot:.2f} ({drift_pct:.2f}% drift)."
-    return result
+    return _finish(result)
+
+
+def _derive_structure_trigger(direction: str, spot: float, structure_ctx: dict | None) -> dict:
+    direction = str(direction or "bull").lower()
+    ps = ((structure_ctx or {}).get("price_structure") or {})
+    local_support = as_float(ps.get("local_support_1"), 0.0)
+    local_resistance = as_float(ps.get("local_resistance_1"), 0.0)
+    balance_low = as_float(ps.get("local_balance_zone_low"), 0.0)
+    balance_high = as_float(ps.get("local_balance_zone_high"), 0.0)
+    buffer_mult = max(PENDING_TRIGGER_BUFFER_PCT / 100.0, 0.0)
+
+    if direction == "bear":
+        cands = [x for x in (local_support, balance_low) if x > 0]
+        trigger_price = min(cands) if cands else None
+        buffer = max((trigger_price or spot or 0) * buffer_mult, 0.05) if trigger_price else 0.0
+        confirmed = bool(trigger_price and spot <= (trigger_price - buffer))
+        desc = f"Break below ${trigger_price:.2f}" if trigger_price else "Break below local support"
+    else:
+        cands = [x for x in (local_resistance, balance_high) if x > 0]
+        trigger_price = max(cands) if cands else None
+        buffer = max((trigger_price or spot or 0) * buffer_mult, 0.05) if trigger_price else 0.0
+        confirmed = bool(trigger_price and spot >= (trigger_price + buffer))
+        desc = f"Break above ${trigger_price:.2f}" if trigger_price else "Break above local resistance"
+
+    return {
+        "trigger_price": round(trigger_price, 2) if trigger_price else None,
+        "confirmed": confirmed,
+        "description": desc,
+    }
+
+
+def _evaluate_entry_trigger(direction: str, spot: float, signal_validation: dict | None, structure_ctx: dict | None) -> dict:
+    signal_validation = signal_validation or {}
+    label = str(signal_validation.get("label") or "")
+    alert_close = as_float(signal_validation.get("alert_close"), 0.0)
+    live_spot = as_float(signal_validation.get("live_spot"), spot)
+    hard_entry = as_float(signal_validation.get("hard_entry_price"), 0.0)
+    grace_mult = max(PENDING_RETRACE_GRACE_PCT / 100.0, 0.0)
+
+    if label == "DRIFT_WARN_ENTRY" and hard_entry > 0:
+        drift_above = live_spot > alert_close
+        grace = max(hard_entry * grace_mult, 0.03)
+        if drift_above:
+            ready = spot <= (hard_entry + grace)
+            desc = f"Wait for pullback to ~${hard_entry:.2f}"
+        else:
+            ready = spot >= (hard_entry - grace)
+            desc = f"Wait for bounce back to ~${hard_entry:.2f}"
+        return {
+            "confirmed": ready,
+            "pending": not ready,
+            "kind": "retrace",
+            "trigger_price": round(hard_entry, 2),
+            "reason": desc,
+        }
+
+    struct_trigger = _derive_structure_trigger(direction, spot, structure_ctx)
+    return {
+        "confirmed": bool(struct_trigger.get("confirmed")),
+        "pending": False,
+        "kind": "breakout",
+        "trigger_price": struct_trigger.get("trigger_price"),
+        "reason": struct_trigger.get("description") or "Trigger required",
+    }
+
+
+def _apply_final_trade_gate(rec: dict, mode: str = "scalp") -> tuple[bool, str, dict]:
+    rec = dict(rec or {})
+    trade = rec.get("trade") or {}
+    reasons = []
+
+    try:
+        conf = int(rec.get("confidence") or 0)
+    except Exception:
+        conf = 0
+    min_conf = MIN_CONFIDENCE_TO_TRADE if mode == "scalp" else 58
+    if conf < min_conf:
+        reasons.append(f"Final confidence {conf}/100 below {min_conf} after overlays")
+
+    try:
+        ev = float(trade.get("ev_after_slippage", trade.get("expected_value", trade.get("ev_per_contract", 0))) or 0.0)
+    except Exception:
+        ev = 0.0
+    if ev <= 0:
+        reasons.append(f"Final EV ${ev:.2f} is not positive")
+
+    try:
+        wp = float(trade.get("win_prob", 0) or 0.0)
+    except Exception:
+        wp = 0.0
+    if wp < MIN_WIN_PROBABILITY:
+        reasons.append(f"Final win probability {wp:.0%} below {MIN_WIN_PROBABILITY:.0%}")
+
+    rec["final_gate_ok"] = not reasons
+    rec["final_gate_reason"] = "; ".join(reasons)[:220] if reasons else ""
+    return (not reasons), rec.get("final_gate_reason", ""), rec
+
+
+def _build_pending_trade_card(best_rec: dict, signal_validation: dict | None, pending_note: str, attempt: int, total: int, next_delay: int | None) -> str:
+    card = format_trade_card(best_rec)
+    shared_lines = _um_format_shared_snapshot_lines(best_rec.get("shared_model_snapshot"))
+    if shared_lines:
+        card += "\n\n" + "\n".join(shared_lines)
+    validation_note = (signal_validation or {}).get("card_note")
+    prefix_lines = [f"⏳ WATCHLIST — pending recheck {attempt}/{total}", pending_note]
+    if next_delay:
+        mins = max(1, int(round(next_delay / 60.0)))
+        prefix_lines.append(f"Auto recheck scheduled in ~{mins}m.")
+    if validation_note and validation_note not in pending_note:
+        prefix_lines.append(validation_note)
+    return "\n".join([x for x in prefix_lines if x]).strip() + "\n\n" + card
 
 
 def check_ticker(ticker, direction="bull", webhook_data=None):
@@ -2537,7 +2740,38 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
             v4_flow=v4_flow,
             mode="scalp",
         )
-        has_confirmed_trigger = bool((webhook_data or {}).get("source") != "check" and (signal_validation or {}).get("ok"))
+        trigger_eval = _evaluate_entry_trigger(direction, spot, signal_validation, structure_ctx)
+        best_rec["entry_trigger_kind"] = trigger_eval.get("kind")
+        best_rec["entry_trigger_price"] = trigger_eval.get("trigger_price")
+        best_rec["entry_trigger_confirmed"] = trigger_eval.get("confirmed")
+        best_rec["entry_trigger_reason"] = trigger_eval.get("reason")
+
+        if trigger_eval.get("pending"):
+            scheduled, next_delay, attempt_idx, total_attempts = _schedule_pending_recheck(
+                ticker, direction, webhook_data, reason=trigger_eval.get("reason", "pending retrace")
+            )
+            pending_reason = trigger_eval.get("reason") or "Waiting for a better entry"
+            if scheduled and next_delay:
+                pending_reason = f"{pending_reason} — recheck {attempt_idx + 1}/{total_attempts} queued"
+            best_rec["reason"] = pending_reason
+            best_rec["rejection_bucket"] = "pending_retrace"
+            card = _build_pending_trade_card(best_rec, signal_validation, pending_reason, attempt_idx + 1, total_attempts, next_delay)
+            trade_journal.log_signal(ticker, webhook_data, outcome="pending", confidence=best_rec.get("confidence"), reason=pending_reason[:200])
+            _log_signal_dataset_event(
+                ticker, webhook_data, outcome="pending_recheck", reason=pending_reason, best_rec=best_rec,
+                signal_validation=signal_validation, regime=regime, v4_flow=v4_flow, spot=spot,
+                expirations_checked=len(chains), vol_regime=vol_regime
+            )
+            return {
+                "ticker": ticker, "ok": False, "posted": False, "pending": True, "card": card,
+                "reason": pending_reason, "confidence": best_rec.get("confidence")
+            }
+
+        has_confirmed_trigger = bool(
+            (webhook_data or {}).get("source") != "check"
+            and (signal_validation or {}).get("ok")
+            and trigger_eval.get("confirmed")
+        )
         eff_allowed, eff_reason, best_rec = _um_apply_effective_regime_gate_to_rec(
             best_rec,
             best_rec.get("shared_model_snapshot"),
@@ -2556,7 +2790,27 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
         if not eff_allowed:
             best_rec["ok"] = False
             best_rec["reason"] = eff_reason
-            best_rec["rejection_bucket"] = best_rec.get("rejection_bucket") or "effective_regime_block"
+            is_trigger_wait = bool(best_rec.get("effective_regime_requires_trigger") and not has_confirmed_trigger)
+            best_rec["rejection_bucket"] = best_rec.get("rejection_bucket") or ("pending_trigger" if is_trigger_wait else "effective_regime_block")
+            if is_trigger_wait:
+                scheduled, next_delay, attempt_idx, total_attempts = _schedule_pending_recheck(
+                    ticker, direction, webhook_data, reason=trigger_eval.get("reason") or eff_reason
+                )
+                pending_reason = trigger_eval.get("reason") or eff_reason or "Trigger required before entry"
+                if scheduled and next_delay:
+                    pending_reason = f"{pending_reason} — recheck {attempt_idx + 1}/{total_attempts} queued"
+                card = _build_pending_trade_card(best_rec, signal_validation, pending_reason, attempt_idx + 1, total_attempts, next_delay)
+                trade_journal.log_signal(ticker, webhook_data, outcome="pending", confidence=best_rec.get("confidence"), reason=pending_reason[:200])
+                _log_signal_dataset_event(
+                    ticker, webhook_data, outcome="pending_recheck", reason=pending_reason, best_rec=best_rec,
+                    signal_validation=signal_validation, regime=regime, v4_flow=v4_flow, spot=spot,
+                    expirations_checked=len(chains), vol_regime=vol_regime
+                )
+                return {
+                    "ticker": ticker, "ok": False, "posted": False, "pending": True, "card": card,
+                    "reason": pending_reason, "confidence": best_rec.get("confidence")
+                }
+
             trade_journal.log_signal(ticker, webhook_data, outcome="rejected", reason=eff_reason[:200])
             _log_signal_dataset_event(
                 ticker,
@@ -2579,6 +2833,29 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
             if validation_note:
                 card = validation_note + "\n\n" + card
             return {"ticker": ticker, "ok": False, "posted": True, "card": card, "reason": eff_reason, "confidence": best_rec.get("confidence")}
+
+        final_allowed, final_reason, best_rec = _apply_final_trade_gate(best_rec, mode="scalp")
+        if not final_allowed:
+            best_rec["ok"] = False
+            best_rec["reason"] = final_reason
+            best_rec["rejection_bucket"] = best_rec.get("rejection_bucket") or "post_overlay_gate"
+            trade_journal.log_signal(ticker, webhook_data, outcome="rejected", reason=final_reason[:200])
+            _log_signal_dataset_event(
+                ticker, webhook_data, outcome="rejected_post_overlay", reason=final_reason, best_rec=best_rec,
+                signal_validation=signal_validation, regime=regime, v4_flow=v4_flow, spot=spot,
+                expirations_checked=len(chains), vol_regime=vol_regime
+            )
+            card = format_trade_card(best_rec)
+            shared_lines = _um_format_shared_snapshot_lines(best_rec.get("shared_model_snapshot"))
+            if shared_lines:
+                card += "\n\n" + "\n".join(shared_lines)
+            validation_note = (signal_validation or {}).get("card_note")
+            if validation_note:
+                card = validation_note + "\n\n" + card
+            return {
+                "ticker": ticker, "ok": False, "posted": False, "reason": final_reason,
+                "card": card, "confidence": best_rec.get("confidence")
+            }
         trade = best_rec.get("trade", {})
 
         if is_duplicate_trade(ticker, direction, trade.get("short"), trade.get("long")):
