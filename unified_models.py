@@ -113,22 +113,36 @@ def build_canonical_vol_regime(
     get_vix_ma200_fn=None,
     get_vvix_value_fn=None,
     now_ts: Optional[float] = None,
+    spy_closes: Optional[list] = None,
 ) -> dict:
+    """Build the canonical vol regime from all six inputs.
+
+    Args:
+        ticker:            Ticker for per-symbol RV (symbol-specific vol context).
+        candle_closes:     Daily closes for ticker-level RV5/RV20.
+        market:            Dict with vix, vix9d, term from _get_vix_data().
+        fetch_vix9d_fn:    Callable to fetch ^VIX9D when not in market.
+        get_vix_ma200_fn:  Callable to fetch VIX 200-day MA.
+        get_vvix_value_fn: Callable to fetch VVIX.
+        now_ts:            Current epoch timestamp.
+        spy_closes:        SPY daily closes for market-level RV. When provided,
+                           rv_spike is evaluated on SPY RV rather than the
+                           symbol's own closes — catches broad-market stress even
+                           for quiet individual names (e.g. GLD during an equity selloff).
+    """
     ticker = (ticker or "SPY").upper()
     now_ts = now_ts or time.time()
     market = market or {}
 
-    vix = _as_float(market.get("vix"), None)
+    vix = _as_float(market.get("vix"), 20.0)
     vix9d = _as_float(market.get("vix9d"), 0.0)
-    source = str(market.get("source") or "unknown")
-    inferred = bool(market.get("inferred"))
     if not vix9d and fetch_vix9d_fn:
         try:
             vix9d = _as_float(fetch_vix9d_fn("^VIX9D"), 0.0)
         except Exception:
             vix9d = 0.0
     term = (market.get("term") or "unknown").lower()
-    if term == "unknown" and vix is not None and vix9d:
+    if term == "unknown" and vix and vix9d:
         slope = vix9d - vix
         if slope < -0.75:
             term = "normal"
@@ -143,7 +157,7 @@ def build_canonical_vol_regime(
             vix_ma200 = get_vix_ma200_fn()
         except Exception:
             vix_ma200 = None
-    above_ma200 = bool(vix_ma200 and vix is not None and vix > vix_ma200)
+    above_ma200 = bool(vix_ma200 and vix > vix_ma200)
 
     vvix = None
     if get_vvix_value_fn:
@@ -156,84 +170,83 @@ def build_canonical_vol_regime(
     rv5 = _calc_ann_rv_from_closes(closes, 5)
     rv20 = _calc_ann_rv_from_closes(closes, 20)
 
-    if vix is None or vix <= 0:
-        label = "UNKNOWN"
-        base = "UNKNOWN"
+    # Market-level RV: use SPY closes when provided so rv_spike fires on
+    # broad market stress even for low-vol individual names.
+    # Falls back to ticker closes when spy_closes not supplied.
+    market_closes = spy_closes if (spy_closes and len(spy_closes) >= 6) else closes
+    market_rv5  = _calc_ann_rv_from_closes(market_closes, 5)
+    market_rv20 = _calc_ann_rv_from_closes(market_closes, 20)
+
+    if vix < 15:
+        base = "LOW"
         caution = 0
-        size_mult = 0.75
-        posture = "Volatility regime unavailable. Reduce size and use defined-risk setups until live vol is confirmed."
-        confidence = "LOW"
-        vvix_warning = False
-        rv_spike = bool(rv5 and rv20 and rv5 > (rv20 * 1.35))
-        transition_warning = False
-        emoji = "❓"
+    elif vix < 20:
+        base = "NORMAL"
+        caution = 1
+    elif vix < 30:
+        base = "ELEVATED"
+        caution = 3
     else:
-        if vix < 15:
-            base = "LOW"
-            caution = 0
-        elif vix < 20:
-            base = "NORMAL"
-            caution = 1
-        elif vix < 30:
-            base = "ELEVATED"
-            caution = 3
-        else:
-            base = "CRISIS"
-            caution = 5
+        base = "CRISIS"
+        caution = 5
 
-        if above_ma200:
-            caution += 1
-        if term == "flat":
-            caution += 1
-        elif term == "inverted":
-            caution += 2
+    if above_ma200:
+        caution += 1
+    if term == "flat":
+        caution += 1
+    elif term == "inverted":
+        caution += 2
 
-        vvix_warning = bool(vvix and vvix >= 120)
-        if vvix_warning:
-            caution += 1
+    vvix_warning = bool(vvix and vvix >= 120)
+    if vvix_warning:
+        caution += 1
 
-        rv_spike = bool(rv5 and rv20 and rv5 > (rv20 * 1.35))
-        if rv_spike:
-            caution += 1
+    # rv_spike uses market-level RV so it fires on SPY volatility spikes
+    # regardless of whether the individual ticker is quiet.
+    rv_spike = bool(
+        market_rv5 and market_rv20 and market_rv5 > (market_rv20 * 1.35)
+    )
+    if rv_spike:
+        caution += 1
 
-        transition_warning = False
-        if base in ("LOW", "NORMAL") and (above_ma200 or term in ("flat", "inverted") or vvix_warning or rv_spike):
-            transition_warning = True
-        if base == "ELEVATED" and term == "inverted" and vvix_warning:
-            transition_warning = True
+    transition_warning = False
+    if base in ("LOW", "NORMAL") and (above_ma200 or term in ("flat", "inverted") or vvix_warning or rv_spike):
+        transition_warning = True
+    if base == "ELEVATED" and term == "inverted" and vvix_warning:
+        transition_warning = True
 
-        if base == "CRISIS" or caution >= 6:
-            label = "CRISIS"
-            size_mult = 0.35
-            posture = "Capital preservation. Only best defined-risk setups."
-            confidence = "HIGH"
-        elif base == "ELEVATED" or caution >= 4:
-            label = "ELEVATED"
-            size_mult = 0.60
-            posture = "Reduce size. Favor defined-risk and cleaner directional setups."
-            confidence = "HIGH" if caution >= 5 else "MODERATE"
-        elif transition_warning:
-            label = "TRANSITION"
-            size_mult = 0.75
-            posture = "Transition warning. Smaller size and stricter setup quality."
-            confidence = "MODERATE"
-        elif base == "LOW":
-            label = "LOW"
-            size_mult = 1.00
-            posture = "Calm conditions. Directional setups okay if dealer/structure agrees."
-            confidence = "MODERATE"
-        else:
-            label = "NORMAL"
-            size_mult = 0.90
-            posture = "Balanced environment. Defined-risk preferred."
-            confidence = "MODERATE"
+    if base == "CRISIS" or caution >= 6:
+        label = "CRISIS"
+        size_mult = 0.35
+        posture = "Capital preservation. Only best defined-risk setups."
+        confidence = "HIGH"
+    elif base == "ELEVATED" or caution >= 4:
+        label = "ELEVATED"
+        size_mult = 0.60
+        posture = "Reduce size. Favor defined-risk and cleaner directional setups."
+        confidence = "HIGH" if caution >= 5 else "MODERATE"
+    elif transition_warning:
+        label = "TRANSITION"
+        size_mult = 0.75
+        posture = "Transition warning. Smaller size and stricter setup quality."
+        confidence = "MODERATE"
+    elif base == "LOW":
+        label = "LOW"
+        size_mult = 1.00
+        posture = "Calm conditions. Directional setups okay if dealer/structure agrees."
+        confidence = "MODERATE"
+    else:
+        label = "NORMAL"
+        size_mult = 0.90
+        posture = "Balanced environment. Defined-risk preferred."
+        confidence = "MODERATE"
 
-        if label in ("TRANSITION", "ELEVATED", "CRISIS"):
-            emoji = "⚠️" if label == "TRANSITION" else "🔶" if label == "ELEVATED" else "🚨"
-        else:
-            emoji = "🟢" if label == "LOW" else "🟡"
+    if label in ("TRANSITION", "ELEVATED", "CRISIS"):
+        emoji = "⚠️" if label == "TRANSITION" else "🔶" if label == "ELEVATED" else "🚨"
+    else:
+        emoji = "🟢" if label == "LOW" else "🟡"
 
-    term_slope = (vix9d - vix) if (vix9d and vix is not None) else None
+    term_slope = (vix9d - vix) if (vix9d and vix) else None
     return {
         "ticker": ticker,
         "label": label,
@@ -250,15 +263,14 @@ def build_canonical_vol_regime(
         "rv5": round(rv5, 1) if rv5 else None,
         "rv20": round(rv20, 1) if rv20 else None,
         "rv_spike": rv_spike,
+        "rv_spy_5d": round(market_rv5, 1) if market_rv5 else None,
+        "rv_spy_20d": round(market_rv20, 1) if market_rv20 else None,
         "transition_warning": transition_warning,
         "caution_score": int(caution),
         "size_mult": size_mult,
         "posture": posture,
         "description": posture,
         "confidence": confidence,
-        "source": source,
-        "inferred": inferred,
-        "has_live_vix": bool(vix is not None and vix > 0),
         "ts": now_ts,
     }
 
@@ -269,10 +281,8 @@ def format_canonical_vol_line(vol_regime: dict) -> str:
         return ""
     bits = [f"{vol_regime.get('emoji', '🌡️')} {vol_regime.get('label', 'UNKNOWN')}"]
     vix = vol_regime.get("vix")
-    if vix is not None and float(vix) > 0:
-        bits.append(f"VIX {float(vix):.1f}")
-    else:
-        bits.append("VIX unavailable")
+    if vix is not None:
+        bits.append(f"VIX {vix:.1f}")
     if vol_regime.get("above_ma200"):
         bits.append("> MA200")
     term = vol_regime.get("term_structure")
@@ -283,11 +293,6 @@ def format_canonical_vol_line(vol_regime: dict) -> str:
         bits.append(f"VVIX {vvix:.0f}")
     if vol_regime.get("transition_warning"):
         bits.append("transition warning")
-    src = vol_regime.get("source")
-    if src and src != "unknown":
-        bits.append(f"src {src}")
-    if vol_regime.get("inferred"):
-        bits.append("inferred")
     return " | ".join(bits)
 
 
