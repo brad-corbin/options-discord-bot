@@ -911,7 +911,7 @@ _prefetch_thread_active = False
 _prefetch_wave_done = threading.Event()  # Workers wait on this
 _prefetch_wave_done.set()  # Start in "done" state (no wave pending)
 PREFETCH_SETTLE_SEC = 3  # wait this long after last signal before prefetching
-PREFETCH_WORKER_WAIT_SEC = 45  # max time workers wait for prefetch
+PREFETCH_WORKER_WAIT_SEC = 80  # max time workers wait for prefetch (prefetch takes 50-85s on cold chains)
 
 
 def _record_prefetch_ticker(ticker: str):
@@ -1397,7 +1397,7 @@ def get_current_regime() -> dict:
         return _regime_cache["data"]
     try:
         vix = get_vix()
-        spy_candles = get_daily_candles("SPY", days=30)
+        spy_candles = get_daily_candles("SPY", days=65)
         regime = risk_manager.classify_regime(vix=vix, spy_candles=spy_candles)
         _regime_cache["data"] = regime
         _regime_cache["ts"] = now
@@ -1516,7 +1516,7 @@ def get_canonical_vol_regime(ticker: str = "SPY", candle_closes: list | None = N
         return cached.get("data", {})
 
     market = _get_vix_data() or {}
-    closes = candle_closes or get_daily_candles(ticker, days=30) or get_daily_candles("SPY", days=30)
+    closes = candle_closes or get_daily_candles(ticker, days=65) or get_daily_candles("SPY", days=65)
     result = _um_build_canonical_vol_regime(
         ticker=ticker,
         candle_closes=closes,
@@ -2281,7 +2281,7 @@ def _validate_live_signal(ticker: str, live_spot: float, webhook_data: dict | No
         })
         return result
 
-    if drift_pct >= reject_pct:
+    if drift_pct > reject_pct:  # > not >= so exact-threshold drift is a warn, not a reject
         result.update({
             "ok": False,
             "label": "DRIFT_REJECT",
