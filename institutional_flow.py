@@ -66,6 +66,8 @@ def compute_cagf(
     adv: float = None,
     candle_closes: List[float] = None,
     ticker: str = "SPY",
+    vol_caution_score: int = 0,
+    vol_transition_warning: bool = False,
 ) -> Dict:
     """
     Compute the Institutional Composite Market Model.
@@ -73,15 +75,20 @@ def compute_cagf(
     Five-component ADV-normalized directional score → logistic probability.
 
     Args:
-        dealer_flows: dict with gex, dex, vanna, charm, gamma_flip
-        iv: current ATM implied volatility (decimal, e.g. 0.18)
-        rv: realized volatility (decimal)
-        spot: current spot price
-        vix: VIX level
-        session_progress: 0.0 (open) to 1.0 (close)
-        adv: average daily dollar volume (from _estimate_liquidity)
-        candle_closes: recent daily closes for momentum calc (optional)
-        ticker: ticker symbol for ADV defaults
+        dealer_flows:          dict with gex, dex, vanna, charm, gamma_flip
+        iv:                    current ATM implied volatility (decimal, e.g. 0.18)
+        rv:                    realized volatility (decimal)
+        spot:                  current spot price
+        vix:                   VIX level
+        session_progress:      0.0 (open) to 1.0 (close)
+        adv:                   average daily dollar volume
+        candle_closes:         recent daily closes for momentum calc (optional)
+        ticker:                ticker symbol for ADV defaults
+        vol_caution_score:     0-8 caution integer from build_canonical_vol_regime.
+                               Reduces trend_day_probability and suppresses the
+                               directional probability logistic when elevated.
+        vol_transition_warning: True when vol is transitioning to a higher regime.
+                               Dampens probability confidence in ambiguous directions.
 
     Returns dict with:
         score: float — raw composite score (unbounded)
@@ -245,6 +252,23 @@ def compute_cagf(
     # Maps score to 0-100% directional probability
     # ═══════════════════════════════════════════════════════
 
+    # ── Canonical vol regime suppression (v4.5) ──
+    # When vol caution is elevated, compress the raw score toward neutral
+    # before the logistic transform. This prevents the model from outputting
+    # high-conviction directional reads during structurally risky vol conditions
+    # (e.g. inverted term structure + VVIX spike + above MA200).
+    #
+    # Suppression curve: caution 0-2 = no effect, 3 = 6% dampen,
+    # 4 = 12%, 5 = 18%, 6+ = 24% (caps at caution 6 for safety).
+    vol_suppression = min(max(vol_caution_score - 2, 0), 4) * 0.06
+    if vol_suppression > 0:
+        raw_score = raw_score * (1.0 - vol_suppression)
+
+    # Transition warning: additional 10% pull-toward-neutral to avoid
+    # high-conviction reads right as regime is breaking down.
+    if vol_transition_warning and abs(raw_score) > 0.1:
+        raw_score = raw_score * 0.90
+
     probability = 1.0 / (1.0 + math.exp(-LOGISTIC_K * raw_score))
     probability_pct = round(probability * 100, 1)
 
@@ -273,7 +297,11 @@ def compute_cagf(
         trend_factors += 0.10
     if strong_flow:
         trend_factors += 0.05
-    trend_day_prob = min(1.0, trend_factors)
+    # Vol caution reduces trend day probability — high caution = choppy conditions
+    # even when dealer flows look directional. Each caution point above 2
+    # shaves ~4% off trend probability; caps at -20% at caution 7+.
+    vol_trend_penalty = min(max(vol_caution_score - 2, 0), 5) * 0.04
+    trend_day_prob = min(1.0, max(0.0, trend_factors - vol_trend_penalty))
 
     # ═══════════════════════════════════════════════════════
     # LABELS
@@ -378,6 +406,10 @@ def compute_cagf(
         "charm_signal": round(c_normalized, 3),
         "vanna_signal": round(v_normalized, 3),
         "dex_signal": round(l_normalized, 3),
+        # Vol regime inputs applied
+        "vol_caution_score": vol_caution_score,
+        "vol_transition_warning": vol_transition_warning,
+        "vol_suppression_applied": round(vol_suppression, 3) if vol_suppression > 0 else 0,
     }
 
 
