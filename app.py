@@ -241,6 +241,7 @@ def _append_csv_row(filename: str, fieldnames: list, row: dict):
                 if not exists or os.path.getsize(path) == 0:
                     writer.writeheader()
                 writer.writerow(safe_row)
+        log.info(f"CSV auto-log wrote: {filename} -> {path}")
         _append_google_sheet_row(filename, fieldnames, safe_row)
     except Exception as e:
         log.warning(f"CSV auto-log failed ({filename}): {e}")
@@ -366,9 +367,16 @@ def _append_google_sheet_row(filename: str, fieldnames: list, row: dict):
         with _google_sheets_lock:
             if tab not in _google_sheets_header_tabs:
                 if not _sheet_headers_exist(tab, token):
-                    _append_google_sheet_values(tab, [fieldnames], token)
+                    if _append_google_sheet_values(tab, [fieldnames], token):
+                        log.info(f"Google Sheets header row written for tab '{tab}'")
+                    else:
+                        log.warning(f"Google Sheets header write failed for tab '{tab}'")
                 _google_sheets_header_tabs.add(tab)
-            _append_google_sheet_values(tab, values, token)
+            ok = _append_google_sheet_values(tab, values, token)
+            if ok:
+                log.info(f"Google Sheets append OK for tab '{tab}' (1 row)")
+            else:
+                log.warning(f"Google Sheets append returned False for tab '{tab}'")
     except Exception as e:
         log.warning(f"Google Sheets row sync failed for {filename}: {e}")
 
@@ -3290,9 +3298,7 @@ def _post_em_card(ticker: str, session: str):
         # ── v4.3: Resolve unified regime for trade card + plain cards ──
         unified_regime = resolve_unified_regime(eng or {}, cagf, spot)
 
-        # NOTE: The live /em user-facing output is intentionally compressed.
-        # We keep the full institutional snapshot for internal logging/backtests,
-        # then post a single decision-first card via _post_trade_card.
+        # Live /em output should include the richer dealer brief when no trade qualifies.
 
         # ── Compute session progress for trade card timing gates ──
         _mkt_open_ct = now_ct.replace(hour=8, minute=30, second=0, microsecond=0)
@@ -3432,9 +3438,37 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
             card_title = f"TRADE SETUP ({effective_dte_label})"
 
         def no_trade(reason, emoji="⚪"):
-            post_to_telegram(
-                f"🎯 {ticker} — {card_title}  |  Exp: {exp_short}\n"
-                f"{emoji} NO TRADE — {reason}\n— Not financial advice —")
+            flip = (walls or {}).get("gamma_flip") or (eng or {}).get("flip_price")
+            call_wall = (walls or {}).get("call_wall")
+            put_wall = (walls or {}).get("put_wall")
+            gamma_wall = (walls or {}).get("gamma_wall")
+            max_pain = (walls or {}).get("max_pain") or (eng or {}).get("max_pain")
+            bias_line = f"{bias['direction']} (score {bias['score']}/14)"
+            range_low = em.get('bear_1sd')
+            range_high = em.get('bull_1sd')
+            accel_up = call_wall or range_high
+            accel_dn = put_wall or range_low
+            lines = [
+                f"🎯 {ticker} — DEALER EM BRIEF ({effective_dte_label})  |  Exp: {exp_short}",
+                f"{emoji} NO TRADE — {reason}",
+                f"Bias: {bias_line}",
+                f"Spot: ${spot:.2f} | 1σ: ${range_low} – ${range_high}",
+            ]
+            if flip is not None:
+                lines.append(f"Gamma Flip: ${flip}")
+            if call_wall is not None or put_wall is not None:
+                lines.append(f"Call Wall: ${call_wall} | Put Wall: ${put_wall}")
+            if gamma_wall is not None:
+                lines.append(f"Gamma Wall: ${gamma_wall}")
+            if max_pain is not None:
+                lines.append(f"Max Pain: ${max_pain}")
+            lines += [
+                f"Trigger Up: above ${accel_up}",
+                f"Trigger Down: below ${accel_dn}",
+                f"Regime: {unified_regime}",
+                "— Not financial advice —",
+            ]
+            post_to_telegram("\n".join(lines))
             log.info(f"Trade card blocked: {ticker} | {reason}")
 
         # ══════ GATE CHECKS ══════
