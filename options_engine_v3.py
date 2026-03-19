@@ -926,17 +926,21 @@ def compute_confidence(
     regime: Dict = None,
     direction: str = "bull",
     v4_flow: Dict = None,
+    vol_regime: Dict = None,
 ) -> Tuple[int, List[str]]:
     """
     Score trade confidence 0-100.
     v3.6: direction-aware — bear trades score differently from bull.
     v3.9: v4 flow quality signals from options_exposure engine.
+    v4.5: canonical vol regime awareness (VVIX, term structure, RV spike,
+          transition warning) via vol_regime from build_canonical_vol_regime.
     """
     reasons = []
     vol_edge = vol_edge or {}
     em_data = em_data or {}
     regime = regime or {}
     v4_flow = v4_flow or {}
+    vol_regime = vol_regime or {}
     is_bear = direction == "bear"
 
     is_manual = (
@@ -1228,6 +1232,73 @@ def compute_confidence(
             score += 5
             reasons.append(f"v4 regime: {v4_regime} (confirms directional, +5)")
 
+    # ── Canonical Vol Regime (v4.5) ──
+    # Uses the full 6-input caution model rather than raw VIX alone.
+    # Supplements (does not replace) the basic VIX regime block above.
+    if vol_regime:
+        vol_label     = vol_regime.get("label", "")
+        caution_score = int(vol_regime.get("caution_score") or 0)
+        transition    = bool(vol_regime.get("transition_warning"))
+        vvix_warn     = bool(vol_regime.get("vvix_warning"))
+        rv_spike      = bool(vol_regime.get("rv_spike"))
+        above_ma200   = bool(vol_regime.get("above_ma200"))
+        term          = (vol_regime.get("term_structure") or "").lower()
+        vvix_val      = vol_regime.get("vvix") or 0
+
+        # Incremental penalty for each caution point above the neutral threshold.
+        # caution 0-2 = no penalty (covered by basic VIX block already).
+        # caution 3 = -3, 4 = -6, 5 = -9, 6+ = -12 (caps at 4 increments).
+        caution_excess = min(max(caution_score - 2, 0), 4)
+        if caution_excess > 0:
+            pen = caution_excess * 3
+            score -= pen
+            reasons.append(
+                f"Vol caution score {caution_score}/8 (−{pen})"
+            )
+
+        # TRANSITION warning: vol is transitioning upward — reduce confidence
+        # more for bull trades (going against rising fear) than bear.
+        if transition and vol_label not in ("ELEVATED", "CRISIS"):
+            trans_pen = 4 if is_bear else 7
+            score -= trans_pen
+            reasons.append(
+                f"Vol transition warning (−{trans_pen})"
+            )
+
+        # Inverted term structure: near-term fear exceeds 30-day — urgent signal.
+        if term == "inverted":
+            if is_bear:
+                score += 3
+                reasons.append("Inverted VIX term (confirms fear, bear +3)")
+            else:
+                score -= 6
+                reasons.append("Inverted VIX term (rising fear, bull −6)")
+        elif term == "flat" and caution_score >= 3:
+            score -= 2
+            reasons.append("Flat VIX term structure (−2)")
+
+        # VVIX spike: vol-of-vol elevated → dealer hedging unstable
+        if vvix_warn:
+            pen = 4 if not is_bear else 2
+            score -= pen
+            reasons.append(
+                f"VVIX {vvix_val:.0f} elevated — hedging unstable (−{pen})"
+            )
+
+        # Short-term RV spike: realized vol accelerating vs medium-term
+        if rv_spike:
+            if is_bear:
+                score += 3
+                reasons.append("RV spike confirms bearish momentum (+3)")
+            else:
+                score -= 4
+                reasons.append("RV spike fighting bull entry (−4)")
+
+        # VIX above 200-day MA: sustained elevated vol regime
+        if above_ma200 and vol_label in ("NORMAL", "LOW"):
+            score -= 3
+            reasons.append("VIX above 200d MA despite low base (−3)")
+
     # ── Deal-breakers ──
     if has_earnings:
         score += CONFIDENCE_PENALTIES["earnings_week"]
@@ -1262,11 +1333,14 @@ def recommend_trade(
     candle_closes: List[float] = None,
     regime: Dict = None,
     v4_flow: Dict = None,
+    vol_regime: Dict = None,
 ) -> Dict[str, Any]:
     """
     Main entry point. Returns a complete trade recommendation or rejection.
     v3.6: supports both bull call and bear put debit spreads.
     v3.9: accepts v4_flow from institutional engine for flow quality scoring.
+    v4.5: accepts vol_regime from build_canonical_vol_regime for full 6-input
+          vol scoring inside compute_confidence.
     """
     webhook_data = webhook_data or {}
     candle_closes = candle_closes or []
@@ -1386,6 +1460,7 @@ def recommend_trade(
         regime=regime,
         direction=bias,
         v4_flow=v4_flow,
+        vol_regime=vol_regime,
     )
 
     if confidence < MIN_CONFIDENCE_TO_TRADE:
