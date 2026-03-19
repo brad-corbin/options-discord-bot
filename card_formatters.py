@@ -24,6 +24,8 @@ import math
 import logging
 from typing import Dict, Optional, List, Tuple
 
+from unified_models import resolve_canonical_dealer_regime
+
 log = logging.getLogger(__name__)
 
 
@@ -38,107 +40,8 @@ def resolve_unified_regime(
     cagf: Optional[dict] = None,
     spot: float = 0,
 ) -> dict:
-    """
-    Produce one canonical regime label from all available sources.
-
-    Priority:
-      1. CAGF institutional model (flip-normalized, if available)
-      2. Raw GEX sign as fallback
-
-    Returns dict with:
-      - label: str ("TRENDING", "SUPPRESSING", "MIXED", "UNKNOWN")
-      - source: str (which model determined it)
-      - description: str (plain English)
-      - allows_debit_spreads: bool
-      - allows_credit_spreads: bool
-      - gex_raw_negative: bool (for backward compat)
-      - flip_price: float or None
-      - spot_vs_flip: str ("above", "below", "unknown")
-    """
-    tgex = eng.get("gex", 0) if eng else 0
-    flip = eng.get("flip_price") if eng else None
-    gex_negative = tgex < 0
-
-    # Default
-    result = {
-        "label": "UNKNOWN",
-        "source": "none",
-        "description": "Insufficient data to determine regime.",
-        "allows_debit_spreads": True,
-        "allows_credit_spreads": True,
-        "gex_raw_negative": gex_negative,
-        "flip_price": flip,
-        "spot_vs_flip": "unknown",
-    }
-
-    # Spot vs flip
-    if flip and spot > 0:
-        result["spot_vs_flip"] = "above" if spot > flip else "below"
-
-    # ── CAGF regime (preferred source) ──
-    if cagf and cagf.get("regime") not in (None, "UNKNOWN"):
-        cagf_regime = cagf["regime"]
-        trend_prob = cagf.get("trend_day_probability", 0)
-
-        if cagf_regime == "TRENDING":
-            result["label"] = "TRENDING"
-            result["source"] = "institutional flow model"
-            result["description"] = (
-                "Dealers are positioned for directional moves. "
-                "Price trends tend to accelerate."
-            )
-            result["allows_debit_spreads"] = True
-            result["allows_credit_spreads"] = False
-
-        elif cagf_regime == "SUPPRESSING":
-            result["label"] = "SUPPRESSING"
-            result["source"] = "institutional flow model"
-
-            # Nuance: if raw GEX is still negative, note the tension
-            if gex_negative:
-                result["description"] = (
-                    "The flow model leans suppressing (above gamma flip), "
-                    "but raw dealer gamma is still negative. "
-                    "Moves may be dampened but breakout risk remains."
-                )
-                result["label"] = "MIXED"  # acknowledge the contradiction
-            else:
-                result["description"] = (
-                    "Dealers suppress price moves in this zone. "
-                    "Ranges tend to hold."
-                )
-            result["allows_debit_spreads"] = trend_prob >= 0.45
-            result["allows_credit_spreads"] = True
-
-        else:
-            result["label"] = "NEUTRAL"
-            result["source"] = "institutional flow model"
-            result["description"] = "No strong regime signal. Mixed conditions."
-            result["allows_debit_spreads"] = True
-            result["allows_credit_spreads"] = True
-
-    # ── Fallback: raw GEX only ──
-    elif eng:
-        if gex_negative:
-            result["label"] = "TRENDING"
-            result["source"] = "raw GEX"
-            result["description"] = (
-                "Negative dealer gamma — moves can accelerate. "
-                "Directional strategies are favored."
-            )
-            result["allows_debit_spreads"] = True
-            result["allows_credit_spreads"] = False
-        else:
-            result["label"] = "SUPPRESSING"
-            result["source"] = "raw GEX"
-            result["description"] = (
-                "Positive dealer gamma — moves tend to be dampened. "
-                "Range-bound strategies may work better."
-            )
-            result["allows_debit_spreads"] = False
-            result["allows_credit_spreads"] = True
-
-    return result
+    """Backward-compatible wrapper around the shared dealer regime resolver."""
+    return resolve_canonical_dealer_regime(eng=eng, cagf=cagf, spot=spot)
 
 
 # ─────────────────────────────────────────────────────────
