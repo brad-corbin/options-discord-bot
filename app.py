@@ -1517,6 +1517,13 @@ def get_canonical_vol_regime(ticker: str = "SPY", candle_closes: list | None = N
 
     market = _get_vix_data() or {}
     closes = candle_closes or get_daily_candles(ticker, days=65) or get_daily_candles("SPY", days=65)
+    # Fetch SPY closes for market-level RV spike detection.
+    # For non-SPY tickers, rv_spike now fires on SPY volatility, not just
+    # the ticker's own quiet vol — catches broad-market stress (e.g. GLD).
+    spy_closes_for_rv = (
+        closes if ticker == "SPY"
+        else (get_daily_candles("SPY", days=65) or [])
+    )
     result = _um_build_canonical_vol_regime(
         ticker=ticker,
         candle_closes=closes,
@@ -1525,6 +1532,7 @@ def get_canonical_vol_regime(ticker: str = "SPY", candle_closes: list | None = N
         get_vix_ma200_fn=_get_vix_ma200,
         get_vvix_value_fn=_get_vvix_value,
         now_ts=now,
+        spy_closes=spy_closes_for_rv,
     )
     _vol_regime_symbol_cache[cache_key] = {"data": result, "ts": now}
     return result
@@ -2402,6 +2410,7 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
                 has_earnings=has_earnings, has_dividend=has_dividend,
                 candle_closes=candle_closes, regime=regime,
                 v4_flow=v4_flow,
+                vol_regime=vol_regime,
             )
             if rec.get("ok"):
                 rec = _apply_canonical_structure_overlay_to_rec(rec, structure_ctx, mode="scalp")
@@ -3774,7 +3783,12 @@ def _compute_cagf_snapshot(
     candle_closes: list = None,
     adv: float = None,
 ) -> dict:
-    """Reusable institutional-flow snapshot for EM/monitor/shared dealer regime logic."""
+    """Reusable institutional-flow snapshot for EM/monitor/shared dealer regime logic.
+
+    v4.5: passes vol_caution_score and vol_transition_warning from canonical
+    vol regime so compute_cagf can suppress directional probability during
+    structurally risky vol environments.
+    """
     ticker = (ticker or "").upper().strip()
     eng = eng or {}
     if not ticker or not eng or ticker not in ("SPY", "QQQ", "SPX"):
@@ -3787,13 +3801,18 @@ def _compute_cagf_snapshot(
         if isinstance(v4_result, dict):
             vol_regime = v4_result.get("vol_regime") or v4_result.get("volatility_regime") or {}
         rv = as_float(vol_regime.get("realized_vol_20d"), 0.0)
+        closes = candle_closes or get_daily_candles(ticker, days=60)
         if rv <= 0:
-            closes = candle_closes or get_daily_candles(ticker, days=60)
             canonical_vol = get_canonical_vol_regime(ticker, candle_closes=closes)
             rv_pct = as_float((canonical_vol or {}).get("rv20"), 0.0)
             rv = rv_pct / 100.0 if rv_pct > 0 else 0.0
         else:
-            closes = candle_closes or get_daily_candles(ticker, days=60)
+            canonical_vol = get_canonical_vol_regime(ticker, candle_closes=closes)
+
+        # Extract canonical vol regime signals for CAGF suppression
+        canonical_vol = canonical_vol or {}
+        vol_caution = int(canonical_vol.get("caution_score") or 0)
+        vol_transition = bool(canonical_vol.get("transition_warning"))
 
         if adv is None:
             adv, _ = _estimate_liquidity(ticker, spot)
@@ -3819,6 +3838,8 @@ def _compute_cagf_snapshot(
             adv=adv,
             candle_closes=closes,
             ticker=ticker,
+            vol_caution_score=vol_caution,
+            vol_transition_warning=vol_transition,
         )
     except Exception as e:
         log.warning(f"CAGF compute failed for {ticker}: {e}")
