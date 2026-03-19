@@ -4794,8 +4794,150 @@ def _post_em_card(ticker: str, session: str):
             canonical_vol=vol_regime,
         )
 
+        # ── Post follow-up plain English guidance from thesis monitor ──
+        try:
+            _te = get_thesis_engine()
+            _thesis_obj = _te.get_thesis(ticker)
+            if _thesis_obj:
+                # Run an initial evaluate so the engine has a starting point
+                _te.evaluate(ticker, spot)
+                guidance = _te.build_guidance(ticker, spot)
+                g_lines = [f"📡 {ticker} — ACTION GUIDE @ ${spot:.2f}", ""]
+                for item in guidance:
+                    if item["type"] == "divider":
+                        g_lines.append(f"\n{item['text']}")
+                    elif item["type"] == "critical":
+                        g_lines.append(f"🔥 {item['text']}")
+                    elif item["type"] == "warning":
+                        g_lines.append(f"⚠️ {item['text']}")
+                    elif item["type"] == "bullish":
+                        g_lines.append(f"🟢 {item['text']}")
+                    elif item["type"] == "bearish":
+                        g_lines.append(f"🔴 {item['text']}")
+                    elif item["type"] == "time":
+                        g_lines.append(f"🕐 {item['text']}")
+                    elif item["type"] == "context":
+                        g_lines.append(f"📋 {item['text']}")
+                    else:
+                        g_lines.append(f"  {item['text']}")
+                g_lines.append("")
+                g_lines.append("📡 Monitoring active — alerts will post if levels break or fail.")
+                g_lines.append("Use /monitor guidance for updated read anytime.")
+                g_lines.append("— Not financial advice —")
+                post_to_telegram("\n".join(g_lines))
+                log.info(f"Plain English guidance posted for {ticker}")
+        except Exception as _ge:
+            log.warning(f"Guidance post failed for {ticker}: {_ge}")
+
     except Exception as e:
         log.error(f"EM card error for {ticker} ({session}): {e}", exc_info=True)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# PLAIN ENGLISH ACTION BLOCK — appended to EM/no-trade cards
+# Tells the trader WHAT TO DO, not just what the levels are.
+# ─────────────────────────────────────────────────────────────────────
+
+def _build_action_block(
+    ticker: str, spot: float, eng: dict, bias: dict, em: dict,
+    local_walls: dict = None, cagf: dict = None,
+) -> list:
+    """Build plain English 'what to do' lines for EM cards."""
+    lines = []
+    eng = eng or {}
+    lw = local_walls or {}
+    cagf = cagf or {}
+    tgex = eng.get("gex", 0)
+    gex_positive = tgex >= 0
+    flip = eng.get("flip_price")
+    struct_r = lw.get("local_resistance_1")
+    struct_s = lw.get("local_support_1")
+    pin_low = lw.get("pin_zone_low")
+    pin_high = lw.get("pin_zone_high")
+    range_break_up = pin_high or lw.get("call_wall")
+    range_break_dn = pin_low or lw.get("put_wall")
+
+    lines.append("")
+    lines.append("─" * 32)
+    lines.append("📡 WHAT TO DO — Plain English")
+
+    # ── Time of day context ──
+    try:
+        from thesis_monitor import _get_time_phase_ct
+        tp = _get_time_phase_ct()
+        lines.append(f"🕐 {tp['label']}: {tp['note']}")
+    except Exception:
+        pass
+
+    # ── GEX environment (the single most important thing) ──
+    if gex_positive:
+        lines.append("⚙️ GEX is POSITIVE — failed moves and mean reversion are MORE LIKELY than continuation.")
+        lines.append("   → Don't chase breakouts. TRADE THE FAILURES.")
+    else:
+        lines.append("⚙️ GEX is NEGATIVE — moves can ACCELERATE. Breakdowns are dangerous.")
+        lines.append("   → Respect the breaks. Use wider stops or smaller size.")
+
+    # ── Gamma flip position ──
+    if flip is not None:
+        if spot > flip:
+            lines.append(f"📈 Above gamma flip ${flip:.2f} — bullish structure. Dealers buy dips.")
+        else:
+            lines.append(f"📉 Below gamma flip ${flip:.2f} — bearish/trending. Breakdowns can extend.")
+
+    # ── Specific action setups ──
+    lines.append("")
+    lines.append("🎯 SETUPS TO WATCH:")
+
+    if struct_s is not None:
+        if gex_positive:
+            lines.append(
+                f"  IF price breaks below ${struct_s:.2f} AND fails to continue (2-3 candles)"
+                f" AND reclaims it → GO LONG (squeeze). Shorts get trapped. Stop below ${struct_s:.2f}."
+            )
+        else:
+            lines.append(
+                f"  IF price breaks below ${struct_s:.2f} WITH large candles"
+                f" AND continues → SHORT is valid. Stop above ${struct_s:.2f}."
+            )
+
+    if struct_r is not None:
+        if gex_positive:
+            lines.append(
+                f"  IF price breaks above ${struct_r:.2f} AND fails to continue"
+                f" AND loses it → GO SHORT (fade). Longs get trapped. Stop above ${struct_r:.2f}."
+            )
+        else:
+            lines.append(
+                f"  IF price breaks above ${struct_r:.2f} WITH momentum"
+                f" AND holds → LONG is valid. Stop below ${struct_r:.2f}."
+            )
+
+    # ── Range break scenarios ──
+    if range_break_dn is not None and range_break_dn != struct_s:
+        lines.append(
+            f"  IF price drops below ${range_break_dn:.2f} (range break) → watch for trap."
+            f" Reclaim = squeeze long. Continuation = real breakdown."
+        )
+    if range_break_up is not None and range_break_up != struct_r:
+        lines.append(
+            f"  IF price pops above ${range_break_up:.2f} (range break) → watch for trap."
+            f" Lost = fade short. Holds = real breakout."
+        )
+
+    # ── Momentum filter ──
+    lines.append("")
+    lines.append("⚠️ MOMENTUM RULES:")
+    lines.append("  A break is ONLY valid with large candles + continuation.")
+    lines.append("  Small candles breaking a level = likely a TRAP. Wait for the failure.")
+    lines.append("  If your trade's momentum fades (moves get smaller) → tighten or exit.")
+
+    # ── Pin zone behavior ──
+    if pin_low is not None and pin_high is not None and gex_positive:
+        lines.append("")
+        lines.append(f"📌 PIN ZONE ACTIVE: ${pin_low:.2f}–${pin_high:.2f}")
+        lines.append("  Price WANTS to stay here. Fade the edges. Don't chase direction.")
+
+    return lines
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -5052,7 +5194,19 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
                 horizon_label=effective_dte_label,
             )
             lines.extend(_um_format_shared_snapshot_lines(em_snapshot))
+
+            # ── Plain English action block ──
+            try:
+                action_lines = _build_action_block(
+                    ticker=ticker, spot=spot, eng=eng or {}, bias=bias, em=em,
+                    local_walls=local_walls, cagf=cagf,
+                )
+                lines.extend(action_lines)
+            except Exception as _ab_err:
+                log.warning(f"Action block build failed: {_ab_err}")
+
             lines += [
+                "",
                 "— Not financial advice —",
             ]
             # ── Thesis Monitor: store thesis even when no trade qualifies ──
