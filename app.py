@@ -2725,6 +2725,47 @@ def _find_expiry_closest_to_21(ticker):
 
 
 # ─────────────────────────────────────────────────────────────────────
+# EM STRUCTURE HELPERS
+# ─────────────────────────────────────────────────────────────────────
+
+def _calc_max_pain_from_by_strike(by_strike: dict | None) -> float | None:
+    """Estimate max pain from by-strike OI. Returns strike with minimum total payout."""
+    try:
+        if not by_strike:
+            return None
+        strikes = sorted(float(k) for k in by_strike.keys())
+        if not strikes:
+            return None
+        best_strike = None
+        best_payout = None
+        for settle in strikes:
+            payout = 0.0
+            for strike in strikes:
+                row = by_strike.get(strike) or by_strike.get(int(strike)) or by_strike.get(str(strike)) or {}
+                call_oi = as_float(row.get("call_oi"), 0.0)
+                put_oi = as_float(row.get("put_oi"), 0.0)
+                payout += max(settle - strike, 0.0) * call_oi
+                payout += max(strike - settle, 0.0) * put_oi
+            if best_payout is None or payout < best_payout:
+                best_payout = payout
+                best_strike = settle
+        return round(best_strike, 2) if best_strike is not None else None
+    except Exception:
+        return None
+
+
+def _ensure_max_pain_in_walls(walls: dict | None, v4_result: dict | None) -> dict:
+    walls = dict(walls or {})
+    if walls.get("max_pain") is not None:
+        return walls
+    by_strike = (v4_result or {}).get("by_strike") or {}
+    max_pain = _calc_max_pain_from_by_strike(by_strike)
+    if max_pain is not None:
+        walls["max_pain"] = max_pain
+    return walls
+
+
+# ─────────────────────────────────────────────────────────────────────
 # EM ACCURACY LOGGER — saves predictions for backtest analysis
 # Stores each EM card's prediction in Redis so we can compare
 # against actual EOD prices and compute hit rates over time.
@@ -2741,23 +2782,24 @@ def _log_em_prediction(ticker: str, session: str, spot: float, em: dict, bias: d
     """
     try:
         import json
-        walls = walls or {}
+        walls = _ensure_max_pain_in_walls(walls or {}, v4_result)
         cagf = cagf or {}
         eng = eng or {}
         now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         key = f"em_log:{now_str}:{ticker}:{session}"
 
-        em_1sd = em.get("em_1sd") or 0.0
+        em_1sd = as_float(em.get("em_1sd"), 0.0)
+        conf_label = ((v4_result or {}).get("confidence", {}) or {}).get("label") or "MODERATE"
+        conf_mult = {"HIGH": 0.18, "MODERATE": 0.12, "LOW": 0.08}.get(conf_label, 0.12)
         idx_tickers = {"SPY", "QQQ", "SPX", "IWM", "DIA"}
-        if str(ticker).upper() in idx_tickers:
-            direction_buffer_abs = max(1.50, em_1sd * 0.20)
-        else:
-            direction_buffer_abs = max(0.50, em_1sd * 0.20)
+        floor = 0.75 if str(ticker).upper() in idx_tickers else 0.50
+        direction_buffer_abs = max(floor, em_1sd * conf_mult)
 
         gamma_flip = eng.get("flip_price")
         call_wall = walls.get("call_wall")
         put_wall = walls.get("put_wall")
         gamma_wall = walls.get("gamma_wall")
+        max_pain = walls.get("max_pain")
         accel_up = gamma_flip or gamma_wall or call_wall or em.get("bull_1sd")
         accel_dn = gamma_flip or gamma_wall or put_wall or em.get("bear_1sd")
         reclaim_level = gamma_flip or gamma_wall or put_wall or spot
@@ -2780,6 +2822,7 @@ def _log_em_prediction(ticker: str, session: str, spot: float, em: dict, bias: d
             "call_wall": call_wall,
             "put_wall": put_wall,
             "gamma_wall": gamma_wall,
+            "max_pain": max_pain,
             "accel_up": accel_up,
             "accel_dn": accel_dn,
             "reclaim_level": reclaim_level,
@@ -2850,6 +2893,7 @@ def _post_em_card(ticker: str, session: str):
         em = _calc_intraday_em(spot, iv, hours_for_em)
         if not em: return
 
+        walls = _ensure_max_pain_in_walls(walls or {}, v4_result)
         bias = _calc_bias(spot, em, walls or {}, skew or {}, eng or {}, pcr or {}, vix or {})
 
         iv_pct = iv * 100
@@ -2996,6 +3040,10 @@ def _post_em_card(ticker: str, session: str):
             if "gamma_wall" in walls:
                 gw = walls["gamma_wall"]; gw_dist = ((gw - spot) / spot) * 100
                 lines.append(f"  🎯 Gamma Wall: ${gw:.0f}  ({gw_dist:+.1f}%)")
+            if "max_pain" in walls:
+                mp = walls["max_pain"]; mp_dist = ((mp - spot) / spot) * 100
+                mp_side = "above" if mp >= spot else "below"
+                lines.append(f"  🧲 Max Pain:   ${mp:.0f}  ({mp_side} spot, {mp_dist:+.1f}%)")
             if "call_top3" in walls:
                 lines.append(f"  📵 Resistance stack: {'  →  '.join(f'${x:.0f}' for x in walls['call_top3'])}")
             if "put_top3" in walls:
@@ -3184,6 +3232,7 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
             call_wall = walls.get("call_wall") if walls else None
             put_wall = walls.get("put_wall") if walls else None
             gamma_wall = walls.get("gamma_wall") if walls else None
+            max_pain = walls.get("max_pain") if walls else None
             flip_side = None
             if flip is not None:
                 flip_side = "above" if spot >= flip else "below"
@@ -3210,7 +3259,7 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
             if unified_regime:
                 structure_lines.append(f"Regime: {unified_regime.get('label', 'UNKNOWN')}")
 
-            if flip is not None or call_wall is not None or put_wall is not None or gamma_wall is not None:
+            if flip is not None or call_wall is not None or put_wall is not None or gamma_wall is not None or max_pain is not None:
                 structure_lines += ["", "📍 Key levels"]
                 if flip is not None:
                     structure_lines.append(f"  • Gamma flip: ${flip:.2f} ({flip_side})")
@@ -3220,6 +3269,8 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
                     structure_lines.append(f"  • Put wall / support: ${put_wall:.2f}")
                 if gamma_wall is not None:
                     structure_lines.append(f"  • Gamma wall: ${gamma_wall:.2f}")
+                if max_pain is not None:
+                    structure_lines.append(f"  • Max pain / magnet: ${max_pain:.2f}")
                 if range_lo is not None and range_hi is not None:
                     structure_lines.append(f"  • Likely pin / balance zone: ${range_lo:.2f} – ${range_hi:.2f}")
 
@@ -3618,9 +3669,11 @@ def _post_monitor_card(ticker: str, mode: str):
         vanna_m = eng.get("vanna", 0) if eng else 0
         charm_m = eng.get("charm", 0) if eng else 0
         flip = eng.get("flip_price") if eng else None
+        walls = _ensure_max_pain_in_walls(walls or {}, v4_result)
         call_wall = walls.get("call_wall") if walls else None
         put_wall = walls.get("put_wall") if walls else None
         gamma_wall = walls.get("gamma_wall") if walls else None
+        max_pain = walls.get("max_pain") if walls else None
 
         reason_lines = []
         counter_lines = []
@@ -3719,6 +3772,8 @@ def _post_monitor_card(ticker: str, mode: str):
             lines.append(f"  Call Wall / Resistance: ${call_wall:.2f}")
         if gamma_wall is not None:
             lines.append(f"  Gamma Wall: ${gamma_wall:.2f}")
+        if max_pain is not None:
+            lines.append(f"  Max Pain: ${max_pain:.2f}")
         if flip is not None:
             lines.append(f"  Gamma Flip: ${flip:.2f}")
         if liquid and eng:
