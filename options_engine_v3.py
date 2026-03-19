@@ -61,9 +61,14 @@ def _norm_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 
-def _prob_finish_above(spot: float, strike: float, iv: float, dte: int) -> Optional[float]:
-    """Approx risk-neutral-style probability spot finishes above strike by expiry.
-    Uses a simple lognormal model with zero rates/dividends for ranking only.
+# Risk-free rate used for probability calculations (current ~4.5%)
+_RISK_FREE_RATE = 0.045
+
+
+def _prob_finish_above(spot: float, strike: float, iv: float, dte: int,
+                       r: float = _RISK_FREE_RATE, q: float = 0.0) -> Optional[float]:
+    """Risk-neutral probability spot finishes above strike by expiry.
+    Uses GBS d2 with risk-free rate and dividend yield (defaults to r=4.5%, q=0).
     """
     if spot <= 0 or strike <= 0 or iv is None or iv <= 0 or dte <= 0:
         return None
@@ -72,14 +77,15 @@ def _prob_finish_above(spot: float, strike: float, iv: float, dte: int) -> Optio
     if sigma_t <= 0:
         return None
     try:
-        d2 = (math.log(spot / strike) - 0.5 * iv * iv * t) / sigma_t
+        d2 = (math.log(spot / strike) + (r - q - 0.5 * iv * iv) * t) / sigma_t
         return max(0.0, min(1.0, _norm_cdf(d2)))
     except (ValueError, ZeroDivisionError):
         return None
 
 
-def _prob_finish_below(spot: float, strike: float, iv: float, dte: int) -> Optional[float]:
-    p_above = _prob_finish_above(spot, strike, iv, dte)
+def _prob_finish_below(spot: float, strike: float, iv: float, dte: int,
+                       r: float = _RISK_FREE_RATE, q: float = 0.0) -> Optional[float]:
+    p_above = _prob_finish_above(spot, strike, iv, dte, r=r, q=q)
     if p_above is None:
         return None
     return max(0.0, min(1.0, 1.0 - p_above))
@@ -144,7 +150,7 @@ def estimate_vertical_trade_quality(
     max_loss = max(debit, 0.0)
     # Partial-profit region sits between breakeven and short strike.
     partial_prob = max(0.0, prob_profit - prob_max)
-    partial_profit = max_profit * 0.35
+    partial_profit = max_profit * 0.50  # linear P&L midpoint between breakeven and short strike
     ev = (prob_max * max_profit) + (partial_prob * partial_profit) - ((1.0 - prob_profit) * max_loss)
 
     return {
@@ -262,18 +268,38 @@ def calc_iv_rv_edge(iv: float, rv: float) -> Dict:
     }
 
 
-def get_avg_chain_iv(contracts: List[Dict], spot: float) -> float:
-    """Average IV from ATM options (within 3% of spot)."""
+def get_avg_chain_iv(contracts: List[Dict], spot: float, side: str = "both") -> float:
+    """Average IV from ATM options (within 3% of spot).
+
+    Args:
+        side: "call", "put", or "both". Prefer call IVs for bull spreads,
+              put IVs for bear spreads. Defaults to "both" for backward compat.
+    """
     atm_range = spot * 0.03
     ivs = []
 
     for c in contracts:
+        right = (c.get("right") or "").lower()
         strike = as_float(c.get("strike"), 0)
         iv = as_float(c.get("iv"), 0)
-        if iv > 0 and abs(strike - spot) <= atm_range:
-            ivs.append(iv)
+        if iv <= 0 or abs(strike - spot) > atm_range:
+            continue
+        if side == "call" and right != "call":
+            continue
+        if side == "put" and right != "put":
+            continue
+        ivs.append(iv)
 
     if not ivs:
+        # Fallback: any ATM IV regardless of side
+        for c in contracts:
+            strike = as_float(c.get("strike"), 0)
+            iv = as_float(c.get("iv"), 0)
+            if iv > 0 and abs(strike - spot) <= atm_range:
+                ivs.append(iv)
+
+    if not ivs:
+        # Last resort: nearest available IVs
         for c in contracts:
             iv = as_float(c.get("iv"), 0)
             if iv > 0:
@@ -555,19 +581,11 @@ def build_itm_debit_spreads(
                 except Exception:
                     natural_debit = None
 
-            natural_debit = None
-            if long_q.get("ask") is not None and short_q.get("bid") is not None:
-                try:
-                    natural_debit = max(0.0, float(long_q.get("ask") or 0) - float(short_q.get("bid") or 0))
-                except Exception:
-                    natural_debit = None
-
             candidates.append({
                 "long":           long_k,
                 "short":          short_k,
                 "width":          width,
                 "debit":          round(debit, 2),
-                "natural_debit":  round(natural_debit, 2) if natural_debit is not None else None,
                 "natural_debit":  round(natural_debit, 2) if natural_debit is not None else None,
                 "cost_pct":       round(cost_pct * 100, 1),
                 "max_profit":     round(max_profit, 2),
@@ -1274,7 +1292,7 @@ def recommend_trade(
         return result
 
     # ── Vol / EM data ──
-    avg_iv = get_avg_chain_iv(contracts, spot)
+    avg_iv = get_avg_chain_iv(contracts, spot, side="call" if bias == "bull" else "put")
     expected_move = calc_expected_move(spot, avg_iv, dte) if avg_iv > 0 else 0.0
     rv = calc_realized_vol(candle_closes) if candle_closes else 0.0
     vol_edge = calc_iv_rv_edge(avg_iv, rv) if avg_iv > 0 and rv > 0 else {}
