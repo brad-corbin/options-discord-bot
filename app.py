@@ -28,6 +28,7 @@ from telegram_commands import (
     send_reply,
 )
 
+import jwt
 import os
 import time
 import math
