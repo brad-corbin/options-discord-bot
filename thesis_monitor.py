@@ -1144,6 +1144,18 @@ def build_thesis_from_em_card(
     gex_val = eng.get("gex", 0)
     gex_sign = "positive" if gex_val >= 0 else "negative"
 
+    # v1.1: Reconcile GEX sign with gamma flip position.
+    # Raw GEX can be positive, but if spot is far below the flip,
+    # effective dealer positioning is amplifying, not suppressing.
+    flip = eng.get("flip_price")
+    if flip is not None and spot > 0:
+        dist_from_flip_pct = (flip - spot) / spot * 100
+        if dist_from_flip_pct > 1.5:
+            gex_sign = "negative"
+            log.info(f"Thesis GEX sign overridden: raw GEX {gex_val:+.1f}M but spot {dist_from_flip_pct:.1f}% below flip → negative")
+        elif dist_from_flip_pct < -1.5:
+            gex_sign = "positive"
+
     # Determine regime
     regime = "UNKNOWN"
     if cagf and cagf.get("regime"):
