@@ -995,9 +995,10 @@ class ThesisMonitorEngine:
                             f"GEX is NEGATIVE — dealers amplify the move.\n"
                             f"Price: ${price:.2f} (continued ${abs(price - ba.level):.2f} past break)\n"
                             f"\n"
-                            f"ENTRY: Short / buy puts now\n"
-                            f"STOP: Above ${ba.level:.2f}\n"
-                            f"TARGET: Next support below\n"
+                            f"💰 TRADE TYPE: Naked puts — GEX- trend can run. Uncapped upside.\n"
+                            f"ENTRY: Buy puts near the money\n"
+                            f"STOP: Exit if price reclaims ${ba.level:.2f}\n"
+                            f"TARGET: Next support below — let the trend work\n"
                             f"\n"
                             f"Trailing alerts will track new levels. The trend is active."
                         ),
@@ -1031,9 +1032,10 @@ class ThesisMonitorEngine:
                             f"GEX is NEGATIVE — dealers amplify the move.\n"
                             f"Price: ${price:.2f} (continued ${abs(price - ba.level):.2f} past break)\n"
                             f"\n"
-                            f"ENTRY: Long / buy calls now\n"
-                            f"STOP: Below ${ba.level:.2f}\n"
-                            f"TARGET: Next resistance above\n"
+                            f"💰 TRADE TYPE: Naked calls — GEX- trend can run. Uncapped upside.\n"
+                            f"ENTRY: Buy calls near the money\n"
+                            f"STOP: Exit if price loses ${ba.level:.2f}\n"
+                            f"TARGET: Next resistance above — let the trend work\n"
                             f"\n"
                             f"Trailing alerts will track new levels. The trend is active."
                         ),
@@ -1077,8 +1079,12 @@ class ThesisMonitorEngine:
                 state.status = "FAILED_MOVE_ACTIVE"
 
                 gex_note = ""
+                trade_type = ""
                 if thesis.gex_sign == "positive":
                     gex_note = " GEX+ amplifies mean reversion — squeeze probability is HIGH."
+                    trade_type = "\n💰 TRADE TYPE: Call debit spread — GEX+ reversal move is capped. Spread reduces cost."
+                else:
+                    trade_type = "\n💰 TRADE TYPE: Naked calls — failed move in GEX- can squeeze hard."
 
                 source_note = " (intraday level)" if "intraday" in ba.level_name else ""
 
@@ -1086,7 +1092,7 @@ class ThesisMonitorEngine:
                     "msg": f"🔥 FAILED BREAKDOWN at ${ba.level:.2f} ({ba.level_name}{source_note}) — "
                            f"price reclaimed to ${price:.2f}. "
                            f"Shorts are trapped below. SQUEEZE SETUP LONG. "
-                           f"Stop: below ${ba.level:.2f}.{gex_note}",
+                           f"Stop: below ${ba.level:.2f}.{gex_note}{trade_type}",
                     "type": "critical", "priority": 5,
                     "alert_key": f"failed_break_{ba.level:.2f}",
                 })
@@ -1098,8 +1104,12 @@ class ThesisMonitorEngine:
                 state.status = "FAILED_MOVE_ACTIVE"
 
                 gex_note = ""
+                trade_type = ""
                 if thesis.gex_sign == "positive":
                     gex_note = " GEX+ amplifies mean reversion — fade probability is HIGH."
+                    trade_type = "\n💰 TRADE TYPE: Put debit spread — GEX+ reversal move is capped. Spread reduces cost."
+                else:
+                    trade_type = "\n💰 TRADE TYPE: Naked puts — failed move in GEX- can dump hard."
 
                 source_note = " (intraday level)" if "intraday" in ba.level_name else ""
 
@@ -1107,7 +1117,7 @@ class ThesisMonitorEngine:
                     "msg": f"🔥 FAILED BREAKOUT at ${ba.level:.2f} ({ba.level_name}{source_note}) — "
                            f"price fell back to ${price:.2f}. "
                            f"Longs are trapped above. FADE SETUP SHORT. "
-                           f"Stop: above ${ba.level:.2f}.{gex_note}",
+                           f"Stop: above ${ba.level:.2f}.{gex_note}{trade_type}",
                     "type": "critical", "priority": 5,
                     "alert_key": f"failed_break_{ba.level_name}",
                 })
