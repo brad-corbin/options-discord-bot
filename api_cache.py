@@ -261,7 +261,12 @@ class CachedMarketData:
 
     # ── VIX Data ──
     def get_vix_data(self, as_float_fn=None) -> dict:
-        """Cached VIX + VIX9D + term structure."""
+        """Cached VIX + VIX9D + term structure.
+        v4.3: Multi-fallback strategy:
+          1. /v1/indices/quotes/ (real-time, may 404 on some plans)
+          2. /v1/indices/candles/ (last daily close, widely available)
+          3. Returns {} if both fail — caller handles Yahoo fallback
+        """
         cached = self._vix_cache.get("vix")
         if cached is not None:
             return cached
@@ -269,6 +274,8 @@ class CachedMarketData:
         af = as_float_fn or _default_as_float
 
         def _parse_quote(data):
+            if not isinstance(data, dict):
+                return 0.0
             for field in ("last", "mid", "bid"):
                 v = data.get(field)
                 if isinstance(v, list):
@@ -278,34 +285,85 @@ class CachedMarketData:
                     return val
             return 0.0
 
+        def _last_candle_close(symbol):
+            """Get last daily close from candles endpoint as fallback."""
+            try:
+                data = self._md_get(
+                    f"https://api.marketdata.app/v1/indices/candles/daily/{symbol}/",
+                    {"countback": 3},
+                )
+                if isinstance(data, dict) and data.get("s") == "ok":
+                    closes = data.get("c", [])
+                    if closes:
+                        val = af(closes[-1], 0)
+                        if val > 0:
+                            log.info(f"VIX candle fallback: {symbol} = {val}")
+                            return val
+            except Exception as e:
+                log.debug(f"VIX candle fallback failed for {symbol}: {e}")
+            return 0.0
+
+        vix = 0.0
+        vix9d = 0.0
+
+        # Strategy 1: Real-time index quotes
         try:
             vix = _parse_quote(self._md_get(
                 "https://api.marketdata.app/v1/indices/quotes/VIX/"
             ))
+            if vix > 0:
+                log.info(f"VIX from indices/quotes: {vix}")
+        except Exception as e:
+            log.debug(f"VIX indices/quotes failed: {e}")
+
+        # Strategy 2: Last daily candle close
+        if vix <= 0:
+            vix = _last_candle_close("VIX")
+
+        # Strategy 3: Stock quotes (some plans map VIX here)
+        if vix <= 0:
+            try:
+                vix = _parse_quote(self._md_get(
+                    "https://api.marketdata.app/v1/stocks/quotes/VIX/"
+                ))
+                if vix > 0:
+                    log.info(f"VIX from stocks/quotes fallback: {vix}")
+            except Exception:
+                pass
+
+        if vix <= 0:
+            log.warning("VIX: All MarketData paths failed — returning empty for Yahoo fallback")
+            return {}
+
+        # VIX9D: same fallback chain
+        try:
             vix9d = _parse_quote(self._md_get(
                 "https://api.marketdata.app/v1/indices/quotes/VIX9D/"
             ))
-            if vix <= 0:
-                return {}
-            if vix9d > 0:
-                if vix9d > vix * 1.05:
-                    term = "inverted"
-                elif vix9d < vix * 0.95:
-                    term = "normal"
-                else:
-                    term = "flat"
+        except Exception:
+            pass
+        if vix9d <= 0:
+            vix9d = _last_candle_close("VIX9D")
+
+        # Term structure
+        if vix9d > 0:
+            if vix9d > vix * 1.05:
+                term = "inverted"
+            elif vix9d < vix * 0.95:
+                term = "normal"
             else:
-                term = "unknown"
-            result = {
-                "vix": round(vix, 1),
-                "vix9d": round(vix9d, 1) if vix9d > 0 else None,
-                "term": term,
-            }
-            self._vix_cache.set("vix", result)
-            return result
-        except Exception as e:
-            log.warning(f"Cached VIX fetch FAILED: {e} — vol regime will use defaults")
-            return {}
+                term = "flat"
+        else:
+            term = "unknown"
+
+        result = {
+            "vix": round(vix, 1),
+            "vix9d": round(vix9d, 1) if vix9d > 0 else None,
+            "term": term,
+        }
+        self._vix_cache.set("vix", result)
+        log.info(f"VIX data resolved: vix={result['vix']} vix9d={result.get('vix9d')} term={result['term']}")
+        return result
 
     # ── Liquidity Estimate (ADV + bid-ask spread) ──
     def get_liquidity(self, ticker: str, as_float_fn=None) -> tuple:
