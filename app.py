@@ -6260,7 +6260,10 @@ with app.app_context():
     _oi_cache = OICache(store_get, store_set)
     log.info(f"OI cache initialized (Redis: {_get_redis() is not None})")
     # ── Thesis Monitor Daemon ──
-    _thesis_daemon = init_thesis_daemon(get_spot_fn=get_spot, post_fn=post_to_telegram)
+    _thesis_daemon = init_thesis_daemon(
+        get_spot_fn=get_spot, post_fn=post_to_telegram,
+        store_get_fn=store_get, store_set_fn=store_set,
+    )
     log.info("Thesis monitor daemon started")
 
 if __name__ == "__main__":
