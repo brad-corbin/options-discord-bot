@@ -1639,7 +1639,32 @@ def _get_vix_ma200() -> float | None:
     ts = _vol_regime_market_cache.get("vix_ma200_ts", 0)
     if cached is not None and (now - ts) < 3600:
         return cached
+    # Try Yahoo first
     closes = _fetch_yahoo_chart_closes("^VIX", range_days=420)
+    # v4.3: Fallback to CBOE direct CSV if Yahoo fails
+    if len(closes) < 200:
+        try:
+            resp = requests.get(
+                "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv",
+                timeout=10, headers={"User-Agent": "Mozilla/5.0"},
+            )
+            resp.raise_for_status()
+            lines = resp.text.strip().split("\n")
+            if len(lines) > 200:
+                # Parse CLOSE column (index 4) from last 250 rows
+                cboe_closes = []
+                for line in lines[-250:]:
+                    parts = line.strip().split(",")
+                    if len(parts) >= 5:
+                        try:
+                            cboe_closes.append(float(parts[4]))
+                        except (ValueError, TypeError):
+                            pass
+                if len(cboe_closes) >= 200:
+                    closes = cboe_closes
+                    log.info(f"VIX MA200: using CBOE direct CSV ({len(closes)} closes)")
+        except Exception as e:
+            log.debug(f"CBOE VIX history fallback failed: {e}")
     if len(closes) < 200:
         return None
     ma = sum(closes[-200:]) / 200.0
@@ -1655,6 +1680,23 @@ def _get_vvix_value() -> float | None:
     if cached is not None and (now - ts) < 900:
         return cached
     vvix = _fetch_yahoo_last("^VVIX")
+    # v4.3: CBOE fallback for VVIX
+    if not vvix:
+        try:
+            resp = requests.get(
+                "https://cdn.cboe.com/api/global/us_indices/daily_prices/VVIX_History.csv",
+                timeout=8, headers={"User-Agent": "Mozilla/5.0"},
+            )
+            resp.raise_for_status()
+            lines = resp.text.strip().split("\n")
+            if len(lines) > 1:
+                parts = lines[-1].strip().split(",")
+                if len(parts) >= 5:
+                    vvix = as_float(parts[4], 0)
+                    if vvix > 0:
+                        log.info(f"VVIX from CBOE direct: {vvix:.1f}")
+        except Exception as e:
+            log.debug(f"CBOE VVIX fallback failed: {e}")
     _vol_regime_market_cache["vvix"] = vvix
     _vol_regime_market_cache["vvix_ts"] = now
     return vvix
