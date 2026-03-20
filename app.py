@@ -1461,6 +1461,16 @@ def get_daily_candles(ticker: str, days: int = 30) -> list:
     return _cached_md.get_daily_candles(ticker, days)
 
 def get_vix() -> float:
+    # v4.3 fix: Try MarketData API first (paid, reliable), then Yahoo, then IV proxy.
+    # Previous order was Yahoo first, which has been broken/unreliable.
+    try:
+        vix_data = _get_vix_data()
+        if vix_data and vix_data.get("vix", 0) > 0:
+            v = vix_data["vix"]
+            log.info(f"VIX from MarketData API: {v:.2f}")
+            return v
+    except Exception as e:
+        log.warning(f"VIX MarketData fetch failed: {e}")
     try:
         resp = requests.get("https://query1.finance.yahoo.com/v8/finance/chart/%5EVIX",
                            params={"interval": "1d", "range": "1d"},
@@ -1490,7 +1500,7 @@ def get_vix() -> float:
             return proxy
     except Exception as e:
         log.warning(f"VIX SPY-IV fallback failed: {e}")
-    log.warning("VIX unavailable — returning 20.0 as neutral default")
+    log.warning("VIX unavailable from ALL sources — returning 20.0 as neutral default")
     return 20.0
 
 
@@ -4848,14 +4858,45 @@ def _build_action_block(
     lw = local_walls or {}
     cagf = cagf or {}
     tgex = eng.get("gex", 0)
-    gex_positive = tgex >= 0
     flip = eng.get("flip_price")
     struct_r = lw.get("local_resistance_1")
     struct_s = lw.get("local_support_1")
     pin_low = lw.get("pin_zone_low")
     pin_high = lw.get("pin_zone_high")
-    range_break_up = pin_high or lw.get("call_wall")
-    range_break_dn = pin_low or lw.get("put_wall")
+    em_1sd = em.get("em_1sd") or 0.0
+    range_low = em.get("bear_1sd")
+    range_high = em.get("bull_1sd")
+
+    # v4.3: Reconcile GEX sign with gamma flip position.
+    # Raw GEX can be positive, but if spot is far below the flip,
+    # the effective dealer positioning is amplifying, not suppressing.
+    # This catches the contradiction where the card says "GEX positive"
+    # while spot is $17 below the flip in full trending territory.
+    gex_positive = tgex >= 0
+    if flip is not None and spot > 0:
+        dist_from_flip_pct = (flip - spot) / spot * 100
+        if dist_from_flip_pct > 1.5:
+            # Spot is meaningfully below flip — effective gamma is negative
+            # even if raw GEX number is positive
+            gex_positive = False
+            log.info(f"GEX sign overridden: raw GEX {tgex:+.1f}M but spot is {dist_from_flip_pct:.1f}% below flip — treating as negative gamma")
+        elif dist_from_flip_pct < -1.5:
+            # Spot is meaningfully above flip — effective gamma is positive
+            gex_positive = True
+
+    # v4.3: Pin zone sanity — check if it's actionable or absurdly wide
+    pin_actionable = False
+    if pin_low is not None and pin_high is not None and em_1sd > 0:
+        pin_width = abs(pin_high - pin_low)
+        pin_actionable = pin_width <= 2.5 * em_1sd
+
+    # v4.3: Range break triggers — use tight pin if actionable, else EM boundaries
+    if pin_actionable:
+        range_break_up = pin_high
+        range_break_dn = pin_low
+    else:
+        range_break_up = range_high or struct_r or lw.get("call_wall")
+        range_break_dn = range_low or struct_s or lw.get("put_wall")
 
     lines.append("")
     lines.append("─" * 32)
@@ -4879,10 +4920,11 @@ def _build_action_block(
 
     # ── Gamma flip position ──
     if flip is not None:
+        dist_note = f" ({abs(flip - spot):.2f} away)" if abs(flip - spot) > em_1sd else ""
         if spot > flip:
-            lines.append(f"📈 Above gamma flip ${flip:.2f} — bullish structure. Dealers buy dips.")
+            lines.append(f"📈 Above gamma flip ${flip:.2f}{dist_note} — bullish structure. Dealers buy dips.")
         else:
-            lines.append(f"📉 Below gamma flip ${flip:.2f} — bearish/trending. Breakdowns can extend.")
+            lines.append(f"📉 Below gamma flip ${flip:.2f}{dist_note} — bearish/trending. Breakdowns can extend.")
 
     # ── Specific action setups ──
     lines.append("")
@@ -4931,8 +4973,8 @@ def _build_action_block(
     lines.append("  Small candles breaking a level = likely a TRAP. Wait for the failure.")
     lines.append("  If your trade's momentum fades (5m candles getting smaller) → tighten or exit.")
 
-    # ── Pin zone behavior ──
-    if pin_low is not None and pin_high is not None and gex_positive:
+    # ── Pin zone behavior (only show if actionable) ──
+    if pin_actionable and gex_positive:
         lines.append("")
         lines.append(f"📌 PIN ZONE ACTIVE: ${pin_low:.2f}–${pin_high:.2f}")
         lines.append("  Price WANTS to stay here. Fade the edges. Don't chase direction.")
@@ -5088,8 +5130,14 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
 
             micro_up = struct_r
             micro_dn = struct_s
-            range_break_up = pin_high or call_wall or range_high
-            range_break_dn = pin_low or put_wall or range_low
+            # v4.3: Don't use pin zone edges as range break triggers when zone is too wide
+            if tight_pin:
+                range_break_up = pin_high or call_wall or range_high
+                range_break_dn = pin_low or put_wall or range_low
+            else:
+                # Fall back to EM 1σ boundaries or local structure
+                range_break_up = range_high or struct_r or call_wall
+                range_break_dn = range_low or struct_s or put_wall
             regime_shift_up = flip if flip is not None and flip > spot else None
             regime_shift_dn = flip if flip is not None and flip < spot else None
 
@@ -5143,9 +5191,15 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
             if vpoc is not None:
                 lines.append(f"📊 VPOC / Acceptance: {_fmt_money(vpoc)}")
             if pin_low is not None and pin_high is not None:
-                lines.append(f"📌 Pin Zone: {_fmt_money(pin_low)} – {_fmt_money(pin_high)}")
                 if tight_pin:
+                    lines.append(f"📌 Pin Zone: {_fmt_money(pin_low)} – {_fmt_money(pin_high)}")
                     lines.append("🤝 Neutral read: range / condor structure favored while price stays inside the pin zone.")
+                else:
+                    # v4.3: Don't show absurdly wide pin zones as actionable
+                    if em_1sd > 0:
+                        lines.append(f"📌 Pin Zone: {_fmt_money(pin_low)} – {_fmt_money(pin_high)}  ⚠️ TOO WIDE ({pin_width:.0f} vs EM ±{em_1sd:.2f}) — not actionable for pinning.")
+                    else:
+                        lines.append(f"📌 Pin Zone: {_fmt_money(pin_low)} – {_fmt_money(pin_high)}")
             if max_pain_close:
                 lines.append(f"🧲 Magnet: spot is trading close to Max Pain {_fmt_money(max_pain)}.")
 
