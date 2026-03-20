@@ -1660,7 +1660,7 @@ def _get_vvix_value() -> float | None:
     return vvix
 
 
-def get_canonical_vol_regime(ticker: str = "SPY", candle_closes: list | None = None) -> dict:
+def get_canonical_vol_regime(ticker: str = "SPY", candle_closes: list | None = None, vix_override: dict | None = None) -> dict:
     ticker = (ticker or "SPY").upper()
     cache_key = ticker
     now = time.time()
@@ -1669,6 +1669,10 @@ def get_canonical_vol_regime(ticker: str = "SPY", candle_closes: list | None = N
         return cached.get("data", {})
 
     market = _get_vix_data() or {}
+    # v4.3: Use vix_override (e.g. IV proxy) if MarketData returned nothing
+    if (not market or not market.get("vix")) and vix_override and vix_override.get("vix"):
+        market = vix_override
+        log.info(f"Vol regime using VIX override: {market.get('vix')} (source: {market.get('source', 'override')})")
     closes = candle_closes or get_daily_candles(ticker, days=65) or get_daily_candles("SPY", days=65)
     # Fetch SPY closes for market-level RV spike detection.
     # For non-SPY tickers, rv_spike now fires on SPY volatility, not just
@@ -4608,7 +4612,15 @@ def _post_em_card(ticker: str, session: str):
         em = _calc_intraday_em(spot, iv, hours_for_em)
         if not em: return
 
-        vol_regime = get_canonical_vol_regime(ticker, get_daily_candles(ticker, days=30))
+        # v4.3: VIX proxy from chain IV when all VIX API sources fail.
+        # For SPY, ATM IV × 100 ≈ VIX. For others, close enough for regime classification.
+        if not vix or not vix.get("vix"):
+            if iv and iv > 0:
+                proxy_vix = round(iv * 100, 1)
+                vix = {"vix": proxy_vix, "vix9d": None, "term": "unknown", "source": "iv_proxy"}
+                log.info(f"VIX proxy from {ticker} ATM IV: {proxy_vix:.1f} (all API sources failed)")
+
+        vol_regime = get_canonical_vol_regime(ticker, get_daily_candles(ticker, days=30), vix_override=vix)
         bias = _calc_bias(spot, em, walls or {}, skew or {}, eng or {}, pcr or {}, vix or {})
 
         iv_pct = iv * 100
