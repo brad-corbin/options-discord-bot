@@ -1568,8 +1568,11 @@ def _fetch_yahoo_chart_closes(symbol: str, range_days: int = 450) -> list:
     try:
         # MarketData uses plain tickers (VIX, not ^VIX)
         md_symbol = symbol.replace("^", "").replace("$", "")
+        # Indices (VIX, VIX9D, VVIX, DJI, etc.) use /indices/ not /stocks/
+        is_index = md_symbol.upper() in ("VIX", "VIX9D", "VVIX", "DJI", "SPX", "NDX", "RUT", "OEX")
+        base_path = "indices" if is_index else "stocks"
         data = md_get(
-            f"https://api.marketdata.app/v1/stocks/candles/daily/{md_symbol}/",
+            f"https://api.marketdata.app/v1/{base_path}/candles/daily/{md_symbol}/",
             {"countback": min(range_days, 500)},
         )
         if isinstance(data, dict) and data.get("s") == "ok":
@@ -1592,7 +1595,9 @@ def _fetch_yahoo_last(symbol: str) -> float | None:
     # v4.3: MarketData fallback for last price
     try:
         md_symbol = symbol.replace("^", "").replace("$", "")
-        data = md_get(f"https://api.marketdata.app/v1/stocks/quotes/{md_symbol}/")
+        is_index = md_symbol.upper() in ("VIX", "VIX9D", "VVIX", "DJI", "SPX", "NDX", "RUT", "OEX")
+        base_path = "indices" if is_index else "stocks"
+        data = md_get(f"https://api.marketdata.app/v1/{base_path}/quotes/{md_symbol}/")
         if isinstance(data, dict):
             for field in ("last", "mid", "bid"):
                 v = data.get(field)
