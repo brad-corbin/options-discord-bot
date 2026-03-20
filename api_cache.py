@@ -263,89 +263,117 @@ class CachedMarketData:
     def get_vix_data(self, as_float_fn=None) -> dict:
         """Cached VIX + VIX9D + term structure.
         v4.3: Multi-fallback strategy:
-          1. /v1/indices/quotes/ (real-time, may 404 on some plans)
-          2. /v1/indices/candles/ (last daily close, widely available)
-          3. Returns {} if both fail — caller handles Yahoo fallback
+          1. CBOE direct CSV (free, no API key, most reliable)
+          2. /v1/indices/quotes/ (real-time MarketData)
+          3. /v1/indices/candles/ (daily close MarketData)
+          4. Returns {} if all fail — caller handles IV proxy fallback
         """
         cached = self._vix_cache.get("vix")
         if cached is not None:
             return cached
 
         af = as_float_fn or _default_as_float
+        vix = 0.0
+        vix9d = 0.0
 
-        def _parse_quote(data):
-            if not isinstance(data, dict):
+        # ── Strategy 1: CBOE direct CSV (free, reliable, works after hours) ──
+        try:
+            import requests as _req
+            resp = _req.get(
+                "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv",
+                timeout=8, headers={"User-Agent": "Mozilla/5.0"},
+            )
+            resp.raise_for_status()
+            lines = resp.text.strip().split("\n")
+            if len(lines) > 1:
+                # Last row: DATE,OPEN,HIGH,LOW,CLOSE
+                parts = lines[-1].strip().split(",")
+                if len(parts) >= 5:
+                    vix = af(parts[4], 0)
+                    if vix > 0:
+                        log.info(f"VIX from CBOE direct: {vix:.2f} (date: {parts[0]})")
+        except Exception as e:
+            log.debug(f"CBOE VIX CSV fetch failed: {e}")
+
+        # ── Strategy 2: MarketData indices quotes ──
+        if vix <= 0:
+            def _parse_quote(data):
+                if not isinstance(data, dict):
+                    return 0.0
+                for field in ("last", "mid", "bid"):
+                    v = data.get(field)
+                    if isinstance(v, list):
+                        v = v[0] if v else None
+                    val = af(v, 0)
+                    if val > 0:
+                        return val
                 return 0.0
-            for field in ("last", "mid", "bid"):
-                v = data.get(field)
-                if isinstance(v, list):
-                    v = v[0] if v else None
-                val = af(v, 0)
-                if val > 0:
-                    return val
-            return 0.0
+            try:
+                vix = _parse_quote(self._md_get(
+                    "https://api.marketdata.app/v1/indices/quotes/VIX/"
+                ))
+                if vix > 0:
+                    log.info(f"VIX from MarketData indices/quotes: {vix}")
+            except Exception:
+                pass
 
-        def _last_candle_close(symbol):
-            """Get last daily close from candles endpoint as fallback."""
+        # ── Strategy 3: MarketData indices candles ──
+        if vix <= 0:
             try:
                 data = self._md_get(
-                    f"https://api.marketdata.app/v1/indices/candles/daily/{symbol}/",
+                    "https://api.marketdata.app/v1/indices/candles/daily/VIX/",
                     {"countback": 3},
                 )
                 if isinstance(data, dict) and data.get("s") == "ok":
                     closes = data.get("c", [])
                     if closes:
-                        val = af(closes[-1], 0)
-                        if val > 0:
-                            log.info(f"VIX candle fallback: {symbol} = {val}")
-                            return val
-            except Exception as e:
-                log.debug(f"VIX candle fallback failed for {symbol}: {e}")
-            return 0.0
-
-        vix = 0.0
-        vix9d = 0.0
-
-        # Strategy 1: Real-time index quotes
-        try:
-            vix = _parse_quote(self._md_get(
-                "https://api.marketdata.app/v1/indices/quotes/VIX/"
-            ))
-            if vix > 0:
-                log.info(f"VIX from indices/quotes: {vix}")
-        except Exception as e:
-            log.debug(f"VIX indices/quotes failed: {e}")
-
-        # Strategy 2: Last daily candle close
-        if vix <= 0:
-            vix = _last_candle_close("VIX")
-
-        # Strategy 3: Stock quotes (some plans map VIX here)
-        if vix <= 0:
-            try:
-                vix = _parse_quote(self._md_get(
-                    "https://api.marketdata.app/v1/stocks/quotes/VIX/"
-                ))
-                if vix > 0:
-                    log.info(f"VIX from stocks/quotes fallback: {vix}")
+                        vix = af(closes[-1], 0)
+                        if vix > 0:
+                            log.info(f"VIX from MarketData candle: {vix}")
             except Exception:
                 pass
 
         if vix <= 0:
-            log.warning("VIX: All MarketData paths failed — returning empty for Yahoo fallback")
+            log.warning("VIX: All sources failed — returning empty for IV proxy fallback")
             return {}
 
-        # VIX9D: same fallback chain
+        # ── VIX9D: try MarketData then CBOE ──
         try:
-            vix9d = _parse_quote(self._md_get(
+            def _pq(data):
+                if not isinstance(data, dict):
+                    return 0.0
+                for field in ("last", "mid", "bid"):
+                    v = data.get(field)
+                    if isinstance(v, list):
+                        v = v[0] if v else None
+                    val = af(v, 0)
+                    if val > 0:
+                        return val
+                return 0.0
+            vix9d = _pq(self._md_get(
                 "https://api.marketdata.app/v1/indices/quotes/VIX9D/"
             ))
         except Exception:
             pass
         if vix9d <= 0:
-            vix9d = _last_candle_close("VIX9D")
+            try:
+                import requests as _req
+                resp = _req.get(
+                    "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX9D_History.csv",
+                    timeout=8, headers={"User-Agent": "Mozilla/5.0"},
+                )
+                resp.raise_for_status()
+                lines = resp.text.strip().split("\n")
+                if len(lines) > 1:
+                    parts = lines[-1].strip().split(",")
+                    if len(parts) >= 5:
+                        vix9d = af(parts[4], 0)
+                        if vix9d > 0:
+                            log.info(f"VIX9D from CBOE direct: {vix9d:.2f}")
+            except Exception:
+                pass
 
-        # Term structure
+        # ── Term structure ──
         if vix9d > 0:
             if vix9d > vix * 1.05:
                 term = "inverted"
