@@ -1560,10 +1560,27 @@ def _fetch_yahoo_chart_closes(symbol: str, range_days: int = 450) -> list:
                     out.append(float(c))
             except Exception:
                 pass
-        return out
+        if out:
+            return out
     except Exception as e:
         log.debug(f"Yahoo closes fetch failed for {symbol}: {e}")
-        return []
+    # v4.3: Fallback to MarketData API for index history
+    try:
+        # MarketData uses plain tickers (VIX, not ^VIX)
+        md_symbol = symbol.replace("^", "").replace("$", "")
+        data = md_get(
+            f"https://api.marketdata.app/v1/stocks/candles/daily/{md_symbol}/",
+            {"countback": min(range_days, 500)},
+        )
+        if isinstance(data, dict) and data.get("s") == "ok":
+            closes = data.get("c", [])
+            out = [float(c) for c in closes if c is not None]
+            if out:
+                log.info(f"Got {len(out)} closes for {symbol} from MarketData fallback")
+                return out
+    except Exception as e:
+        log.debug(f"MarketData closes fallback failed for {symbol}: {e}")
+    return []
 
 
 def _fetch_yahoo_last(symbol: str) -> float | None:
@@ -1571,7 +1588,23 @@ def _fetch_yahoo_last(symbol: str) -> float | None:
         closes = _fetch_yahoo_chart_closes(symbol, range_days=10)
         return float(closes[-1]) if closes else None
     except Exception:
-        return None
+        pass
+    # v4.3: MarketData fallback for last price
+    try:
+        md_symbol = symbol.replace("^", "").replace("$", "")
+        data = md_get(f"https://api.marketdata.app/v1/stocks/quotes/{md_symbol}/")
+        if isinstance(data, dict):
+            for field in ("last", "mid", "bid"):
+                v = data.get(field)
+                if isinstance(v, list):
+                    v = v[0] if v else None
+                val = as_float(v, 0)
+                if val > 0:
+                    log.info(f"Got {symbol} = {val} from MarketData fallback")
+                    return val
+    except Exception as e:
+        log.debug(f"MarketData last price fallback failed for {symbol}: {e}")
+    return None
 
 
 def _calc_ann_rv_from_closes(closes: list, window: int = 20) -> float | None:
@@ -1649,6 +1682,11 @@ def get_canonical_vol_regime(ticker: str = "SPY", candle_closes: list | None = N
         now_ts=now,
         spy_closes=spy_closes_for_rv,
     )
+    # v4.3: Diagnostic logging for vol regime pipeline
+    log.info(f"Vol regime [{ticker}]: label={result.get('label')} base={result.get('base')} "
+             f"vix={result.get('vix')} vix9d={result.get('vix9d')} vvix={result.get('vvix')} "
+             f"term={result.get('term_structure')} ma200={result.get('vix_ma200')} "
+             f"caution={result.get('caution_score')} rv5={result.get('rv5')} rv20={result.get('rv20')}")
     _vol_regime_symbol_cache[cache_key] = {"data": result, "ts": now}
     return result
 
@@ -4272,7 +4310,10 @@ def _calc_pcr(oi_list, vol_l, sides, n):
 
 
 def _get_vix_data():
-    return _cached_md.get_vix_data(as_float_fn=as_float)
+    result = _cached_md.get_vix_data(as_float_fn=as_float)
+    if not result or not result.get("vix"):
+        log.warning("VIX data empty from MarketData cache — vol regime will use defaults")
+    return result
 
 def _discover_vix_market_snapshot():
     """Alias kept for call sites in _get_0dte_iv and _get_chain_iv_for_expiry."""
@@ -4750,7 +4791,7 @@ def _post_em_card(ticker: str, session: str):
                  f"conf={v4_result.get('confidence', {}).get('label', '?')}")
 
         # ── EM accuracy logger: save prediction for backtest ──
-        _log_em_prediction(ticker, session, spot, em, bias, v4_result, walls=walls, eng=eng, cagf=cagf)
+        _log_em_prediction(ticker, session, spot, em, bias, v4_result, walls=walls, eng=eng, cagf=cagf, vol_regime=vol_regime)
 
         # ── v4.3: Resolve unified regime for trade card + plain cards ──
         unified_regime = resolve_unified_regime(eng or {}, cagf, spot)
