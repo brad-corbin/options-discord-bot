@@ -723,7 +723,12 @@ def handle_command(
             return
 
         # Default: show status for all monitored tickers
-        tickers_to_show = [args[0].upper()] if args else ["SPY", "QQQ"]
+        if args:
+            tickers_to_show = [args[0].upper()]
+        else:
+            tickers_to_show = thesis_engine.get_monitored_tickers()
+            if not tickers_to_show:
+                tickers_to_show = ["SPY", "QQQ"]
         for t in tickers_to_show:
             reply(thesis_engine.format_status(t))
         return
@@ -746,13 +751,14 @@ def handle_command(
             "/em SPY morning — specific ticker + session\n"
             "  Auto-fires: 8:45 AM CT (today) & 2:45 PM CT (next day)\n"
             "\n── Thesis Monitor (NEW) ──\n"
-            "/monitor — show thesis status for SPY & QQQ\n"
+            "/monitor — show thesis status for all monitored tickers\n"
             "/monitor SPY — show status for specific ticker\n"
             "/monitor guidance — plain English action guidance\n"
             "/monitor guidance SPY — guidance for specific ticker\n"
             "/monitor start — resume monitoring\n"
             "/monitor stop — pause monitoring\n"
-            "  Auto-starts when /em fires. Polls every 5 min.\n"
+            "  Auto-monitors SPY & QQQ from scheduled cards.\n"
+            "  Run /em AAPL to add any ticker to monitoring.\n"
             "  Detects: failed breakdowns, momentum decay, trapped traders.\n"
             "\n── Position Monitor ──\n"
             "/monitorlong GLD — monitoring / wheel outlook with ~21-day thesis\n"
