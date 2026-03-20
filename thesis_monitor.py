@@ -105,6 +105,7 @@ class BreakAttempt:
     break_price: float
     break_time: float        # monotonic timestamp
     detected_as_failed: bool = False
+    detected_as_confirmed: bool = False
     candles_since: int = 0
 
 
@@ -130,6 +131,8 @@ class MonitorState:
     price_history: list = field(default_factory=list)
     break_attempts: list = field(default_factory=list)
     failed_moves: list = field(default_factory=list)
+    confirmed_breaks: list = field(default_factory=list)   # v1.2: breaks with follow-through
+    active_trend_direction: Optional[str] = None           # v1.2: "SHORT" or "LONG" when trend confirmed
     alert_history: dict = field(default_factory=dict)
     last_guidance_ts: float = 0.0
     check_count: int = 0
@@ -452,9 +455,18 @@ class ThesisMonitorEngine:
             intraday_events = IntradayLevelTracker.update(state, price, now)
             events.extend(intraday_events)
 
+            # ── v1.2: Increment candle counter for all active breaks (once per cycle) ──
+            for ba in state.break_attempts:
+                if not ba.detected_as_failed and not ba.detected_as_confirmed:
+                    if (now - ba.break_time) <= MONITOR_MAX_BREAK_AGE_SEC:
+                        ba.candles_since += 1
+
             # ── Break attempt detection ──
             if prev_price is not None:
                 events.extend(self._detect_breaks(thesis, state, price, prev_price, now))
+
+            # ── v1.2: Confirmed break detection (GEX- follow-through) ──
+            events.extend(self._detect_confirmed_breaks(thesis, state, price, now))
 
             # ── Failed move detection ──
             events.extend(self._detect_failed_moves(thesis, state, price, now))
@@ -742,8 +754,15 @@ class ThesisMonitorEngine:
             if too_close:
                 continue
             if il.kind == "support":
+                # v1.2: Session low updates during a trend are noise — suppress to log only
+                if il.source == "session_low" and state.active_trend_direction == "SHORT":
+                    watch_levels.append((il.price, f"intraday_support ({il.source.replace('_', ' ')})", True))
+                    continue  # will be watched but alerts are low priority
                 watch_levels.append((il.price, f"intraday_support ({il.source.replace('_', ' ')})", True))
             else:
+                if il.source == "session_high" and state.active_trend_direction == "LONG":
+                    watch_levels.append((il.price, f"intraday_resistance ({il.source.replace('_', ' ')})", False))
+                    continue
                 watch_levels.append((il.price, f"intraday_resistance ({il.source.replace('_', ' ')})", False))
 
         for level, name, is_support in watch_levels:
@@ -755,12 +774,22 @@ class ThesisMonitorEngine:
                     state.status = "BREAK_IN_PROGRESS"
                     is_range = "range" in name
                     is_intraday = "intraday" in name
+                    # v1.2: Session low breaks during confirmed trend are noise
+                    is_session_low = "session low" in name
+                    is_trend_continuation = is_session_low and state.active_trend_direction == "SHORT"
                     if is_range:
                         events.append({
                             "msg": f"🚨 RANGE BREAK DOWN: Below ${level:.2f} ({name}). "
                                    f"If this fails to continue → SQUEEZE potential is high (GEX={thesis.gex_sign}).",
                             "type": "critical", "priority": 5,
                             "alert_key": f"break_down_{name}_{level:.2f}",
+                        })
+                    elif is_trend_continuation:
+                        # Log only — don't spam Telegram during a confirmed trend
+                        events.append({
+                            "msg": f"📉 Trend continuing: new session low ${level:.2f}.",
+                            "type": "info", "priority": 1,
+                            "alert_key": f"trend_cont_low_{level:.2f}",
                         })
                     elif is_intraday:
                         events.append({
@@ -784,12 +813,21 @@ class ThesisMonitorEngine:
                     state.status = "BREAK_IN_PROGRESS"
                     is_range = "range" in name
                     is_intraday = "intraday" in name
+                    # v1.2: Session high breaks during confirmed uptrend are noise
+                    is_session_high = "session high" in name
+                    is_trend_continuation = is_session_high and state.active_trend_direction == "LONG"
                     if is_range:
                         events.append({
                             "msg": f"🚨 RANGE BREAK UP: Above ${level:.2f} ({name}). "
                                    f"Watching for continuation or trap.",
                             "type": "critical", "priority": 5,
                             "alert_key": f"break_up_{name}_{level:.2f}",
+                        })
+                    elif is_trend_continuation:
+                        events.append({
+                            "msg": f"📈 Trend continuing: new session high ${level:.2f}.",
+                            "type": "info", "priority": 1,
+                            "alert_key": f"trend_cont_high_{level:.2f}",
                         })
                     elif is_intraday:
                         events.append({
@@ -808,6 +846,118 @@ class ThesisMonitorEngine:
 
         return events
 
+    def _detect_confirmed_breaks(self, thesis: ThesisContext, state: MonitorState,
+                                 price: float, now: float) -> List[dict]:
+        """
+        v1.2: Detect when a break has FOLLOW-THROUGH — the trade is confirmed.
+
+        In GEX- environments, a break with continuation IS the trade.
+        In GEX+ environments, we wait for failure instead (handled by _detect_failed_moves).
+
+        Fires a highly distinctive alert so the trader knows to act.
+        """
+        events = []
+
+        for ba in state.break_attempts:
+            if ba.detected_as_failed or ba.detected_as_confirmed:
+                continue
+            if (now - ba.break_time) > MONITOR_MAX_BREAK_AGE_SEC:
+                continue
+
+            # Need at least 2 candles to confirm follow-through
+            if ba.candles_since < 2:
+                continue
+
+            # Skip session low/high — those are just the trend continuing, not new signals
+            if "session low" in ba.level_name or "session high" in ba.level_name:
+                continue
+
+            # Check follow-through: price continued in the break direction
+            continued = False
+            if ba.direction == "DOWN" and price < ba.break_price:
+                continued = True
+            elif ba.direction == "UP" and price > ba.break_price:
+                continued = True
+
+            if not continued:
+                continue  # No follow-through — _detect_failed_moves will handle reclaim
+
+            ba.detected_as_confirmed = True
+            state.confirmed_breaks.append(ba)
+
+            if ba.direction == "DOWN":
+                state.active_trend_direction = "SHORT"
+                state.status = "BREAK_CONFIRMED"
+
+                if thesis.gex_sign == "negative":
+                    # GEX- confirmed breakdown = THE TRADE
+                    events.append({
+                        "msg": (
+                            f"🟥🟥🟥 BREAKDOWN CONFIRMED — PUTS / SHORT 🟥🟥🟥\n"
+                            f"\n"
+                            f"${ba.level:.2f} ({ba.level_name}) broke with follow-through.\n"
+                            f"GEX is NEGATIVE — dealers amplify the move.\n"
+                            f"Price: ${price:.2f} (continued ${abs(price - ba.level):.2f} past break)\n"
+                            f"\n"
+                            f"ENTRY: Short / buy puts now\n"
+                            f"STOP: Above ${ba.level:.2f}\n"
+                            f"TARGET: Next support below\n"
+                            f"\n"
+                            f"Trailing alerts will track new levels. The trend is active."
+                        ),
+                        "type": "trade_confirmed", "priority": 5,
+                        "alert_key": f"confirmed_short_{ba.level:.2f}",
+                    })
+                else:
+                    # GEX+ but break still continued — note it but with caution
+                    events.append({
+                        "msg": (
+                            f"⚠️ BREAKDOWN WITH FOLLOW-THROUGH at ${ba.level:.2f} ({ba.level_name})\n"
+                            f"Price continued to ${price:.2f}. BUT GEX is positive — "
+                            f"mean reversion is still possible. If price reclaims ${ba.level:.2f}, "
+                            f"squeeze long becomes the play. Proceed with caution."
+                        ),
+                        "type": "warning", "priority": 4,
+                        "alert_key": f"followthru_down_{ba.level:.2f}",
+                    })
+
+            elif ba.direction == "UP":
+                state.active_trend_direction = "LONG"
+                state.status = "BREAK_CONFIRMED"
+
+                if thesis.gex_sign == "negative":
+                    # GEX- confirmed breakout = THE TRADE
+                    events.append({
+                        "msg": (
+                            f"🟩🟩🟩 BREAKOUT CONFIRMED — CALLS / LONG 🟩🟩🟩\n"
+                            f"\n"
+                            f"${ba.level:.2f} ({ba.level_name}) broke with follow-through.\n"
+                            f"GEX is NEGATIVE — dealers amplify the move.\n"
+                            f"Price: ${price:.2f} (continued ${abs(price - ba.level):.2f} past break)\n"
+                            f"\n"
+                            f"ENTRY: Long / buy calls now\n"
+                            f"STOP: Below ${ba.level:.2f}\n"
+                            f"TARGET: Next resistance above\n"
+                            f"\n"
+                            f"Trailing alerts will track new levels. The trend is active."
+                        ),
+                        "type": "trade_confirmed", "priority": 5,
+                        "alert_key": f"confirmed_long_{ba.level:.2f}",
+                    })
+                else:
+                    events.append({
+                        "msg": (
+                            f"⚠️ BREAKOUT WITH FOLLOW-THROUGH at ${ba.level:.2f} ({ba.level_name})\n"
+                            f"Price continued to ${price:.2f}. BUT GEX is positive — "
+                            f"mean reversion is still possible. If price loses ${ba.level:.2f}, "
+                            f"fade short becomes the play. Proceed with caution."
+                        ),
+                        "type": "warning", "priority": 4,
+                        "alert_key": f"followthru_up_{ba.level:.2f}",
+                    })
+
+        return events
+
     def _detect_failed_moves(self, thesis: ThesisContext, state: MonitorState,
                              price: float, now: float) -> List[dict]:
         """Detect when a break attempt fails and price reclaims the level."""
@@ -815,12 +965,10 @@ class ThesisMonitorEngine:
         reclaim_buffer = price * MONITOR_RECLAIM_THRESHOLD_PCT
 
         for ba in state.break_attempts:
-            if ba.detected_as_failed:
+            if ba.detected_as_failed or ba.detected_as_confirmed:
                 continue
             if (now - ba.break_time) > MONITOR_MAX_BREAK_AGE_SEC:
                 continue  # too old
-
-            ba.candles_since += 1
 
             # Need at least 2 candles (checks) for the break to have had time to continue or fail
             if ba.candles_since < 2:
