@@ -304,7 +304,7 @@ class CachedMarketData:
             self._vix_cache.set("vix", result)
             return result
         except Exception as e:
-            log.debug(f"Cached VIX fetch failed: {e}")
+            log.warning(f"Cached VIX fetch FAILED: {e} — vol regime will use defaults")
             return {}
 
     # ── Liquidity Estimate (ADV + bid-ask spread) ──
