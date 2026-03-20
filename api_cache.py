@@ -280,10 +280,10 @@ class CachedMarketData:
 
         try:
             vix = _parse_quote(self._md_get(
-                "https://api.marketdata.app/v1/stocks/quotes/VIX/"
+                "https://api.marketdata.app/v1/indices/quotes/VIX/"
             ))
             vix9d = _parse_quote(self._md_get(
-                "https://api.marketdata.app/v1/stocks/quotes/VIX9D/"
+                "https://api.marketdata.app/v1/indices/quotes/VIX9D/"
             ))
             if vix <= 0:
                 return {}
