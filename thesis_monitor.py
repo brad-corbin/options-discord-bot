@@ -30,7 +30,8 @@ MONITOR_MAX_BREAK_AGE_SEC = 900          # 15 min window for failed move detecti
 MONITOR_MOMENTUM_LOOKBACK = 5            # number of price points for momentum calc
 MONITOR_RECLAIM_THRESHOLD_PCT = 0.015    # 0.015% above/below level = reclaim
 MONITOR_STALL_THRESHOLD_PCT = 0.008      # moves < this = stalling
-MONITOR_ENABLED_TICKERS = ["SPY", "QQQ"]
+MONITOR_DEFAULT_TICKERS = ["SPY", "QQQ"]    # Auto-monitored from scheduled EM cards
+# Any ticker with a stored thesis will be monitored — run /em AAPL to add AAPL
 
 # Intraday level detection config
 INTRADAY_MIN_TOUCHES = 2                 # min times price must touch a zone to be a level
@@ -182,7 +183,7 @@ def _get_time_phase_ct() -> dict:
     if mins < 870:    # 1:30 – 2:30
         return {"phase": "POWER_HOUR", "label": "Power Hour", "favor": "pin_or_expand",
                 "note": "GEX+ = pinning. GEX- = expansion. Adjust accordingly."}
-    if mins < 960:    # 2:30 – 4:00
+    if mins < 915:    # 2:30 – 3:15 (SPY/QQQ options close at 3:15 CT)
         return {"phase": "CLOSE", "label": "Into Close", "favor": "pin",
                 "note": "Favor pin / mean reversion. Reduce size on new entries."}
     return {"phase": "AFTER_HOURS", "label": "After Hours", "favor": "wait",
@@ -364,10 +365,12 @@ class ThesisMonitorEngine:
     scheduling and Telegram posting. This class is pure logic.
     """
 
-    def __init__(self):
+    def __init__(self, store_get_fn=None, store_set_fn=None):
         self._theses: Dict[str, ThesisContext] = {}
         self._states: Dict[str, MonitorState] = {}
         self._lock = threading.Lock()
+        self._store_get = store_get_fn
+        self._store_set = store_set_fn
 
     def store_thesis(self, ticker: str, thesis: ThesisContext):
         """Called by app.py after each EM card. Resets monitoring state."""
@@ -394,11 +397,104 @@ class ThesisMonitorEngine:
             log.info(f"Thesis stored: {ticker} | bias={thesis.bias} score={thesis.bias_score} "
                      f"gex={thesis.gex_sign} regime={thesis.regime}")
 
+            # v1.2: Persist to Redis so thesis survives deploys
+            self._persist_thesis(ticker, thesis)
+
+    def _persist_thesis(self, ticker: str, thesis: ThesisContext):
+        """Save thesis to Redis/store for deploy survival."""
+        if not self._store_set:
+            return
+        try:
+            data = {
+                "ticker": thesis.ticker,
+                "bias": thesis.bias,
+                "bias_score": thesis.bias_score,
+                "gex_sign": thesis.gex_sign,
+                "gex_value": thesis.gex_value,
+                "dex_value": thesis.dex_value,
+                "vanna_value": thesis.vanna_value,
+                "charm_value": thesis.charm_value,
+                "regime": thesis.regime,
+                "volatility_regime": thesis.volatility_regime,
+                "vix": thesis.vix,
+                "iv": thesis.iv,
+                "prior_day_close": thesis.prior_day_close,
+                "prior_day_context": thesis.prior_day_context,
+                "session_label": thesis.session_label,
+                "created_at": thesis.created_at,
+                "spot_at_creation": thesis.spot_at_creation,
+                "levels": asdict(thesis.levels),
+            }
+            self._store_set(f"thesis_monitor:{ticker}", json.dumps(data), ttl=86400)
+            log.debug(f"Thesis persisted to store: {ticker}")
+        except Exception as e:
+            log.warning(f"Thesis persist failed for {ticker}: {e}")
+
+    def _load_thesis_from_store(self, ticker: str) -> Optional[ThesisContext]:
+        """Load thesis from Redis/store after a deploy."""
+        if not self._store_get:
+            return None
+        try:
+            raw = self._store_get(f"thesis_monitor:{ticker}")
+            if not raw:
+                return None
+            data = json.loads(raw)
+            levels = ThesisLevels(**{k: v for k, v in data.get("levels", {}).items()
+                                     if k in ThesisLevels.__dataclass_fields__})
+            thesis = ThesisContext(
+                ticker=data.get("ticker", ticker),
+                bias=data.get("bias", "NEUTRAL"),
+                bias_score=data.get("bias_score", 0),
+                gex_sign=data.get("gex_sign", "positive"),
+                gex_value=data.get("gex_value", 0),
+                dex_value=data.get("dex_value", 0),
+                vanna_value=data.get("vanna_value", 0),
+                charm_value=data.get("charm_value", 0),
+                regime=data.get("regime", "UNKNOWN"),
+                volatility_regime=data.get("volatility_regime", "NORMAL"),
+                vix=data.get("vix", 20),
+                iv=data.get("iv", 0.20),
+                prior_day_close=data.get("prior_day_close"),
+                prior_day_context=data.get("prior_day_context", "NORMAL"),
+                session_label=data.get("session_label", ""),
+                created_at=data.get("created_at", ""),
+                spot_at_creation=data.get("spot_at_creation", 0),
+                levels=levels,
+            )
+            log.info(f"Thesis loaded from store: {ticker} | bias={thesis.bias} "
+                     f"score={thesis.bias_score} gex={thesis.gex_sign}")
+            return thesis
+        except Exception as e:
+            log.warning(f"Thesis load from store failed for {ticker}: {e}")
+            return None
+
     def get_thesis(self, ticker: str) -> Optional[ThesisContext]:
-        return self._theses.get(ticker)
+        thesis = self._theses.get(ticker)
+        if thesis:
+            return thesis
+        # v1.2: Try loading from Redis after a deploy
+        thesis = self._load_thesis_from_store(ticker)
+        if thesis:
+            self._theses[ticker] = thesis
+            if ticker not in self._states:
+                self._states[ticker] = MonitorState()
+        return thesis
 
     def get_state(self, ticker: str) -> Optional[MonitorState]:
         return self._states.get(ticker)
+
+    def get_monitored_tickers(self) -> List[str]:
+        """Return all tickers that have a thesis (in memory or Redis).
+        v1.2: Any ticker with a stored thesis gets monitored automatically.
+        Run /em AAPL to start monitoring AAPL."""
+        tickers = set(self._theses.keys())
+        # Also check Redis for tickers that survived a deploy
+        for default in MONITOR_DEFAULT_TICKERS:
+            if default not in tickers:
+                thesis = self.get_thesis(default)  # triggers Redis load
+                if thesis:
+                    tickers.add(default)
+        return sorted(tickers)
 
     def evaluate(self, ticker: str, price: float) -> List[dict]:
         """
@@ -1164,7 +1260,7 @@ class ThesisMonitorDaemon:
         if tp["phase"] in ("PRE_MARKET", "AFTER_HOURS"):
             return
 
-        for ticker in MONITOR_ENABLED_TICKERS:
+        for ticker in self.engine.get_monitored_tickers():
             thesis = self.engine.get_thesis(ticker)
             if not thesis:
                 continue  # No thesis loaded for this ticker
@@ -1356,8 +1452,12 @@ def get_daemon() -> Optional[ThesisMonitorDaemon]:
     return _monitor_daemon
 
 
-def init_daemon(get_spot_fn: Callable, post_fn: Callable) -> ThesisMonitorDaemon:
+def init_daemon(get_spot_fn: Callable, post_fn: Callable,
+                store_get_fn=None, store_set_fn=None) -> ThesisMonitorDaemon:
     global _monitor_daemon
+    # v1.2: Wire store functions for Redis persistence
+    _monitor_engine._store_get = store_get_fn
+    _monitor_engine._store_set = store_set_fn
     _monitor_daemon = ThesisMonitorDaemon(_monitor_engine, get_spot_fn, post_fn)
     _monitor_daemon.start()
     log.info("Thesis monitor daemon initialized and started")
