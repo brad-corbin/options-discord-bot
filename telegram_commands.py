@@ -716,8 +716,6 @@ def handle_command(
                     reply(f"⚠️ Could not fetch spot price for {ticker}.")
                     return
                 guidance = thesis_engine.build_guidance(ticker, spot)
-                # Also run evaluate to check for events
-                thesis_engine.evaluate(ticker, spot)
                 out_lines = [f"📡 {ticker} — THESIS GUIDANCE @ ${spot:.2f}", ""]
                 for item in guidance:
                     if item["type"] == "divider":
