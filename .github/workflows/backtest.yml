@@ -1,0 +1,86 @@
+# .github/workflows/backtest.yml
+# ─────────────────────────────────────────────────────────────────────────────
+# Backtest Runner — runs on GitHub's free servers.
+# No terminal needed. No Render changes needed. Your live bot is unaffected.
+#
+# HOW TO RUN:
+#   1. Go to your GitHub repo
+#   2. Click the "Actions" tab
+#   3. Click "Backtest Runner" in the left sidebar
+#   4. Click "Run workflow" (top right of the list)
+#   5. Fill in the inputs (or leave defaults for SPY / 20 days)
+#   6. Click the green "Run workflow" button
+#   7. Wait ~2-3 minutes
+#   8. Click the completed run → scroll down → "Artifacts" → download "backtest-results"
+#
+# REQUIREMENTS:
+#   - MARKETDATA_TOKEN must be added as a GitHub Secret
+#     (Settings → Secrets and variables → Actions → New repository secret)
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Backtest Runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      ticker:
+        description: 'Ticker to backtest (e.g. SPY, QQQ, AAPL)'
+        required: true
+        default: 'SPY'
+      days:
+        description: 'Number of trading days to download (e.g. 20)'
+        required: true
+        default: '20'
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Check out your code ──────────────────────────────────────────────
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ── 2. Set up Python ────────────────────────────────────────────────────
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # ── 3. Install dependencies ─────────────────────────────────────────────
+      # Install your bot's requirements plus pandas (used by download_bars)
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install requests pandas pytz
+          # Install your bot's own requirements too
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      # ── 4. Download historical bars ─────────────────────────────────────────
+      - name: Download historical bars from MarketData
+        env:
+          MARKETDATA_TOKEN: ${{ secrets.MARKETDATA_TOKEN }}
+        run: |
+          python backtest/download_bars.py \
+            --ticker ${{ github.event.inputs.ticker }} \
+            --days ${{ github.event.inputs.days }}
+
+      # ── 5. Run the backtest replay ───────────────────────────────────────────
+      - name: Run backtest replay
+        env:
+          MARKETDATA_TOKEN: ${{ secrets.MARKETDATA_TOKEN }}
+        run: |
+          python backtest/backtest_replay.py \
+            --ticker ${{ github.event.inputs.ticker }}
+
+      # ── 6. Upload results so you can download them ───────────────────────────
+      # After the run, click the completed job → scroll to "Artifacts" → download
+      - name: Upload backtest results
+        uses: actions/upload-artifact@v4
+        if: always()   # upload even if the backtest had errors
+        with:
+          name: backtest-results-${{ github.event.inputs.ticker }}-${{ github.run_number }}
+          path: |
+            backtest/results/
+            backtest/data/
+          retention-days: 30   # keep results for 30 days
