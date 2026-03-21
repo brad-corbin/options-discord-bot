@@ -1,11 +1,16 @@
 # thesis_monitor.py
-# v1.5 Thesis Monitor — Merged: v1.4 Live Entry + v1.2 Best Features
-# v1.4: reclaim-hold, don't-chase, retest, time-phase candles, momentum validation
-# v1.2: trade types, session-low suppression, build_guidance, GEX reconciliation, Redis, any-ticker
+# v2.0 Thesis Monitor — Bar-Aware + Confluence Scoring + Policy Engine
+# v1.5 base: entry detection, exit monitor, ActiveTrade, persistence
+# v2.0 adds: OHLCV bars, level registry, entry validator, exit policies
 import logging, threading, time, json
 from datetime import datetime, timezone
 from typing import Dict, Optional, List, Callable
 from dataclasses import dataclass, field, asdict
+
+from bar_state import BarStateManager, Bar, ExecutionState
+from level_registry import LevelRegistry, Level
+from entry_validator import EntryValidator, ValidationResult
+from exit_policy import ExitPolicy, ExitSignal, select_exit_policy, evaluate_exit
 
 log = logging.getLogger(__name__)
 
@@ -91,6 +96,13 @@ class ActiveTrade:
     level_name: str = ""  # what level triggered the entry
     gex_at_entry: str = "positive"
     trade_type_label: str = ""  # "Naked puts", "Call debit spread", etc.
+    # v2.0: setup quality + exit policy
+    setup_score: int = 0          # 1-5 from EntryValidator
+    setup_label: str = ""         # "HIGH CONVICTION", etc.
+    exit_policy_name: str = ""    # "TREND_CONTINUATION", etc.
+    scale_advice: str = ""        # "1/3 at T1", etc.
+    level_tier: str = "C"         # A/B/C from LevelRegistry
+    validation_summary: str = ""  # gate summary from validator
     # tracking
     max_favorable: float = 0.0  # max move in trade direction from entry
     min_favorable: float = 0.0  # worst adverse excursion from entry
@@ -215,9 +227,57 @@ class IntradayLevelTracker:
         return {"support": sups[0] if sups else None, "resistance": ress[0] if ress else None, "all_support": sups[:3], "all_resistance": ress[:3]}
 
 class ThesisMonitorEngine:
-    def __init__(self, store_get_fn=None, store_set_fn=None):
+    def __init__(self, store_get_fn=None, store_set_fn=None, get_bars_fn=None):
         self._theses: Dict[str, ThesisContext] = {}; self._states: Dict[str, MonitorState] = {}
         self._lock = threading.Lock(); self._store_get = store_get_fn; self._store_set = store_set_fn
+        self._get_bars_fn = get_bars_fn  # callable(ticker, resolution, countback) -> dict
+        # v2.0: bar managers, level registries, exit policies, entry validator
+        self._bar_managers: Dict[str, BarStateManager] = {}
+        self._level_registries: Dict[str, LevelRegistry] = {}
+        self._exit_policies: Dict[str, ExitPolicy] = {}  # keyed by trade id (entry_price)
+        self._entry_validator = EntryValidator()
+
+    def _get_or_create_bar_manager(self, ticker: str) -> Optional[BarStateManager]:
+        """Lazy-init bar manager for a ticker."""
+        if ticker in self._bar_managers:
+            return self._bar_managers[ticker]
+        if not self._get_bars_fn:
+            return None
+        bm = BarStateManager(ticker, self._get_bars_fn)
+        if bm.initialize():
+            self._bar_managers[ticker] = bm
+            return bm
+        return None
+
+    def _build_level_registry(self, ticker: str, thesis: ThesisContext,
+                              state: MonitorState, spot: float) -> LevelRegistry:
+        """Build or rebuild level registry from all sources."""
+        reg = LevelRegistry()
+        now_epoch = time.time()
+        # Thesis levels (daily, OI walls, EM, pivots, etc.)
+        reg.ingest_thesis_levels(thesis.levels, spot=spot, epoch=now_epoch)
+        # Opening range
+        bm = self._bar_managers.get(ticker)
+        if bm:
+            reg.ingest_opening_range(bm.state.or_30, epoch=now_epoch)
+            reg.ingest_opening_range(bm.state.or_15, epoch=now_epoch)
+        # Intraday levels from monitor state
+        if state.intraday_levels:
+            reg.ingest_intraday_levels(state.intraday_levels, epoch=now_epoch)
+        # Score everything
+        session_range = 0
+        if state.session_high is not None and state.session_low is not None:
+            session_range = (state.session_high or 0) - (state.session_low or 999999)
+            session_range = max(session_range, 0)
+        reg.score_all(
+            spot=spot,
+            session_range=session_range,
+            pin_low=thesis.levels.pin_zone_low,
+            pin_high=thesis.levels.pin_zone_high,
+            now_epoch=now_epoch,
+        )
+        self._level_registries[ticker] = reg
+        return reg
 
     def store_thesis(self, ticker: str, thesis: ThesisContext):
         with self._lock:
@@ -326,13 +386,22 @@ class ThesisMonitorEngine:
             thesis = self._theses.get(ticker); state = self._states.get(ticker)
             if not thesis or not state: return []
             events = []; now = time.monotonic()
-            prev_price = state.price_history[-1]["price"] if state.price_history else None
             try:
                 from zoneinfo import ZoneInfo; ts = datetime.now(ZoneInfo("America/Chicago")).strftime("%I:%M %p")
             except Exception: ts = datetime.utcnow().strftime("%H:%M")
+            # ── v2.0: Bar-aware price source ──
+            bar = None
+            bm = self._get_or_create_bar_manager(ticker)
+            if bm:
+                bar = bm.update()
+                if bar:
+                    price = bar.close  # canonical price = bar close, not spot sample
+            prev_price = state.price_history[-1]["price"] if state.price_history else None
             state.price_history.append({"price": price, "time_str": ts, "ts_mono": now})
             if len(state.price_history) > 240: state.price_history = state.price_history[-240:]
             state.check_count += 1
+            # ── v2.0: Build level registry with confluence scoring ──
+            registry = self._build_level_registry(ticker, thesis, state, price)
             events.extend(self._evaluate_momentum(state, price))
             events.extend(IntradayLevelTracker.update(state, price, now))
             # Prior-day gap context — fire once early in session
@@ -356,22 +425,22 @@ class ThesisMonitorEngine:
             for ba in state.break_attempts:
                 if not ba.detected_as_failed and not ba.detected_as_confirmed and (now - ba.break_time) <= MONITOR_MAX_BREAK_AGE_SEC:
                     ba.candles_since += 1
-            if prev_price is not None: events.extend(self._detect_breaks(thesis, state, price, prev_price, now))
+            if prev_price is not None: events.extend(self._detect_breaks(thesis, state, price, prev_price, now, bar=bar, bm=bm))
             entry_events = []
-            entry_events.extend(self._detect_confirmed_breaks(thesis, state, price, now))
+            entry_events.extend(self._detect_confirmed_breaks(thesis, state, price, now, bar=bar, bm=bm))
             entry_events.extend(self._detect_failed_moves(thesis, state, price, now))
             entry_events.extend(self._detect_retests(thesis, state, price, now))
-            # Auto-create ActiveTrade from clean entry signals
+            # Auto-create ActiveTrade — runs through EntryValidator + ExitPolicy
             for ev in entry_events:
                 if ev.get("type") in ("trade_confirmed", "critical") and ev.get("priority", 0) >= 5:
                     ak = ev.get("alert_key", "")
-                    # Only create trade on clean entries (not DON'T CHASE / extended)
                     if "wait" not in ak and "late" not in ak:
-                        self._create_trade_from_event(ticker, thesis, state, price, ev, now, ts)
+                        self._create_trade_from_event(ticker, thesis, state, price, ev, now, ts,
+                                                       registry=registry, bar=bar, bm=bm)
             events.extend(entry_events)
             events.extend(self._check_gamma_flip(thesis, state, price))
-            # ── Exit monitoring for active trades ──
-            events.extend(self._monitor_exits(ticker, thesis, state, price, now))
+            # ── v2.0: Exit monitoring with policy engine ──
+            events.extend(self._monitor_exits(ticker, thesis, state, price, now, bar=bar, bm=bm))
             # Expire stale trades
             if self._expire_stale_trades(state, now):
                 self._persist_trades(ticker, state)
@@ -415,8 +484,9 @@ class ThesisMonitorEngine:
         return targets
 
     # ── Exit Monitor: Auto-Create Trade ──
-    def _create_trade_from_event(self, ticker, thesis, state, price, event, now, ts):
-        """Create an ActiveTrade from a clean entry signal."""
+    def _create_trade_from_event(self, ticker, thesis, state, price, event, now, ts,
+                                   registry=None, bar=None, bm=None):
+        """Create an ActiveTrade from a clean entry signal. v2.0: validates through EntryValidator."""
         ak = event.get("alert_key", "")
         msg = event.get("msg", "")
         # Parse direction and entry_type from alert_key
@@ -435,11 +505,11 @@ class ThesisMonitorEngine:
             entry_type = "RETEST"
         else:
             entry_type = "BREAK"
-        # Find the stop level — extract from the break attempt
+        # Find the stop level
         stop = 0.0
         level_name = ""
         for ba in state.break_attempts + state.failed_moves + state.confirmed_breaks:
-            bak = ak.split("_")[-1]  # e.g. "656.30"
+            bak = ak.split("_")[-1]
             try:
                 ba_price_str = f"{ba.level:.2f}"
                 if ba_price_str == bak or ba_price_str in ak:
@@ -449,13 +519,11 @@ class ThesisMonitorEngine:
             except Exception:
                 continue
         if stop == 0.0:
-            # Fallback: use nearest level in opposite direction
             if direction == "LONG":
-                stop = price * 0.995  # 0.5% below as safety
+                stop = price * 0.995
             else:
                 stop = price * 1.005
-        # Don't double-create — block if open trade at same direction near same stop level
-        # Compare parsed stop to existing stop, not current price to existing stop
+        # Dedup
         for t in state.active_trades:
             if t.status not in ("OPEN", "SCALED", "TRAILED"):
                 continue
@@ -464,27 +532,116 @@ class ThesisMonitorEngine:
             if abs(t.stop_level - stop) / stop < 0.005 or abs(t.entry_price - price) / price < 0.005:
                 log.info(f"Trade already open for {ticker} {direction} stop=${t.stop_level:.2f} near new stop=${stop:.2f}, skipping")
                 return
-        # Parse trade type label from message
-        tt_label = ""
-        for line in msg.split("\n"):
-            if "TRADE TYPE:" in line or line.strip().startswith("💰"):
-                tt_label = line.strip().replace("💰 TRADE TYPE: ", "").replace("💰 ", "").strip()
-                break
-        targets = self._find_targets(ticker, thesis, state, price, direction)
+
+        # ── v2.0: Level quality from registry ──
+        level_quality = 0
+        level_tier = "C"
+        level_sources = set()
+        if registry:
+            reg_level = registry.get_level_at(stop)
+            if reg_level:
+                level_quality = reg_level.quality_score
+                level_tier = reg_level.quality_tier
+                level_sources = reg_level.sources
+
+        # ── v2.0: Bar metrics for validator ──
+        bar_closed = True
+        bar_wicked = False
+        bar_body_pct = 0.5
+        bar_expansion = 1.0
+        consecutive = 0
+        if bar:
+            bar_closed = bar.closed_through(stop, "DOWN" if direction == "SHORT" else "UP")
+            bar_wicked = bar.wicked_through(stop, "DOWN" if direction == "SHORT" else "UP")
+            bar_body_pct = bar.body_pct
+        if bm:
+            bar_expansion = bm.state.metrics.expansion_ratio
+            consecutive = bm.state.metrics.consecutive_direction
+
+        # ── v2.0: Extension metrics ──
+        ext_trigger = abs(price - stop) / stop * 100 if stop > 0 else 0
+        ext_vwap = bm.distance_from_vwap(price) if bm else 0
+        or_dist = bm.distance_from_or(price) if bm else {}
+        ext_or = or_dist.get("dist_high", 0) if direction == "LONG" else or_dist.get("dist_low", 0)
+        ext_em = 0
+        if thesis.levels.em_high and thesis.levels.em_low:
+            em_width = thesis.levels.em_high - thesis.levels.em_low
+            if em_width > 0:
+                if direction == "LONG" and thesis.levels.em_high:
+                    ext_em = (price - thesis.levels.em_high) / em_width if price > thesis.levels.em_high else 0
+                elif direction == "SHORT" and thesis.levels.em_low:
+                    ext_em = (thesis.levels.em_low - price) / em_width if price < thesis.levels.em_low else 0
+
+        tp = _get_time_phase_ct()
+        is_above_flip = None
+        if thesis.levels.gamma_flip is not None:
+            is_above_flip = price > thesis.levels.gamma_flip
+        or_type = bm.state.or_30.range_type if bm and bm.state.or_30.is_complete else "NORMAL"
+
+        # ── v2.0: Run EntryValidator ──
+        validation = self._entry_validator.validate(
+            level_quality=level_quality, level_tier=level_tier, level_sources=level_sources,
+            bar_closed_through=bar_closed, bar_wicked_only=bar_wicked,
+            bar_body_pct=bar_body_pct, bar_expansion=bar_expansion,
+            consecutive_bars=consecutive,
+            extension_from_trigger_pct=ext_trigger,
+            extension_from_vwap_pct=ext_vwap,
+            extension_from_or_pct=ext_or,
+            extension_from_em_pct=ext_em,
+            gex_sign=thesis.gex_sign, regime=thesis.regime,
+            setup_type=entry_type, time_phase=tp["phase"],
+            direction=direction, is_above_gamma_flip=is_above_flip,
+            signal_age_sec=0, vix=thesis.vix, or_type=or_type,
+        )
+
+        if not validation.valid:
+            log.info(f"EntryValidator REJECTED {ticker} {direction} {entry_type}: "
+                     f"score={validation.setup_score} [{validation.gate_summary}]")
+            return
+
+        # ── v2.0: Select ExitPolicy ──
+        policy = select_exit_policy(
+            setup_score=validation.setup_score,
+            gex_sign=thesis.gex_sign,
+            setup_type=entry_type,
+            is_0dte=True,
+            vix=thesis.vix,
+            time_phase=tp["phase"],
+        )
+
+        # ── v2.0: Targets from registry (quality-ranked) ──
+        if registry:
+            target_levels = registry.get_targets(price, direction, count=3, min_score=10)
+            targets = [l.price for l in target_levels]
+        else:
+            targets = self._find_targets(ticker, thesis, state, price, direction)
+
         trade = ActiveTrade(
             ticker=ticker, direction=direction, entry_type=entry_type,
             entry_price=price, stop_level=stop, targets=targets,
             status="OPEN", entry_time=now, entry_epoch=time.time(),
             entry_time_str=ts, level_name=level_name, gex_at_entry=thesis.gex_sign,
-            trade_type_label=tt_label, max_favorable=0.0, min_favorable=0.0,
+            trade_type_label=validation.trade_type,
+            setup_score=validation.setup_score, setup_label=validation.setup_label,
+            exit_policy_name=policy.name, scale_advice=validation.scale_advice,
+            level_tier=level_tier, validation_summary=validation.gate_summary,
+            max_favorable=0.0, min_favorable=0.0,
         )
+        policy_key = f"{ticker}_{price:.2f}_{now}"
+        self._exit_policies[policy_key] = policy
+
         state.active_trades.append(trade)
         self._persist_trades(ticker, state)
-        log.info(f"ActiveTrade created: {ticker} {direction} {entry_type} @ ${price:.2f} | stop=${stop:.2f} | targets={[f'${t:.2f}' for t in targets]}")
+        log.info(f"ActiveTrade created: {ticker} {direction} {entry_type} @ ${price:.2f} | "
+                 f"score={validation.setup_score}/5 [{validation.setup_label}] | "
+                 f"policy={policy.name} | scale={validation.scale_advice} | "
+                 f"stop=${stop:.2f} | targets={[f'${t:.2f}' for t in targets]} | "
+                 f"gates=[{validation.gate_summary}]")
 
     # ── Exit Monitor: Core Loop ──
-    def _monitor_exits(self, ticker, thesis, state, price, now):
-        """Check all active trades for exit/scale/trail/invalidation signals."""
+    def _monitor_exits(self, ticker, thesis, state, price, now, bar=None, bm=None):
+        """Check all active trades for exit/scale/trail/invalidation signals.
+        v2.0: Uses ExitPolicy engine when bar + policy available, falls back to v1 logic."""
         events = []
         for trade in state.active_trades:
             if trade.status in ("CLOSED", "INVALIDATED"):
@@ -498,18 +655,60 @@ class ThesisMonitorEngine:
                 fav = trade.entry_price - price
                 trade.max_favorable = max(trade.max_favorable, fav)
                 trade.min_favorable = min(trade.min_favorable, fav)
-            # 1. INVALIDATION — stop level reclaimed/lost
+
+            # ── v2.0: Try policy-based exit evaluation ──
+            policy = self._exit_policies.get(getattr(trade, '_policy_key', ''))
+            if policy and bar and bm:
+                recent_bars = bm.get_recent_bars(5)
+                signal = evaluate_exit(policy, trade, bar, recent_bars,
+                                       current_gex=thesis.gex_sign)
+                if signal.action == "INVALIDATE":
+                    if self._exit_alert_ok(trade, "invalidate", now):
+                        trade.status = "INVALIDATED"; trade.close_price = price
+                        trade.close_time = now; trade.close_epoch = time.time()
+                        trade.close_reason = signal.reason
+                        self._persist_trades(ticker, state)
+                        events.append({"msg": f"🛑 TRADE INVALIDATED — {trade.direction}\n\n{signal.reason}\nEntry: ${trade.entry_price:.2f} → Now: ${price:.2f} ({signal.pnl_pct:+.2f}%)\nDon't hope. Close it.", "type": "exit", "priority": 5, "alert_key": f"exit_inv_{trade.direction}_{trade.entry_price:.2f}"})
+                    continue
+                elif signal.action == "SCALE":
+                    if self._exit_alert_ok(trade, "scale", now):
+                        trade.status = "SCALED"; trade.scaled_at_price = price
+                        trade.trail_stop = trade.entry_price
+                        self._persist_trades(ticker, state)
+                        events.append({"msg": f"💰 SCALE {signal.scale_fraction} — {trade.direction}\n\n{signal.reason}\nEntry: ${trade.entry_price:.2f} → Now: ${price:.2f} ({signal.pnl_pct:+.2f}%)\nMove stop to breakeven. {trade.scale_advice}", "type": "exit", "priority": 5, "alert_key": f"exit_scale_{trade.direction}_{trade.entry_price:.2f}"})
+                elif signal.action == "TRAIL" and signal.new_stop:
+                    if self._exit_alert_ok(trade, "trail", now):
+                        trade.trail_stop = signal.new_stop; trade.status = "TRAILED"
+                        self._persist_trades(ticker, state)
+                        events.append({"msg": f"🏃 TRAIL — {trade.direction}\n\n{signal.reason}\nEntry: ${trade.entry_price:.2f} → Now: ${price:.2f} ({signal.pnl_pct:+.2f}%)\nPolicy: {policy.name}", "type": "exit", "priority": 5, "alert_key": f"exit_trail_{trade.direction}_{trade.entry_price:.2f}"})
+                elif signal.action == "REDUCE":
+                    if self._exit_alert_ok(trade, "fade", now):
+                        if signal.new_stop:
+                            trade.trail_stop = signal.new_stop
+                        events.append({"msg": f"⚠️ REDUCE — {trade.direction}\n\n{signal.reason}\nEntry: ${trade.entry_price:.2f} → Now: ${price:.2f} ({signal.pnl_pct:+.2f}%)\n{signal.urgency_label}", "type": "exit", "priority": 4, "alert_key": f"exit_fade_{trade.direction}_{trade.entry_price:.2f}"})
+                elif signal.action == "EXIT":
+                    if self._exit_alert_ok(trade, "exit", now):
+                        trade.status = "CLOSED"; trade.close_price = price
+                        trade.close_time = now; trade.close_epoch = time.time()
+                        trade.close_reason = signal.reason
+                        self._persist_trades(ticker, state)
+                        events.append({"msg": f"⏹ EXIT — {trade.direction}\n\n{signal.reason}\nEntry: ${trade.entry_price:.2f} → Now: ${price:.2f} ({signal.pnl_pct:+.2f}%)\nPay yourself.", "type": "exit", "priority": 5, "alert_key": f"exit_done_{trade.direction}_{trade.entry_price:.2f}"})
+                # HOLD = do nothing
+                continue
+
+            # ── v1 fallback: old logic when no policy or no bar ──
+            # 1. INVALIDATION
             inv_events = self._check_invalidation(trade, thesis, state, price, now)
             if inv_events:
                 events.extend(inv_events)
-                continue  # trade closed, skip other checks
-            # 2. SCALE PARTIAL — first target hit
+                continue
+            # 2. SCALE PARTIAL
             events.extend(self._check_scale(trade, thesis, state, price, now))
-            # 3. TRAIL RUNNER — momentum accelerating in position direction
+            # 3. TRAIL RUNNER
             events.extend(self._check_trail(trade, thesis, state, price, now))
-            # 4. REDUCE EXPOSURE — momentum fading against position
+            # 4. REDUCE EXPOSURE
             events.extend(self._check_momentum_fade(trade, thesis, state, price, now))
-            # 5. EXIT — second target or exhaustion
+            # 5. EXIT
             events.extend(self._check_exit(trade, thesis, state, price, now))
         return events
 
@@ -782,6 +981,9 @@ class ThesisMonitorEngine:
                     "entry_epoch": t.entry_epoch, "entry_time_str": t.entry_time_str,
                     "level_name": t.level_name, "gex_at_entry": t.gex_at_entry,
                     "trade_type_label": t.trade_type_label,
+                    "setup_score": t.setup_score, "setup_label": t.setup_label,
+                    "exit_policy_name": t.exit_policy_name, "scale_advice": t.scale_advice,
+                    "level_tier": t.level_tier, "validation_summary": t.validation_summary,
                     "max_favorable": t.max_favorable, "min_favorable": t.min_favorable,
                     "scaled_at_price": t.scaled_at_price,
                     "trail_stop": t.trail_stop, "close_price": t.close_price,
@@ -828,6 +1030,12 @@ class ThesisMonitorEngine:
                     level_name=td.get("level_name", ""),
                     gex_at_entry=td.get("gex_at_entry", "positive"),
                     trade_type_label=td.get("trade_type_label", ""),
+                    setup_score=td.get("setup_score", 0),
+                    setup_label=td.get("setup_label", ""),
+                    exit_policy_name=td.get("exit_policy_name", ""),
+                    scale_advice=td.get("scale_advice", ""),
+                    level_tier=td.get("level_tier", "C"),
+                    validation_summary=td.get("validation_summary", ""),
                     max_favorable=td.get("max_favorable", 0),
                     min_favorable=td.get("min_favorable", 0),
                     scaled_at_price=td.get("scaled_at_price"),
@@ -890,13 +1098,16 @@ class ThesisMonitorEngine:
                 pnl_pct = ((price - t.entry_price) / t.entry_price * 100) if t.direction == "LONG" else ((t.entry_price - price) / t.entry_price * 100)
                 pnl = f" | P&L: {pnl_pct:+.2f}%"
             stop_ref = t.trail_stop if t.trail_stop else t.stop_level
-            lines.append(f"\n{status_emoji} {t.direction} {t.entry_type} — {t.status}")
+            score_str = f" [{t.setup_score}/5 {t.level_tier}]" if t.setup_score else ""
+            lines.append(f"\n{status_emoji} {t.direction} {t.entry_type} — {t.status}{score_str}")
             lines.append(f"  Entry: ${t.entry_price:.2f} ({t.entry_time_str})")
             lines.append(f"  Stop: ${stop_ref:.2f}{pnl}")
             if t.targets:
                 tgt_str = " → ".join([f"${tg:.2f}" for tg in t.targets[:3]])
                 lines.append(f"  Targets: {tgt_str}")
-            if t.trade_type_label:
+            if t.exit_policy_name:
+                lines.append(f"  Policy: {t.exit_policy_name} | Scale: {t.scale_advice}")
+            elif t.trade_type_label:
                 lines.append(f"  Type: {t.trade_type_label}")
             if t.max_favorable > 0:
                 mfe_pct = t.max_favorable / t.entry_price * 100
@@ -991,7 +1202,7 @@ class ThesisMonitorEngine:
                 events.append({"msg": "⚠️ Downside momentum fading. Tighten if short.", "type": "warning", "priority": 4, "alert_key": "mom_fade_dn"})
         return events
 
-    def _detect_breaks(self, thesis, state, price, prev_price, now):
+    def _detect_breaks(self, thesis, state, price, prev_price, now, bar=None, bm=None):
         events = []; lvl = thesis.levels; wl = []
         if lvl.local_support is not None: wl.append((lvl.local_support, "daily_support", True))
         if lvl.local_resistance is not None: wl.append((lvl.local_resistance, "daily_resistance", False))
@@ -1019,6 +1230,10 @@ class ThesisMonitorEngine:
             wl.append((il.price, f"intraday_{il.kind} ({il.source.replace('_',' ')})", il.kind == "support"))
         for level, name, is_sup in wl:
             if is_sup and prev_price >= level and price < level:
+                # v2.0: If bar available, require bar CLOSE through, not just wick
+                if bar and bar.wicked_through(level, "DOWN"):
+                    log.info(f"Break [{name}] ${level:.2f}: wick-only, not bar close — skipping")
+                    continue
                 # Skip if a pending (non-expired) break already exists at this level+direction
                 if any(
                     abs(ba.level - level) <= tol
@@ -1033,6 +1248,10 @@ class ThesisMonitorEngine:
                 state.status = "BREAK_IN_PROGRESS"
                 events.append({"msg": f"🔻 BREAK ATTEMPT: below ${level:.2f} ({name}). Watching follow-through or reclaim.", "type": "alert", "priority": 4, "alert_key": f"brk_dn_{name}_{level:.2f}"})
             elif not is_sup and prev_price <= level and price > level:
+                # v2.0: If bar available, require bar CLOSE through, not just wick
+                if bar and bar.wicked_through(level, "UP"):
+                    log.info(f"Break [{name}] ${level:.2f}: wick-only, not bar close — skipping")
+                    continue
                 if any(
                     abs(ba.level - level) <= tol
                     and ba.direction == "UP"
@@ -1047,7 +1266,7 @@ class ThesisMonitorEngine:
                 events.append({"msg": f"🔺 BREAK ATTEMPT: above ${level:.2f} ({name}). Watching follow-through or failure.", "type": "alert", "priority": 4, "alert_key": f"brk_up_{name}_{level:.2f}"})
         return events
 
-    def _detect_confirmed_breaks(self, thesis, state, price, now):
+    def _detect_confirmed_breaks(self, thesis, state, price, now, bar=None, bm=None):
         events = []; tp = _get_time_phase_ct()
         for ba in state.break_attempts:
             if ba.detected_as_failed or ba.detected_as_confirmed: continue
@@ -1057,8 +1276,15 @@ class ThesisMonitorEngine:
             buf = ba.level * (MONITOR_CONFIRM_BUFFER_PCT / 100); net = self._recent_net_move(state, 3)
             if ba.direction == "DOWN":
                 ok = price < (ba.level - buf) and net < -(ba.level * 0.0012)
+                # v2.0: If bars available, require bar close through, not just spot
+                if ok and bm and not bm.bar_closed_through(ba.level, "DOWN", lookback=2):
+                    ok = False
+                    log.info(f"Confirm [{ba.level_name}] ${ba.level:.2f}: spot below but no bar close — waiting")
             else:
                 ok = price > (ba.level + buf) and net > (ba.level * 0.0012)
+                if ok and bm and not bm.bar_closed_through(ba.level, "UP", lookback=2):
+                    ok = False
+                    log.info(f"Confirm [{ba.level_name}] ${ba.level:.2f}: spot above but no bar close — waiting")
             if not ok: continue
             ba.detected_as_confirmed = True; ba.retest_armed = True
             state.confirmed_breaks.append(ba); state.status = "BREAK_CONFIRMED"
@@ -1183,7 +1409,8 @@ class ThesisMonitorEngine:
                         pnl_pct = ((p - t.entry_price) / t.entry_price * 100) if t.direction == "LONG" else ((t.entry_price - p) / t.entry_price * 100)
                         pnl = f" ({pnl_pct:+.2f}%)"
                     stop_ref = t.trail_stop if t.trail_stop else t.stop_level
-                    lines.append(f"{emoji} {t.direction} @ ${t.entry_price:.2f}{pnl} stop=${stop_ref:.2f}")
+                    score_tag = f" {t.setup_score}/5{t.level_tier}" if t.setup_score else ""
+                    lines.append(f"{emoji} {t.direction}{score_tag} @ ${t.entry_price:.2f}{pnl} stop=${stop_ref:.2f}")
         tp = _get_time_phase_ct(); lines.append(f"Phase: {tp['label']}")
         fast = ticker.upper() in MONITOR_FAST_POLL_TICKERS
         lines.append(f"Poll: {MONITOR_POLL_INTERVAL_FAST_SEC if fast else MONITOR_POLL_INTERVAL_SEC}s")
@@ -1266,8 +1493,9 @@ _monitor_engine = ThesisMonitorEngine()
 _monitor_daemon: Optional[ThesisMonitorDaemon] = None
 def get_engine(): return _monitor_engine
 def get_daemon(): return _monitor_daemon
-def init_daemon(get_spot_fn, post_fn, store_get_fn=None, store_set_fn=None):
+def init_daemon(get_spot_fn, post_fn, store_get_fn=None, store_set_fn=None, get_bars_fn=None):
     global _monitor_daemon
     _monitor_engine._store_get = store_get_fn; _monitor_engine._store_set = store_set_fn
+    _monitor_engine._get_bars_fn = get_bars_fn
     _monitor_daemon = ThesisMonitorDaemon(_monitor_engine, get_spot_fn, post_fn)
     _monitor_daemon.start(); log.info("Thesis monitor daemon initialized"); return _monitor_daemon
