@@ -839,7 +839,7 @@ def _flush_wave_digest():
             reason = r.get("reason", "waiting on recheck")[:50]
             pending_lines.append(f"  ⏳ {ticker} T{tier} {dir_emoji} {conf_str} — {reason}")
         else:
-            reason = r.get("reason", "no setup")[:40]
+            reason = r.get("reason", "no setup")[:60]
             skipped_lines.append(f"  ❌ {ticker} T{tier} {dir_emoji} {conf_str} — {reason}")
 
     lines = []
@@ -1086,6 +1086,42 @@ def _process_job(worker_id: int, job: dict):
         "tier": tier_label, "outcome": "skip", "card": None,
         "confidence": None, "reason": "",
     }
+
+    # ── v4.3: VOL REGIME EARLY GATE ──────────────────────────────────
+    # Check cached vol regime BEFORE any chain fetches or API calls.
+    # If CRISIS, almost nothing passes downstream gates anyway.
+    # Saves 500-800+ API calls per day on heavy signal days.
+    # VIX is cached from CBOE (0 extra API calls). Daily candles are
+    # cached with 10-min TTL. Total cost: 0-1 API calls.
+    # ─────────────────────────────────────────────────────────────────
+    try:
+        _early_vol = get_canonical_vol_regime(ticker, get_daily_candles(ticker, days=30))
+        _early_label = (_early_vol or {}).get("label", "")
+        _early_caution = (_early_vol or {}).get("caution_score", 0)
+        _early_vix = (_early_vol or {}).get("vix", 0)
+
+        if _early_label == "CRISIS" or _early_caution >= 6:
+            # Swing: always block in CRISIS
+            if job_type == "swing":
+                reason = f"🚨 VIX Crisis Regime (VIX {_early_vix:.1f}, caution {_early_caution}/8) — swing blocked before chain fetch"
+                base["reason"] = reason
+                log.info(f"[worker-{worker_id}] {ticker} {job_type} EARLY BLOCK: {reason}")
+                _record_wave_result(base)
+                return
+
+            # TV scalp: block bull calls in CRISIS (risk_manager blocks anyway)
+            if job_type == "tv" and bias == "bull":
+                reason = f"🚨 VIX Crisis Regime (VIX {_early_vix:.1f}) — bull calls blocked before chain fetch"
+                base["reason"] = reason
+                log.info(f"[worker-{worker_id}] {ticker} {job_type} EARLY BLOCK: {reason}")
+                _record_wave_result(base)
+                return
+
+            # TV bear puts in CRISIS: allow through (bears can work) but log
+            if job_type == "tv":
+                log.info(f"[worker-{worker_id}] {ticker} CRISIS regime but bear signal — allowing through")
+    except Exception as e:
+        log.debug(f"[worker-{worker_id}] Vol regime early gate skipped for {ticker}: {e}")
 
     if job_type == "tv":
         check_spread_exit_warning(ticker, bias, webhook_data)
