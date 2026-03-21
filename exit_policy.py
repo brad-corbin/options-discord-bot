@@ -82,6 +82,37 @@ class ExitPolicy:
     # Time urgency
     urgency: float = 1.0
 
+    def to_config(self) -> dict:
+        """Serialize to dict for persistence on ActiveTrade."""
+        return {
+            "name": self.name, "trail_pct_of_profit": self.trail_pct_of_profit,
+            "trail_min_profit_pct": self.trail_min_profit_pct,
+            "scale_fraction": self.scale_fraction, "scale_at_target": self.scale_at_target,
+            "max_giveback_pct": self.max_giveback_pct,
+            "exhaustion_decel_mult": self.exhaustion_decel_mult,
+            "gex_at_entry": self.gex_at_entry, "setup_score": self.setup_score,
+            "is_0dte": self.is_0dte,
+        }
+
+    @classmethod
+    def from_config(cls, cfg: dict) -> 'ExitPolicy':
+        """Reconstruct from persisted config dict."""
+        if not cfg:
+            return cls()
+        return cls(
+            name=cfg.get("name", "DEFAULT"),
+            trail_pct_of_profit=cfg.get("trail_pct_of_profit", 0.45),
+            trail_min_profit_pct=cfg.get("trail_min_profit_pct", 0.15),
+            scale_fraction=cfg.get("scale_fraction", "1/2"),
+            scale_at_target=cfg.get("scale_at_target", True),
+            max_giveback_pct=cfg.get("max_giveback_pct", 0.40),
+            exhaustion_decel_mult=cfg.get("exhaustion_decel_mult", 0.4),
+            gex_at_entry=cfg.get("gex_at_entry", "positive"),
+            setup_score=cfg.get("setup_score", 3),
+            is_0dte=cfg.get("is_0dte", True),
+            urgency=_time_urgency(_minutes_since_open(), cfg.get("is_0dte", True)),
+        )
+
     def compute_trail_stop(self, entry_price: float, current_price: float,
                            direction: str, current_stop: float = None) -> float:
         """Compute trail stop accounting for urgency and regime."""
