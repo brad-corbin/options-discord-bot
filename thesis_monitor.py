@@ -299,6 +299,13 @@ class ThesisMonitorEngine:
                     events.append({"msg": "📊 GAP UP into GEX- — breakout can accelerate. Trail tight if fading.", "type": "info", "priority": 3, "alert_key": "gap_up_neg_ctx"})
                 elif thesis.prior_day_context == "GAP_DOWN" and thesis.gex_sign == "positive":
                     events.append({"msg": "📊 GAP DOWN into GEX+ — bounce probability HIGH. Watch for failed breakdown.", "type": "info", "priority": 3, "alert_key": "gap_dn_pos_ctx"})
+            # Prune stale break attempts — keep resolved ones and those still within age window
+            state.break_attempts = [
+                ba for ba in state.break_attempts
+                if ba.detected_as_failed
+                or ba.detected_as_confirmed
+                or (now - ba.break_time) <= MONITOR_MAX_BREAK_AGE_SEC
+            ]
             for ba in state.break_attempts:
                 if not ba.detected_as_failed and not ba.detected_as_confirmed and (now - ba.break_time) <= MONITOR_MAX_BREAK_AGE_SEC:
                     ba.candles_since += 1
@@ -380,17 +387,6 @@ class ThesisMonitorEngine:
             entry_type = "RETEST"
         else:
             entry_type = "BREAK"
-        # Don't double-create — block if open trade at same direction near same level
-        # This allows a legit RETEST at a different level even if a BREAK is still open
-        for t in state.active_trades:
-            if t.status not in ("OPEN", "SCALED", "TRAILED"):
-                continue
-            if t.direction != direction:
-                continue
-            # Same direction + near same stop level = same setup, skip
-            if abs(t.stop_level - price) / price < 0.005 or abs(t.entry_price - price) / price < 0.005:
-                log.info(f"Trade already open for {ticker} {direction} near ${price:.2f} (stop=${t.stop_level:.2f}), skipping")
-                return
         # Find the stop level — extract from the break attempt
         stop = 0.0
         level_name = ""
@@ -410,6 +406,16 @@ class ThesisMonitorEngine:
                 stop = price * 0.995  # 0.5% below as safety
             else:
                 stop = price * 1.005
+        # Don't double-create — block if open trade at same direction near same stop level
+        # Compare parsed stop to existing stop, not current price to existing stop
+        for t in state.active_trades:
+            if t.status not in ("OPEN", "SCALED", "TRAILED"):
+                continue
+            if t.direction != direction:
+                continue
+            if abs(t.stop_level - stop) / stop < 0.005 or abs(t.entry_price - price) / price < 0.005:
+                log.info(f"Trade already open for {ticker} {direction} stop=${t.stop_level:.2f} near new stop=${stop:.2f}, skipping")
+                return
         # Parse trade type label from message
         tt_label = ""
         for line in msg.split("\n"):
@@ -936,14 +942,28 @@ class ThesisMonitorEngine:
             wl.append((il.price, f"intraday_{il.kind} ({il.source.replace('_',' ')})", il.kind == "support"))
         for level, name, is_sup in wl:
             if is_sup and prev_price >= level and price < level:
-                # Skip if a pending break already exists at this level+direction
-                if any(abs(ba.level - level) <= tol and ba.direction == "DOWN" and not ba.detected_as_failed and not ba.detected_as_confirmed for ba in state.break_attempts):
+                # Skip if a pending (non-expired) break already exists at this level+direction
+                if any(
+                    abs(ba.level - level) <= tol
+                    and ba.direction == "DOWN"
+                    and not ba.detected_as_failed
+                    and not ba.detected_as_confirmed
+                    and (now - ba.break_time) <= MONITOR_MAX_BREAK_AGE_SEC
+                    for ba in state.break_attempts
+                ):
                     continue
                 state.break_attempts.append(BreakAttempt(level=level, level_name=name, direction="DOWN", break_price=price, break_time=now))
                 state.status = "BREAK_IN_PROGRESS"
                 events.append({"msg": f"🔻 BREAK ATTEMPT: below ${level:.2f} ({name}). Watching follow-through or reclaim.", "type": "alert", "priority": 4, "alert_key": f"brk_dn_{name}_{level:.2f}"})
             elif not is_sup and prev_price <= level and price > level:
-                if any(abs(ba.level - level) <= tol and ba.direction == "UP" and not ba.detected_as_failed and not ba.detected_as_confirmed for ba in state.break_attempts):
+                if any(
+                    abs(ba.level - level) <= tol
+                    and ba.direction == "UP"
+                    and not ba.detected_as_failed
+                    and not ba.detected_as_confirmed
+                    and (now - ba.break_time) <= MONITOR_MAX_BREAK_AGE_SEC
+                    for ba in state.break_attempts
+                ):
                     continue
                 state.break_attempts.append(BreakAttempt(level=level, level_name=name, direction="UP", break_price=price, break_time=now))
                 state.status = "BREAK_IN_PROGRESS"
