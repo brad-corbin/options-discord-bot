@@ -153,61 +153,57 @@ def _get_time_phase_ct() -> dict:
 class IntradayLevelTracker:
     @staticmethod
     def update(state: MonitorState, price: float, now: float, bm=None) -> List[dict]:
+        """Discover intraday S/R from 5m bar structure. Bars are the single truth source.
+        No bars = deactivate stale levels only, produce no new levels."""
         events = []
-        # ── v2.0: Use bars when available, spot samples as fallback ──
-        if bm and len(bm.state.bars_5m) >= 2:
-            bars = bm.state.bars_5m
-            closes = [b.close for b in bars]
-            highs = [b.high for b in bars]
-            lows = [b.low for b in bars]
-            n = len(bars)
-        else:
-            closes = [p["price"] for p in state.price_history]
-            highs = closes  # fallback: no true high/low
-            lows = closes
-            n = len(closes)
-            bars = None
-        if n < 2: return events
         tol = price * INTRADAY_ZONE_TOLERANCE_PCT / 100
 
-        # ── Session extremes: use bar highs/lows for accuracy ──
+        # Deactivate stale levels regardless of bar availability
+        for lvl in state.intraday_levels:
+            if lvl.active and abs(price - lvl.price) > tol * 8 and (now - lvl.last_touched_ts) > 2700:
+                lvl.active = False
+
+        # No bars = no level discovery. Don't fake 5m levels from spot samples.
+        if not bm or len(bm.state.bars_5m) < 2:
+            return events
+
+        bars = bm.state.bars_5m
+        closes = [b.close for b in bars]
+        highs = [b.high for b in bars]
+        lows = [b.low for b in bars]
+        n = len(bars)
+
+        # ── Session extremes from bar highs/lows ──
         current_high = max(highs)
         current_low = min(lows)
         if state.session_high is None or current_high > state.session_high:
             state.session_high = current_high
-            if bars:
-                for b in bars:
-                    if b.high == current_high:
-                        try:
-                            from zoneinfo import ZoneInfo
-                            from datetime import datetime
-                            state.session_high_time = datetime.fromtimestamp(b.timestamp, ZoneInfo("America/Chicago")).strftime("%I:%M %p")
-                        except Exception:
-                            state.session_high_time = ""
-                        break
-            else:
-                for p in state.price_history:
-                    if p["price"] == current_high: state.session_high_time = p.get("time_str", ""); break
+            for b in bars:
+                if b.high == current_high:
+                    try:
+                        from zoneinfo import ZoneInfo
+                        from datetime import datetime
+                        state.session_high_time = datetime.fromtimestamp(b.timestamp, ZoneInfo("America/Chicago")).strftime("%I:%M %p")
+                    except Exception:
+                        state.session_high_time = ""
+                    break
             IntradayLevelTracker._upsert_level(state, current_high, "resistance", "session_high", now)
         if state.session_low is None or current_low < state.session_low:
             state.session_low = current_low
-            if bars:
-                for b in bars:
-                    if b.low == current_low:
-                        try:
-                            from zoneinfo import ZoneInfo
-                            from datetime import datetime
-                            state.session_low_time = datetime.fromtimestamp(b.timestamp, ZoneInfo("America/Chicago")).strftime("%I:%M %p")
-                        except Exception:
-                            state.session_low_time = ""
-                        break
-            else:
-                for p in state.price_history:
-                    if p["price"] == current_low: state.session_low_time = p.get("time_str", ""); break
+            for b in bars:
+                if b.low == current_low:
+                    try:
+                        from zoneinfo import ZoneInfo
+                        from datetime import datetime
+                        state.session_low_time = datetime.fromtimestamp(b.timestamp, ZoneInfo("America/Chicago")).strftime("%I:%M %p")
+                    except Exception:
+                        state.session_low_time = ""
+                    break
             IntradayLevelTracker._upsert_level(state, current_low, "support", "session_low", now)
-        if n < INTRADAY_MIN_PRICES_FOR_LEVELS: return events
+        if n < INTRADAY_MIN_PRICES_FOR_LEVELS:
+            return events
 
-        # ── Zone detection: use bar closes for touch, bar range for departure ──
+        # ── Zone detection from bar closes + bar range departure ──
         zone_counts: Dict[float, list] = {}
         for i, c in enumerate(closes):
             placed = False
@@ -216,20 +212,13 @@ class IntradayLevelTracker:
             if not placed: zone_counts[c] = [i]
         for rep_price, indices in zone_counts.items():
             if len(indices) < INTRADAY_MIN_TOUCHES: continue
-            # Departure check: did price move away after touching?
             has_dep = False
             for idx in indices:
-                if bars and idx < len(bars):
-                    # Bar-aware: check if subsequent bars had range away from level
-                    for j in range(idx+1, min(idx+4, n)):
-                        bar_dist = max(abs(highs[j] - rep_price), abs(lows[j] - rep_price))
-                        if bar_dist > tol * 2.5: has_dep = True; break
-                else:
-                    for sp in closes[idx+1:idx+4]:
-                        if abs(sp - rep_price) > tol * 2.5: has_dep = True; break
+                for j in range(idx+1, min(idx+4, n)):
+                    bar_dist = max(abs(highs[j] - rep_price), abs(lows[j] - rep_price))
+                    if bar_dist > tol * 2.5: has_dep = True; break
                 if has_dep: break
             if not has_dep: continue
-            # Direction: did price bounce up or reject down from this zone?
             bu = sum(1 for idx in indices if idx+1 < n and closes[idx+1] > rep_price + tol*0.5)
             bd = sum(1 for idx in indices if idx+1 < n and closes[idx+1] < rep_price - tol*0.5)
             if bu >= INTRADAY_MIN_TOUCHES:
@@ -239,45 +228,29 @@ class IntradayLevelTracker:
                 if IntradayLevelTracker._upsert_level(state, rep_price, "resistance", "rejection_zone", now, touches=len(indices)):
                     events.append({"msg": f"📍 NEW 5m RESISTANCE at ${rep_price:.2f} ({len(indices)} touches).", "type": "info", "priority": 3, "alert_key": f"id_res_{rep_price:.2f}"})
 
-        # ── Sharp move detection: use bar range and body when available ──
+        # ── Sharp move detection from bar structure ──
         if n >= 3:
             for i in range(max(n-12, 1), n):
-                if bars:
-                    bar_i = bars[i]
-                    move_pct = bar_i.range / bar_i.open * 100 if bar_i.open > 0 else 0
-                    if move_pct >= INTRADAY_SHARP_MOVE_THRESHOLD and bar_i.body_pct > 0.5:
-                        origin = bar_i.low if bar_i.is_bullish else bar_i.high
-                        kind = "support" if bar_i.is_bullish else "resistance"
-                        verb = "launched from" if bar_i.is_bullish else "dumped from"
-                        if IntradayLevelTracker._upsert_level(state, origin, kind, "sharp_move_origin", now):
-                            events.append({"msg": f"📍 SHARP MOVE ORIGIN: price {verb} ${origin:.2f}. Now intraday {kind}.", "type": "info", "priority": 3, "alert_key": f"sharp_{kind[:3]}_{origin:.2f}"})
-                else:
-                    move = closes[i] - closes[i-1]; move_pct = abs(move) / closes[i-1] * 100
-                    if move_pct >= INTRADAY_SHARP_MOVE_THRESHOLD:
-                        origin = closes[i-1]
-                        kind = "support" if move > 0 else "resistance"
-                        verb = "launched from" if move > 0 else "dumped from"
-                        if IntradayLevelTracker._upsert_level(state, origin, kind, "sharp_move_origin", now):
-                            events.append({"msg": f"📍 SHARP MOVE ORIGIN: price {verb} ${origin:.2f}. Now intraday {kind}.", "type": "info", "priority": 3, "alert_key": f"sharp_{kind[:3]}_{origin:.2f}"})
+                bar_i = bars[i]
+                move_pct = bar_i.range / bar_i.open * 100 if bar_i.open > 0 else 0
+                if move_pct >= INTRADAY_SHARP_MOVE_THRESHOLD and bar_i.body_pct > 0.5:
+                    origin = bar_i.low if bar_i.is_bullish else bar_i.high
+                    kind = "support" if bar_i.is_bullish else "resistance"
+                    verb = "launched from" if bar_i.is_bullish else "dumped from"
+                    if IntradayLevelTracker._upsert_level(state, origin, kind, "sharp_move_origin", now):
+                        events.append({"msg": f"📍 SHARP MOVE ORIGIN: price {verb} ${origin:.2f}. Now intraday {kind}.", "type": "info", "priority": 3, "alert_key": f"sharp_{kind[:3]}_{origin:.2f}"})
 
-        # ── Consolidation detection: use bar ranges ──
+        # ── Consolidation detection from bar ranges ──
         if n >= INTRADAY_CONSOLIDATION_CANDLES:
-            if bars:
-                recent_bars = bars[-INTRADAY_CONSOLIDATION_CANDLES:]
-                ch = max(b.high for b in recent_bars)
-                cl = min(b.low for b in recent_bars)
-            else:
-                recent_c = closes[-INTRADAY_CONSOLIDATION_CANDLES:]
-                ch, cl = max(recent_c), min(recent_c)
+            recent_bars = bars[-INTRADAY_CONSOLIDATION_CANDLES:]
+            ch = max(b.high for b in recent_bars)
+            cl = min(b.low for b in recent_bars)
             rng = ch - cl; rng_pct = rng / price * 100
             if rng_pct <= INTRADAY_CONSOLIDATION_RANGE_PCT and rng > 0:
                 IntradayLevelTracker._upsert_level(state, ch, "resistance", "consolidation_edge", now)
                 IntradayLevelTracker._upsert_level(state, cl, "support", "consolidation_edge", now)
                 events.append({"msg": f"📍 CONSOLIDATION: ${cl:.2f}-${ch:.2f} ({INTRADAY_CONSOLIDATION_CANDLES*5} min). Break with momentum is actionable.", "type": "info", "priority": 2, "alert_key": f"cons_{cl:.1f}_{ch:.1f}"})
 
-        # ── Deactivate stale levels ──
-        for lvl in state.intraday_levels:
-            if lvl.active and abs(price - lvl.price) > tol * 8 and (now - lvl.last_touched_ts) > 2700: lvl.active = False
         return events
 
     @staticmethod
@@ -479,7 +452,12 @@ class ThesisMonitorEngine:
             if d not in tickers and self.get_thesis(d): tickers.add(d)
         return sorted(tickers)
 
-    def _recent_net_move(self, state, lookback=3):
+    def _recent_net_move(self, state, lookback=3, bm=None):
+        """Net price move over last N bars (or spot samples as last resort)."""
+        if bm and len(bm.state.bars_5m) >= lookback:
+            bars = bm.state.bars_5m[-lookback:]
+            return bars[-1].close - bars[0].close
+        # Legacy fallback for pre-bar trades only
         recent = [p["price"] for p in state.price_history[-lookback:]]
         return (recent[-1] - recent[0]) if len(recent) >= 2 else 0.0
 
@@ -531,7 +509,7 @@ class ThesisMonitorEngine:
             entry_events = []
             entry_events.extend(self._detect_confirmed_breaks(thesis, state, price, now, bar=bar, bm=bm))
             entry_events.extend(self._detect_failed_moves(thesis, state, price, now))
-            entry_events.extend(self._detect_retests(thesis, state, price, now))
+            entry_events.extend(self._detect_retests(thesis, state, price, now, bm=bm))
             # Auto-create ActiveTrade — runs through EntryValidator + ExitPolicy
             for ev in entry_events:
                 if ev.get("type") in ("trade_confirmed", "critical") and ev.get("priority", 0) >= 5:
@@ -1297,43 +1275,34 @@ class ThesisMonitorEngine:
 
     def _evaluate_momentum(self, state, price, bm=None):
         events = []
-        # ── v2.0: Use bar closes when available ──
-        if bm and len(bm.state.bars_5m) >= 3:
-            bars = bm.state.bars_5m[-MONITOR_MOMENTUM_LOOKBACK:]
-            recent = [b.close for b in bars]
-        else:
-            recent = [p["price"] for p in state.price_history[-MONITOR_MOMENTUM_LOOKBACK:]]
+        # v2.0: Bars are the single truth source for momentum.
+        # No bars = stay at current momentum state, produce no events.
+        if not bm or len(bm.state.bars_5m) < 3:
+            return events
+        bars = bm.state.bars_5m[-MONITOR_MOMENTUM_LOOKBACK:]
+        recent = [b.close for b in bars]
         if len(recent) < 3: return events
         diffs = [recent[i] - recent[i-1] for i in range(1, len(recent))]
         avg_d = sum(diffs)/len(diffs); last_d = diffs[-1]; old = state.momentum
         thr = recent[-1] * (MONITOR_STALL_THRESHOLD_PCT / 100)
-        # ── v2.0: Use bar metrics for richer momentum when available ──
-        if bm and bm.state.metrics.consecutive_direction != 0:
-            consec = bm.state.metrics.consecutive_direction
-            expansion = bm.state.metrics.expansion_ratio
-            if abs(avg_d) < thr and expansion < 0.8:
-                state.momentum = "STALLING"
-            elif consec >= 2 and expansion > 1.3:
-                state.momentum = "ACCELERATING_UP"
-            elif consec <= -2 and expansion > 1.3:
-                state.momentum = "ACCELERATING_DOWN"
-            elif consec >= 1 and avg_d > 0:
-                state.momentum = "DRIFTING_UP"
-            elif consec <= -1 and avg_d < 0:
-                state.momentum = "DRIFTING_DOWN"
-            elif avg_d > 0 and last_d <= 0:
-                state.momentum = "LOSING_UPSIDE_MOMENTUM"
-            elif avg_d < 0 and last_d >= 0:
-                state.momentum = "LOSING_DOWNSIDE_MOMENTUM"
-            else:
-                state.momentum = "STALLING"
+        consec = bm.state.metrics.consecutive_direction
+        expansion = bm.state.metrics.expansion_ratio
+        if abs(avg_d) < thr and expansion < 0.8:
+            state.momentum = "STALLING"
+        elif consec >= 2 and expansion > 1.3:
+            state.momentum = "ACCELERATING_UP"
+        elif consec <= -2 and expansion > 1.3:
+            state.momentum = "ACCELERATING_DOWN"
+        elif consec >= 1 and avg_d > 0:
+            state.momentum = "DRIFTING_UP"
+        elif consec <= -1 and avg_d < 0:
+            state.momentum = "DRIFTING_DOWN"
+        elif avg_d > 0 and last_d <= 0:
+            state.momentum = "LOSING_UPSIDE_MOMENTUM"
+        elif avg_d < 0 and last_d >= 0:
+            state.momentum = "LOSING_DOWNSIDE_MOMENTUM"
         else:
-            # Spot-sample fallback (original logic)
-            if abs(avg_d) < thr: state.momentum = "STALLING"
-            elif avg_d > 0 and last_d > 0: state.momentum = "ACCELERATING_UP" if last_d > avg_d * 1.5 else "DRIFTING_UP"
-            elif avg_d < 0 and last_d < 0: state.momentum = "ACCELERATING_DOWN" if abs(last_d) > abs(avg_d) * 1.5 else "DRIFTING_DOWN"
-            elif avg_d > 0 and last_d <= 0: state.momentum = "LOSING_UPSIDE_MOMENTUM"
-            elif avg_d < 0 and last_d >= 0: state.momentum = "LOSING_DOWNSIDE_MOMENTUM"
+            state.momentum = "STALLING"
         if state.momentum != old:
             if state.momentum == "LOSING_UPSIDE_MOMENTUM" and old in ("ACCELERATING_UP", "DRIFTING_UP"):
                 events.append({"msg": "⚠️ Upside momentum fading. Tighten if long.", "type": "warning", "priority": 4, "alert_key": "mom_fade_up"})
@@ -1412,7 +1381,7 @@ class ThesisMonitorEngine:
             if (now - ba.break_time) > MONITOR_MAX_BREAK_AGE_SEC: continue
             req = 2 if tp["phase"] in ("OPEN", "MORNING", "AFTERNOON") else 3
             if ba.candles_since < req: continue
-            buf = ba.level * (MONITOR_CONFIRM_BUFFER_PCT / 100); net = self._recent_net_move(state, 3)
+            buf = ba.level * (MONITOR_CONFIRM_BUFFER_PCT / 100); net = self._recent_net_move(state, 3, bm=bm)
             if ba.direction == "DOWN":
                 ok = price < (ba.level - buf) and net < -(ba.level * 0.0012)
                 # v2.0: If bars available, require bar close through, not just spot
@@ -1483,8 +1452,8 @@ class ThesisMonitorEngine:
                     ba.reclaim_seen = False; ba.reclaim_price = None; ba.reclaim_time = 0.0; ba.reclaim_holds = 0
         return events
 
-    def _detect_retests(self, thesis, state, price, now):
-        events = []; net = self._recent_net_move(state, 3)
+    def _detect_retests(self, thesis, state, price, now, bm=None):
+        events = []; net = self._recent_net_move(state, 3, bm=bm)
         for ba in state.break_attempts:
             if not ba.retest_armed or ba.retest_fired: continue
             if (now - ba.break_time) > MONITOR_MAX_BREAK_AGE_SEC: continue
