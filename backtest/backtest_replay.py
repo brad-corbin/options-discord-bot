@@ -161,6 +161,80 @@ def make_dict_store():
 # This gives the engine real levels to watch: PDH, PDL, pivot, R1, S1.
 # ─────────────────────────────────────────────────────────────────────────────
 
+def estimate_gex_sign(prior_day: dict) -> str:
+    """
+    Estimate GEX sign from prior day's price behavior.
+
+    Real GEX data isn't available in backtest mode, so we use a simple
+    heuristic based on how the prior day actually moved:
+
+    GEX NEGATIVE (dealers short gamma — they AMPLIFY moves):
+        - Prior day had a large directional range (trending day)
+        - Body was large relative to total range (not much wicking)
+        - Price closed strongly near the high or low
+
+    GEX POSITIVE (dealers long gamma — they DAMPEN moves):
+        - Prior day had a tight range (pinning/choppy day)
+        - Price closed near the middle (indecision)
+        - Large wicks relative to body (dealers absorbing momentum)
+
+    This lets the engine decide:
+        - GEX negative days: confirmed breakouts fire BREAK trades
+        - GEX positive days: breakouts are fades, only FAILED moves fire
+    """
+    pdh  = prior_day["high"]
+    pdl  = prior_day["low"]
+    pdc  = prior_day["close"]
+    pdo  = prior_day["open"]
+
+    total_range = pdh - pdl
+    if total_range == 0:
+        return "positive"
+
+    # Body = distance between open and close
+    body = abs(pdc - pdo)
+    body_pct_of_range = body / total_range
+
+    # Range as % of close — how much did it move relative to price
+    range_pct = total_range / pdc * 100
+
+    # Where did it close? 0 = at the low, 1 = at the high
+    close_position = (pdc - pdl) / total_range
+
+    # Trending day signals (GEX negative):
+    #   - Range > 0.8% of price (real movement)
+    #   - Body > 50% of range (not just wicks)
+    #   - Closed in the top 30% or bottom 30% (strong directional close)
+    trending = (
+        range_pct > 0.8
+        and body_pct_of_range > 0.50
+        and (close_position > 0.70 or close_position < 0.30)
+    )
+
+    # Strong trend signals (very clearly GEX negative):
+    strong_trend = range_pct > 1.5 and body_pct_of_range > 0.60
+
+    if strong_trend or trending:
+        return "negative"
+    else:
+        return "positive"
+
+
+def estimate_regime(prior_day: dict) -> str:
+    """Estimate market regime from prior day's range."""
+    total_range = prior_day["high"] - prior_day["low"]
+    range_pct   = total_range / prior_day["close"] * 100
+    body        = abs(prior_day["close"] - prior_day["open"])
+    body_pct    = body / prior_day["close"] * 100
+
+    if range_pct > 1.5:
+        return "HIGH_VOL_TREND"
+    elif range_pct > 0.8 and body_pct > 0.4:
+        return "BULL_TREND" if prior_day["close"] > prior_day["open"] else "BEAR_TREND"
+    else:
+        return "LOW_VOL_CHOP"
+
+
 def build_auto_thesis(ticker: str, prior_day: dict, today_open: float) -> ThesisContext:
     """
     Build a ThesisContext from prior day's OHLC data.
@@ -171,6 +245,12 @@ def build_auto_thesis(ticker: str, prior_day: dict, today_open: float) -> Thesis
         pivot            = (PDH + PDL + PDC) / 3
         r1               = 2 * pivot - PDL
         s1               = 2 * pivot - PDH
+        range_break_up   = PDH (alias for breakout detection)
+        range_break_down = PDL (alias for breakdown detection)
+
+    GEX sign is estimated from prior day's trending vs pinning behavior:
+        - Prior day trended hard → gex_sign = "negative" → BREAK trades fire
+        - Prior day chopped/pinned → gex_sign = "positive" → only FAILED trades fire
 
     Bias is BULLISH if today opens above prior close, else BEARISH.
     """
@@ -182,7 +262,7 @@ def build_auto_thesis(ticker: str, prior_day: dict, today_open: float) -> Thesis
     r1    = 2 * pivot - pdl
     s1    = 2 * pivot - pdh
 
-    # Simple gap context
+    # Gap context
     gap_pct = (today_open - pdc) / pdc * 100
     if gap_pct > 0.3:
         prior_day_context = "GAP_UP"
@@ -193,21 +273,29 @@ def build_auto_thesis(ticker: str, prior_day: dict, today_open: float) -> Thesis
 
     bias = "BULLISH" if today_open >= pdc else "BEARISH"
 
+    # Estimate GEX sign from prior day behavior
+    gex_sign = estimate_gex_sign(prior_day)
+    regime   = estimate_regime(prior_day)
+
+    # Add range_break_up/down as explicit breakout trigger levels
+    # (separate from local_resistance/support so the engine tracks both)
     levels = ThesisLevels(
-        local_resistance = round(pdh, 2),
-        local_support    = round(pdl, 2),
-        pivot            = round(pivot, 2),
-        r1               = round(r1, 2),
-        s1               = round(s1, 2),
+        local_resistance  = round(pdh, 2),
+        local_support     = round(pdl, 2),
+        range_break_up    = round(pdh, 2),   # breakout above PDH
+        range_break_down  = round(pdl, 2),   # breakdown below PDL
+        pivot             = round(pivot, 2),
+        r1                = round(r1, 2),
+        s1                = round(s1, 2),
     )
 
     thesis = ThesisContext(
         ticker            = ticker,
         bias              = bias,
         bias_score        = 2 if bias == "BULLISH" else -2,
-        gex_sign          = "positive",   # default — no live GEX in backtest
-        regime            = "BULL_TREND", # default — no live regime in backtest
-        volatility_regime = "NORMAL",
+        gex_sign          = gex_sign,
+        regime            = regime,
+        volatility_regime = "ELEVATED" if (pdh - pdl) / pdc * 100 > 1.2 else "NORMAL",
         vix               = 20.0,
         iv                = 0.20,
         prior_day_close   = round(pdc, 2),
@@ -531,7 +619,7 @@ def run_backtest(ticker: str, csv_path: str, output_dir: str, skip_days: int = 1
 
         print(f"  {day}  ({len(bars)} bars)  "
               f"PDH={prior['high']:.2f}  PDL={prior['low']:.2f}  PDC={prior['close']:.2f}  "
-              f"Bias={thesis.bias}  Context={thesis.prior_day_context}")
+              f"Bias={thesis.bias}  {'GEX-' if thesis.gex_sign == 'negative' else 'GEX+'}  Regime={thesis.regime}  Context={thesis.prior_day_context}")
 
         # ── Create fresh engine for this day ──────────────────────────────────
         store_get, store_set = make_dict_store()
