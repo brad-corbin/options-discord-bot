@@ -686,6 +686,28 @@ def handle_command(
                 reply("⚠️ Monitor daemon not initialized. Restart bot.")
             return
 
+        if args and args[0].lower() == "trades":
+            ticker = args[1].upper() if len(args) > 1 else "SPY"
+            try:
+                spot = get_spot_fn(ticker) if get_spot_fn else 0
+                reply(thesis_engine.format_trades(ticker, price=spot))
+            except Exception as e:
+                log.error(f"Monitor trades error: {e}", exc_info=True)
+                reply(f"⚠️ Trades error: {e}")
+            return
+
+        if args and args[0].lower() == "close":
+            ticker = args[1].upper() if len(args) > 1 else "SPY"
+            reason = " ".join(args[2:]) if len(args) > 2 else "Manual close"
+            try:
+                spot = get_spot_fn(ticker) if get_spot_fn else None
+                result = thesis_engine.close_trade(ticker, price=spot, reason=reason)
+                reply(f"📊 {ticker}: {result}")
+            except Exception as e:
+                log.error(f"Monitor close error: {e}", exc_info=True)
+                reply(f"⚠️ Close error: {e}")
+            return
+
         if args and args[0].lower() == "guidance":
             ticker = args[1].upper() if len(args) > 1 else "SPY"
             try:
@@ -753,13 +775,16 @@ def handle_command(
             "\n── Thesis Monitor (NEW) ──\n"
             "/monitor — show thesis status for all monitored tickers\n"
             "/monitor SPY — show status for specific ticker\n"
+            "/monitor trades — show active trades & P&L\n"
+            "/monitor trades SPY — trades for specific ticker\n"
+            "/monitor close SPY — close most recent open trade\n"
             "/monitor guidance — plain English action guidance\n"
             "/monitor guidance SPY — guidance for specific ticker\n"
             "/monitor start — resume monitoring\n"
             "/monitor stop — pause monitoring\n"
             "  Auto-monitors SPY & QQQ from scheduled cards.\n"
             "  Run /em AAPL to add any ticker to monitoring.\n"
-            "  Detects: failed breakdowns, momentum decay, trapped traders.\n"
+            "  Detects: entries, exits, scale, trail, invalidation.\n"
             "\n── Position Monitor ──\n"
             "/monitorlong GLD — monitoring / wheel outlook with ~21-day thesis\n"
             "/monitorshort GLD — near-term management view for roll / close-early decisions\n"
