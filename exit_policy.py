@@ -344,6 +344,9 @@ def evaluate_exit(policy: ExitPolicy, trade, bar, bars_recent: list,
     """
     price = bar.close
     signal = ExitSignal()
+
+    # Update urgency based on current time FIRST, then label
+    policy.urgency = _time_urgency(_minutes_since_open(), policy.is_0dte)
     signal.urgency_label = policy.get_urgency_label()
 
     # P&L
@@ -355,9 +358,6 @@ def evaluate_exit(policy: ExitPolicy, trade, bar, bars_recent: list,
         profit = trade.entry_price - price
 
     signal.mfe_pct = trade.max_favorable / trade.entry_price * 100 if trade.entry_price > 0 else 0
-
-    # Update urgency based on current time
-    policy.urgency = _time_urgency(_minutes_since_open(), policy.is_0dte)
 
     # ── 1. GEX flip detection ──
     if current_gex and current_gex != policy.gex_at_entry:
