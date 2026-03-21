@@ -103,6 +103,7 @@ class ActiveTrade:
     scale_advice: str = ""        # "1/3 at T1", etc.
     level_tier: str = "C"         # A/B/C from LevelRegistry
     validation_summary: str = ""  # gate summary from validator
+    policy_config: dict = field(default_factory=dict)  # persisted policy params for restart
     # tracking
     max_favorable: float = 0.0  # max move in trade direction from entry
     min_favorable: float = 0.0  # worst adverse excursion from entry
@@ -234,7 +235,7 @@ class ThesisMonitorEngine:
         # v2.0: bar managers, level registries, exit policies, entry validator
         self._bar_managers: Dict[str, BarStateManager] = {}
         self._level_registries: Dict[str, LevelRegistry] = {}
-        self._exit_policies: Dict[str, ExitPolicy] = {}  # keyed by trade id (entry_price)
+        self._level_first_seen: Dict[str, float] = {}  # "ticker:price_rounded" → epoch
         self._entry_validator = EntryValidator()
 
     def _get_or_create_bar_manager(self, ticker: str) -> Optional[BarStateManager]:
@@ -251,19 +252,31 @@ class ThesisMonitorEngine:
 
     def _build_level_registry(self, ticker: str, thesis: ThesisContext,
                               state: MonitorState, spot: float) -> LevelRegistry:
-        """Build or rebuild level registry from all sources."""
+        """Build or rebuild level registry from all sources.
+        Uses cached first_seen timestamps so thesis levels don't get freshness-penalized every cycle."""
         reg = LevelRegistry()
         now_epoch = time.time()
-        # Thesis levels (daily, OI walls, EM, pivots, etc.)
-        reg.ingest_thesis_levels(thesis.levels, spot=spot, epoch=now_epoch)
-        # Opening range
+        # Thesis levels — use cached first_seen (these are stable across cycles)
+        thesis_epoch = self._level_first_seen_for_thesis(ticker, thesis, now_epoch)
+        reg.ingest_thesis_levels(thesis.levels, spot=spot, epoch=thesis_epoch)
+        # Opening range — use OR completion time, not now
         bm = self._bar_managers.get(ticker)
         if bm:
-            reg.ingest_opening_range(bm.state.or_30, epoch=now_epoch)
-            reg.ingest_opening_range(bm.state.or_15, epoch=now_epoch)
-        # Intraday levels from monitor state
+            or30_epoch = self._level_first_seen.get(f"{ticker}:OR30", now_epoch)
+            if bm.state.or_30.is_complete and f"{ticker}:OR30" not in self._level_first_seen:
+                self._level_first_seen[f"{ticker}:OR30"] = now_epoch
+                or30_epoch = now_epoch
+            reg.ingest_opening_range(bm.state.or_30, epoch=or30_epoch)
+            or15_epoch = self._level_first_seen.get(f"{ticker}:OR15", now_epoch)
+            if bm.state.or_15.is_complete and f"{ticker}:OR15" not in self._level_first_seen:
+                self._level_first_seen[f"{ticker}:OR15"] = now_epoch
+                or15_epoch = now_epoch
+            reg.ingest_opening_range(bm.state.or_15, epoch=or15_epoch)
+            # Also ingest OR5
+            reg.ingest_opening_range(bm.state.or_5, epoch=self._level_first_seen.get(f"{ticker}:OR5", now_epoch))
+        # Intraday levels — use their actual first_seen_ts (already tracked)
         if state.intraday_levels:
-            reg.ingest_intraday_levels(state.intraday_levels, epoch=now_epoch)
+            reg.ingest_intraday_levels(state.intraday_levels, epoch=0)  # epoch=0 means use level's own timestamp
         # Score everything
         session_range = 0
         if state.session_high is not None and state.session_low is not None:
@@ -278,6 +291,13 @@ class ThesisMonitorEngine:
         )
         self._level_registries[ticker] = reg
         return reg
+
+    def _level_first_seen_for_thesis(self, ticker, thesis, now_epoch):
+        """Get or set first_seen epoch for thesis levels (stable across cycles)."""
+        key = f"{ticker}:thesis:{thesis.created_at}"
+        if key not in self._level_first_seen:
+            self._level_first_seen[key] = now_epoch
+        return self._level_first_seen[key]
 
     def store_thesis(self, ticker: str, thesis: ThesisContext):
         with self._lock:
@@ -625,10 +645,9 @@ class ThesisMonitorEngine:
             setup_score=validation.setup_score, setup_label=validation.setup_label,
             exit_policy_name=policy.name, scale_advice=validation.scale_advice,
             level_tier=level_tier, validation_summary=validation.gate_summary,
+            policy_config=policy.to_config(),
             max_favorable=0.0, min_favorable=0.0,
         )
-        policy_key = f"{ticker}_{price:.2f}_{now}"
-        self._exit_policies[policy_key] = policy
 
         state.active_trades.append(trade)
         self._persist_trades(ticker, state)
@@ -640,9 +659,11 @@ class ThesisMonitorEngine:
 
     # ── Exit Monitor: Core Loop ──
     def _monitor_exits(self, ticker, thesis, state, price, now, bar=None, bm=None):
-        """Check all active trades for exit/scale/trail/invalidation signals.
-        v2.0: Uses ExitPolicy engine when bar + policy available, falls back to v1 logic."""
+        """Check all active trades using policy engine. Falls back to v1 only if no policy_config."""
         events = []
+        # Use latest bar from buffer — not just the newly-arrived bar
+        effective_bar = bar or (bm.get_latest_bar() if bm else None)
+        recent_bars = bm.get_recent_bars(5) if bm else []
         for trade in state.active_trades:
             if trade.status in ("CLOSED", "INVALIDATED"):
                 continue
@@ -656,11 +677,13 @@ class ThesisMonitorEngine:
                 trade.max_favorable = max(trade.max_favorable, fav)
                 trade.min_favorable = min(trade.min_favorable, fav)
 
-            # ── v2.0: Try policy-based exit evaluation ──
-            policy = self._exit_policies.get(getattr(trade, '_policy_key', ''))
-            if policy and bar and bm:
-                recent_bars = bm.get_recent_bars(5)
-                signal = evaluate_exit(policy, trade, bar, recent_bars,
+            # ── v2.0: Reconstruct policy from trade's persisted config ──
+            policy = None
+            if trade.policy_config:
+                policy = ExitPolicy.from_config(trade.policy_config)
+
+            if policy and effective_bar:
+                signal = evaluate_exit(policy, trade, effective_bar, recent_bars,
                                        current_gex=thesis.gex_sign)
                 if signal.action == "INVALIDATE":
                     if self._exit_alert_ok(trade, "invalidate", now):
@@ -683,6 +706,15 @@ class ThesisMonitorEngine:
                         events.append({"msg": f"🏃 TRAIL — {trade.direction}\n\n{signal.reason}\nEntry: ${trade.entry_price:.2f} → Now: ${price:.2f} ({signal.pnl_pct:+.2f}%)\nPolicy: {policy.name}", "type": "exit", "priority": 5, "alert_key": f"exit_trail_{trade.direction}_{trade.entry_price:.2f}"})
                 elif signal.action == "REDUCE":
                     if self._exit_alert_ok(trade, "fade", now):
+                        # ── Fix 7: Latch GEX flip — update trade's stored policy ──
+                        if thesis.gex_sign != trade.policy_config.get("gex_at_entry"):
+                            adjusted = policy.recalibrate_for_gex_flip(thesis.gex_sign)
+                            trade.policy_config = adjusted.to_config()
+                            # Update gex_at_entry to current so we don't re-detect same flip
+                            trade.policy_config["gex_at_entry"] = thesis.gex_sign
+                            trade.exit_policy_name = adjusted.name
+                            self._persist_trades(ticker, state)
+                            log.info(f"Policy latched: {trade.ticker} {trade.direction} → {adjusted.name} (gex now {thesis.gex_sign})")
                         if signal.new_stop:
                             trade.trail_stop = signal.new_stop
                         events.append({"msg": f"⚠️ REDUCE — {trade.direction}\n\n{signal.reason}\nEntry: ${trade.entry_price:.2f} → Now: ${price:.2f} ({signal.pnl_pct:+.2f}%)\n{signal.urgency_label}", "type": "exit", "priority": 4, "alert_key": f"exit_fade_{trade.direction}_{trade.entry_price:.2f}"})
@@ -693,22 +725,16 @@ class ThesisMonitorEngine:
                         trade.close_reason = signal.reason
                         self._persist_trades(ticker, state)
                         events.append({"msg": f"⏹ EXIT — {trade.direction}\n\n{signal.reason}\nEntry: ${trade.entry_price:.2f} → Now: ${price:.2f} ({signal.pnl_pct:+.2f}%)\nPay yourself.", "type": "exit", "priority": 5, "alert_key": f"exit_done_{trade.direction}_{trade.entry_price:.2f}"})
-                # HOLD = do nothing
                 continue
 
-            # ── v1 fallback: old logic when no policy or no bar ──
-            # 1. INVALIDATION
+            # ── v1 fallback: only when no policy_config exists (legacy trades) ──
             inv_events = self._check_invalidation(trade, thesis, state, price, now)
             if inv_events:
                 events.extend(inv_events)
                 continue
-            # 2. SCALE PARTIAL
             events.extend(self._check_scale(trade, thesis, state, price, now))
-            # 3. TRAIL RUNNER
             events.extend(self._check_trail(trade, thesis, state, price, now))
-            # 4. REDUCE EXPOSURE
             events.extend(self._check_momentum_fade(trade, thesis, state, price, now))
-            # 5. EXIT
             events.extend(self._check_exit(trade, thesis, state, price, now))
         return events
 
@@ -984,6 +1010,7 @@ class ThesisMonitorEngine:
                     "setup_score": t.setup_score, "setup_label": t.setup_label,
                     "exit_policy_name": t.exit_policy_name, "scale_advice": t.scale_advice,
                     "level_tier": t.level_tier, "validation_summary": t.validation_summary,
+                    "policy_config": t.policy_config,
                     "max_favorable": t.max_favorable, "min_favorable": t.min_favorable,
                     "scaled_at_price": t.scaled_at_price,
                     "trail_stop": t.trail_stop, "close_price": t.close_price,
@@ -1036,6 +1063,7 @@ class ThesisMonitorEngine:
                     scale_advice=td.get("scale_advice", ""),
                     level_tier=td.get("level_tier", "C"),
                     validation_summary=td.get("validation_summary", ""),
+                    policy_config=td.get("policy_config", {}),
                     max_favorable=td.get("max_favorable", 0),
                     min_favorable=td.get("min_favorable", 0),
                     scaled_at_price=td.get("scaled_at_price"),
