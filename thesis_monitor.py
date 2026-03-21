@@ -85,7 +85,8 @@ class ActiveTrade:
     stop_level: float
     targets: list = field(default_factory=list)  # [float] — next S/R levels
     status: str = "OPEN"  # OPEN / SCALED / TRAILED / CLOSED / INVALIDATED
-    entry_time: float = 0.0
+    entry_time: float = 0.0       # monotonic — in-process only
+    entry_epoch: float = 0.0      # time.time() — survives restart
     entry_time_str: str = ""
     level_name: str = ""  # what level triggered the entry
     gex_at_entry: str = "positive"
@@ -97,7 +98,8 @@ class ActiveTrade:
     trail_stop: Optional[float] = None
     close_price: Optional[float] = None
     close_reason: str = ""
-    close_time: float = 0.0
+    close_time: float = 0.0      # monotonic — in-process only
+    close_epoch: float = 0.0     # time.time() — survives restart
     exit_alert_history: dict = field(default_factory=dict)  # cooldown tracking
 
 @dataclass
@@ -221,12 +223,31 @@ class ThesisMonitorEngine:
         with self._lock:
             self._theses[ticker] = thesis
             old = self._states.get(ticker); ns = MonitorState()
+            now_mono = time.monotonic(); now_epoch = time.time()
             if old and old.failed_moves:
-                now = time.monotonic(); ns.failed_moves = [fm for fm in old.failed_moves if (now - fm.break_time) < 1800]
+                ns.failed_moves = [fm for fm in old.failed_moves if (now_mono - fm.break_time) < 1800]
             if old and old.intraday_levels:
                 ns.intraday_levels = [l for l in old.intraday_levels if l.active]
                 ns.session_high = old.session_high; ns.session_low = old.session_low
                 ns.session_high_time = old.session_high_time; ns.session_low_time = old.session_low_time
+            if old and old.active_trades:
+                ns.active_trades = [
+                    t for t in old.active_trades
+                    if t.status in ("OPEN", "SCALED", "TRAILED")
+                    or (now_epoch - t.entry_epoch if t.entry_epoch > 0 else 0) < 28800
+                ]
+            if old and old.price_history:
+                ns.price_history = old.price_history[-60:]
+            if old and old.break_attempts:
+                ns.break_attempts = [
+                    ba for ba in old.break_attempts
+                    if ba.detected_as_failed or ba.detected_as_confirmed
+                    or (now_mono - ba.break_time) <= MONITOR_MAX_BREAK_AGE_SEC
+                ]
+                ns.confirmed_breaks = old.confirmed_breaks[-10:]
+            if old:
+                ns.active_trend_direction = old.active_trend_direction
+                ns.alert_history = old.alert_history
             self._states[ticker] = ns
             log.info(f"Thesis stored: {ticker} | bias={thesis.bias} score={thesis.bias_score} gex={thesis.gex_sign} regime={thesis.regime}")
             self._persist_thesis(ticker, thesis)
@@ -236,7 +257,22 @@ class ThesisMonitorEngine:
         try:
             data = {"ticker": thesis.ticker, "bias": thesis.bias, "bias_score": thesis.bias_score, "gex_sign": thesis.gex_sign, "gex_value": thesis.gex_value, "dex_value": thesis.dex_value, "vanna_value": thesis.vanna_value, "charm_value": thesis.charm_value, "regime": thesis.regime, "volatility_regime": thesis.volatility_regime, "vix": thesis.vix, "iv": thesis.iv, "prior_day_close": thesis.prior_day_close, "prior_day_context": thesis.prior_day_context, "session_label": thesis.session_label, "created_at": thesis.created_at, "spot_at_creation": thesis.spot_at_creation, "levels": asdict(thesis.levels)}
             self._store_set(f"thesis_monitor:{ticker}", json.dumps(data), ttl=86400)
+            # Maintain monitored ticker list in store
+            self._update_ticker_list(ticker)
         except Exception as e: log.warning(f"Thesis persist failed for {ticker}: {e}")
+
+    def _update_ticker_list(self, ticker):
+        """Add ticker to persisted monitored list if not already present."""
+        if not self._store_set or not self._store_get:
+            return
+        try:
+            raw = self._store_get("thesis_monitor:tickers")
+            tickers = json.loads(raw) if raw else []
+            if ticker not in tickers:
+                tickers.append(ticker)
+                self._store_set("thesis_monitor:tickers", json.dumps(tickers), ttl=86400)
+        except Exception as e:
+            log.warning(f"Ticker list update failed: {e}")
 
     def _load_thesis_from_store(self, ticker):
         if not self._store_get: return None
@@ -266,6 +302,17 @@ class ThesisMonitorEngine:
 
     def get_monitored_tickers(self) -> List[str]:
         tickers = set(self._theses.keys())
+        # Load persisted ticker list on restart
+        if not tickers and self._store_get:
+            try:
+                raw = self._store_get("thesis_monitor:tickers")
+                if raw:
+                    stored = json.loads(raw)
+                    for t in stored:
+                        if self.get_thesis(t):
+                            tickers.add(t)
+            except Exception as e:
+                log.warning(f"Ticker list load failed: {e}")
         for d in MONITOR_DEFAULT_TICKERS:
             if d not in tickers and self.get_thesis(d): tickers.add(d)
         return sorted(tickers)
@@ -326,7 +373,8 @@ class ThesisMonitorEngine:
             # ── Exit monitoring for active trades ──
             events.extend(self._monitor_exits(ticker, thesis, state, price, now))
             # Expire stale trades
-            self._expire_stale_trades(state, now)
+            if self._expire_stale_trades(state, now):
+                self._persist_trades(ticker, state)
             if state.status == "FRESH" and state.check_count >= 2: state.status = "DEVELOPING"
             return self._apply_cooldowns(state, events, now)
 
@@ -426,8 +474,8 @@ class ThesisMonitorEngine:
         trade = ActiveTrade(
             ticker=ticker, direction=direction, entry_type=entry_type,
             entry_price=price, stop_level=stop, targets=targets,
-            status="OPEN", entry_time=now, entry_time_str=ts,
-            level_name=level_name, gex_at_entry=thesis.gex_sign,
+            status="OPEN", entry_time=now, entry_epoch=time.time(),
+            entry_time_str=ts, level_name=level_name, gex_at_entry=thesis.gex_sign,
             trade_type_label=tt_label, max_favorable=0.0, min_favorable=0.0,
         )
         state.active_trades.append(trade)
@@ -493,7 +541,7 @@ class ThesisMonitorEngine:
             return events
         if not self._exit_alert_ok(trade, "invalidate", now):
             return events
-        trade.status = "INVALIDATED"; trade.close_price = price; trade.close_time = now
+        trade.status = "INVALIDATED"; trade.close_price = price; trade.close_time = now; trade.close_epoch = time.time()
         stop_ref = trade.trail_stop if trade.trail_stop else trade.stop_level
         pnl_pct = ((price - trade.entry_price) / trade.entry_price * 100) if trade.direction == "LONG" else ((trade.entry_price - price) / trade.entry_price * 100)
         if trade.direction == "LONG":
@@ -686,22 +734,34 @@ class ThesisMonitorEngine:
                 f"Entry: ${trade.entry_price:.2f} → Now: ${price:.2f} ({pnl_pct:+.2f}%)\n"
                 f"Move extended. Pay yourself."
             ), "type": "exit", "priority": 5, "alert_key": f"exit_exh_{trade.direction}_{trade.entry_price:.2f}"})
-        trade.status = "CLOSED"; trade.close_price = price; trade.close_time = now
+        trade.status = "CLOSED"; trade.close_price = price; trade.close_time = now; trade.close_epoch = time.time()
         self._persist_trades(trade.ticker, state)
         log.info(f"Trade CLOSED: {trade.ticker} {trade.direction} @ ${trade.entry_price:.2f} → ${price:.2f} | {reason}")
         return events
 
     # ── Expire Stale Trades ──
     def _expire_stale_trades(self, state, now):
+        changed = False
+        now_epoch = time.time()
         for trade in state.active_trades:
             if trade.status in ("CLOSED", "INVALIDATED"):
                 continue
-            if (now - trade.entry_time) > EXIT_MAX_TRADE_AGE_SEC:
-                trade.status = "CLOSED"; trade.close_time = now
+            # Use epoch for age — survives restarts
+            age = now_epoch - trade.entry_epoch if trade.entry_epoch > 0 else (now - trade.entry_time)
+            if age > EXIT_MAX_TRADE_AGE_SEC:
+                trade.status = "CLOSED"; trade.close_time = now; trade.close_epoch = now_epoch
                 trade.close_reason = "Session expired (4hr max)"
                 log.info(f"Trade expired: {trade.ticker} {trade.direction} @ ${trade.entry_price:.2f}")
+                changed = True
         # Prune trades older than 8 hours (keep history but don't bloat)
-        state.active_trades = [t for t in state.active_trades if (now - t.entry_time) < 28800]
+        before = len(state.active_trades)
+        state.active_trades = [
+            t for t in state.active_trades
+            if (now_epoch - t.entry_epoch if t.entry_epoch > 0 else (now - t.entry_time)) < 28800
+        ]
+        if len(state.active_trades) < before:
+            changed = True
+        return changed
 
     # ── Trade Persistence ──
     def _persist_trades(self, ticker, state):
@@ -719,13 +779,13 @@ class ThesisMonitorEngine:
                     "ticker": t.ticker, "direction": t.direction, "entry_type": t.entry_type,
                     "entry_price": t.entry_price, "stop_level": t.stop_level,
                     "targets": t.targets, "status": t.status,
-                    "entry_time": t.entry_time, "entry_time_str": t.entry_time_str,
+                    "entry_epoch": t.entry_epoch, "entry_time_str": t.entry_time_str,
                     "level_name": t.level_name, "gex_at_entry": t.gex_at_entry,
                     "trade_type_label": t.trade_type_label,
                     "max_favorable": t.max_favorable, "min_favorable": t.min_favorable,
                     "scaled_at_price": t.scaled_at_price,
                     "trail_stop": t.trail_stop, "close_price": t.close_price,
-                    "close_reason": t.close_reason, "close_time": t.close_time,
+                    "close_reason": t.close_reason, "close_epoch": t.close_epoch,
                     "exit_alert_history_rel": eah_relative,
                 })
             self._store_set(f"active_trades:{ticker}", json.dumps(trades_data), ttl=86400)
@@ -740,8 +800,20 @@ class ThesisMonitorEngine:
             if not raw:
                 return
             now_mono = time.monotonic()
+            now_epoch = time.time()
             trades_data = json.loads(raw)
             for td in trades_data:
+                # Reconstruct monotonic entry_time from epoch for in-process age math
+                entry_epoch = td.get("entry_epoch", 0)
+                if entry_epoch > 0:
+                    entry_time = now_mono - (now_epoch - entry_epoch)
+                else:
+                    entry_time = td.get("entry_time", 0)  # legacy fallback
+                close_epoch = td.get("close_epoch", 0)
+                if close_epoch > 0:
+                    close_time = now_mono - (now_epoch - close_epoch)
+                else:
+                    close_time = td.get("close_time", 0)
                 trade = ActiveTrade(
                     ticker=td.get("ticker", ticker),
                     direction=td.get("direction", "LONG"),
@@ -750,7 +822,8 @@ class ThesisMonitorEngine:
                     stop_level=td.get("stop_level", 0),
                     targets=td.get("targets", []),
                     status=td.get("status", "OPEN"),
-                    entry_time=td.get("entry_time", 0),
+                    entry_time=entry_time,
+                    entry_epoch=entry_epoch,
                     entry_time_str=td.get("entry_time_str", ""),
                     level_name=td.get("level_name", ""),
                     gex_at_entry=td.get("gex_at_entry", "positive"),
@@ -761,7 +834,8 @@ class ThesisMonitorEngine:
                     trail_stop=td.get("trail_stop"),
                     close_price=td.get("close_price"),
                     close_reason=td.get("close_reason", ""),
-                    close_time=td.get("close_time", 0),
+                    close_time=close_time,
+                    close_epoch=close_epoch,
                 )
                 # Reconstruct exit_alert_history from relative offsets
                 eah_rel = td.get("exit_alert_history_rel", {})
@@ -777,15 +851,16 @@ class ThesisMonitorEngine:
     def close_trade(self, ticker, price=None, reason="Manual close"):
         """Close the most recent open trade for a ticker."""
         with self._lock:
-            state = self._states.get(ticker)
-            if not state:
-                return "No state for this ticker."
+            self.get_thesis(ticker)  # trigger lazy-load
+            state = self._states.setdefault(ticker, MonitorState())
+            if not state.active_trades:
+                self._load_trades_from_store(ticker, state)
             open_trades = [t for t in state.active_trades if t.status in ("OPEN", "SCALED", "TRAILED")]
             if not open_trades:
                 return "No open trades."
             trade = open_trades[-1]
             trade.status = "CLOSED"; trade.close_reason = reason
-            trade.close_price = price; trade.close_time = time.monotonic()
+            trade.close_price = price; trade.close_time = time.monotonic(); trade.close_epoch = time.time()
             self._persist_trades(ticker, state)
             pnl = ""
             if price and trade.entry_price:
@@ -795,9 +870,10 @@ class ThesisMonitorEngine:
 
     # ── Format Active Trades for Display ──
     def format_trades(self, ticker, price=None):
-        state = self._states.get(ticker)
-        if not state:
-            return f"📊 {ticker}: No monitor state."
+        thesis = self.get_thesis(ticker)  # triggers lazy-load + trade recovery
+        if not thesis:
+            return f"📊 {ticker}: No thesis. Run /em."
+        state = self._states.setdefault(ticker, MonitorState())
         # Load from store if empty
         if not state.active_trades:
             self._load_trades_from_store(ticker, state)
@@ -839,8 +915,9 @@ class ThesisMonitorEngine:
         return "\n".join(lines)
 
     def build_guidance(self, ticker, price):
-        thesis = self._theses.get(ticker); state = self._states.get(ticker)
-        if not thesis or not state: return [{"text": f"No thesis for {ticker}. Run /em first.", "type": "neutral"}]
+        thesis = self.get_thesis(ticker)
+        if not thesis: return [{"text": f"No thesis for {ticker}. Run /em first.", "type": "neutral"}]
+        state = self._states.setdefault(ticker, MonitorState())
         g = []; lvl = thesis.levels; tp = _get_time_phase_ct()
         g.append({"text": f"THESIS: {thesis.bias} ({thesis.bias_score}/14) | GEX {thesis.gex_sign} ({thesis.gex_value:+.1f}M) | {thesis.regime}", "type": "context"})
         g.append({"text": f"{tp['label']}: {tp['note']}", "type": "time"})
@@ -1084,8 +1161,9 @@ class ThesisMonitorEngine:
         return out
 
     def format_status(self, ticker):
-        thesis = self._theses.get(ticker); state = self._states.get(ticker)
+        thesis = self.get_thesis(ticker)
         if not thesis: return f"📡 {ticker}: No thesis. Run /em."
+        state = self._states.setdefault(ticker, MonitorState())
         p = state.price_history[-1]["price"] if state and state.price_history else thesis.spot_at_creation
         lines = [f"📡 {ticker} MONITOR", f"Status: {state.status if state else 'INACTIVE'}", f"Bias: {thesis.bias} ({thesis.bias_score:+d}/14)", f"GEX: {thesis.gex_sign} ({thesis.gex_value:+.1f}M) | {thesis.regime}", f"Price: ${p:.2f}"]
         if state:
