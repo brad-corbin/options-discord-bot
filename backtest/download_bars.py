@@ -1,18 +1,21 @@
 # backtest/download_bars.py
 # ─────────────────────────────────────────────────────────────────────────────
 # Downloads historical 5-minute bars from MarketData.app and saves to CSV.
-# Supports both "most recent N days" and "specific date range" modes.
 #
-# Called automatically by the GitHub Actions workflow.
+# MarketData's free/starter plan only supports countback (fetch last N bars).
+# The from/to date API parameters require a higher paid tier and return 403.
+#
+# This version works around that by:
+#   1. Calculating how many calendar days back the start date is from today
+#   2. Converting that to a bar countback (78 bars/trading day * 1.4 buffer)
+#   3. Fetching with countback, then trimming rows to the requested date window
 #
 # Examples:
-#   python backtest/download_bars.py                        # last 22 trading days of SPY
-#   python backtest/download_bars.py --from 2025-10-01 --to 2025-11-30
-#   python backtest/download_bars.py --ticker QQQ --from 2025-06-01 --to 2025-07-31
+#   python backtest/download_bars.py                          # last 22 trading days
+#   python backtest/download_bars.py --from 2025-10-01 --to 2025-11-28
+#   python backtest/download_bars.py --ticker QQQ --from 2025-07-01 --to 2025-08-29
 #
 # Output: backtest/data/{TICKER}_5m_{LABEL}.csv
-#   e.g.  backtest/data/SPY_5m_recent.csv
-#         backtest/data/SPY_5m_2025-10-01_2025-11-30.csv
 # ─────────────────────────────────────────────────────────────────────────────
 
 import os
@@ -20,7 +23,7 @@ import sys
 import csv
 import argparse
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 # ── Token ─────────────────────────────────────────────────────────────────────
@@ -40,7 +43,7 @@ def md_get(url: str, params: dict = None) -> dict:
 
 
 def to_ct_str(epoch: float) -> str:
-    """Convert epoch timestamp to Central Time string for human readability."""
+    """Convert epoch timestamp to Central Time human-readable string."""
     dt_utc = datetime.fromtimestamp(epoch, tz=timezone.utc)
     try:
         from zoneinfo import ZoneInfo
@@ -56,35 +59,26 @@ def to_date_ct(epoch: float) -> str:
     return to_ct_str(epoch)[:10]
 
 
-# ── Download modes ─────────────────────────────────────────────────────────────
+def calendar_days_since(date_str: str) -> int:
+    """How many calendar days between date_str (YYYY-MM-DD) and today?"""
+    target = datetime.strptime(date_str, "%Y-%m-%d").date()
+    today  = datetime.now(timezone.utc).date()
+    return (today - target).days
 
-def download_by_countback(ticker: str, days: int) -> list:
+
+# ── Core download ─────────────────────────────────────────────────────────────
+
+def download_with_countback(ticker: str, countback: int) -> list:
     """
-    Fetch the most recent N trading days using countback.
-    78 bars/day * days * 1.2 buffer = safe countback.
+    Fetch bars using countback. This works on all MarketData plan tiers.
+    Returns list of row dicts sorted oldest → newest.
     """
-    countback = int(days * 78 * 1.2)
     url = f"https://api.marketdata.app/v1/stocks/candles/5/{ticker.upper()}/"
-    print(f"  Mode: last {days} trading days  (countback={countback})")
+    print(f"  Fetching {ticker} (countback={countback})...")
     data = md_get(url, {"countback": countback})
-    return _unpack(data, ticker)
 
-
-def download_by_date_range(ticker: str, from_date: str, to_date: str) -> list:
-    """
-    Fetch bars between two dates (YYYY-MM-DD).
-    MarketData accepts 'from' and 'to' as date strings.
-    """
-    url = f"https://api.marketdata.app/v1/stocks/candles/5/{ticker.upper()}/"
-    print(f"  Mode: date range {from_date} → {to_date}")
-    data = md_get(url, {"from": from_date, "to": to_date})
-    return _unpack(data, ticker)
-
-
-def _unpack(data: dict, ticker: str) -> list:
-    """Convert MarketData columnar response into a list of row dicts."""
     if not isinstance(data, dict) or data.get("s") != "ok":
-        print(f"  ERROR: Bad response from MarketData: {data}")
+        print(f"  ERROR: Bad API response: {data}")
         sys.exit(1)
 
     timestamps = data.get("t", [])
@@ -95,7 +89,7 @@ def _unpack(data: dict, ticker: str) -> list:
     volumes    = data.get("v", [])
     n = min(len(timestamps), len(opens), len(closes))
 
-    print(f"  Got {n} bars from API")
+    print(f"  Got {n} raw bars from API")
 
     rows = []
     for i in range(n):
@@ -111,13 +105,54 @@ def _unpack(data: dict, ticker: str) -> list:
             "datetime_ct": to_ct_str(ts),
         })
 
-    # Sort oldest → newest
     rows.sort(key=lambda r: r["timestamp"])
-
-    dates = sorted(set(r["date"] for r in rows))
-    print(f"  Date range in data: {dates[0]} → {dates[-1]}")
-    print(f"  Trading days: {len(dates)}")
     return rows
+
+
+def trim_to_dates(rows: list, from_date: str, to_date: str) -> list:
+    """Keep only rows whose date falls within [from_date, to_date] inclusive."""
+    return [r for r in rows if from_date <= r["date"] <= to_date]
+
+
+# ── Download modes ─────────────────────────────────────────────────────────────
+
+def fetch_recent(ticker: str, days: int) -> tuple:
+    """Fetch the most recent N trading days."""
+    countback = int(days * 78 * 1.2)
+    print(f"  Mode: last {days} trading days")
+    rows = download_with_countback(ticker, countback)
+    label = "recent"
+    return rows, label
+
+
+def fetch_date_range(ticker: str, from_date: str, to_date: str) -> tuple:
+    """
+    Fetch bars for a specific date window.
+    Uses countback calculated from calendar distance, then trims.
+    Adds a 1.4x buffer to account for weekends, holidays, and partial weeks.
+    """
+    print(f"  Mode: date range {from_date} → {to_date}")
+
+    # How many calendar days back is the start date?
+    cal_days_back = calendar_days_since(from_date)
+    # Calendar days → approximate trading days (5/7 ratio), with buffer
+    trading_days_est = int(cal_days_back * 5 / 7 * 1.4) + 10
+    countback = int(trading_days_est * 78)
+
+    print(f"  Calendar days back: {cal_days_back}  →  countback: {countback}")
+
+    rows = download_with_countback(ticker, countback)
+
+    # Trim to the requested window
+    trimmed = trim_to_dates(rows, from_date, to_date)
+
+    if not trimmed:
+        print(f"  ERROR: No bars found in range {from_date} → {to_date}")
+        print(f"  Got dates: {rows[0]['date']} → {rows[-1]['date']}" if rows else "  No bars at all.")
+        sys.exit(1)
+
+    label = f"{from_date}_{to_date}"
+    return trimmed, label
 
 
 # ── Save ───────────────────────────────────────────────────────────────────────
@@ -133,6 +168,8 @@ def save_to_csv(rows: list, ticker: str, output_dir: str, label: str) -> str:
         writer.writeheader()
         writer.writerows(rows)
 
+    dates = sorted(set(r["date"] for r in rows))
+    print(f"  Date range saved: {dates[0]} → {dates[-1]}  ({len(dates)} trading days)")
     print(f"  Saved {len(rows)} bars to: {filepath}")
     return filepath
 
@@ -141,14 +178,14 @@ def save_to_csv(rows: list, ticker: str, output_dir: str, label: str) -> str:
 
 def main():
     parser = argparse.ArgumentParser(description="Download historical 5m bars from MarketData.app")
-    parser.add_argument("--ticker",  default="SPY",    help="Ticker symbol (default: SPY)")
-    parser.add_argument("--days",    default=22, type=int,
-                        help="Trading days to fetch in countback mode (default: 22, ignored if --from/--to used)")
-    parser.add_argument("--from",    dest="from_date", default=None,
-                        help="Start date YYYY-MM-DD (activates date-range mode)")
-    parser.add_argument("--to",      dest="to_date",   default=None,
-                        help="End date YYYY-MM-DD (activates date-range mode, defaults to today)")
-    parser.add_argument("--output",  default=None,
+    parser.add_argument("--ticker",   default="SPY", help="Ticker symbol (default: SPY)")
+    parser.add_argument("--days",     default=22, type=int,
+                        help="Trading days to fetch in recent mode (default: 22)")
+    parser.add_argument("--from",     dest="from_date", default=None,
+                        help="Start date YYYY-MM-DD — activates date-range mode")
+    parser.add_argument("--to",       dest="to_date",   default=None,
+                        help="End date YYYY-MM-DD (only used with --from, defaults to today)")
+    parser.add_argument("--output",   default=None,
                         help="Output directory (default: backtest/data/)")
     args = parser.parse_args()
 
@@ -160,21 +197,18 @@ def main():
     print(f"  Downloading {args.ticker} historical 5m bars")
     print(f"{'='*55}")
 
-    # Choose mode
     if args.from_date:
         to_date = args.to_date or datetime.now().strftime("%Y-%m-%d")
-        rows = download_by_date_range(args.ticker, args.from_date, to_date)
-        label = f"{args.from_date}_{to_date}"
+        rows, label = fetch_date_range(args.ticker, args.from_date, to_date)
     else:
-        rows = download_by_countback(args.ticker, args.days)
-        label = "recent"
+        rows, label = fetch_recent(args.ticker, args.days)
 
     path = save_to_csv(rows, args.ticker, args.output, label)
 
-    # Preview
     print("\nFirst 3 bars:")
     for r in rows[:3]:
-        print(f"  {r['datetime_ct']}  O={r['open']:.2f}  H={r['high']:.2f}  L={r['low']:.2f}  C={r['close']:.2f}")
+        print(f"  {r['datetime_ct']}  O={r['open']:.2f}  H={r['high']:.2f}  "
+              f"L={r['low']:.2f}  C={r['close']:.2f}")
 
     print(f"\n✅ Done → {path}")
     print(f"   Total bars: {len(rows)}")
