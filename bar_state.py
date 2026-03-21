@@ -247,6 +247,12 @@ class BarStateManager:
             bars = self._parse_bars(raw, resolution=5)
             if not bars:
                 return None
+            # Check for new session BEFORE appending — prevents clearing just-appended bars
+            today = _get_today_str()
+            if today != self.state.session_date:
+                self._new_session(today)
+                # Reinitialize with full backfill for new session
+                return self._reinit_from_bars(bars)
             new_bar = None
             for bar in bars:
                 if bar.timestamp > self.state.last_bar_ts:
@@ -259,10 +265,6 @@ class BarStateManager:
             # Trim buffer
             if len(self.state.bars_5m) > BAR_BUFFER_MAX_5M:
                 self.state.bars_5m = self.state.bars_5m[-BAR_BUFFER_MAX_5M:]
-            # Check if new session
-            today = _get_today_str()
-            if today != self.state.session_date:
-                self._new_session(today)
             # Update OR if still forming
             if not self.state.or_30.is_complete:
                 self._compute_opening_ranges()
@@ -273,6 +275,21 @@ class BarStateManager:
         except Exception as e:
             log.warning(f"BarState [{self.ticker}]: update failed: {e}")
             return None
+
+    def _reinit_from_bars(self, seed_bars: list) -> Optional['Bar']:
+        """After session reset, seed with available bars and re-init."""
+        for bar in seed_bars:
+            self.state.bars_5m.append(bar)
+            self.state.vwap.update(bar)
+            self.state.last_bar_ts = bar.timestamp
+            self.state.last_close = bar.close
+            self.state.bars_since_open += 1
+        self._compute_opening_ranges()
+        self._update_session_extremes()
+        self._update_metrics()
+        # Then do a full backfill
+        self.initialize()
+        return self.state.bars_5m[-1] if self.state.bars_5m else None
 
     def get_latest_bar(self) -> Optional[Bar]:
         return self.state.bars_5m[-1] if self.state.bars_5m else None
