@@ -157,48 +157,178 @@ def make_dict_store():
 # ═════════════════════════════════════════════════════════════════════════════
 # FILTER CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
-# Change these values to adjust the active filters.
+# Global settings apply to all tickers.
+# Per-ticker overrides are in TICKER_RULES below.
 # ═════════════════════════════════════════════════════════════════════════════
 
-# Regimes to skip entirely — no trades taken on these days.
+# Regimes to skip entirely — no trades taken on these days (all tickers).
 SKIP_REGIMES = {"LOW_VOL_CHOP", "BEAR_TREND"}
 
 # Stop loss buffer: how far past stop_level price must move to trigger exit.
 # 0.005 = 0.5%. Set to 0.0 to exit exactly at the stop with no buffer.
 STOP_BUFFER_PCT = 0.005
 
-# ── Trade combo rules ──────────────────────────────────────────────────────
-# Only trades matching one of these combos are taken.
-# Anything not matching is force-closed immediately after entry.
+# ── Per-ticker rule sets ────────────────────────────────────────────────────
+# Each ticker has its own combo rules derived from backtest analysis.
+# The combo gate loads the rule set for the current ticker automatically.
+# "DEFAULT" is used for any ticker not explicitly listed.
 #
-# Score 5 trades fire if ANY of these conditions is true:
-#   - Regime is HIGH_VOL_TREND
-#   - GEX sign is positive
-#   - Prior day context is GAP_UP
-#   - Time phase is POWER_HOUR
-#
-# Score 4 trades fire ONLY on: intraday_support (sharp move origin)
-#
-# BLOCKED levels (never trade, any score):
-#   - intraday_support (rejection zone)
-#
-# Unlocks added after analysis of rejected trades:
-#   Unlock 1: S4 + daily_support (60% win, +1.48 pts on 5 trades)
-#   Unlock 2: S4 + resistance RZ — but ONLY when GEX+ (100% win, 2 trades)
-#   Unlock 3: S5 + BULL_TREND + GEX- + AFTERNOON (75% win, 4 trades)
+# Rule set keys:
+#   skip_sessions     : set of time_phase values — no new trades in these sessions
+#   blocked_levels    : set of level_name values — never trade these (any score)
+#   blocked_short_conditions : list of condition dicts — block SHORT if all match
+#   blocked_long_conditions  : list of condition dicts — block LONG if all match
+#   score5_conditions : list of condition dicts — S5 allowed if ANY matches
+#   score4_levels     : set of level_name values — S4 allowed only on these levels
+#   score4_extra      : list of condition dicts — additional S4 passes
 
-BLOCKED_LEVEL_NAMES = {
-    "intraday_support (rejection zone)",
+TICKER_RULES = {
+
+    # ── SPY ────────────────────────────────────────────────────────────────
+    # Tuned over 125 days. 81% win rate, +24.58 pts on 42 real trades.
+    # Both directions work equally. All sessions except OPEN are tradeable.
+    "SPY": {
+        "skip_sessions": {"OPEN"},
+        "blocked_levels": {
+            "intraday_support (rejection zone)",
+        },
+        "score5_conditions": [
+            {"regime": "HIGH_VOL_TREND"},
+            {"gex_sign": "positive"},
+            {"prior_day_context": "GAP_UP"},
+            {"time_phase": "POWER_HOUR"},
+            {"regime": "BULL_TREND", "gex_sign": "negative", "time_phase": "AFTERNOON"},
+        ],
+        "score4_levels": {
+            "intraday_support (sharp move origin)",
+            "daily_support",
+        },
+        "score4_extra": [
+            {"level": "intraday_resistance (rejection zone)", "gex_sign": "positive"},
+        ],
+        "direction_block": [],  # both directions allowed
+    },
+
+    # ── QQQ ────────────────────────────────────────────────────────────────
+    # Key finding: LONG + Aft/Mid is the killer (37 trades, 27% win, -12.28 pts)
+    # Strongest clusters:
+    #   FAILED + GEX+ + GAP_DOWN: 23 trades, 65% win, +10.26 pts
+    #   SHORT + GEX+ + GAP_DOWN: 13 trades, 77% win, +7.15 pts
+    #   SHORT + PH + resistance RZ: 6 trades, 83% win, +2.99 pts
+    #   S5 + Morning/PH: 29 trades, 62% win, +8.56 pts
+    "QQQ": {
+        "skip_sessions": {"OPEN"},
+        "blocked_levels": {
+            "intraday_support (rejection zone)",
+            "daily_support",          # 33% win on QQQ, -0.72 pts
+        },
+        "score5_conditions": [
+            # GEX+ + GAP_DOWN is the top cluster — allow all S5 in this combo
+            {"gex_sign": "positive", "prior_day_context": "GAP_DOWN"},
+            # Morning and Power Hour work regardless of other conditions
+            {"time_phase": "MORNING"},
+            {"time_phase": "POWER_HOUR"},
+            # HVT + GEX+ (partial overlap but verified positive)
+            {"regime": "HIGH_VOL_TREND", "gex_sign": "positive"},
+        ],
+        "score4_levels": {
+            "intraday_support (sharp move origin)",  # only on GAP_DOWN days (see score4_extra)
+        },
+        "score4_extra": [
+            # S4 SMO support allowed on GAP_DOWN + GEX+ specifically
+            {"level": "intraday_support (sharp move origin)",
+             "gex_sign": "positive", "prior_day_context": "GAP_DOWN"},
+        ],
+        "direction_block": [
+            # Block LONG in Afternoon and Midday — 27% win, -12.28 pts
+            {"direction": "LONG", "time_phase": "AFTERNOON"},
+            {"direction": "LONG", "time_phase": "MIDDAY"},
+            # Block LONG with GEX- — 29% win, -8.01 pts
+            {"direction": "LONG", "gex_sign": "negative"},
+        ],
+    },
+
+    # ── GLD ────────────────────────────────────────────────────────────────
+    # Key finding: GEX- shorts are broken (31% win, -6.64 pts)
+    #              Morning is worst session (33% win)
+    #              GAP_UP days are a trap (-8.68 pts on 90 trades)
+    # Winning: SHORT + GEX+ across all sessions, LONG + GEX+ + non-GAP_UP
+    "GLD": {
+        "skip_sessions": {"MORNING", "OPEN"},
+        "blocked_levels": {
+            "intraday_support (rejection zone)",
+        },
+        "score5_conditions": [
+            # SHORT bias: GEX+ enables shorts (dealer pinning = clean resistance fades)
+            {"gex_sign": "positive"},
+            # LONG with NORMAL gap + GEX+ works
+            {"gex_sign": "positive", "prior_day_context": "NORMAL"},
+            # Afternoon specifically strong for S5
+            {"time_phase": "AFTERNOON"},
+        ],
+        "score4_levels": {
+            "intraday_support (sharp move origin)",
+            "daily_support",
+        },
+        "score4_extra": [],
+        "direction_block": [
+            # Never short GLD with GEX- — 31% win, -6.64 pts
+            {"direction": "SHORT", "gex_sign": "negative"},
+            # Never long GLD on GAP_UP days — -8.68 pts
+            {"direction": "LONG", "prior_day_context": "GAP_UP"},
+        ],
+    },
+
+    # ── SLV ────────────────────────────────────────────────────────────────
+    # Key findings: SMO resistance is broken (32% win, -1.81 pts)
+    #               Morning is weak, tiny move size requires patience
+    #               GAP_UP + S4 works, Mid/Aft/Close sessions are positive
+    "SLV": {
+        "skip_sessions": {"MORNING", "OPEN"},
+        "blocked_levels": {
+            "intraday_support (rejection zone)",
+            "intraday_resistance (sharp move origin)",  # 32% win, -1.81 pts
+        },
+        "score5_conditions": [
+            {"time_phase": "MIDDAY"},
+            {"time_phase": "AFTERNOON"},
+            {"time_phase": "CLOSE"},
+            {"prior_day_context": "GAP_UP"},
+        ],
+        "score4_levels": {
+            "intraday_support (sharp move origin)",
+            "daily_support",
+            "intraday_resistance (rejection zone)",  # works on SLV when in Aft/Mid
+        },
+        "score4_extra": [
+            # GAP_UP + S4 is the strongest SLV cluster
+            {"prior_day_context": "GAP_UP"},
+        ],
+        "direction_block": [
+            # Weak short side — block SHORT with GEX- specifically
+            {"direction": "SHORT", "gex_sign": "negative", "time_phase": "MORNING"},
+        ],
+    },
+
+    # ── DEFAULT (any unrecognised ticker) ───────────────────────────────────
+    # Conservative SPY-like rules as a safe starting point.
+    "DEFAULT": {
+        "skip_sessions": {"OPEN"},
+        "blocked_levels": {
+            "intraday_support (rejection zone)",
+        },
+        "score5_conditions": [
+            {"regime": "HIGH_VOL_TREND"},
+            {"gex_sign": "positive"},
+            {"time_phase": "POWER_HOUR"},
+        ],
+        "score4_levels": {
+            "intraday_support (sharp move origin)",
+        },
+        "score4_extra": [],
+        "direction_block": [],
+    },
 }
-
-SCORE4_ALLOWED_LEVELS = {
-    "intraday_support (sharp move origin)",
-    "daily_support",                          # Unlock 1: 60% win, avg winner +1.08
-}
-
-# Unlock 2: S4 resistance rejection zone is only allowed when GEX is positive
-# (dealer pinning makes the fade more reliable). HVT without GEX+ stays blocked.
-SCORE4_RESISTANCE_RZ_REQUIRES_GEX_POSITIVE = True
 
 
 
@@ -559,54 +689,69 @@ class ResultsRecorder:
 # or immediately close it. Uses the rules defined in FILTER CONFIGURATION.
 # ═════════════════════════════════════════════════════════════════════════════
 
-def _trade_passes_combo(trade, session_meta: dict, time_phase: str) -> tuple:
+def _condition_matches(cond: dict, trade, session_meta: dict, time_phase: str) -> bool:
+    """Check if a single condition dict matches the current trade context."""
+    level  = trade.level_name or ""
+    regime = session_meta.get("regime", "")
+    gex    = session_meta.get("gex_sign", "")
+    ctx    = session_meta.get("prior_day_context", "")
+    dirn   = trade.direction or ""
+
+    checks = {
+        "regime":           regime,
+        "gex_sign":         gex,
+        "prior_day_context": ctx,
+        "time_phase":       time_phase,
+        "level":            level,
+        "direction":        dirn,
+    }
+    return all(checks.get(k) == v for k, v in cond.items())
+
+
+def _trade_passes_combo(trade, session_meta: dict, time_phase: str,
+                        ticker: str = "SPY") -> tuple:
     """
+    Per-ticker combo gate. Loads rules from TICKER_RULES[ticker] (or DEFAULT).
     Returns (allowed: bool, reason: str).
-
-    Score 5 — allowed if ANY of:
-        regime == HIGH_VOL_TREND
-        gex_sign == positive
-        prior_day_context == GAP_UP
-        time_phase == POWER_HOUR
-        [Unlock 3] regime == BULL_TREND AND gex == negative AND time_phase == AFTERNOON
-
-    Score 4 — allowed if:
-        level_name in SCORE4_ALLOWED_LEVELS  (SMO support, daily_support)
-        [Unlock 2] level == resistance RZ AND gex == positive
-
-    All scores — blocked if:
-        level_name in BLOCKED_LEVEL_NAMES
     """
-    score   = trade.setup_score
-    level   = trade.level_name or ""
-    regime  = session_meta.get("regime", "")
-    gex     = session_meta.get("gex_sign", "")
-    ctx     = session_meta.get("prior_day_context", "")
+    rules = TICKER_RULES.get(ticker.upper(), TICKER_RULES["DEFAULT"])
 
-    # Hard block — never trade this level regardless of score or conditions
-    if level in BLOCKED_LEVEL_NAMES:
-        return False, f"blocked_level: {level}"
+    score = trade.setup_score
+    level = trade.level_name or ""
+    gex   = session_meta.get("gex_sign", "")
 
+    # ── Session gate ────────────────────────────────────────────────────────
+    if time_phase in rules.get("skip_sessions", set()):
+        return False, f"skip_session:{time_phase}"
+
+    # ── Hard blocked levels ─────────────────────────────────────────────────
+    if level in rules.get("blocked_levels", set()):
+        return False, f"blocked_level:{level}"
+
+    # ── Direction blocks ────────────────────────────────────────────────────
+    for cond in rules.get("direction_block", []):
+        if _condition_matches(cond, trade, session_meta, time_phase):
+            return False, f"direction_block:{cond}"
+
+    # ── Score 5 logic ───────────────────────────────────────────────────────
     if score == 5:
-        if regime == "HIGH_VOL_TREND":                          return True, "S5+HVT"
-        if gex    == "positive":                                return True, "S5+GEX+"
-        if ctx    == "GAP_UP":                                  return True, "S5+GAP_UP"
-        if time_phase == "POWER_HOUR":                          return True, "S5+POWER_HOUR"
-        # Unlock 3: BULL_TREND + GEX- works in Afternoon specifically
-        if (regime == "BULL_TREND"
-                and gex == "negative"
-                and time_phase == "AFTERNOON"):                 return True, "S5+BULL_GEX-_AFT"
+        for cond in rules.get("score5_conditions", []):
+            if _condition_matches(cond, trade, session_meta, time_phase):
+                label = "+".join(f"{k}={v}" for k, v in cond.items())
+                return True, f"S5+{label}"
         return False, "S5_no_qualifying_combo"
 
+    # ── Score 4 logic ───────────────────────────────────────────────────────
     if score == 4:
-        # Standard allowed levels (SMO support + daily support)
-        if level in SCORE4_ALLOWED_LEVELS:
-            return True, f"S4+{level}"
-        # Unlock 2: resistance rejection zone — only when GEX+ (dealer pinning)
-        if (level == "intraday_resistance (rejection zone)"
-                and gex == "positive"):
-            return True, "S4+RES_RZ+GEX+"
-        return False, f"S4_level_not_allowed: {level}"
+        # Standard level match
+        if level in rules.get("score4_levels", set()):
+            return True, f"S4+level:{level}"
+        # Extra condition-based passes
+        for cond in rules.get("score4_extra", []):
+            if _condition_matches(cond, trade, session_meta, time_phase):
+                label = "+".join(f"{k}={v}" for k, v in cond.items())
+                return True, f"S4+extra:{label}"
+        return False, f"S4_not_allowed:{level}"
 
     return False, f"score_{score}_not_in_rules"
 
@@ -632,7 +777,7 @@ def apply_combo_gate(
     for trade in state.active_trades:
         if trade.status in ("CLOSED", "INVALIDATED"):
             continue
-        allowed, reason = _trade_passes_combo(trade, session_meta, time_phase)
+        allowed, reason = _trade_passes_combo(trade, session_meta, time_phase, ticker=ticker)
         if not allowed:
             engine.close_trade(
                 ticker,
@@ -796,6 +941,10 @@ def run_backtest(ticker: str, csv_path: str, output_dir: str, skip_days: int = 1
             time_phase = _patched_get_time_phase_ct()["phase"]
 
             if time_phase in ("PRE_MARKET", "AFTER_HOURS"):
+                continue
+            # Per-ticker session gate (e.g. skip MORNING for GLD/SLV, OPEN for all)
+            ticker_rules = TICKER_RULES.get(ticker.upper(), TICKER_RULES["DEFAULT"])
+            if time_phase in ticker_rules.get("skip_sessions", set()):
                 continue
 
             # ── Filter 2: Enforce mechanical stop loss ───────────────────────
