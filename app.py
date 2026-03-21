@@ -4945,7 +4945,8 @@ def _post_em_card(ticker: str, session: str):
             _te = get_thesis_engine()
             _thesis_obj = _te.get_thesis(ticker)
             if _thesis_obj:
-                # Run an initial evaluate so the engine has a starting point
+                # Seed first price into fresh state — intentional, this is thesis creation
+                # NOT a read-only guidance call. Without this, build_guidance has no price_history.
                 _te.evaluate(ticker, spot)
                 guidance = _te.build_guidance(ticker, spot)
                 g_lines = [f"📡 {ticker} — ACTION GUIDE @ ${spot:.2f}", ""]
