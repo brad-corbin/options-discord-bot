@@ -162,13 +162,13 @@ def make_dict_store():
 
 # Regimes to skip entirely — no trades taken on these days.
 # Based on backtest data: LOW_VOL_CHOP days consistently lose money.
-SKIP_REGIMES = {"LOW_VOL_CHOP"}
+SKIP_REGIMES = {"LOW_VOL_CHOP", "BEAR_TREND"}
 
 # Stop loss buffer: how far past the stop_level price must move to trigger exit.
 # 0.005 = 0.5%. A LONG exits when price <= stop_level * (1 - 0.005).
 # Set to 0.0 to exit exactly at the stop_level with no buffer.
-STOP_BUFFER_PCT = 0.01
-SKIP_PHASE = ("MIDDAY")
+STOP_BUFFER_PCT = 0.00
+
 
 
 
