@@ -1,21 +1,22 @@
 # .github/workflows/backtest.yml
 # ─────────────────────────────────────────────────────────────────────────────
 # Backtest Runner — runs on GitHub's free servers.
-# No terminal needed. No Render changes needed. Your live bot is unaffected.
 #
 # HOW TO RUN:
-#   1. Go to your GitHub repo
-#   2. Click the "Actions" tab
-#   3. Click "Backtest Runner" in the left sidebar
-#   4. Click "Run workflow" (top right of the list)
-#   5. Fill in the inputs (or leave defaults for SPY / 20 days)
-#   6. Click the green "Run workflow" button
-#   7. Wait ~2-3 minutes
-#   8. Click the completed run → scroll down → "Artifacts" → download "backtest-results"
+#   1. GitHub repo → Actions tab → "Backtest Runner" → "Run workflow"
+#   2. Fill in the inputs (see below)
+#   3. Click the green "Run workflow" button
+#   4. Wait ~2-4 minutes
+#   5. Click the completed run → scroll to "Artifacts" → download results
 #
-# REQUIREMENTS:
-#   - MARKETDATA_TOKEN must be added as a GitHub Secret
-#     (Settings → Secrets and variables → Actions → New repository secret)
+# DATE RANGE MODE:
+#   Leave "From date" and "To date" blank → downloads the most recent 22 days
+#   Fill in "From date" (and optionally "To date") → downloads that specific window
+#
+# Examples:
+#   Ticker=SPY, Days=22, From=blank, To=blank   → last 22 trading days
+#   Ticker=SPY, From=2025-10-01, To=2025-11-30  → specific window
+#   Ticker=QQQ, From=2025-06-01, To=2025-07-31  → QQQ summer 2025
 # ─────────────────────────────────────────────────────────────────────────────
 
 name: Backtest Runner
@@ -24,63 +25,79 @@ on:
   workflow_dispatch:
     inputs:
       ticker:
-        description: 'Ticker to backtest (e.g. SPY, QQQ, AAPL)'
+        description: 'Ticker (e.g. SPY, QQQ, AAPL)'
         required: true
         default: 'SPY'
       days:
-        description: 'Number of trading days to download (e.g. 20)'
-        required: true
-        default: '20'
+        description: 'Trading days to fetch (used only when From/To are blank)'
+        required: false
+        default: '22'
+      from_date:
+        description: 'From date YYYY-MM-DD (leave blank for most-recent mode)'
+        required: false
+        default: ''
+      to_date:
+        description: 'To date YYYY-MM-DD (leave blank = today, only used with From date)'
+        required: false
+        default: ''
 
 jobs:
   backtest:
     runs-on: ubuntu-latest
 
     steps:
-      # ── 1. Check out your code ──────────────────────────────────────────────
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # ── 2. Set up Python ────────────────────────────────────────────────────
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      # ── 3. Install dependencies ─────────────────────────────────────────────
-      # Install your bot's requirements plus pandas (used by download_bars)
       - name: Install dependencies
         run: |
           pip install --upgrade pip
           pip install requests pandas pytz
-          # Install your bot's own requirements too
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      # ── 4. Download historical bars ─────────────────────────────────────────
-      - name: Download historical bars from MarketData
+      - name: Download historical bars
         env:
           MARKETDATA_TOKEN: ${{ secrets.MARKETDATA_TOKEN }}
         run: |
-          python backtest/download_bars.py \
-            --ticker ${{ github.event.inputs.ticker }} \
-            --days ${{ github.event.inputs.days }}
+          if [ -n "${{ github.event.inputs.from_date }}" ]; then
+            # Date range mode
+            TO_ARG=""
+            if [ -n "${{ github.event.inputs.to_date }}" ]; then
+              TO_ARG="--to ${{ github.event.inputs.to_date }}"
+            fi
+            python backtest/download_bars.py \
+              --ticker ${{ github.event.inputs.ticker }} \
+              --from ${{ github.event.inputs.from_date }} \
+              $TO_ARG
+          else
+            # Countback mode (most recent N days)
+            python backtest/download_bars.py \
+              --ticker ${{ github.event.inputs.ticker }} \
+              --days ${{ github.event.inputs.days }}
+          fi
 
-      # ── 5. Run the backtest replay ───────────────────────────────────────────
       - name: Run backtest replay
         env:
           MARKETDATA_TOKEN: ${{ secrets.MARKETDATA_TOKEN }}
         run: |
+          # Find whichever CSV was just downloaded
+          DATA_FILE=$(ls backtest/data/*.csv | head -1)
+          echo "Using data file: $DATA_FILE"
           python backtest/backtest_replay.py \
-            --ticker ${{ github.event.inputs.ticker }}
+            --ticker ${{ github.event.inputs.ticker }} \
+            --data "$DATA_FILE"
 
-      # ── 6. Upload results so you can download them ───────────────────────────
-      # After the run, click the completed job → scroll to "Artifacts" → download
-      - name: Upload backtest results
+      - name: Upload results
         uses: actions/upload-artifact@v4
-        if: always()   # upload even if the backtest had errors
+        if: always()
         with:
           name: backtest-results-${{ github.event.inputs.ticker }}-${{ github.run_number }}
           path: |
             backtest/results/
             backtest/data/
-          retention-days: 30   # keep results for 30 days
+          retention-days: 30
