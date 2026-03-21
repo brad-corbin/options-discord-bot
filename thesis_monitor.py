@@ -32,7 +32,7 @@ INTRADAY_CONSOLIDATION_RANGE_PCT = 0.06
 # ── Exit Monitor Constants ──
 EXIT_INVALIDATE_BUFFER_PCT = 0.06     # price must reclaim past stop by this % to invalidate
 EXIT_MOMENTUM_FADE_LOOKBACK = 4       # polls to check momentum against position
-EXIT_SCALE_PROXIMITY_PCT = 0.08       # how close to target = "reached"
+EXIT_SCALE_PROXIMITY_PCT = 0.08       # 0.08% — how close to target counts as "reached"
 EXIT_TRAIL_ACCELERATION_MULT = 1.8    # momentum must be 1.8x avg to trail
 EXIT_EXHAUSTION_DECEL_MULT = 0.4      # momentum below 0.4x avg after scaling = exhaustion
 EXIT_MAX_TRADE_AGE_SEC = 14400        # 4 hours — auto-expire stale trades
@@ -288,6 +288,17 @@ class ThesisMonitorEngine:
             state.check_count += 1
             events.extend(self._evaluate_momentum(state, price))
             events.extend(IntradayLevelTracker.update(state, price, now))
+            # Prior-day gap context — fire once early in session
+            if state.check_count <= 3 and thesis.prior_day_context in ("GAP_UP", "GAP_DOWN") and not state.prior_day_applied:
+                state.prior_day_applied = True
+                if thesis.prior_day_context == "GAP_UP" and thesis.gex_sign == "positive":
+                    events.append({"msg": "📊 GAP UP into GEX+ — fade probability HIGH. Watch for failed breakout.", "type": "info", "priority": 3, "alert_key": "gap_up_ctx"})
+                elif thesis.prior_day_context == "GAP_DOWN" and thesis.gex_sign == "negative":
+                    events.append({"msg": "📊 GAP DOWN into GEX- — trend can extend. Respect the gap.", "type": "info", "priority": 3, "alert_key": "gap_dn_ctx"})
+                elif thesis.prior_day_context == "GAP_UP" and thesis.gex_sign == "negative":
+                    events.append({"msg": "📊 GAP UP into GEX- — breakout can accelerate. Trail tight if fading.", "type": "info", "priority": 3, "alert_key": "gap_up_neg_ctx"})
+                elif thesis.prior_day_context == "GAP_DOWN" and thesis.gex_sign == "positive":
+                    events.append({"msg": "📊 GAP DOWN into GEX+ — bounce probability HIGH. Watch for failed breakdown.", "type": "info", "priority": 3, "alert_key": "gap_dn_pos_ctx"})
             for ba in state.break_attempts:
                 if not ba.detected_as_failed and not ba.detected_as_confirmed and (now - ba.break_time) <= MONITOR_MAX_BREAK_AGE_SEC:
                     ba.candles_since += 1
@@ -353,12 +364,6 @@ class ThesisMonitorEngine:
         """Create an ActiveTrade from a clean entry signal."""
         ak = event.get("alert_key", "")
         msg = event.get("msg", "")
-        # Don't double-create — check for existing OPEN trade at similar level
-        for t in state.active_trades:
-            if t.status in ("OPEN", "SCALED", "TRAILED") and t.direction == ("SHORT" if "short" in ak.lower() else "LONG"):
-                if abs(t.entry_price - price) / price < 0.005:
-                    log.info(f"Trade already open for {ticker} near ${price:.2f}, skipping")
-                    return
         # Parse direction and entry_type from alert_key
         if "conf_short" in ak or "fbo_now" in ak or "rt_short" in ak or "rt_fs" in ak:
             direction = "SHORT"
@@ -375,6 +380,20 @@ class ThesisMonitorEngine:
             entry_type = "RETEST"
         else:
             entry_type = "BREAK"
+        # Don't double-create — block if open trade at same direction+type or same-level proximity
+        for t in state.active_trades:
+            if t.status not in ("OPEN", "SCALED", "TRAILED"):
+                continue
+            if t.direction != direction:
+                continue
+            # Same direction + same entry type = definite duplicate
+            if t.entry_type == entry_type:
+                log.info(f"Trade already open for {ticker} {direction} {entry_type}, skipping")
+                return
+            # Same direction + near same price = likely duplicate from different signal type
+            if abs(t.entry_price - price) / price < 0.005:
+                log.info(f"Trade already open for {ticker} {direction} near ${price:.2f}, skipping")
+                return
         # Find the stop level — extract from the break attempt
         stop = 0.0
         level_name = ""
@@ -446,8 +465,8 @@ class ThesisMonitorEngine:
 
     def _exit_alert_ok(self, trade, key, now):
         """Check and set cooldown for exit alerts."""
-        last = trade.exit_alert_history.get(key, 0)
-        if (now - last) < EXIT_ALERT_COOLDOWN_SEC:
+        last = trade.exit_alert_history.get(key)
+        if last is not None and (now - last) < EXIT_ALERT_COOLDOWN_SEC:
             return False
         trade.exit_alert_history[key] = now
         return True
@@ -503,8 +522,8 @@ class ThesisMonitorEngine:
         if trade.status != "OPEN" or not trade.targets:
             return events
         first_target = trade.targets[0]
-        prox = abs(price - first_target) / first_target * 100
-        if prox > EXIT_SCALE_PROXIMITY_PCT * 100:
+        prox_pct = abs(price - first_target) / first_target * 100
+        if prox_pct > EXIT_SCALE_PROXIMITY_PCT:
             return events
         # Target reached
         if trade.direction == "LONG" and price < first_target:
@@ -617,8 +636,8 @@ class ThesisMonitorEngine:
         events = []
         if trade.status not in ("SCALED", "TRAILED"):
             return events  # only exit after scaling or trailing
-        # Check if second target reached
-        remaining = trade.targets[1:] if len(trade.targets) > 1 else trade.targets
+        # Check if second (or later) target reached — targets[0] was the scale target
+        remaining = trade.targets[1:]
         second_hit = False
         for tgt in remaining:
             if trade.direction == "LONG" and price >= tgt:
@@ -632,12 +651,12 @@ class ThesisMonitorEngine:
             diffs = [recent[i] - recent[i-1] for i in range(1, len(recent))]
             avg_d = sum(diffs) / len(diffs)
             last_d = diffs[-1]
-            if trade.direction == "LONG" and trade.max_favorable > price * 0.003:
+            if trade.direction == "LONG" and trade.max_favorable > trade.entry_price * 0.003:
                 if avg_d > 0 and abs(last_d) < abs(avg_d) * EXIT_EXHAUSTION_DECEL_MULT:
                     exhausted = True
                 elif last_d < 0:
                     exhausted = True
-            elif trade.direction == "SHORT" and trade.max_favorable > price * 0.003:
+            elif trade.direction == "SHORT" and trade.max_favorable > trade.entry_price * 0.003:
                 if avg_d < 0 and abs(last_d) < abs(avg_d) * EXIT_EXHAUSTION_DECEL_MULT:
                     exhausted = True
                 elif last_d > 0:
@@ -814,9 +833,9 @@ class ThesisMonitorEngine:
         if lvl.gamma_flip is not None:
             if price > lvl.gamma_flip: g.append({"text": f"ABOVE gamma flip ${lvl.gamma_flip:.2f} — bullish. Dealers buy dips.", "type": "bullish"})
             else: g.append({"text": f"BELOW gamma flip ${lvl.gamma_flip:.2f} — bearish/trending. Breakdowns accelerate.", "type": "bearish"})
-        if lvl.pin_zone_low and lvl.pin_zone_high and lvl.pin_zone_low <= price <= lvl.pin_zone_high and thesis.gex_sign == "positive":
+        if lvl.pin_zone_low is not None and lvl.pin_zone_high is not None and lvl.pin_zone_low <= price <= lvl.pin_zone_high and thesis.gex_sign == "positive":
             g.append({"text": f"INSIDE PIN ZONE ${lvl.pin_zone_low:.2f}-${lvl.pin_zone_high:.2f} with GEX+. Trade failures, not breakouts.", "type": "warning"})
-        if lvl.micro_trigger_up and lvl.micro_trigger_down:
+        if lvl.micro_trigger_up is not None and lvl.micro_trigger_down is not None:
             if lvl.micro_trigger_down < price < lvl.micro_trigger_up:
                 g.append({"text": f"NO-MAN'S LAND ${lvl.micro_trigger_down:.2f}-${lvl.micro_trigger_up:.2f}. Wait for trigger.", "type": "neutral"})
         mm = {"ACCELERATING_UP": ("Momentum ACCELERATING UP — trail stops.", "bullish"), "ACCELERATING_DOWN": ("Momentum ACCELERATING DOWN — don't catch knife.", "bearish"), "LOSING_UPSIDE_MOMENTUM": ("Upside momentum fading. Tighten if long.", "warning"), "LOSING_DOWNSIDE_MOMENTUM": ("Downside momentum fading. Tighten if short.", "warning"), "STALLING": ("Price STALLING — traps happen here.", "neutral")}
@@ -893,15 +912,29 @@ class ThesisMonitorEngine:
         for il in state.intraday_levels:
             if not il.active: continue
             if any(abs(il.price - d) <= tol for d, _, _ in wl): continue
+            # Suppress session extremes during confirmed trends
             if il.source == "session_low" and state.active_trend_direction == "SHORT": continue
             if il.source == "session_high" and state.active_trend_direction == "LONG": continue
+            # Suppress fresh session extremes — a level just set at current edge
+            # is not meaningful S/R yet. Require it to have held for 3+ polls.
+            if il.source in ("session_low", "session_high"):
+                age_polls = sum(1 for p in state.price_history if p.get("ts_mono", 0) >= il.first_seen_ts)
+                if age_polls < 3: continue
+            # Suppress session extremes during consistent directional momentum
+            if il.source == "session_low" and state.momentum in ("ACCELERATING_DOWN", "DRIFTING_DOWN"): continue
+            if il.source == "session_high" and state.momentum in ("ACCELERATING_UP", "DRIFTING_UP"): continue
             wl.append((il.price, f"intraday_{il.kind} ({il.source.replace('_',' ')})", il.kind == "support"))
         for level, name, is_sup in wl:
             if is_sup and prev_price >= level and price < level:
+                # Skip if a pending break already exists at this level+direction
+                if any(abs(ba.level - level) <= tol and ba.direction == "DOWN" and not ba.detected_as_failed and not ba.detected_as_confirmed for ba in state.break_attempts):
+                    continue
                 state.break_attempts.append(BreakAttempt(level=level, level_name=name, direction="DOWN", break_price=price, break_time=now))
                 state.status = "BREAK_IN_PROGRESS"
                 events.append({"msg": f"🔻 BREAK ATTEMPT: below ${level:.2f} ({name}). Watching follow-through or reclaim.", "type": "alert", "priority": 4, "alert_key": f"brk_dn_{name}_{level:.2f}"})
             elif not is_sup and prev_price <= level and price > level:
+                if any(abs(ba.level - level) <= tol and ba.direction == "UP" and not ba.detected_as_failed and not ba.detected_as_confirmed for ba in state.break_attempts):
+                    continue
                 state.break_attempts.append(BreakAttempt(level=level, level_name=name, direction="UP", break_price=price, break_time=now))
                 state.status = "BREAK_IN_PROGRESS"
                 events.append({"msg": f"🔺 BREAK ATTEMPT: above ${level:.2f} ({name}). Watching follow-through or failure.", "type": "alert", "priority": 4, "alert_key": f"brk_up_{name}_{level:.2f}"})
@@ -912,7 +945,7 @@ class ThesisMonitorEngine:
         for ba in state.break_attempts:
             if ba.detected_as_failed or ba.detected_as_confirmed: continue
             if (now - ba.break_time) > MONITOR_MAX_BREAK_AGE_SEC: continue
-            req = 2 if tp["phase"] in ("MORNING", "AFTERNOON") else 3
+            req = 2 if tp["phase"] in ("OPEN", "MORNING", "AFTERNOON") else 3
             if ba.candles_since < req: continue
             buf = ba.level * (MONITOR_CONFIRM_BUFFER_PCT / 100); net = self._recent_net_move(state, 3)
             if ba.direction == "DOWN":
@@ -985,6 +1018,11 @@ class ThesisMonitorEngine:
             if (now - ba.break_time) > MONITOR_MAX_BREAK_AGE_SEC: continue
             tol = ba.level * (MONITOR_RETEST_TOLERANCE_PCT / 100)
             if abs(price - ba.level) > tol: continue
+            # Side-of-level validation: price must be on correct side for the retest type
+            if ba.detected_as_confirmed and ba.direction == "DOWN" and price > ba.level: continue  # short retest must be at/below
+            if ba.detected_as_confirmed and ba.direction == "UP" and price < ba.level: continue    # long retest must be at/above
+            if ba.detected_as_failed and ba.direction == "DOWN" and price < ba.level: continue     # squeeze retest must be at/above
+            if ba.detected_as_failed and ba.direction == "UP" and price > ba.level: continue       # fade retest must be at/below
             if ba.detected_as_confirmed and ba.direction == "DOWN" and net < -(ba.level * 0.0008):
                 ba.retest_fired = True; tt = "💰 Naked puts" if thesis.gex_sign == "negative" else "💰 Put debit spread"
                 events.append({"msg": f"🎯 RETEST SHORT ENTRY\n\nBreakdown retested ${ba.level:.2f} and rejecting.\n\nENTRY: short / puts\nSTOP: above ${ba.level:.2f}\n{tt}", "type": "critical", "priority": 5, "alert_key": f"rt_short_{ba.level:.2f}"})
@@ -1011,8 +1049,8 @@ class ThesisMonitorEngine:
     def _apply_cooldowns(self, state, events, now):
         out = []
         for e in events:
-            k = e.get("alert_key", e.get("msg", "")[:40]); last = state.alert_history.get(k, 0)
-            if (now - last) >= MONITOR_ALERT_COOLDOWN_SEC: state.alert_history[k] = now; out.append(e)
+            k = e.get("alert_key", e.get("msg", "")[:40]); last = state.alert_history.get(k)
+            if last is None or (now - last) >= MONITOR_ALERT_COOLDOWN_SEC: state.alert_history[k] = now; out.append(e)
         return out
 
     def format_status(self, ticker):
@@ -1022,7 +1060,7 @@ class ThesisMonitorEngine:
         lines = [f"📡 {ticker} MONITOR", f"Status: {state.status if state else 'INACTIVE'}", f"Bias: {thesis.bias} ({thesis.bias_score:+d}/14)", f"GEX: {thesis.gex_sign} ({thesis.gex_value:+.1f}M) | {thesis.regime}", f"Price: ${p:.2f}"]
         if state:
             lines.append(f"Momentum: {state.momentum}"); lines.append(f"Checks: {state.check_count}")
-            if state.session_high and state.session_low: lines.append(f"Session: ${state.session_low:.2f}-${state.session_high:.2f}")
+            if state.session_high is not None and state.session_low is not None: lines.append(f"Session: ${state.session_low:.2f}-${state.session_high:.2f}")
             al = [l for l in state.intraday_levels if l.active]
             if al: lines.append(f"Levels: {sum(1 for l in al if l.kind=='support')}S / {sum(1 for l in al if l.kind=='resistance')}R")
             if state.confirmed_breaks: lines.append(f"Confirmed: {len(state.confirmed_breaks)}")
