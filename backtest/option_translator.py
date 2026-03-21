@@ -1,29 +1,27 @@
 # backtest/option_translator.py
 # ─────────────────────────────────────────────────────────────────────────────
-# Phase 2: Options P&L layer for the backtest.
+# Options P&L layer for the SPY backtest.
 #
-# Reads the trades.csv produced by backtest_replay.py and adds real options
-# pricing from MarketData.app historical quotes API. Outputs a new CSV with
-# actual dollar P&L per contract alongside all original trade data.
+# Strategy:
+#   Naked calls (LONG trades) or puts (SHORT trades)
+#   Strike: int(spot) + 2 for calls, int(spot) - 2 for puts (~$1-2 OTM)
+#   0DTE for Morning/Midday/Afternoon, 1DTE for Power Hour/Close
 #
-# Strategy modeled:
-#   - SPY naked calls (LONG trades) or puts (SHORT trades)
-#   - Strike: int(spot) ± 2  →  ~$1-2 OTM in trade direction
-#     e.g. spot 683.23 LONG  → call at 685
-#          spot 683.56 SHORT → put  at 681
-#   - Expiration:
-#       Sessions before Power Hour (MORNING/MIDDAY/AFTERNOON) → 0DTE
-#       Power Hour / Close → 1DTE (next trading day)
-#   - Entry: option mid price at the entry bar
-#   - Exit:  option mid price at the exit bar
+# Pricing method:
+#   The MarketData historical options API returns one daily quote per date,
+#   not intraday bars. So we use two-point pricing:
+#     Entry premium  = daily quote mid on entry date
+#     Exit premium   = estimated using delta × underlying move
+#                      (entry_premium + delta × underlying_pnl_pts)
+#   This gives a realistic P&L without needing intraday option bars.
+#
+#   For 0DTE trades that hit their stop (loss), we cap exit at $0
+#   (option expired worthless or near-worthless).
 #
 # Usage:
 #   python backtest/option_translator.py
-#   python backtest/option_translator.py --trades backtest/results/trades.csv
 #   python backtest/option_translator.py --contracts 5
-#
-# Output:
-#   backtest/results/trades_with_options.csv
+#   python backtest/option_translator.py --trades backtest/results/trades.csv
 # ─────────────────────────────────────────────────────────────────────────────
 
 import os
@@ -35,446 +33,328 @@ import requests
 from datetime import datetime, timedelta
 from pathlib import Path
 
-# ── Token ─────────────────────────────────────────────────────────────────────
 TOKEN = os.getenv("MARKETDATA_TOKEN", "").strip()
 if not TOKEN:
-    print("ERROR: MARKETDATA_TOKEN environment variable is not set.")
+    print("ERROR: MARKETDATA_TOKEN not set.")
     sys.exit(1)
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# ── Config ─────────────────────────────────────────────────────────────────────
-# Sessions that use 1DTE instead of 0DTE
 ONE_DTE_SESSIONS = {"POWER_HOUR", "CLOSE"}
-
-# Rate limiting — MarketData API has request limits
-API_DELAY_SECONDS = 0.5   # pause between API calls
+API_DELAY        = 0.4   # seconds between calls
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# STRIKE & SYMBOL HELPERS
-# ═════════════════════════════════════════════════════════════════════════════
+# ── Strike & symbol helpers ───────────────────────────────────────────────────
 
 def get_strike(spot: float, direction: str) -> int:
-    """
-    Calculate option strike price.
-
-    Formula: truncate spot to integer, then ±2 in trade direction.
-    This produces ~$1-2 OTM strikes.
-
-    Examples:
-        spot 683.23, LONG  → int(683.23)=683 → 683+2 = 685 (call)
-        spot 683.56, SHORT → int(683.56)=683 → 683-2 = 681 (put)
-    """
     base = int(spot)
     return base + 2 if direction == "LONG" else base - 2
 
 
-def get_expiration_date(trade_date: str, time_phase: str) -> str:
-    """
-    Determine option expiration date.
-
-    0DTE: trade_date itself (sessions before Power Hour)
-    1DTE: next trading day (Power Hour and Close sessions)
-
-    Skips weekends when calculating next trading day.
-    Note: does not account for market holidays — adjust manually if needed.
-    """
+def get_expiry(trade_date: str, time_phase: str) -> str:
     dt = datetime.strptime(trade_date, "%Y-%m-%d")
-
     if time_phase in ONE_DTE_SESSIONS:
-        # Advance to next trading day
-        next_day = dt + timedelta(days=1)
-        while next_day.weekday() >= 5:  # 5=Sat, 6=Sun
-            next_day += timedelta(days=1)
-        return next_day.strftime("%Y-%m-%d")
-    else:
-        return trade_date
+        nxt = dt + timedelta(days=1)
+        while nxt.weekday() >= 5:
+            nxt += timedelta(days=1)
+        return nxt.strftime("%Y-%m-%d")
+    return trade_date
 
 
-def build_occ_symbol(ticker: str, expiry: str, direction: str, strike: int) -> str:
-    """
-    Build OCC-standard option symbol.
-
-    Format: {TICKER}{YYMMDD}{C|P}{8-digit strike (price × 1000, zero-padded)}
-
-    Examples:
-        SPY 0DTE call at 685 expiring 2026-03-20 → SPY260320C00685000
-        SPY 0DTE put  at 681 expiring 2026-03-20 → SPY260320P00681000
-        SPY 1DTE call at 687 expiring 2026-03-23 → SPY260323C00687000
-    """
-    dt = datetime.strptime(expiry, "%Y-%m-%d")
+def build_occ(ticker: str, expiry: str, direction: str, strike: int) -> str:
+    dt       = datetime.strptime(expiry, "%Y-%m-%d")
     date_str = dt.strftime("%y%m%d")
-    cp = "C" if direction == "LONG" else "P"
-    strike_str = f"{int(strike * 1000):08d}"
-    return f"{ticker.upper()}{date_str}{cp}{strike_str}"
+    cp       = "C" if direction == "LONG" else "P"
+    return f"{ticker.upper()}{date_str}{cp}{int(strike * 1000):08d}"
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# MARKETDATA API
-# ═════════════════════════════════════════════════════════════════════════════
+# ── API ───────────────────────────────────────────────────────────────────────
 
-def md_get(url: str, params: dict = None) -> dict:
-    """Make an authenticated GET request to MarketData.app."""
-    headers = {"Authorization": f"Bearer {TOKEN}"}
-    response = requests.get(url, headers=headers, params=params or {}, timeout=15)
-    response.raise_for_status()
-    return response.json()
-
-
-def fetch_option_quote(symbol: str, trade_date: str) -> dict:
-    """
-    Fetch historical option quote for a specific date.
-
-    Returns dict with keys: mid, bid, ask, iv, delta, gamma, theta, vega
-    Returns None if the quote is unavailable (option didn't exist, no data, etc.)
-
-    API endpoint: /v1/options/quotes/{symbol}/?date={YYYY-MM-DD}
-    """
-    url = f"https://api.marketdata.app/v1/options/quotes/{symbol}/"
+def md_get(url: str, params: dict = None) -> dict | None:
     try:
-        data = md_get(url, {"date": trade_date})
-
-        if not isinstance(data, dict) or data.get("s") != "ok":
+        r = requests.get(url,
+                         headers={"Authorization": f"Bearer {TOKEN}"},
+                         params=params or {},
+                         timeout=12)
+        if r.status_code == 404:
             return None
-
-        # Response is columnar: mid=[...], bid=[...], etc.
-        # We want the first (and usually only) data point for the date
-        mid  = data.get("mid",   [None])[0]
-        bid  = data.get("bid",   [None])[0]
-        ask  = data.get("ask",   [None])[0]
-        iv   = data.get("iv",    [None])[0]
-        delta= data.get("delta", [None])[0]
-
-        if mid is None and bid is not None and ask is not None:
-            mid = round((bid + ask) / 2, 4)
-
-        return {
-            "mid":   mid,
-            "bid":   bid,
-            "ask":   ask,
-            "iv":    iv,
-            "delta": delta,
-        }
-
-    except requests.exceptions.HTTPError as e:
-        if e.response.status_code == 404:
-            return None  # Option didn't exist or no data for that date
-        raise
+        r.raise_for_status()
+        return r.json()
     except Exception:
         return None
 
 
-def fetch_option_candles(symbol: str, trade_date: str, resolution: int = 5) -> list:
+def fetch_daily_quote(symbol: str, date: str) -> dict | None:
     """
-    Fetch intraday option candles for a specific date (if available on plan).
-    Returns list of {timestamp, open, high, low, close, volume} dicts, or [].
-
-    This gives better entry/exit precision than daily quotes.
-    Falls back gracefully if candles are not available.
+    Fetch a single-day historical option quote.
+    Returns dict with mid, iv, delta — or None if unavailable.
     """
-    url = f"https://api.marketdata.app/v1/options/candles/{resolution}/{symbol}/"
-    try:
-        data = md_get(url, {"date": trade_date})
-        if not isinstance(data, dict) or data.get("s") != "ok":
-            return []
+    data = md_get(
+        f"https://api.marketdata.app/v1/options/quotes/{symbol}/",
+        {"date": date}
+    )
+    time.sleep(API_DELAY)
 
-        timestamps = data.get("t", [])
-        closes     = data.get("c", [])
-        opens      = data.get("o", [])
+    if not data or data.get("s") != "ok":
+        return None
 
-        candles = []
-        for i in range(len(timestamps)):
-            candles.append({
-                "timestamp": timestamps[i],
-                "close":     float(closes[i]) if i < len(closes) else None,
-                "open":      float(opens[i])  if i < len(opens)  else None,
-            })
-        return candles
+    def first(key):
+        vals = data.get(key, [])
+        return vals[0] if vals else None
 
-    except Exception:
-        return []
+    mid = first("mid")
+    bid = first("bid")
+    ask = first("ask")
+
+    if mid is None and bid is not None and ask is not None:
+        mid = round((float(bid) + float(ask)) / 2, 4)
+
+    if mid is None:
+        return None
+
+    return {
+        "mid":   float(mid),
+        "iv":    float(first("iv"))    if first("iv")    else None,
+        "delta": float(first("delta")) if first("delta") else None,
+    }
 
 
-def get_option_price_at_time(symbol: str, trade_date: str, bar_time_str: str,
-                              fallback_daily: bool = True) -> float | None:
+# ── P&L calculation ───────────────────────────────────────────────────────────
+
+DEFAULT_DELTA = {
+    "LONG":  0.35,   # ~$1-2 OTM call
+    "SHORT": 0.35,   # ~$1-2 OTM put (absolute value)
+}
+
+
+def calc_option_pnl(
+    entry_mid:    float,
+    delta:        float,
+    underlying_pnl_pts: float,
+    direction:    str,
+    dte:          int,
+    close_reason: str,
+) -> float:
     """
-    Get option mid price as close as possible to bar_time_str.
+    Estimate option exit price and P&L.
 
-    Strategy:
-    1. Try intraday candles → find the candle closest to bar_time_str
-    2. Fall back to daily quote (mid) if candles unavailable
+    Method: delta approximation
+        exit_mid ≈ entry_mid + delta × underlying_move
 
-    bar_time_str: "YYYY-MM-DD HH:MM" in Central Time
+    For LONG calls:  underlying_move = +underlying_pnl_pts (price went up)
+    For SHORT puts:  underlying_move = -underlying_pnl_pts (price went down)
+
+    For 0DTE trades that hit a hard stop, we floor the exit price at $0.01
+    (option expired nearly worthless).
     """
-    # Try intraday candles first
-    candles = fetch_option_candles(symbol, trade_date)
-    if candles:
-        # Parse target time as epoch
-        try:
-            from zoneinfo import ZoneInfo
-            target_dt = datetime.strptime(bar_time_str, "%Y-%m-%d %H:%M").replace(
-                tzinfo=ZoneInfo("America/Chicago"))
-        except ImportError:
-            import pytz
-            target_dt = pytz.timezone("America/Chicago").localize(
-                datetime.strptime(bar_time_str, "%Y-%m-%d %H:%M"))
+    # Underlying move in the option's favor
+    if direction == "LONG":
+        underlying_move = underlying_pnl_pts
+    else:
+        # put gains value as spot falls
+        underlying_move = underlying_pnl_pts  # pnl_pts for SHORT = entry - close (positive = good)
 
-        target_epoch = target_dt.timestamp()
-        best_candle = min(candles, key=lambda c: abs(c["timestamp"] - target_epoch))
-        price = best_candle.get("close") or best_candle.get("open")
-        if price:
-            return float(price)
+    exit_mid = entry_mid + delta * underlying_move
 
-    # Fall back to daily quote
-    if fallback_daily:
-        quote = fetch_option_quote(symbol, trade_date)
-        if quote and quote.get("mid"):
-            return float(quote["mid"])
+    # Floor: option can't go below $0
+    exit_mid = max(exit_mid, 0.0)
 
-    return None
+    # 0DTE stopped-out trades: option likely expired near worthless
+    is_hard_stop = "Hard stop" in str(close_reason) or "breached" in str(close_reason)
+    if dte == 0 and is_hard_stop:
+        exit_mid = 0.05  # assume near-zero at expiry after stop
+
+    return round(exit_mid - entry_mid, 4)
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# MAIN TRANSLATOR
-# ═════════════════════════════════════════════════════════════════════════════
+# ── Main translator ───────────────────────────────────────────────────────────
 
 OPTION_FIELDS = [
     "option_symbol",
     "expiry",
     "strike",
     "dte",
-    "entry_option_price",
-    "exit_option_price",
+    "entry_option_mid",
+    "exit_option_mid",
     "option_pnl_per_contract",
-    "option_pnl_dollars",       # per_contract × 100 (standard lot)
+    "option_pnl_dollars",
     "option_entry_iv",
     "option_entry_delta",
-    "option_pricing_method",    # "candle", "daily_quote", or "unavailable"
+    "option_pricing_method",
 ]
 
 
-def translate_trade(row: dict, contracts: int, ticker: str) -> dict:
-    """
-    Process one trade row and add options data.
-
-    Returns a dict of option fields to merge into the row.
-    All fields are empty strings if pricing is unavailable.
-    """
+def translate_row(row: dict, contracts: int, ticker: str) -> dict:
     empty = {f: "" for f in OPTION_FIELDS}
 
-    # Skip trades without complete data
-    entry_price = row.get("entry_price")
-    close_price = row.get("close_price")
     direction   = row.get("direction", "")
     date        = row.get("date", "")
     time_phase  = row.get("time_phase", "")
-    entry_time  = row.get("entry_bar_time", "")
-    exit_time   = row.get("close_bar_time", "")
-
-    if not all([entry_price, close_price, direction, date, time_phase]):
-        return empty
+    close_reason= row.get("close_reason", "")
 
     try:
-        spot = float(entry_price)
-    except (ValueError, TypeError):
+        spot    = float(row["entry_price"])
+        pnl_pts = float(row["pnl_pts"])
+    except (TypeError, ValueError, KeyError):
         return empty
 
-    # Build option parameters
+    if not direction or not date or not time_phase:
+        return empty
+
     strike = get_strike(spot, direction)
-    expiry = get_expiration_date(date, time_phase)
-    symbol = build_occ_symbol(ticker, expiry, direction, strike)
+    expiry = get_expiry(date, time_phase)
+    symbol = build_occ(ticker, expiry, direction, strike)
+    dte    = (datetime.strptime(expiry, "%Y-%m-%d") -
+              datetime.strptime(date,   "%Y-%m-%d")).days
 
-    # Calculate DTE
-    trade_dt  = datetime.strptime(date, "%Y-%m-%d")
-    expiry_dt = datetime.strptime(expiry, "%Y-%m-%d")
-    dte = (expiry_dt - trade_dt).days
+    # Fetch entry quote
+    quote = fetch_daily_quote(symbol, date)
 
-    result = {
-        "option_symbol": symbol,
-        "expiry":        expiry,
-        "strike":        strike,
-        "dte":           dte,
-    }
-
-    # Fetch entry option price
-    print(f"    {symbol} — fetching entry price ({entry_time or date})...")
-    entry_op = get_option_price_at_time(symbol, date, entry_time) if entry_time else None
-    time.sleep(API_DELAY_SECONDS)
-
-    if entry_op is None:
-        print(f"    ⚠ Entry price unavailable for {symbol}")
-        result.update({f: "" for f in OPTION_FIELDS if f not in result})
-        result["option_pricing_method"] = "unavailable"
+    if quote is None:
+        result = dict(empty)
+        result.update({
+            "option_symbol":       symbol,
+            "expiry":              expiry,
+            "strike":              strike,
+            "dte":                 dte,
+            "option_pricing_method": "unavailable",
+        })
         return result
 
-    # Fetch exit option price (may be different date for multi-day holds)
-    exit_date = exit_time[:10] if exit_time else date
-    print(f"    {symbol} — fetching exit price ({exit_time or exit_date})...")
-    exit_op = get_option_price_at_time(symbol, exit_date, exit_time) if exit_time else None
-    time.sleep(API_DELAY_SECONDS)
+    entry_mid = quote["mid"]
+    delta     = abs(quote["delta"]) if quote.get("delta") else DEFAULT_DELTA[direction]
+    iv        = quote.get("iv")
 
-    if exit_op is None:
-        # For 0DTE options that expired, use $0 as exit price
-        if dte == 0:
-            exit_op = 0.00
-            print(f"    ℹ 0DTE expired worthless → exit price $0.00")
-        else:
-            print(f"    ⚠ Exit price unavailable for {symbol}")
-            result["option_pricing_method"] = "unavailable"
-            result.update({k: "" for k in ["entry_option_price","exit_option_price",
-                                            "option_pnl_per_contract","option_pnl_dollars",
-                                            "option_entry_iv","option_entry_delta"]})
-            return result
+    # Calculate exit premium via delta approximation
+    pnl_per   = calc_option_pnl(entry_mid, delta, pnl_pts,
+                                 direction, dte, close_reason)
+    exit_mid  = round(entry_mid + pnl_per, 4)
+    pnl_usd   = round(pnl_per * 100 * contracts, 2)
 
-    # P&L calculation
-    # For calls (LONG): profit when price rises → exit_op - entry_op
-    # For puts (SHORT): profit when price falls → exit_op - entry_op
-    # (put value increases as spot falls, so same formula works)
-    pnl_per_contract = round(exit_op - entry_op, 4)
-    pnl_dollars      = round(pnl_per_contract * 100 * contracts, 2)
-
-    # Fetch greeks at entry (optional, best effort)
-    entry_quote = fetch_option_quote(symbol, date)
-    time.sleep(API_DELAY_SECONDS)
-
-    result.update({
-        "entry_option_price":      round(entry_op, 4),
-        "exit_option_price":       round(exit_op, 4)  if exit_op else "",
-        "option_pnl_per_contract": pnl_per_contract,
-        "option_pnl_dollars":      pnl_dollars,
-        "option_entry_iv":         round(entry_quote["iv"], 4)    if entry_quote and entry_quote.get("iv")    else "",
-        "option_entry_delta":      round(entry_quote["delta"], 4) if entry_quote and entry_quote.get("delta") else "",
-        "option_pricing_method":   "candle" if entry_time else "daily_quote",
-    })
-
-    return result
+    return {
+        "option_symbol":           symbol,
+        "expiry":                  expiry,
+        "strike":                  strike,
+        "dte":                     dte,
+        "entry_option_mid":        round(entry_mid, 4),
+        "exit_option_mid":         max(round(exit_mid, 4), 0.0),
+        "option_pnl_per_contract": pnl_per,
+        "option_pnl_dollars":      pnl_usd,
+        "option_entry_iv":         round(iv, 4) if iv else "",
+        "option_entry_delta":      round(delta, 4),
+        "option_pricing_method":   "delta_approx",
+    }
 
 
-def run_translator(trades_path: str, output_path: str,
-                   contracts: int, ticker: str) -> None:
+def run(trades_path: str, output_path: str, contracts: int, ticker: str):
     print(f"\n{'='*55}")
     print(f"  Options P&L Translator — {ticker}")
-    print(f"{'='*55}\n")
+    print(f"{'='*55}")
     print(f"  Input:     {trades_path}")
-    print(f"  Output:    {output_path}")
-    print(f"  Ticker:    {ticker}")
-    print(f"  Contracts: {contracts}")
+    print(f"  Contracts: {contracts}  |  Multiplier: $100/contract")
     print()
 
-    # Load trades
     with open(trades_path, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        trades = list(reader)
-        base_fields = reader.fieldnames or []
+        reader    = csv.DictReader(f)
+        all_rows  = list(reader)
+        base_cols = list(reader.fieldnames or [])
 
-    # Filter to real trades only (skip combo gate rejections)
-    real_trades = [
-        t for t in trades
-        if t.get("pnl_pts") not in ("", None)
-        and not str(t.get("close_reason", "")).startswith("Combo gate")
+    real_rows = [
+        r for r in all_rows
+        if r.get("pnl_pts") not in ("", None)
+        and not str(r.get("close_reason", "")).startswith("Combo gate")
     ]
-    all_trades = trades  # keep all for output
 
-    print(f"  Total rows: {len(trades)}")
-    print(f"  Real trades to price: {len(real_trades)}\n")
+    print(f"  Total rows:   {len(all_rows)}")
+    print(f"  Real trades:  {len(real_rows)}")
+    print()
 
-    # Build lookup: trade_id → option data
-    option_data = {}
-    success = 0
-    unavailable = 0
+    opt_by_id = {}
+    priced_count = unavail_count = 0
 
-    for i, row in enumerate(real_trades):
-        trade_id = row.get("_trade_id") or f"row_{i}"
-        date     = row.get("date", "?")
-        direction= row.get("direction", "?")
-        phase    = row.get("time_phase", "?")
+    for i, row in enumerate(real_rows):
+        date      = row.get("date", "?")
+        direction = row.get("direction", "?")
+        phase     = row.get("time_phase", "?")
+        symbol    = build_occ(
+            ticker,
+            get_expiry(date, phase),
+            direction,
+            get_strike(float(row.get("entry_price", 0) or 0), direction),
+        )
+        print(f"  [{i+1:>3}/{len(real_rows)}] {date} {direction:<5} {phase:<12} {symbol}")
 
-        print(f"  [{i+1}/{len(real_trades)}] {date} {direction} {phase}")
-
-        opt = translate_trade(row, contracts, ticker)
-        option_data[id(row)] = opt   # use object id as key
+        opt = translate_row(row, contracts, ticker)
+        opt_by_id[id(row)] = opt
 
         if opt.get("option_pricing_method") == "unavailable":
-            unavailable += 1
-        elif opt.get("entry_option_price") != "":
-            success += 1
+            unavail_count += 1
+            print(f"            ⚠ unavailable")
+        else:
+            priced_count += 1
+            print(f"            entry=${opt.get('entry_option_mid','?'):>6}  "
+                  f"exit=${opt.get('exit_option_mid','?'):>6}  "
+                  f"P&L=${opt.get('option_pnl_dollars','?'):>8}")
 
-    print(f"\n  ✅ Priced: {success}  ⚠ Unavailable: {unavailable}")
-
-    # Write output — merge option fields into all trade rows
-    all_fields = base_fields + [f for f in OPTION_FIELDS if f not in base_fields]
+    # Write output
+    all_fields = base_cols + [f for f in OPTION_FIELDS if f not in base_cols]
     Path(os.path.dirname(output_path)).mkdir(parents=True, exist_ok=True)
-
-    # Build a map from real_trades rows to option data
-    real_trade_set = {id(r): r for r in real_trades}
-    opt_by_id = {}
-    for i, row in enumerate(real_trades):
-        opt_by_id[id(row)] = option_data.get(id(row), {f: "" for f in OPTION_FIELDS})
 
     with open(output_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=all_fields, extrasaction="ignore")
         writer.writeheader()
-        for row in all_trades:
+        for row in all_rows:
             merged = dict(row)
-            opt = opt_by_id.get(id(row), {f: "" for f in OPTION_FIELDS})
-            merged.update(opt)
+            merged.update(opt_by_id.get(id(row), {f: "" for f in OPTION_FIELDS}))
             writer.writerow(merged)
 
-    print(f"\n  📄 trades_with_options.csv → {output_path}")
+    # Summary
+    priced_rows = [r for r in real_rows
+                   if opt_by_id.get(id(r), {}).get("option_pnl_dollars") not in ("", None)]
+    print(f"\n{'─'*55}")
+    print(f"  ✅ Priced: {priced_count}   ⚠ Unavailable: {unavail_count}")
+    print(f"  📄 {output_path}")
 
-    # Print summary
-    priced = [r for r in real_trades if opt_by_id.get(id(r), {}).get("option_pnl_dollars") not in ("", None)]
-    if priced:
-        total_usd = sum(float(opt_by_id[id(r)]["option_pnl_dollars"]) for r in priced)
-        wins  = [r for r in priced if float(opt_by_id[id(r)]["option_pnl_dollars"]) > 0]
-        losses= [r for r in priced if float(opt_by_id[id(r)]["option_pnl_dollars"]) < 0]
+    if priced_rows:
+        pnls  = [float(opt_by_id[id(r)]["option_pnl_dollars"]) for r in priced_rows]
+        wins  = [p for p in pnls if p > 0]
+        losses= [p for p in pnls if p < 0]
+        total = sum(pnls)
+
         print(f"\n{'='*55}")
-        print(f"  OPTIONS P&L SUMMARY ({contracts} contract{'s' if contracts>1 else ''})")
+        print(f"  OPTIONS SUMMARY  ({contracts} contract{'s' if contracts>1 else ''} × $100)")
         print(f"{'='*55}")
-        print(f"  Trades priced:    {len(priced)}")
-        print(f"  Win rate:         {len(wins)/len(priced)*100:.1f}%  ({len(wins)}W / {len(losses)}L)")
-        print(f"  Total P&L:        ${total_usd:+,.2f}")
-        print(f"  Avg per trade:    ${total_usd/len(priced):+,.2f}")
-        if wins:
-            avg_w = sum(float(opt_by_id[id(r)]["option_pnl_dollars"]) for r in wins) / len(wins)
-            print(f"  Avg winner:       ${avg_w:+,.2f}")
-        if losses:
-            avg_l = sum(float(opt_by_id[id(r)]["option_pnl_dollars"]) for r in losses) / len(losses)
-            print(f"  Avg loser:        ${avg_l:+,.2f}")
+        print(f"  Trades priced:  {len(pnls)}")
+        print(f"  Win rate:       {len(wins)/len(pnls)*100:.1f}%  ({len(wins)}W / {len(losses)}L)")
+        print(f"  Total P&L:      ${total:+,.2f}")
+        print(f"  Avg / trade:    ${total/len(pnls):+,.2f}")
+        if wins:   print(f"  Avg winner:     ${sum(wins)/len(wins):+,.2f}")
+        if losses: print(f"  Avg loser:      ${sum(losses)/len(losses):+,.2f}")
+        print(f"  Best:           ${max(pnls):+,.2f}")
+        print(f"  Worst:          ${min(pnls):+,.2f}")
         print(f"{'='*55}")
 
-    print(f"\n✅ Done.")
+    print("\n✅ Done.\n")
 
-
-# ═════════════════════════════════════════════════════════════════════════════
-# ENTRY POINT
-# ═════════════════════════════════════════════════════════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Add real options P&L to backtest trades.csv")
-    parser.add_argument("--trades", default=None,
-                        help="Path to trades.csv (default: backtest/results/trades.csv)")
-    parser.add_argument("--output", default=None,
-                        help="Output CSV path (default: backtest/results/trades_with_options.csv)")
-    parser.add_argument("--contracts", default=1, type=int,
-                        help="Number of option contracts per trade (default: 1)")
-    parser.add_argument("--ticker", default="SPY",
-                        help="Ticker symbol (default: SPY)")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument("--trades",    default=None)
+    p.add_argument("--output",    default=None)
+    p.add_argument("--contracts", default=1, type=int)
+    p.add_argument("--ticker",    default="SPY")
+    a = p.parse_args()
 
-    if args.trades is None:
-        args.trades = os.path.join(SCRIPT_DIR, "results", "trades.csv")
-    if args.output is None:
-        args.output = os.path.join(SCRIPT_DIR, "results", "trades_with_options.csv")
+    if a.trades is None:
+        a.trades = os.path.join(SCRIPT_DIR, "results", "trades.csv")
+    if a.output is None:
+        a.output = os.path.join(SCRIPT_DIR, "results", "trades_with_options.csv")
 
-    if not os.path.exists(args.trades):
-        print(f"ERROR: trades.csv not found at {args.trades}")
-        print("Run backtest_replay.py first.")
+    if not os.path.exists(a.trades):
+        print(f"ERROR: {a.trades} not found. Run backtest_replay.py first.")
         sys.exit(1)
 
-    run_translator(args.trades, args.output, args.contracts, args.ticker)
+    run(a.trades, a.output, a.contracts, a.ticker)
 
 
 if __name__ == "__main__":
