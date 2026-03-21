@@ -167,7 +167,8 @@ SKIP_REGIMES = {"LOW_VOL_CHOP"}
 # Stop loss buffer: how far past the stop_level price must move to trigger exit.
 # 0.005 = 0.5%. A LONG exits when price <= stop_level * (1 - 0.005).
 # Set to 0.0 to exit exactly at the stop_level with no buffer.
-STOP_BUFFER_PCT = 0.005
+STOP_BUFFER_PCT = 0.01
+SKIP_PHASE = ("MIDDAY")
 
 
 
