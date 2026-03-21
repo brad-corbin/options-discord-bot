@@ -166,12 +166,17 @@ class LevelRegistry:
                 self.add(or_obj.low, SRC_OR_LOW, "support", epoch=epoch)
 
     def ingest_intraday_levels(self, intraday_levels: list, epoch: float = 0):
-        """Ingest from thesis monitor's intraday level list."""
+        """Ingest from thesis monitor's intraday level list.
+        If epoch=0, uses each level's own first_seen_ts (preserves real age)."""
         for il in intraday_levels:
             if not il.active:
                 continue
-            src = SRC_INTRADAY_SUPPORT if il.kind == "support" else SRC_INTRADAY_RESISTANCE
-            self.add(il.price, src, il.kind, touch_count=il.touches, epoch=epoch)
+            # Preserve source granularity (session_high, consolidation_edge, etc.)
+            source_tag = f"intraday_{il.kind}"
+            if hasattr(il, 'source') and il.source:
+                source_tag = il.source  # keep original: session_high, rejection_zone, sharp_move_origin, etc.
+            level_epoch = epoch if epoch > 0 else getattr(il, 'first_seen_ts', 0)
+            self.add(il.price, source_tag, il.kind, touch_count=il.touches, epoch=level_epoch)
 
     # ── Scoring ──
 
