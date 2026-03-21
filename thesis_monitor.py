@@ -1,330 +1,165 @@
 # thesis_monitor.py
-# ═══════════════════════════════════════════════════════════════════
-# v1.1 Thesis Monitor — Continuous Context-Aware Price Monitoring
-#
-# v1.1: IntradayLevelTracker — builds support/resistance from the
-#   prices the daemon already collects. Zero additional API calls.
-#   Detects: rejection zones, session high/low, consolidation edges,
-#   sharp-move origins (order blocks). Feeds into failed move engine.
-#
-# NOTE: Educational/demo code. Not financial advice.
-# ═══════════════════════════════════════════════════════════════════
-
-import logging
-import threading
-import time
-import json
+# v1.5 Thesis Monitor — Merged: v1.4 Live Entry + v1.2 Best Features
+# v1.4: reclaim-hold, don't-chase, retest, time-phase candles, momentum validation
+# v1.2: trade types, session-low suppression, build_guidance, GEX reconciliation, Redis, any-ticker
+import logging, threading, time, json
 from datetime import datetime, timezone
 from typing import Dict, Optional, List, Callable
 from dataclasses import dataclass, field, asdict
 
 log = logging.getLogger(__name__)
 
-# ─────────────────────────────────────────────────────────
-# CONFIGURATION
-# ─────────────────────────────────────────────────────────
-
-MONITOR_POLL_INTERVAL_SEC = 300          # 5 minutes default
-MONITOR_POLL_INTERVAL_FAST_SEC = 60      # 1 minute for SPY (active 0DTE trading)
-MONITOR_FAST_POLL_TICKERS = ["SPY"]      # Tickers that get 60s polling
-MONITOR_ALERT_COOLDOWN_SEC = 600         # min 10 min between same-type alerts
-MONITOR_MAX_BREAK_AGE_SEC = 900          # 15 min window for failed move detection
-MONITOR_MOMENTUM_LOOKBACK = 5            # number of price points for momentum calc
-MONITOR_RECLAIM_THRESHOLD_PCT = 0.015    # 0.015% above/below level = reclaim
-MONITOR_STALL_THRESHOLD_PCT = 0.008      # moves < this = stalling
-MONITOR_DEFAULT_TICKERS = ["SPY", "QQQ"]    # Auto-monitored from scheduled EM cards
-# Any ticker with a stored thesis will be monitored — run /em AAPL to add AAPL
-
-# Intraday level detection config
-INTRADAY_MIN_TOUCHES = 2                 # min times price must touch a zone to be a level
-INTRADAY_ZONE_TOLERANCE_PCT = 0.04       # 0.04% = ~$0.26 on SPY — how close counts as "same level"
-INTRADAY_MIN_PRICES_FOR_LEVELS = 6       # need ~30 min of data before detecting levels
-INTRADAY_SHARP_MOVE_THRESHOLD = 0.12     # 0.12% in one 5m candle = sharp move
-INTRADAY_CONSOLIDATION_CANDLES = 4       # 4 candles in tight range = consolidation
-INTRADAY_CONSOLIDATION_RANGE_PCT = 0.06  # range < 0.06% of price = tight
-
-
-# ─────────────────────────────────────────────────────────
-# DATA STRUCTURES
-# ─────────────────────────────────────────────────────────
+MONITOR_POLL_INTERVAL_SEC = 300
+MONITOR_POLL_INTERVAL_FAST_SEC = 60
+MONITOR_FAST_POLL_TICKERS = ["SPY"]
+MONITOR_ALERT_COOLDOWN_SEC = 600
+MONITOR_MAX_BREAK_AGE_SEC = 900
+MONITOR_MOMENTUM_LOOKBACK = 5
+MONITOR_RECLAIM_THRESHOLD_PCT = 0.015
+MONITOR_STALL_THRESHOLD_PCT = 0.008
+MONITOR_CONFIRM_BUFFER_PCT = 0.08
+MONITOR_EXTENSION_LIMIT_PCT = 0.25
+MONITOR_MIN_HOLD_POLLS_AFTER_RECLAIM = 1
+MONITOR_RETEST_TOLERANCE_PCT = 0.04
+MONITOR_DEFAULT_TICKERS = ["SPY", "QQQ"]
+INTRADAY_MIN_TOUCHES = 2
+INTRADAY_ZONE_TOLERANCE_PCT = 0.04
+INTRADAY_MIN_PRICES_FOR_LEVELS = 6
+INTRADAY_SHARP_MOVE_THRESHOLD = 0.12
+INTRADAY_CONSOLIDATION_CANDLES = 4
+INTRADAY_CONSOLIDATION_RANGE_PCT = 0.06
 
 @dataclass
 class ThesisLevels:
-    """Key levels from an EM card — set once, referenced all day."""
-    gamma_flip: Optional[float] = None
-    local_resistance: Optional[float] = None
-    local_support: Optional[float] = None
-    call_wall: Optional[float] = None
-    put_wall: Optional[float] = None
-    gamma_wall: Optional[float] = None
-    pin_zone_low: Optional[float] = None
-    pin_zone_high: Optional[float] = None
-    micro_trigger_up: Optional[float] = None
-    micro_trigger_down: Optional[float] = None
-    range_break_up: Optional[float] = None
-    range_break_down: Optional[float] = None
-    pivot: Optional[float] = None
-    r1: Optional[float] = None
-    s1: Optional[float] = None
-    fib_support: Optional[float] = None
-    fib_resistance: Optional[float] = None
-    vpoc: Optional[float] = None
-    max_pain: Optional[float] = None
-    em_high: Optional[float] = None   # 1σ upper
-    em_low: Optional[float] = None    # 1σ lower
-    em_2sd_high: Optional[float] = None
-    em_2sd_low: Optional[float] = None
-
+    gamma_flip: Optional[float] = None; local_resistance: Optional[float] = None
+    local_support: Optional[float] = None; call_wall: Optional[float] = None
+    put_wall: Optional[float] = None; gamma_wall: Optional[float] = None
+    pin_zone_low: Optional[float] = None; pin_zone_high: Optional[float] = None
+    micro_trigger_up: Optional[float] = None; micro_trigger_down: Optional[float] = None
+    range_break_up: Optional[float] = None; range_break_down: Optional[float] = None
+    pivot: Optional[float] = None; r1: Optional[float] = None; s1: Optional[float] = None
+    fib_support: Optional[float] = None; fib_resistance: Optional[float] = None
+    vpoc: Optional[float] = None; max_pain: Optional[float] = None
+    em_high: Optional[float] = None; em_low: Optional[float] = None
+    em_2sd_high: Optional[float] = None; em_2sd_low: Optional[float] = None
 
 @dataclass
 class ThesisContext:
-    """Full thesis context — set from EM card, enriched over the day."""
-    ticker: str = ""
-    bias: str = "NEUTRAL"
-    bias_score: int = 0
-    gex_sign: str = "positive"             # positive or negative
-    gex_value: float = 0.0
-    dex_value: float = 0.0
-    vanna_value: float = 0.0
-    charm_value: float = 0.0
-    regime: str = "UNKNOWN"                # TRENDING, SUPPRESSING, MIXED
-    volatility_regime: str = "NORMAL"
-    vix: float = 20.0
-    iv: float = 0.20
-    prior_day_close: Optional[float] = None
-    prior_day_context: str = "NORMAL"      # SQUEEZE_INTO_CLOSE, BREAKDOWN_INTO_CLOSE, etc.
-    session_label: str = ""
-    levels: ThesisLevels = field(default_factory=ThesisLevels)
-    created_at: str = ""
-    spot_at_creation: float = 0.0
-
+    ticker: str = ""; bias: str = "NEUTRAL"; bias_score: int = 0
+    gex_sign: str = "positive"; gex_value: float = 0.0
+    dex_value: float = 0.0; vanna_value: float = 0.0; charm_value: float = 0.0
+    regime: str = "UNKNOWN"; volatility_regime: str = "NORMAL"
+    vix: float = 20.0; iv: float = 0.20
+    prior_day_close: Optional[float] = None; prior_day_context: str = "NORMAL"
+    session_label: str = ""; levels: ThesisLevels = field(default_factory=ThesisLevels)
+    created_at: str = ""; spot_at_creation: float = 0.0
 
 @dataclass
 class BreakAttempt:
-    """Record of a price break at a level."""
-    level: float
-    level_name: str          # e.g. "local_support", "intraday_support"
-    direction: str           # "UP" or "DOWN"
-    break_price: float
-    break_time: float        # monotonic timestamp
-    detected_as_failed: bool = False
-    detected_as_confirmed: bool = False
-    candles_since: int = 0
-
+    level: float; level_name: str; direction: str; break_price: float; break_time: float
+    detected_as_failed: bool = False; detected_as_confirmed: bool = False; candles_since: int = 0
+    reclaim_seen: bool = False; reclaim_price: Optional[float] = None
+    reclaim_time: float = 0.0; reclaim_holds: int = 0
+    retest_armed: bool = False; retest_fired: bool = False
 
 @dataclass
 class IntradayLevel:
-    """A support or resistance level discovered from intraday price action."""
-    price: float
-    kind: str                # "support" or "resistance"
-    source: str              # "rejection_zone", "session_high", "session_low",
-                             # "sharp_move_origin", "consolidation_edge"
-    touches: int = 0
-    first_seen_ts: float = 0.0
-    last_touched_ts: float = 0.0
-    active: bool = True
-
+    price: float; kind: str; source: str; touches: int = 0
+    first_seen_ts: float = 0.0; last_touched_ts: float = 0.0; active: bool = True
 
 @dataclass
 class MonitorState:
-    """Evolving state tracked throughout the day."""
-    status: str = "FRESH"
-    momentum: str = "NEUTRAL"
+    status: str = "FRESH"; momentum: str = "NEUTRAL"
     above_gamma_flip: Optional[bool] = None
     price_history: list = field(default_factory=list)
     break_attempts: list = field(default_factory=list)
     failed_moves: list = field(default_factory=list)
-    confirmed_breaks: list = field(default_factory=list)   # v1.2: breaks with follow-through
-    active_trend_direction: Optional[str] = None           # v1.2: "SHORT" or "LONG" when trend confirmed
+    confirmed_breaks: list = field(default_factory=list)
+    active_trend_direction: Optional[str] = None
     alert_history: dict = field(default_factory=dict)
-    last_guidance_ts: float = 0.0
-    check_count: int = 0
-    prior_day_applied: bool = False
-    # v1.1: Intraday levels
+    last_guidance_ts: float = 0.0; check_count: int = 0; prior_day_applied: bool = False
     intraday_levels: list = field(default_factory=list)
-    session_high: Optional[float] = None
-    session_low: Optional[float] = None
-    session_high_time: str = ""
-    session_low_time: str = ""
-
-
-# ─────────────────────────────────────────────────────────
-# TIME-OF-DAY LOGIC
-# ─────────────────────────────────────────────────────────
+    session_high: Optional[float] = None; session_low: Optional[float] = None
+    session_high_time: str = ""; session_low_time: str = ""
 
 def _get_time_phase_ct() -> dict:
-    """Get current Central Time trading phase."""
     try:
         from zoneinfo import ZoneInfo
         now = datetime.now(ZoneInfo("America/Chicago"))
     except Exception:
         try:
-            import pytz
-            now = datetime.now(pytz.timezone("America/Chicago"))
+            import pytz; now = datetime.now(pytz.timezone("America/Chicago"))
         except Exception:
             now = datetime.utcnow()
-
-    h, m = now.hour, now.minute
-    mins = h * 60 + m
-
-    if mins < 510:    # before 8:30
-        return {"phase": "PRE_MARKET", "label": "Pre-Market", "favor": "wait",
-                "note": "Levels are set — wait for open to confirm."}
-    if mins < 540:    # 8:30 – 9:00
-        return {"phase": "OPEN", "label": "Open (first 30 min)", "favor": "caution",
-                "note": "Expansion / discovery window — let levels prove before acting."}
-    if mins < 600:    # 9:00 – 10:00
-        return {"phase": "MORNING", "label": "Morning Session", "favor": "breakout",
-                "note": "Breakouts are more reliable now. Watch for trend establishment."}
-    if mins < 720:    # 10:00 – 12:00
-        return {"phase": "MIDDAY", "label": "Midday", "favor": "failed_move",
-                "note": "Chop zone — failed moves are the best play here."}
-    if mins < 810:    # 12:00 – 1:30
-        return {"phase": "AFTERNOON", "label": "Afternoon", "favor": "trend_resumption",
-                "note": "Trend resumption or reversal — momentum matters now."}
-    if mins < 870:    # 1:30 – 2:30
-        return {"phase": "POWER_HOUR", "label": "Power Hour", "favor": "pin_or_expand",
-                "note": "GEX+ = pinning. GEX- = expansion. Adjust accordingly."}
-    if mins < 915:    # 2:30 – 3:15 (SPY/QQQ options close at 3:15 CT)
-        return {"phase": "CLOSE", "label": "Into Close", "favor": "pin",
-                "note": "Favor pin / mean reversion. Reduce size on new entries."}
-    return {"phase": "AFTER_HOURS", "label": "After Hours", "favor": "wait",
-            "note": "Session over — review and plan for tomorrow."}
-
-
-# ─────────────────────────────────────────────────────────
-# INTRADAY LEVEL TRACKER — Zero API calls
-# ─────────────────────────────────────────────────────────
+    mins = now.hour * 60 + now.minute
+    if mins < 510: return {"phase": "PRE_MARKET", "label": "Pre-Market", "favor": "wait", "note": "Wait for open to confirm."}
+    if mins < 540: return {"phase": "OPEN", "label": "Open (first 30 min)", "favor": "caution", "note": "Expansion window — let levels prove."}
+    if mins < 600: return {"phase": "MORNING", "label": "Morning Session", "favor": "breakout", "note": "Breakouts more reliable. Watch for trend."}
+    if mins < 720: return {"phase": "MIDDAY", "label": "Midday", "favor": "failed_move", "note": "Chop zone — failed moves are best."}
+    if mins < 810: return {"phase": "AFTERNOON", "label": "Afternoon", "favor": "trend_resumption", "note": "Trend resumption or reversal."}
+    if mins < 870: return {"phase": "POWER_HOUR", "label": "Power Hour", "favor": "pin_or_expand", "note": "GEX+ = pinning. GEX- = expansion."}
+    if mins < 915: return {"phase": "CLOSE", "label": "Into Close", "favor": "pin", "note": "Favor pin / mean reversion. Reduce size."}
+    return {"phase": "AFTER_HOURS", "label": "After Hours", "favor": "wait", "note": "Session over."}
 
 class IntradayLevelTracker:
-    """Discovers intraday S/R from prices already being collected."""
-
     @staticmethod
     def update(state: MonitorState, price: float, now: float) -> List[dict]:
-        events = []
-        prices = [p["price"] for p in state.price_history]
-        n = len(prices)
-        if n < 2:
-            return events
-        spot = price
-        tol = spot * INTRADAY_ZONE_TOLERANCE_PCT / 100
-
-        # 1. Session high/low
-        current_high = max(prices)
-        current_low = min(prices)
+        events = []; prices = [p["price"] for p in state.price_history]; n = len(prices)
+        if n < 2: return events
+        tol = price * INTRADAY_ZONE_TOLERANCE_PCT / 100
+        current_high, current_low = max(prices), min(prices)
         if state.session_high is None or current_high > state.session_high:
             state.session_high = current_high
             for p in state.price_history:
-                if p["price"] == current_high:
-                    state.session_high_time = p.get("time_str", "")
-                    break
+                if p["price"] == current_high: state.session_high_time = p.get("time_str", ""); break
             IntradayLevelTracker._upsert_level(state, current_high, "resistance", "session_high", now)
         if state.session_low is None or current_low < state.session_low:
             state.session_low = current_low
             for p in state.price_history:
-                if p["price"] == current_low:
-                    state.session_low_time = p.get("time_str", "")
-                    break
+                if p["price"] == current_low: state.session_low_time = p.get("time_str", ""); break
             IntradayLevelTracker._upsert_level(state, current_low, "support", "session_low", now)
-
-        if n < INTRADAY_MIN_PRICES_FOR_LEVELS:
-            return events
-
-        # 2. Rejection zones — prices touched 2+ times then moved away
+        if n < INTRADAY_MIN_PRICES_FOR_LEVELS: return events
         zone_counts: Dict[float, list] = {}
         for i, p in enumerate(prices):
             placed = False
             for rep in zone_counts:
-                if abs(p - rep) <= tol:
-                    zone_counts[rep].append(i)
-                    placed = True
-                    break
-            if not placed:
-                zone_counts[p] = [i]
-
+                if abs(p - rep) <= tol: zone_counts[rep].append(i); placed = True; break
+            if not placed: zone_counts[p] = [i]
         for rep_price, indices in zone_counts.items():
-            if len(indices) < INTRADAY_MIN_TOUCHES:
-                continue
-            has_departure = False
+            if len(indices) < INTRADAY_MIN_TOUCHES: continue
+            has_dep = False
             for idx in indices:
-                subsequent = prices[idx + 1:idx + 4] if idx + 1 < n else []
-                for sp in subsequent:
-                    if abs(sp - rep_price) > tol * 2.5:
-                        has_departure = True
-                        break
-                if has_departure:
-                    break
-            if not has_departure:
-                continue
-
-            bounces_up = sum(1 for idx in indices if idx + 1 < n and prices[idx + 1] > rep_price + tol * 0.5)
-            bounces_down = sum(1 for idx in indices if idx + 1 < n and prices[idx + 1] < rep_price - tol * 0.5)
-
-            if bounces_up >= INTRADAY_MIN_TOUCHES:
+                for sp in prices[idx+1:idx+4]:
+                    if abs(sp - rep_price) > tol * 2.5: has_dep = True; break
+                if has_dep: break
+            if not has_dep: continue
+            bu = sum(1 for idx in indices if idx+1 < n and prices[idx+1] > rep_price + tol*0.5)
+            bd = sum(1 for idx in indices if idx+1 < n and prices[idx+1] < rep_price - tol*0.5)
+            if bu >= INTRADAY_MIN_TOUCHES:
                 if IntradayLevelTracker._upsert_level(state, rep_price, "support", "rejection_zone", now, touches=len(indices)):
-                    events.append({
-                        "msg": f"📍 NEW 5m SUPPORT at ${rep_price:.2f} ({len(indices)} touches, bounced up each time). "
-                               f"Watch for failed break below.",
-                        "type": "info", "priority": 3,
-                        "alert_key": f"id_sup_{rep_price:.2f}",
-                    })
-            if bounces_down >= INTRADAY_MIN_TOUCHES:
+                    events.append({"msg": f"📍 NEW 5m SUPPORT at ${rep_price:.2f} ({len(indices)} touches).", "type": "info", "priority": 3, "alert_key": f"id_sup_{rep_price:.2f}"})
+            if bd >= INTRADAY_MIN_TOUCHES:
                 if IntradayLevelTracker._upsert_level(state, rep_price, "resistance", "rejection_zone", now, touches=len(indices)):
-                    events.append({
-                        "msg": f"📍 NEW 5m RESISTANCE at ${rep_price:.2f} ({len(indices)} touches, rejected down each time). "
-                               f"Watch for failed break above.",
-                        "type": "info", "priority": 3,
-                        "alert_key": f"id_res_{rep_price:.2f}",
-                    })
-
-        # 3. Sharp move origins (order block concept)
+                    events.append({"msg": f"📍 NEW 5m RESISTANCE at ${rep_price:.2f} ({len(indices)} touches).", "type": "info", "priority": 3, "alert_key": f"id_res_{rep_price:.2f}"})
         if n >= 3:
-            for i in range(max(n - 12, 1), n):
-                move = prices[i] - prices[i - 1]
-                move_pct = abs(move) / prices[i - 1] * 100
+            for i in range(max(n-12, 1), n):
+                move = prices[i] - prices[i-1]; move_pct = abs(move) / prices[i-1] * 100
                 if move_pct >= INTRADAY_SHARP_MOVE_THRESHOLD:
-                    origin = prices[i - 1]
-                    if move > 0:
-                        if IntradayLevelTracker._upsert_level(state, origin, "support", "sharp_move_origin", now):
-                            events.append({
-                                "msg": f"📍 SHARP MOVE ORIGIN: Price rocketed up from ${origin:.2f}. "
-                                       f"Now intraday support — trapped shorts sit here.",
-                                "type": "info", "priority": 3,
-                                "alert_key": f"sharp_sup_{origin:.2f}",
-                            })
-                    else:
-                        if IntradayLevelTracker._upsert_level(state, origin, "resistance", "sharp_move_origin", now):
-                            events.append({
-                                "msg": f"📍 SHARP MOVE ORIGIN: Price dumped from ${origin:.2f}. "
-                                       f"Now intraday resistance — trapped longs sit here.",
-                                "type": "info", "priority": 3,
-                                "alert_key": f"sharp_res_{origin:.2f}",
-                            })
-
-        # 4. Consolidation edges
+                    origin = prices[i-1]
+                    kind = "support" if move > 0 else "resistance"
+                    verb = "launched from" if move > 0 else "dumped from"
+                    if IntradayLevelTracker._upsert_level(state, origin, kind, "sharp_move_origin", now):
+                        events.append({"msg": f"📍 SHARP MOVE ORIGIN: price {verb} ${origin:.2f}. Now intraday {kind}.", "type": "info", "priority": 3, "alert_key": f"sharp_{kind[:3]}_{origin:.2f}"})
         if n >= INTRADAY_CONSOLIDATION_CANDLES:
             recent = prices[-INTRADAY_CONSOLIDATION_CANDLES:]
-            rng = max(recent) - min(recent)
-            rng_pct = rng / spot * 100
+            rng = max(recent) - min(recent); rng_pct = rng / price * 100
             if rng_pct <= INTRADAY_CONSOLIDATION_RANGE_PCT and rng > 0:
-                cons_high = max(recent)
-                cons_low = min(recent)
-                IntradayLevelTracker._upsert_level(state, cons_high, "resistance", "consolidation_edge", now)
-                IntradayLevelTracker._upsert_level(state, cons_low, "support", "consolidation_edge", now)
-                events.append({
-                    "msg": f"📍 CONSOLIDATION: Flat between ${cons_low:.2f}–${cons_high:.2f} "
-                           f"for {INTRADAY_CONSOLIDATION_CANDLES * 5} min. Break with momentum is actionable.",
-                    "type": "info", "priority": 2,
-                    "alert_key": f"cons_{cons_low:.1f}_{cons_high:.1f}",
-                })
-
-        # Deactivate stale levels
+                ch, cl = max(recent), min(recent)
+                IntradayLevelTracker._upsert_level(state, ch, "resistance", "consolidation_edge", now)
+                IntradayLevelTracker._upsert_level(state, cl, "support", "consolidation_edge", now)
+                events.append({"msg": f"📍 CONSOLIDATION: ${cl:.2f}-${ch:.2f} ({INTRADAY_CONSOLIDATION_CANDLES*5} min). Break with momentum is actionable.", "type": "info", "priority": 2, "alert_key": f"cons_{cl:.1f}_{ch:.1f}"})
         for lvl in state.intraday_levels:
-            if not lvl.active:
-                continue
-            if abs(spot - lvl.price) > tol * 8 and (now - lvl.last_touched_ts) > 2700:
-                lvl.active = False
-
+            if lvl.active and abs(price - lvl.price) > tol * 8 and (now - lvl.last_touched_ts) > 2700: lvl.active = False
         return events
 
     @staticmethod
@@ -332,1160 +167,391 @@ class IntradayLevelTracker:
         tol = price * INTRADAY_ZONE_TOLERANCE_PCT / 100
         for lvl in state.intraday_levels:
             if abs(lvl.price - price) <= tol and lvl.kind == kind:
-                lvl.touches = max(lvl.touches, touches)
-                lvl.last_touched_ts = now
-                lvl.active = True
-                return False
-        state.intraday_levels.append(IntradayLevel(
-            price=round(price, 2), kind=kind, source=source,
-            touches=touches, first_seen_ts=now, last_touched_ts=now, active=True,
-        ))
+                lvl.touches = max(lvl.touches, touches); lvl.last_touched_ts = now; lvl.active = True; return False
+        state.intraday_levels.append(IntradayLevel(price=round(price, 2), kind=kind, source=source, touches=touches, first_seen_ts=now, last_touched_ts=now, active=True))
         return True
 
     @staticmethod
     def get_active_levels(state: MonitorState, price: float) -> dict:
         active = [l for l in state.intraday_levels if l.active]
-        supports = sorted([l for l in active if l.kind == "support" and l.price < price], key=lambda l: price - l.price)
-        resistances = sorted([l for l in active if l.kind == "resistance" and l.price > price], key=lambda l: l.price - price)
-        return {
-            "support": supports[0] if supports else None,
-            "resistance": resistances[0] if resistances else None,
-            "all_support": supports[:3],
-            "all_resistance": resistances[:3],
-        }
-
-
-# ─────────────────────────────────────────────────────────
-# THESIS MONITOR ENGINE
-# ─────────────────────────────────────────────────────────
+        sups = sorted([l for l in active if l.kind == "support" and l.price < price], key=lambda l: price - l.price)
+        ress = sorted([l for l in active if l.kind == "resistance" and l.price > price], key=lambda l: l.price - price)
+        return {"support": sups[0] if sups else None, "resistance": ress[0] if ress else None, "all_support": sups[:3], "all_resistance": ress[:3]}
 
 class ThesisMonitorEngine:
-    """
-    Core engine that evaluates price action against the thesis.
-
-    NOT a standalone thread — the ThesisMonitorDaemon (below) handles
-    scheduling and Telegram posting. This class is pure logic.
-    """
-
     def __init__(self, store_get_fn=None, store_set_fn=None):
-        self._theses: Dict[str, ThesisContext] = {}
-        self._states: Dict[str, MonitorState] = {}
-        self._lock = threading.Lock()
-        self._store_get = store_get_fn
-        self._store_set = store_set_fn
+        self._theses: Dict[str, ThesisContext] = {}; self._states: Dict[str, MonitorState] = {}
+        self._lock = threading.Lock(); self._store_get = store_get_fn; self._store_set = store_set_fn
 
     def store_thesis(self, ticker: str, thesis: ThesisContext):
-        """Called by app.py after each EM card. Resets monitoring state."""
         with self._lock:
             self._theses[ticker] = thesis
-            # Preserve failed moves from earlier session if still relevant
-            old_state = self._states.get(ticker)
-            new_state = MonitorState()
-            if old_state and old_state.failed_moves:
-                # Keep failed moves < 30 min old
-                now = time.monotonic()
-                new_state.failed_moves = [
-                    fm for fm in old_state.failed_moves
-                    if (now - fm.break_time) < 1800
-                ]
-            # Preserve intraday levels from earlier in the session
-            if old_state and old_state.intraday_levels:
-                new_state.intraday_levels = [l for l in old_state.intraday_levels if l.active]
-                new_state.session_high = old_state.session_high
-                new_state.session_low = old_state.session_low
-                new_state.session_high_time = old_state.session_high_time
-                new_state.session_low_time = old_state.session_low_time
-            self._states[ticker] = new_state
-            log.info(f"Thesis stored: {ticker} | bias={thesis.bias} score={thesis.bias_score} "
-                     f"gex={thesis.gex_sign} regime={thesis.regime}")
-
-            # v1.2: Persist to Redis so thesis survives deploys
+            old = self._states.get(ticker); ns = MonitorState()
+            if old and old.failed_moves:
+                now = time.monotonic(); ns.failed_moves = [fm for fm in old.failed_moves if (now - fm.break_time) < 1800]
+            if old and old.intraday_levels:
+                ns.intraday_levels = [l for l in old.intraday_levels if l.active]
+                ns.session_high = old.session_high; ns.session_low = old.session_low
+                ns.session_high_time = old.session_high_time; ns.session_low_time = old.session_low_time
+            self._states[ticker] = ns
+            log.info(f"Thesis stored: {ticker} | bias={thesis.bias} score={thesis.bias_score} gex={thesis.gex_sign} regime={thesis.regime}")
             self._persist_thesis(ticker, thesis)
 
-    def _persist_thesis(self, ticker: str, thesis: ThesisContext):
-        """Save thesis to Redis/store for deploy survival."""
-        if not self._store_set:
-            return
+    def _persist_thesis(self, ticker, thesis):
+        if not self._store_set: return
         try:
-            data = {
-                "ticker": thesis.ticker,
-                "bias": thesis.bias,
-                "bias_score": thesis.bias_score,
-                "gex_sign": thesis.gex_sign,
-                "gex_value": thesis.gex_value,
-                "dex_value": thesis.dex_value,
-                "vanna_value": thesis.vanna_value,
-                "charm_value": thesis.charm_value,
-                "regime": thesis.regime,
-                "volatility_regime": thesis.volatility_regime,
-                "vix": thesis.vix,
-                "iv": thesis.iv,
-                "prior_day_close": thesis.prior_day_close,
-                "prior_day_context": thesis.prior_day_context,
-                "session_label": thesis.session_label,
-                "created_at": thesis.created_at,
-                "spot_at_creation": thesis.spot_at_creation,
-                "levels": asdict(thesis.levels),
-            }
+            data = {"ticker": thesis.ticker, "bias": thesis.bias, "bias_score": thesis.bias_score, "gex_sign": thesis.gex_sign, "gex_value": thesis.gex_value, "dex_value": thesis.dex_value, "vanna_value": thesis.vanna_value, "charm_value": thesis.charm_value, "regime": thesis.regime, "volatility_regime": thesis.volatility_regime, "vix": thesis.vix, "iv": thesis.iv, "prior_day_close": thesis.prior_day_close, "prior_day_context": thesis.prior_day_context, "session_label": thesis.session_label, "created_at": thesis.created_at, "spot_at_creation": thesis.spot_at_creation, "levels": asdict(thesis.levels)}
             self._store_set(f"thesis_monitor:{ticker}", json.dumps(data), ttl=86400)
-            log.debug(f"Thesis persisted to store: {ticker}")
-        except Exception as e:
-            log.warning(f"Thesis persist failed for {ticker}: {e}")
+        except Exception as e: log.warning(f"Thesis persist failed for {ticker}: {e}")
 
-    def _load_thesis_from_store(self, ticker: str) -> Optional[ThesisContext]:
-        """Load thesis from Redis/store after a deploy."""
-        if not self._store_get:
-            return None
+    def _load_thesis_from_store(self, ticker):
+        if not self._store_get: return None
         try:
             raw = self._store_get(f"thesis_monitor:{ticker}")
-            if not raw:
-                return None
-            data = json.loads(raw)
-            levels = ThesisLevels(**{k: v for k, v in data.get("levels", {}).items()
-                                     if k in ThesisLevels.__dataclass_fields__})
-            thesis = ThesisContext(
-                ticker=data.get("ticker", ticker),
-                bias=data.get("bias", "NEUTRAL"),
-                bias_score=data.get("bias_score", 0),
-                gex_sign=data.get("gex_sign", "positive"),
-                gex_value=data.get("gex_value", 0),
-                dex_value=data.get("dex_value", 0),
-                vanna_value=data.get("vanna_value", 0),
-                charm_value=data.get("charm_value", 0),
-                regime=data.get("regime", "UNKNOWN"),
-                volatility_regime=data.get("volatility_regime", "NORMAL"),
-                vix=data.get("vix", 20),
-                iv=data.get("iv", 0.20),
-                prior_day_close=data.get("prior_day_close"),
-                prior_day_context=data.get("prior_day_context", "NORMAL"),
-                session_label=data.get("session_label", ""),
-                created_at=data.get("created_at", ""),
-                spot_at_creation=data.get("spot_at_creation", 0),
-                levels=levels,
-            )
-            log.info(f"Thesis loaded from store: {ticker} | bias={thesis.bias} "
-                     f"score={thesis.bias_score} gex={thesis.gex_sign}")
-            return thesis
-        except Exception as e:
-            log.warning(f"Thesis load from store failed for {ticker}: {e}")
-            return None
+            if not raw: return None
+            d = json.loads(raw)
+            levels = ThesisLevels(**{k: v for k, v in d.get("levels", {}).items() if k in ThesisLevels.__dataclass_fields__})
+            t = ThesisContext(ticker=d.get("ticker", ticker), bias=d.get("bias", "NEUTRAL"), bias_score=d.get("bias_score", 0), gex_sign=d.get("gex_sign", "positive"), gex_value=d.get("gex_value", 0), dex_value=d.get("dex_value", 0), vanna_value=d.get("vanna_value", 0), charm_value=d.get("charm_value", 0), regime=d.get("regime", "UNKNOWN"), volatility_regime=d.get("volatility_regime", "NORMAL"), vix=d.get("vix", 20), iv=d.get("iv", 0.20), prior_day_close=d.get("prior_day_close"), prior_day_context=d.get("prior_day_context", "NORMAL"), session_label=d.get("session_label", ""), created_at=d.get("created_at", ""), spot_at_creation=d.get("spot_at_creation", 0), levels=levels)
+            log.info(f"Thesis loaded from store: {ticker} | bias={t.bias} gex={t.gex_sign}")
+            return t
+        except Exception as e: log.warning(f"Thesis load failed for {ticker}: {e}"); return None
 
-    def get_thesis(self, ticker: str) -> Optional[ThesisContext]:
-        thesis = self._theses.get(ticker)
-        if thesis:
-            return thesis
-        # v1.2: Try loading from Redis after a deploy
-        thesis = self._load_thesis_from_store(ticker)
-        if thesis:
-            self._theses[ticker] = thesis
-            if ticker not in self._states:
-                self._states[ticker] = MonitorState()
-        return thesis
+    def get_thesis(self, ticker):
+        t = self._theses.get(ticker)
+        if t: return t
+        t = self._load_thesis_from_store(ticker)
+        if t: self._theses[ticker] = t; self._states.setdefault(ticker, MonitorState())
+        return t
 
-    def get_state(self, ticker: str) -> Optional[MonitorState]:
-        return self._states.get(ticker)
+    def get_state(self, ticker): return self._states.get(ticker)
 
     def get_monitored_tickers(self) -> List[str]:
-        """Return all tickers that have a thesis (in memory or Redis).
-        v1.2: Any ticker with a stored thesis gets monitored automatically.
-        Run /em AAPL to start monitoring AAPL."""
         tickers = set(self._theses.keys())
-        # Also check Redis for tickers that survived a deploy
-        for default in MONITOR_DEFAULT_TICKERS:
-            if default not in tickers:
-                thesis = self.get_thesis(default)  # triggers Redis load
-                if thesis:
-                    tickers.add(default)
+        for d in MONITOR_DEFAULT_TICKERS:
+            if d not in tickers and self.get_thesis(d): tickers.add(d)
         return sorted(tickers)
 
-    def evaluate(self, ticker: str, price: float) -> List[dict]:
-        """
-        Evaluate a new price against the thesis.
+    def _recent_net_move(self, state, lookback=3):
+        recent = [p["price"] for p in state.price_history[-lookback:]]
+        return (recent[-1] - recent[0]) if len(recent) >= 2 else 0.0
 
-        Returns a list of events: [{msg, type, priority}]
-          type: info, warning, alert, critical
-          priority: 1 (low) to 5 (high)
-        """
+    def evaluate(self, ticker, price):
         with self._lock:
-            thesis = self._theses.get(ticker)
-            state = self._states.get(ticker)
-            if not thesis or not state:
-                return []
-
-            events = []
-            now = time.monotonic()
-            lvl = thesis.levels
+            thesis = self._theses.get(ticker); state = self._states.get(ticker)
+            if not thesis or not state: return []
+            events = []; now = time.monotonic()
             prev_price = state.price_history[-1]["price"] if state.price_history else None
-
-            # Record price
             try:
-                from zoneinfo import ZoneInfo
-                ts = datetime.now(ZoneInfo("America/Chicago")).strftime("%I:%M %p")
-            except Exception:
-                ts = datetime.utcnow().strftime("%H:%M")
-
+                from zoneinfo import ZoneInfo; ts = datetime.now(ZoneInfo("America/Chicago")).strftime("%I:%M %p")
+            except Exception: ts = datetime.utcnow().strftime("%H:%M")
             state.price_history.append({"price": price, "time_str": ts, "ts_mono": now})
-            # Keep last 60 data points (~5 hours at 5 min intervals)
-            if len(state.price_history) > 60:
-                state.price_history = state.price_history[-60:]
+            if len(state.price_history) > 240: state.price_history = state.price_history[-240:]
             state.check_count += 1
-
-            # ── Prior day context (first check only) ──
-            if not state.prior_day_applied and thesis.prior_day_context != "NORMAL":
-                state.prior_day_applied = True
-                if thesis.prior_day_context == "SQUEEZE_INTO_CLOSE":
-                    events.append({
-                        "msg": f"📅 PRIOR DAY CONTEXT: Yesterday ended with a squeeze into close. "
-                               f"Expect continuation pressure early OR a fade. Watch the first 15 min.",
-                        "type": "info", "priority": 2,
-                    })
-                elif thesis.prior_day_context == "BREAKDOWN_INTO_CLOSE":
-                    events.append({
-                        "msg": f"📅 PRIOR DAY CONTEXT: Yesterday ended with a breakdown into close. "
-                               f"Gap-down risk or early selling possible.",
-                        "type": "warning", "priority": 3,
-                    })
-
-            # ── Momentum tracking ──
             events.extend(self._evaluate_momentum(state, price))
-
-            # ── v1.1: Update intraday levels from price history ──
-            intraday_events = IntradayLevelTracker.update(state, price, now)
-            events.extend(intraday_events)
-
-            # ── v1.2: Increment candle counter for all active breaks (once per cycle) ──
+            events.extend(IntradayLevelTracker.update(state, price, now))
             for ba in state.break_attempts:
-                if not ba.detected_as_failed and not ba.detected_as_confirmed:
-                    if (now - ba.break_time) <= MONITOR_MAX_BREAK_AGE_SEC:
-                        ba.candles_since += 1
-
-            # ── Break attempt detection ──
-            if prev_price is not None:
-                events.extend(self._detect_breaks(thesis, state, price, prev_price, now))
-
-            # ── v1.2: Confirmed break detection (GEX- follow-through) ──
+                if not ba.detected_as_failed and not ba.detected_as_confirmed and (now - ba.break_time) <= MONITOR_MAX_BREAK_AGE_SEC:
+                    ba.candles_since += 1
+            if prev_price is not None: events.extend(self._detect_breaks(thesis, state, price, prev_price, now))
             events.extend(self._detect_confirmed_breaks(thesis, state, price, now))
-
-            # ── Failed move detection ──
             events.extend(self._detect_failed_moves(thesis, state, price, now))
-
-            # ── Gamma flip crossover ──
+            events.extend(self._detect_retests(thesis, state, price, now))
             events.extend(self._check_gamma_flip(thesis, state, price))
+            if state.status == "FRESH" and state.check_count >= 2: state.status = "DEVELOPING"
+            return self._apply_cooldowns(state, events, now)
 
-            # ── Status evolution ──
-            if state.status == "FRESH" and state.check_count >= 2:
-                state.status = "DEVELOPING"
-
-            # ── Apply cooldowns ──
-            events = self._apply_cooldowns(state, events, now)
-
-            return events
-
-    def build_guidance(self, ticker: str, price: float) -> List[dict]:
-        """
-        Build full plain English guidance for current price.
-
-        Returns list of {text, type} items.
-        type: context, time, bullish, bearish, warning, critical, neutral, divider, info
-        """
-        thesis = self._theses.get(ticker)
-        state = self._states.get(ticker)
-        if not thesis or not state:
-            return [{"text": f"No thesis loaded for {ticker}. Run /em first.", "type": "neutral"}]
-
-        guidance = []
-        lvl = thesis.levels
-        tp = _get_time_phase_ct()
-
-        # ── Thesis header ──
-        guidance.append({
-            "text": f"THESIS: {thesis.bias} (score {thesis.bias_score}/14) | "
-                    f"GEX {thesis.gex_sign} ({thesis.gex_value:+.1f}M) | Regime: {thesis.regime}",
-            "type": "context",
-        })
-
-        # ── Time of day ──
-        guidance.append({"text": f"{tp['label']}: {tp['note']}", "type": "time"})
-
-        # ── Gamma flip position ──
+    def build_guidance(self, ticker, price):
+        thesis = self._theses.get(ticker); state = self._states.get(ticker)
+        if not thesis or not state: return [{"text": f"No thesis for {ticker}. Run /em first.", "type": "neutral"}]
+        g = []; lvl = thesis.levels; tp = _get_time_phase_ct()
+        g.append({"text": f"THESIS: {thesis.bias} ({thesis.bias_score}/14) | GEX {thesis.gex_sign} ({thesis.gex_value:+.1f}M) | {thesis.regime}", "type": "context"})
+        g.append({"text": f"{tp['label']}: {tp['note']}", "type": "time"})
         if lvl.gamma_flip is not None:
-            if price > lvl.gamma_flip:
-                guidance.append({
-                    "text": f"Price is ABOVE gamma flip (${lvl.gamma_flip:.2f}) — bullish structure. "
-                            f"Dealers are buying dips. Favor long setups.",
-                    "type": "bullish",
-                })
-            else:
-                guidance.append({
-                    "text": f"Price is BELOW gamma flip (${lvl.gamma_flip:.2f}) — bearish/trending structure. "
-                            f"Breakdowns can accelerate.",
-                    "type": "bearish",
-                })
-
-        # ── Pin zone check ──
-        if lvl.pin_zone_low is not None and lvl.pin_zone_high is not None:
-            if lvl.pin_zone_low <= price <= lvl.pin_zone_high:
-                if thesis.gex_sign == "positive":
-                    guidance.append({
-                        "text": f"INSIDE PIN ZONE (${lvl.pin_zone_low:.2f}–${lvl.pin_zone_high:.2f}) "
-                                f"with positive GEX — price wants to stay here. "
-                                f"Don't chase breakouts — TRADE FAILURES instead.",
-                        "type": "warning",
-                    })
-
-        # ── Micro trigger position ──
-        if lvl.micro_trigger_up is not None and lvl.micro_trigger_down is not None:
+            if price > lvl.gamma_flip: g.append({"text": f"ABOVE gamma flip ${lvl.gamma_flip:.2f} — bullish. Dealers buy dips.", "type": "bullish"})
+            else: g.append({"text": f"BELOW gamma flip ${lvl.gamma_flip:.2f} — bearish/trending. Breakdowns accelerate.", "type": "bearish"})
+        if lvl.pin_zone_low and lvl.pin_zone_high and lvl.pin_zone_low <= price <= lvl.pin_zone_high and thesis.gex_sign == "positive":
+            g.append({"text": f"INSIDE PIN ZONE ${lvl.pin_zone_low:.2f}-${lvl.pin_zone_high:.2f} with GEX+. Trade failures, not breakouts.", "type": "warning"})
+        if lvl.micro_trigger_up and lvl.micro_trigger_down:
             if lvl.micro_trigger_down < price < lvl.micro_trigger_up:
-                guidance.append({
-                    "text": f"IN NO-MAN'S LAND between micro triggers "
-                            f"(${lvl.micro_trigger_down:.2f}–${lvl.micro_trigger_up:.2f}). "
-                            f"Wait for a trigger to fire before acting.",
-                    "type": "neutral",
-                })
-            elif price >= lvl.micro_trigger_up:
-                guidance.append({
-                    "text": f"ABOVE micro trigger ${lvl.micro_trigger_up:.2f} — bullish bias active. "
-                            f"Look for pullbacks to this level as re-entry.",
-                    "type": "bullish",
-                })
-            elif price <= lvl.micro_trigger_down:
-                guidance.append({
-                    "text": f"BELOW micro trigger ${lvl.micro_trigger_down:.2f} — bearish bias active. "
-                            f"Look for bounces to this level as short re-entry.",
-                    "type": "bearish",
-                })
-
-        # ── Momentum state ──
-        momentum_map = {
-            "ACCELERATING_UP": ("🚀 Momentum ACCELERATING UP — 5m candles getting bigger. Let winners run, trail stops.", "bullish"),
-            "ACCELERATING_DOWN": ("🚀 Momentum ACCELERATING DOWN — selling intensifying on 5m. Don't catch the knife.", "bearish"),
-            "LOSING_UPSIDE_MOMENTUM": ("⚠️ MOMENTUM WARNING: Last 5m candle went against the uptrend. If long, tighten stops.", "warning"),
-            "LOSING_DOWNSIDE_MOMENTUM": ("⚠️ MOMENTUM WARNING: Last 5m candle went against the downtrend. If short, tighten stops.", "warning"),
-            "STALLING": ("Price is STALLING on 5m — no clear direction. This is where traps happen. Wait for decisive candle.", "neutral"),
-            "DRIFTING_UP": ("Drifting higher on 5m — mild bullish pressure.", "info"),
-            "DRIFTING_DOWN": ("Drifting lower on 5m — mild bearish pressure.", "info"),
-        }
-        if state.momentum in momentum_map:
-            text, mtype = momentum_map[state.momentum]
-            guidance.append({"text": text, "type": mtype})
-
-        # ── v1.1: Intraday levels section ──
+                g.append({"text": f"NO-MAN'S LAND ${lvl.micro_trigger_down:.2f}-${lvl.micro_trigger_up:.2f}. Wait for trigger.", "type": "neutral"})
+        mm = {"ACCELERATING_UP": ("Momentum ACCELERATING UP — trail stops.", "bullish"), "ACCELERATING_DOWN": ("Momentum ACCELERATING DOWN — don't catch knife.", "bearish"), "LOSING_UPSIDE_MOMENTUM": ("Upside momentum fading. Tighten if long.", "warning"), "LOSING_DOWNSIDE_MOMENTUM": ("Downside momentum fading. Tighten if short.", "warning"), "STALLING": ("Price STALLING — traps happen here.", "neutral")}
+        if state.momentum in mm: t, ty = mm[state.momentum]; g.append({"text": t, "type": ty})
         intraday = IntradayLevelTracker.get_active_levels(state, price)
-        id_sup = intraday["support"]
-        id_res = intraday["resistance"]
-
-        if id_sup or id_res:
-            guidance.append({"text": "— INTRADAY LEVELS (formed today from 5m price action) —", "type": "divider"})
-
-            if id_sup:
-                action = "Failed break below = squeeze long." if thesis.gex_sign == "positive" else "Break with momentum = valid short."
-                guidance.append({
-                    "text": f"Intraday support: ${id_sup.price:.2f} "
-                            f"({id_sup.source.replace('_', ' ')}, {id_sup.touches} touches). {action}",
-                    "type": "info",
-                })
-            if id_res:
-                action = "Failed break above = fade short." if thesis.gex_sign == "positive" else "Break with momentum = valid long."
-                guidance.append({
-                    "text": f"Intraday resistance: ${id_res.price:.2f} "
-                            f"({id_res.source.replace('_', ' ')}, {id_res.touches} touches). {action}",
-                    "type": "info",
-                })
-
-        # ── Session range ──
+        ids, idr = intraday["support"], intraday["resistance"]
+        if ids or idr:
+            g.append({"text": "— INTRADAY LEVELS —", "type": "divider"})
+            if ids:
+                act = "Failed break = squeeze." if thesis.gex_sign == "positive" else "Break with momentum = short."
+                g.append({"text": f"Support: ${ids.price:.2f} ({ids.source.replace('_',' ')}, {ids.touches}x). {act}", "type": "info"})
+            if idr:
+                act = "Failed break = fade." if thesis.gex_sign == "positive" else "Break with momentum = long."
+                g.append({"text": f"Resistance: ${idr.price:.2f} ({idr.source.replace('_',' ')}, {idr.touches}x). {act}", "type": "info"})
         if state.session_high is not None and state.session_low is not None:
-            rng = state.session_high - state.session_low
-            guidance.append({
-                "text": f"Session range: ${state.session_low:.2f} ({state.session_low_time}) → "
-                        f"${state.session_high:.2f} ({state.session_high_time}) = ${rng:.2f} wide",
-                "type": "context",
-            })
-
-        # ── Failed move setups (the key differentiator) ──
+            g.append({"text": f"Session: ${state.session_low:.2f}-${state.session_high:.2f} (${state.session_high - state.session_low:.2f} wide)", "type": "context"})
         if state.failed_moves:
-            last_fail = state.failed_moves[-1]
-            age_min = (time.monotonic() - last_fail.break_time) / 60
-            if age_min < 30:  # still relevant
-                src_note = " (intraday level)" if "intraday" in last_fail.level_name else ""
-                if last_fail.direction == "DOWN":
-                    guidance.append({
-                        "text": f"🔥 ACTIVE SQUEEZE SETUP: Failed breakdown at ${last_fail.level:.2f} "
-                                f"({last_fail.level_name}{src_note}) was reclaimed. Shorts are trapped. "
-                                f"Bias flips LONG. Stop: below ${last_fail.level:.2f}.",
-                        "type": "critical",
-                    })
-                else:
-                    guidance.append({
-                        "text": f"🔥 ACTIVE FADE SETUP: Failed breakout at ${last_fail.level:.2f} "
-                                f"({last_fail.level_name}{src_note}) was lost. Longs are trapped. "
-                                f"Bias flips SHORT. Stop: above ${last_fail.level:.2f}.",
-                        "type": "critical",
-                    })
+            lf = state.failed_moves[-1]; age = (time.monotonic() - lf.break_time) / 60
+            if age < 30:
+                if lf.direction == "DOWN": g.append({"text": f"🔥 ACTIVE SQUEEZE at ${lf.level:.2f}. Shorts trapped. Bias LONG. Stop below.", "type": "critical"})
+                else: g.append({"text": f"🔥 ACTIVE FADE at ${lf.level:.2f}. Longs trapped. Bias SHORT. Stop above.", "type": "critical"})
         elif state.status == "BREAK_IN_PROGRESS":
-            guidance.append({
-                "text": "⏳ BREAK IN PROGRESS: A level was just broken. Do NOT trade yet — "
-                        "wait 2-3 five-minute candles for follow-through. If it fails and reclaims, that's the trade.",
-                "type": "warning",
-            })
-
-        # ── What to watch next ──
-        guidance.append({"text": "— WHAT TO WATCH NEXT —", "type": "divider"})
-
-        # Use intraday levels if available, fall back to daily
-        nearest_sup = id_sup.price if id_sup else lvl.local_support
-        nearest_res = id_res.price if id_res else lvl.local_resistance
-        sup_label = "intraday support" if id_sup else "daily support"
-        res_label = "intraday resistance" if id_res else "daily resistance"
-
-        if nearest_res is not None and nearest_sup is not None:
-            dist_res = nearest_res - price
-            dist_sup = price - nearest_sup
-
-            if dist_res < dist_sup:
-                guidance.append({
-                    "text": f"Nearest test: {res_label} at ${nearest_res:.2f} ({dist_res:.2f} away). "
-                            f"If it rejects → short toward ${nearest_sup:.2f}. "
-                            f"If it breaks AND holds on 5m → long.",
-                    "type": "info",
-                })
-            else:
-                guidance.append({
-                    "text": f"Nearest test: {sup_label} at ${nearest_sup:.2f} ({dist_sup:.2f} away). "
-                            f"If it bounces → long toward ${nearest_res:.2f}. "
-                            f"If it breaks AND fails on 5m → squeeze long (the best trade).",
-                    "type": "info",
-                })
-
-        # ── GEX-specific behavior ──
+            g.append({"text": "⏳ BREAK IN PROGRESS — wait 2-3 candles for confirm or failure.", "type": "warning"})
+        g.append({"text": "— WHAT TO WATCH —", "type": "divider"})
+        ns = ids.price if ids else lvl.local_support; nr = idr.price if idr else lvl.local_resistance
+        if nr is not None and ns is not None:
+            dr, ds = nr - price, price - ns
+            if dr < ds: g.append({"text": f"Nearest: resistance ${nr:.2f} ({dr:.2f} away). Reject → short. Break+hold → long.", "type": "info"})
+            else: g.append({"text": f"Nearest: support ${ns:.2f} ({ds:.2f} away). Bounce → long. Break+fail → squeeze.", "type": "info"})
         if thesis.gex_sign == "positive":
-            if tp["phase"] in ("POWER_HOUR", "CLOSE"):
-                guidance.append({
-                    "text": "GEX+ near close = maximum pinning. Expect price pulled toward max pain / pin zone. Fade extremes.",
-                    "type": "time",
-                })
-            guidance.append({
-                "text": "GEX+ reminder: Failed moves and mean reversion are MORE likely than continuation.",
-                "type": "context",
-            })
-        else:
-            guidance.append({
-                "text": "GEX- reminder: Moves can ACCELERATE. Breakdowns are more dangerous. Wider stops or smaller size.",
-                "type": "context",
-            })
+            if tp["phase"] in ("POWER_HOUR", "CLOSE"): g.append({"text": "GEX+ near close = max pinning. Fade extremes.", "type": "time"})
+            g.append({"text": "GEX+ reminder: Failed moves > continuation.", "type": "context"})
+        else: g.append({"text": "GEX- reminder: Moves ACCELERATE. Respect breaks. Wider stops.", "type": "context"})
+        return g
 
-        return guidance
-
-    # ── Internal analysis methods ──
-
-    def _evaluate_momentum(self, state: MonitorState, price: float) -> List[dict]:
-        """Track momentum using recent price history."""
-        events = []
-        recent = [p["price"] for p in state.price_history[-MONITOR_MOMENTUM_LOOKBACK:]]
-        if len(recent) < 3:
-            return events
-
-        diffs = [recent[i] - recent[i - 1] for i in range(1, len(recent))]
-        avg_diff = sum(diffs) / len(diffs)
-        last_diff = diffs[-1]
-        old_momentum = state.momentum
-
-        spot = recent[-1] if recent else price
-        threshold = spot * MONITOR_STALL_THRESHOLD_PCT
-
-        if abs(avg_diff) < threshold:
-            state.momentum = "STALLING"
-        elif avg_diff > 0 and last_diff > 0:
-            state.momentum = "ACCELERATING_UP" if last_diff > avg_diff * 1.5 else "DRIFTING_UP"
-        elif avg_diff < 0 and last_diff < 0:
-            state.momentum = "ACCELERATING_DOWN" if last_diff < avg_diff * 1.5 else "DRIFTING_DOWN"
-        elif avg_diff > 0 and last_diff <= 0:
-            state.momentum = "LOSING_UPSIDE_MOMENTUM"
-        elif avg_diff < 0 and last_diff >= 0:
-            state.momentum = "LOSING_DOWNSIDE_MOMENTUM"
-
-        # Alert on momentum transitions that matter
-        if state.momentum != old_momentum:
-            if state.momentum == "LOSING_UPSIDE_MOMENTUM" and old_momentum in ("ACCELERATING_UP", "DRIFTING_UP"):
-                events.append({
-                    "msg": f"⚠️ {state.price_history[-1].get('time_str', '')} — Upside momentum fading. "
-                           f"Last move was against the trend. If long, tighten stops.",
-                    "type": "warning", "priority": 4,
-                    "alert_key": "momentum_fade_up",
-                })
-            elif state.momentum == "LOSING_DOWNSIDE_MOMENTUM" and old_momentum in ("ACCELERATING_DOWN", "DRIFTING_DOWN"):
-                events.append({
-                    "msg": f"⚠️ {state.price_history[-1].get('time_str', '')} — Downside momentum fading. "
-                           f"Bounce attempt forming. If short, tighten stops.",
-                    "type": "warning", "priority": 4,
-                    "alert_key": "momentum_fade_down",
-                })
-
+    def _evaluate_momentum(self, state, price):
+        events = []; recent = [p["price"] for p in state.price_history[-MONITOR_MOMENTUM_LOOKBACK:]]
+        if len(recent) < 3: return events
+        diffs = [recent[i] - recent[i-1] for i in range(1, len(recent))]
+        avg_d = sum(diffs)/len(diffs); last_d = diffs[-1]; old = state.momentum
+        thr = recent[-1] * (MONITOR_STALL_THRESHOLD_PCT / 100)
+        if abs(avg_d) < thr: state.momentum = "STALLING"
+        elif avg_d > 0 and last_d > 0: state.momentum = "ACCELERATING_UP" if last_d > avg_d * 1.5 else "DRIFTING_UP"
+        elif avg_d < 0 and last_d < 0: state.momentum = "ACCELERATING_DOWN" if abs(last_d) > abs(avg_d) * 1.5 else "DRIFTING_DOWN"
+        elif avg_d > 0 and last_d <= 0: state.momentum = "LOSING_UPSIDE_MOMENTUM"
+        elif avg_d < 0 and last_d >= 0: state.momentum = "LOSING_DOWNSIDE_MOMENTUM"
+        if state.momentum != old:
+            if state.momentum == "LOSING_UPSIDE_MOMENTUM" and old in ("ACCELERATING_UP", "DRIFTING_UP"):
+                events.append({"msg": "⚠️ Upside momentum fading. Tighten if long.", "type": "warning", "priority": 4, "alert_key": "mom_fade_up"})
+            elif state.momentum == "LOSING_DOWNSIDE_MOMENTUM" and old in ("ACCELERATING_DOWN", "DRIFTING_DOWN"):
+                events.append({"msg": "⚠️ Downside momentum fading. Tighten if short.", "type": "warning", "priority": 4, "alert_key": "mom_fade_dn"})
         return events
 
-    def _detect_breaks(self, thesis: ThesisContext, state: MonitorState,
-                       price: float, prev_price: float, now: float) -> List[dict]:
-        """Detect when price crosses a key level (daily OR intraday)."""
-        events = []
-        lvl = thesis.levels
-
-        # Define level-pairs to watch: (level_value, level_name, is_support)
-        watch_levels = []
-        if lvl.local_support is not None:
-            watch_levels.append((lvl.local_support, "daily_support", True))
-        if lvl.local_resistance is not None:
-            watch_levels.append((lvl.local_resistance, "daily_resistance", False))
-        if lvl.range_break_down is not None and lvl.range_break_down != lvl.local_support:
-            watch_levels.append((lvl.range_break_down, "range_break_down", True))
-        if lvl.range_break_up is not None and lvl.range_break_up != lvl.local_resistance:
-            watch_levels.append((lvl.range_break_up, "range_break_up", False))
-        if lvl.put_wall is not None and lvl.put_wall != lvl.local_support:
-            watch_levels.append((lvl.put_wall, "put_wall", True))
-        if lvl.call_wall is not None and lvl.call_wall != lvl.local_resistance:
-            watch_levels.append((lvl.call_wall, "call_wall", False))
-
-        # v1.1: Add active intraday levels (skip if too close to a daily level)
+    def _detect_breaks(self, thesis, state, price, prev_price, now):
+        events = []; lvl = thesis.levels; wl = []
+        if lvl.local_support is not None: wl.append((lvl.local_support, "daily_support", True))
+        if lvl.local_resistance is not None: wl.append((lvl.local_resistance, "daily_resistance", False))
+        if lvl.range_break_down is not None and lvl.range_break_down != lvl.local_support: wl.append((lvl.range_break_down, "range_break_down", True))
+        if lvl.range_break_up is not None and lvl.range_break_up != lvl.local_resistance: wl.append((lvl.range_break_up, "range_break_up", False))
+        if lvl.put_wall is not None and lvl.put_wall != lvl.local_support: wl.append((lvl.put_wall, "put_wall", True))
+        if lvl.call_wall is not None and lvl.call_wall != lvl.local_resistance: wl.append((lvl.call_wall, "call_wall", False))
         tol = price * INTRADAY_ZONE_TOLERANCE_PCT / 100
         for il in state.intraday_levels:
-            if not il.active:
-                continue
-            too_close = any(abs(il.price - dlvl) <= tol for (dlvl, _, _) in watch_levels)
-            if too_close:
-                continue
-            if il.kind == "support":
-                # v1.2: Session low updates during a trend are noise — suppress to log only
-                if il.source == "session_low" and state.active_trend_direction == "SHORT":
-                    watch_levels.append((il.price, f"intraday_support ({il.source.replace('_', ' ')})", True))
-                    continue  # will be watched but alerts are low priority
-                watch_levels.append((il.price, f"intraday_support ({il.source.replace('_', ' ')})", True))
-            else:
-                if il.source == "session_high" and state.active_trend_direction == "LONG":
-                    watch_levels.append((il.price, f"intraday_resistance ({il.source.replace('_', ' ')})", False))
-                    continue
-                watch_levels.append((il.price, f"intraday_resistance ({il.source.replace('_', ' ')})", False))
-
-        for level, name, is_support in watch_levels:
-            if is_support:
-                if prev_price >= level and price < level:
-                    ba = BreakAttempt(level=level, level_name=name, direction="DOWN",
-                                     break_price=price, break_time=now)
-                    state.break_attempts.append(ba)
-                    state.status = "BREAK_IN_PROGRESS"
-                    is_range = "range" in name
-                    is_intraday = "intraday" in name
-                    # v1.2: Session low breaks during confirmed trend are noise
-                    is_session_low = "session low" in name
-                    is_trend_continuation = is_session_low and state.active_trend_direction == "SHORT"
-                    if is_range:
-                        events.append({
-                            "msg": f"🚨 RANGE BREAK DOWN: Below ${level:.2f} ({name}). "
-                                   f"If this fails to continue → SQUEEZE potential is high (GEX={thesis.gex_sign}).",
-                            "type": "critical", "priority": 5,
-                            "alert_key": f"break_down_{name}_{level:.2f}",
-                        })
-                    elif is_trend_continuation:
-                        # Log only — don't spam Telegram during a confirmed trend
-                        events.append({
-                            "msg": f"📉 Trend continuing: new session low ${level:.2f}.",
-                            "type": "info", "priority": 1,
-                            "alert_key": f"trend_cont_low_{level:.2f}",
-                        })
-                    elif is_intraday:
-                        events.append({
-                            "msg": f"🔻 INTRADAY BREAK: Price broke below ${level:.2f} ({name}). "
-                                   f"Watching 5m candles for follow-through or failure.",
-                            "type": "alert", "priority": 4,
-                            "alert_key": f"break_down_id_{level:.2f}",
-                        })
-                    else:
-                        events.append({
-                            "msg": f"🔻 BREAK ATTEMPT: Price broke below {name} ${level:.2f}. "
-                                   f"Watching 5m candles for follow-through or failure.",
-                            "type": "alert", "priority": 4,
-                            "alert_key": f"break_down_{name}",
-                        })
-            else:
-                if prev_price <= level and price > level:
-                    ba = BreakAttempt(level=level, level_name=name, direction="UP",
-                                     break_price=price, break_time=now)
-                    state.break_attempts.append(ba)
-                    state.status = "BREAK_IN_PROGRESS"
-                    is_range = "range" in name
-                    is_intraday = "intraday" in name
-                    # v1.2: Session high breaks during confirmed uptrend are noise
-                    is_session_high = "session high" in name
-                    is_trend_continuation = is_session_high and state.active_trend_direction == "LONG"
-                    if is_range:
-                        events.append({
-                            "msg": f"🚨 RANGE BREAK UP: Above ${level:.2f} ({name}). "
-                                   f"Watching for continuation or trap.",
-                            "type": "critical", "priority": 5,
-                            "alert_key": f"break_up_{name}_{level:.2f}",
-                        })
-                    elif is_trend_continuation:
-                        events.append({
-                            "msg": f"📈 Trend continuing: new session high ${level:.2f}.",
-                            "type": "info", "priority": 1,
-                            "alert_key": f"trend_cont_high_{level:.2f}",
-                        })
-                    elif is_intraday:
-                        events.append({
-                            "msg": f"🔺 INTRADAY BREAK: Price broke above ${level:.2f} ({name}). "
-                                   f"Watching 5m candles for follow-through or failure.",
-                            "type": "alert", "priority": 4,
-                            "alert_key": f"break_up_id_{level:.2f}",
-                        })
-                    else:
-                        events.append({
-                            "msg": f"🔺 BREAK ATTEMPT: Price broke above {name} ${level:.2f}. "
-                                   f"Watching 5m candles for follow-through or failure.",
-                            "type": "alert", "priority": 4,
-                            "alert_key": f"break_up_{name}",
-                        })
-
+            if not il.active: continue
+            if any(abs(il.price - d) <= tol for d, _, _ in wl): continue
+            if il.source == "session_low" and state.active_trend_direction == "SHORT": continue
+            if il.source == "session_high" and state.active_trend_direction == "LONG": continue
+            wl.append((il.price, f"intraday_{il.kind} ({il.source.replace('_',' ')})", il.kind == "support"))
+        for level, name, is_sup in wl:
+            if is_sup and prev_price >= level and price < level:
+                state.break_attempts.append(BreakAttempt(level=level, level_name=name, direction="DOWN", break_price=price, break_time=now))
+                state.status = "BREAK_IN_PROGRESS"
+                events.append({"msg": f"🔻 BREAK ATTEMPT: below ${level:.2f} ({name}). Watching follow-through or reclaim.", "type": "alert", "priority": 4, "alert_key": f"brk_dn_{name}_{level:.2f}"})
+            elif not is_sup and prev_price <= level and price > level:
+                state.break_attempts.append(BreakAttempt(level=level, level_name=name, direction="UP", break_price=price, break_time=now))
+                state.status = "BREAK_IN_PROGRESS"
+                events.append({"msg": f"🔺 BREAK ATTEMPT: above ${level:.2f} ({name}). Watching follow-through or failure.", "type": "alert", "priority": 4, "alert_key": f"brk_up_{name}_{level:.2f}"})
         return events
 
-    def _detect_confirmed_breaks(self, thesis: ThesisContext, state: MonitorState,
-                                 price: float, now: float) -> List[dict]:
-        """
-        v1.2: Detect when a break has FOLLOW-THROUGH — the trade is confirmed.
-
-        In GEX- environments, a break with continuation IS the trade.
-        In GEX+ environments, we wait for failure instead (handled by _detect_failed_moves).
-
-        Fires a highly distinctive alert so the trader knows to act.
-        """
-        events = []
-
+    def _detect_confirmed_breaks(self, thesis, state, price, now):
+        events = []; tp = _get_time_phase_ct()
         for ba in state.break_attempts:
-            if ba.detected_as_failed or ba.detected_as_confirmed:
-                continue
-            if (now - ba.break_time) > MONITOR_MAX_BREAK_AGE_SEC:
-                continue
-
-            # Need at least 2 candles to confirm follow-through
-            if ba.candles_since < 2:
-                continue
-
-            # Skip session low/high — those are just the trend continuing, not new signals
-            if "session low" in ba.level_name or "session high" in ba.level_name:
-                continue
-
-            # Check follow-through: price continued in the break direction
-            continued = False
-            if ba.direction == "DOWN" and price < ba.break_price:
-                continued = True
-            elif ba.direction == "UP" and price > ba.break_price:
-                continued = True
-
-            if not continued:
-                continue  # No follow-through — _detect_failed_moves will handle reclaim
-
-            ba.detected_as_confirmed = True
-            state.confirmed_breaks.append(ba)
-
+            if ba.detected_as_failed or ba.detected_as_confirmed: continue
+            if (now - ba.break_time) > MONITOR_MAX_BREAK_AGE_SEC: continue
+            req = 2 if tp["phase"] in ("MORNING", "AFTERNOON") else 3
+            if ba.candles_since < req: continue
+            buf = ba.level * (MONITOR_CONFIRM_BUFFER_PCT / 100); net = self._recent_net_move(state, 3)
+            if ba.direction == "DOWN":
+                ok = price < (ba.level - buf) and net < -(ba.level * 0.0012)
+            else:
+                ok = price > (ba.level + buf) and net > (ba.level * 0.0012)
+            if not ok: continue
+            ba.detected_as_confirmed = True; ba.retest_armed = True
+            state.confirmed_breaks.append(ba); state.status = "BREAK_CONFIRMED"
+            ext = abs(price - ba.level) / ba.level * 100; chase = ext > MONITOR_EXTENSION_LIMIT_PCT
             if ba.direction == "DOWN":
                 state.active_trend_direction = "SHORT"
-                state.status = "BREAK_CONFIRMED"
-
                 if thesis.gex_sign == "negative":
-                    # GEX- confirmed breakdown = THE TRADE
-                    events.append({
-                        "msg": (
-                            f"🟥🟥🟥 BREAKDOWN CONFIRMED — PUTS / SHORT 🟥🟥🟥\n"
-                            f"\n"
-                            f"${ba.level:.2f} ({ba.level_name}) broke with follow-through.\n"
-                            f"GEX is NEGATIVE — dealers amplify the move.\n"
-                            f"Price: ${price:.2f} (continued ${abs(price - ba.level):.2f} past break)\n"
-                            f"\n"
-                            f"💰 TRADE TYPE: Naked puts — GEX- trend can run. Uncapped upside.\n"
-                            f"ENTRY: Buy puts near the money\n"
-                            f"STOP: Exit if price reclaims ${ba.level:.2f}\n"
-                            f"TARGET: Next support below — let the trend work\n"
-                            f"\n"
-                            f"Trailing alerts will track new levels. The trend is active."
-                        ),
-                        "type": "trade_confirmed", "priority": 5,
-                        "alert_key": f"confirmed_short_{ba.level:.2f}",
-                    })
+                    tt = "💰 TRADE TYPE: Naked puts — GEX- trend can run."
+                    if chase:
+                        events.append({"msg": f"🟥 BREAKDOWN CONFIRMED — EXTENDED\n\n${ba.level:.2f} ({ba.level_name}) broke. Price {ext:.2f}% past — DON'T CHASE.\nWait for retest of ${ba.level:.2f}.\nSTOP: above ${ba.level:.2f}\n{tt}", "type": "trade_confirmed", "priority": 5, "alert_key": f"conf_short_wait_{ba.level:.2f}"})
+                    else:
+                        events.append({"msg": f"🟥🟥🟥 BREAKDOWN CONFIRMED — PUTS / SHORT 🟥🟥🟥\n\n${ba.level:.2f} ({ba.level_name}) broke with follow-through.\nGEX NEGATIVE — dealers amplify.\n\n{tt}\nENTRY: Buy puts near the money\nSTOP: Reclaim above ${ba.level:.2f}\nTARGET: Next support — let trend work", "type": "trade_confirmed", "priority": 5, "alert_key": f"conf_short_{ba.level:.2f}"})
                 else:
-                    # GEX+ but break still continued — note it but with caution
-                    events.append({
-                        "msg": (
-                            f"⚠️ BREAKDOWN WITH FOLLOW-THROUGH at ${ba.level:.2f} ({ba.level_name})\n"
-                            f"Price continued to ${price:.2f}. BUT GEX is positive — "
-                            f"mean reversion is still possible. If price reclaims ${ba.level:.2f}, "
-                            f"squeeze long becomes the play. Proceed with caution."
-                        ),
-                        "type": "warning", "priority": 4,
-                        "alert_key": f"followthru_down_{ba.level:.2f}",
-                    })
-
-            elif ba.direction == "UP":
+                    events.append({"msg": f"⚠️ BREAKDOWN + FOLLOW-THROUGH at ${ba.level:.2f}\nGEX+ — mean reversion possible. Reclaim = squeeze long.", "type": "warning", "priority": 4, "alert_key": f"ft_dn_{ba.level:.2f}"})
+            else:
                 state.active_trend_direction = "LONG"
-                state.status = "BREAK_CONFIRMED"
-
                 if thesis.gex_sign == "negative":
-                    # GEX- confirmed breakout = THE TRADE
-                    events.append({
-                        "msg": (
-                            f"🟩🟩🟩 BREAKOUT CONFIRMED — CALLS / LONG 🟩🟩🟩\n"
-                            f"\n"
-                            f"${ba.level:.2f} ({ba.level_name}) broke with follow-through.\n"
-                            f"GEX is NEGATIVE — dealers amplify the move.\n"
-                            f"Price: ${price:.2f} (continued ${abs(price - ba.level):.2f} past break)\n"
-                            f"\n"
-                            f"💰 TRADE TYPE: Naked calls — GEX- trend can run. Uncapped upside.\n"
-                            f"ENTRY: Buy calls near the money\n"
-                            f"STOP: Exit if price loses ${ba.level:.2f}\n"
-                            f"TARGET: Next resistance above — let the trend work\n"
-                            f"\n"
-                            f"Trailing alerts will track new levels. The trend is active."
-                        ),
-                        "type": "trade_confirmed", "priority": 5,
-                        "alert_key": f"confirmed_long_{ba.level:.2f}",
-                    })
+                    tt = "💰 TRADE TYPE: Naked calls — GEX- trend can run."
+                    if chase:
+                        events.append({"msg": f"🟩 BREAKOUT CONFIRMED — EXTENDED\n\n${ba.level:.2f} ({ba.level_name}) broke. Price {ext:.2f}% past — DON'T CHASE.\nWait for retest of ${ba.level:.2f}.\nSTOP: below ${ba.level:.2f}\n{tt}", "type": "trade_confirmed", "priority": 5, "alert_key": f"conf_long_wait_{ba.level:.2f}"})
+                    else:
+                        events.append({"msg": f"🟩🟩🟩 BREAKOUT CONFIRMED — CALLS / LONG 🟩🟩🟩\n\n${ba.level:.2f} ({ba.level_name}) broke with follow-through.\nGEX NEGATIVE — dealers amplify.\n\n{tt}\nENTRY: Buy calls near the money\nSTOP: Lose ${ba.level:.2f}\nTARGET: Next resistance — let trend work", "type": "trade_confirmed", "priority": 5, "alert_key": f"conf_long_{ba.level:.2f}"})
                 else:
-                    events.append({
-                        "msg": (
-                            f"⚠️ BREAKOUT WITH FOLLOW-THROUGH at ${ba.level:.2f} ({ba.level_name})\n"
-                            f"Price continued to ${price:.2f}. BUT GEX is positive — "
-                            f"mean reversion is still possible. If price loses ${ba.level:.2f}, "
-                            f"fade short becomes the play. Proceed with caution."
-                        ),
-                        "type": "warning", "priority": 4,
-                        "alert_key": f"followthru_up_{ba.level:.2f}",
-                    })
-
+                    events.append({"msg": f"⚠️ BREAKOUT + FOLLOW-THROUGH at ${ba.level:.2f}\nGEX+ — mean reversion possible. Lose level = fade short.", "type": "warning", "priority": 4, "alert_key": f"ft_up_{ba.level:.2f}"})
         return events
 
-    def _detect_failed_moves(self, thesis: ThesisContext, state: MonitorState,
-                             price: float, now: float) -> List[dict]:
-        """Detect when a break attempt fails and price reclaims the level."""
-        events = []
-        reclaim_buffer = price * MONITOR_RECLAIM_THRESHOLD_PCT
-
+    def _detect_failed_moves(self, thesis, state, price, now):
+        events = []; rb = price * (MONITOR_RECLAIM_THRESHOLD_PCT / 100)
         for ba in state.break_attempts:
-            if ba.detected_as_failed or ba.detected_as_confirmed:
-                continue
-            if (now - ba.break_time) > MONITOR_MAX_BREAK_AGE_SEC:
-                continue  # too old
-
-            # Need at least 2 candles (checks) for the break to have had time to continue or fail
-            if ba.candles_since < 2:
-                continue
-
-            if ba.direction == "DOWN" and price > ba.level + reclaim_buffer:
-                # Failed breakdown → SQUEEZE
-                ba.detected_as_failed = True
-                state.failed_moves.append(ba)
-                state.status = "FAILED_MOVE_ACTIVE"
-
-                gex_note = ""
-                trade_type = ""
-                if thesis.gex_sign == "positive":
-                    gex_note = " GEX+ amplifies mean reversion — squeeze probability is HIGH."
-                    trade_type = "\n💰 TRADE TYPE: Call debit spread — GEX+ reversal move is capped. Spread reduces cost."
+            if ba.detected_as_failed or ba.detected_as_confirmed: continue
+            if (now - ba.break_time) > MONITOR_MAX_BREAK_AGE_SEC or ba.candles_since < 2: continue
+            reclaimed = (ba.direction == "DOWN" and price > ba.level + rb) or (ba.direction == "UP" and price < ba.level - rb)
+            if reclaimed:
+                if not ba.reclaim_seen:
+                    ba.reclaim_seen = True; ba.reclaim_price = price; ba.reclaim_time = now; ba.reclaim_holds = 0; continue
+                ba.reclaim_holds += 1
+                if ba.reclaim_holds < MONITOR_MIN_HOLD_POLLS_AFTER_RECLAIM: continue
+                ba.detected_as_failed = True; ba.retest_armed = True
+                state.failed_moves.append(ba); state.status = "FAILED_MOVE_ACTIVE"
+                ext = abs(price - ba.level) / ba.level * 100; late = ext > MONITOR_EXTENSION_LIMIT_PCT
+                if ba.direction == "DOWN":
+                    rn = ("GEX+ — squeeze probability HIGH." if thesis.gex_sign == "positive" else "GEX- squeeze can run hard.")
+                    tt = ("\n💰 TRADE TYPE: Call debit spread — GEX+ reversal capped." if thesis.gex_sign == "positive" else "\n💰 TRADE TYPE: Naked calls — GEX- squeeze can run.")
+                    if late:
+                        events.append({"msg": f"🔥 FAILED BREAKDOWN at ${ba.level:.2f}\n\nReclaimed + held. Shorts trapped.\n⚠️ Extended {ext:.2f}% — DON'T CHASE.\nWait for retest.\nSTOP: below level\n{rn}{tt}", "type": "critical", "priority": 5, "alert_key": f"fb_late_{ba.level:.2f}"})
+                    else:
+                        events.append({"msg": f"🔥 FAILED BREAKDOWN — SQUEEZE LONG\n\n${ba.level:.2f} held after reclaim. Shorts trapped.\n\nENTRY: Now\nSTOP: Below ${ba.level:.2f}\n{rn}{tt}", "type": "critical", "priority": 5, "alert_key": f"fb_now_{ba.level:.2f}"})
                 else:
-                    trade_type = "\n💰 TRADE TYPE: Naked calls — failed move in GEX- can squeeze hard."
-
-                source_note = " (intraday level)" if "intraday" in ba.level_name else ""
-
-                events.append({
-                    "msg": f"🔥 FAILED BREAKDOWN at ${ba.level:.2f} ({ba.level_name}{source_note}) — "
-                           f"price reclaimed to ${price:.2f}. "
-                           f"Shorts are trapped below. SQUEEZE SETUP LONG. "
-                           f"Stop: below ${ba.level:.2f}.{gex_note}{trade_type}",
-                    "type": "critical", "priority": 5,
-                    "alert_key": f"failed_break_{ba.level:.2f}",
-                })
-
-            elif ba.direction == "UP" and price < ba.level - reclaim_buffer:
-                # Failed breakout → FADE
-                ba.detected_as_failed = True
-                state.failed_moves.append(ba)
-                state.status = "FAILED_MOVE_ACTIVE"
-
-                gex_note = ""
-                trade_type = ""
-                if thesis.gex_sign == "positive":
-                    gex_note = " GEX+ amplifies mean reversion — fade probability is HIGH."
-                    trade_type = "\n💰 TRADE TYPE: Put debit spread — GEX+ reversal move is capped. Spread reduces cost."
-                else:
-                    trade_type = "\n💰 TRADE TYPE: Naked puts — failed move in GEX- can dump hard."
-
-                source_note = " (intraday level)" if "intraday" in ba.level_name else ""
-
-                events.append({
-                    "msg": f"🔥 FAILED BREAKOUT at ${ba.level:.2f} ({ba.level_name}{source_note}) — "
-                           f"price fell back to ${price:.2f}. "
-                           f"Longs are trapped above. FADE SETUP SHORT. "
-                           f"Stop: above ${ba.level:.2f}.{gex_note}{trade_type}",
-                    "type": "critical", "priority": 5,
-                    "alert_key": f"failed_break_{ba.level_name}",
-                })
-
+                    rn = ("GEX+ — fade probability HIGH." if thesis.gex_sign == "positive" else "GEX- downside can accelerate.")
+                    tt = ("\n💰 TRADE TYPE: Put debit spread — GEX+ reversal capped." if thesis.gex_sign == "positive" else "\n💰 TRADE TYPE: Naked puts — GEX- dump can run.")
+                    if late:
+                        events.append({"msg": f"🔥 FAILED BREAKOUT at ${ba.level:.2f}\n\nLost + held. Longs trapped.\n⚠️ Extended {ext:.2f}% — DON'T CHASE.\nWait for retest.\nSTOP: above level\n{rn}{tt}", "type": "critical", "priority": 5, "alert_key": f"fbo_late_{ba.level:.2f}"})
+                    else:
+                        events.append({"msg": f"🔥 FAILED BREAKOUT — FADE SHORT\n\n${ba.level:.2f} lost and held. Longs trapped.\n\nENTRY: Now\nSTOP: Above ${ba.level:.2f}\n{rn}{tt}", "type": "critical", "priority": 5, "alert_key": f"fbo_now_{ba.level:.2f}"})
+            else:
+                if ba.reclaim_seen and not ba.detected_as_failed:
+                    ba.reclaim_seen = False; ba.reclaim_price = None; ba.reclaim_time = 0.0; ba.reclaim_holds = 0
         return events
 
-    def _check_gamma_flip(self, thesis: ThesisContext, state: MonitorState,
-                          price: float) -> List[dict]:
-        """Track gamma flip crossovers."""
-        events = []
-        flip = thesis.levels.gamma_flip
-        if flip is None:
-            return events
+    def _detect_retests(self, thesis, state, price, now):
+        events = []; net = self._recent_net_move(state, 3)
+        for ba in state.break_attempts:
+            if not ba.retest_armed or ba.retest_fired: continue
+            if (now - ba.break_time) > MONITOR_MAX_BREAK_AGE_SEC: continue
+            tol = ba.level * (MONITOR_RETEST_TOLERANCE_PCT / 100)
+            if abs(price - ba.level) > tol: continue
+            if ba.detected_as_confirmed and ba.direction == "DOWN" and net < -(ba.level * 0.0008):
+                ba.retest_fired = True; tt = "💰 Naked puts" if thesis.gex_sign == "negative" else "💰 Put debit spread"
+                events.append({"msg": f"🎯 RETEST SHORT ENTRY\n\nBreakdown retested ${ba.level:.2f} and rejecting.\n\nENTRY: short / puts\nSTOP: above ${ba.level:.2f}\n{tt}", "type": "critical", "priority": 5, "alert_key": f"rt_short_{ba.level:.2f}"})
+            elif ba.detected_as_confirmed and ba.direction == "UP" and net > (ba.level * 0.0008):
+                ba.retest_fired = True; tt = "💰 Naked calls" if thesis.gex_sign == "negative" else "💰 Call debit spread"
+                events.append({"msg": f"🎯 RETEST LONG ENTRY\n\nBreakout retested ${ba.level:.2f} and holding.\n\nENTRY: long / calls\nSTOP: below ${ba.level:.2f}\n{tt}", "type": "critical", "priority": 5, "alert_key": f"rt_long_{ba.level:.2f}"})
+            elif ba.detected_as_failed and ba.direction == "DOWN" and net > (ba.level * 0.0008):
+                ba.retest_fired = True; tt = "💰 Call debit spread" if thesis.gex_sign == "positive" else "💰 Naked calls"
+                events.append({"msg": f"🎯 RETEST LONG (squeeze)\n\nFailed breakdown retested ${ba.level:.2f} and holding.\n\nENTRY: long / calls\nSTOP: below ${ba.level:.2f}\n{tt}", "type": "critical", "priority": 5, "alert_key": f"rt_fl_{ba.level:.2f}"})
+            elif ba.detected_as_failed and ba.direction == "UP" and net < -(ba.level * 0.0008):
+                ba.retest_fired = True; tt = "💰 Put debit spread" if thesis.gex_sign == "positive" else "💰 Naked puts"
+                events.append({"msg": f"🎯 RETEST SHORT (fade)\n\nFailed breakout retested ${ba.level:.2f} and rejecting.\n\nENTRY: short / puts\nSTOP: above ${ba.level:.2f}\n{tt}", "type": "critical", "priority": 5, "alert_key": f"rt_fs_{ba.level:.2f}"})
+        return events
 
+    def _check_gamma_flip(self, thesis, state, price):
+        events = []; flip = thesis.levels.gamma_flip
+        if flip is None: return events
         above = price > flip
         if state.above_gamma_flip is not None and above != state.above_gamma_flip:
-            if above:
-                events.append({
-                    "msg": f"📈 RECLAIMED GAMMA FLIP (${flip:.2f}) — "
-                           f"bullish structure improving, dealers shift to buying dips.",
-                    "type": "critical", "priority": 5,
-                    "alert_key": "gamma_flip_reclaim",
-                })
-            else:
-                events.append({
-                    "msg": f"📉 LOST GAMMA FLIP (${flip:.2f}) — "
-                           f"bearish pressure increasing, dealers amplify selling.",
-                    "type": "critical", "priority": 5,
-                    "alert_key": "gamma_flip_lost",
-                })
-        state.above_gamma_flip = above
-        return events
+            if above: events.append({"msg": f"📈 RECLAIMED GAMMA FLIP ${flip:.2f} — bullish improving.", "type": "critical", "priority": 5, "alert_key": "gf_reclaim"})
+            else: events.append({"msg": f"📉 LOST GAMMA FLIP ${flip:.2f} — bearish pressure.", "type": "critical", "priority": 5, "alert_key": "gf_lost"})
+        state.above_gamma_flip = above; return events
 
-    def _apply_cooldowns(self, state: MonitorState, events: List[dict],
-                         now: float) -> List[dict]:
-        """Filter events by cooldown to prevent alert spam."""
-        filtered = []
+    def _apply_cooldowns(self, state, events, now):
+        out = []
         for e in events:
-            key = e.get("alert_key", e.get("msg", "")[:40])
-            last = state.alert_history.get(key, 0)
-            if (now - last) >= MONITOR_ALERT_COOLDOWN_SEC:
-                state.alert_history[key] = now
-                filtered.append(e)
-            else:
-                log.debug(f"Alert cooled down: {key}")
-        return filtered
+            k = e.get("alert_key", e.get("msg", "")[:40]); last = state.alert_history.get(k, 0)
+            if (now - last) >= MONITOR_ALERT_COOLDOWN_SEC: state.alert_history[k] = now; out.append(e)
+        return out
 
-    def format_status(self, ticker: str) -> str:
-        """Format current monitoring status for /monitor command."""
-        thesis = self._theses.get(ticker)
-        state = self._states.get(ticker)
-        if not thesis:
-            return f"📡 {ticker}: No thesis loaded. Run /em to generate one."
-
-        price = state.price_history[-1]["price"] if state and state.price_history else thesis.spot_at_creation
-        lines = [
-            f"📡 {ticker} — THESIS MONITOR",
-            f"Status: {state.status if state else 'INACTIVE'}",
-            f"Bias: {thesis.bias} ({thesis.bias_score:+d}/14)",
-            f"GEX: {thesis.gex_sign} ({thesis.gex_value:+.1f}M) | Regime: {thesis.regime}",
-            f"Last Price: ${price:.2f}",
-        ]
+    def format_status(self, ticker):
+        thesis = self._theses.get(ticker); state = self._states.get(ticker)
+        if not thesis: return f"📡 {ticker}: No thesis. Run /em."
+        p = state.price_history[-1]["price"] if state and state.price_history else thesis.spot_at_creation
+        lines = [f"📡 {ticker} MONITOR", f"Status: {state.status if state else 'INACTIVE'}", f"Bias: {thesis.bias} ({thesis.bias_score:+d}/14)", f"GEX: {thesis.gex_sign} ({thesis.gex_value:+.1f}M) | {thesis.regime}", f"Price: ${p:.2f}"]
         if state:
-            lines.append(f"Momentum: {state.momentum}")
-            lines.append(f"Checks: {state.check_count}")
-
-            if state.session_high is not None and state.session_low is not None:
-                lines.append(f"Session: ${state.session_low:.2f} – ${state.session_high:.2f}")
-
-            active_levels = [l for l in state.intraday_levels if l.active]
-            if active_levels:
-                sup_levels = [l for l in active_levels if l.kind == "support"]
-                res_levels = [l for l in active_levels if l.kind == "resistance"]
-                lines.append(f"Intraday levels: {len(sup_levels)} support, {len(res_levels)} resistance")
-                for l in sorted(sup_levels, key=lambda x: x.price, reverse=True)[:2]:
-                    lines.append(f"  🟢 ${l.price:.2f} support ({l.source}, {l.touches}x)")
-                for l in sorted(res_levels, key=lambda x: x.price)[:2]:
-                    lines.append(f"  🔴 ${l.price:.2f} resistance ({l.source}, {l.touches}x)")
-
-            if state.break_attempts:
-                active = [ba for ba in state.break_attempts
-                          if not ba.detected_as_failed and (time.monotonic() - ba.break_time) < MONITOR_MAX_BREAK_AGE_SEC]
-                if active:
-                    lines.append(f"Active breaks: {len(active)}")
-            if state.failed_moves:
-                lines.append(f"Failed moves detected: {len(state.failed_moves)}")
-
-        tp = _get_time_phase_ct()
-        lines.append(f"Phase: {tp['label']}")
-        is_fast = ticker.upper() in MONITOR_FAST_POLL_TICKERS
-        poll_sec = MONITOR_POLL_INTERVAL_FAST_SEC if is_fast else MONITOR_POLL_INTERVAL_SEC
-        lines.append(f"Polling: every {poll_sec}s ({'fast 1m' if is_fast else '5m candles'}, intraday levels active)")
+            lines.append(f"Momentum: {state.momentum}"); lines.append(f"Checks: {state.check_count}")
+            if state.session_high and state.session_low: lines.append(f"Session: ${state.session_low:.2f}-${state.session_high:.2f}")
+            al = [l for l in state.intraday_levels if l.active]
+            if al: lines.append(f"Levels: {sum(1 for l in al if l.kind=='support')}S / {sum(1 for l in al if l.kind=='resistance')}R")
+            if state.confirmed_breaks: lines.append(f"Confirmed: {len(state.confirmed_breaks)}")
+            if state.failed_moves: lines.append(f"Failed moves: {len(state.failed_moves)}")
+        tp = _get_time_phase_ct(); lines.append(f"Phase: {tp['label']}")
+        fast = ticker.upper() in MONITOR_FAST_POLL_TICKERS
+        lines.append(f"Poll: {MONITOR_POLL_INTERVAL_FAST_SEC if fast else MONITOR_POLL_INTERVAL_SEC}s")
         return "\n".join(lines)
 
-
-# ─────────────────────────────────────────────────────────
-# BACKGROUND DAEMON
-# ─────────────────────────────────────────────────────────
-
 class ThesisMonitorDaemon:
-    """
-    Background thread that polls prices and sends alerts.
-
-    Wired into app.py — needs:
-      - get_spot_fn(ticker) -> float
-      - post_fn(text) -> None (Telegram poster)
-    """
-
-    def __init__(self, engine: ThesisMonitorEngine,
-                 get_spot_fn: Callable, post_fn: Callable):
-        self.engine = engine
-        self.get_spot = get_spot_fn
-        self.post_fn = post_fn
-        self._enabled = True
-        self._thread = None
-        self._stop_event = threading.Event()
-
+    def __init__(self, engine, get_spot_fn, post_fn):
+        self.engine = engine; self.get_spot = get_spot_fn; self.post_fn = post_fn
+        self._enabled = True; self._thread = None; self._stop_event = threading.Event()
     def start(self):
-        if self._thread and self._thread.is_alive():
-            log.info("Thesis monitor daemon already running")
-            return
+        if self._thread and self._thread.is_alive(): return
         self._stop_event.clear()
-        self._thread = threading.Thread(target=self._run, daemon=True, name="thesis-monitor")
-        self._thread.start()
+        self._thread = threading.Thread(target=self._run, daemon=True, name="thesis-monitor"); self._thread.start()
         log.info("Thesis monitor daemon started")
-
-    def stop(self):
-        self._stop_event.set()
-        log.info("Thesis monitor daemon stop requested")
-
+    def stop(self): self._stop_event.set(); log.info("Thesis monitor stop requested")
     @property
-    def is_running(self):
-        return self._thread is not None and self._thread.is_alive()
-
+    def is_running(self): return self._thread is not None and self._thread.is_alive()
     def _run(self):
-        log.info(f"Thesis monitor polling loop started "
-                 f"(fast={MONITOR_POLL_INTERVAL_FAST_SEC}s for {MONITOR_FAST_POLL_TICKERS}, "
-                 f"normal={MONITOR_POLL_INTERVAL_SEC}s for others)")
-        self._cycle_count = 0
-        # Use fast interval as base loop; slow tickers check every Nth cycle
-        self._slow_every_n = max(1, MONITOR_POLL_INTERVAL_SEC // MONITOR_POLL_INTERVAL_FAST_SEC)
+        log.info(f"Thesis monitor: fast={MONITOR_POLL_INTERVAL_FAST_SEC}s for {MONITOR_FAST_POLL_TICKERS}, normal={MONITOR_POLL_INTERVAL_SEC}s")
+        self._cycle_count = 0; self._slow_n = max(1, MONITOR_POLL_INTERVAL_SEC // MONITOR_POLL_INTERVAL_FAST_SEC)
         while not self._stop_event.is_set():
-            try:
-                self._poll_cycle()
-            except Exception as e:
-                log.error(f"Thesis monitor poll error: {e}", exc_info=True)
-            self._cycle_count += 1
-            self._stop_event.wait(MONITOR_POLL_INTERVAL_FAST_SEC)
-        log.info("Thesis monitor polling loop stopped")
-
+            try: self._poll_cycle()
+            except Exception as e: log.error(f"Thesis monitor poll error: {e}", exc_info=True)
+            self._cycle_count += 1; self._stop_event.wait(MONITOR_POLL_INTERVAL_FAST_SEC)
     def _poll_cycle(self):
-        """One polling cycle — fast tickers every cycle, slow tickers every Nth."""
-        if not self._enabled:
-            return
-
-        # Only poll during market hours
+        if not self._enabled: return
         tp = _get_time_phase_ct()
-        if tp["phase"] in ("PRE_MARKET", "AFTER_HOURS"):
-            return
-
-        is_slow_cycle = (self._cycle_count % self._slow_every_n == 0)
-
+        if tp["phase"] in ("PRE_MARKET", "AFTER_HOURS"): return
+        slow = (self._cycle_count % self._slow_n == 0)
         for ticker in self.engine.get_monitored_tickers():
-            # Fast tickers (SPY) check every cycle; others only on slow cycles
-            is_fast = ticker.upper() in MONITOR_FAST_POLL_TICKERS
-            if not is_fast and not is_slow_cycle:
-                continue
-
+            fast = ticker.upper() in MONITOR_FAST_POLL_TICKERS
+            if not fast and not slow: continue
             thesis = self.engine.get_thesis(ticker)
-            if not thesis:
-                continue  # No thesis loaded for this ticker
-
+            if not thesis: continue
             try:
                 price = self.get_spot(ticker)
-                if not price or price <= 0:
-                    log.warning(f"Thesis monitor: bad price for {ticker}: {price}")
-                    continue
-
-                # Evaluate price against thesis
-                events = self.engine.evaluate(ticker, price)
-
-                # Post any events to Telegram
-                for event in events:
-                    priority = event.get("priority", 1)
-                    if priority >= 3:
-                        # High-priority events get their own message
-                        self._post_alert(ticker, price, event)
-                    else:
-                        log.info(f"Thesis monitor [{ticker}]: {event.get('msg', '')}")
-
-            except Exception as e:
-                log.warning(f"Thesis monitor price check failed for {ticker}: {e}")
-
-    def _post_alert(self, ticker: str, price: float, event: dict):
-        """Format and send an alert to Telegram."""
-        tp = _get_time_phase_ct()
-        state = self.engine.get_state(ticker)
-        thesis = self.engine.get_thesis(ticker)
-
-        lines = [
-            f"📡 {ticker} THESIS ALERT — ${price:.2f}",
-            f"",
-            event["msg"],
-        ]
-
-        # Add momentum context if relevant
-        if state and state.momentum not in ("NEUTRAL", "STALLING"):
-            lines.append(f"Momentum: {state.momentum.replace('_', ' ')}")
-
-        # Add nearest intraday levels for context
+                if not price or price <= 0: continue
+                for ev in self.engine.evaluate(ticker, price):
+                    if ev.get("priority", 1) >= 3: self._post_alert(ticker, price, ev)
+                    else: log.info(f"Monitor [{ticker}]: {ev.get('msg','')}")
+            except Exception as e: log.warning(f"Monitor {ticker} failed: {e}")
+    def _post_alert(self, ticker, price, event):
+        tp = _get_time_phase_ct(); state = self.engine.get_state(ticker); thesis = self.engine.get_thesis(ticker)
+        lines = [f"📡 {ticker} THESIS ALERT — ${price:.2f}", "", event["msg"]]
+        if state and state.momentum not in ("NEUTRAL", "STALLING"): lines.append(f"Momentum: {state.momentum.replace('_',' ')}")
         if state:
-            intraday = IntradayLevelTracker.get_active_levels(state, price)
-            if intraday["support"]:
-                lines.append(f"Nearest intraday support: ${intraday['support'].price:.2f}")
-            if intraday["resistance"]:
-                lines.append(f"Nearest intraday resistance: ${intraday['resistance'].price:.2f}")
+            il = IntradayLevelTracker.get_active_levels(state, price)
+            if il["support"]: lines.append(f"Nearest support: ${il['support'].price:.2f}")
+            if il["resistance"]: lines.append(f"Nearest resistance: ${il['resistance'].price:.2f}")
+        lines.append(""); lines.append(f"Phase: {tp['label']} | {thesis.bias} ({thesis.bias_score:+d}/14)")
+        lines.append("— Not financial advice —")
+        try: self.post_fn("\n".join(lines)); log.info(f"Alert: {ticker} | {event.get('type','')} | {event.get('msg','')[:80]}")
+        except Exception as e: log.error(f"Alert post failed: {e}")
 
-        lines.append(f"")
-        lines.append(f"Phase: {tp['label']} | Thesis: {thesis.bias} ({thesis.bias_score:+d}/14)")
-        lines.append(f"— Not financial advice —")
-
-        try:
-            self.post_fn("\n".join(lines))
-            log.info(f"Thesis alert posted: {ticker} | {event.get('type', '?')} | {event.get('msg', '')[:80]}")
-        except Exception as e:
-            log.error(f"Thesis alert post failed: {e}")
-
-
-# ─────────────────────────────────────────────────────────
-# THESIS BUILDER (from EM card data)
-# ─────────────────────────────────────────────────────────
-
-def build_thesis_from_em_card(
-    ticker: str,
-    spot: float,
-    bias: dict,
-    eng: dict,
-    em: dict,
-    walls: dict,
-    cagf: dict = None,
-    vix: dict = None,
-    v4_result: dict = None,
-    session_label: str = "",
-    local_walls: dict = None,
-    prior_day_close: float = None,
-) -> ThesisContext:
-    """
-    Convert EM card data into a ThesisContext for monitoring.
-
-    Called by app.py after _post_em_card generates its data.
-    """
-    eng = eng or {}
-    walls = walls or {}
-    em = em or {}
-    local_w = local_walls or walls or {}
-    cagf = cagf or {}
-    vix = vix or {}
-
-    # Build levels
-    levels = ThesisLevels(
-        gamma_flip=eng.get("flip_price"),
-        local_resistance=local_w.get("local_resistance_1") or walls.get("call_wall"),
-        local_support=local_w.get("local_support_1") or walls.get("put_wall"),
-        call_wall=walls.get("call_wall"),
-        put_wall=walls.get("put_wall"),
-        gamma_wall=walls.get("gamma_wall"),
-        pin_zone_low=local_w.get("pin_zone_low"),
-        pin_zone_high=local_w.get("pin_zone_high"),
-        micro_trigger_up=local_w.get("local_resistance_1") or walls.get("call_wall"),
-        micro_trigger_down=local_w.get("local_support_1") or walls.get("put_wall"),
-        range_break_up=local_w.get("pin_zone_high") or walls.get("call_wall"),
-        range_break_down=local_w.get("pin_zone_low") or walls.get("put_wall"),
-        pivot=local_w.get("pivot"),
-        r1=local_w.get("r1"),
-        s1=local_w.get("s1"),
-        fib_support=local_w.get("fib_support"),
-        fib_resistance=local_w.get("fib_resistance"),
-        vpoc=local_w.get("vpoc"),
-        max_pain=local_w.get("max_pain") or eng.get("max_pain"),
-        em_high=em.get("bull_1sd"),
-        em_low=em.get("bear_1sd"),
-        em_2sd_high=em.get("bull_2sd"),
-        em_2sd_low=em.get("bear_2sd"),
-    )
-
-    # Determine prior day context
+def build_thesis_from_em_card(ticker, spot, bias, eng, em, walls, cagf=None, vix=None, v4_result=None, session_label="", local_walls=None, prior_day_close=None):
+    eng = eng or {}; walls = walls or {}; em = em or {}; lw = local_walls or walls or {}; cagf = cagf or {}; vix = vix or {}
+    levels = ThesisLevels(gamma_flip=eng.get("flip_price"), local_resistance=lw.get("local_resistance_1") or walls.get("call_wall"), local_support=lw.get("local_support_1") or walls.get("put_wall"), call_wall=walls.get("call_wall"), put_wall=walls.get("put_wall"), gamma_wall=walls.get("gamma_wall"), pin_zone_low=lw.get("pin_zone_low"), pin_zone_high=lw.get("pin_zone_high"), micro_trigger_up=lw.get("local_resistance_1") or walls.get("call_wall"), micro_trigger_down=lw.get("local_support_1") or walls.get("put_wall"), range_break_up=lw.get("pin_zone_high") or walls.get("call_wall"), range_break_down=lw.get("pin_zone_low") or walls.get("put_wall"), pivot=lw.get("pivot"), r1=lw.get("r1"), s1=lw.get("s1"), fib_support=lw.get("fib_support"), fib_resistance=lw.get("fib_resistance"), vpoc=lw.get("vpoc"), max_pain=lw.get("max_pain") or eng.get("max_pain"), em_high=em.get("bull_1sd"), em_low=em.get("bear_1sd"), em_2sd_high=em.get("bull_2sd"), em_2sd_low=em.get("bear_2sd"))
     prior_ctx = "NORMAL"
     if prior_day_close is not None and spot > 0:
-        gap_pct = abs(spot - prior_day_close) / prior_day_close * 100
-        if gap_pct > 0.5:
-            prior_ctx = "GAP_UP" if spot > prior_day_close else "GAP_DOWN"
-
-    gex_val = eng.get("gex", 0)
-    gex_sign = "positive" if gex_val >= 0 else "negative"
-
-    # v1.1: Reconcile GEX sign with gamma flip position.
-    # Raw GEX can be positive, but if spot is far below the flip,
-    # effective dealer positioning is amplifying, not suppressing.
+        gap = abs(spot - prior_day_close) / prior_day_close * 100
+        if gap > 0.5: prior_ctx = "GAP_UP" if spot > prior_day_close else "GAP_DOWN"
+    gex_val = eng.get("gex", 0); gex_sign = "positive" if gex_val >= 0 else "negative"
     flip = eng.get("flip_price")
     if flip is not None and spot > 0:
-        dist_from_flip_pct = (flip - spot) / spot * 100
-        if dist_from_flip_pct > 1.5:
-            gex_sign = "negative"
-            log.info(f"Thesis GEX sign overridden: raw GEX {gex_val:+.1f}M but spot {dist_from_flip_pct:.1f}% below flip → negative")
-        elif dist_from_flip_pct < -1.5:
-            gex_sign = "positive"
-
-    # Determine regime
+        d = (flip - spot) / spot * 100
+        if d > 1.5: gex_sign = "negative"; log.info(f"Thesis GEX overridden: raw {gex_val:+.1f}M but spot {d:.1f}% below flip → negative")
+        elif d < -1.5: gex_sign = "positive"
     regime = "UNKNOWN"
-    if cagf and cagf.get("regime"):
-        regime = cagf["regime"]
-    elif eng.get("is_positive_gex") is not None:
-        regime = "SUPPRESSING" if eng["is_positive_gex"] else "TRENDING"
-
+    if cagf and cagf.get("regime"): regime = cagf["regime"]
+    elif eng.get("is_positive_gex") is not None: regime = "SUPPRESSING" if eng["is_positive_gex"] else "TRENDING"
     try:
-        from zoneinfo import ZoneInfo
-        ts = datetime.now(ZoneInfo("America/Chicago")).isoformat()
-    except Exception:
-        ts = datetime.now(timezone.utc).isoformat()
-
-    return ThesisContext(
-        ticker=ticker,
-        bias=bias.get("direction", "NEUTRAL"),
-        bias_score=bias.get("score", 0),
-        gex_sign=gex_sign,
-        gex_value=round(gex_val, 2),
-        dex_value=round(eng.get("dex", 0), 2),
-        vanna_value=round(eng.get("vanna", 0), 2),
-        charm_value=round(eng.get("charm", 0), 2),
-        regime=regime,
-        volatility_regime=v4_result.get("vol_regime", {}).get("label", "NORMAL") if v4_result else "NORMAL",
-        vix=vix.get("vix", 20) if isinstance(vix, dict) else 20,
-        iv=v4_result.get("iv", 0.20) if v4_result else 0.20,
-        prior_day_close=prior_day_close,
-        prior_day_context=prior_ctx,
-        session_label=session_label,
-        levels=levels,
-        created_at=ts,
-        spot_at_creation=spot,
-    )
-
-
-# ─────────────────────────────────────────────────────────
-# MODULE-LEVEL SINGLETON
-# ─────────────────────────────────────────────────────────
-# Created once, wired up by app.py at startup.
+        from zoneinfo import ZoneInfo; ts = datetime.now(ZoneInfo("America/Chicago")).isoformat()
+    except Exception: ts = datetime.now(timezone.utc).isoformat()
+    return ThesisContext(ticker=ticker, bias=bias.get("direction", "NEUTRAL"), bias_score=bias.get("score", 0), gex_sign=gex_sign, gex_value=round(gex_val, 2), dex_value=round(eng.get("dex", 0), 2), vanna_value=round(eng.get("vanna", 0), 2), charm_value=round(eng.get("charm", 0), 2), regime=regime, volatility_regime=v4_result.get("vol_regime", {}).get("label", "NORMAL") if v4_result else "NORMAL", vix=vix.get("vix", 20) if isinstance(vix, dict) else 20, iv=v4_result.get("iv", 0.20) if v4_result else 0.20, prior_day_close=prior_day_close, prior_day_context=prior_ctx, session_label=session_label, levels=levels, created_at=ts, spot_at_creation=spot)
 
 _monitor_engine = ThesisMonitorEngine()
 _monitor_daemon: Optional[ThesisMonitorDaemon] = None
-
-
-def get_engine() -> ThesisMonitorEngine:
-    return _monitor_engine
-
-
-def get_daemon() -> Optional[ThesisMonitorDaemon]:
-    return _monitor_daemon
-
-
-def init_daemon(get_spot_fn: Callable, post_fn: Callable,
-                store_get_fn=None, store_set_fn=None) -> ThesisMonitorDaemon:
+def get_engine(): return _monitor_engine
+def get_daemon(): return _monitor_daemon
+def init_daemon(get_spot_fn, post_fn, store_get_fn=None, store_set_fn=None):
     global _monitor_daemon
-    # v1.2: Wire store functions for Redis persistence
-    _monitor_engine._store_get = store_get_fn
-    _monitor_engine._store_set = store_set_fn
+    _monitor_engine._store_get = store_get_fn; _monitor_engine._store_set = store_set_fn
     _monitor_daemon = ThesisMonitorDaemon(_monitor_engine, get_spot_fn, post_fn)
-    _monitor_daemon.start()
-    log.info("Thesis monitor daemon initialized and started")
-    return _monitor_daemon
+    _monitor_daemon.start(); log.info("Thesis monitor daemon initialized"); return _monitor_daemon
