@@ -1,23 +1,36 @@
 # backtest/backtest_replay.py
 # ─────────────────────────────────────────────────────────────────────────────
-# Phase 2 replay engine + stop-loss overlay.
+# Phase 1/2 backtest replay engine.
 #
-# What this version adds:
-#   - configurable stop-loss overlay for backtests
-#   - stop modes:
-#       none       = keep prior behavior
-#       structure  = use trade.trail_stop if present, else trade.stop_level
-#       percent    = fixed percent stop from entry price
-#   - conservative intrabar rule on 5-minute bars:
-#       if the bar touches the stop, assume the stop was hit
-#   - new output columns:
-#       stop_mode
-#       stop_trigger_price
+# Walks through historical 5-minute bars day by day, feeds each bar into your
+# real ThesisMonitorEngine, and records every trade that fires.
 #
-# Why this is useful:
-#   - you can compare your current engine exits vs a hard stop overlay
-#   - you keep using the real ThesisMonitorEngine for entries and policy exits
-#   - you do NOT need to change your live production bot
+# What it uses from your real bot:
+#   - ThesisMonitorEngine  (the main engine, unchanged)
+#   - BarStateManager      (bar ingestion, VWAP, opening ranges)
+#   - EntryValidator       (setup scoring, gates)
+#   - ExitPolicy           (policy-based exits)
+#   - All detection logic  (breaks, retests, failed moves)
+#
+# What is DIFFERENT from live:
+#   - get_bars_fn reads local CSV instead of calling MarketData API
+#   - store_get/store_set use a plain Python dict instead of Redis
+#   - thesis_monitor time-of-day uses replay bar time instead of real clock
+#   - exit_policy urgency uses replay bar time instead of real clock
+#   - open trades are force-closed at the final bar of each session
+#   - No Discord/Telegram posting
+#
+# Output files (written to backtest/results/):
+#   trades.csv      — one row per trade (including forced EOD closes)
+#   events.csv      — every alert/event fired during replay
+#   summary.txt     — printed stats (also saved as text)
+#
+# This version adds richer trade metadata for Phase 2 reporting:
+#   - regime
+#   - gex_sign
+#   - bias
+#   - prior_day_context
+#   - volatility_regime
 # ─────────────────────────────────────────────────────────────────────────────
 
 import os
@@ -26,7 +39,7 @@ import csv
 import argparse
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional
 
 # ── Add the repo root to sys.path so we can import your bot modules ───────────
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -142,6 +155,23 @@ def make_dict_store():
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# FILTER CONFIGURATION
+# ─────────────────────────────────────────────────────────────────────────────
+# Change these values to adjust the active filters.
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Regimes to skip entirely — no trades taken on these days.
+# Based on backtest data: LOW_VOL_CHOP days consistently lose money.
+SKIP_REGIMES = {"LOW_VOL_CHOP"}
+
+# Stop loss buffer: how far past the stop_level price must move to trigger exit.
+# 0.005 = 0.5%. A LONG exits when price <= stop_level * (1 - 0.005).
+# Set to 0.0 to exit exactly at the stop_level with no buffer.
+STOP_BUFFER_PCT = 0.005
+
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # THESIS BUILDER
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -239,7 +269,7 @@ TRADE_FIELDS = [
     "date", "ticker", "direction", "entry_type", "setup_score", "setup_label",
     "level_name", "level_tier", "time_phase",
     "bias", "regime", "gex_sign", "volatility_regime", "prior_day_context",
-    "entry_bar_time", "entry_price", "stop_level", "stop_mode", "stop_trigger_price",
+    "entry_bar_time", "entry_price", "stop_level",
     "close_bar_time", "close_price", "close_reason", "status",
     "pnl_pts", "pnl_pct",
     "mae_pts", "mae_pct",
@@ -256,10 +286,9 @@ EVENT_FIELDS = [
 class ResultsRecorder:
     """Collect trades and events during replay and write them to CSV."""
 
-    def __init__(self, output_dir: str, stop_mode: str):
+    def __init__(self, output_dir: str):
         Path(output_dir).mkdir(parents=True, exist_ok=True)
         self._output_dir = output_dir
-        self._stop_mode = stop_mode
         self._trades = []
         self._events = []
 
@@ -275,18 +304,6 @@ class ResultsRecorder:
                 "alert_key": ev.get("alert_key", ""),
                 "message": ev.get("msg", "").replace("\n", " | "),
             })
-
-    def record_stop_event(self, date: str, bar_time: str, ticker: str, bar_close: float, message: str) -> None:
-        self._events.append({
-            "date": date,
-            "bar_time": bar_time,
-            "ticker": ticker,
-            "bar_close": round(bar_close, 4),
-            "event_type": "stop",
-            "priority": 9,
-            "alert_key": "hard_stop",
-            "message": message,
-        })
 
     def snapshot_trades(
         self,
@@ -354,8 +371,6 @@ class ResultsRecorder:
             "entry_bar_time": bar_time,
             "entry_price": round(ep, 4),
             "stop_level": round(trade.stop_level, 4) if trade.stop_level is not None else "",
-            "stop_mode": self._stop_mode,
-            "stop_trigger_price": "",
             "close_bar_time": close_bar_time,
             "close_price": round(cp, 4) if cp is not None else "",
             "close_reason": trade.close_reason,
@@ -405,8 +420,6 @@ class ResultsRecorder:
         rec["mae_pct"] = mae_pct
         rec["mfe_pts"] = mfe_pts
         rec["mfe_pct"] = mfe_pct
-        if trade.close_reason and "STOP" in str(trade.close_reason).upper():
-            rec["stop_trigger_price"] = round(cp, 4)
 
     def write(self):
         trades_path = os.path.join(self._output_dir, "trades.csv")
@@ -437,7 +450,7 @@ class ResultsRecorder:
             g_pnls = [float(t["pnl_pts"]) for t in group]
             g_wins = [p for p in g_pnls if p > 0]
             wr = len(g_wins) / len(group) * 100 if group else 0
-            lines.append(f"    {val:<18}: {len(group):>3} trades, {wr:.0f}% win, {sum(g_pnls):+.2f} pts total")
+            lines.append(f"    {val:<14}: {len(group):>3} trades, {wr:.0f}% win, {sum(g_pnls):+.2f} pts total")
 
     def print_summary(self, output_dir: str) -> None:
         trades_with_close = [t for t in self._trades if t.get("pnl_pts") != ""]
@@ -448,11 +461,10 @@ class ResultsRecorder:
         lines.append("=" * 60)
         lines.append("  BACKTEST SUMMARY")
         lines.append("=" * 60)
-        lines.append(f"  Stop mode:             {self._stop_mode}")
-        lines.append(f"  Total trades recorded: {len(self._trades)}")
-        lines.append(f"  Trades with close data:{len(closed):>4}")
-        lines.append(f"  Trades still open:    {len(still_open):>5}")
-        lines.append(f"  Total events fired:   {len(self._events):>5}")
+        lines.append(f"  Total trades recorded:  {len(self._trades)}")
+        lines.append(f"  Trades with close data: {len(closed)}")
+        lines.append(f"  Trades still open:      {len(still_open)}")
+        lines.append(f"  Total events fired:     {len(self._events)}")
 
         if closed:
             wins = [t for t in closed if float(t.get("pnl_pts") or 0) > 0]
@@ -460,7 +472,6 @@ class ResultsRecorder:
             pnls = [float(t["pnl_pts"]) for t in closed]
             total_pnl = sum(pnls)
             win_rate = len(wins) / len(closed) * 100 if closed else 0
-            stop_hits = [t for t in closed if "STOP" in str(t.get("close_reason", "")).upper()]
 
             lines.append("")
             lines.append(f"  Win rate:  {win_rate:.1f}%  ({len(wins)}W / {len(losses)}L)")
@@ -468,7 +479,6 @@ class ResultsRecorder:
             lines.append(f"  Avg trade: {sum(pnls) / len(pnls):+.3f} pts")
             lines.append(f"  Best:      {max(pnls):+.3f} pts")
             lines.append(f"  Worst:     {min(pnls):+.3f} pts")
-            lines.append(f"  Stop hits: {len(stop_hits)}")
 
             self._append_group_block(lines, closed, "entry type", "entry_type")
             self._append_group_block(lines, closed, "setup score", "setup_score")
@@ -477,7 +487,6 @@ class ResultsRecorder:
             self._append_group_block(lines, closed, "gex_sign", "gex_sign")
             self._append_group_block(lines, closed, "bias", "bias")
             self._append_group_block(lines, closed, "prior_day_context", "prior_day_context")
-            self._append_group_block(lines, closed, "close reason", "close_reason")
 
         lines.append("")
         lines.append("=" * 60)
@@ -492,141 +501,66 @@ class ResultsRecorder:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# STOP-LOSS HELPERS
+# REPLAY HELPERS
 # ═════════════════════════════════════════════════════════════════════════════
 
-def _round_price(value: float) -> float:
-    return round(float(value), 4)
 
+# ═════════════════════════════════════════════════════════════════════════════
+# STOP LOSS ENFORCER
+# ─────────────────────────────────────────────────────────────────────────────
+# Runs before engine.evaluate() each bar. Checks every open trade against
+# stop_level ± STOP_BUFFER_PCT and force-closes anything that has breached.
+# This gives the backtest a clean, consistent mechanical stop rather than
+# relying entirely on the engine's dynamic exit policy.
+# ═════════════════════════════════════════════════════════════════════════════
 
-def _compute_stop_price(trade, stop_mode: str, stop_pct: float) -> Tuple[Optional[float], str]:
+def enforce_stop_losses(
+    engine: ThesisMonitorEngine,
+    ticker: str,
+    bar_close: float,
+    bar_time: str,
+) -> int:
     """
-    Return (stop_price, stop_reason_label).
-    stop_mode:
-      - none
-      - structure  -> trail_stop if available, else stop_level
-      - percent    -> fixed percent from entry price
-    """
-    if stop_mode == "none":
-        return None, ""
+    Force-close any open trade whose stop level has been breached by
+    STOP_BUFFER_PCT. Returns the number of trades closed.
 
-    if stop_mode == "structure":
-        stop_price = trade.trail_stop if trade.trail_stop is not None else trade.stop_level
-        if stop_price is None:
-            return None, ""
-        return float(stop_price), "STRUCTURE_STOP"
-
-    if stop_mode == "percent":
-        ep = float(trade.entry_price or 0.0)
-        if ep <= 0 or stop_pct <= 0:
-            return None, ""
-        pct = stop_pct / 100.0
-        if trade.direction == "LONG":
-            return ep * (1.0 - pct), "PERCENT_STOP"
-        return ep * (1.0 + pct), "PERCENT_STOP"
-
-    raise ValueError(f"Unsupported stop mode: {stop_mode}")
-
-
-def _trade_is_open(trade) -> bool:
-    return trade.status in ("OPEN", "SCALED", "TRAILED")
-
-
-def _trade_entered_before_this_bar(trade, bar_epoch: float) -> bool:
-    """
-    We enter on the bar close. So a new trade opened on this same bar should NOT
-    be stopped by this bar's earlier high/low range.
-    """
-    entry_epoch = float(getattr(trade, "entry_epoch", 0.0) or 0.0)
-    return entry_epoch < float(bar_epoch)
-
-
-def _bar_hits_stop(trade, stop_price: float, bar: dict) -> bool:
-    if trade.direction == "LONG":
-        return float(bar["low"]) <= stop_price
-    return float(bar["high"]) >= stop_price
-
-
-def _close_trade_direct(engine: ThesisMonitorEngine, ticker: str, trade, close_price: float, reason: str) -> None:
-    """
-    Close a specific trade inside the backtest layer.
-    We do this directly because engine.close_trade() only closes the most recent
-    open trade, while backtests may have multiple open trades alive at once.
+    For a LONG trade:  exit if price <= stop_level * (1 - STOP_BUFFER_PCT)
+    For a SHORT trade: exit if price >= stop_level * (1 + STOP_BUFFER_PCT)
     """
     state = engine.get_state(ticker)
     if not state:
-        return
-
-    trade.status = "INVALIDATED"
-    trade.close_reason = reason
-    trade.close_price = float(close_price)
-    trade.close_time = _patched_monotonic()
-    trade.close_epoch = _patched_time()
-
-    persist = getattr(engine, "_persist_trades", None)
-    if callable(persist):
-        persist(ticker, state)
-
-
-def apply_stop_overlays(
-    engine: ThesisMonitorEngine,
-    recorder: ResultsRecorder,
-    ticker: str,
-    day: str,
-    bar: dict,
-    time_phase: str,
-    session_meta: dict,
-    stop_mode: str,
-    stop_pct: float,
-) -> int:
-    """
-    Apply hard stops after engine.evaluate() for the current bar.
-
-    Conservative OHLC rule:
-      if the bar touched the stop at any point, assume the stop was hit.
-
-    Important:
-      trades opened on this same bar are skipped, because entry happens at the
-      close and we do not want to assume a pre-entry low/high stopped them out.
-    """
-    if stop_mode == "none":
         return 0
 
-    state = engine.get_state(ticker)
-    if not state or not getattr(state, "active_trades", None):
-        return 0
-
-    stopped = 0
-    for trade in list(state.active_trades):
-        if not _trade_is_open(trade):
-            continue
-        if not _trade_entered_before_this_bar(trade, bar["timestamp"]):
+    closed_count = 0
+    for trade in state.active_trades:
+        if trade.status in ("CLOSED", "INVALIDATED"):
             continue
 
-        stop_price, reason_label = _compute_stop_price(trade, stop_mode, stop_pct)
-        if stop_price is None:
+        stop = trade.trail_stop if trade.trail_stop else trade.stop_level
+        if not stop:
             continue
 
-        if not _bar_hits_stop(trade, stop_price, bar):
-            continue
+        breached = False
+        if trade.direction == "LONG":
+            trigger = stop * (1 - STOP_BUFFER_PCT)
+            if bar_close <= trigger:
+                breached = True
+        else:  # SHORT
+            trigger = stop * (1 + STOP_BUFFER_PCT)
+            if bar_close >= trigger:
+                breached = True
 
-        stop_price = _round_price(stop_price)
-        msg = (
-            f"{reason_label} hit for {trade.direction} {trade.entry_type} "
-            f"at {stop_price:.4f} on {bar['datetime_ct']}"
-        )
-        _close_trade_direct(engine, ticker, trade, close_price=stop_price, reason=reason_label)
-        recorder.record_stop_event(day, bar["datetime_ct"], ticker, bar["close"], msg)
-        stopped += 1
+        if breached:
+            pct = STOP_BUFFER_PCT * 100
+            engine.close_trade(
+                ticker,
+                price=bar_close,
+                reason=f"Stop loss ({pct:.1f}% buffer) at ${stop:.2f}",
+            )
+            closed_count += 1
 
-    if stopped:
-        recorder.snapshot_trades(engine, ticker, day, bar["datetime_ct"], time_phase, session_meta)
-    return stopped
+    return closed_count
 
-
-# ═════════════════════════════════════════════════════════════════════════════
-# REPLAY HELPERS
-# ═════════════════════════════════════════════════════════════════════════════
 
 def close_all_open_trades(engine: ThesisMonitorEngine, ticker: str, price: float, reason: str) -> int:
     """
@@ -639,7 +573,7 @@ def close_all_open_trades(engine: ThesisMonitorEngine, ticker: str, price: float
         state = engine.get_state(ticker)
         if not state:
             break
-        open_trades = [t for t in state.active_trades if _trade_is_open(t)]
+        open_trades = [t for t in state.active_trades if t.status in ("OPEN", "SCALED", "TRAILED")]
         if not open_trades:
             break
         engine.close_trade(ticker, price=price, reason=reason)
@@ -651,14 +585,7 @@ def close_all_open_trades(engine: ThesisMonitorEngine, ticker: str, price: float
 # MAIN REPLAY LOOP
 # ═════════════════════════════════════════════════════════════════════════════
 
-def run_backtest(
-    ticker: str,
-    csv_path: str,
-    output_dir: str,
-    skip_days: int = 1,
-    stop_mode: str = "none",
-    stop_pct: float = 0.5,
-) -> None:
+def run_backtest(ticker: str, csv_path: str, output_dir: str, skip_days: int = 1) -> None:
     print(f"\n{'=' * 55}")
     print(f"  Backtest Replay: {ticker}")
     print(f"{'=' * 55}\n")
@@ -672,15 +599,11 @@ def run_backtest(
         sys.exit(1)
 
     install_time_patches()
-    recorder = ResultsRecorder(output_dir, stop_mode=stop_mode)
+    recorder = ResultsRecorder(output_dir)
     global_bar_seq = [0]
 
     days_to_replay = trading_days[skip_days:]
-    print(f"  Replaying {len(days_to_replay)} days (skipping first {skip_days} for prior-day seeding)")
-    print(f"  Stop mode: {stop_mode}")
-    if stop_mode == "percent":
-        print(f"  Stop percent: {stop_pct:.3f}%")
-    print("")
+    print(f"  Replaying {len(days_to_replay)} days (skipping first {skip_days} for prior-day seeding)\n")
 
     for day in days_to_replay:
         bars = feed.get_bars_for_day(day)
@@ -703,6 +626,13 @@ def run_backtest(
             "prior_day_context": thesis.prior_day_context,
         }
 
+        # ── Filter 1: Skip LOW_VOL_CHOP days entirely ──────────────────────
+        if thesis.regime in SKIP_REGIMES:
+            print(
+                f"  {day}  SKIPPED — regime={thesis.regime} is in SKIP_REGIMES"
+            )
+            continue
+
         print(
             f"  {day}  ({len(bars)} bars)  "
             f"PDH={prior['high']:.2f}  PDL={prior['low']:.2f}  PDC={prior['close']:.2f}  "
@@ -718,8 +648,6 @@ def run_backtest(
         )
         engine.store_thesis(ticker, thesis)
 
-        stop_hits_today = 0
-
         for bar_idx, bar in enumerate(bars):
             feed.set_cursor(day, bar_idx)
             set_replay_time(bar["timestamp"], global_bar_seq[0])
@@ -731,6 +659,9 @@ def run_backtest(
             if time_phase in ("PRE_MARKET", "AFTER_HOURS"):
                 continue
 
+            # ── Filter 2: Enforce mechanical stop loss ───────────────────────
+            enforce_stop_losses(engine, ticker, bar["close"], bar_time)
+
             try:
                 events = engine.evaluate(ticker, bar["close"])
             except Exception as e:
@@ -738,24 +669,6 @@ def run_backtest(
                 events = []
 
             recorder.record_events(events, day, bar_time, ticker, bar["close"])
-
-            # Apply stop-loss overlay AFTER evaluate() so the engine gets first
-            # crack at policy exits, but BEFORE snapshotting final state for bar.
-            # On 5-minute OHLC, if the bar touched the stop, we conservatively
-            # assume the stop was hit.
-            stop_hits = apply_stop_overlays(
-                engine=engine,
-                recorder=recorder,
-                ticker=ticker,
-                day=day,
-                bar=bar,
-                time_phase=time_phase,
-                session_meta=session_meta,
-                stop_mode=stop_mode,
-                stop_pct=stop_pct,
-            )
-            stop_hits_today += stop_hits
-
             recorder.snapshot_trades(engine, ticker, day, bar_time, time_phase, session_meta)
 
         last_bar = bars[-1]
@@ -777,12 +690,10 @@ def run_backtest(
         )
 
         day_trades = [t for t in recorder._trades if t.get("date") == day]
-        msg = f"    → {len(day_trades)} trades fired"
-        if stop_hits_today:
-            msg += f" | {stop_hits_today} stop hits"
         if forced:
-            msg += f" | {forced} forced EOD closes"
-        print(msg)
+            print(f"    → {len(day_trades)} trades fired ({forced} forced EOD closes)")
+        else:
+            print(f"    → {len(day_trades)} trades fired")
 
     print(f"\n{'─' * 55}")
     print("  Writing results...")
@@ -808,18 +719,6 @@ def main() -> None:
         type=int,
         help="Days to skip at start for prior-day seeding (default: 1)",
     )
-    parser.add_argument(
-        "--stop-mode",
-        default="structure",
-        choices=["none", "structure", "percent"],
-        help="Stop-loss mode: none, structure, or percent (default: structure)",
-    )
-    parser.add_argument(
-        "--stop-pct",
-        default=0.5,
-        type=float,
-        help="Percent stop used only when --stop-mode percent (default: 0.5)",
-    )
     args = parser.parse_args()
 
     if args.data is None:
@@ -837,8 +736,6 @@ def main() -> None:
         csv_path=args.data,
         output_dir=args.output,
         skip_days=args.skip,
-        stop_mode=args.stop_mode,
-        stop_pct=args.stop_pct,
     )
 
 
