@@ -181,6 +181,11 @@ STOP_BUFFER_PCT = 0.005
 #
 # BLOCKED levels (never trade, any score):
 #   - intraday_support (rejection zone)
+#
+# Unlocks added after analysis of rejected trades:
+#   Unlock 1: S4 + daily_support (60% win, +1.48 pts on 5 trades)
+#   Unlock 2: S4 + resistance RZ — but ONLY when GEX+ (100% win, 2 trades)
+#   Unlock 3: S5 + BULL_TREND + GEX- + AFTERNOON (75% win, 4 trades)
 
 BLOCKED_LEVEL_NAMES = {
     "intraday_support (rejection zone)",
@@ -188,7 +193,12 @@ BLOCKED_LEVEL_NAMES = {
 
 SCORE4_ALLOWED_LEVELS = {
     "intraday_support (sharp move origin)",
+    "daily_support",                          # Unlock 1: 60% win, avg winner +1.08
 }
+
+# Unlock 2: S4 resistance rejection zone is only allowed when GEX is positive
+# (dealer pinning makes the fade more reliable). HVT without GEX+ stays blocked.
+SCORE4_RESISTANCE_RZ_REQUIRES_GEX_POSITIVE = True
 
 
 
@@ -558,9 +568,11 @@ def _trade_passes_combo(trade, session_meta: dict, time_phase: str) -> tuple:
         gex_sign == positive
         prior_day_context == GAP_UP
         time_phase == POWER_HOUR
+        [Unlock 3] regime == BULL_TREND AND gex == negative AND time_phase == AFTERNOON
 
-    Score 4 — allowed ONLY if:
-        level_name == intraday_support (sharp move origin)
+    Score 4 — allowed if:
+        level_name in SCORE4_ALLOWED_LEVELS  (SMO support, daily_support)
+        [Unlock 2] level == resistance RZ AND gex == positive
 
     All scores — blocked if:
         level_name in BLOCKED_LEVEL_NAMES
@@ -571,20 +583,29 @@ def _trade_passes_combo(trade, session_meta: dict, time_phase: str) -> tuple:
     gex     = session_meta.get("gex_sign", "")
     ctx     = session_meta.get("prior_day_context", "")
 
-    # Hard block — never trade this level regardless of score
+    # Hard block — never trade this level regardless of score or conditions
     if level in BLOCKED_LEVEL_NAMES:
         return False, f"blocked_level: {level}"
 
     if score == 5:
-        if regime == "HIGH_VOL_TREND": return True,  "S5+HVT"
-        if gex    == "positive":       return True,  "S5+GEX+"
-        if ctx    == "GAP_UP":         return True,  "S5+GAP_UP"
-        if time_phase == "POWER_HOUR": return True,  "S5+POWER_HOUR"
+        if regime == "HIGH_VOL_TREND":                          return True, "S5+HVT"
+        if gex    == "positive":                                return True, "S5+GEX+"
+        if ctx    == "GAP_UP":                                  return True, "S5+GAP_UP"
+        if time_phase == "POWER_HOUR":                          return True, "S5+POWER_HOUR"
+        # Unlock 3: BULL_TREND + GEX- works in Afternoon specifically
+        if (regime == "BULL_TREND"
+                and gex == "negative"
+                and time_phase == "AFTERNOON"):                 return True, "S5+BULL_GEX-_AFT"
         return False, "S5_no_qualifying_combo"
 
     if score == 4:
+        # Standard allowed levels (SMO support + daily support)
         if level in SCORE4_ALLOWED_LEVELS:
-            return True, "S4+SMO"
+            return True, f"S4+{level}"
+        # Unlock 2: resistance rejection zone — only when GEX+ (dealer pinning)
+        if (level == "intraday_resistance (rejection zone)"
+                and gex == "positive"):
+            return True, "S4+RES_RZ+GEX+"
         return False, f"S4_level_not_allowed: {level}"
 
     return False, f"score_{score}_not_in_rules"
