@@ -103,6 +103,7 @@ TTL_VIX          = 60
 TTL_STOCK_QUOTE  = 15
 TTL_EARNINGS     = 3600  # 1 hour
 TTL_REGIME       = 300   # 5 min
+TTL_INTRADAY     = 60    # 1 min — intraday bars (5m resolution)
 
 
 class CachedMarketData:
@@ -126,6 +127,7 @@ class CachedMarketData:
         self._adv_cache = _TTLCache(TTL_ADV)
         self._vix_cache = _TTLCache(TTL_VIX)
         self._quote_cache = _TTLCache(TTL_STOCK_QUOTE)
+        self._intraday_cache = _TTLCache(TTL_INTRADAY)
 
     # ── Spot Price ──
     def get_spot(self, ticker: str, as_float_fn=None) -> float:
@@ -243,6 +245,37 @@ class CachedMarketData:
         except Exception as e:
             log.warning(f"Cached OHLC bars fetch failed for {ticker}: {e}")
             return []
+
+    # ── Intraday Bars (5m OHLCV for bar-aware monitor) ──
+    def get_intraday_bars(self, ticker: str, resolution: int = 5,
+                          countback: int = 80) -> dict:
+        """
+        Cached intraday OHLCV bars from MarketData.app.
+        Returns raw API dict: {s: "ok", o: [...], h: [...], l: [...], c: [...], v: [...], t: [...]}
+        Caller (BarStateManager) parses into Bar objects.
+
+        Args:
+            ticker: Symbol
+            resolution: Bar size in minutes (1, 5, 15, 30, 60)
+            countback: Number of bars to fetch
+        """
+        key = f"intra:{ticker.upper()}:{resolution}:{countback}"
+        cached = self._intraday_cache.get(key)
+        if cached is not None:
+            return cached
+        try:
+            data = self._md_get(
+                f"https://api.marketdata.app/v1/stocks/candles/{resolution}/{ticker.upper()}/",
+                {"countback": countback},
+            )
+            if isinstance(data, dict) and data.get("s") == "ok":
+                self._intraday_cache.set(key, data)
+                return data
+            log.warning(f"Intraday bars {ticker} {resolution}m: bad response")
+            return {}
+        except Exception as e:
+            log.warning(f"Intraday bars fetch failed for {ticker}: {e}")
+            return {}
 
     # ── Stock Quote (for liquidity estimates) ──
     def get_stock_quote(self, ticker: str) -> dict:
