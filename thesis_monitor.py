@@ -380,19 +380,16 @@ class ThesisMonitorEngine:
             entry_type = "RETEST"
         else:
             entry_type = "BREAK"
-        # Don't double-create — block if open trade at same direction+type or same-level proximity
+        # Don't double-create — block if open trade at same direction near same level
+        # This allows a legit RETEST at a different level even if a BREAK is still open
         for t in state.active_trades:
             if t.status not in ("OPEN", "SCALED", "TRAILED"):
                 continue
             if t.direction != direction:
                 continue
-            # Same direction + same entry type = definite duplicate
-            if t.entry_type == entry_type:
-                log.info(f"Trade already open for {ticker} {direction} {entry_type}, skipping")
-                return
-            # Same direction + near same price = likely duplicate from different signal type
-            if abs(t.entry_price - price) / price < 0.005:
-                log.info(f"Trade already open for {ticker} {direction} near ${price:.2f}, skipping")
+            # Same direction + near same stop level = same setup, skip
+            if abs(t.stop_level - price) / price < 0.005 or abs(t.entry_price - price) / price < 0.005:
+                log.info(f"Trade already open for {ticker} {direction} near ${price:.2f} (stop=${t.stop_level:.2f}), skipping")
                 return
         # Find the stop level — extract from the break attempt
         stop = 0.0
@@ -447,7 +444,6 @@ class ThesisMonitorEngine:
                 fav = trade.entry_price - price
                 trade.max_favorable = max(trade.max_favorable, fav)
                 trade.min_favorable = min(trade.min_favorable, fav)
-            age = now - trade.entry_time
             # 1. INVALIDATION — stop level reclaimed/lost
             inv_events = self._check_invalidation(trade, thesis, state, price, now)
             if inv_events:
@@ -706,8 +702,13 @@ class ThesisMonitorEngine:
         if not self._store_set:
             return
         try:
+            now_mono = time.monotonic()
             trades_data = []
             for t in state.active_trades:
+                # Convert exit_alert_history monotonic timestamps to seconds-ago
+                eah_relative = {}
+                for k, v in t.exit_alert_history.items():
+                    eah_relative[k] = round(now_mono - v, 1) if v is not None else None
                 trades_data.append({
                     "ticker": t.ticker, "direction": t.direction, "entry_type": t.entry_type,
                     "entry_price": t.entry_price, "stop_level": t.stop_level,
@@ -719,6 +720,7 @@ class ThesisMonitorEngine:
                     "scaled_at_price": t.scaled_at_price,
                     "trail_stop": t.trail_stop, "close_price": t.close_price,
                     "close_reason": t.close_reason, "close_time": t.close_time,
+                    "exit_alert_history_rel": eah_relative,
                 })
             self._store_set(f"active_trades:{ticker}", json.dumps(trades_data), ttl=86400)
         except Exception as e:
@@ -731,6 +733,7 @@ class ThesisMonitorEngine:
             raw = self._store_get(f"active_trades:{ticker}")
             if not raw:
                 return
+            now_mono = time.monotonic()
             trades_data = json.loads(raw)
             for td in trades_data:
                 trade = ActiveTrade(
@@ -754,6 +757,11 @@ class ThesisMonitorEngine:
                     close_reason=td.get("close_reason", ""),
                     close_time=td.get("close_time", 0),
                 )
+                # Reconstruct exit_alert_history from relative offsets
+                eah_rel = td.get("exit_alert_history_rel", {})
+                for k, secs_ago in eah_rel.items():
+                    if secs_ago is not None:
+                        trade.exit_alert_history[k] = now_mono - secs_ago
                 state.active_trades.append(trade)
             log.info(f"Loaded {len(trades_data)} trades from store for {ticker}")
         except Exception as e:
@@ -915,11 +923,13 @@ class ThesisMonitorEngine:
             # Suppress session extremes during confirmed trends
             if il.source == "session_low" and state.active_trend_direction == "SHORT": continue
             if il.source == "session_high" and state.active_trend_direction == "LONG": continue
-            # Suppress fresh session extremes — a level just set at current edge
-            # is not meaningful S/R yet. Require it to have held for 3+ polls.
+            # Suppress fresh session extremes — a level is only meaningful S/R
+            # if price has moved away from it. Require that the level hasn't been
+            # updated (retouched) in the last 120s, proving price departed and the
+            # extreme held.
             if il.source in ("session_low", "session_high"):
-                age_polls = sum(1 for p in state.price_history if p.get("ts_mono", 0) >= il.first_seen_ts)
-                if age_polls < 3: continue
+                stale_time = now - il.last_touched_ts
+                if stale_time < 120: continue  # still being actively set/updated
             # Suppress session extremes during consistent directional momentum
             if il.source == "session_low" and state.momentum in ("ACCELERATING_DOWN", "DRIFTING_DOWN"): continue
             if il.source == "session_high" and state.momentum in ("ACCELERATING_UP", "DRIFTING_UP"): continue
