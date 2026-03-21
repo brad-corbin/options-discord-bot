@@ -1,35 +1,15 @@
 # .github/workflows/backtest.yml
-# ─────────────────────────────────────────────────────────────────────────────
-# Backtest Runner — runs on GitHub's free servers.
-#
-# HOW TO RUN:
-#   1. GitHub repo → Actions tab → "Backtest Runner" → "Run workflow"
-#   2. Fill in the inputs (see below)
-#   3. Click the green "Run workflow" button
-#   4. Wait ~2-4 minutes
-#   5. Click the completed run → scroll to "Artifacts" → download results
-#
-# DATE RANGE MODE:
-#   Leave "From date" and "To date" blank → downloads the most recent 22 days
-#   Fill in "From date" (and optionally "To date") → downloads that specific window
-#
-# Examples:
-#   Ticker=SPY, Days=22, From=blank, To=blank   → last 22 trading days
-#   Ticker=SPY, From=2025-10-01, To=2025-11-30  → specific window
-#   Ticker=QQQ, From=2025-06-01, To=2025-07-31  → QQQ summer 2025
-# ─────────────────────────────────────────────────────────────────────────────
-
 name: Backtest Runner
 
 on:
   workflow_dispatch:
     inputs:
       ticker:
-        description: 'Ticker (e.g. SPY, QQQ, AAPL)'
+        description: 'Ticker (e.g. SPY, QQQ, GLD)'
         required: true
         default: 'SPY'
       days:
-        description: 'Trading days to fetch (used only when From/To are blank)'
+        description: 'Trading days to fetch (used when From/To are blank)'
         required: false
         default: '22'
       from_date:
@@ -37,9 +17,17 @@ on:
         required: false
         default: ''
       to_date:
-        description: 'To date YYYY-MM-DD (leave blank = today, only used with From date)'
+        description: 'To date YYYY-MM-DD (leave blank = today)'
         required: false
         default: ''
+      contracts:
+        description: 'Option contracts per trade for P&L calculation (default: 1)'
+        required: false
+        default: '1'
+      price_options:
+        description: 'Fetch real options pricing after backtest? (yes/no)'
+        required: false
+        default: 'no'
 
 jobs:
   backtest:
@@ -65,7 +53,6 @@ jobs:
           MARKETDATA_TOKEN: ${{ secrets.MARKETDATA_TOKEN }}
         run: |
           if [ -n "${{ github.event.inputs.from_date }}" ]; then
-            # Date range mode
             TO_ARG=""
             if [ -n "${{ github.event.inputs.to_date }}" ]; then
               TO_ARG="--to ${{ github.event.inputs.to_date }}"
@@ -75,7 +62,6 @@ jobs:
               --from ${{ github.event.inputs.from_date }} \
               $TO_ARG
           else
-            # Countback mode (most recent N days)
             python backtest/download_bars.py \
               --ticker ${{ github.event.inputs.ticker }} \
               --days ${{ github.event.inputs.days }}
@@ -85,12 +71,24 @@ jobs:
         env:
           MARKETDATA_TOKEN: ${{ secrets.MARKETDATA_TOKEN }}
         run: |
-          # Find whichever CSV was just downloaded
           DATA_FILE=$(ls backtest/data/*.csv | head -1)
           echo "Using data file: $DATA_FILE"
           python backtest/backtest_replay.py \
             --ticker ${{ github.event.inputs.ticker }} \
             --data "$DATA_FILE"
+
+      - name: Fetch options pricing
+        if: ${{ github.event.inputs.price_options == 'yes' }}
+        env:
+          MARKETDATA_TOKEN: ${{ secrets.MARKETDATA_TOKEN }}
+        run: |
+          python backtest/option_translator.py \
+            --ticker ${{ github.event.inputs.ticker }} \
+            --contracts ${{ github.event.inputs.contracts }} \
+            --trades backtest/results/trades.csv
+        # Note: this step makes multiple API calls (2-3 per trade).
+        # For 42 SPY trades that is ~120 API calls.
+        # Runs after the backtest so it only prices real trades, not gated ones.
 
       - name: Upload results
         uses: actions/upload-artifact@v4
