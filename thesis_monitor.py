@@ -29,6 +29,15 @@ INTRADAY_SHARP_MOVE_THRESHOLD = 0.12
 INTRADAY_CONSOLIDATION_CANDLES = 4
 INTRADAY_CONSOLIDATION_RANGE_PCT = 0.06
 
+# ── Exit Monitor Constants ──
+EXIT_INVALIDATE_BUFFER_PCT = 0.06     # price must reclaim past stop by this % to invalidate
+EXIT_MOMENTUM_FADE_LOOKBACK = 4       # polls to check momentum against position
+EXIT_SCALE_PROXIMITY_PCT = 0.08       # how close to target = "reached"
+EXIT_TRAIL_ACCELERATION_MULT = 1.8    # momentum must be 1.8x avg to trail
+EXIT_EXHAUSTION_DECEL_MULT = 0.4      # momentum below 0.4x avg after scaling = exhaustion
+EXIT_MAX_TRADE_AGE_SEC = 14400        # 4 hours — auto-expire stale trades
+EXIT_ALERT_COOLDOWN_SEC = 300         # 5 min between same exit alert type per trade
+
 @dataclass
 class ThesisLevels:
     gamma_flip: Optional[float] = None; local_resistance: Optional[float] = None
@@ -68,6 +77,30 @@ class IntradayLevel:
     first_seen_ts: float = 0.0; last_touched_ts: float = 0.0; active: bool = True
 
 @dataclass
+class ActiveTrade:
+    ticker: str
+    direction: str  # LONG / SHORT
+    entry_type: str  # BREAK / FAILED / RETEST
+    entry_price: float
+    stop_level: float
+    targets: list = field(default_factory=list)  # [float] — next S/R levels
+    status: str = "OPEN"  # OPEN / SCALED / TRAILED / CLOSED / INVALIDATED
+    entry_time: float = 0.0
+    entry_time_str: str = ""
+    level_name: str = ""  # what level triggered the entry
+    gex_at_entry: str = "positive"
+    trade_type_label: str = ""  # "Naked puts", "Call debit spread", etc.
+    # tracking
+    max_favorable: float = 0.0  # max move in trade direction from entry
+    min_favorable: float = 0.0  # worst adverse excursion from entry
+    scaled_at_price: Optional[float] = None
+    trail_stop: Optional[float] = None
+    close_price: Optional[float] = None
+    close_reason: str = ""
+    close_time: float = 0.0
+    exit_alert_history: dict = field(default_factory=dict)  # cooldown tracking
+
+@dataclass
 class MonitorState:
     status: str = "FRESH"; momentum: str = "NEUTRAL"
     above_gamma_flip: Optional[bool] = None
@@ -81,6 +114,7 @@ class MonitorState:
     intraday_levels: list = field(default_factory=list)
     session_high: Optional[float] = None; session_low: Optional[float] = None
     session_high_time: str = ""; session_low_time: str = ""
+    active_trades: list = field(default_factory=list)  # List[ActiveTrade]
 
 def _get_time_phase_ct() -> dict:
     try:
@@ -220,7 +254,12 @@ class ThesisMonitorEngine:
         t = self._theses.get(ticker)
         if t: return t
         t = self._load_thesis_from_store(ticker)
-        if t: self._theses[ticker] = t; self._states.setdefault(ticker, MonitorState())
+        if t:
+            self._theses[ticker] = t
+            state = self._states.setdefault(ticker, MonitorState())
+            # Recover active trades from store
+            if not state.active_trades:
+                self._load_trades_from_store(ticker, state)
         return t
 
     def get_state(self, ticker): return self._states.get(ticker)
@@ -253,12 +292,518 @@ class ThesisMonitorEngine:
                 if not ba.detected_as_failed and not ba.detected_as_confirmed and (now - ba.break_time) <= MONITOR_MAX_BREAK_AGE_SEC:
                     ba.candles_since += 1
             if prev_price is not None: events.extend(self._detect_breaks(thesis, state, price, prev_price, now))
-            events.extend(self._detect_confirmed_breaks(thesis, state, price, now))
-            events.extend(self._detect_failed_moves(thesis, state, price, now))
-            events.extend(self._detect_retests(thesis, state, price, now))
+            entry_events = []
+            entry_events.extend(self._detect_confirmed_breaks(thesis, state, price, now))
+            entry_events.extend(self._detect_failed_moves(thesis, state, price, now))
+            entry_events.extend(self._detect_retests(thesis, state, price, now))
+            # Auto-create ActiveTrade from clean entry signals
+            for ev in entry_events:
+                if ev.get("type") in ("trade_confirmed", "critical") and ev.get("priority", 0) >= 5:
+                    ak = ev.get("alert_key", "")
+                    # Only create trade on clean entries (not DON'T CHASE / extended)
+                    if "wait" not in ak and "late" not in ak:
+                        self._create_trade_from_event(ticker, thesis, state, price, ev, now, ts)
+            events.extend(entry_events)
             events.extend(self._check_gamma_flip(thesis, state, price))
+            # ── Exit monitoring for active trades ──
+            events.extend(self._monitor_exits(ticker, thesis, state, price, now))
+            # Expire stale trades
+            self._expire_stale_trades(state, now)
             if state.status == "FRESH" and state.check_count >= 2: state.status = "DEVELOPING"
             return self._apply_cooldowns(state, events, now)
+
+    # ── Exit Monitor: Target Discovery ──
+    def _find_targets(self, ticker, thesis, state, price, direction):
+        """Find next S/R levels in trade direction as targets. Zero API calls."""
+        targets = []
+        lvl = thesis.levels
+        # Gather all known levels
+        all_levels = []
+        for attr, name in [
+            ("local_support", "daily_support"), ("local_resistance", "daily_resistance"),
+            ("put_wall", "put_wall"), ("call_wall", "call_wall"), ("gamma_wall", "gamma_wall"),
+            ("gamma_flip", "gamma_flip"), ("s1", "S1"), ("r1", "R1"), ("pivot", "pivot"),
+            ("em_low", "EM_low"), ("em_high", "EM_high"), ("em_2sd_low", "EM_2sd_low"),
+            ("em_2sd_high", "EM_2sd_high"), ("fib_support", "fib_support"),
+            ("fib_resistance", "fib_resistance"), ("vpoc", "vpoc"), ("max_pain", "max_pain"),
+        ]:
+            v = getattr(lvl, attr, None)
+            if v is not None and v > 0:
+                all_levels.append(v)
+        # Add active intraday levels
+        for il in state.intraday_levels:
+            if il.active:
+                all_levels.append(il.price)
+        # Deduplicate within tolerance
+        tol = price * 0.001  # 0.1%
+        unique = []
+        for lv in sorted(set(all_levels)):
+            if not unique or abs(lv - unique[-1]) > tol:
+                unique.append(lv)
+        if direction == "SHORT":
+            targets = sorted([l for l in unique if l < price - tol])
+            targets = targets[-3:][::-1]  # nearest 3 below, closest first
+        else:  # LONG
+            targets = sorted([l for l in unique if l > price + tol])
+            targets = targets[:3]  # nearest 3 above, closest first
+        return targets
+
+    # ── Exit Monitor: Auto-Create Trade ──
+    def _create_trade_from_event(self, ticker, thesis, state, price, event, now, ts):
+        """Create an ActiveTrade from a clean entry signal."""
+        ak = event.get("alert_key", "")
+        msg = event.get("msg", "")
+        # Don't double-create — check for existing OPEN trade at similar level
+        for t in state.active_trades:
+            if t.status in ("OPEN", "SCALED", "TRAILED") and t.direction == ("SHORT" if "short" in ak.lower() else "LONG"):
+                if abs(t.entry_price - price) / price < 0.005:
+                    log.info(f"Trade already open for {ticker} near ${price:.2f}, skipping")
+                    return
+        # Parse direction and entry_type from alert_key
+        if "conf_short" in ak or "fbo_now" in ak or "rt_short" in ak or "rt_fs" in ak:
+            direction = "SHORT"
+        elif "conf_long" in ak or "fb_now" in ak or "rt_long" in ak or "rt_fl" in ak:
+            direction = "LONG"
+        else:
+            log.info(f"Cannot parse direction from alert_key={ak}, skipping trade creation")
+            return
+        if "conf_" in ak:
+            entry_type = "BREAK"
+        elif "fb_" in ak or "fbo_" in ak:
+            entry_type = "FAILED"
+        elif "rt_" in ak:
+            entry_type = "RETEST"
+        else:
+            entry_type = "BREAK"
+        # Find the stop level — extract from the break attempt
+        stop = 0.0
+        level_name = ""
+        for ba in state.break_attempts + state.failed_moves + state.confirmed_breaks:
+            bak = ak.split("_")[-1]  # e.g. "656.30"
+            try:
+                ba_price_str = f"{ba.level:.2f}"
+                if ba_price_str == bak or ba_price_str in ak:
+                    stop = ba.level
+                    level_name = ba.level_name
+                    break
+            except Exception:
+                continue
+        if stop == 0.0:
+            # Fallback: use nearest level in opposite direction
+            if direction == "LONG":
+                stop = price * 0.995  # 0.5% below as safety
+            else:
+                stop = price * 1.005
+        # Parse trade type label from message
+        tt_label = ""
+        for line in msg.split("\n"):
+            if "TRADE TYPE:" in line or line.strip().startswith("💰"):
+                tt_label = line.strip().replace("💰 TRADE TYPE: ", "").replace("💰 ", "").strip()
+                break
+        targets = self._find_targets(ticker, thesis, state, price, direction)
+        trade = ActiveTrade(
+            ticker=ticker, direction=direction, entry_type=entry_type,
+            entry_price=price, stop_level=stop, targets=targets,
+            status="OPEN", entry_time=now, entry_time_str=ts,
+            level_name=level_name, gex_at_entry=thesis.gex_sign,
+            trade_type_label=tt_label, max_favorable=0.0, min_favorable=0.0,
+        )
+        state.active_trades.append(trade)
+        self._persist_trades(ticker, state)
+        log.info(f"ActiveTrade created: {ticker} {direction} {entry_type} @ ${price:.2f} | stop=${stop:.2f} | targets={[f'${t:.2f}' for t in targets]}")
+
+    # ── Exit Monitor: Core Loop ──
+    def _monitor_exits(self, ticker, thesis, state, price, now):
+        """Check all active trades for exit/scale/trail/invalidation signals."""
+        events = []
+        for trade in state.active_trades:
+            if trade.status in ("CLOSED", "INVALIDATED"):
+                continue
+            # Update max favorable excursion
+            if trade.direction == "LONG":
+                fav = price - trade.entry_price
+                trade.max_favorable = max(trade.max_favorable, fav)
+                trade.min_favorable = min(trade.min_favorable, fav)
+            else:
+                fav = trade.entry_price - price
+                trade.max_favorable = max(trade.max_favorable, fav)
+                trade.min_favorable = min(trade.min_favorable, fav)
+            age = now - trade.entry_time
+            # 1. INVALIDATION — stop level reclaimed/lost
+            inv_events = self._check_invalidation(trade, thesis, state, price, now)
+            if inv_events:
+                events.extend(inv_events)
+                continue  # trade closed, skip other checks
+            # 2. SCALE PARTIAL — first target hit
+            events.extend(self._check_scale(trade, thesis, state, price, now))
+            # 3. TRAIL RUNNER — momentum accelerating in position direction
+            events.extend(self._check_trail(trade, thesis, state, price, now))
+            # 4. REDUCE EXPOSURE — momentum fading against position
+            events.extend(self._check_momentum_fade(trade, thesis, state, price, now))
+            # 5. EXIT — second target or exhaustion
+            events.extend(self._check_exit(trade, thesis, state, price, now))
+        return events
+
+    def _exit_alert_ok(self, trade, key, now):
+        """Check and set cooldown for exit alerts."""
+        last = trade.exit_alert_history.get(key, 0)
+        if (now - last) < EXIT_ALERT_COOLDOWN_SEC:
+            return False
+        trade.exit_alert_history[key] = now
+        return True
+
+    # ── Invalidation Check ──
+    def _check_invalidation(self, trade, thesis, state, price, now):
+        events = []
+        buf = trade.stop_level * (EXIT_INVALIDATE_BUFFER_PCT / 100)
+        if trade.direction == "LONG":
+            # Price dropped below stop
+            invalidated = price < (trade.stop_level - buf)
+        else:
+            # Price rallied above stop
+            invalidated = price > (trade.stop_level + buf)
+        # Also check trail stop if set
+        if trade.trail_stop is not None:
+            if trade.direction == "LONG" and price < trade.trail_stop:
+                invalidated = True
+            elif trade.direction == "SHORT" and price > trade.trail_stop:
+                invalidated = True
+        if not invalidated:
+            return events
+        if not self._exit_alert_ok(trade, "invalidate", now):
+            return events
+        trade.status = "INVALIDATED"; trade.close_price = price; trade.close_time = now
+        stop_ref = trade.trail_stop if trade.trail_stop else trade.stop_level
+        pnl_pct = ((price - trade.entry_price) / trade.entry_price * 100) if trade.direction == "LONG" else ((trade.entry_price - price) / trade.entry_price * 100)
+        if trade.direction == "LONG":
+            trade.close_reason = f"Reclaimed ${stop_ref:.2f}"
+            events.append({"msg": (
+                f"🛑 TRADE INVALIDATED — LONG\n\n"
+                f"Lost ${stop_ref:.2f}. Exit now.\n"
+                f"Entry: ${trade.entry_price:.2f} → Now: ${price:.2f} ({pnl_pct:+.2f}%)\n"
+                f"Stop was ${stop_ref:.2f} ({trade.level_name})\n"
+                f"Don't hope. Close it."
+            ), "type": "exit", "priority": 5, "alert_key": f"exit_inv_L_{trade.entry_price:.2f}"})
+        else:
+            trade.close_reason = f"Lost ${stop_ref:.2f}"
+            events.append({"msg": (
+                f"🛑 TRADE INVALIDATED — SHORT\n\n"
+                f"Reclaimed ${stop_ref:.2f}. Exit now.\n"
+                f"Entry: ${trade.entry_price:.2f} → Now: ${price:.2f} ({pnl_pct:+.2f}%)\n"
+                f"Stop was ${stop_ref:.2f} ({trade.level_name})\n"
+                f"Don't hope. Close it."
+            ), "type": "exit", "priority": 5, "alert_key": f"exit_inv_S_{trade.entry_price:.2f}"})
+        self._persist_trades(trade.ticker, state)
+        log.info(f"Trade INVALIDATED: {trade.ticker} {trade.direction} @ ${trade.entry_price:.2f} → ${price:.2f}")
+        return events
+
+    # ── Scale Partial Check ──
+    def _check_scale(self, trade, thesis, state, price, now):
+        events = []
+        if trade.status != "OPEN" or not trade.targets:
+            return events
+        first_target = trade.targets[0]
+        prox = abs(price - first_target) / first_target * 100
+        if prox > EXIT_SCALE_PROXIMITY_PCT * 100:
+            return events
+        # Target reached
+        if trade.direction == "LONG" and price < first_target:
+            return events  # hasn't actually reached it yet
+        if trade.direction == "SHORT" and price > first_target:
+            return events
+        if not self._exit_alert_ok(trade, "scale", now):
+            return events
+        trade.status = "SCALED"; trade.scaled_at_price = price
+        pnl_pct = ((price - trade.entry_price) / trade.entry_price * 100) if trade.direction == "LONG" else ((trade.entry_price - price) / trade.entry_price * 100)
+        dir_word = "long" if trade.direction == "LONG" else "short"
+        remaining = trade.targets[1:] if len(trade.targets) > 1 else []
+        next_tgt = f"${remaining[0]:.2f}" if remaining else "—"
+        events.append({"msg": (
+            f"💰 SCALE PARTIAL — {trade.direction}\n\n"
+            f"First target ${first_target:.2f} reached. Take partials.\n"
+            f"Entry: ${trade.entry_price:.2f} → Now: ${price:.2f} ({pnl_pct:+.2f}%)\n"
+            f"Move stop to breakeven (${trade.entry_price:.2f}).\n"
+            f"Next target: {next_tgt}\n"
+            f"Don't let winner turn into loser."
+        ), "type": "exit", "priority": 5, "alert_key": f"exit_scale_{dir_word}_{trade.entry_price:.2f}"})
+        # Move stop to breakeven after scaling
+        trade.trail_stop = trade.entry_price
+        self._persist_trades(trade.ticker, state)
+        log.info(f"Trade SCALED: {trade.ticker} {trade.direction} @ ${trade.entry_price:.2f}, target ${first_target:.2f} hit, stop→BE")
+        return events
+
+    # ── Trail Runner Check ──
+    def _check_trail(self, trade, thesis, state, price, now):
+        events = []
+        if trade.status not in ("SCALED", "TRAILED"):
+            return events
+        # Check momentum acceleration in trade direction
+        recent = [p["price"] for p in state.price_history[-EXIT_MOMENTUM_FADE_LOOKBACK:]]
+        if len(recent) < 3:
+            return events
+        diffs = [recent[i] - recent[i-1] for i in range(1, len(recent))]
+        avg_d = sum(diffs) / len(diffs)
+        last_d = diffs[-1]
+        # Is momentum accelerating in our direction?
+        accel = False
+        if trade.direction == "LONG" and avg_d > 0 and last_d > avg_d * EXIT_TRAIL_ACCELERATION_MULT:
+            accel = True
+        elif trade.direction == "SHORT" and avg_d < 0 and abs(last_d) > abs(avg_d) * EXIT_TRAIL_ACCELERATION_MULT:
+            accel = True
+        if not accel:
+            return events
+        if not self._exit_alert_ok(trade, "trail", now):
+            return events
+        # Compute new trail stop — halfway between entry and current price
+        old_stop = trade.trail_stop if trade.trail_stop else trade.stop_level
+        if trade.direction == "LONG":
+            new_stop = max(old_stop, price - (price - trade.entry_price) * 0.5)
+            new_stop = max(new_stop, trade.entry_price)  # never below breakeven
+        else:
+            new_stop = min(old_stop, price + (trade.entry_price - price) * 0.5)
+            new_stop = min(new_stop, trade.entry_price)  # never above breakeven
+        if abs(new_stop - old_stop) / old_stop < 0.001:
+            return events  # trail didn't move meaningfully
+        trade.trail_stop = round(new_stop, 2)
+        trade.status = "TRAILED"
+        pnl_pct = ((price - trade.entry_price) / trade.entry_price * 100) if trade.direction == "LONG" else ((trade.entry_price - price) / trade.entry_price * 100)
+        events.append({"msg": (
+            f"🏃 LET RUNNER WORK — {trade.direction}\n\n"
+            f"Trend accelerating. Trail stop → ${trade.trail_stop:.2f}\n"
+            f"Entry: ${trade.entry_price:.2f} → Now: ${price:.2f} ({pnl_pct:+.2f}%)\n"
+            f"Let momentum do the work."
+        ), "type": "exit", "priority": 5, "alert_key": f"exit_trail_{trade.direction}_{trade.entry_price:.2f}"})
+        self._persist_trades(trade.ticker, state)
+        log.info(f"Trade TRAILED: {trade.ticker} {trade.direction}, trail_stop → ${trade.trail_stop:.2f}")
+        return events
+
+    # ── Momentum Fade Check ──
+    def _check_momentum_fade(self, trade, thesis, state, price, now):
+        events = []
+        if trade.status not in ("OPEN", "SCALED", "TRAILED"):
+            return events
+        recent = [p["price"] for p in state.price_history[-EXIT_MOMENTUM_FADE_LOOKBACK:]]
+        if len(recent) < 3:
+            return events
+        diffs = [recent[i] - recent[i-1] for i in range(1, len(recent))]
+        avg_d = sum(diffs) / len(diffs)
+        # Is momentum fading AGAINST our position?
+        fading = False
+        if trade.direction == "LONG" and avg_d < 0 and trade.max_favorable > 0:
+            fading = True
+        elif trade.direction == "SHORT" and avg_d > 0 and trade.max_favorable > 0:
+            fading = True
+        if not fading:
+            return events
+        # Only alert if we've had a meaningful move first (at least 0.15% in our favor)
+        fav_pct = trade.max_favorable / trade.entry_price * 100
+        if fav_pct < 0.15:
+            return events
+        if not self._exit_alert_ok(trade, "fade", now):
+            return events
+        pnl_pct = ((price - trade.entry_price) / trade.entry_price * 100) if trade.direction == "LONG" else ((trade.entry_price - price) / trade.entry_price * 100)
+        dir_word = "Upside" if trade.direction == "LONG" else "Downside"
+        events.append({"msg": (
+            f"⚠️ REDUCE EXPOSURE — {trade.direction}\n\n"
+            f"{dir_word} stalling. Momentum fading against position.\n"
+            f"Entry: ${trade.entry_price:.2f} → Now: ${price:.2f} ({pnl_pct:+.2f}%)\n"
+            f"Best: {'+' if trade.direction == 'LONG' else ''}{fav_pct:.2f}% | Now giving back.\n"
+            f"Don't let winner turn into loser."
+        ), "type": "exit", "priority": 4, "alert_key": f"exit_fade_{trade.direction}_{trade.entry_price:.2f}"})
+        return events
+
+    # ── Exit / Exhaustion Check ──
+    def _check_exit(self, trade, thesis, state, price, now):
+        events = []
+        if trade.status not in ("SCALED", "TRAILED"):
+            return events  # only exit after scaling or trailing
+        # Check if second target reached
+        remaining = trade.targets[1:] if len(trade.targets) > 1 else trade.targets
+        second_hit = False
+        for tgt in remaining:
+            if trade.direction == "LONG" and price >= tgt:
+                second_hit = True; break
+            elif trade.direction == "SHORT" and price <= tgt:
+                second_hit = True; break
+        # Check for exhaustion — momentum decelerating after a run
+        exhausted = False
+        recent = [p["price"] for p in state.price_history[-EXIT_MOMENTUM_FADE_LOOKBACK:]]
+        if len(recent) >= 3:
+            diffs = [recent[i] - recent[i-1] for i in range(1, len(recent))]
+            avg_d = sum(diffs) / len(diffs)
+            last_d = diffs[-1]
+            if trade.direction == "LONG" and trade.max_favorable > price * 0.003:
+                if avg_d > 0 and abs(last_d) < abs(avg_d) * EXIT_EXHAUSTION_DECEL_MULT:
+                    exhausted = True
+                elif last_d < 0:
+                    exhausted = True
+            elif trade.direction == "SHORT" and trade.max_favorable > price * 0.003:
+                if avg_d < 0 and abs(last_d) < abs(avg_d) * EXIT_EXHAUSTION_DECEL_MULT:
+                    exhausted = True
+                elif last_d > 0:
+                    exhausted = True
+        if not second_hit and not exhausted:
+            return events
+        if not self._exit_alert_ok(trade, "exit", now):
+            return events
+        pnl_pct = ((price - trade.entry_price) / trade.entry_price * 100) if trade.direction == "LONG" else ((trade.entry_price - price) / trade.entry_price * 100)
+        if second_hit:
+            reason = "Second target reached"
+            trade.close_reason = reason
+            events.append({"msg": (
+                f"⏹ EXIT — {trade.direction}\n\n"
+                f"Second target hit. Pay yourself.\n"
+                f"Entry: ${trade.entry_price:.2f} → Now: ${price:.2f} ({pnl_pct:+.2f}%)\n"
+                f"Move extended. Close remaining."
+            ), "type": "exit", "priority": 5, "alert_key": f"exit_done_{trade.direction}_{trade.entry_price:.2f}"})
+        else:
+            reason = "Exhaustion signal"
+            trade.close_reason = reason
+            events.append({"msg": (
+                f"⏹ EXIT — {trade.direction}\n\n"
+                f"Momentum exhausting after {trade.status.lower()} phase.\n"
+                f"Entry: ${trade.entry_price:.2f} → Now: ${price:.2f} ({pnl_pct:+.2f}%)\n"
+                f"Move extended. Pay yourself."
+            ), "type": "exit", "priority": 5, "alert_key": f"exit_exh_{trade.direction}_{trade.entry_price:.2f}"})
+        trade.status = "CLOSED"; trade.close_price = price; trade.close_time = now
+        self._persist_trades(trade.ticker, state)
+        log.info(f"Trade CLOSED: {trade.ticker} {trade.direction} @ ${trade.entry_price:.2f} → ${price:.2f} | {reason}")
+        return events
+
+    # ── Expire Stale Trades ──
+    def _expire_stale_trades(self, state, now):
+        for trade in state.active_trades:
+            if trade.status in ("CLOSED", "INVALIDATED"):
+                continue
+            if (now - trade.entry_time) > EXIT_MAX_TRADE_AGE_SEC:
+                trade.status = "CLOSED"; trade.close_time = now
+                trade.close_reason = "Session expired (4hr max)"
+                log.info(f"Trade expired: {trade.ticker} {trade.direction} @ ${trade.entry_price:.2f}")
+        # Prune trades older than 8 hours (keep history but don't bloat)
+        state.active_trades = [t for t in state.active_trades if (now - t.entry_time) < 28800]
+
+    # ── Trade Persistence ──
+    def _persist_trades(self, ticker, state):
+        if not self._store_set:
+            return
+        try:
+            trades_data = []
+            for t in state.active_trades:
+                trades_data.append({
+                    "ticker": t.ticker, "direction": t.direction, "entry_type": t.entry_type,
+                    "entry_price": t.entry_price, "stop_level": t.stop_level,
+                    "targets": t.targets, "status": t.status,
+                    "entry_time": t.entry_time, "entry_time_str": t.entry_time_str,
+                    "level_name": t.level_name, "gex_at_entry": t.gex_at_entry,
+                    "trade_type_label": t.trade_type_label,
+                    "max_favorable": t.max_favorable, "min_favorable": t.min_favorable,
+                    "scaled_at_price": t.scaled_at_price,
+                    "trail_stop": t.trail_stop, "close_price": t.close_price,
+                    "close_reason": t.close_reason, "close_time": t.close_time,
+                })
+            self._store_set(f"active_trades:{ticker}", json.dumps(trades_data), ttl=86400)
+        except Exception as e:
+            log.warning(f"Trade persist failed for {ticker}: {e}")
+
+    def _load_trades_from_store(self, ticker, state):
+        if not self._store_get:
+            return
+        try:
+            raw = self._store_get(f"active_trades:{ticker}")
+            if not raw:
+                return
+            trades_data = json.loads(raw)
+            for td in trades_data:
+                trade = ActiveTrade(
+                    ticker=td.get("ticker", ticker),
+                    direction=td.get("direction", "LONG"),
+                    entry_type=td.get("entry_type", "BREAK"),
+                    entry_price=td.get("entry_price", 0),
+                    stop_level=td.get("stop_level", 0),
+                    targets=td.get("targets", []),
+                    status=td.get("status", "OPEN"),
+                    entry_time=td.get("entry_time", 0),
+                    entry_time_str=td.get("entry_time_str", ""),
+                    level_name=td.get("level_name", ""),
+                    gex_at_entry=td.get("gex_at_entry", "positive"),
+                    trade_type_label=td.get("trade_type_label", ""),
+                    max_favorable=td.get("max_favorable", 0),
+                    min_favorable=td.get("min_favorable", 0),
+                    scaled_at_price=td.get("scaled_at_price"),
+                    trail_stop=td.get("trail_stop"),
+                    close_price=td.get("close_price"),
+                    close_reason=td.get("close_reason", ""),
+                    close_time=td.get("close_time", 0),
+                )
+                state.active_trades.append(trade)
+            log.info(f"Loaded {len(trades_data)} trades from store for {ticker}")
+        except Exception as e:
+            log.warning(f"Trade load failed for {ticker}: {e}")
+
+    # ── Manual Trade Management ──
+    def close_trade(self, ticker, price=None, reason="Manual close"):
+        """Close the most recent open trade for a ticker."""
+        with self._lock:
+            state = self._states.get(ticker)
+            if not state:
+                return "No state for this ticker."
+            open_trades = [t for t in state.active_trades if t.status in ("OPEN", "SCALED", "TRAILED")]
+            if not open_trades:
+                return "No open trades."
+            trade = open_trades[-1]
+            trade.status = "CLOSED"; trade.close_reason = reason
+            trade.close_price = price; trade.close_time = time.monotonic()
+            self._persist_trades(ticker, state)
+            pnl = ""
+            if price and trade.entry_price:
+                pnl_pct = ((price - trade.entry_price) / trade.entry_price * 100) if trade.direction == "LONG" else ((trade.entry_price - price) / trade.entry_price * 100)
+                pnl = f" ({pnl_pct:+.2f}%)"
+            return f"Closed {trade.direction} {trade.entry_type} @ ${trade.entry_price:.2f}{pnl}. Reason: {reason}"
+
+    # ── Format Active Trades for Display ──
+    def format_trades(self, ticker, price=None):
+        state = self._states.get(ticker)
+        if not state:
+            return f"📊 {ticker}: No monitor state."
+        # Load from store if empty
+        if not state.active_trades:
+            self._load_trades_from_store(ticker, state)
+        open_trades = [t for t in state.active_trades if t.status in ("OPEN", "SCALED", "TRAILED")]
+        closed_trades = [t for t in state.active_trades if t.status in ("CLOSED", "INVALIDATED")]
+        lines = [f"📊 {ticker} ACTIVE TRADES"]
+        if not open_trades and not closed_trades:
+            lines.append("No trades. Waiting for entry signals.")
+            return "\n".join(lines)
+        for t in open_trades:
+            status_emoji = {"OPEN": "🟢", "SCALED": "💰", "TRAILED": "🏃"}.get(t.status, "⚪")
+            pnl = ""
+            if price and t.entry_price:
+                pnl_pct = ((price - t.entry_price) / t.entry_price * 100) if t.direction == "LONG" else ((t.entry_price - price) / t.entry_price * 100)
+                pnl = f" | P&L: {pnl_pct:+.2f}%"
+            stop_ref = t.trail_stop if t.trail_stop else t.stop_level
+            lines.append(f"\n{status_emoji} {t.direction} {t.entry_type} — {t.status}")
+            lines.append(f"  Entry: ${t.entry_price:.2f} ({t.entry_time_str})")
+            lines.append(f"  Stop: ${stop_ref:.2f}{pnl}")
+            if t.targets:
+                tgt_str = " → ".join([f"${tg:.2f}" for tg in t.targets[:3]])
+                lines.append(f"  Targets: {tgt_str}")
+            if t.trade_type_label:
+                lines.append(f"  Type: {t.trade_type_label}")
+            if t.max_favorable > 0:
+                mfe_pct = t.max_favorable / t.entry_price * 100
+                lines.append(f"  Best: +{mfe_pct:.2f}%")
+        if closed_trades:
+            recent = closed_trades[-3:][::-1]
+            lines.append(f"\n— Recent Closed ({len(closed_trades)} total) —")
+            for t in recent:
+                status_emoji = "🛑" if t.status == "INVALIDATED" else "⏹"
+                pnl = ""
+                if t.close_price and t.entry_price:
+                    pnl_pct = ((t.close_price - t.entry_price) / t.entry_price * 100) if t.direction == "LONG" else ((t.entry_price - t.close_price) / t.entry_price * 100)
+                    pnl = f" ({pnl_pct:+.2f}%)"
+                cp = t.close_price if t.close_price else 0
+                lines.append(f"  {status_emoji} {t.direction} ${t.entry_price:.2f}→${cp:.2f}{pnl} [{t.close_reason}]")
+        return "\n".join(lines)
 
     def build_guidance(self, ticker, price):
         thesis = self._theses.get(ticker); state = self._states.get(ticker)
@@ -288,6 +833,17 @@ class ThesisMonitorEngine:
                 g.append({"text": f"Resistance: ${idr.price:.2f} ({idr.source.replace('_',' ')}, {idr.touches}x). {act}", "type": "info"})
         if state.session_high is not None and state.session_low is not None:
             g.append({"text": f"Session: ${state.session_low:.2f}-${state.session_high:.2f} (${state.session_high - state.session_low:.2f} wide)", "type": "context"})
+        # Show active trade status in guidance
+        open_trades = [t for t in state.active_trades if t.status in ("OPEN", "SCALED", "TRAILED")]
+        if open_trades:
+            g.append({"text": "— ACTIVE TRADES —", "type": "divider"})
+            for t in open_trades:
+                pnl_pct = ((price - t.entry_price) / t.entry_price * 100) if t.direction == "LONG" else ((t.entry_price - price) / t.entry_price * 100)
+                stop_ref = t.trail_stop if t.trail_stop else t.stop_level
+                ty = "bullish" if pnl_pct > 0 else "bearish"
+                g.append({"text": f"{t.direction} {t.entry_type} @ ${t.entry_price:.2f} ({pnl_pct:+.2f}%) | stop ${stop_ref:.2f} | {t.status}", "type": ty})
+                if t.targets:
+                    g.append({"text": f"  Targets: {' → '.join([f'${tg:.2f}' for tg in t.targets[:3]])}", "type": "info"})
         if state.failed_moves:
             lf = state.failed_moves[-1]; age = (time.monotonic() - lf.break_time) / 60
             if age < 30:
@@ -471,6 +1027,17 @@ class ThesisMonitorEngine:
             if al: lines.append(f"Levels: {sum(1 for l in al if l.kind=='support')}S / {sum(1 for l in al if l.kind=='resistance')}R")
             if state.confirmed_breaks: lines.append(f"Confirmed: {len(state.confirmed_breaks)}")
             if state.failed_moves: lines.append(f"Failed moves: {len(state.failed_moves)}")
+            # Active trades summary
+            open_trades = [t for t in state.active_trades if t.status in ("OPEN", "SCALED", "TRAILED")]
+            if open_trades:
+                for t in open_trades:
+                    emoji = {"OPEN": "🟢", "SCALED": "💰", "TRAILED": "🏃"}.get(t.status, "⚪")
+                    pnl = ""
+                    if t.entry_price > 0:
+                        pnl_pct = ((p - t.entry_price) / t.entry_price * 100) if t.direction == "LONG" else ((t.entry_price - p) / t.entry_price * 100)
+                        pnl = f" ({pnl_pct:+.2f}%)"
+                    stop_ref = t.trail_stop if t.trail_stop else t.stop_level
+                    lines.append(f"{emoji} {t.direction} @ ${t.entry_price:.2f}{pnl} stop=${stop_ref:.2f}")
         tp = _get_time_phase_ct(); lines.append(f"Phase: {tp['label']}")
         fast = ticker.upper() in MONITOR_FAST_POLL_TICKERS
         lines.append(f"Poll: {MONITOR_POLL_INTERVAL_FAST_SEC if fast else MONITOR_POLL_INTERVAL_SEC}s")
@@ -514,12 +1081,15 @@ class ThesisMonitorDaemon:
             except Exception as e: log.warning(f"Monitor {ticker} failed: {e}")
     def _post_alert(self, ticker, price, event):
         tp = _get_time_phase_ct(); state = self.engine.get_state(ticker); thesis = self.engine.get_thesis(ticker)
-        lines = [f"📡 {ticker} THESIS ALERT — ${price:.2f}", "", event["msg"]]
-        if state and state.momentum not in ("NEUTRAL", "STALLING"): lines.append(f"Momentum: {state.momentum.replace('_',' ')}")
-        if state:
-            il = IntradayLevelTracker.get_active_levels(state, price)
-            if il["support"]: lines.append(f"Nearest support: ${il['support'].price:.2f}")
-            if il["resistance"]: lines.append(f"Nearest resistance: ${il['resistance'].price:.2f}")
+        is_exit = event.get("type") == "exit"
+        header = f"📊 {ticker} TRADE MGMT — ${price:.2f}" if is_exit else f"📡 {ticker} THESIS ALERT — ${price:.2f}"
+        lines = [header, "", event["msg"]]
+        if not is_exit:
+            if state and state.momentum not in ("NEUTRAL", "STALLING"): lines.append(f"Momentum: {state.momentum.replace('_',' ')}")
+            if state:
+                il = IntradayLevelTracker.get_active_levels(state, price)
+                if il["support"]: lines.append(f"Nearest support: ${il['support'].price:.2f}")
+                if il["resistance"]: lines.append(f"Nearest resistance: ${il['resistance'].price:.2f}")
         lines.append(""); lines.append(f"Phase: {tp['label']} | {thesis.bias} ({thesis.bias_score:+d}/14)")
         lines.append("— Not financial advice —")
         try: self.post_fn("\n".join(lines)); log.info(f"Alert: {ticker} | {event.get('type','')} | {event.get('msg','')[:80]}")
