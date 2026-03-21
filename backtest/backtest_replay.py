@@ -161,14 +161,34 @@ def make_dict_store():
 # ═════════════════════════════════════════════════════════════════════════════
 
 # Regimes to skip entirely — no trades taken on these days.
-# Based on backtest data: LOW_VOL_CHOP days consistently lose money.
 SKIP_REGIMES = {"LOW_VOL_CHOP", "BEAR_TREND"}
 
-# Stop loss buffer: how far past the stop_level price must move to trigger exit.
-# 0.005 = 0.5%. A LONG exits when price <= stop_level * (1 - 0.005).
-# Set to 0.0 to exit exactly at the stop_level with no buffer.
-STOP_BUFFER_PCT = 0.00
+# Stop loss buffer: how far past stop_level price must move to trigger exit.
+# 0.005 = 0.5%. Set to 0.0 to exit exactly at the stop with no buffer.
+STOP_BUFFER_PCT = 0.005
 
+# ── Trade combo rules ──────────────────────────────────────────────────────
+# Only trades matching one of these combos are taken.
+# Anything not matching is force-closed immediately after entry.
+#
+# Score 5 trades fire if ANY of these conditions is true:
+#   - Regime is HIGH_VOL_TREND
+#   - GEX sign is positive
+#   - Prior day context is GAP_UP
+#   - Time phase is POWER_HOUR
+#
+# Score 4 trades fire ONLY on: intraday_support (sharp move origin)
+#
+# BLOCKED levels (never trade, any score):
+#   - intraday_support (rejection zone)
+
+BLOCKED_LEVEL_NAMES = {
+    "intraday_support (rejection zone)",
+}
+
+SCORE4_ALLOWED_LEVELS = {
+    "intraday_support (sharp move origin)",
+}
 
 
 
@@ -507,6 +527,87 @@ class ResultsRecorder:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# TRADE COMBO GATE
+# ─────────────────────────────────────────────────────────────────────────────
+# After the engine creates a trade, this function decides whether to keep it
+# or immediately close it. Uses the rules defined in FILTER CONFIGURATION.
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _trade_passes_combo(trade, session_meta: dict, time_phase: str) -> tuple:
+    """
+    Returns (allowed: bool, reason: str).
+
+    Score 5 — allowed if ANY of:
+        regime == HIGH_VOL_TREND
+        gex_sign == positive
+        prior_day_context == GAP_UP
+        time_phase == POWER_HOUR
+
+    Score 4 — allowed ONLY if:
+        level_name == intraday_support (sharp move origin)
+
+    All scores — blocked if:
+        level_name in BLOCKED_LEVEL_NAMES
+    """
+    score   = trade.setup_score
+    level   = trade.level_name or ""
+    regime  = session_meta.get("regime", "")
+    gex     = session_meta.get("gex_sign", "")
+    ctx     = session_meta.get("prior_day_context", "")
+
+    # Hard block — never trade this level regardless of score
+    if level in BLOCKED_LEVEL_NAMES:
+        return False, f"blocked_level: {level}"
+
+    if score == 5:
+        if regime == "HIGH_VOL_TREND": return True,  "S5+HVT"
+        if gex    == "positive":       return True,  "S5+GEX+"
+        if ctx    == "GAP_UP":         return True,  "S5+GAP_UP"
+        if time_phase == "POWER_HOUR": return True,  "S5+POWER_HOUR"
+        return False, "S5_no_qualifying_combo"
+
+    if score == 4:
+        if level in SCORE4_ALLOWED_LEVELS:
+            return True, "S4+SMO"
+        return False, f"S4_level_not_allowed: {level}"
+
+    return False, f"score_{score}_not_in_rules"
+
+
+def apply_combo_gate(
+    engine: ThesisMonitorEngine,
+    ticker: str,
+    session_meta: dict,
+    time_phase: str,
+    bar_close: float,
+    bar_time: str,
+    recorder,
+) -> int:
+    """
+    Check all newly opened trades against the combo rules.
+    Force-close any trade that doesn't pass. Returns number closed.
+    """
+    state = engine.get_state(ticker)
+    if not state:
+        return 0
+
+    closed = 0
+    for trade in state.active_trades:
+        if trade.status in ("CLOSED", "INVALIDATED"):
+            continue
+        allowed, reason = _trade_passes_combo(trade, session_meta, time_phase)
+        if not allowed:
+            engine.close_trade(
+                ticker,
+                price=bar_close,
+                reason=f"Combo gate: {reason}",
+            )
+            closed += 1
+
+    return closed
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # STOP LOSS ENFORCER
 # ─────────────────────────────────────────────────────────────────────────────
 # Runs before engine.evaluate() each bar. Checks every open trade against
@@ -670,6 +771,13 @@ def run_backtest(ticker: str, csv_path: str, output_dir: str, skip_days: int = 1
                 events = []
 
             recorder.record_events(events, day, bar_time, ticker, bar["close"])
+
+            # ── Filter 3: Combo gate — close any trade that doesn't match rules ──
+            apply_combo_gate(
+                engine, ticker, session_meta, time_phase,
+                bar["close"], bar_time, recorder,
+            )
+
             recorder.snapshot_trades(engine, ticker, day, bar_time, time_phase, session_meta)
 
         last_bar = bars[-1]
