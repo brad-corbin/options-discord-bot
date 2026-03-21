@@ -254,28 +254,57 @@ TICKER_RULES = {
     #              GAP_UP days are a trap (-8.68 pts on 90 trades)
     # Winning: SHORT + GEX+ across all sessions, LONG + GEX+ + non-GAP_UP
     "GLD": {
+        # ── GLD rule set — derived from detailed cluster analysis ──────────
+        # GLD is a selective LONG score-5 BREAK engine.
+        # Strongest around Midday, best on A/B tier levels, NORMAL gap context.
+        #
+        # Key verified clusters:
+        #   LONG + S5 + BREAK:                14t, 71.4% win, +3.75 pts
+        #   LONG + S5 + MIDDAY:               13t, 76.9% win, +3.02 pts
+        #   LONG + S5 + SMO support:          22t, 68.2% win, +2.29 pts
+        #   LONG + S5 + SMO resistance:       14t, 64.3% win, +2.65 pts
+        #   NORMAL gap context:               21t, 42.9% win, +5.58 pts (big winners)
+        #
+        # Blocked — confirmed losers:
+        #   ALL SHORT trades:                 47t, 34.0% win, -6.63 pts
+        #   SHORT + MORNING:                  12t, 16.7% win, -4.83 pts
+        #   Score 4 trades:                   62t, 38.7% win, -7.71 pts
+        #   Score 4 + Power Hour:              9t, 33.3% win, -4.12 pts
+
         "skip_sessions": {"MORNING", "OPEN"},
+
         "blocked_levels": {
             "intraday_support (rejection zone)",
         },
+
+        # Score 5 LONG only — allowed in Midday or Afternoon on approved levels
+        # The direction_block below handles blocking all shorts,
+        # so score5_conditions only needs to pass legitimate LONGs.
         "score5_conditions": [
-            # SHORT bias: GEX+ enables shorts (dealer pinning = clean resistance fades)
-            {"gex_sign": "positive"},
-            # LONG with NORMAL gap + GEX+ works
-            {"gex_sign": "positive", "prior_day_context": "NORMAL"},
-            # Afternoon specifically strong for S5
-            {"time_phase": "AFTERNOON"},
+            # BREAK entries in Midday or Afternoon on SMO levels — top cluster
+            {"entry_type": "BREAK", "time_phase": "MIDDAY"},
+            {"entry_type": "BREAK", "time_phase": "AFTERNOON"},
+            # SMO support in Midday/Afternoon — strong recurring level
+            {"level": "intraday_support (sharp move origin)", "time_phase": "MIDDAY"},
+            {"level": "intraday_support (sharp move origin)", "time_phase": "AFTERNOON"},
+            # SMO resistance (secondary approved level)
+            {"level": "intraday_resistance (sharp move origin)", "time_phase": "MIDDAY"},
+            {"level": "intraday_resistance (sharp move origin)", "time_phase": "AFTERNOON"},
+            # NORMAL gap context has strong expectancy regardless of session
+            {"prior_day_context": "NORMAL"},
+            # Power Hour allowed for BREAK entries specifically
+            {"entry_type": "BREAK", "time_phase": "POWER_HOUR"},
+            # Close session — allowed but not preferred
+            {"entry_type": "BREAK", "time_phase": "CLOSE"},
         ],
-        "score4_levels": {
-            "intraday_support (sharp move origin)",
-            "daily_support",
-        },
+
+        # Score 4 — blocked entirely (38.7% win, -7.71 pts)
+        "score4_levels": set(),   # empty = no Score 4 trades pass
         "score4_extra": [],
+
         "direction_block": [
-            # Never short GLD with GEX- — 31% win, -6.64 pts
-            {"direction": "SHORT", "gex_sign": "negative"},
-            # Never long GLD on GAP_UP days — -8.68 pts
-            {"direction": "LONG", "prior_day_context": "GAP_UP"},
+            # Block ALL shorts — 34% win, -6.63 pts, no redemptive subgroup
+            {"direction": "SHORT"},
         ],
     },
 
@@ -698,12 +727,14 @@ def _condition_matches(cond: dict, trade, session_meta: dict, time_phase: str) -
     dirn   = trade.direction or ""
 
     checks = {
-        "regime":           regime,
-        "gex_sign":         gex,
+        "regime":            regime,
+        "gex_sign":          gex,
         "prior_day_context": ctx,
-        "time_phase":       time_phase,
-        "level":            level,
-        "direction":        dirn,
+        "time_phase":        time_phase,
+        "level":             level,
+        "direction":         dirn,
+        "entry_type":        trade.entry_type or "",
+        "level_tier":        trade.level_tier or "",
     }
     return all(checks.get(k) == v for k, v in cond.items())
 
