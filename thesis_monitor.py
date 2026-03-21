@@ -24,7 +24,9 @@ log = logging.getLogger(__name__)
 # CONFIGURATION
 # ─────────────────────────────────────────────────────────
 
-MONITOR_POLL_INTERVAL_SEC = 300          # 5 minutes between checks
+MONITOR_POLL_INTERVAL_SEC = 300          # 5 minutes default
+MONITOR_POLL_INTERVAL_FAST_SEC = 60      # 1 minute for SPY (active 0DTE trading)
+MONITOR_FAST_POLL_TICKERS = ["SPY"]      # Tickers that get 60s polling
 MONITOR_ALERT_COOLDOWN_SEC = 600         # min 10 min between same-type alerts
 MONITOR_MAX_BREAK_AGE_SEC = 900          # 15 min window for failed move detection
 MONITOR_MOMENTUM_LOOKBACK = 5            # number of price points for momentum calc
@@ -1207,7 +1209,9 @@ class ThesisMonitorEngine:
 
         tp = _get_time_phase_ct()
         lines.append(f"Phase: {tp['label']}")
-        lines.append(f"Polling: every {MONITOR_POLL_INTERVAL_SEC}s (5m candles, intraday levels active)")
+        is_fast = ticker.upper() in MONITOR_FAST_POLL_TICKERS
+        poll_sec = MONITOR_POLL_INTERVAL_FAST_SEC if is_fast else MONITOR_POLL_INTERVAL_SEC
+        lines.append(f"Polling: every {poll_sec}s ({'fast 1m' if is_fast else '5m candles'}, intraday levels active)")
         return "\n".join(lines)
 
 
@@ -1251,17 +1255,23 @@ class ThesisMonitorDaemon:
         return self._thread is not None and self._thread.is_alive()
 
     def _run(self):
-        log.info(f"Thesis monitor polling loop started (interval={MONITOR_POLL_INTERVAL_SEC}s)")
+        log.info(f"Thesis monitor polling loop started "
+                 f"(fast={MONITOR_POLL_INTERVAL_FAST_SEC}s for {MONITOR_FAST_POLL_TICKERS}, "
+                 f"normal={MONITOR_POLL_INTERVAL_SEC}s for others)")
+        self._cycle_count = 0
+        # Use fast interval as base loop; slow tickers check every Nth cycle
+        self._slow_every_n = max(1, MONITOR_POLL_INTERVAL_SEC // MONITOR_POLL_INTERVAL_FAST_SEC)
         while not self._stop_event.is_set():
             try:
                 self._poll_cycle()
             except Exception as e:
                 log.error(f"Thesis monitor poll error: {e}", exc_info=True)
-            self._stop_event.wait(MONITOR_POLL_INTERVAL_SEC)
+            self._cycle_count += 1
+            self._stop_event.wait(MONITOR_POLL_INTERVAL_FAST_SEC)
         log.info("Thesis monitor polling loop stopped")
 
     def _poll_cycle(self):
-        """One polling cycle — check all monitored tickers."""
+        """One polling cycle — fast tickers every cycle, slow tickers every Nth."""
         if not self._enabled:
             return
 
@@ -1270,7 +1280,14 @@ class ThesisMonitorDaemon:
         if tp["phase"] in ("PRE_MARKET", "AFTER_HOURS"):
             return
 
+        is_slow_cycle = (self._cycle_count % self._slow_every_n == 0)
+
         for ticker in self.engine.get_monitored_tickers():
+            # Fast tickers (SPY) check every cycle; others only on slow cycles
+            is_fast = ticker.upper() in MONITOR_FAST_POLL_TICKERS
+            if not is_fast and not is_slow_cycle:
+                continue
+
             thesis = self.engine.get_thesis(ticker)
             if not thesis:
                 continue  # No thesis loaded for this ticker
