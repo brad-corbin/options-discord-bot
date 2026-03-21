@@ -2,7 +2,7 @@
 # v2.0 Thesis Monitor — Bar-Aware + Confluence Scoring + Policy Engine
 # v1.5 base: entry detection, exit monitor, ActiveTrade, persistence
 # v2.0 adds: OHLCV bars, level registry, entry validator, exit policies
-import logging, threading, time, json
+import logging, threading, time, json, uuid
 from datetime import datetime, timezone
 from typing import Dict, Optional, List, Callable
 from dataclasses import dataclass, field, asdict
@@ -71,7 +71,7 @@ class ThesisContext:
 @dataclass
 class BreakAttempt:
     level: float; level_name: str; direction: str; break_price: float; break_time: float
-    detected_as_failed: bool = False; detected_as_confirmed: bool = False; candles_since: int = 0
+    detected_as_failed: bool = False; detected_as_confirmed: bool = False; break_bar_index: int = -1
     reclaim_seen: bool = False; reclaim_price: Optional[float] = None
     reclaim_time: float = 0.0; reclaim_holds: int = 0
     retest_armed: bool = False; retest_fired: bool = False
@@ -88,6 +88,7 @@ class ActiveTrade:
     entry_type: str  # BREAK / FAILED / RETEST
     entry_price: float
     stop_level: float
+    trade_id: str = field(default_factory=lambda: str(uuid.uuid4())[:12])
     targets: list = field(default_factory=list)  # [float] — next S/R levels
     status: str = "OPEN"  # OPEN / SCALED / TRAILED / CLOSED / INVALIDATED
     entry_time: float = 0.0       # monotonic — in-process only
@@ -114,6 +115,7 @@ class ActiveTrade:
     close_time: float = 0.0      # monotonic — in-process only
     close_epoch: float = 0.0     # time.time() — survives restart
     exit_alert_history: dict = field(default_factory=dict)  # cooldown tracking
+    last_exit_bar_ts: float = 0.0  # timestamp of last bar used for policy eval
 
 @dataclass
 class MonitorState:
@@ -165,6 +167,8 @@ class IntradayLevelTracker:
 
         # No bars = no level discovery. Don't fake 5m levels from spot samples.
         if not bm or len(bm.state.bars_5m) < 2:
+            return events
+        if price <= 0:
             return events
 
         bars = bm.state.bars_5m
@@ -245,7 +249,7 @@ class IntradayLevelTracker:
             recent_bars = bars[-INTRADAY_CONSOLIDATION_CANDLES:]
             ch = max(b.high for b in recent_bars)
             cl = min(b.low for b in recent_bars)
-            rng = ch - cl; rng_pct = rng / price * 100
+            rng = ch - cl; rng_pct = (rng / price * 100) if price > 0 else 0
             if rng_pct <= INTRADAY_CONSOLIDATION_RANGE_PCT and rng > 0:
                 IntradayLevelTracker._upsert_level(state, ch, "resistance", "consolidation_edge", now)
                 IntradayLevelTracker._upsert_level(state, cl, "support", "consolidation_edge", now)
@@ -453,13 +457,11 @@ class ThesisMonitorEngine:
         return sorted(tickers)
 
     def _recent_net_move(self, state, lookback=3, bm=None):
-        """Net price move over last N bars (or spot samples as last resort)."""
+        """Net price move over last N closed bars. No bars = 0."""
         if bm and len(bm.state.bars_5m) >= lookback:
             bars = bm.state.bars_5m[-lookback:]
             return bars[-1].close - bars[0].close
-        # Legacy fallback for pre-bar trades only
-        recent = [p["price"] for p in state.price_history[-lookback:]]
-        return (recent[-1] - recent[0]) if len(recent) >= 2 else 0.0
+        return 0.0
 
     def evaluate(self, ticker, price):
         with self._lock:
@@ -502,13 +504,11 @@ class ThesisMonitorEngine:
                 or ba.detected_as_confirmed
                 or (now - ba.break_time) <= MONITOR_MAX_BREAK_AGE_SEC
             ]
-            for ba in state.break_attempts:
-                if not ba.detected_as_failed and not ba.detected_as_confirmed and (now - ba.break_time) <= MONITOR_MAX_BREAK_AGE_SEC:
-                    ba.candles_since += 1
+            # Break attempts age by bar index, not poll count — no increment needed here
             if prev_price is not None: events.extend(self._detect_breaks(thesis, state, price, prev_price, now, bar=bar, bm=bm))
             entry_events = []
             entry_events.extend(self._detect_confirmed_breaks(thesis, state, price, now, bar=bar, bm=bm))
-            entry_events.extend(self._detect_failed_moves(thesis, state, price, now))
+            entry_events.extend(self._detect_failed_moves(thesis, state, price, now, bm=bm))
             entry_events.extend(self._detect_retests(thesis, state, price, now, bm=bm))
             # Auto-create ActiveTrade — runs through EntryValidator + ExitPolicy
             for ev in entry_events:
@@ -719,15 +719,19 @@ class ThesisMonitorEngine:
 
     # ── Exit Monitor: Core Loop ──
     def _monitor_exits(self, ticker, thesis, state, price, now, bar=None, bm=None):
-        """Check all active trades using policy engine. Falls back to v1 only if no policy_config."""
+        """Two-layer exit engine:
+        Layer 1 (every poll): Spot-risk overlay — hard stop breach only.
+        Layer 2 (bar-close only): Policy evaluation — scale, trail, reduce, exit, exhaustion.
+        One engine, one truth source. No legacy fallback."""
         events = []
-        # Use latest bar from buffer — not just the newly-arrived bar
-        effective_bar = bar or (bm.get_latest_bar() if bm else None)
+        latest_bar = bar or (bm.get_latest_bar() if bm else None)
         recent_bars = bm.get_recent_bars(5) if bm else []
+
         for trade in state.active_trades:
             if trade.status in ("CLOSED", "INVALIDATED"):
                 continue
-            # Update max favorable excursion
+
+            # Update max favorable excursion (always, every poll)
             if trade.direction == "LONG":
                 fav = price - trade.entry_price
                 trade.max_favorable = max(trade.max_favorable, fav)
@@ -737,66 +741,94 @@ class ThesisMonitorEngine:
                 trade.max_favorable = max(trade.max_favorable, fav)
                 trade.min_favorable = min(trade.min_favorable, fav)
 
-            # ── v2.0: Reconstruct policy from trade's persisted config ──
-            policy = None
-            if trade.policy_config:
-                policy = ExitPolicy.from_config(trade.policy_config)
+            # ── Auto-migrate legacy trades without policy_config ──
+            if not trade.policy_config:
+                from exit_policy import select_exit_policy as _sel
+                default_policy = _sel(
+                    setup_score=max(trade.setup_score, 3),
+                    gex_sign=trade.gex_at_entry,
+                    setup_type=trade.entry_type,
+                    is_0dte=True, vix=thesis.vix,
+                )
+                trade.policy_config = default_policy.to_config()
+                trade.exit_policy_name = default_policy.name
+                self._persist_trades(ticker, state)
+                log.info(f"Auto-migrated trade {trade.trade_id} to policy {default_policy.name}")
 
-            if policy and effective_bar:
-                signal = evaluate_exit(policy, trade, effective_bar, recent_bars,
-                                       current_gex=thesis.gex_sign)
-                if signal.action == "INVALIDATE":
-                    if self._exit_alert_ok(trade, "invalidate", now):
-                        trade.status = "INVALIDATED"; trade.close_price = price
-                        trade.close_time = now; trade.close_epoch = time.time()
-                        trade.close_reason = signal.reason
-                        self._persist_trades(ticker, state)
-                        events.append({"msg": f"🛑 TRADE INVALIDATED — {trade.direction}\n\n{signal.reason}\nEntry: ${trade.entry_price:.2f} → Now: ${price:.2f} ({signal.pnl_pct:+.2f}%)\nDon't hope. Close it.", "type": "exit", "priority": 5, "alert_key": f"exit_inv_{trade.direction}_{trade.entry_price:.2f}"})
-                    continue
-                elif signal.action == "SCALE":
-                    if self._exit_alert_ok(trade, "scale", now):
-                        trade.status = "SCALED"; trade.scaled_at_price = price
-                        trade.trail_stop = trade.entry_price
-                        self._persist_trades(ticker, state)
-                        events.append({"msg": f"💰 SCALE {signal.scale_fraction} — {trade.direction}\n\n{signal.reason}\nEntry: ${trade.entry_price:.2f} → Now: ${price:.2f} ({signal.pnl_pct:+.2f}%)\nMove stop to breakeven. {trade.scale_advice}", "type": "exit", "priority": 5, "alert_key": f"exit_scale_{trade.direction}_{trade.entry_price:.2f}"})
-                elif signal.action == "TRAIL" and signal.new_stop:
-                    if self._exit_alert_ok(trade, "trail", now):
-                        trade.trail_stop = signal.new_stop; trade.status = "TRAILED"
-                        self._persist_trades(ticker, state)
-                        events.append({"msg": f"🏃 TRAIL — {trade.direction}\n\n{signal.reason}\nEntry: ${trade.entry_price:.2f} → Now: ${price:.2f} ({signal.pnl_pct:+.2f}%)\nPolicy: {policy.name}", "type": "exit", "priority": 5, "alert_key": f"exit_trail_{trade.direction}_{trade.entry_price:.2f}"})
-                elif signal.action == "REDUCE":
-                    if self._exit_alert_ok(trade, "fade", now):
-                        # ── Fix 7: Latch GEX flip — update trade's stored policy ──
-                        if thesis.gex_sign != trade.policy_config.get("gex_at_entry"):
-                            adjusted = policy.recalibrate_for_gex_flip(thesis.gex_sign)
-                            trade.policy_config = adjusted.to_config()
-                            # Update gex_at_entry to current so we don't re-detect same flip
-                            trade.policy_config["gex_at_entry"] = thesis.gex_sign
-                            trade.gex_at_entry = thesis.gex_sign  # keep display metadata in sync
-                            trade.exit_policy_name = adjusted.name
-                            self._persist_trades(ticker, state)
-                            log.info(f"Policy latched: {trade.ticker} {trade.direction} → {adjusted.name} (gex now {thesis.gex_sign})")
-                        if signal.new_stop:
-                            trade.trail_stop = signal.new_stop
-                        events.append({"msg": f"⚠️ REDUCE — {trade.direction}\n\n{signal.reason}\nEntry: ${trade.entry_price:.2f} → Now: ${price:.2f} ({signal.pnl_pct:+.2f}%)\n{signal.urgency_label}", "type": "exit", "priority": 4, "alert_key": f"exit_fade_{trade.direction}_{trade.entry_price:.2f}"})
-                elif signal.action == "EXIT":
-                    if self._exit_alert_ok(trade, "exit", now):
-                        trade.status = "CLOSED"; trade.close_price = price
-                        trade.close_time = now; trade.close_epoch = time.time()
-                        trade.close_reason = signal.reason
-                        self._persist_trades(ticker, state)
-                        events.append({"msg": f"⏹ EXIT — {trade.direction}\n\n{signal.reason}\nEntry: ${trade.entry_price:.2f} → Now: ${price:.2f} ({signal.pnl_pct:+.2f}%)\nPay yourself.", "type": "exit", "priority": 5, "alert_key": f"exit_done_{trade.direction}_{trade.entry_price:.2f}"})
+            # ── LAYER 1: Spot-risk overlay (every poll) ──
+            # Hard stop breach — emergency protection, no bar required
+            stop_ref = trade.trail_stop if trade.trail_stop else trade.stop_level
+            breached = False
+            if trade.direction == "LONG" and price < stop_ref:
+                breached = True
+            elif trade.direction == "SHORT" and price > stop_ref:
+                breached = True
+            if breached:
+                if self._exit_alert_ok(trade, "invalidate", now):
+                    pnl_pct = ((price - trade.entry_price) / trade.entry_price * 100) if trade.direction == "LONG" else ((trade.entry_price - price) / trade.entry_price * 100)
+                    trade.status = "INVALIDATED"; trade.close_price = price
+                    trade.close_time = now; trade.close_epoch = time.time()
+                    trade.close_reason = f"Hard stop ${stop_ref:.2f} breached"
+                    self._persist_trades(ticker, state)
+                    events.append({"msg": f"\U0001f6d1 TRADE INVALIDATED — {trade.direction}\n\nHard stop ${stop_ref:.2f} breached.\nEntry: ${trade.entry_price:.2f} → Now: ${price:.2f} ({pnl_pct:+.2f}%)\nDon't hope. Close it.", "type": "exit", "priority": 5, "alert_key": f"exit_inv_{trade.trade_id}"})
+                    log.info(f"Trade {trade.trade_id} INVALIDATED: hard stop ${stop_ref:.2f} breached at ${price:.2f}")
                 continue
 
-            # ── v1 fallback: only when no policy_config exists (legacy trades) ──
-            inv_events = self._check_invalidation(trade, thesis, state, price, now)
-            if inv_events:
-                events.extend(inv_events)
+            # ── LAYER 2: Policy evaluation (bar-close clock only) ──
+            if not latest_bar:
+                continue  # no bar data = no strategy decisions
+
+            # Skip if we already evaluated this bar
+            if latest_bar.timestamp <= trade.last_exit_bar_ts:
                 continue
-            events.extend(self._check_scale(trade, thesis, state, price, now))
-            events.extend(self._check_trail(trade, thesis, state, price, now))
-            events.extend(self._check_momentum_fade(trade, thesis, state, price, now))
-            events.extend(self._check_exit(trade, thesis, state, price, now))
+            trade.last_exit_bar_ts = latest_bar.timestamp
+
+            policy = ExitPolicy.from_config(trade.policy_config)
+            signal = evaluate_exit(policy, trade, latest_bar, recent_bars,
+                                   current_gex=thesis.gex_sign)
+
+            if signal.action == "SCALE":
+                if self._exit_alert_ok(trade, "scale", now):
+                    trade.status = "SCALED"; trade.scaled_at_price = price
+                    trade.trail_stop = trade.entry_price
+                    self._persist_trades(ticker, state)
+                    events.append({"msg": f"\U0001f4b0 SCALE {signal.scale_fraction} — {trade.direction}\n\n{signal.reason}\nEntry: ${trade.entry_price:.2f} → Now: ${price:.2f} ({signal.pnl_pct:+.2f}%)\nMove stop to breakeven. {trade.scale_advice}", "type": "exit", "priority": 5, "alert_key": f"exit_scale_{trade.trade_id}"})
+            elif signal.action == "TRAIL" and signal.new_stop:
+                if self._exit_alert_ok(trade, "trail", now):
+                    trade.trail_stop = signal.new_stop; trade.status = "TRAILED"
+                    self._persist_trades(ticker, state)
+                    events.append({"msg": f"\U0001f3c3 TRAIL — {trade.direction}\n\n{signal.reason}\nEntry: ${trade.entry_price:.2f} → Now: ${price:.2f} ({signal.pnl_pct:+.2f}%)\nPolicy: {policy.name}", "type": "exit", "priority": 5, "alert_key": f"exit_trail_{trade.trade_id}"})
+            elif signal.action == "REDUCE":
+                if self._exit_alert_ok(trade, "fade", now):
+                    # Latch GEX flip
+                    if thesis.gex_sign != trade.policy_config.get("gex_at_entry"):
+                        adjusted = policy.recalibrate_for_gex_flip(thesis.gex_sign)
+                        trade.policy_config = adjusted.to_config()
+                        trade.policy_config["gex_at_entry"] = thesis.gex_sign
+                        trade.gex_at_entry = thesis.gex_sign
+                        trade.exit_policy_name = adjusted.name
+                        self._persist_trades(ticker, state)
+                        log.info(f"Policy latched: {trade.trade_id} → {adjusted.name}")
+                    if signal.new_stop:
+                        trade.trail_stop = signal.new_stop
+                    events.append({"msg": f"\u26a0\ufe0f REDUCE — {trade.direction}\n\n{signal.reason}\nEntry: ${trade.entry_price:.2f} → Now: ${price:.2f} ({signal.pnl_pct:+.2f}%)\n{signal.urgency_label}", "type": "exit", "priority": 4, "alert_key": f"exit_fade_{trade.trade_id}"})
+            elif signal.action == "EXIT":
+                if self._exit_alert_ok(trade, "exit", now):
+                    trade.status = "CLOSED"; trade.close_price = price
+                    trade.close_time = now; trade.close_epoch = time.time()
+                    trade.close_reason = signal.reason
+                    self._persist_trades(ticker, state)
+                    events.append({"msg": f"\u23f9 EXIT — {trade.direction}\n\n{signal.reason}\nEntry: ${trade.entry_price:.2f} → Now: ${price:.2f} ({signal.pnl_pct:+.2f}%)\nPay yourself.", "type": "exit", "priority": 5, "alert_key": f"exit_done_{trade.trade_id}"})
+            elif signal.action == "INVALIDATE":
+                # Bar-close invalidation (policy detected, distinct from hard-stop)
+                if self._exit_alert_ok(trade, "invalidate", now):
+                    pnl_pct = signal.pnl_pct
+                    trade.status = "INVALIDATED"; trade.close_price = price
+                    trade.close_time = now; trade.close_epoch = time.time()
+                    trade.close_reason = signal.reason
+                    self._persist_trades(ticker, state)
+                    events.append({"msg": f"\U0001f6d1 TRADE INVALIDATED — {trade.direction}\n\n{signal.reason}\nEntry: ${trade.entry_price:.2f} → Now: ${price:.2f} ({pnl_pct:+.2f}%)\nDon't hope. Close it.", "type": "exit", "priority": 5, "alert_key": f"exit_inv_{trade.trade_id}"})
+            # HOLD = do nothing
         return events
 
     def _exit_alert_ok(self, trade, key, now):
@@ -806,224 +838,6 @@ class ThesisMonitorEngine:
             return False
         trade.exit_alert_history[key] = now
         return True
-
-    # ── Invalidation Check ──
-    def _check_invalidation(self, trade, thesis, state, price, now):
-        events = []
-        buf = trade.stop_level * (EXIT_INVALIDATE_BUFFER_PCT / 100)
-        if trade.direction == "LONG":
-            # Price dropped below stop
-            invalidated = price < (trade.stop_level - buf)
-        else:
-            # Price rallied above stop
-            invalidated = price > (trade.stop_level + buf)
-        # Also check trail stop if set
-        if trade.trail_stop is not None:
-            if trade.direction == "LONG" and price < trade.trail_stop:
-                invalidated = True
-            elif trade.direction == "SHORT" and price > trade.trail_stop:
-                invalidated = True
-        if not invalidated:
-            return events
-        if not self._exit_alert_ok(trade, "invalidate", now):
-            return events
-        trade.status = "INVALIDATED"; trade.close_price = price; trade.close_time = now; trade.close_epoch = time.time()
-        stop_ref = trade.trail_stop if trade.trail_stop else trade.stop_level
-        pnl_pct = ((price - trade.entry_price) / trade.entry_price * 100) if trade.direction == "LONG" else ((trade.entry_price - price) / trade.entry_price * 100)
-        if trade.direction == "LONG":
-            trade.close_reason = f"Reclaimed ${stop_ref:.2f}"
-            events.append({"msg": (
-                f"🛑 TRADE INVALIDATED — LONG\n\n"
-                f"Lost ${stop_ref:.2f}. Exit now.\n"
-                f"Entry: ${trade.entry_price:.2f} → Now: ${price:.2f} ({pnl_pct:+.2f}%)\n"
-                f"Stop was ${stop_ref:.2f} ({trade.level_name})\n"
-                f"Don't hope. Close it."
-            ), "type": "exit", "priority": 5, "alert_key": f"exit_inv_L_{trade.entry_price:.2f}"})
-        else:
-            trade.close_reason = f"Lost ${stop_ref:.2f}"
-            events.append({"msg": (
-                f"🛑 TRADE INVALIDATED — SHORT\n\n"
-                f"Reclaimed ${stop_ref:.2f}. Exit now.\n"
-                f"Entry: ${trade.entry_price:.2f} → Now: ${price:.2f} ({pnl_pct:+.2f}%)\n"
-                f"Stop was ${stop_ref:.2f} ({trade.level_name})\n"
-                f"Don't hope. Close it."
-            ), "type": "exit", "priority": 5, "alert_key": f"exit_inv_S_{trade.entry_price:.2f}"})
-        self._persist_trades(trade.ticker, state)
-        log.info(f"Trade INVALIDATED: {trade.ticker} {trade.direction} @ ${trade.entry_price:.2f} → ${price:.2f}")
-        return events
-
-    # ── Scale Partial Check ──
-    def _check_scale(self, trade, thesis, state, price, now):
-        events = []
-        if trade.status != "OPEN" or not trade.targets:
-            return events
-        first_target = trade.targets[0]
-        prox_pct = abs(price - first_target) / first_target * 100
-        if prox_pct > EXIT_SCALE_PROXIMITY_PCT:
-            return events
-        # Target reached
-        if trade.direction == "LONG" and price < first_target:
-            return events  # hasn't actually reached it yet
-        if trade.direction == "SHORT" and price > first_target:
-            return events
-        if not self._exit_alert_ok(trade, "scale", now):
-            return events
-        trade.status = "SCALED"; trade.scaled_at_price = price
-        pnl_pct = ((price - trade.entry_price) / trade.entry_price * 100) if trade.direction == "LONG" else ((trade.entry_price - price) / trade.entry_price * 100)
-        dir_word = "long" if trade.direction == "LONG" else "short"
-        remaining = trade.targets[1:] if len(trade.targets) > 1 else []
-        next_tgt = f"${remaining[0]:.2f}" if remaining else "—"
-        events.append({"msg": (
-            f"💰 SCALE PARTIAL — {trade.direction}\n\n"
-            f"First target ${first_target:.2f} reached. Take partials.\n"
-            f"Entry: ${trade.entry_price:.2f} → Now: ${price:.2f} ({pnl_pct:+.2f}%)\n"
-            f"Move stop to breakeven (${trade.entry_price:.2f}).\n"
-            f"Next target: {next_tgt}\n"
-            f"Don't let winner turn into loser."
-        ), "type": "exit", "priority": 5, "alert_key": f"exit_scale_{dir_word}_{trade.entry_price:.2f}"})
-        # Move stop to breakeven after scaling
-        trade.trail_stop = trade.entry_price
-        self._persist_trades(trade.ticker, state)
-        log.info(f"Trade SCALED: {trade.ticker} {trade.direction} @ ${trade.entry_price:.2f}, target ${first_target:.2f} hit, stop→BE")
-        return events
-
-    # ── Trail Runner Check ──
-    def _check_trail(self, trade, thesis, state, price, now):
-        events = []
-        if trade.status not in ("SCALED", "TRAILED"):
-            return events
-        # Check momentum acceleration in trade direction
-        recent = [p["price"] for p in state.price_history[-EXIT_MOMENTUM_FADE_LOOKBACK:]]
-        if len(recent) < 3:
-            return events
-        diffs = [recent[i] - recent[i-1] for i in range(1, len(recent))]
-        avg_d = sum(diffs) / len(diffs)
-        last_d = diffs[-1]
-        # Is momentum accelerating in our direction?
-        accel = False
-        if trade.direction == "LONG" and avg_d > 0 and last_d > avg_d * EXIT_TRAIL_ACCELERATION_MULT:
-            accel = True
-        elif trade.direction == "SHORT" and avg_d < 0 and abs(last_d) > abs(avg_d) * EXIT_TRAIL_ACCELERATION_MULT:
-            accel = True
-        if not accel:
-            return events
-        if not self._exit_alert_ok(trade, "trail", now):
-            return events
-        # Compute new trail stop — halfway between entry and current price
-        old_stop = trade.trail_stop if trade.trail_stop else trade.stop_level
-        if trade.direction == "LONG":
-            new_stop = max(old_stop, price - (price - trade.entry_price) * 0.5)
-            new_stop = max(new_stop, trade.entry_price)  # never below breakeven
-        else:
-            new_stop = min(old_stop, price + (trade.entry_price - price) * 0.5)
-            new_stop = min(new_stop, trade.entry_price)  # never above breakeven
-        if abs(new_stop - old_stop) / old_stop < 0.001:
-            return events  # trail didn't move meaningfully
-        trade.trail_stop = round(new_stop, 2)
-        trade.status = "TRAILED"
-        pnl_pct = ((price - trade.entry_price) / trade.entry_price * 100) if trade.direction == "LONG" else ((trade.entry_price - price) / trade.entry_price * 100)
-        events.append({"msg": (
-            f"🏃 LET RUNNER WORK — {trade.direction}\n\n"
-            f"Trend accelerating. Trail stop → ${trade.trail_stop:.2f}\n"
-            f"Entry: ${trade.entry_price:.2f} → Now: ${price:.2f} ({pnl_pct:+.2f}%)\n"
-            f"Let momentum do the work."
-        ), "type": "exit", "priority": 5, "alert_key": f"exit_trail_{trade.direction}_{trade.entry_price:.2f}"})
-        self._persist_trades(trade.ticker, state)
-        log.info(f"Trade TRAILED: {trade.ticker} {trade.direction}, trail_stop → ${trade.trail_stop:.2f}")
-        return events
-
-    # ── Momentum Fade Check ──
-    def _check_momentum_fade(self, trade, thesis, state, price, now):
-        events = []
-        if trade.status not in ("OPEN", "SCALED", "TRAILED"):
-            return events
-        recent = [p["price"] for p in state.price_history[-EXIT_MOMENTUM_FADE_LOOKBACK:]]
-        if len(recent) < 3:
-            return events
-        diffs = [recent[i] - recent[i-1] for i in range(1, len(recent))]
-        avg_d = sum(diffs) / len(diffs)
-        # Is momentum fading AGAINST our position?
-        fading = False
-        if trade.direction == "LONG" and avg_d < 0 and trade.max_favorable > 0:
-            fading = True
-        elif trade.direction == "SHORT" and avg_d > 0 and trade.max_favorable > 0:
-            fading = True
-        if not fading:
-            return events
-        # Only alert if we've had a meaningful move first (at least 0.15% in our favor)
-        fav_pct = trade.max_favorable / trade.entry_price * 100
-        if fav_pct < 0.15:
-            return events
-        if not self._exit_alert_ok(trade, "fade", now):
-            return events
-        pnl_pct = ((price - trade.entry_price) / trade.entry_price * 100) if trade.direction == "LONG" else ((trade.entry_price - price) / trade.entry_price * 100)
-        dir_word = "Upside" if trade.direction == "LONG" else "Downside"
-        events.append({"msg": (
-            f"⚠️ REDUCE EXPOSURE — {trade.direction}\n\n"
-            f"{dir_word} stalling. Momentum fading against position.\n"
-            f"Entry: ${trade.entry_price:.2f} → Now: ${price:.2f} ({pnl_pct:+.2f}%)\n"
-            f"Best: {'+' if trade.direction == 'LONG' else ''}{fav_pct:.2f}% | Now giving back.\n"
-            f"Don't let winner turn into loser."
-        ), "type": "exit", "priority": 4, "alert_key": f"exit_fade_{trade.direction}_{trade.entry_price:.2f}"})
-        return events
-
-    # ── Exit / Exhaustion Check ──
-    def _check_exit(self, trade, thesis, state, price, now):
-        events = []
-        if trade.status not in ("SCALED", "TRAILED"):
-            return events  # only exit after scaling or trailing
-        # Check if second (or later) target reached — targets[0] was the scale target
-        remaining = trade.targets[1:]
-        second_hit = False
-        for tgt in remaining:
-            if trade.direction == "LONG" and price >= tgt:
-                second_hit = True; break
-            elif trade.direction == "SHORT" and price <= tgt:
-                second_hit = True; break
-        # Check for exhaustion — momentum decelerating after a run
-        exhausted = False
-        recent = [p["price"] for p in state.price_history[-EXIT_MOMENTUM_FADE_LOOKBACK:]]
-        if len(recent) >= 3:
-            diffs = [recent[i] - recent[i-1] for i in range(1, len(recent))]
-            avg_d = sum(diffs) / len(diffs)
-            last_d = diffs[-1]
-            if trade.direction == "LONG" and trade.max_favorable > trade.entry_price * 0.003:
-                if avg_d > 0 and abs(last_d) < abs(avg_d) * EXIT_EXHAUSTION_DECEL_MULT:
-                    exhausted = True
-                elif last_d < 0:
-                    exhausted = True
-            elif trade.direction == "SHORT" and trade.max_favorable > trade.entry_price * 0.003:
-                if avg_d < 0 and abs(last_d) < abs(avg_d) * EXIT_EXHAUSTION_DECEL_MULT:
-                    exhausted = True
-                elif last_d > 0:
-                    exhausted = True
-        if not second_hit and not exhausted:
-            return events
-        if not self._exit_alert_ok(trade, "exit", now):
-            return events
-        pnl_pct = ((price - trade.entry_price) / trade.entry_price * 100) if trade.direction == "LONG" else ((trade.entry_price - price) / trade.entry_price * 100)
-        if second_hit:
-            reason = "Second target reached"
-            trade.close_reason = reason
-            events.append({"msg": (
-                f"⏹ EXIT — {trade.direction}\n\n"
-                f"Second target hit. Pay yourself.\n"
-                f"Entry: ${trade.entry_price:.2f} → Now: ${price:.2f} ({pnl_pct:+.2f}%)\n"
-                f"Move extended. Close remaining."
-            ), "type": "exit", "priority": 5, "alert_key": f"exit_done_{trade.direction}_{trade.entry_price:.2f}"})
-        else:
-            reason = "Exhaustion signal"
-            trade.close_reason = reason
-            events.append({"msg": (
-                f"⏹ EXIT — {trade.direction}\n\n"
-                f"Momentum exhausting after {trade.status.lower()} phase.\n"
-                f"Entry: ${trade.entry_price:.2f} → Now: ${price:.2f} ({pnl_pct:+.2f}%)\n"
-                f"Move extended. Pay yourself."
-            ), "type": "exit", "priority": 5, "alert_key": f"exit_exh_{trade.direction}_{trade.entry_price:.2f}"})
-        trade.status = "CLOSED"; trade.close_price = price; trade.close_time = now; trade.close_epoch = time.time()
-        self._persist_trades(trade.ticker, state)
-        log.info(f"Trade CLOSED: {trade.ticker} {trade.direction} @ ${trade.entry_price:.2f} → ${price:.2f} | {reason}")
-        return events
 
     # ── Expire Stale Trades ──
     def _expire_stale_trades(self, state, now):
@@ -1062,6 +876,7 @@ class ThesisMonitorEngine:
                 for k, v in t.exit_alert_history.items():
                     eah_relative[k] = round(now_mono - v, 1) if v is not None else None
                 trades_data.append({
+                    "trade_id": t.trade_id,
                     "ticker": t.ticker, "direction": t.direction, "entry_type": t.entry_type,
                     "entry_price": t.entry_price, "stop_level": t.stop_level,
                     "targets": t.targets, "status": t.status,
@@ -1076,6 +891,7 @@ class ThesisMonitorEngine:
                     "scaled_at_price": t.scaled_at_price,
                     "trail_stop": t.trail_stop, "close_price": t.close_price,
                     "close_reason": t.close_reason, "close_epoch": t.close_epoch,
+                    "last_exit_bar_ts": t.last_exit_bar_ts,
                     "exit_alert_history_rel": eah_relative,
                 })
             self._store_set(f"active_trades:{ticker}", json.dumps(trades_data), ttl=86400)
@@ -1110,6 +926,7 @@ class ThesisMonitorEngine:
                     entry_type=td.get("entry_type", "BREAK"),
                     entry_price=td.get("entry_price", 0),
                     stop_level=td.get("stop_level", 0),
+                    trade_id=td.get("trade_id", str(uuid.uuid4())[:12]),
                     targets=td.get("targets", []),
                     status=td.get("status", "OPEN"),
                     entry_time=entry_time,
@@ -1133,6 +950,7 @@ class ThesisMonitorEngine:
                     close_reason=td.get("close_reason", ""),
                     close_time=close_time,
                     close_epoch=close_epoch,
+                    last_exit_bar_ts=td.get("last_exit_bar_ts", 0),
                 )
                 # Reconstruct exit_alert_history from relative offsets
                 eah_rel = td.get("exit_alert_history_rel", {})
@@ -1352,7 +1170,7 @@ class ThesisMonitorEngine:
                     for ba in state.break_attempts
                 ):
                     continue
-                state.break_attempts.append(BreakAttempt(level=level, level_name=name, direction="DOWN", break_price=price, break_time=now))
+                state.break_attempts.append(BreakAttempt(level=level, level_name=name, direction="DOWN", break_price=price, break_time=now, break_bar_index=bm.state.bars_since_open if bm else -1))
                 state.status = "BREAK_IN_PROGRESS"
                 events.append({"msg": f"🔻 BREAK ATTEMPT: below ${level:.2f} ({name}). Watching follow-through or reclaim.", "type": "alert", "priority": 4, "alert_key": f"brk_dn_{name}_{level:.2f}"})
             elif not is_sup and prev_price <= level and price > level:
@@ -1369,7 +1187,7 @@ class ThesisMonitorEngine:
                     for ba in state.break_attempts
                 ):
                     continue
-                state.break_attempts.append(BreakAttempt(level=level, level_name=name, direction="UP", break_price=price, break_time=now))
+                state.break_attempts.append(BreakAttempt(level=level, level_name=name, direction="UP", break_price=price, break_time=now, break_bar_index=bm.state.bars_since_open if bm else -1))
                 state.status = "BREAK_IN_PROGRESS"
                 events.append({"msg": f"🔺 BREAK ATTEMPT: above ${level:.2f} ({name}). Watching follow-through or failure.", "type": "alert", "priority": 4, "alert_key": f"brk_up_{name}_{level:.2f}"})
         return events
@@ -1380,7 +1198,8 @@ class ThesisMonitorEngine:
             if ba.detected_as_failed or ba.detected_as_confirmed: continue
             if (now - ba.break_time) > MONITOR_MAX_BREAK_AGE_SEC: continue
             req = 2 if tp["phase"] in ("OPEN", "MORNING", "AFTERNOON") else 3
-            if ba.candles_since < req: continue
+            bars_since_break = (bm.state.bars_since_open - ba.break_bar_index) if (bm and ba.break_bar_index >= 0) else 999
+            if bars_since_break < req: continue
             buf = ba.level * (MONITOR_CONFIRM_BUFFER_PCT / 100); net = self._recent_net_move(state, 3, bm=bm)
             if ba.direction == "DOWN":
                 ok = price < (ba.level - buf) and net < -(ba.level * 0.0012)
@@ -1419,11 +1238,12 @@ class ThesisMonitorEngine:
                     events.append({"msg": f"⚠️ BREAKOUT + FOLLOW-THROUGH at ${ba.level:.2f}\nGEX+ — mean reversion possible. Lose level = fade short.", "type": "warning", "priority": 4, "alert_key": f"ft_up_{ba.level:.2f}"})
         return events
 
-    def _detect_failed_moves(self, thesis, state, price, now):
+    def _detect_failed_moves(self, thesis, state, price, now, bm=None):
         events = []; rb = price * (MONITOR_RECLAIM_THRESHOLD_PCT / 100)
         for ba in state.break_attempts:
             if ba.detected_as_failed or ba.detected_as_confirmed: continue
-            if (now - ba.break_time) > MONITOR_MAX_BREAK_AGE_SEC or ba.candles_since < 2: continue
+            bars_since = (bm.state.bars_since_open - ba.break_bar_index) if (bm and ba.break_bar_index >= 0) else 999
+            if (now - ba.break_time) > MONITOR_MAX_BREAK_AGE_SEC or bars_since < 2: continue
             reclaimed = (ba.direction == "DOWN" and price > ba.level + rb) or (ba.direction == "UP" and price < ba.level - rb)
             if reclaimed:
                 if not ba.reclaim_seen:
