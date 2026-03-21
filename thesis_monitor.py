@@ -342,7 +342,11 @@ class ThesisMonitorEngine:
                 or15_epoch = now_epoch
             reg.ingest_opening_range(bm.state.or_15, epoch=or15_epoch)
             # Also ingest OR5
-            reg.ingest_opening_range(bm.state.or_5, epoch=self._level_first_seen.get(f"{ticker}:OR5", now_epoch))
+            or5_epoch = self._level_first_seen.get(f"{ticker}:OR5", now_epoch)
+            if bm.state.or_5.is_complete and f"{ticker}:OR5" not in self._level_first_seen:
+                self._level_first_seen[f"{ticker}:OR5"] = now_epoch
+                or5_epoch = now_epoch
+            reg.ingest_opening_range(bm.state.or_5, epoch=or5_epoch)
         # Intraday levels — use their actual first_seen_ts (already tracked)
         if state.intraday_levels:
             reg.ingest_intraday_levels(state.intraday_levels, epoch=0)  # epoch=0 means use level's own timestamp
@@ -362,8 +366,17 @@ class ThesisMonitorEngine:
         return reg
 
     def _level_first_seen_for_thesis(self, ticker, thesis, now_epoch):
-        """Get or set first_seen epoch for thesis levels (stable across cycles)."""
-        key = f"{ticker}:thesis:{thesis.created_at}"
+        """Get or set first_seen epoch for thesis levels.
+        Keyed by ticker + session date, NOT by created_at — because /em refreshes
+        create new timestamps but the structural levels (daily S/R, OI walls) don't
+        actually become "fresh" just because a new card was generated."""
+        try:
+            from zoneinfo import ZoneInfo
+            from datetime import datetime
+            session_date = datetime.now(ZoneInfo("America/Chicago")).strftime("%Y-%m-%d")
+        except Exception:
+            session_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        key = f"{ticker}:thesis:{session_date}"
         if key not in self._level_first_seen:
             self._level_first_seen[key] = now_epoch
         return self._level_first_seen[key]
@@ -781,6 +794,7 @@ class ThesisMonitorEngine:
                             trade.policy_config = adjusted.to_config()
                             # Update gex_at_entry to current so we don't re-detect same flip
                             trade.policy_config["gex_at_entry"] = thesis.gex_sign
+                            trade.gex_at_entry = thesis.gex_sign  # keep display metadata in sync
                             trade.exit_policy_name = adjusted.name
                             self._persist_trades(ticker, state)
                             log.info(f"Policy latched: {trade.ticker} {trade.direction} → {adjusted.name} (gex now {thesis.gex_sign})")
