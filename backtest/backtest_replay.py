@@ -478,14 +478,30 @@ class ResultsRecorder:
         closed = [t for t in trades_with_close if t["status"] in ("CLOSED", "INVALIDATED")]
         still_open = [t for t in self._trades if t.get("status") not in ("CLOSED", "INVALIDATED")]
 
+        # Separate combo-gated rejections (pnl=0, closed immediately) from real trades.
+        # Gated trades are filtered BEFORE they can move — they should not count
+        # toward win rate, avg trade, best/worst, or group breakdowns.
+        real_trades = [
+            t for t in closed
+            if not str(t.get("close_reason", "")).startswith("Combo gate")
+        ]
+        gated_trades = [
+            t for t in closed
+            if str(t.get("close_reason", "")).startswith("Combo gate")
+        ]
+
         lines = []
         lines.append("=" * 60)
         lines.append("  BACKTEST SUMMARY")
         lines.append("=" * 60)
         lines.append(f"  Total trades recorded:  {len(self._trades)}")
-        lines.append(f"  Trades with close data: {len(closed)}")
+        lines.append(f"  Real trades (passed filter): {len(real_trades)}")
+        lines.append(f"  Combo gate rejections:  {len(gated_trades)}")
         lines.append(f"  Trades still open:      {len(still_open)}")
         lines.append(f"  Total events fired:     {len(self._events)}")
+
+        # Use only real_trades for all stats — gated trades are rejections, not results
+        closed = real_trades
 
         if closed:
             wins = [t for t in closed if float(t.get("pnl_pts") or 0) > 0]
