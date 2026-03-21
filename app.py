@@ -1496,6 +1496,10 @@ def get_expirations(ticker: str) -> list:
 def get_daily_candles(ticker: str, days: int = 30) -> list:
     return _cached_md.get_daily_candles(ticker, days)
 
+def get_intraday_bars(ticker: str, resolution: int = 5, countback: int = 80) -> dict:
+    """Fetch intraday OHLCV bars. Returns raw API dict for BarStateManager."""
+    return _cached_md.get_intraday_bars(ticker, resolution, countback)
+
 def get_vix() -> float:
     # v4.3 fix: Try MarketData API first (paid, reliable), then Yahoo, then IV proxy.
     # Previous order was Yahoo first, which has been broken/unreliable.
@@ -6300,6 +6304,7 @@ with app.app_context():
     _thesis_daemon = init_thesis_daemon(
         get_spot_fn=get_spot, post_fn=post_to_telegram,
         store_get_fn=store_get, store_set_fn=store_set,
+        get_bars_fn=lambda ticker, res, count: get_intraday_bars(ticker, res, count),
     )
     log.info("Thesis monitor daemon started")
 
