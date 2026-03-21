@@ -1,6 +1,6 @@
 # backtest/backtest_replay.py
 # ─────────────────────────────────────────────────────────────────────────────
-# Phase 1 backtest replay engine.
+# Phase 1/2 backtest replay engine.
 #
 # Walks through historical 5-minute bars day by day, feeds each bar into your
 # real ThesisMonitorEngine, and records every trade that fires.
@@ -24,6 +24,13 @@
 #   trades.csv      — one row per trade (including forced EOD closes)
 #   events.csv      — every alert/event fired during replay
 #   summary.txt     — printed stats (also saved as text)
+#
+# This version adds richer trade metadata for Phase 2 reporting:
+#   - regime
+#   - gex_sign
+#   - bias
+#   - prior_day_context
+#   - volatility_regime
 # ─────────────────────────────────────────────────────────────────────────────
 
 import os
@@ -121,7 +128,7 @@ def install_time_patches() -> None:
     _tm.time.monotonic = _patched_monotonic
     _tm.time.time = _patched_time
     _ep._minutes_since_open = _patched_minutes_since_open
-    print("  Time patches installed (thesis_monitor + exit_policy)")
+    print("  Time patches installed (time_phase, monotonic, time.time, minutes_since_open)")
 
 
 def set_replay_time(bar_epoch: float, bar_seq_number: int) -> None:
@@ -135,7 +142,7 @@ def set_replay_time(bar_epoch: float, bar_seq_number: int) -> None:
 # ═════════════════════════════════════════════════════════════════════════════
 
 def make_dict_store():
-    """Returns a (store_get, store_set) pair backed by a plain Python dict."""
+    """Return (store_get, store_set) backed by a plain Python dict."""
     _store = {}
 
     def store_get(key: str) -> Optional[str]:
@@ -152,7 +159,6 @@ def make_dict_store():
 # ═════════════════════════════════════════════════════════════════════════════
 
 def estimate_gex_sign(prior_day: dict) -> str:
-    """Estimate GEX sign from prior day's price behavior."""
     pdh = prior_day["high"]
     pdl = prior_day["low"]
     pdc = prior_day["close"]
@@ -177,7 +183,6 @@ def estimate_gex_sign(prior_day: dict) -> str:
 
 
 def estimate_regime(prior_day: dict) -> str:
-    """Estimate market regime from prior day's range."""
     total_range = prior_day["high"] - prior_day["low"]
     range_pct = total_range / prior_day["close"] * 100
     body = abs(prior_day["close"] - prior_day["open"])
@@ -191,7 +196,6 @@ def estimate_regime(prior_day: dict) -> str:
 
 
 def build_auto_thesis(ticker: str, prior_day: dict, today_open: float) -> ThesisContext:
-    """Build a ThesisContext from prior day's OHLC data."""
     pdh = prior_day["high"]
     pdl = prior_day["low"]
     pdc = prior_day["close"]
@@ -222,7 +226,7 @@ def build_auto_thesis(ticker: str, prior_day: dict, today_open: float) -> Thesis
         s1=round(s1, 2),
     )
 
-    thesis = ThesisContext(
+    return ThesisContext(
         ticker=ticker,
         bias=bias,
         bias_score=2 if bias == "BULLISH" else -2,
@@ -238,7 +242,6 @@ def build_auto_thesis(ticker: str, prior_day: dict, today_open: float) -> Thesis
         created_at=datetime.now().strftime("%Y-%m-%d %H:%M"),
         spot_at_creation=today_open,
     )
-    return thesis
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -248,6 +251,7 @@ def build_auto_thesis(ticker: str, prior_day: dict, today_open: float) -> Thesis
 TRADE_FIELDS = [
     "date", "ticker", "direction", "entry_type", "setup_score", "setup_label",
     "level_name", "level_tier", "time_phase",
+    "bias", "regime", "gex_sign", "volatility_regime", "prior_day_context",
     "entry_bar_time", "entry_price", "stop_level",
     "close_bar_time", "close_price", "close_reason", "status",
     "pnl_pts", "pnl_pct",
@@ -263,17 +267,15 @@ EVENT_FIELDS = [
 
 
 class ResultsRecorder:
-    """Collects trades and events during replay and writes them to CSV."""
+    """Collect trades and events during replay and write them to CSV."""
 
     def __init__(self, output_dir: str):
         Path(output_dir).mkdir(parents=True, exist_ok=True)
         self._output_dir = output_dir
         self._trades = []
         self._events = []
-        self._seen_trade_ids = set()
 
     def record_events(self, events: list, date: str, bar_time: str, ticker: str, bar_close: float) -> None:
-        """Record all events returned by engine.evaluate()."""
         for ev in events:
             self._events.append({
                 "date": date,
@@ -293,11 +295,9 @@ class ResultsRecorder:
         date: str,
         bar_time: str,
         time_phase: str,
+        session_meta: dict,
     ) -> None:
-        """
-        Capture new trades and update existing ones.
-        Always refresh close fields when a trade becomes CLOSED/INVALIDATED.
-        """
+        """Capture new trades and update existing ones."""
         state = engine.get_state(ticker)
         if not state:
             return
@@ -305,12 +305,12 @@ class ResultsRecorder:
         for trade in state.active_trades:
             existing = self._find_record(trade.trade_id)
             if existing is None:
-                rec = self._build_trade_record(trade, date, bar_time, time_phase)
+                rec = self._build_trade_record(trade, date, bar_time, time_phase, session_meta)
                 self._trades.append(rec)
-                self._seen_trade_ids.add(trade.trade_id)
             else:
                 if not existing.get("time_phase"):
                     existing["time_phase"] = time_phase
+                self._fill_meta(existing, session_meta)
                 if trade.status in ("CLOSED", "INVALIDATED"):
                     self._fill_close_fields(existing, trade, bar_time)
 
@@ -320,7 +320,12 @@ class ResultsRecorder:
                 return rec
         return None
 
-    def _build_trade_record(self, trade, date: str, bar_time: str, time_phase: str) -> dict:
+    def _fill_meta(self, rec: dict, session_meta: dict) -> None:
+        for key, value in session_meta.items():
+            if rec.get(key, "") in ("", None):
+                rec[key] = value
+
+    def _build_trade_record(self, trade, date: str, bar_time: str, time_phase: str, session_meta: dict) -> dict:
         ep = trade.entry_price or 0.0
         cp = trade.close_price
 
@@ -330,7 +335,7 @@ class ResultsRecorder:
             close_bar_time = bar_time
             pnl_pts, pnl_pct, mae_pts, mae_pct, mfe_pts, mfe_pct = self._calc_performance_fields(trade, ep, cp)
 
-        return {
+        rec = {
             "_trade_id": trade.trade_id,
             "date": date,
             "ticker": trade.ticker,
@@ -341,6 +346,11 @@ class ResultsRecorder:
             "level_name": trade.level_name,
             "level_tier": trade.level_tier,
             "time_phase": time_phase,
+            "bias": session_meta.get("bias", ""),
+            "regime": session_meta.get("regime", ""),
+            "gex_sign": session_meta.get("gex_sign", ""),
+            "volatility_regime": session_meta.get("volatility_regime", ""),
+            "prior_day_context": session_meta.get("prior_day_context", ""),
             "entry_bar_time": bar_time,
             "entry_price": round(ep, 4),
             "stop_level": round(trade.stop_level, 4) if trade.stop_level is not None else "",
@@ -357,6 +367,7 @@ class ResultsRecorder:
             "exit_policy": trade.exit_policy_name,
             "validation_summary": trade.validation_summary,
         }
+        return rec
 
     def _calc_performance_fields(self, trade, entry_price: float, close_price: float):
         if trade.direction == "LONG":
@@ -382,7 +393,6 @@ class ResultsRecorder:
             return
 
         pnl_pts, pnl_pct, mae_pts, mae_pct, mfe_pts, mfe_pct = self._calc_performance_fields(trade, ep, cp)
-
         rec["close_bar_time"] = bar_time
         rec["close_price"] = round(cp, 4)
         rec["close_reason"] = trade.close_reason
@@ -412,6 +422,19 @@ class ResultsRecorder:
         print(f"  📄 events.csv   → {events_path}  ({len(self._events)} rows)")
         return trades_path, events_path
 
+    def _append_group_block(self, lines: list, closed: list, label: str, field: str) -> None:
+        values = sorted({str(t.get(field, "")) for t in closed if str(t.get(field, "")).strip()})
+        if not values:
+            return
+        lines.append("")
+        lines.append(f"  By {label}:")
+        for val in values:
+            group = [t for t in closed if str(t.get(field, "")) == val]
+            g_pnls = [float(t["pnl_pts"]) for t in group]
+            g_wins = [p for p in g_pnls if p > 0]
+            wr = len(g_wins) / len(group) * 100 if group else 0
+            lines.append(f"    {val:<14}: {len(group):>3} trades, {wr:.0f}% win, {sum(g_pnls):+.2f} pts total")
+
     def print_summary(self, output_dir: str) -> None:
         trades_with_close = [t for t in self._trades if t.get("pnl_pts") != ""]
         closed = [t for t in trades_with_close if t["status"] in ("CLOSED", "INVALIDATED")]
@@ -440,42 +463,13 @@ class ResultsRecorder:
             lines.append(f"  Best:      {max(pnls):+.3f} pts")
             lines.append(f"  Worst:     {min(pnls):+.3f} pts")
 
-            lines.append("")
-            lines.append("  By entry type:")
-            for etype in ("BREAK", "FAILED", "RETEST"):
-                group = [t for t in closed if t.get("entry_type") == etype]
-                if group:
-                    g_pnls = [float(t["pnl_pts"]) for t in group]
-                    g_wins = [p for p in g_pnls if p > 0]
-                    wr = len(g_wins) / len(group) * 100
-                    lines.append(
-                        f"    {etype:<8}: {len(group):>3} trades, {wr:.0f}% win, {sum(g_pnls):+.2f} pts total"
-                    )
-
-            lines.append("")
-            lines.append("  By setup score:")
-            for score in (5, 4, 3, 2, 1):
-                group = [t for t in closed if t.get("setup_score") == score]
-                if group:
-                    g_pnls = [float(t["pnl_pts"]) for t in group]
-                    g_wins = [p for p in g_pnls if p > 0]
-                    wr = len(g_wins) / len(group) * 100
-                    lines.append(
-                        f"    Score {score}: {len(group):>3} trades, {wr:.0f}% win, {sum(g_pnls):+.2f} pts total"
-                    )
-
-            phases = sorted(set(t.get("time_phase", "") for t in closed if t.get("time_phase")))
-            if phases:
-                lines.append("")
-                lines.append("  By time phase:")
-                for ph in phases:
-                    group = [t for t in closed if t.get("time_phase") == ph]
-                    g_pnls = [float(t["pnl_pts"]) for t in group]
-                    g_wins = [p for p in g_pnls if p > 0]
-                    wr = len(g_wins) / len(group) * 100 if group else 0
-                    lines.append(
-                        f"    {ph:<14}: {len(group):>3} trades, {wr:.0f}% win, {sum(g_pnls):+.2f} pts total"
-                    )
+            self._append_group_block(lines, closed, "entry type", "entry_type")
+            self._append_group_block(lines, closed, "setup score", "setup_score")
+            self._append_group_block(lines, closed, "time phase", "time_phase")
+            self._append_group_block(lines, closed, "regime", "regime")
+            self._append_group_block(lines, closed, "gex_sign", "gex_sign")
+            self._append_group_block(lines, closed, "bias", "bias")
+            self._append_group_block(lines, closed, "prior_day_context", "prior_day_context")
 
         lines.append("")
         lines.append("=" * 60)
@@ -549,6 +543,13 @@ def run_backtest(ticker: str, csv_path: str, output_dir: str, skip_days: int = 1
 
         today_open = bars[0]["open"]
         thesis = build_auto_thesis(ticker, prior, today_open)
+        session_meta = {
+            "bias": thesis.bias,
+            "regime": thesis.regime,
+            "gex_sign": thesis.gex_sign,
+            "volatility_regime": thesis.volatility_regime,
+            "prior_day_context": thesis.prior_day_context,
+        }
 
         print(
             f"  {day}  ({len(bars)} bars)  "
@@ -583,9 +584,8 @@ def run_backtest(ticker: str, csv_path: str, output_dir: str, skip_days: int = 1
                 events = []
 
             recorder.record_events(events, day, bar_time, ticker, bar["close"])
-            recorder.snapshot_trades(engine, ticker, day, bar_time, time_phase)
+            recorder.snapshot_trades(engine, ticker, day, bar_time, time_phase, session_meta)
 
-        # Force-close any leftover trades at the final bar of the session.
         last_bar = bars[-1]
         set_replay_time(last_bar["timestamp"], global_bar_seq[0])
         global_bar_seq[0] += 1
@@ -601,6 +601,7 @@ def run_backtest(ticker: str, csv_path: str, output_dir: str, skip_days: int = 1
             day,
             last_bar["datetime_ct"],
             _patched_get_time_phase_ct()["phase"],
+            session_meta,
         )
 
         day_trades = [t for t in recorder._trades if t.get("date") == day]
