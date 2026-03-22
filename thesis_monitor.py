@@ -96,6 +96,11 @@ class ActiveTrade:
     entry_time_str: str = ""
     level_name: str = ""  # what level triggered the entry
     gex_at_entry: str = "positive"
+    regime: str = ""
+    time_phase: str = ""
+    prior_day_context: str = "NORMAL"
+    bias_at_entry: str = ""
+    volatility_regime: str = ""
     trade_type_label: str = ""  # "Naked puts", "Call debit spread", etc.
     # v2.0: setup quality + exit policy
     setup_score: int = 0          # 1-5 from EntryValidator
@@ -701,6 +706,9 @@ class ThesisMonitorEngine:
             entry_price=price, stop_level=stop, targets=targets,
             status="OPEN", entry_time=now, entry_epoch=time.time(),
             entry_time_str=ts, level_name=level_name, gex_at_entry=thesis.gex_sign,
+            regime=thesis.regime, time_phase=tp["phase"],
+            prior_day_context=thesis.prior_day_context,
+            bias_at_entry=thesis.bias, volatility_regime=thesis.volatility_regime,
             trade_type_label=validation.trade_type,
             setup_score=validation.setup_score, setup_label=validation.setup_label,
             exit_policy_name=policy.name, scale_advice=validation.scale_advice,
@@ -711,6 +719,8 @@ class ThesisMonitorEngine:
 
         state.active_trades.append(trade)
         self._persist_trades(ticker, state)
+        badge = self._trade_quality_badge(trade)
+        _log_trade_event(trade, event="OPEN", badge=badge)
         log.info(f"ActiveTrade created: {ticker} {direction} {entry_type} @ ${price:.2f} | "
                  f"score={validation.setup_score}/5 [{validation.setup_label}] | "
                  f"policy={policy.name} | scale={validation.scale_advice} | "
@@ -772,6 +782,9 @@ class ThesisMonitorEngine:
                     self._persist_trades(ticker, state)
                     events.append({"msg": f"\U0001f6d1 TRADE INVALIDATED — {trade.direction}\n\nHard stop ${stop_ref:.2f} breached.\nEntry: ${trade.entry_price:.2f} → Now: ${price:.2f} ({pnl_pct:+.2f}%)\nDon't hope. Close it.", "type": "exit", "priority": 5, "alert_key": f"exit_inv_{trade.trade_id}"})
                     log.info(f"Trade {trade.trade_id} INVALIDATED: hard stop ${stop_ref:.2f} breached at ${price:.2f}")
+                    _log_trade_event(trade, event="CLOSE", close_price=price,
+                                      close_reason=f"Hard stop ${stop_ref:.2f} breached",
+                                      badge=self._trade_quality_badge(trade))
                 continue
 
             # ── LAYER 2: Policy evaluation (bar-close clock only) ──
@@ -817,6 +830,9 @@ class ThesisMonitorEngine:
                     trade.status = "CLOSED"; trade.close_price = price
                     trade.close_time = now; trade.close_epoch = time.time()
                     trade.close_reason = signal.reason
+                    _log_trade_event(trade, event="CLOSE", close_price=price,
+                                      close_reason=signal.reason,
+                                      badge=self._trade_quality_badge(trade))
                     self._persist_trades(ticker, state)
                     events.append({"msg": f"\u23f9 EXIT — {trade.direction}\n\n{signal.reason}\nEntry: ${trade.entry_price:.2f} → Now: ${price:.2f} ({signal.pnl_pct:+.2f}%)\nPay yourself.", "type": "exit", "priority": 5, "alert_key": f"exit_done_{trade.trade_id}"})
             elif signal.action == "INVALIDATE":
@@ -851,6 +867,9 @@ class ThesisMonitorEngine:
             if age > EXIT_MAX_TRADE_AGE_SEC:
                 trade.status = "CLOSED"; trade.close_time = now; trade.close_epoch = now_epoch
                 trade.close_reason = "Session expired (4hr max)"
+                _log_trade_event(trade, event="CLOSE", close_price=price,
+                                  close_reason="Session expired (4hr max)",
+                                  badge=self._trade_quality_badge(trade))
                 log.info(f"Trade expired: {trade.ticker} {trade.direction} @ ${trade.entry_price:.2f}")
                 changed = True
         # Prune trades older than 8 hours (keep history but don't bloat)
@@ -882,6 +901,10 @@ class ThesisMonitorEngine:
                     "targets": t.targets, "status": t.status,
                     "entry_epoch": t.entry_epoch, "entry_time_str": t.entry_time_str,
                     "level_name": t.level_name, "gex_at_entry": t.gex_at_entry,
+                    "regime": t.regime, "time_phase": t.time_phase,
+                    "prior_day_context": t.prior_day_context,
+                    "bias_at_entry": t.bias_at_entry,
+                    "volatility_regime": t.volatility_regime,
                     "trade_type_label": t.trade_type_label,
                     "setup_score": t.setup_score, "setup_label": t.setup_label,
                     "exit_policy_name": t.exit_policy_name, "scale_advice": t.scale_advice,
@@ -934,6 +957,11 @@ class ThesisMonitorEngine:
                     entry_time_str=td.get("entry_time_str", ""),
                     level_name=td.get("level_name", ""),
                     gex_at_entry=td.get("gex_at_entry", "positive"),
+                    regime=td.get("regime", ""),
+                    time_phase=td.get("time_phase", ""),
+                    prior_day_context=td.get("prior_day_context", "NORMAL"),
+                    bias_at_entry=td.get("bias_at_entry", ""),
+                    volatility_regime=td.get("volatility_regime", ""),
                     trade_type_label=td.get("trade_type_label", ""),
                     setup_score=td.get("setup_score", 0),
                     setup_label=td.get("setup_label", ""),
@@ -976,6 +1004,9 @@ class ThesisMonitorEngine:
             trade = open_trades[-1]
             trade.status = "CLOSED"; trade.close_reason = reason
             trade.close_price = price; trade.close_time = time.monotonic(); trade.close_epoch = time.time()
+            _log_trade_event(trade, event="CLOSE", close_price=price,
+                              close_reason=reason,
+                              badge=self._trade_quality_badge(trade))
             self._persist_trades(ticker, state)
             pnl = ""
             if price and trade.entry_price:
@@ -1016,6 +1047,9 @@ class ThesisMonitorEngine:
                 lines.append(f"  Policy: {t.exit_policy_name} | Scale: {t.scale_advice}")
             elif t.trade_type_label:
                 lines.append(f"  Type: {t.trade_type_label}")
+            context_bits = [b for b in [t.time_phase, t.gex_at_entry, t.prior_day_context, t.regime] if b]
+            if context_bits:
+                lines.append(f"  Context: {' | '.join(context_bits)}")
             if t.max_favorable > 0:
                 mfe_pct = t.max_favorable / t.entry_price * 100
                 lines.append(f"  Best: +{mfe_pct:.2f}%")
@@ -1344,6 +1378,89 @@ class ThesisMonitorEngine:
         lines.append(f"Poll: {MONITOR_POLL_INTERVAL_FAST_SEC if fast else MONITOR_POLL_INTERVAL_SEC}s")
         return "\n".join(lines)
 
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PER-TICKER TRADE LOGGER
+# ─────────────────────────────────────────────────────────────────────────────
+# Appends one CSV row per trade event (OPEN, SCALE, CLOSE) to a per-ticker
+# log file. Accumulates live data in the same column format as backtest CSVs
+# so live vs backtest can be compared directly.
+# ═════════════════════════════════════════════════════════════════════════════
+
+import csv as _csv_mod
+import os as _os
+
+_TRADE_LOG_DIR = _os.environ.get("TRADE_LOG_DIR", "/tmp/trade_logs")
+
+def _ensure_log_dir():
+    _os.makedirs(_TRADE_LOG_DIR, exist_ok=True)
+
+def _trade_log_path(ticker: str) -> str:
+    _ensure_log_dir()
+    return _os.path.join(_TRADE_LOG_DIR, f"trades_{ticker.upper()}.csv")
+
+_TRADE_LOG_FIELDS = [
+    "ts_utc", "ticker", "event",
+    "direction", "entry_type", "setup_score", "setup_label",
+    "level_name", "level_tier", "time_phase",
+    "regime", "gex_sign", "volatility_regime", "prior_day_context", "bias",
+    "entry_price", "stop_level", "close_price", "pnl_pts",
+    "close_reason", "exit_policy", "badge",
+    "entry_bar_time", "close_bar_time",
+    "mfe_pts", "mae_pts",
+]
+
+def _log_trade_event(trade, event: str, close_price: float = None,
+                     close_reason: str = "", badge: str = ""):
+    """Append one row to the per-ticker CSV log file."""
+    try:
+        path = _trade_log_path(getattr(trade, "ticker", "UNKNOWN"))
+        write_header = not _os.path.exists(path)
+
+        pnl = ""
+        if close_price is not None and hasattr(trade, "entry_price"):
+            raw = close_price - trade.entry_price
+            pnl = round(raw if trade.direction == "LONG" else -raw, 4)
+
+        from datetime import datetime, timezone
+        row = {
+            "ts_utc":           datetime.now(timezone.utc).isoformat(),
+            "ticker":           getattr(trade, "ticker",            ""),
+            "event":            event,
+            "direction":        getattr(trade, "direction",         ""),
+            "entry_type":       getattr(trade, "entry_type",        ""),
+            "setup_score":      getattr(trade, "setup_score",       ""),
+            "setup_label":      getattr(trade, "setup_label",       ""),
+            "level_name":       getattr(trade, "level_name",        ""),
+            "level_tier":       getattr(trade, "level_tier",        ""),
+            "time_phase":       getattr(trade, "time_phase",        ""),
+            "regime":           getattr(trade, "regime",            ""),
+            "gex_sign":         getattr(trade, "gex_at_entry",      ""),
+            "volatility_regime":getattr(trade, "volatility_regime", ""),
+            "prior_day_context":getattr(trade, "prior_day_context", ""),
+            "bias":             getattr(trade, "bias_at_entry",     ""),
+            "entry_price":      getattr(trade, "entry_price",       ""),
+            "stop_level":       getattr(trade, "stop_level",        ""),
+            "close_price":      close_price if close_price is not None else "",
+            "pnl_pts":          pnl,
+            "close_reason":     close_reason,
+            "exit_policy":      getattr(trade, "exit_policy_name",  ""),
+            "badge":            badge,
+            "entry_bar_time":   getattr(trade, "entry_time_str",    ""),
+            "close_bar_time":   datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M") if close_price else "",
+            "mfe_pts":          getattr(trade, "max_favorable",     ""),
+            "mae_pts":          getattr(trade, "min_favorable",     ""),
+        }
+
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            writer = _csv_mod.DictWriter(f, fieldnames=_TRADE_LOG_FIELDS)
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row)
+
+    except Exception as e:
+        log.warning(f"Trade log write failed: {e}")
+
 class ThesisMonitorDaemon:
     def __init__(self, engine, get_spot_fn, post_fn):
         self.engine = engine; self.get_spot = get_spot_fn; self.post_fn = post_fn
@@ -1381,47 +1498,174 @@ class ThesisMonitorDaemon:
                     else: log.info(f"Monitor [{ticker}]: {ev.get('msg','')}")
             except Exception as e: log.warning(f"Monitor {ticker} failed: {e}")
 
+    def _ticker_backtest_profile(self, ticker: str) -> dict:
+        """Ticker-aware quality preferences derived from recent backtests.
+        This is used for alert badging only — it does not block trade creation."""
+        t = (ticker or "").upper()
+        profiles = {
+            "QQQ": {
+                "preferred_directions": {"SHORT"},
+                "preferred_entry_types": {"FAILED"},
+                "preferred_gex": {"positive"},
+                "preferred_phases": {"MORNING", "POWER_HOUR"},
+                "preferred_levels": {
+                    "daily_resistance",
+                    "intraday_resistance (rejection zone)",
+                    "intraday_resistance (sharp move origin)",
+                },
+                "preferred_prior_context": {"GAP_DOWN"},
+                "preferred_biases": set(),
+                "preferred_regimes": set(),
+                "preferred_tiers": {"A", "B"},
+                "score4_ok": False,
+                "score4_levels": {"intraday_resistance (rejection zone)", "daily_resistance"},
+                "rocket_hits": 5,
+                "good_hits": 3,
+                "min_score_rocket": 5,
+                "min_score_good": 5,
+            },
+            "GLD": {
+                "preferred_directions": {"LONG"},
+                "preferred_entry_types": {"BREAK"},
+                "preferred_gex": set(),
+                "preferred_phases": {"MIDDAY", "AFTERNOON"},
+                "preferred_levels": {
+                    "intraday_support (sharp move origin)",
+                    "intraday_resistance (sharp move origin)",
+                    "daily_resistance",
+                },
+                "preferred_prior_context": {"NORMAL"},
+                "preferred_biases": {"BULLISH"},
+                "preferred_regimes": {"HIGH_VOL_TREND"},
+                "preferred_tiers": {"A", "B"},
+                "score4_ok": False,
+                "score4_levels": {"intraday_support (sharp move origin)", "daily_support"},
+                "rocket_hits": 5,
+                "good_hits": 3,
+                "min_score_rocket": 5,
+                "min_score_good": 5,
+            },
+            "SLV": {
+                "preferred_directions": {"LONG"},
+                "preferred_entry_types": {"FAILED"},
+                "preferred_gex": {"negative"},
+                "preferred_phases": {"MIDDAY", "AFTERNOON"},
+                "preferred_levels": {"intraday_support (sharp move origin)"},
+                "preferred_prior_context": {"GAP_UP"},
+                "preferred_biases": {"BULLISH"},
+                "preferred_regimes": set(),
+                "preferred_tiers": {"A", "B", "C"},
+                "score4_ok": True,
+                "score4_levels": set(),
+                "rocket_hits": 5,
+                "good_hits": 3,
+                "min_score_rocket": 4,
+                "min_score_good": 4,
+            },
+            "IWM": {
+                "preferred_directions": {"LONG"},
+                "preferred_entry_types": {"FAILED"},
+                "preferred_gex": {"negative"},
+                "preferred_phases": {"MIDDAY", "POWER_HOUR", "CLOSE"},
+                "preferred_levels": {"intraday_support (sharp move origin)"},
+                "preferred_prior_context": {"NORMAL", "GAP_UP"},
+                "preferred_biases": {"BULLISH"},
+                "preferred_regimes": set(),
+                "preferred_tiers": {"A", "B"},
+                "score4_ok": False,
+                "score4_levels": {"intraday_support (sharp move origin)", "daily_support"},
+                "rocket_hits": 5,
+                "good_hits": 3,
+                "min_score_rocket": 5,
+                "min_score_good": 4,
+            },
+        }
+        default_profile = {
+            "preferred_directions": set(),
+            "preferred_entry_types": {"FAILED"},
+            "preferred_gex": set(),
+            "preferred_phases": {"MIDDAY", "POWER_HOUR", "CLOSE"},
+            "preferred_levels": {
+                "intraday_support (sharp move origin)",
+                "daily_support",
+                "intraday_resistance (rejection zone)",
+            },
+            "preferred_prior_context": set(),
+            "preferred_biases": set(),
+            "preferred_regimes": set(),
+            "preferred_tiers": {"A", "B"},
+            "score4_ok": False,
+            "score4_levels": {"intraday_support (sharp move origin)", "daily_support"},
+            "rocket_hits": 4,
+            "good_hits": 2,
+            "min_score_rocket": 5,
+            "min_score_good": 4,
+        }
+        return profiles.get(t, default_profile)
+
     def _trade_quality_badge(self, trade) -> str:
-        """
-        Returns 🚀 for best-setup trades (matches proven backtest edge),
-        or ⚠️ for everything else (fires but not the A+ setup).
-
-        ROCKET — needs 2+ of these and no disqualifiers:
-          Score 5, HVT/BULL regime, GEX+, Midday/Afternoon/Power Hour,
-          FAILED entry type, A or B tier level
-
-        CAUTION disqualifiers (any one → ⚠️ regardless):
-          Morning or Open session, Score 4 on non-SMO/daily_support levels
-        """
+        """Ticker-aware quality badge aligned to the recent backtest findings.
+        🚀 = elite fit to the ticker profile, ✅ = decent fit, ⚠️ = usable but not preferred."""
         if trade is None:
             return "⚠️"
 
-        score      = getattr(trade, "setup_score",  0)
-        regime     = getattr(trade, "regime",       "") or ""
-        gex        = getattr(trade, "gex_at_entry", "") or ""
-        phase      = getattr(trade, "time_phase",   "") or ""
-        entry_type = getattr(trade, "entry_type",   "") or ""
-        level      = getattr(trade, "level_name",   "") or ""
-        tier       = getattr(trade, "level_tier",   "") or ""
+        profile = self._ticker_backtest_profile(getattr(trade, "ticker", ""))
 
-        # Disqualifiers — always ⚠️
-        if phase in ("MORNING", "OPEN"):
-            return "⚠️"
-        if score == 4 and level not in (
-            "intraday_support (sharp move origin)", "daily_support"
-        ):
-            return "⚠️"
+        score = getattr(trade, "setup_score", 0) or 0
+        regime = getattr(trade, "regime", "") or ""
+        gex = getattr(trade, "gex_at_entry", "") or ""
+        phase = getattr(trade, "time_phase", "") or ""
+        entry_type = getattr(trade, "entry_type", "") or ""
+        level = getattr(trade, "level_name", "") or ""
+        tier = getattr(trade, "level_tier", "") or ""
+        direction = getattr(trade, "direction", "") or ""
+        prior_ctx = getattr(trade, "prior_day_context", "") or ""
+        bias = getattr(trade, "bias_at_entry", "") or ""
 
-        # Primary hits — need at least 2 for 🚀
-        hits = sum([
-            score >= 5,
-            regime in ("HIGH_VOL_TREND", "BULL_TREND"),
-            gex == "positive",
-            phase in ("POWER_HOUR", "AFTERNOON", "MIDDAY"),
-            entry_type == "FAILED",
-            tier in ("A", "B"),
-        ])
-        return "🚀" if hits >= 2 else "⚠️"
+        # Universal caution rules
+        if phase == "OPEN":
+            return "⚠️"
+        if score <= 3:
+            return "⚠️"
+        if score == 4 and not profile.get("score4_ok"):
+            allowed = profile.get("score4_levels") or set()
+            if level not in allowed:
+                return "⚠️"
+
+        hits = 0
+        critical_misses = 0
+
+        if score >= profile.get("min_score_rocket", 5):
+            hits += 1
+        elif score >= profile.get("min_score_good", 4):
+            hits += 1
+
+        checks = [
+            ("preferred_entry_types", entry_type, True),
+            ("preferred_directions", direction, True),
+            ("preferred_gex", gex, False),
+            ("preferred_phases", phase, False),
+            ("preferred_levels", level, False),
+            ("preferred_prior_context", prior_ctx, False),
+            ("preferred_biases", bias, False),
+            ("preferred_regimes", regime, False),
+            ("preferred_tiers", tier, False),
+        ]
+
+        for key, value, critical in checks:
+            preferred = profile.get(key) or set()
+            if not preferred:
+                continue
+            if value in preferred:
+                hits += 1
+            elif critical:
+                critical_misses += 1
+
+        if critical_misses == 0 and hits >= profile.get("rocket_hits", 5):
+            return "🚀"
+        if critical_misses <= 1 and hits >= profile.get("good_hits", 3):
+            return "✅"
+        return "⚠️"
 
     def _post_alert(self, ticker, price, event):
         tp = _get_time_phase_ct(); state = self.engine.get_state(ticker); thesis = self.engine.get_thesis(ticker)
@@ -1439,6 +1683,10 @@ class ThesisMonitorDaemon:
 
         header = f"📊 {ticker} TRADE MGMT — ${price:.2f}" if is_exit else f"{badge_prefix}📡 {ticker} THESIS ALERT — ${price:.2f}"
         lines = [header, "", event["msg"]]
+        if not is_exit and active_trade:
+            ctx = [x for x in [active_trade.time_phase, active_trade.gex_at_entry, active_trade.prior_day_context] if x]
+            if ctx:
+                lines.append(f"Setup context: {' | '.join(ctx)}")
         if not is_exit:
             if state and state.momentum not in ("NEUTRAL", "STALLING"): lines.append(f"Momentum: {state.momentum.replace('_',' ')}")
             if state:
