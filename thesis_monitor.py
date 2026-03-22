@@ -1380,10 +1380,64 @@ class ThesisMonitorDaemon:
                     if ev.get("priority", 1) >= 3: self._post_alert(ticker, price, ev)
                     else: log.info(f"Monitor [{ticker}]: {ev.get('msg','')}")
             except Exception as e: log.warning(f"Monitor {ticker} failed: {e}")
+
+    def _trade_quality_badge(self, trade) -> str:
+        """
+        Returns 🚀 for best-setup trades (matches proven backtest edge),
+        or ⚠️ for everything else (fires but not the A+ setup).
+
+        ROCKET — needs 2+ of these and no disqualifiers:
+          Score 5, HVT/BULL regime, GEX+, Midday/Afternoon/Power Hour,
+          FAILED entry type, A or B tier level
+
+        CAUTION disqualifiers (any one → ⚠️ regardless):
+          Morning or Open session, Score 4 on non-SMO/daily_support levels
+        """
+        if trade is None:
+            return "⚠️"
+
+        score      = getattr(trade, "setup_score",  0)
+        regime     = getattr(trade, "regime",       "") or ""
+        gex        = getattr(trade, "gex_at_entry", "") or ""
+        phase      = getattr(trade, "time_phase",   "") or ""
+        entry_type = getattr(trade, "entry_type",   "") or ""
+        level      = getattr(trade, "level_name",   "") or ""
+        tier       = getattr(trade, "level_tier",   "") or ""
+
+        # Disqualifiers — always ⚠️
+        if phase in ("MORNING", "OPEN"):
+            return "⚠️"
+        if score == 4 and level not in (
+            "intraday_support (sharp move origin)", "daily_support"
+        ):
+            return "⚠️"
+
+        # Primary hits — need at least 2 for 🚀
+        hits = sum([
+            score >= 5,
+            regime in ("HIGH_VOL_TREND", "BULL_TREND"),
+            gex == "positive",
+            phase in ("POWER_HOUR", "AFTERNOON", "MIDDAY"),
+            entry_type == "FAILED",
+            tier in ("A", "B"),
+        ])
+        return "🚀" if hits >= 2 else "⚠️"
+
     def _post_alert(self, ticker, price, event):
         tp = _get_time_phase_ct(); state = self.engine.get_state(ticker); thesis = self.engine.get_thesis(ticker)
         is_exit = event.get("type") == "exit"
-        header = f"📊 {ticker} TRADE MGMT — ${price:.2f}" if is_exit else f"📡 {ticker} THESIS ALERT — ${price:.2f}"
+
+        # Find the most recently opened trade to evaluate quality badge
+        active_trade = None
+        if state and state.active_trades:
+            open_trades = [t for t in state.active_trades if t.status in ("OPEN","SCALED","TRAILED")]
+            if open_trades:
+                active_trade = max(open_trades, key=lambda t: getattr(t, "entry_epoch", 0))
+
+        badge = self._trade_quality_badge(active_trade) if not is_exit else ""
+        badge_prefix = f"{badge} " if badge else ""
+
+        header = f"📊 {ticker} TRADE MGMT — ${price:.2f}" if is_exit else f"{badge_prefix}📡 {ticker} THESIS ALERT — ${price:.2f}"
         lines = [header, "", event["msg"]]
         if not is_exit:
             if state and state.momentum not in ("NEUTRAL", "STALLING"): lines.append(f"Momentum: {state.momentum.replace('_',' ')}")
