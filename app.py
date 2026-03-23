@@ -140,8 +140,9 @@ app = Flask(__name__)
 # ─────────────────────────────────────────────────────────
 # ENV VARS
 # ─────────────────────────────────────────────────────────
-TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN",  "").strip()
-TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID",    "").strip()
+TELEGRAM_BOT_TOKEN      = os.getenv("TELEGRAM_BOT_TOKEN",      "").strip()
+TELEGRAM_CHAT_ID        = os.getenv("TELEGRAM_CHAT_ID",        "").strip()
+TELEGRAM_CHAT_INTRADAY  = os.getenv("TELEGRAM_CHAT_INTRADAY",  "").strip()  # intraday monitor alerts
 TV_WEBHOOK_SECRET   = os.getenv("TV_WEBHOOK_SECRET",   "").strip()
 MARKETDATA_TOKEN    = os.getenv("MARKETDATA_TOKEN",    "").strip()
 WATCHLIST           = os.getenv("WATCHLIST",           "").strip()
@@ -1471,6 +1472,19 @@ def post_to_telegram(text: str, max_retries: int = 4, chat_id: str = None):
 def get_portfolio_chat_id(account: str) -> str:
     cid = ACCOUNT_CHAT_IDS.get(account, "")
     return cid if cid else TELEGRAM_CHAT_ID
+
+
+def post_to_intraday(text: str):
+    """Post to the dedicated intraday channel (TELEGRAM_CHAT_INTRADAY).
+    Used exclusively by the thesis monitor daemon — dealer briefs, action
+    guides, swing and spread alerts all continue using post_to_telegram()
+    which defaults to TELEGRAM_CHAT_ID (main channel).
+    Falls back to main channel if TELEGRAM_CHAT_INTRADAY is not configured."""
+    cid = TELEGRAM_CHAT_INTRADAY or TELEGRAM_CHAT_ID
+    if not cid:
+        log.error("post_to_intraday: no chat ID configured")
+        return
+    post_to_telegram(text, chat_id=cid)
 
 # ─────────────────────────────────────────────────────────
 # MARKETDATA API
@@ -6317,7 +6331,7 @@ with app.app_context():
     log.info(f"OI cache initialized (Redis: {_get_redis() is not None})")
     # ── Thesis Monitor Daemon ──
     _thesis_daemon = init_thesis_daemon(
-        get_spot_fn=get_spot, post_fn=post_to_telegram,
+        get_spot_fn=get_spot, intraday_post_fn=post_to_intraday,
         store_get_fn=store_get, store_set_fn=store_set,
         get_bars_fn=lambda ticker, res, count: get_intraday_bars(ticker, res, count),
     )
