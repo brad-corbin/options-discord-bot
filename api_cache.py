@@ -103,7 +103,7 @@ TTL_VIX          = 60
 TTL_STOCK_QUOTE  = 15
 TTL_EARNINGS     = 3600  # 1 hour
 TTL_REGIME       = 300   # 5 min
-TTL_INTRADAY     = 60    # 1 min — intraday bars (5m resolution)
+TTL_INTRADAY     = 30    # 30s — intraday bars (5m resolution, fast poll needs fresh data)
 
 
 class CachedMarketData:
@@ -260,16 +260,21 @@ class CachedMarketData:
             countback: Number of bars to fetch
         """
         key = f"intra:{ticker.upper()}:{resolution}:{countback}"
-        cached = self._intraday_cache.get(key)
-        if cached is not None:
-            return cached
+        # Don't cache small update polls (countback <= 5) — these are real-time
+        # monitoring calls that need fresh data every time, not cached responses
+        use_cache = countback > 5
+        if use_cache:
+            cached = self._intraday_cache.get(key)
+            if cached is not None:
+                return cached
         try:
             data = self._md_get(
                 f"https://api.marketdata.app/v1/stocks/candles/{resolution}/{ticker.upper()}/",
                 {"countback": countback},
             )
             if isinstance(data, dict) and data.get("s") == "ok":
-                self._intraday_cache.set(key, data)
+                if use_cache:
+                    self._intraday_cache.set(key, data)
                 return data
             log.warning(f"Intraday bars {ticker} {resolution}m: bad response")
             return {}
