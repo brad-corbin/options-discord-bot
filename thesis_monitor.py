@@ -18,6 +18,7 @@ MONITOR_POLL_INTERVAL_SEC = 300
 MONITOR_POLL_INTERVAL_FAST_SEC = 60
 MONITOR_FAST_POLL_TICKERS = ["SPY"]
 MONITOR_ALERT_COOLDOWN_SEC = 600
+MONITOR_ZONE_CLUSTER_PCT   = 0.08   # break attempts / level alerts within 0.08% of each other are treated as the same zone
 MONITOR_MAX_BREAK_AGE_SEC = 900
 MONITOR_MOMENTUM_LOOKBACK = 5
 MONITOR_RECLAIM_THRESHOLD_PCT = 0.015
@@ -907,7 +908,12 @@ class ThesisMonitorEngine:
             if age > EXIT_MAX_TRADE_AGE_SEC:
                 trade.status = "CLOSED"; trade.close_time = now; trade.close_epoch = now_epoch
                 trade.close_reason = "Session expired (4hr max)"
-                _log_trade_event(trade, event="CLOSE", close_price=price,
+                # close_price: use last known price from trade entry — current spot is not
+                # available in this scope. _monitor_exits() handles price-aware closes;
+                # this path is purely a safety expiry for genuinely abandoned trades.
+                close_px = trade.entry_price
+                trade.close_price = close_px
+                _log_trade_event(trade, event="CLOSE", close_price=close_px,
                                   close_reason="Session expired (4hr max)",
                                   badge=_trade_quality_badge(trade))
                 log.info(f"Trade expired: {trade.ticker} {trade.direction} @ ${trade.entry_price:.2f}")
@@ -1339,18 +1345,18 @@ class ThesisMonitorEngine:
                     tt = ("\n💰 TRADE TYPE: Call debit spread — GEX+ reversal capped." if thesis.gex_sign == "positive" else "\n💰 TRADE TYPE: Naked calls — GEX- squeeze can run.")
                     strike_line = _strike_guidance(direction, price)
                     if late:
-                        events.append({"msg": f"🔥 FAILED BREAKDOWN at ${ba.level:.2f}\n\nReclaimed + held. Shorts trapped.\n⚠️ Extended {ext:.2f}% — DON'T CHASE.\nWait for retest.\nSTOP: below ${ba.level:.2f}\n{rn}{tt}\n\n— TRADE CARD —\n{dte_line}\n{strike_line}\n{_size_guidance()}", "type": "critical", "priority": 5, "alert_key": f"fb_late_{ba.level:.2f}"})
+                        events.append({"msg": f"🟩🚀🔥 FAILED BREAKDOWN — SQUEEZE LONG 🟩🚀🔥\n\n${ba.level:.2f} held after reclaim. Shorts trapped.\n⚠️ Extended {ext:.2f}% — DON'T CHASE.\nWait for retest.\nSTOP: below ${ba.level:.2f}\n{rn}{tt}\n\n— TRADE CARD —\n{dte_line}\n{strike_line}\n{_size_guidance()}", "type": "critical", "priority": 5, "alert_key": f"fb_late_{ba.level:.2f}"})
                     else:
-                        events.append({"msg": f"🔥 FAILED BREAKDOWN — SQUEEZE LONG\n\n${ba.level:.2f} held after reclaim. Shorts trapped.\n\nENTRY: Now @ ~${price:.2f}\nSTOP: Below ${ba.level:.2f}\n{rn}{tt}\n\n— TRADE CARD —\n{dte_line}\n{strike_line}\n{_size_guidance()}", "type": "critical", "priority": 5, "alert_key": f"fb_now_{ba.level:.2f}"})
+                        events.append({"msg": f"🟩🚀🔥 FAILED BREAKDOWN — SQUEEZE LONG 🟩🚀🔥\n\n${ba.level:.2f} held after reclaim. Shorts trapped.\n\nENTRY: Now @ ~${price:.2f}\nSTOP: Below ${ba.level:.2f}\n{rn}{tt}\n\n— TRADE CARD —\n{dte_line}\n{strike_line}\n{_size_guidance()}", "type": "critical", "priority": 5, "alert_key": f"fb_now_{ba.level:.2f}"})
                 else:
                     direction = "SHORT"
                     rn = ("GEX+ — fade probability HIGH." if thesis.gex_sign == "positive" else "GEX- downside can accelerate.")
                     tt = ("\n💰 TRADE TYPE: Put debit spread — GEX+ reversal capped." if thesis.gex_sign == "positive" else "\n💰 TRADE TYPE: Naked puts — GEX- dump can run.")
                     strike_line = _strike_guidance(direction, price)
                     if late:
-                        events.append({"msg": f"🔥 FAILED BREAKOUT at ${ba.level:.2f}\n\nLost + held. Longs trapped.\n⚠️ Extended {ext:.2f}% — DON'T CHASE.\nWait for retest.\nSTOP: above ${ba.level:.2f}\n{rn}{tt}\n\n— TRADE CARD —\n{dte_line}\n{strike_line}\n{_size_guidance()}", "type": "critical", "priority": 5, "alert_key": f"fbo_late_{ba.level:.2f}"})
+                        events.append({"msg": f"🟩🚀🔥 FAILED BREAKOUT — FADE SHORT 🟩🚀🔥\n\nLost + held. Longs trapped.\n⚠️ Extended {ext:.2f}% — DON'T CHASE.\nWait for retest.\nSTOP: above ${ba.level:.2f}\n{rn}{tt}\n\n— TRADE CARD —\n{dte_line}\n{strike_line}\n{_size_guidance()}", "type": "critical", "priority": 5, "alert_key": f"fbo_late_{ba.level:.2f}"})
                     else:
-                        events.append({"msg": f"🔥 FAILED BREAKOUT — FADE SHORT\n\n${ba.level:.2f} lost and held. Longs trapped.\n\nENTRY: Now @ ~${price:.2f}\nSTOP: Above ${ba.level:.2f}\n{rn}{tt}\n\n— TRADE CARD —\n{dte_line}\n{strike_line}\n{_size_guidance()}", "type": "critical", "priority": 5, "alert_key": f"fbo_now_{ba.level:.2f}"})
+                        events.append({"msg": f"🟩🚀🔥 FAILED BREAKOUT — FADE SHORT 🟩🚀🔥\n\n${ba.level:.2f} lost and held. Longs trapped.\n\nENTRY: Now @ ~${price:.2f}\nSTOP: Above ${ba.level:.2f}\n{rn}{tt}\n\n— TRADE CARD —\n{dte_line}\n{strike_line}\n{_size_guidance()}", "type": "critical", "priority": 5, "alert_key": f"fbo_now_{ba.level:.2f}"})
             else:
                 if ba.reclaim_seen and not ba.detected_as_failed:
                     ba.reclaim_seen = False; ba.reclaim_price = None; ba.reclaim_time = 0.0; ba.reclaim_holds = 0
@@ -1394,10 +1400,73 @@ class ThesisMonitorEngine:
         state.above_gamma_flip = above; return events
 
     def _apply_cooldowns(self, state, events, now):
+        """Suppress duplicate alerts using two layers:
+        1. Exact key match — same alert_key within cooldown window.
+        2. Zone-family match — for break attempts and level alerts, any alert
+           whose price falls within MONITOR_ZONE_CLUSTER_PCT of a recently-fired
+           alert of the same family ('brk_dn', 'brk_up', 'id_sup', 'id_res',
+           'sharp_sup', 'sharp_res') is treated as a cluster duplicate and skipped.
+           This is what eliminates the burst of 4 alerts in 3 seconds on nearby levels.
+        """
+        # Build a quick lookup: family_prefix → list of (price, last_fired_ts)
+        # We store zone fires in alert_history under a synthetic key "zone:{family}:{price:.2f}"
         out = []
         for e in events:
-            k = e.get("alert_key", e.get("msg", "")[:40]); last = state.alert_history.get(k)
-            if last is None or (now - last) >= MONITOR_ALERT_COOLDOWN_SEC: state.alert_history[k] = now; out.append(e)
+            k = e.get("alert_key", e.get("msg", "")[:40])
+            last = state.alert_history.get(k)
+            if last is not None and (now - last) < MONITOR_ALERT_COOLDOWN_SEC:
+                continue  # exact key cooldown
+
+            # ── Zone-family cluster suppression ──
+            # Extract family and price from alert_key patterns like:
+            #   brk_dn_{name}_{price}  brk_up_{name}_{price}
+            #   id_sup_{price}         id_res_{price}
+            #   sharp_sup_{price}      sharp_res_{price}
+            suppressed = False
+            try:
+                parts = k.split("_")
+                family = None; level_price = None
+                if k.startswith("brk_dn_"):
+                    family = "brk_dn"; level_price = float(parts[-1])
+                elif k.startswith("brk_up_"):
+                    family = "brk_up"; level_price = float(parts[-1])
+                elif k.startswith("id_sup_"):
+                    family = "id_sup"; level_price = float(parts[-1])
+                elif k.startswith("id_res_"):
+                    family = "id_res"; level_price = float(parts[-1])
+                elif k.startswith("sharp_sup_"):
+                    family = "sharp_sup"; level_price = float(parts[-1])
+                elif k.startswith("sharp_res_"):
+                    family = "sharp_res"; level_price = float(parts[-1])
+
+                if family and level_price:
+                    tol = level_price * MONITOR_ZONE_CLUSTER_PCT / 100
+                    # Scan alert_history for nearby fires in the same family
+                    zone_prefix = f"zone:{family}:"
+                    for hist_key, hist_ts in state.alert_history.items():
+                        if not hist_key.startswith(zone_prefix):
+                            continue
+                        if (now - hist_ts) >= MONITOR_ALERT_COOLDOWN_SEC:
+                            continue
+                        try:
+                            hist_price = float(hist_key[len(zone_prefix):])
+                            if abs(hist_price - level_price) <= tol:
+                                suppressed = True
+                                log.debug(f"Zone cluster suppressed: {k} within {MONITOR_ZONE_CLUSTER_PCT}% of {hist_key}")
+                                break
+                        except ValueError:
+                            continue
+                    if not suppressed and family:
+                        # Register this fire as the zone anchor
+                        state.alert_history[f"zone:{family}:{level_price:.2f}"] = now
+            except (ValueError, IndexError):
+                pass  # non-price alert keys pass through unaffected
+
+            if suppressed:
+                continue
+
+            state.alert_history[k] = now
+            out.append(e)
         return out
 
     def format_status(self, ticker):
@@ -1980,8 +2049,9 @@ class ThesisMonitorDaemon:
 
     def _post_alert(self, ticker, price, event):
         tp = _get_time_phase_ct(); state = self.engine.get_state(ticker); thesis = self.engine.get_thesis(ticker)
-        is_exit = event.get("type") == "exit"
+        is_exit  = event.get("type") == "exit"
         is_entry = event.get("type") in ("critical", "trade_confirmed")
+        ev_priority = event.get("priority", 3)
 
         # Find the most recently opened trade to evaluate quality badge
         active_trade = None
@@ -1991,16 +2061,40 @@ class ThesisMonitorDaemon:
                 active_trade = max(open_trades, key=lambda t: getattr(t, "entry_epoch", 0))
 
         badge = self._trade_quality_badge(active_trade) if not is_exit else ""
+
+        # ── Star rating line ──
+        # P5 entry → 5 filled stars  |  P4 contextual → 4 filled + 1 empty
+        if is_entry and ev_priority >= 5:
+            star_line = "⭐⭐⭐⭐⭐"
+        elif ev_priority == 4:
+            star_line = "⭐⭐⭐⭐☆"
+        else:
+            star_line = None
+
+        # ── Badge prefix ──
         badge_prefix = f"{badge} " if badge else ""
 
-        header = f"📊 {ticker} TRADE MGMT — ${price:.2f}" if is_exit else f"{badge_prefix}📡 {ticker} THESIS ALERT — ${price:.2f}"
-        lines = [header, "", event["msg"]]
+        # ── Header ──
+        # Entries get "TRADE ALERT" — an actual trade is being called.
+        # Everything else (momentum, break attempts, gamma flip) stays "THESIS ALERT".
+        if is_exit:
+            header = f"📊 {ticker} TRADE MGMT — ${price:.2f}"
+        elif is_entry:
+            header = f"{badge_prefix}{ticker} TRADE ALERT — ${price:.2f}"
+        else:
+            header = f"{badge_prefix}📡 {ticker} THESIS ALERT — ${price:.2f}"
 
-        # Explicit ⚠️ caution block — injected into body so it cannot be missed
+        # Stars go first, then header
+        lines = []
+        if star_line:
+            lines.append(star_line)
+        lines += [header, "", event["msg"]]
+
+        # ── Explicit ⚠️ caution block ──
         if is_entry and badge == "⚠️":
             lines.append("")
             lines.append("━━━━━━━━━━━━━━━━━━━━━━")
-            lines.append("⚠️ CAUTION BADGE — REDUCED SIZE")
+            lines.append("⚠️ CAUTION ⚠️ — REDUCED SIZE")
             lines.append("This setup does NOT match backtest sweet spot.")
             lines.append("• Use HALF normal size or PAPER TRADE only")
             lines.append("• Do not add to position if it goes against you")
