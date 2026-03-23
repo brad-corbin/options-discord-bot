@@ -27,7 +27,7 @@ MONITOR_EXTENSION_LIMIT_PCT = 0.25
 MONITOR_MIN_HOLD_POLLS_AFTER_RECLAIM = 1
 MONITOR_RETEST_TOLERANCE_PCT = 0.04
 MONITOR_DEFAULT_TICKERS = ["SPY", "QQQ"]
-INTRADAY_MIN_TOUCHES = 2
+INTRADAY_MIN_TOUCHES = 3
 INTRADAY_ZONE_TOLERANCE_PCT = 0.04
 INTRADAY_MIN_PRICES_FOR_LEVELS = 6
 INTRADAY_SHARP_MOVE_THRESHOLD = 0.12
@@ -156,6 +156,38 @@ def _get_time_phase_ct() -> dict:
     if mins < 870: return {"phase": "POWER_HOUR", "label": "Power Hour", "favor": "pin_or_expand", "note": "GEX+ = pinning. GEX- = expansion."}
     if mins < 915: return {"phase": "CLOSE", "label": "Into Close", "favor": "pin", "note": "Favor pin / mean reversion. Reduce size."}
     return {"phase": "AFTER_HOURS", "label": "After Hours", "favor": "wait", "note": "Session over."}
+
+def _dte_guidance(phase: str) -> str:
+    """Return explicit DTE instruction based on session phase."""
+    if phase in ("POWER_HOUR", "CLOSE"):
+        from datetime import date, timedelta
+        try:
+            from zoneinfo import ZoneInfo
+            today = datetime.now(ZoneInfo("America/Chicago")).date()
+        except Exception:
+            today = datetime.utcnow().date()
+        # Next trading day (skip Saturday=5, Sunday=6)
+        next_day = today + timedelta(days=1)
+        while next_day.weekday() >= 5:
+            next_day += timedelta(days=1)
+        return f"📅 DTE: Use TOMORROW's expiry ({next_day.strftime('%m/%d')}) — 1DTE. Session ends soon. DO NOT buy 0DTE."
+    return "📅 DTE: Use TODAY's expiry (0DTE)."
+
+
+def _strike_guidance(direction: str, price: float) -> str:
+    """Return ATM+2 strike suggestion in trade direction."""
+    base = int(price)
+    if direction == "LONG":
+        strike = base + 2
+        return f"🎯 STRIKE: ~{strike} call (ATM+2 in direction)"
+    else:
+        strike = base - 2
+        return f"🎯 STRIKE: ~{strike} put (ATM+2 in direction)"
+
+
+def _size_guidance() -> str:
+    return "📐 SIZE: min(floor($2,000 ÷ premium × 100), 40 contracts). Half size on ⚠️."
+
 
 class IntradayLevelTracker:
     @staticmethod
@@ -697,7 +729,7 @@ class ThesisMonitorEngine:
             setup_score=validation.setup_score,
             gex_sign=thesis.gex_sign,
             setup_type=entry_type,
-            is_0dte=True,
+            is_0dte=(tp["phase"] not in ("POWER_HOUR", "CLOSE")),  # use 1DTE during power hour/close
             vix=thesis.vix,
             time_phase=tp["phase"],
         )
@@ -1258,30 +1290,35 @@ class ThesisMonitorEngine:
             ba.detected_as_confirmed = True; ba.retest_armed = True
             state.confirmed_breaks.append(ba); state.status = "BREAK_CONFIRMED"
             ext = abs(price - ba.level) / ba.level * 100; chase = ext > MONITOR_EXTENSION_LIMIT_PCT
+            tp_now = _get_time_phase_ct()
+            dte_line = _dte_guidance(tp_now["phase"])
             if ba.direction == "DOWN":
                 state.active_trend_direction = "SHORT"
                 if thesis.gex_sign == "negative":
                     tt = "💰 TRADE TYPE: Naked puts — GEX- trend can run."
+                    strike_line = _strike_guidance("SHORT", price)
                     if chase:
                         events.append({"msg": f"🟥 BREAKDOWN CONFIRMED — EXTENDED\n\n${ba.level:.2f} ({ba.level_name}) broke. Price {ext:.2f}% past — DON'T CHASE.\nWait for retest of ${ba.level:.2f}.\nSTOP: above ${ba.level:.2f}\n{tt}", "type": "trade_confirmed", "priority": 5, "alert_key": f"conf_short_wait_{ba.level:.2f}"})
                     else:
-                        events.append({"msg": f"🟥🟥🟥 BREAKDOWN CONFIRMED — PUTS / SHORT 🟥🟥🟥\n\n${ba.level:.2f} ({ba.level_name}) broke with follow-through.\nGEX NEGATIVE — dealers amplify.\n\n{tt}\nENTRY: Buy puts near the money\nSTOP: Reclaim above ${ba.level:.2f}\nTARGET: Next support — let trend work", "type": "trade_confirmed", "priority": 5, "alert_key": f"conf_short_{ba.level:.2f}"})
+                        events.append({"msg": f"🟥🟥🟥 BREAKDOWN CONFIRMED — PUTS / SHORT 🟥🟥🟥\n\n${ba.level:.2f} ({ba.level_name}) broke with follow-through.\nGEX NEGATIVE — dealers amplify.\n\n{tt}\nENTRY: Now @ ~${price:.2f}\nSTOP: Reclaim above ${ba.level:.2f}\nTARGET: Next support — let trend work\n\n— TRADE CARD —\n{dte_line}\n{strike_line}\n{_size_guidance()}", "type": "trade_confirmed", "priority": 5, "alert_key": f"conf_short_{ba.level:.2f}"})
                 else:
                     events.append({"msg": f"⚠️ BREAKDOWN + FOLLOW-THROUGH at ${ba.level:.2f}\nGEX+ — mean reversion possible. Reclaim = squeeze long.", "type": "warning", "priority": 4, "alert_key": f"ft_dn_{ba.level:.2f}"})
             else:
                 state.active_trend_direction = "LONG"
                 if thesis.gex_sign == "negative":
                     tt = "💰 TRADE TYPE: Naked calls — GEX- trend can run."
+                    strike_line = _strike_guidance("LONG", price)
                     if chase:
                         events.append({"msg": f"🟩 BREAKOUT CONFIRMED — EXTENDED\n\n${ba.level:.2f} ({ba.level_name}) broke. Price {ext:.2f}% past — DON'T CHASE.\nWait for retest of ${ba.level:.2f}.\nSTOP: below ${ba.level:.2f}\n{tt}", "type": "trade_confirmed", "priority": 5, "alert_key": f"conf_long_wait_{ba.level:.2f}"})
                     else:
-                        events.append({"msg": f"🟩🟩🟩 BREAKOUT CONFIRMED — CALLS / LONG 🟩🟩🟩\n\n${ba.level:.2f} ({ba.level_name}) broke with follow-through.\nGEX NEGATIVE — dealers amplify.\n\n{tt}\nENTRY: Buy calls near the money\nSTOP: Lose ${ba.level:.2f}\nTARGET: Next resistance — let trend work", "type": "trade_confirmed", "priority": 5, "alert_key": f"conf_long_{ba.level:.2f}"})
+                        events.append({"msg": f"🟩🟩🟩 BREAKOUT CONFIRMED — CALLS / LONG 🟩🟩🟩\n\n${ba.level:.2f} ({ba.level_name}) broke with follow-through.\nGEX NEGATIVE — dealers amplify.\n\n{tt}\nENTRY: Now @ ~${price:.2f}\nSTOP: Lose ${ba.level:.2f}\nTARGET: Next resistance — let trend work\n\n— TRADE CARD —\n{dte_line}\n{strike_line}\n{_size_guidance()}", "type": "trade_confirmed", "priority": 5, "alert_key": f"conf_long_{ba.level:.2f}"})
                 else:
                     events.append({"msg": f"⚠️ BREAKOUT + FOLLOW-THROUGH at ${ba.level:.2f}\nGEX+ — mean reversion possible. Lose level = fade short.", "type": "warning", "priority": 4, "alert_key": f"ft_up_{ba.level:.2f}"})
         return events
 
     def _detect_failed_moves(self, thesis, state, price, now, bm=None):
         events = []; rb = price * (MONITOR_RECLAIM_THRESHOLD_PCT / 100)
+        tp = _get_time_phase_ct()
         for ba in state.break_attempts:
             if ba.detected_as_failed or ba.detected_as_confirmed: continue
             bars_since = (bm.state.bars_since_open - ba.break_bar_index) if (bm and ba.break_bar_index >= 0) else 999
@@ -1295,20 +1332,25 @@ class ThesisMonitorEngine:
                 ba.detected_as_failed = True; ba.retest_armed = True
                 state.failed_moves.append(ba); state.status = "FAILED_MOVE_ACTIVE"
                 ext = abs(price - ba.level) / ba.level * 100; late = ext > MONITOR_EXTENSION_LIMIT_PCT
+                dte_line = _dte_guidance(tp["phase"])
                 if ba.direction == "DOWN":
+                    direction = "LONG"
                     rn = ("GEX+ — squeeze probability HIGH." if thesis.gex_sign == "positive" else "GEX- squeeze can run hard.")
                     tt = ("\n💰 TRADE TYPE: Call debit spread — GEX+ reversal capped." if thesis.gex_sign == "positive" else "\n💰 TRADE TYPE: Naked calls — GEX- squeeze can run.")
+                    strike_line = _strike_guidance(direction, price)
                     if late:
-                        events.append({"msg": f"🔥 FAILED BREAKDOWN at ${ba.level:.2f}\n\nReclaimed + held. Shorts trapped.\n⚠️ Extended {ext:.2f}% — DON'T CHASE.\nWait for retest.\nSTOP: below level\n{rn}{tt}", "type": "critical", "priority": 5, "alert_key": f"fb_late_{ba.level:.2f}"})
+                        events.append({"msg": f"🔥 FAILED BREAKDOWN at ${ba.level:.2f}\n\nReclaimed + held. Shorts trapped.\n⚠️ Extended {ext:.2f}% — DON'T CHASE.\nWait for retest.\nSTOP: below ${ba.level:.2f}\n{rn}{tt}\n\n— TRADE CARD —\n{dte_line}\n{strike_line}\n{_size_guidance()}", "type": "critical", "priority": 5, "alert_key": f"fb_late_{ba.level:.2f}"})
                     else:
-                        events.append({"msg": f"🔥 FAILED BREAKDOWN — SQUEEZE LONG\n\n${ba.level:.2f} held after reclaim. Shorts trapped.\n\nENTRY: Now\nSTOP: Below ${ba.level:.2f}\n{rn}{tt}", "type": "critical", "priority": 5, "alert_key": f"fb_now_{ba.level:.2f}"})
+                        events.append({"msg": f"🔥 FAILED BREAKDOWN — SQUEEZE LONG\n\n${ba.level:.2f} held after reclaim. Shorts trapped.\n\nENTRY: Now @ ~${price:.2f}\nSTOP: Below ${ba.level:.2f}\n{rn}{tt}\n\n— TRADE CARD —\n{dte_line}\n{strike_line}\n{_size_guidance()}", "type": "critical", "priority": 5, "alert_key": f"fb_now_{ba.level:.2f}"})
                 else:
+                    direction = "SHORT"
                     rn = ("GEX+ — fade probability HIGH." if thesis.gex_sign == "positive" else "GEX- downside can accelerate.")
                     tt = ("\n💰 TRADE TYPE: Put debit spread — GEX+ reversal capped." if thesis.gex_sign == "positive" else "\n💰 TRADE TYPE: Naked puts — GEX- dump can run.")
+                    strike_line = _strike_guidance(direction, price)
                     if late:
-                        events.append({"msg": f"🔥 FAILED BREAKOUT at ${ba.level:.2f}\n\nLost + held. Longs trapped.\n⚠️ Extended {ext:.2f}% — DON'T CHASE.\nWait for retest.\nSTOP: above level\n{rn}{tt}", "type": "critical", "priority": 5, "alert_key": f"fbo_late_{ba.level:.2f}"})
+                        events.append({"msg": f"🔥 FAILED BREAKOUT at ${ba.level:.2f}\n\nLost + held. Longs trapped.\n⚠️ Extended {ext:.2f}% — DON'T CHASE.\nWait for retest.\nSTOP: above ${ba.level:.2f}\n{rn}{tt}\n\n— TRADE CARD —\n{dte_line}\n{strike_line}\n{_size_guidance()}", "type": "critical", "priority": 5, "alert_key": f"fbo_late_{ba.level:.2f}"})
                     else:
-                        events.append({"msg": f"🔥 FAILED BREAKOUT — FADE SHORT\n\n${ba.level:.2f} lost and held. Longs trapped.\n\nENTRY: Now\nSTOP: Above ${ba.level:.2f}\n{rn}{tt}", "type": "critical", "priority": 5, "alert_key": f"fbo_now_{ba.level:.2f}"})
+                        events.append({"msg": f"🔥 FAILED BREAKOUT — FADE SHORT\n\n${ba.level:.2f} lost and held. Longs trapped.\n\nENTRY: Now @ ~${price:.2f}\nSTOP: Above ${ba.level:.2f}\n{rn}{tt}\n\n— TRADE CARD —\n{dte_line}\n{strike_line}\n{_size_guidance()}", "type": "critical", "priority": 5, "alert_key": f"fbo_now_{ba.level:.2f}"})
             else:
                 if ba.reclaim_seen and not ba.detected_as_failed:
                     ba.reclaim_seen = False; ba.reclaim_price = None; ba.reclaim_time = 0.0; ba.reclaim_holds = 0
@@ -1316,6 +1358,8 @@ class ThesisMonitorEngine:
 
     def _detect_retests(self, thesis, state, price, now, bm=None):
         events = []; net = self._recent_net_move(state, 3, bm=bm)
+        tp = _get_time_phase_ct()
+        dte_line = _dte_guidance(tp["phase"])
         for ba in state.break_attempts:
             if not ba.retest_armed or ba.retest_fired: continue
             if (now - ba.break_time) > MONITOR_MAX_BREAK_AGE_SEC: continue
@@ -1328,16 +1372,16 @@ class ThesisMonitorEngine:
             if ba.detected_as_failed and ba.direction == "UP" and price > ba.level: continue       # fade retest must be at/below
             if ba.detected_as_confirmed and ba.direction == "DOWN" and net < -(ba.level * 0.0008):
                 ba.retest_fired = True; tt = "💰 Naked puts" if thesis.gex_sign == "negative" else "💰 Put debit spread"
-                events.append({"msg": f"🎯 RETEST SHORT ENTRY\n\nBreakdown retested ${ba.level:.2f} and rejecting.\n\nENTRY: short / puts\nSTOP: above ${ba.level:.2f}\n{tt}", "type": "critical", "priority": 5, "alert_key": f"rt_short_{ba.level:.2f}"})
+                events.append({"msg": f"🎯 RETEST SHORT ENTRY\n\nBreakdown retested ${ba.level:.2f} and rejecting.\n\nENTRY: Now @ ~${price:.2f}\nSTOP: above ${ba.level:.2f}\n{tt}\n\n— TRADE CARD —\n{dte_line}\n{_strike_guidance('SHORT', price)}\n{_size_guidance()}", "type": "critical", "priority": 5, "alert_key": f"rt_short_{ba.level:.2f}"})
             elif ba.detected_as_confirmed and ba.direction == "UP" and net > (ba.level * 0.0008):
                 ba.retest_fired = True; tt = "💰 Naked calls" if thesis.gex_sign == "negative" else "💰 Call debit spread"
-                events.append({"msg": f"🎯 RETEST LONG ENTRY\n\nBreakout retested ${ba.level:.2f} and holding.\n\nENTRY: long / calls\nSTOP: below ${ba.level:.2f}\n{tt}", "type": "critical", "priority": 5, "alert_key": f"rt_long_{ba.level:.2f}"})
+                events.append({"msg": f"🎯 RETEST LONG ENTRY\n\nBreakout retested ${ba.level:.2f} and holding.\n\nENTRY: Now @ ~${price:.2f}\nSTOP: below ${ba.level:.2f}\n{tt}\n\n— TRADE CARD —\n{dte_line}\n{_strike_guidance('LONG', price)}\n{_size_guidance()}", "type": "critical", "priority": 5, "alert_key": f"rt_long_{ba.level:.2f}"})
             elif ba.detected_as_failed and ba.direction == "DOWN" and net > (ba.level * 0.0008):
                 ba.retest_fired = True; tt = "💰 Call debit spread" if thesis.gex_sign == "positive" else "💰 Naked calls"
-                events.append({"msg": f"🎯 RETEST LONG (squeeze)\n\nFailed breakdown retested ${ba.level:.2f} and holding.\n\nENTRY: long / calls\nSTOP: below ${ba.level:.2f}\n{tt}", "type": "critical", "priority": 5, "alert_key": f"rt_fl_{ba.level:.2f}"})
+                events.append({"msg": f"🎯 RETEST LONG (squeeze)\n\nFailed breakdown retested ${ba.level:.2f} and holding.\n\nENTRY: Now @ ~${price:.2f}\nSTOP: below ${ba.level:.2f}\n{tt}\n\n— TRADE CARD —\n{dte_line}\n{_strike_guidance('LONG', price)}\n{_size_guidance()}", "type": "critical", "priority": 5, "alert_key": f"rt_fl_{ba.level:.2f}"})
             elif ba.detected_as_failed and ba.direction == "UP" and net < -(ba.level * 0.0008):
                 ba.retest_fired = True; tt = "💰 Put debit spread" if thesis.gex_sign == "positive" else "💰 Naked puts"
-                events.append({"msg": f"🎯 RETEST SHORT (fade)\n\nFailed breakout retested ${ba.level:.2f} and rejecting.\n\nENTRY: short / puts\nSTOP: above ${ba.level:.2f}\n{tt}", "type": "critical", "priority": 5, "alert_key": f"rt_fs_{ba.level:.2f}"})
+                events.append({"msg": f"🎯 RETEST SHORT (fade)\n\nFailed breakout retested ${ba.level:.2f} and rejecting.\n\nENTRY: Now @ ~${price:.2f}\nSTOP: above ${ba.level:.2f}\n{tt}\n\n— TRADE CARD —\n{dte_line}\n{_strike_guidance('SHORT', price)}\n{_size_guidance()}", "type": "critical", "priority": 5, "alert_key": f"rt_fs_{ba.level:.2f}"})
         return events
 
     def _check_gamma_flip(self, thesis, state, price):
@@ -1648,6 +1692,8 @@ class ThesisMonitorDaemon:
     def __init__(self, engine, get_spot_fn, post_fn):
         self.engine = engine; self.get_spot = get_spot_fn; self.post_fn = post_fn
         self._enabled = True; self._thread = None; self._stop_event = threading.Event()
+        self._last_phase = ""
+        self._digest_fired: set = set()  # "PHASE:YYYY-MM-DD" keys — prevents re-firing same phase same day
     def start(self):
         if self._thread and self._thread.is_alive(): return
         self._stop_event.clear()
@@ -1667,6 +1713,12 @@ class ThesisMonitorDaemon:
         if not self._enabled: return
         tp = _get_time_phase_ct()
         if tp["phase"] in ("PRE_MARKET", "AFTER_HOURS"): return
+        # ── Phase transition digest ──
+        current_phase = tp["phase"]
+        if current_phase != self._last_phase:
+            if current_phase in ("MIDDAY", "AFTERNOON", "POWER_HOUR", "CLOSE"):
+                self._fire_phase_digest(current_phase, tp["label"])
+            self._last_phase = current_phase
         slow = (self._cycle_count % self._slow_n == 0)
         for ticker in self.engine.get_monitored_tickers():
             fast = ticker.upper() in MONITOR_FAST_POLL_TICKERS
@@ -1677,9 +1729,85 @@ class ThesisMonitorDaemon:
                 price = self.get_spot(ticker)
                 if not price or price <= 0: continue
                 for ev in self.engine.evaluate(ticker, price):
-                    if ev.get("priority", 1) >= 3: self._post_alert(ticker, price, ev)
+                    if ev.get("priority", 1) >= 4: self._post_alert(ticker, price, ev)
                     else: log.info(f"Monitor [{ticker}]: {ev.get('msg','')}")
             except Exception as e: log.warning(f"Monitor {ticker} failed: {e}")
+
+    def _fire_phase_digest(self, phase: str, label: str):
+        """Post a pre-phase digest to Telegram summarising all tickers + key levels + open trades.
+        Fires once per phase per calendar day. Power Hour digest includes explicit 1DTE reminder."""
+        try:
+            from zoneinfo import ZoneInfo
+            today_str = datetime.now(ZoneInfo("America/Chicago")).strftime("%Y-%m-%d")
+        except Exception:
+            today_str = datetime.utcnow().strftime("%Y-%m-%d")
+        digest_key = f"{phase}:{today_str}"
+        if digest_key in self._digest_fired:
+            return
+        self._digest_fired.add(digest_key)
+
+        lines = [f"📋 ── {label.upper()} DIGEST ──", ""]
+
+        # Power Hour / Close: prominent 1DTE warning goes at the top
+        if phase in ("POWER_HOUR", "CLOSE"):
+            from datetime import date, timedelta
+            try:
+                from zoneinfo import ZoneInfo
+                today = datetime.now(ZoneInfo("America/Chicago")).date()
+            except Exception:
+                today = datetime.utcnow().date()
+            next_day = today + timedelta(days=1)
+            while next_day.weekday() >= 5:
+                next_day += timedelta(days=1)
+            lines.append("🚨 DTE REMINDER 🚨")
+            lines.append(f"Use TOMORROW's expiry ({next_day.strftime('%m/%d')}) for ALL new entries.")
+            lines.append("0DTE contracts will expire worthless at close. DO NOT buy 0DTE now.")
+            lines.append("")
+
+        for ticker in self.engine.get_monitored_tickers():
+            thesis = self.engine.get_thesis(ticker)
+            state = self.engine.get_state(ticker)
+            if not thesis:
+                continue
+            # Current spot (best effort)
+            try:
+                spot = self.get_spot(ticker) or thesis.spot_at_creation
+            except Exception:
+                spot = thesis.spot_at_creation
+
+            bias_str = f"{thesis.bias} ({thesis.bias_score:+d}/14)"
+            gex_str = f"GEX {'➕' if thesis.gex_sign == 'positive' else '➖'} {thesis.gex_sign.upper()} ({thesis.gex_value:+.1f}M)"
+            lines.append(f"── {ticker} @ ${spot:.2f} ──")
+            lines.append(f"Bias: {bias_str} | {gex_str}")
+            lines.append(f"Regime: {thesis.regime} | Vol: {thesis.volatility_regime}")
+
+            # Key levels
+            if state:
+                il = IntradayLevelTracker.get_active_levels(state, spot)
+                sups = il.get("all_support", [])[:3]
+                ress = il.get("all_resistance", [])[:3]
+                if sups:
+                    lines.append("Support: " + " | ".join(f"${l.price:.2f}({l.source})" for l in sups))
+                if ress:
+                    lines.append("Resistance: " + " | ".join(f"${l.price:.2f}({l.source})" for l in ress))
+                # Open trades
+                open_trades = [t for t in state.active_trades if t.status in ("OPEN", "SCALED", "TRAILED")]
+                if open_trades:
+                    lines.append("📌 OPEN TRADES:")
+                    for t in open_trades:
+                        pnl = ((spot - t.entry_price) if t.direction == "LONG" else (t.entry_price - spot))
+                        stop_ref = t.trail_stop if t.trail_stop else t.stop_level
+                        lines.append(f"  {t.direction} @ ${t.entry_price:.2f} | Stop ${stop_ref:.2f} | P&L {pnl:+.2f} pts | {t.status}")
+            lines.append("")
+
+        lines.append(f"Approach: {_get_time_phase_ct()['note']}")
+        lines.append("— Not financial advice —")
+        msg = "\n".join(lines)
+        try:
+            self.post_fn(msg)
+            log.info(f"Phase digest posted: {phase}")
+        except Exception as e:
+            log.error(f"Phase digest post failed: {e}")
 
     def _ticker_backtest_profile(self, ticker: str) -> dict:
         """Ticker-aware quality preferences derived from recent backtests.
@@ -1853,6 +1981,7 @@ class ThesisMonitorDaemon:
     def _post_alert(self, ticker, price, event):
         tp = _get_time_phase_ct(); state = self.engine.get_state(ticker); thesis = self.engine.get_thesis(ticker)
         is_exit = event.get("type") == "exit"
+        is_entry = event.get("type") in ("critical", "trade_confirmed")
 
         # Find the most recently opened trade to evaluate quality badge
         active_trade = None
@@ -1866,6 +1995,18 @@ class ThesisMonitorDaemon:
 
         header = f"📊 {ticker} TRADE MGMT — ${price:.2f}" if is_exit else f"{badge_prefix}📡 {ticker} THESIS ALERT — ${price:.2f}"
         lines = [header, "", event["msg"]]
+
+        # Explicit ⚠️ caution block — injected into body so it cannot be missed
+        if is_entry and badge == "⚠️":
+            lines.append("")
+            lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+            lines.append("⚠️ CAUTION BADGE — REDUCED SIZE")
+            lines.append("This setup does NOT match backtest sweet spot.")
+            lines.append("• Use HALF normal size or PAPER TRADE only")
+            lines.append("• Do not add to position if it goes against you")
+            lines.append("• Treat as data collection, not conviction trade")
+            lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+
         if not is_exit and active_trade:
             ctx = [x for x in [active_trade.time_phase, active_trade.gex_at_entry, active_trade.prior_day_context] if x]
             if ctx:
