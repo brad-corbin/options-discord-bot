@@ -2047,9 +2047,60 @@ _monitor_engine = ThesisMonitorEngine()
 _monitor_daemon: Optional[ThesisMonitorDaemon] = None
 def get_engine(): return _monitor_engine
 def get_daemon(): return _monitor_daemon
-def init_daemon(get_spot_fn, post_fn, store_get_fn=None, store_set_fn=None, get_bars_fn=None):
+
+# ── Channel routing ──────────────────────────────────────────────────────────
+#
+#  TWO-CHANNEL DESIGN
+#  ──────────────────
+#  MAIN channel    (TELEGRAM_CHAT_ID)      → dealer briefs, action guides,
+#                                            /em cards, swing + spread trades.
+#                                            Posted by app.py — not this module.
+#
+#  INTRADAY channel (TELEGRAM_CHAT_INTRADAY) → everything ThesisMonitorDaemon
+#                                              posts: P4/P5 alerts, trade mgmt,
+#                                              phase digests, for ALL tickers.
+#
+#  To wire this up in app.py:
+#
+#    import os
+#    CHAT_MAIN     = os.environ["TELEGRAM_CHAT_ID"]
+#    CHAT_INTRADAY = os.environ["TELEGRAM_CHAT_INTRADAY"]
+#
+#    def post_main(msg):     send_telegram(msg, chat_id=CHAT_MAIN)
+#    def post_intraday(msg): send_telegram(msg, chat_id=CHAT_INTRADAY)
+#
+#    # Dealer briefs / action guides — use post_main directly in your handlers
+#    # Monitor daemon — pass post_intraday
+#    init_daemon(get_spot_fn=get_spot, intraday_post_fn=post_intraday, ...)
+#
+# ────────────────────────────────────────────────────────────────────────────
+
+def init_daemon(get_spot_fn, post_fn=None, store_get_fn=None, store_set_fn=None,
+                get_bars_fn=None, intraday_post_fn=None):
+    """Initialise and start the thesis monitor daemon.
+
+    Args:
+        get_spot_fn:       callable(ticker) -> float
+        post_fn:           fallback post callable (used if intraday_post_fn is None).
+                           Points at main Telegram channel. Kept for backwards compat.
+        intraday_post_fn:  callable(msg) -> None posting to the dedicated intraday
+                           channel (TELEGRAM_CHAT_INTRADAY). If supplied, the daemon
+                           uses this exclusively. Main-channel posts (dealer briefs,
+                           action guides) remain in app.py and are unaffected.
+        store_get_fn:      Redis get callable
+        store_set_fn:      Redis set callable
+        get_bars_fn:       callable(ticker, resolution, countback) -> dict
+    """
     global _monitor_daemon
     _monitor_engine._store_get = store_get_fn; _monitor_engine._store_set = store_set_fn
     _monitor_engine._get_bars_fn = get_bars_fn
-    _monitor_daemon = ThesisMonitorDaemon(_monitor_engine, get_spot_fn, post_fn)
+    # Prefer the explicit intraday channel; fall back to post_fn for backwards compat
+    effective_post_fn = intraday_post_fn if intraday_post_fn is not None else post_fn
+    if effective_post_fn is None:
+        raise ValueError("init_daemon requires either intraday_post_fn or post_fn")
+    if intraday_post_fn is not None:
+        log.info("Thesis monitor: routing all alerts to INTRADAY channel")
+    else:
+        log.warning("Thesis monitor: intraday_post_fn not set — posting to main channel (legacy mode)")
+    _monitor_daemon = ThesisMonitorDaemon(_monitor_engine, get_spot_fn, effective_post_fn)
     _monitor_daemon.start(); log.info("Thesis monitor daemon initialized"); return _monitor_daemon
