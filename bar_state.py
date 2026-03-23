@@ -179,15 +179,22 @@ class BarStateManager:
     One instance per monitored ticker.
     """
 
-    def __init__(self, ticker: str, get_bars_fn=None):
+    def __init__(self, ticker: str, get_bars_fn=None, resolution: int = 5):
         """
         Args:
             ticker: Symbol
             get_bars_fn: callable(ticker, resolution, countback) -> list[dict]
                          Each dict: {t: epoch, o, h, l, c, v}
+            resolution: Bar size in minutes. Default 5. Use 1 for SPY to reduce lag.
         """
         self.ticker = ticker
         self._get_bars = get_bars_fn
+        self._resolution = resolution
+        # Countback for init: cover ~6.5 hours of session
+        # 5m: 80 bars, 1m: 400 bars
+        self._init_countback = 400 if resolution == 1 else 80
+        # Countback for update: last 3 bars (same logic, faster resolution = more recent data)
+        self._update_countback = 5 if resolution == 1 else 3
         self.state = ExecutionState(ticker=ticker)
         self._initialized = False
 
@@ -197,11 +204,11 @@ class BarStateManager:
             log.warning(f"BarState [{self.ticker}]: no get_bars_fn, cannot initialize")
             return False
         try:
-            raw_bars = self._get_bars(self.ticker, 5, 80)  # ~6.5 hours of 5m bars
+            raw_bars = self._get_bars(self.ticker, self._resolution, self._init_countback)
             if not raw_bars:
                 log.warning(f"BarState [{self.ticker}]: no bars returned")
                 return False
-            bars = self._parse_bars(raw_bars, resolution=5)
+            bars = self._parse_bars(raw_bars, resolution=self._resolution)
             if not bars:
                 return False
             # Filter to today only
@@ -225,7 +232,7 @@ class BarStateManager:
                 self.state.last_bar_ts = self.state.bars_5m[-1].timestamp
                 self.state.bars_since_open = len(self.state.bars_5m)
             self._initialized = True
-            log.info(f"BarState [{self.ticker}]: initialized with {len(self.state.bars_5m)} bars, "
+            log.info(f"BarState [{self.ticker}]: initialized with {len(self.state.bars_5m)} {self._resolution}m bars, "
                      f"VWAP=${self.state.vwap.value:.2f}, "
                      f"OR30=${self.state.or_30.low:.2f}-${self.state.or_30.high:.2f}")
             return True
@@ -241,10 +248,10 @@ class BarStateManager:
         if not self._get_bars:
             return None
         try:
-            raw = self._get_bars(self.ticker, 5, 3)  # last 3 bars
+            raw = self._get_bars(self.ticker, self._resolution, self._update_countback)
             if not raw:
                 return None
-            bars = self._parse_bars(raw, resolution=5)
+            bars = self._parse_bars(raw, resolution=self._resolution)
             if not bars:
                 return None
             # Check for new session BEFORE appending — prevents clearing just-appended bars
