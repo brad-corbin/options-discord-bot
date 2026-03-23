@@ -289,13 +289,21 @@ class ThesisMonitorEngine:
         self._level_first_seen: Dict[str, float] = {}  # "ticker:price_rounded" → epoch
         self._entry_validator = EntryValidator()
 
+    # Tickers that use 1-minute bars for lower latency.
+    # All others use 5-minute bars.
+    _HIGH_RES_TICKERS = {"SPY"}
+
     def _get_or_create_bar_manager(self, ticker: str) -> Optional[BarStateManager]:
-        """Lazy-init bar manager for a ticker."""
+        """Lazy-init bar manager for a ticker.
+        SPY uses 1-minute bars to reduce alert lag from ~5min to ~1min.
+        All other tickers use 5-minute bars.
+        """
         if ticker in self._bar_managers:
             return self._bar_managers[ticker]
         if not self._get_bars_fn:
             return None
-        bm = BarStateManager(ticker, self._get_bars_fn)
+        resolution = 1 if ticker.upper() in self._HIGH_RES_TICKERS else 5
+        bm = BarStateManager(ticker, self._get_bars_fn, resolution=resolution)
         if bm.initialize():
             self._bar_managers[ticker] = bm
             return bm
