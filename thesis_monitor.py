@@ -719,7 +719,7 @@ class ThesisMonitorEngine:
 
         state.active_trades.append(trade)
         self._persist_trades(ticker, state)
-        badge = self._trade_quality_badge(trade)
+        badge = _trade_quality_badge(trade)
         _log_trade_event(trade, event="OPEN", badge=badge)
         log.info(f"ActiveTrade created: {ticker} {direction} {entry_type} @ ${price:.2f} | "
                  f"score={validation.setup_score}/5 [{validation.setup_label}] | "
@@ -784,7 +784,7 @@ class ThesisMonitorEngine:
                     log.info(f"Trade {trade.trade_id} INVALIDATED: hard stop ${stop_ref:.2f} breached at ${price:.2f}")
                     _log_trade_event(trade, event="CLOSE", close_price=price,
                                       close_reason=f"Hard stop ${stop_ref:.2f} breached",
-                                      badge=self._trade_quality_badge(trade))
+                                      badge=_trade_quality_badge(trade))
                 continue
 
             # ── LAYER 2: Policy evaluation (bar-close clock only) ──
@@ -832,7 +832,7 @@ class ThesisMonitorEngine:
                     trade.close_reason = signal.reason
                     _log_trade_event(trade, event="CLOSE", close_price=price,
                                       close_reason=signal.reason,
-                                      badge=self._trade_quality_badge(trade))
+                                      badge=_trade_quality_badge(trade))
                     self._persist_trades(ticker, state)
                     events.append({"msg": f"\u23f9 EXIT — {trade.direction}\n\n{signal.reason}\nEntry: ${trade.entry_price:.2f} → Now: ${price:.2f} ({signal.pnl_pct:+.2f}%)\nPay yourself.", "type": "exit", "priority": 5, "alert_key": f"exit_done_{trade.trade_id}"})
             elif signal.action == "INVALIDATE":
@@ -869,7 +869,7 @@ class ThesisMonitorEngine:
                 trade.close_reason = "Session expired (4hr max)"
                 _log_trade_event(trade, event="CLOSE", close_price=price,
                                   close_reason="Session expired (4hr max)",
-                                  badge=self._trade_quality_badge(trade))
+                                  badge=_trade_quality_badge(trade))
                 log.info(f"Trade expired: {trade.ticker} {trade.direction} @ ${trade.entry_price:.2f}")
                 changed = True
         # Prune trades older than 8 hours (keep history but don't bloat)
@@ -1006,7 +1006,7 @@ class ThesisMonitorEngine:
             trade.close_price = price; trade.close_time = time.monotonic(); trade.close_epoch = time.time()
             _log_trade_event(trade, event="CLOSE", close_price=price,
                               close_reason=reason,
-                              badge=self._trade_quality_badge(trade))
+                              badge=_trade_quality_badge(trade))
             self._persist_trades(ticker, state)
             pnl = ""
             if price and trade.entry_price:
@@ -1460,6 +1460,181 @@ def _log_trade_event(trade, event: str, close_price: float = None,
 
     except Exception as e:
         log.warning(f"Trade log write failed: {e}")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# QUALITY BADGE — Module-level functions (callable from engine AND daemon)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _ticker_backtest_profile(ticker: str) -> dict:
+    """Ticker-aware quality preferences derived from recent backtests.
+    This is used for alert badging only — it does not block trade creation."""
+    t = (ticker or "").upper()
+    profiles = {
+        "QQQ": {
+            "preferred_directions": {"SHORT"},
+            "preferred_entry_types": {"FAILED"},
+            "preferred_gex": {"positive"},
+            "preferred_phases": {"MORNING", "POWER_HOUR"},
+            "preferred_levels": {
+                "daily_resistance",
+                "intraday_resistance (rejection zone)",
+                "intraday_resistance (sharp move origin)",
+            },
+            "preferred_prior_context": {"GAP_DOWN"},
+            "preferred_biases": set(),
+            "preferred_regimes": set(),
+            "preferred_tiers": {"A", "B"},
+            "score4_ok": False,
+            "score4_levels": {"intraday_resistance (rejection zone)", "daily_resistance"},
+            "rocket_hits": 5,
+            "good_hits": 3,
+            "min_score_rocket": 5,
+            "min_score_good": 5,
+        },
+        "GLD": {
+            "preferred_directions": {"LONG"},
+            "preferred_entry_types": {"BREAK"},
+            "preferred_gex": set(),
+            "preferred_phases": {"MIDDAY", "AFTERNOON"},
+            "preferred_levels": {
+                "intraday_support (sharp move origin)",
+                "intraday_resistance (sharp move origin)",
+                "daily_resistance",
+            },
+            "preferred_prior_context": {"NORMAL"},
+            "preferred_biases": {"BULLISH"},
+            "preferred_regimes": {"HIGH_VOL_TREND"},
+            "preferred_tiers": {"A", "B"},
+            "score4_ok": False,
+            "score4_levels": {"intraday_support (sharp move origin)", "daily_support"},
+            "rocket_hits": 5,
+            "good_hits": 3,
+            "min_score_rocket": 5,
+            "min_score_good": 5,
+        },
+        "SLV": {
+            "preferred_directions": {"LONG"},
+            "preferred_entry_types": {"FAILED"},
+            "preferred_gex": {"negative"},
+            "preferred_phases": {"MIDDAY", "AFTERNOON"},
+            "preferred_levels": {"intraday_support (sharp move origin)"},
+            "preferred_prior_context": {"GAP_UP"},
+            "preferred_biases": {"BULLISH"},
+            "preferred_regimes": set(),
+            "preferred_tiers": {"A", "B", "C"},
+            "score4_ok": True,
+            "score4_levels": set(),
+            "rocket_hits": 5,
+            "good_hits": 3,
+            "min_score_rocket": 4,
+            "min_score_good": 4,
+        },
+        "IWM": {
+            "preferred_directions": {"LONG"},
+            "preferred_entry_types": {"FAILED"},
+            "preferred_gex": {"negative"},
+            "preferred_phases": {"MIDDAY", "POWER_HOUR", "CLOSE"},
+            "preferred_levels": {"intraday_support (sharp move origin)"},
+            "preferred_prior_context": {"NORMAL", "GAP_UP"},
+            "preferred_biases": {"BULLISH"},
+            "preferred_regimes": set(),
+            "preferred_tiers": {"A", "B"},
+            "score4_ok": False,
+            "score4_levels": {"intraday_support (sharp move origin)", "daily_support"},
+            "rocket_hits": 5,
+            "good_hits": 3,
+            "min_score_rocket": 5,
+            "min_score_good": 4,
+        },
+    }
+    default_profile = {
+        "preferred_directions": set(),
+        "preferred_entry_types": {"FAILED"},
+        "preferred_gex": set(),
+        "preferred_phases": {"MIDDAY", "POWER_HOUR", "CLOSE"},
+        "preferred_levels": {
+            "intraday_support (sharp move origin)",
+            "daily_support",
+            "intraday_resistance (rejection zone)",
+        },
+        "preferred_prior_context": set(),
+        "preferred_biases": set(),
+        "preferred_regimes": set(),
+        "preferred_tiers": {"A", "B"},
+        "score4_ok": False,
+        "score4_levels": {"intraday_support (sharp move origin)", "daily_support"},
+        "rocket_hits": 4,
+        "good_hits": 2,
+        "min_score_rocket": 5,
+        "min_score_good": 4,
+    }
+    return profiles.get(t, default_profile)
+
+
+def _trade_quality_badge(trade) -> str:
+    """Ticker-aware quality badge aligned to the recent backtest findings.
+    🚀 = elite fit to the ticker profile, ✅ = decent fit, ⚠️ = usable but not preferred."""
+    if trade is None:
+        return "⚠️"
+
+    profile = _ticker_backtest_profile(getattr(trade, "ticker", ""))
+
+    score = getattr(trade, "setup_score", 0) or 0
+    regime = getattr(trade, "regime", "") or ""
+    gex = getattr(trade, "gex_at_entry", "") or ""
+    phase = getattr(trade, "time_phase", "") or ""
+    entry_type = getattr(trade, "entry_type", "") or ""
+    level = getattr(trade, "level_name", "") or ""
+    tier = getattr(trade, "level_tier", "") or ""
+    direction = getattr(trade, "direction", "") or ""
+    prior_ctx = getattr(trade, "prior_day_context", "") or ""
+    bias = getattr(trade, "bias_at_entry", "") or ""
+
+    # Universal caution rules
+    if phase == "OPEN":
+        return "⚠️"
+    if score <= 3:
+        return "⚠️"
+    if score == 4 and not profile.get("score4_ok"):
+        allowed = profile.get("score4_levels") or set()
+        if level not in allowed:
+            return "⚠️"
+
+    hits = 0
+    critical_misses = 0
+
+    if score >= profile.get("min_score_rocket", 5):
+        hits += 1
+    elif score >= profile.get("min_score_good", 4):
+        hits += 1
+
+    checks = [
+        ("preferred_entry_types", entry_type, True),
+        ("preferred_directions", direction, True),
+        ("preferred_gex", gex, False),
+        ("preferred_phases", phase, False),
+        ("preferred_levels", level, False),
+        ("preferred_prior_context", prior_ctx, False),
+        ("preferred_biases", bias, False),
+        ("preferred_regimes", regime, False),
+        ("preferred_tiers", tier, False),
+    ]
+
+    for key, value, critical in checks:
+        preferred = profile.get(key) or set()
+        if not preferred:
+            continue
+        if value in preferred:
+            hits += 1
+        elif critical:
+            critical_misses += 1
+
+    if critical_misses == 0 and hits >= profile.get("rocket_hits", 5):
+        return "🚀"
+    if critical_misses <= 1 and hits >= profile.get("good_hits", 3):
+        return "✅"
+    return "⚠️"
 
 class ThesisMonitorDaemon:
     def __init__(self, engine, get_spot_fn, post_fn):
