@@ -1476,13 +1476,28 @@ def get_portfolio_chat_id(account: str) -> str:
 # MARKETDATA API
 # ─────────────────────────────────────────────────────────
 
-def md_get(url, params=None):
+def md_get(url, params=None, retries=2):
+    """MarketData API GET with retry on timeout.
+    timeout=15s — gives the API time to respond under load.
+    retries=2   — tries up to 3 times total before giving up.
+    """
     if not MARKETDATA_TOKEN:
         raise RuntimeError("MARKETDATA_TOKEN not set")
-    r = requests.get(url, headers={"Authorization": f"Bearer {MARKETDATA_TOKEN}"},
-                     params=params or {}, timeout=8)
-    r.raise_for_status()
-    return r.json()
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            r = requests.get(url, headers={"Authorization": f"Bearer {MARKETDATA_TOKEN}"},
+                             params=params or {}, timeout=15)
+            r.raise_for_status()
+            return r.json()
+        except requests.exceptions.Timeout as e:
+            last_err = e
+            if attempt < retries:
+                log.warning(f"md_get timeout (attempt {attempt+1}/{retries+1}): {url.split('/')[-2]}")
+                continue
+        except Exception as e:
+            raise
+    raise last_err
 
 # v4.1: Cached API layer — reduces duplicate API calls by 70-90%
 _cached_md = CachedMarketData(md_get)
