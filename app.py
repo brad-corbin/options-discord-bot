@@ -3359,7 +3359,12 @@ def swing_webhook():
 # 0DTE EM TRIGGER
 # ─────────────────────────────────────────────────────────
 
-EM_SCHEDULE_TIMES_CT = [(8, 45), (14, 45)]
+EM_SCHEDULE_TIMES_CT = [(8, 45), (9, 15), (14, 45)]
+# 8:45 AM  — pre-open / first-minute snap. Chain greeks may be stale (no live market).
+# 9:15 AM  — mid-morning refresh (v15). Market has been open 45 min. Greeks are live.
+#            This ensures thesis monitor gets ATM delta/premium for premium stop.
+#            Also refreshes bias score with live price action data.
+# 2:45 PM  — afternoon / next-day preview for power hour entries.
 EM_TICKERS = ["SPY", "QQQ"]
 
 @app.route("/em", methods=["POST", "GET"])
@@ -4707,35 +4712,50 @@ def _extract_atm_option_data(chain_data: dict, spot: float) -> dict:
     Used by the thesis monitor to approximate option premium loss each poll
     without fetching live quotes. Zero API calls — reads from already-fetched data.
 
+    v15: Two-path extraction:
+      Path A: via build_option_rows (structured row dicts).
+      Path B: direct raw parallel-array read from marketdata.app format.
+    Falls back to Path B if Path A yields nothing, which happens when
+    build_option_rows drops the 'side' or 'delta' fields.
+
     Returns dict with keys: call_delta, call_premium, put_delta, put_premium.
     All values default to 0.0 if chain is thin or ATM cannot be found.
     """
     result = {"call_delta": 0.0, "call_premium": 0.0,
               "put_delta":  0.0, "put_premium":  0.0}
     if not chain_data or not spot:
+        log.info("ATM extract: no chain data or spot")
         return result
     try:
-        rows = build_option_rows(chain_data) or []
-        if not rows:
-            return result
-
+        # ── Path A: structured rows ───────────────────────────────────
         best_call = None; best_call_dist = float("inf")
         best_put  = None; best_put_dist  = float("inf")
+
+        rows = build_option_rows(chain_data) or []
+        rows_checked = 0; rows_no_side = 0; rows_no_delta = 0; rows_no_mid = 0
 
         for row in rows:
             strike = as_float(row.get("strike"), 0.0)
             if not strike or strike <= 0:
                 continue
             dist = abs(strike - spot)
+            # Only check nearby strikes (within 5%) for efficiency
+            if dist > spot * 0.05:
+                continue
+            rows_checked += 1
             side = (row.get("side") or row.get("option_type") or row.get("type") or "").lower()
             if side not in ("call", "put"):
-                # try right field
                 side = (row.get("right") or "").lower()
             if side not in ("call", "put"):
+                rows_no_side += 1
                 continue
 
             delta = abs(as_float(row.get("delta"), 0.0))
             mid = _option_mid_price(row)
+            if not delta or delta <= 0:
+                rows_no_delta += 1
+            if not mid or mid <= 0:
+                rows_no_mid += 1
             if not mid or mid <= 0 or delta <= 0:
                 continue
 
@@ -4745,6 +4765,64 @@ def _extract_atm_option_data(chain_data: dict, spot: float) -> dict:
             elif side == "put" and dist < best_put_dist:
                 best_put = {"delta": delta, "premium": round(mid, 2)}
                 best_put_dist = dist
+
+        # ── Path B fallback: raw parallel arrays ──────────────────────
+        # If Path A yielded nothing, try reading directly from the raw
+        # marketdata.app chain format (parallel arrays keyed by field name).
+        if not best_call and not best_put:
+            log.info(f"ATM extract Path A: {len(rows)} rows, {rows_checked} near ATM, "
+                     f"{rows_no_side} no side, {rows_no_delta} no delta, {rows_no_mid} no mid — "
+                     f"falling back to Path B (raw arrays)")
+
+            raw_strikes = chain_data.get("strike") or []
+            raw_sides   = chain_data.get("side") or chain_data.get("right") or []
+            raw_deltas  = chain_data.get("delta") or []
+            raw_bids    = chain_data.get("bid") or []
+            raw_asks    = chain_data.get("ask") or []
+            raw_mids    = chain_data.get("mid") or []
+            raw_lasts   = chain_data.get("last") or chain_data.get("lastPrice") or []
+            n = len(raw_strikes)
+
+            for i in range(n):
+                strike = as_float(raw_strikes[i] if i < len(raw_strikes) else 0, 0.0)
+                if not strike or strike <= 0:
+                    continue
+                dist = abs(strike - spot)
+                if dist > spot * 0.05:
+                    continue
+
+                side_raw = raw_sides[i] if i < len(raw_sides) else ""
+                side = _normalize_option_side(side_raw)
+                if side not in ("call", "put"):
+                    continue
+
+                delta = abs(as_float(raw_deltas[i] if i < len(raw_deltas) else 0, 0.0))
+
+                # Compute mid from bid/ask or mid or last
+                bid = as_float(raw_bids[i] if i < len(raw_bids) else 0, 0.0)
+                ask = as_float(raw_asks[i] if i < len(raw_asks) else 0, 0.0)
+                mid_direct = as_float(raw_mids[i] if i < len(raw_mids) else 0, 0.0)
+                last = as_float(raw_lasts[i] if i < len(raw_lasts) else 0, 0.0)
+
+                mid = 0.0
+                if bid > 0 and ask > 0:
+                    mid = (bid + ask) / 2.0
+                elif mid_direct > 0:
+                    mid = mid_direct
+                elif ask > 0:
+                    mid = ask
+                elif last > 0:
+                    mid = last
+
+                if mid <= 0 or delta <= 0:
+                    continue
+
+                if side == "call" and dist < best_call_dist:
+                    best_call = {"delta": delta, "premium": round(mid, 2)}
+                    best_call_dist = dist
+                elif side == "put" and dist < best_put_dist:
+                    best_put = {"delta": delta, "premium": round(mid, 2)}
+                    best_put_dist = dist
 
         if best_call:
             result["call_delta"]   = round(best_call["delta"],   3)
@@ -4756,8 +4834,12 @@ def _extract_atm_option_data(chain_data: dict, spot: float) -> dict:
         if best_call or best_put:
             log.info(f"ATM snapshot: call δ={result['call_delta']:.3f} ${result['call_premium']:.2f} | "
                      f"put δ={result['put_delta']:.3f} ${result['put_premium']:.2f} | spot=${spot:.2f}")
+        else:
+            log.warning(f"ATM extract: FAILED to find ATM options near spot=${spot:.2f} "
+                        f"(chain has {len(chain_data.get('strike', []))} strikes, "
+                        f"rows={len(rows)}, checked={rows_checked})")
     except Exception as e:
-        log.warning(f"ATM option data extraction failed: {e}")
+        log.warning(f"ATM option data extraction failed: {e}", exc_info=True)
 
     return result
 
@@ -4792,7 +4874,11 @@ def _post_em_card(ticker: str, session: str):
         else:
             target_date_str = today_dt.strftime("%Y-%m-%d")
             hours_for_em = max((market_close_ct - now_ct).total_seconds() / 3600, 0.25)
-            session_emoji = "🌅"; session_label = "Today (Pre-Open)"
+            # v15: Distinguish pre-open from live session for thesis label
+            if now_ct >= market_open_ct:
+                session_emoji = "🔔"; session_label = "Today (Live)"
+            else:
+                session_emoji = "🌅"; session_label = "Today (Pre-Open)"
             horizon_note = f"{hours_for_em:.1f}h remaining today"
 
         # v4: 9-element tuple now includes v4_result
