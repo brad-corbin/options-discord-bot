@@ -4676,6 +4676,69 @@ def _log_em_prediction(ticker: str, session: str, spot: float, em: dict, bias: d
         log.warning(f"EM prediction log failed: {e}")
 
 # ─────────────────────────────────────────────────────────────────────
+# ── ATM option snapshot for thesis monitor premium stop ──────────────────────
+def _extract_atm_option_data(chain_data: dict, spot: float) -> dict:
+    """Extract ATM call and put delta + mid price from a raw chain dict.
+
+    Called once per em card run, result stored on ThesisContext.
+    Used by the thesis monitor to approximate option premium loss each poll
+    without fetching live quotes. Zero API calls — reads from already-fetched data.
+
+    Returns dict with keys: call_delta, call_premium, put_delta, put_premium.
+    All values default to 0.0 if chain is thin or ATM cannot be found.
+    """
+    result = {"call_delta": 0.0, "call_premium": 0.0,
+              "put_delta":  0.0, "put_premium":  0.0}
+    if not chain_data or not spot:
+        return result
+    try:
+        rows = build_option_rows(chain_data) or []
+        if not rows:
+            return result
+
+        best_call = None; best_call_dist = float("inf")
+        best_put  = None; best_put_dist  = float("inf")
+
+        for row in rows:
+            strike = as_float(row.get("strike"), 0.0)
+            if not strike or strike <= 0:
+                continue
+            dist = abs(strike - spot)
+            side = (row.get("side") or row.get("option_type") or row.get("type") or "").lower()
+            if side not in ("call", "put"):
+                # try right field
+                side = (row.get("right") or "").lower()
+            if side not in ("call", "put"):
+                continue
+
+            delta = abs(as_float(row.get("delta"), 0.0))
+            mid = _option_mid_price(row)
+            if not mid or mid <= 0 or delta <= 0:
+                continue
+
+            if side == "call" and dist < best_call_dist:
+                best_call = {"delta": delta, "premium": round(mid, 2)}
+                best_call_dist = dist
+            elif side == "put" and dist < best_put_dist:
+                best_put = {"delta": delta, "premium": round(mid, 2)}
+                best_put_dist = dist
+
+        if best_call:
+            result["call_delta"]   = round(best_call["delta"],   3)
+            result["call_premium"] = best_call["premium"]
+        if best_put:
+            result["put_delta"]    = round(best_put["delta"],    3)
+            result["put_premium"]  = best_put["premium"]
+
+        if best_call or best_put:
+            log.info(f"ATM snapshot: call δ={result['call_delta']:.3f} ${result['call_premium']:.2f} | "
+                     f"put δ={result['put_delta']:.3f} ${result['put_premium']:.2f} | spot=${spot:.2f}")
+    except Exception as e:
+        log.warning(f"ATM option data extraction failed: {e}")
+
+    return result
+
+
 # _post_em_card — v4 INTEGRATED
 # Now shows confidence, downgrades, trade sign, vol regime from v4 engine.
 # _calc_bias 14-signal scoring preserved exactly.
@@ -4944,6 +5007,13 @@ def _post_em_card(ticker: str, session: str):
             _thesis_price_struct = _compute_price_structure_levels(ticker, spot, days=90)
             _thesis_local_walls = _merge_price_structure_with_walls(_thesis_price_struct, _thesis_chain_struct, spot, em)
 
+            # ── ATM option snapshot for premium stop ──
+            # Re-uses the cached chain (no extra API call). Extracts the nearest
+            # ATM call and put delta + mid price so the thesis monitor can
+            # approximate a 20% premium stop each poll without live quotes.
+            _atm_chain, _atm_spot, _ = _get_0dte_chain(ticker, target_date_str)
+            _atm_data = _extract_atm_option_data(_atm_chain or {}, _atm_spot or spot)
+
             _thesis = build_thesis_from_em_card(
                 ticker=ticker,
                 spot=spot,
@@ -4957,6 +5027,10 @@ def _post_em_card(ticker: str, session: str):
                 session_label=session_label,
                 local_walls=_thesis_local_walls,
                 prior_day_close=_prior_close,
+                atm_call_delta=_atm_data["call_delta"],
+                atm_call_premium=_atm_data["call_premium"],
+                atm_put_delta=_atm_data["put_delta"],
+                atm_put_premium=_atm_data["put_premium"],
             )
             get_thesis_engine().store_thesis(ticker, _thesis)
             log.info(f"Thesis stored for monitoring: {ticker} | {session_label}")
@@ -5435,6 +5509,8 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
             ]
             # ── Thesis Monitor: store thesis even when no trade qualifies ──
             try:
+                _nt_chain, _nt_spot, _ = _get_0dte_chain(ticker, expiration)
+                _nt_atm = _extract_atm_option_data(_nt_chain or {}, _nt_spot or spot)
                 _nt_thesis = build_thesis_from_em_card(
                     ticker=ticker, spot=spot, bias=bias,
                     eng=eng or {}, em=em, walls=walls or {},
@@ -5442,6 +5518,10 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
                     v4_result=v4_result,
                     session_label=effective_dte_label,
                     local_walls=local_walls,
+                    atm_call_delta=_nt_atm["call_delta"],
+                    atm_call_premium=_nt_atm["call_premium"],
+                    atm_put_delta=_nt_atm["put_delta"],
+                    atm_put_premium=_nt_atm["put_premium"],
                 )
                 get_thesis_engine().store_thesis(ticker, _nt_thesis)
             except Exception:
