@@ -2591,14 +2591,26 @@ class ThesisMonitorDaemon:
         is_entry = event.get("type") in ("critical", "trade_confirmed")
         ev_priority = event.get("priority", 3)
 
-        # Find the most recently opened trade to evaluate quality badge
+        # Find the most recently opened trade to evaluate quality badge.
+        # IMPORTANT: badge is only meaningful when a trade exists to evaluate.
+        # If no trade exists (e.g. entry event fired but validator rejected it,
+        # or badge is being shown before the trade is persisted), do not default
+        # to ⚠️ — that falsely implies a quality judgement on a non-existent trade.
         active_trade = None
         if state and state.active_trades:
             open_trades = [t for t in state.active_trades if t.status in ("OPEN","SCALED","TRAILED")]
             if open_trades:
                 active_trade = max(open_trades, key=lambda t: getattr(t, "entry_epoch", 0))
 
-        badge = self._trade_quality_badge(active_trade) if not is_exit else ""
+        if is_exit:
+            badge = ""
+        elif active_trade is not None:
+            badge = self._trade_quality_badge(active_trade)
+        else:
+            # No active trade to evaluate — no quality badge.
+            # Show a neutral signal indicator instead of ⚠️ (which would
+            # falsely imply the setup is weak rather than unevaluated).
+            badge = "📡" if not is_entry else ""
 
         # ── Star rating line ──
         # P5 entry → 5 filled stars  |  P4 contextual → 4 filled + 1 empty
@@ -2629,7 +2641,9 @@ class ThesisMonitorDaemon:
         lines += [header, "", event["msg"]]
 
         # ── Explicit ⚠️ caution block ──
-        if is_entry and badge == "⚠️":
+        # Only fires when an actual trade was created AND scored as ⚠️.
+        # active_trade being None means no trade to evaluate — no caution block.
+        if is_entry and badge == "⚠️" and active_trade is not None:
             lines.append("")
             lines.append("━━━━━━━━━━━━━━━━━━━━━━")
             lines.append("⚠️ CAUTION ⚠️ — REDUCED SIZE")
