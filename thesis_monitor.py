@@ -756,6 +756,7 @@ class ThesisMonitorEngine:
             if old:
                 ns.active_trend_direction = old.active_trend_direction
                 ns.alert_history = old.alert_history
+                ns.gamma_flip_crossings = old.gamma_flip_crossings  # v15: preserve oscillation gate state
             self._states[ticker] = ns
             log.info(f"Thesis stored: {ticker} | bias={thesis.bias} score={thesis.bias_score} gex={thesis.gex_sign} regime={thesis.regime}")
             self._persist_thesis(ticker, thesis)
@@ -763,7 +764,13 @@ class ThesisMonitorEngine:
     def _persist_thesis(self, ticker, thesis):
         if not self._store_set: return
         try:
-            data = {"ticker": thesis.ticker, "bias": thesis.bias, "bias_score": thesis.bias_score, "gex_sign": thesis.gex_sign, "gex_value": thesis.gex_value, "dex_value": thesis.dex_value, "vanna_value": thesis.vanna_value, "charm_value": thesis.charm_value, "regime": thesis.regime, "volatility_regime": thesis.volatility_regime, "vix": thesis.vix, "iv": thesis.iv, "prior_day_close": thesis.prior_day_close, "prior_day_context": thesis.prior_day_context, "session_label": thesis.session_label, "created_at": thesis.created_at, "spot_at_creation": thesis.spot_at_creation, "levels": asdict(thesis.levels)}
+            data = {"ticker": thesis.ticker, "bias": thesis.bias, "bias_score": thesis.bias_score, "gex_sign": thesis.gex_sign, "gex_value": thesis.gex_value, "dex_value": thesis.dex_value, "vanna_value": thesis.vanna_value, "charm_value": thesis.charm_value, "regime": thesis.regime, "volatility_regime": thesis.volatility_regime, "vix": thesis.vix, "iv": thesis.iv, "prior_day_close": thesis.prior_day_close, "prior_day_context": thesis.prior_day_context, "session_label": thesis.session_label, "created_at": thesis.created_at, "spot_at_creation": thesis.spot_at_creation, "levels": asdict(thesis.levels),
+                    # v15: persist ATM option data for premium stop
+                    "atm_call_delta": thesis.atm_call_delta,
+                    "atm_call_premium": thesis.atm_call_premium,
+                    "atm_put_delta": thesis.atm_put_delta,
+                    "atm_put_premium": thesis.atm_put_premium,
+            }
             self._store_set(f"thesis_monitor:{ticker}", json.dumps(data), ttl=86400)
             # Maintain monitored ticker list in store
             self._update_ticker_list(ticker)
@@ -790,7 +797,13 @@ class ThesisMonitorEngine:
             d = json.loads(raw)
             levels = ThesisLevels(**{k: v for k, v in d.get("levels", {}).items() if k in ThesisLevels.__dataclass_fields__})
             t = ThesisContext(ticker=d.get("ticker", ticker), bias=d.get("bias", "NEUTRAL"), bias_score=d.get("bias_score", 0), gex_sign=d.get("gex_sign", "positive"), gex_value=d.get("gex_value", 0), dex_value=d.get("dex_value", 0), vanna_value=d.get("vanna_value", 0), charm_value=d.get("charm_value", 0), regime=d.get("regime", "UNKNOWN"), volatility_regime=d.get("volatility_regime", "NORMAL"), vix=d.get("vix", 20), iv=d.get("iv", 0.20), prior_day_close=d.get("prior_day_close"), prior_day_context=d.get("prior_day_context", "NORMAL"), session_label=d.get("session_label", ""), created_at=d.get("created_at", ""), spot_at_creation=d.get("spot_at_creation", 0), levels=levels)
-            log.info(f"Thesis loaded from store: {ticker} | bias={t.bias} gex={t.gex_sign}")
+            # v15: restore ATM option data for premium stop
+            t.atm_call_delta   = float(d.get("atm_call_delta", 0.0) or 0.0)
+            t.atm_call_premium = float(d.get("atm_call_premium", 0.0) or 0.0)
+            t.atm_put_delta    = float(d.get("atm_put_delta", 0.0) or 0.0)
+            t.atm_put_premium  = float(d.get("atm_put_premium", 0.0) or 0.0)
+            log.info(f"Thesis loaded from store: {ticker} | bias={t.bias} gex={t.gex_sign} "
+                     f"atm_call_δ={t.atm_call_delta:.3f} atm_put_δ={t.atm_put_delta:.3f}")
             return t
         except Exception as e: log.warning(f"Thesis load failed for {ticker}: {e}"); return None
 
