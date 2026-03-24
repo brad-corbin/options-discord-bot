@@ -224,57 +224,49 @@ def _pick_instrument(
 
     Returns one of: "naked_call", "naked_put", "call_spread", "put_spread"
 
-    Decision tree — naked wins when the move can run well past a spread's
-    short strike and the regime supports it. Spread wins when the move is
-    bounded, conviction is low, or premium is too expensive for the thesis.
+    Momentum vocabulary matches _evaluate_momentum output exactly:
+      Strong:  ACCELERATING_UP, ACCELERATING_DOWN
+      Drifting: DRIFTING_UP, DRIFTING_DOWN   (treated as moderate — neither strong nor weak)
+      Weak:    LOSING_UPSIDE_MOMENTUM, LOSING_DOWNSIDE_MOMENTUM, STALLING
     """
-    # Continuation setups that can run far deserve naked when GEX amplifies
     is_continuation = setup_type in (_SETUP_BREAKOUT_FOLLOW, _SETUP_BREAKDOWN_FOLLOW)
     is_failed_move  = setup_type in (_SETUP_FAILED_BREAKDOWN, _SETUP_FAILED_BREAKOUT)
     is_retest       = setup_type in (_SETUP_RETEST_LONG, _SETUP_RETEST_SHORT)
-    is_overnight    = phase in ("POWER_HOUR", "CLOSE")   # 1DTE — time value works for you
+    is_overnight    = phase in ("POWER_HOUR", "CLOSE")
     is_crisis_vol   = vol_regime in ("CRISIS", "ELEVATED")
     has_room        = d1 is not None and d1 > 2.0
-    momentum_strong = momentum in ("BULLISH_ACCELERATING", "BEARISH_ACCELERATING", "EXPANDING")
-    momentum_weak   = momentum in ("STALLING", "NEUTRAL", "LOSING_UPSIDE", "LOSING_DOWNSIDE")
+    # Strong = confirmed acceleration in either direction
+    momentum_strong = momentum in ("ACCELERATING_UP", "ACCELERATING_DOWN")
+    # Weak = fading, stalling, or lost direction
+    momentum_weak   = momentum in ("LOSING_UPSIDE_MOMENTUM", "LOSING_DOWNSIDE_MOMENTUM", "STALLING")
+    # Drifting = mild directional bias, treated as neutral for instrument selection
 
     # ── Always spread ────────────────────────────────────────────────────────
     if gex == "positive":
-        # GEX+ = pinning / mean-reversion. Move is bounded. Spread captures
-        # the same target at lower cost with defined risk. Never naked here.
         return "call_spread" if direction == "LONG" else "put_spread"
 
     if momentum_weak and not is_overnight:
-        # Move is not confirming. Define your risk until it proves itself.
         return "call_spread" if direction == "LONG" else "put_spread"
 
     if not has_room and is_failed_move:
-        # Target is right on top of you — spread width covers the full move.
-        # Naked premium buys you nothing extra.
         return "call_spread" if direction == "LONG" else "put_spread"
 
     if is_crisis_vol and abs(bias_score) <= 2:
-        # Expensive premium + weak thesis = don't go naked.
         return "call_spread" if direction == "LONG" else "put_spread"
 
     # ── Naked for overnight (Power Hour / Close → 1DTE) ─────────────────────
     if is_overnight and gex == "negative" and abs(bias_score) >= 4:
-        # 1DTE: overnight theta erosion is slow, move can continue into next
-        # session. A spread caps you right when the trade could keep working.
         return "naked_call" if direction == "LONG" else "naked_put"
 
-    # ── Naked for GEX- continuation with room and momentum ──────────────────
+    # ── Naked for GEX- continuation with room and confirmed momentum ─────────
     if is_continuation and gex == "negative" and has_room and momentum_strong:
-        # Dealers amplify. The move can accelerate well past the spread's
-        # short strike. Don't cap your winner.
         return "naked_call" if direction == "LONG" else "naked_put"
 
-    # ── Naked for GEX- failed moves with expanding momentum ─────────────────
+    # ── Naked for GEX- failed moves with confirmed acceleration and room ─────
     if is_failed_move and gex == "negative" and momentum_strong and has_room:
-        # Squeeze or fade with GEX- + expanding = trapped side unwinds fast.
         return "naked_call" if direction == "LONG" else "naked_put"
 
-    # ── Naked for GEQ- retests with confirmed momentum ───────────────────────
+    # ── Naked for GEX- retests with confirmed acceleration ───────────────────
     if is_retest and gex == "negative" and momentum_strong:
         return "naked_call" if direction == "LONG" else "naked_put"
 
@@ -399,8 +391,8 @@ def _contract_suggestion(
             reasons.append("1DTE — overnight theta is slow")
         if d1 is not None and d1 > 2.0:
             reasons.append(f"{d1:.1f}pt room — spread would cap you early")
-        if momentum in ("BULLISH_ACCELERATING", "BEARISH_ACCELERATING", "EXPANDING"):
-            reasons.append("momentum expanding")
+        if momentum in ("ACCELERATING_UP", "ACCELERATING_DOWN"):
+            reasons.append("momentum accelerating")
         why = " | ".join(reasons) if reasons else "GEX- continuation"
 
         return (
@@ -438,16 +430,20 @@ def _contract_suggestion(
     width = min(width, max_widths.get(setup_type, 2))
 
     # ── Step 7: quality modifier ─────────────────────────────────────────────
+    # Uses exact vocabulary from _evaluate_momentum:
+    #   Strong:   ACCELERATING_UP, ACCELERATING_DOWN
+    #   Drifting: DRIFTING_UP, DRIFTING_DOWN  (no modifier — let width stand)
+    #   Weak:     LOSING_UPSIDE_MOMENTUM, LOSING_DOWNSIDE_MOMENTUM, STALLING
     narrow = (
         (gex == "positive" and
          setup_type in (_SETUP_BREAKOUT_FOLLOW, _SETUP_BREAKDOWN_FOLLOW)) or
         abs(bias_score) <= 2 or
-        momentum in ("STALLING", "NEUTRAL", "LOSING_UPSIDE", "LOSING_DOWNSIDE") or
+        momentum in ("LOSING_UPSIDE_MOMENTUM", "LOSING_DOWNSIDE_MOMENTUM", "STALLING") or
         (d1 is not None and d1 < 0.75)
     )
     widen = (
         setup_type in (_SETUP_BREAKOUT_FOLLOW, _SETUP_BREAKDOWN_FOLLOW) and
-        momentum in ("BULLISH_ACCELERATING", "BEARISH_ACCELERATING", "EXPANDING") and
+        momentum in ("ACCELERATING_UP", "ACCELERATING_DOWN") and
         (d1 is not None and d1 > 2.0) and
         abs(bias_score) >= 4 and
         gex == "negative"
