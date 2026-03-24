@@ -1526,8 +1526,31 @@ def get_daily_candles(ticker: str, days: int = 30) -> list:
     return _cached_md.get_daily_candles(ticker, days)
 
 def get_intraday_bars(ticker: str, resolution: int = 5, countback: int = 80) -> dict:
-    """Fetch intraday OHLCV bars. Returns raw API dict for BarStateManager."""
-    return _cached_md.get_intraday_bars(ticker, resolution, countback)
+    """Fetch intraday OHLCV bars. Returns raw API dict for BarStateManager.
+
+    Retries with larger countback values on 404 — MarketData returns 404 when
+    the requested number of bars don't exist yet (e.g. early session or slow
+    periods with sparse 1-minute activity). Stepping up gives the API more
+    time window to find bars.
+    """
+    countbacks_to_try = sorted(set([countback, max(countback, 10), 20, 40]))
+    last_err = None
+    for cb in countbacks_to_try:
+        try:
+            result = _cached_md.get_intraday_bars(ticker, resolution, cb)
+            if result:
+                return result
+        except Exception as e:
+            err_str = str(e)
+            if "404" in err_str or "Not Found" in err_str:
+                log.debug(f"Intraday bars 404 for {ticker} countback={cb}, trying larger")
+                last_err = e
+                continue
+            # Non-404 error — don't retry
+            raise
+    if last_err:
+        raise last_err
+    return {}
 
 def get_vix() -> float:
     # v4.3 fix: Try MarketData API first (paid, reliable), then Yahoo, then IV proxy.
