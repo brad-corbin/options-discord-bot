@@ -132,6 +132,11 @@ class ActiveTrade:
     close_epoch: float = 0.0     # time.time() — survives restart
     exit_alert_history: dict = field(default_factory=dict)  # cooldown tracking
     last_exit_bar_ts: float = 0.0  # timestamp of last bar used for policy eval
+    # ── Option premium tracking (delta approximation) ────────────────────────
+    # Set at entry if chain data is available from the pre-market em fetch.
+    # Used for 20% premium stop without live quote fetching.
+    entry_premium: float = 0.0   # estimated option mid price at entry (dollars)
+    entry_delta: float = 0.0     # option delta at entry (0–1 for calls, 0–1 for puts)
 
 @dataclass
 class MonitorState:
@@ -1008,6 +1013,18 @@ class ThesisMonitorEngine:
         if not validation.valid:
             log.info(f"EntryValidator REJECTED {ticker} {direction} {entry_type}: "
                      f"score={validation.setup_score} [{validation.gate_summary}]")
+            stop_dist_pct = abs(price - stop) / price * 100 if price > 0 else 0
+            _log_filtered_trade(
+                ticker=ticker, filter_reason="VALIDATOR_REJECTED",
+                direction=direction, entry_type=entry_type,
+                setup_score=validation.setup_score, gate_summary=validation.gate_summary,
+                level_name=level_name, level_tier=level_tier,
+                time_phase=tp["phase"], regime=thesis.regime,
+                gex_sign=thesis.gex_sign, volatility_regime=thesis.volatility_regime,
+                prior_day_context=thesis.prior_day_context, bias=thesis.bias,
+                price=price, stop_level=stop, stop_dist_pct=stop_dist_pct,
+                badge="",  # no badge — never reached badging
+            )
             return
 
         # ── v2.0: Select ExitPolicy ──
@@ -1112,6 +1129,43 @@ class ThesisMonitorEngine:
                                       close_reason=f"Hard stop ${stop_ref:.2f} breached",
                                       badge=_trade_quality_badge(trade))
                 continue
+
+            # ── LAYER 1b: Delta-based 20% premium stop ───────────────────────
+            # No live quote needed. Uses entry_delta (from em chain at session
+            # start) and min_favorable (worst spot excursion, tracked every poll)
+            # to estimate current option loss percentage.
+            # Formula: est_loss = adverse_spot_move × entry_delta / entry_premium
+            # Fires when estimated premium loss ≥ 20%.
+            # Approximation degrades for large moves (delta shifts) but is
+            # accurate enough for the tight intraday stops we run.
+            if (trade.entry_premium > 0 and trade.entry_delta > 0
+                    and trade.status in ("OPEN",)  # only before scaling
+                    and trade.max_favorable <= 0):  # no MFE yet — still a pure loser
+                adverse_move = abs(trade.min_favorable)
+                if adverse_move > 0:
+                    est_loss_pct = (adverse_move * trade.entry_delta) / trade.entry_premium
+                    if est_loss_pct >= 0.20:
+                        if self._exit_alert_ok(trade, "prem_stop", now):
+                            pnl_pct = ((price - trade.entry_price) / trade.entry_price * 100) if trade.direction == "LONG" else ((trade.entry_price - price) / trade.entry_price * 100)
+                            est_loss_dollars = round(adverse_move * trade.entry_delta, 2)
+                            trade.status = "INVALIDATED"; trade.close_price = price
+                            trade.close_time = now; trade.close_epoch = time.time()
+                            trade.close_reason = (f"Premium stop: est. {est_loss_pct:.0%} loss "
+                                                   f"(${adverse_move:.2f} adverse × δ{trade.entry_delta:.2f})")
+                            self._persist_trades(ticker, state)
+                            events.append({"msg": (
+                                f"🛑 PREMIUM STOP — {trade.direction}\n\n"
+                                f"Estimated option loss ~{est_loss_pct:.0%} of entry premium.\n"
+                                f"Adverse move: ${adverse_move:.2f} × delta {trade.entry_delta:.2f} "
+                                f"≈ ${est_loss_dollars:.2f} estimated loss.\n"
+                                f"Entry: ${trade.entry_price:.2f} → Now: ${price:.2f} ({pnl_pct:+.2f}%)\n"
+                                f"Cut it. Don't let a small loss compound."
+                            ), "type": "exit", "priority": 5, "alert_key": f"exit_prem_{trade.trade_id}"})
+                            log.info(f"Trade {trade.trade_id} PREMIUM STOP: est {est_loss_pct:.0%} loss at ${price:.2f}")
+                            _log_trade_event(trade, event="CLOSE", close_price=price,
+                                              close_reason=trade.close_reason,
+                                              badge=_trade_quality_badge(trade))
+                            continue
 
             # ── LAYER 2: Policy evaluation (bar-close clock only) ──
             if not latest_bar:
@@ -1604,6 +1658,21 @@ class ThesisMonitorEngine:
                         "priority": 4,
                         "alert_key": f"hairline_{ba.level:.2f}",
                     })
+                    _log_filtered_trade(
+                        ticker=ticker, filter_reason="HAIRLINE_GATE",
+                        direction="SHORT" if ba.direction == "DOWN" else "LONG",
+                        entry_type="BREAK",
+                        setup_score=0, gate_summary=f"stop_dist={stop_dist_pct:.4f}%",
+                        level_name=ba.level_name, level_tier="C",
+                        time_phase=tp_now["phase"], regime=thesis.regime,
+                        gex_sign=thesis.gex_sign,
+                        volatility_regime=thesis.volatility_regime,
+                        prior_day_context=thesis.prior_day_context,
+                        bias=thesis.bias,
+                        price=price, stop_level=ba.level,
+                        stop_dist_pct=stop_dist_pct,
+                        badge="",
+                    )
                 if ba.hairline_holds <= MONITOR_HAIRLINE_EXTRA_HOLDS:
                     ba.detected_as_confirmed = False
                     continue
@@ -1679,6 +1748,22 @@ class ThesisMonitorEngine:
                             "priority": 4,
                             "alert_key": f"hairline_{ba.level:.2f}",
                         })
+                        # Log to filtered CSV on first detection so we capture
+                        # the full setup context before we know the outcome.
+                        _log_filtered_trade(
+                            ticker=ticker, filter_reason="HAIRLINE_GATE",
+                            direction=direction, entry_type=entry_type,
+                            setup_score=0, gate_summary=f"stop_dist={stop_dist_pct:.4f}%",
+                            level_name=ba.level_name, level_tier="C",
+                            time_phase=tp["phase"], regime=thesis.regime,
+                            gex_sign=thesis.gex_sign,
+                            volatility_regime=thesis.volatility_regime,
+                            prior_day_context=thesis.prior_day_context,
+                            bias=thesis.bias,
+                            price=price, stop_level=ba.level,
+                            stop_dist_pct=stop_dist_pct,
+                            badge="",
+                        )
                     if ba.hairline_holds <= MONITOR_HAIRLINE_EXTRA_HOLDS:
                         # Still accumulating confirmation — don't fire entry yet.
                         # Reset detected_as_failed so we re-evaluate next poll.
@@ -1876,6 +1961,7 @@ _TRADE_LOG_FIELDS = [
     "close_reason", "exit_policy", "badge",
     "entry_bar_time", "close_bar_time",
     "mfe_pts", "mae_pts",
+    "entry_premium", "entry_delta",  # option tracking for premium stop analysis
 ]
 
 def _log_trade_event(trade, event: str, close_price: float = None,
@@ -1918,6 +2004,8 @@ def _log_trade_event(trade, event: str, close_price: float = None,
             "close_bar_time":   datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M") if close_price else "",
             "mfe_pts":          getattr(trade, "max_favorable",     ""),
             "mae_pts":          getattr(trade, "min_favorable",     ""),
+            "entry_premium":    getattr(trade, "entry_premium",     ""),
+            "entry_delta":      getattr(trade, "entry_delta",       ""),
         }
 
         with open(path, "a", newline="", encoding="utf-8") as f:
@@ -1928,6 +2016,88 @@ def _log_trade_event(trade, event: str, close_price: float = None,
 
     except Exception as e:
         log.warning(f"Trade log write failed: {e}")
+
+
+# ── Filtered trade log ────────────────────────────────────────────────────────
+# Every setup that gets blocked — EntryValidator rejection, hairline gate,
+# or any future filter — is written here so we can analyse missed opportunities
+# as live data accumulates. Separate file per ticker: filtered_{TICKER}.csv
+# Columns intentionally match _TRADE_LOG_FIELDS where possible so the two
+# files can be joined/compared directly.
+
+_FILTERED_LOG_FIELDS = [
+    "ts_utc", "ticker", "filter_reason",
+    "direction", "entry_type", "setup_score", "gate_summary",
+    "level_name", "level_tier", "time_phase",
+    "regime", "gex_sign", "volatility_regime", "prior_day_context", "bias",
+    "price_at_filter", "stop_level", "stop_dist_pct",
+    "badge_would_have_been",
+]
+
+def _filtered_log_path(ticker: str) -> str:
+    _ensure_log_dir()
+    return _os.path.join(_TRADE_LOG_DIR, f"filtered_{ticker.upper()}.csv")
+
+def _log_filtered_trade(
+    ticker: str,
+    filter_reason: str,          # VALIDATOR_REJECTED | HAIRLINE_GATE
+    direction: str,
+    entry_type: str,
+    setup_score,
+    gate_summary: str,
+    level_name: str,
+    level_tier: str,
+    time_phase: str,
+    regime: str,
+    gex_sign: str,
+    volatility_regime: str,
+    prior_day_context: str,
+    bias: str,
+    price: float,
+    stop_level: float,
+    stop_dist_pct: float,
+    badge: str = "",
+):
+    """Append one row to the per-ticker filtered trade CSV.
+
+    Call at every point where a valid setup signal is blocked before entry.
+    Does NOT cover trades that enter and then lose — those are in the main CSV.
+    """
+    try:
+        path = _filtered_log_path(ticker)
+        write_header = not _os.path.exists(path)
+
+        from datetime import datetime, timezone
+        row = {
+            "ts_utc":               datetime.now(timezone.utc).isoformat(),
+            "ticker":               ticker,
+            "filter_reason":        filter_reason,
+            "direction":            direction,
+            "entry_type":           entry_type,
+            "setup_score":          setup_score,
+            "gate_summary":         gate_summary,
+            "level_name":           level_name,
+            "level_tier":           level_tier,
+            "time_phase":           time_phase,
+            "regime":               regime,
+            "gex_sign":             gex_sign,
+            "volatility_regime":    volatility_regime,
+            "prior_day_context":    prior_day_context,
+            "bias":                 bias,
+            "price_at_filter":      round(price, 2),
+            "stop_level":           round(stop_level, 2),
+            "stop_dist_pct":        round(stop_dist_pct, 4),
+            "badge_would_have_been": badge,
+        }
+
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            writer = _csv_mod.DictWriter(f, fieldnames=_FILTERED_LOG_FIELDS)
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row)
+
+    except Exception as e:
+        log.warning(f"Filtered trade log write failed: {e}")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
