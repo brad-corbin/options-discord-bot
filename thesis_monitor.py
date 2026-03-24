@@ -37,6 +37,7 @@ MONITOR_DEFAULT_TICKERS = ["SPY", "QQQ"]
 # This prevents auto-entering stops that are at noise level (e.g. $0.10 on SPY).
 MONITOR_HAIRLINE_STOP_PCT    = 0.03   # 0.03% = ~$0.20 on SPY $660, ~$0.18 on QQQ $590
 MONITOR_HAIRLINE_EXTRA_HOLDS = 2      # extra candles of structure hold required
+MONITOR_ENTRY_COOLDOWN_SEC   = 300    # minimum 5 minutes between new trade entries per ticker
 INTRADAY_MIN_TOUCHES = 3
 INTRADAY_ZONE_TOLERANCE_PCT = 0.04
 INTRADAY_MIN_PRICES_FOR_LEVELS = 6
@@ -160,6 +161,7 @@ class MonitorState:
     session_high: Optional[float] = None; session_low: Optional[float] = None
     session_high_time: str = ""; session_low_time: str = ""
     active_trades: list = field(default_factory=list)  # List[ActiveTrade]
+    last_entry_time: float = 0.0   # monotonic — time of most recent trade entry
 
 def _get_time_phase_ct() -> dict:
     try:
@@ -907,6 +909,16 @@ class ThesisMonitorEngine:
                                    registry=None, bar=None, bm=None):
         """Create an ActiveTrade from a clean entry signal. v2.0: validates through EntryValidator."""
         ak = event.get("alert_key", "")
+
+        # ── Entry cooldown — prevent rapid re-entry ───────────────────────────
+        # Gamma flip oscillation and clustered level breaks can fire multiple
+        # signals within minutes. Enforce a minimum gap between entries.
+        time_since_last = now - state.last_entry_time if state.last_entry_time > 0 else float("inf")
+        if time_since_last < MONITOR_ENTRY_COOLDOWN_SEC:
+            log.info(f"Entry cooldown: {ticker} — {time_since_last:.0f}s since last entry "
+                     f"(need {MONITOR_ENTRY_COOLDOWN_SEC}s), skipping {ak}")
+            return
+
         msg = event.get("msg", "")
         # Parse direction and entry_type from alert_key
         if "conf_short" in ak or "fbo_now" in ak or "rt_short" in ak or "rt_fs" in ak:
@@ -1047,6 +1059,29 @@ class ThesisMonitorEngine:
         else:
             targets = self._find_targets(ticker, thesis, state, price, direction)
 
+        # ── Target sanity for mean-reversion setups ───────────────────────────
+        # Failed moves and retests should target the first realistic intraday
+        # level, not the EM 1σ boundary (which is an all-day boundary, not a
+        # meaningful T1 for a 10-20 min fade). If the first target is beyond
+        # the EM 1σ it will never get reached before the giveback exit fires,
+        # making scale logic meaningless. Cap T1 at EM ±1σ and drop T2+ that
+        # are implausibly far for an intraday mean-reversion timeframe.
+        if entry_type in ("FAILED", "RETEST") and targets:
+            em_high = thesis.levels.em_high
+            em_low  = thesis.levels.em_low
+            if direction == "SHORT" and em_low and em_low > 0:
+                targets = [t for t in targets if t >= em_low]
+            elif direction == "LONG" and em_high and em_high > 0:
+                targets = [t for t in targets if t <= em_high]
+            # If registry gave us only EM-boundary levels (no structural levels
+            # closer in), fall back to nearest intraday levels from state
+            if not targets or (targets and abs(targets[0] - price) > 3.0):
+                intraday_targets = self._find_targets(ticker, thesis, state, price, direction)
+                # Keep only intraday levels within 3 pts — realistic for a fade
+                intraday_near = [t for t in intraday_targets if abs(t - price) <= 3.0]
+                if intraday_near:
+                    targets = intraday_near[:2]
+
         trade = ActiveTrade(
             ticker=ticker, direction=direction, entry_type=entry_type,
             entry_price=price, stop_level=stop, targets=targets,
@@ -1082,6 +1117,7 @@ class ThesisMonitorEngine:
                      f"(delta={trade.entry_delta}, premium={trade.entry_premium})")
 
         state.active_trades.append(trade)
+        state.last_entry_time = now   # stamp cooldown timer
         self._persist_trades(ticker, state)
         badge = _trade_quality_badge(trade)
         _log_trade_event(trade, event="OPEN", badge=badge)
@@ -1680,7 +1716,8 @@ class ThesisMonitorEngine:
                         "alert_key": f"hairline_{ba.level:.2f}",
                     })
                     _log_filtered_trade(
-                        ticker=ticker, filter_reason="HAIRLINE_GATE",
+                        ticker=getattr(thesis, "ticker", "UNKNOWN"),
+                        filter_reason="HAIRLINE_GATE",
                         direction="SHORT" if ba.direction == "DOWN" else "LONG",
                         entry_type="BREAK",
                         setup_score=0, gate_summary=f"stop_dist={stop_dist_pct:.4f}%",
@@ -1772,7 +1809,8 @@ class ThesisMonitorEngine:
                         # Log to filtered CSV on first detection so we capture
                         # the full setup context before we know the outcome.
                         _log_filtered_trade(
-                            ticker=ticker, filter_reason="HAIRLINE_GATE",
+                            ticker=getattr(thesis, "ticker", "UNKNOWN"),
+                            filter_reason="HAIRLINE_GATE",
                             direction=direction, entry_type=entry_type,
                             setup_score=0, gate_summary=f"stop_dist={stop_dist_pct:.4f}%",
                             level_name=ba.level_name, level_tier="C",
@@ -2607,10 +2645,10 @@ class ThesisMonitorDaemon:
         elif active_trade is not None:
             badge = self._trade_quality_badge(active_trade)
         else:
-            # No active trade to evaluate — no quality badge.
-            # Show a neutral signal indicator instead of ⚠️ (which would
-            # falsely imply the setup is weak rather than unevaluated).
-            badge = "📡" if not is_entry else ""
+            # No active trade to evaluate — no quality badge on any alert type.
+            # Using "📡" for non-entry was causing "📡 📡" duplication since
+            # the THESIS ALERT header already contains 📡.
+            badge = ""
 
         # ── Star rating line ──
         # P5 entry → 5 filled stars  |  P4 contextual → 4 filled + 1 empty
