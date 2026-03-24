@@ -28,6 +28,15 @@ MONITOR_EXTENSION_LIMIT_PCT = 0.25
 MONITOR_MIN_HOLD_POLLS_AFTER_RECLAIM = 1
 MONITOR_RETEST_TOLERANCE_PCT = 0.04
 MONITOR_DEFAULT_TICKERS = ["SPY", "QQQ"]
+
+# ── Hairline stop gate ───────────────────────────────────────────────────────
+# When the distance between entry price and stop level is below this threshold
+# (expressed as % of price), the setup is considered a hairline stop.
+# Hairline setups DO still alert — but they require MONITOR_HAIRLINE_EXTRA_HOLDS
+# additional confirmation polls of holding structure before the trade card fires.
+# This prevents auto-entering stops that are at noise level (e.g. $0.10 on SPY).
+MONITOR_HAIRLINE_STOP_PCT    = 0.03   # 0.03% = ~$0.20 on SPY $660, ~$0.18 on QQQ $590
+MONITOR_HAIRLINE_EXTRA_HOLDS = 2      # extra candles of structure hold required
 INTRADAY_MIN_TOUCHES = 3
 INTRADAY_ZONE_TOLERANCE_PCT = 0.04
 INTRADAY_MIN_PRICES_FOR_LEVELS = 6
@@ -76,6 +85,7 @@ class BreakAttempt:
     reclaim_seen: bool = False; reclaim_price: Optional[float] = None
     reclaim_time: float = 0.0; reclaim_holds: int = 0
     retest_armed: bool = False; retest_fired: bool = False
+    hairline_holds: int = 0   # extra confirmation polls accumulated on hairline setups
 
 @dataclass
 class IntradayLevel:
@@ -175,19 +185,294 @@ def _dte_guidance(phase: str) -> str:
     return "📅 DTE: Use TODAY's expiry (0DTE)."
 
 
-def _strike_guidance(direction: str, price: float) -> str:
-    """Return ATM+2 strike suggestion in trade direction."""
-    base = int(price)
-    if direction == "LONG":
-        strike = base + 2
-        return f"🎯 STRIKE: ~{strike} call (ATM+2 in direction)"
+# ── Tickers that use the spread ladder ──────────────────────────────────────
+# All others fall back to simple ATM+2 naked suggestion.
+_SPREAD_TICKERS = {"SPY", "QQQ"}
+
+# Setup type constants — passed into _contract_suggestion
+_SETUP_FAILED_BREAKDOWN    = "failed_breakdown"      # reclaim after false break down → LONG
+_SETUP_FAILED_BREAKOUT     = "failed_breakout"       # lost + held after false break up → SHORT
+_SETUP_BREAKOUT_FOLLOW     = "breakout_followthrough" # true breakout with continuation → LONG
+_SETUP_BREAKDOWN_FOLLOW    = "breakdown_followthrough" # true breakdown with continuation → SHORT
+_SETUP_RETEST_LONG         = "retest_long"            # retest of confirmed/failed level → LONG
+_SETUP_RETEST_SHORT        = "retest_short"           # retest of confirmed/failed level → SHORT
+
+
+def _pick_instrument(
+    setup_type: str,
+    direction: str,
+    gex: str,
+    vol_regime: str,
+    bias_score: int,
+    momentum: str,
+    phase: str,
+    d1: Optional[float],
+) -> str:
+    """Decide between naked option and debit spread.
+
+    Returns one of: "naked_call", "naked_put", "call_spread", "put_spread"
+
+    Decision tree — naked wins when the move can run well past a spread's
+    short strike and the regime supports it. Spread wins when the move is
+    bounded, conviction is low, or premium is too expensive for the thesis.
+    """
+    # Continuation setups that can run far deserve naked when GEX amplifies
+    is_continuation = setup_type in (_SETUP_BREAKOUT_FOLLOW, _SETUP_BREAKDOWN_FOLLOW)
+    is_failed_move  = setup_type in (_SETUP_FAILED_BREAKDOWN, _SETUP_FAILED_BREAKOUT)
+    is_retest       = setup_type in (_SETUP_RETEST_LONG, _SETUP_RETEST_SHORT)
+    is_overnight    = phase in ("POWER_HOUR", "CLOSE")   # 1DTE — time value works for you
+    is_crisis_vol   = vol_regime in ("CRISIS", "ELEVATED")
+    has_room        = d1 is not None and d1 > 2.0
+    momentum_strong = momentum in ("BULLISH_ACCELERATING", "BEARISH_ACCELERATING", "EXPANDING")
+    momentum_weak   = momentum in ("STALLING", "NEUTRAL", "LOSING_UPSIDE", "LOSING_DOWNSIDE")
+
+    # ── Always spread ────────────────────────────────────────────────────────
+    if gex == "positive":
+        # GEX+ = pinning / mean-reversion. Move is bounded. Spread captures
+        # the same target at lower cost with defined risk. Never naked here.
+        return "call_spread" if direction == "LONG" else "put_spread"
+
+    if momentum_weak and not is_overnight:
+        # Move is not confirming. Define your risk until it proves itself.
+        return "call_spread" if direction == "LONG" else "put_spread"
+
+    if not has_room and is_failed_move:
+        # Target is right on top of you — spread width covers the full move.
+        # Naked premium buys you nothing extra.
+        return "call_spread" if direction == "LONG" else "put_spread"
+
+    if is_crisis_vol and abs(bias_score) <= 2:
+        # Expensive premium + weak thesis = don't go naked.
+        return "call_spread" if direction == "LONG" else "put_spread"
+
+    # ── Naked for overnight (Power Hour / Close → 1DTE) ─────────────────────
+    if is_overnight and gex == "negative" and abs(bias_score) >= 4:
+        # 1DTE: overnight theta erosion is slow, move can continue into next
+        # session. A spread caps you right when the trade could keep working.
+        return "naked_call" if direction == "LONG" else "naked_put"
+
+    # ── Naked for GEX- continuation with room and momentum ──────────────────
+    if is_continuation and gex == "negative" and has_room and momentum_strong:
+        # Dealers amplify. The move can accelerate well past the spread's
+        # short strike. Don't cap your winner.
+        return "naked_call" if direction == "LONG" else "naked_put"
+
+    # ── Naked for GEX- failed moves with expanding momentum ─────────────────
+    if is_failed_move and gex == "negative" and momentum_strong and has_room:
+        # Squeeze or fade with GEX- + expanding = trapped side unwinds fast.
+        return "naked_call" if direction == "LONG" else "naked_put"
+
+    # ── Naked for GEQ- retests with confirmed momentum ───────────────────────
+    if is_retest and gex == "negative" and momentum_strong:
+        return "naked_call" if direction == "LONG" else "naked_put"
+
+    # ── Default: spread ──────────────────────────────────────────────────────
+    return "call_spread" if direction == "LONG" else "put_spread"
+
+
+def _contract_suggestion(
+    setup_type: str,
+    direction: str,
+    price: float,
+    thesis=None,
+    state=None,
+    phase: str = "",
+) -> str:
+    """Return a formatted TRADE CARD contract block.
+
+    Step 0  Decide instrument: naked vs debit spread (via _pick_instrument)
+    Step 1  Classify setup type
+    Step 2  Compute usable EM fraction — scaled by 1.5× for 1DTE phase
+    Step 3  Nearest opposing level distance (d1)
+    Step 4  Target move = min(d1, d3)
+    Step 5  Raw width = 80% of target move  [spread path only]
+    Step 6  Snap to 1-pt increments + hard caps  [spread path only]
+    Step 7  Quality modifier  [spread path only]
+    Step 8  Strike placement
+    Step 9  Format with inline reasoning
+
+    Tickers not in _SPREAD_TICKERS get a simple naked ATM suggestion.
+    Always returns a string safe to embed in the TRADE CARD block.
+    """
+    ticker     = getattr(thesis, "ticker",           "").upper() if thesis else ""
+    gex        = getattr(thesis, "gex_sign",         "positive") if thesis else "positive"
+    vol_regime = getattr(thesis, "volatility_regime", "NORMAL")  if thesis else "NORMAL"
+    bias_score = getattr(thesis, "bias_score",        0)         if thesis else 0
+    momentum   = getattr(state,  "momentum",          "NEUTRAL") if state  else "NEUTRAL"
+
+    # ── Non-spread tickers: always naked ATM ────────────────────────────────
+    if ticker not in _SPREAD_TICKERS:
+        atm = int(price)
+        if direction == "LONG":
+            return (f"💰 INSTRUMENT: Naked call\n"
+                    f"🎯 STRIKE: {atm} call (ATM)\n"
+                    f"📐 SIZE: min(floor($1,500 ÷ premium × 100), 20 contracts).")
+        else:
+            return (f"💰 INSTRUMENT: Naked put\n"
+                    f"🎯 STRIKE: {atm + 1} put (ATM)\n"
+                    f"📐 SIZE: min(floor($1,500 ÷ premium × 100), 20 contracts).")
+
+    # ── Step 2: usable EM fraction by setup type ─────────────────────────────
+    usable_fracs = {
+        _SETUP_FAILED_BREAKDOWN:  0.30,
+        _SETUP_FAILED_BREAKOUT:   0.30,
+        _SETUP_RETEST_LONG:       0.35,
+        _SETUP_RETEST_SHORT:      0.35,
+        _SETUP_BREAKOUT_FOLLOW:   0.50,
+        _SETUP_BREAKDOWN_FOLLOW:  0.50,
+    }
+    usable_frac = usable_fracs.get(setup_type, 0.30)
+
+    # 1DTE EM scale: overnight expected move is ~1.5× the same-day EM.
+    # Scaling prevents the system from recommending too-tight spreads on
+    # Power Hour entries where the move can continue into next session.
+    is_overnight = phase in ("POWER_HOUR", "CLOSE")
+    if is_overnight:
+        usable_frac *= 1.5
+
+    # ── Step 2b: EM 1σ budget (d3) ──────────────────────────────────────────
+    d3 = None
+    if thesis and thesis.levels.em_high and thesis.levels.em_low:
+        em_1sd = (thesis.levels.em_high - thesis.levels.em_low) / 2.0
+        if em_1sd > 0:
+            d3 = em_1sd * usable_frac
+
+    # ── Step 3: nearest opposing level distance (d1) ─────────────────────────
+    d1 = None
+    if state:
+        lvls = IntradayLevelTracker.get_active_levels(state, price)
+        if direction == "LONG" and lvls.get("resistance"):
+            d1 = lvls["resistance"].price - price
+        elif direction == "SHORT" and lvls.get("support"):
+            d1 = price - lvls["support"].price
+    if d1 is None and thesis:
+        if direction == "LONG" and thesis.levels.local_resistance:
+            d1 = max(thesis.levels.local_resistance - price, 0) or None
+        elif direction == "SHORT" and thesis.levels.local_support:
+            d1 = max(price - thesis.levels.local_support, 0) or None
+
+    # ── Step 0: instrument decision ──────────────────────────────────────────
+    instrument = _pick_instrument(
+        setup_type=setup_type, direction=direction,
+        gex=gex, vol_regime=vol_regime, bias_score=bias_score,
+        momentum=momentum, phase=phase, d1=d1,
+    )
+    is_naked = instrument in ("naked_call", "naked_put")
+
+    # ── Step 4: target move ──────────────────────────────────────────────────
+    candidates = [x for x in [d1, d3] if x is not None and x > 0]
+    target_move = min(candidates) if candidates else 1.0
+
+    atm = int(price)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # NAKED PATH
+    # ══════════════════════════════════════════════════════════════════════════
+    if is_naked:
+        # Strike: ATM for calls, ATM+1 for puts (slight ITM for better delta)
+        if direction == "LONG":
+            strike       = atm
+            option_label = f"{strike} call (ATM)"
+            instr_label  = "Naked call"
+        else:
+            strike       = atm + 1
+            option_label = f"{strike} put (ATM)"
+            instr_label  = "Naked put"
+
+        # Reasoning for the trader
+        reasons = []
+        if gex == "negative":
+            reasons.append("GEX- amplifies move")
+        if is_overnight:
+            reasons.append("1DTE — overnight theta is slow")
+        if d1 is not None and d1 > 2.0:
+            reasons.append(f"{d1:.1f}pt room — spread would cap you early")
+        if momentum in ("BULLISH_ACCELERATING", "BEARISH_ACCELERATING", "EXPANDING"):
+            reasons.append("momentum expanding")
+        why = " | ".join(reasons) if reasons else "GEX- continuation"
+
+        return (
+            f"💰 INSTRUMENT: {instr_label}  [{why}]\n"
+            f"🎯 STRIKE: {option_label}\n"
+            f"📐 SIZE: min(floor($1,500 ÷ premium × 100), 20 contracts).\n"
+            f"   Exit at 50% of premium paid (stop) or 100% gain (target)."
+        )
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SPREAD PATH
+    # ══════════════════════════════════════════════════════════════════════════
+
+    # ── Step 5: raw width ────────────────────────────────────────────────────
+    raw_width = 0.80 * target_move
+
+    # ── Step 6: snap + hard caps ─────────────────────────────────────────────
+    if raw_width < 1.125:
+        width = 1
+    elif raw_width < 2.125:
+        width = 2
+    elif raw_width < 3.125:
+        width = 3
     else:
-        strike = base - 2
-        return f"🎯 STRIKE: ~{strike} put (ATM+2 in direction)"
+        width = 4
 
+    max_widths = {
+        _SETUP_FAILED_BREAKDOWN:  2,
+        _SETUP_FAILED_BREAKOUT:   2,
+        _SETUP_RETEST_LONG:       3,
+        _SETUP_RETEST_SHORT:      3,
+        _SETUP_BREAKOUT_FOLLOW:   4,
+        _SETUP_BREAKDOWN_FOLLOW:  4,
+    }
+    width = min(width, max_widths.get(setup_type, 2))
 
-def _size_guidance() -> str:
-    return "📐 SIZE: min(floor($2,000 ÷ premium × 100), 40 contracts). Half size on ⚠️."
+    # ── Step 7: quality modifier ─────────────────────────────────────────────
+    narrow = (
+        (gex == "positive" and
+         setup_type in (_SETUP_BREAKOUT_FOLLOW, _SETUP_BREAKDOWN_FOLLOW)) or
+        abs(bias_score) <= 2 or
+        momentum in ("STALLING", "NEUTRAL", "LOSING_UPSIDE", "LOSING_DOWNSIDE") or
+        (d1 is not None and d1 < 0.75)
+    )
+    widen = (
+        setup_type in (_SETUP_BREAKOUT_FOLLOW, _SETUP_BREAKDOWN_FOLLOW) and
+        momentum in ("BULLISH_ACCELERATING", "BEARISH_ACCELERATING", "EXPANDING") and
+        (d1 is not None and d1 > 2.0) and
+        abs(bias_score) >= 4 and
+        gex == "negative"
+    )
+    if narrow:
+        width = max(1, width - 1)
+    elif widen:
+        width = min(max_widths.get(setup_type, 2), width + 1)
+
+    # ── Step 8: strike placement ─────────────────────────────────────────────
+    if direction == "LONG":
+        long_strike  = atm
+        short_strike = atm + width
+        spread_label = f"{long_strike}/{short_strike} call debit spread"
+        instr_label  = "Call debit spread"
+    else:
+        long_strike  = atm + 1
+        short_strike = long_strike - width
+        spread_label = f"{long_strike}/{short_strike} put debit spread"
+        instr_label  = "Put debit spread"
+
+    # Reasoning
+    basis_parts = []
+    if d1 is not None:
+        basis_parts.append(f"level {d1:.2f}pt away")
+    if d3 is not None:
+        basis_parts.append(f"EM budget {d3:.2f}pt")
+    if gex == "positive":
+        basis_parts.append("GEX+ bounds move")
+    basis = f"  [{' | '.join(basis_parts)} → {width}-pt]" if basis_parts else ""
+
+    return (
+        f"💰 INSTRUMENT: {instr_label}{basis}\n"
+        f"🎯 SPREAD: {spread_label} ({width}-pt)\n"
+        f"📐 SIZE: min(floor($2,000 ÷ premium × 100), 40 contracts).\n"
+        f"   Exit at 75-80% of max profit (${width * 100 - int(width * 25)} target on ${width * 100} max)."
+    )
 
 
 class IntradayLevelTracker:
@@ -1297,27 +1582,54 @@ class ThesisMonitorEngine:
             state.confirmed_breaks.append(ba); state.status = "BREAK_CONFIRMED"
             ext = abs(price - ba.level) / ba.level * 100; chase = ext > MONITOR_EXTENSION_LIMIT_PCT
             tp_now = _get_time_phase_ct()
+
+            # ── Hairline stop gate (confirmed breaks) ─────────────────────────
+            # On a confirmed break the stop is the broken level (reclaim above/below).
+            # If price has only just cleared the level, the stop may be hairline.
+            stop_dist_pct = abs(price - ba.level) / price * 100
+            is_hairline = stop_dist_pct < MONITOR_HAIRLINE_STOP_PCT
+            if is_hairline:
+                ba.hairline_holds += 1
+                if ba.hairline_holds == 1:
+                    events.append({
+                        "msg": (
+                            f"👁 HAIRLINE STOP — WATCHING STRUCTURE\n\n"
+                            f"${ba.level:.2f} broke but stop is only "
+                            f"${abs(price - ba.level):.2f} away ({stop_dist_pct:.3f}%).\n"
+                            f"Confirming {MONITOR_HAIRLINE_EXTRA_HOLDS} more candles of hold "
+                            f"before entry fires.\n\n"
+                            f"Watch: price must hold away from ${ba.level:.2f}."
+                        ),
+                        "type": "warning",
+                        "priority": 4,
+                        "alert_key": f"hairline_{ba.level:.2f}",
+                    })
+                if ba.hairline_holds <= MONITOR_HAIRLINE_EXTRA_HOLDS:
+                    ba.detected_as_confirmed = False
+                    continue
+            # ── End hairline gate ─────────────────────────────────────────────
+
             dte_line = _dte_guidance(tp_now["phase"])
             if ba.direction == "DOWN":
                 state.active_trend_direction = "SHORT"
                 if thesis.gex_sign == "negative":
                     tt = "💰 TRADE TYPE: Naked puts — GEX- trend can run."
-                    strike_line = _strike_guidance("SHORT", price)
+                    contract_line = _contract_suggestion(_SETUP_BREAKDOWN_FOLLOW, "SHORT", price, thesis, state, phase=tp_now["phase"])
                     if chase:
-                        events.append({"msg": f"🟥 BREAKDOWN CONFIRMED — EXTENDED\n\n${ba.level:.2f} ({ba.level_name}) broke. Price {ext:.2f}% past — DON'T CHASE.\nWait for retest of ${ba.level:.2f}.\nSTOP: above ${ba.level:.2f}\n{tt}", "type": "trade_confirmed", "priority": 5, "alert_key": f"conf_short_wait_{ba.level:.2f}"})
+                        events.append({"msg": f"🟥 BREAKDOWN CONFIRMED — EXTENDED\n\n${ba.level:.2f} ({ba.level_name}) broke. Price {ext:.2f}% past — DON'T CHASE.\nWait for retest of ${ba.level:.2f}.\nSTOP: above ${ba.level:.2f}", "type": "trade_confirmed", "priority": 5, "alert_key": f"conf_short_wait_{ba.level:.2f}"})
                     else:
-                        events.append({"msg": f"🟥🟥🟥 BREAKDOWN CONFIRMED — PUTS / SHORT 🟥🟥🟥\n\n${ba.level:.2f} ({ba.level_name}) broke with follow-through.\nGEX NEGATIVE — dealers amplify.\n\n{tt}\nENTRY: Now @ ~${price:.2f}\nSTOP: Reclaim above ${ba.level:.2f}\nTARGET: Next support — let trend work\n\n— TRADE CARD —\n{dte_line}\n{strike_line}\n{_size_guidance()}", "type": "trade_confirmed", "priority": 5, "alert_key": f"conf_short_{ba.level:.2f}"})
+                        events.append({"msg": f"🟥🟥🟥 BREAKDOWN CONFIRMED — PUTS / SHORT 🟥🟥🟥\n\n${ba.level:.2f} ({ba.level_name}) broke with follow-through.\nGEX NEGATIVE — dealers amplify.\n\nENTRY: Now @ ~${price:.2f}\nSTOP: Reclaim above ${ba.level:.2f}\nTARGET: Next support — let trend work\n\n— TRADE CARD —\n{dte_line}\n{contract_line}", "type": "trade_confirmed", "priority": 5, "alert_key": f"conf_short_{ba.level:.2f}"})
                 else:
                     events.append({"msg": f"⚠️ BREAKDOWN + FOLLOW-THROUGH at ${ba.level:.2f}\nGEX+ — mean reversion possible. Reclaim = squeeze long.", "type": "warning", "priority": 4, "alert_key": f"ft_dn_{ba.level:.2f}"})
             else:
                 state.active_trend_direction = "LONG"
                 if thesis.gex_sign == "negative":
                     tt = "💰 TRADE TYPE: Naked calls — GEX- trend can run."
-                    strike_line = _strike_guidance("LONG", price)
+                    contract_line = _contract_suggestion(_SETUP_BREAKOUT_FOLLOW, "LONG", price, thesis, state, phase=tp_now["phase"])
                     if chase:
-                        events.append({"msg": f"🟩 BREAKOUT CONFIRMED — EXTENDED\n\n${ba.level:.2f} ({ba.level_name}) broke. Price {ext:.2f}% past — DON'T CHASE.\nWait for retest of ${ba.level:.2f}.\nSTOP: below ${ba.level:.2f}\n{tt}", "type": "trade_confirmed", "priority": 5, "alert_key": f"conf_long_wait_{ba.level:.2f}"})
+                        events.append({"msg": f"🟩 BREAKOUT CONFIRMED — EXTENDED\n\n${ba.level:.2f} ({ba.level_name}) broke. Price {ext:.2f}% past — DON'T CHASE.\nWait for retest of ${ba.level:.2f}.\nSTOP: below ${ba.level:.2f}", "type": "trade_confirmed", "priority": 5, "alert_key": f"conf_long_wait_{ba.level:.2f}"})
                     else:
-                        events.append({"msg": f"🟩🟩🟩 BREAKOUT CONFIRMED — CALLS / LONG 🟩🟩🟩\n\n${ba.level:.2f} ({ba.level_name}) broke with follow-through.\nGEX NEGATIVE — dealers amplify.\n\n{tt}\nENTRY: Now @ ~${price:.2f}\nSTOP: Lose ${ba.level:.2f}\nTARGET: Next resistance — let trend work\n\n— TRADE CARD —\n{dte_line}\n{strike_line}\n{_size_guidance()}", "type": "trade_confirmed", "priority": 5, "alert_key": f"conf_long_{ba.level:.2f}"})
+                        events.append({"msg": f"🟩🟩🟩 BREAKOUT CONFIRMED — CALLS / LONG 🟩🟩🟩\n\n${ba.level:.2f} ({ba.level_name}) broke with follow-through.\nGEX NEGATIVE — dealers amplify.\n\nENTRY: Now @ ~${price:.2f}\nSTOP: Lose ${ba.level:.2f}\nTARGET: Next resistance — let trend work\n\n— TRADE CARD —\n{dte_line}\n{contract_line}", "type": "trade_confirmed", "priority": 5, "alert_key": f"conf_long_{ba.level:.2f}"})
                 else:
                     events.append({"msg": f"⚠️ BREAKOUT + FOLLOW-THROUGH at ${ba.level:.2f}\nGEX+ — mean reversion possible. Lose level = fade short.", "type": "warning", "priority": 4, "alert_key": f"ft_up_{ba.level:.2f}"})
         return events
@@ -1338,25 +1650,60 @@ class ThesisMonitorEngine:
                 ba.detected_as_failed = True; ba.retest_armed = True
                 state.failed_moves.append(ba); state.status = "FAILED_MOVE_ACTIVE"
                 ext = abs(price - ba.level) / ba.level * 100; late = ext > MONITOR_EXTENSION_LIMIT_PCT
+
+                # ── Hairline stop gate ────────────────────────────────────────
+                # If the stop (ba.level) is within MONITOR_HAIRLINE_STOP_PCT of
+                # entry price, the risk/reward is noise-level. Require
+                # MONITOR_HAIRLINE_EXTRA_HOLDS more polls of structure hold
+                # before firing the trade card. The alert still posts immediately
+                # with a "HAIRLINE — waiting for confirmation" note so the trader
+                # can watch the level. Once holds are satisfied the normal
+                # entry message fires with the full trade card.
+                stop_dist_pct = abs(price - ba.level) / price * 100
+                is_hairline = stop_dist_pct < MONITOR_HAIRLINE_STOP_PCT
+                if is_hairline:
+                    ba.hairline_holds += 1
+                    if ba.hairline_holds == 1:
+                        # First time we detect hairline — fire the watch alert only
+                        events.append({
+                            "msg": (
+                                f"👁 HAIRLINE STOP — WATCHING STRUCTURE\n\n"
+                                f"${ba.level:.2f} reclaimed but stop is only "
+                                f"${abs(price - ba.level):.2f} away ({stop_dist_pct:.3f}%).\n"
+                                f"Too tight to enter now — confirming {MONITOR_HAIRLINE_EXTRA_HOLDS} "
+                                f"more candles of hold.\n\n"
+                                f"Watch: price must stay above ${ba.level:.2f}. "
+                                f"If it does, trade card fires next poll."
+                            ),
+                            "type": "warning",
+                            "priority": 4,
+                            "alert_key": f"hairline_{ba.level:.2f}",
+                        })
+                    if ba.hairline_holds <= MONITOR_HAIRLINE_EXTRA_HOLDS:
+                        # Still accumulating confirmation — don't fire entry yet.
+                        # Reset detected_as_failed so we re-evaluate next poll.
+                        ba.detected_as_failed = False
+                        continue
+                    # Enough holds accumulated — fall through to normal entry below
+                # ── End hairline gate ─────────────────────────────────────────
+
                 dte_line = _dte_guidance(tp["phase"])
                 if ba.direction == "DOWN":
                     direction = "LONG"
                     rn = ("GEX+ — squeeze probability HIGH." if thesis.gex_sign == "positive" else "GEX- squeeze can run hard.")
-                    tt = ("\n💰 TRADE TYPE: Call debit spread — GEX+ reversal capped." if thesis.gex_sign == "positive" else "\n💰 TRADE TYPE: Naked calls — GEX- squeeze can run.")
-                    strike_line = _strike_guidance(direction, price)
+                    contract_line = _contract_suggestion(_SETUP_FAILED_BREAKDOWN, direction, price, thesis, state, phase=tp["phase"])
                     if late:
-                        events.append({"msg": f"🟩🚀🔥 FAILED BREAKDOWN — SQUEEZE LONG 🟩🚀🔥\n\n${ba.level:.2f} held after reclaim. Shorts trapped.\n⚠️ Extended {ext:.2f}% — DON'T CHASE.\nWait for retest.\nSTOP: below ${ba.level:.2f}\n{rn}{tt}\n\n— TRADE CARD —\n{dte_line}\n{strike_line}\n{_size_guidance()}", "type": "critical", "priority": 5, "alert_key": f"fb_late_{ba.level:.2f}"})
+                        events.append({"msg": f"🟩🚀🔥 FAILED BREAKDOWN — SQUEEZE LONG 🟩🚀🔥\n\n${ba.level:.2f} held after reclaim. Shorts trapped.\n⚠️ Extended {ext:.2f}% — DON'T CHASE.\nWait for retest.\nSTOP: below ${ba.level:.2f}\n{rn}\n\n— TRADE CARD —\n{dte_line}\n{contract_line}", "type": "critical", "priority": 5, "alert_key": f"fb_late_{ba.level:.2f}"})
                     else:
-                        events.append({"msg": f"🟩🚀🔥 FAILED BREAKDOWN — SQUEEZE LONG 🟩🚀🔥\n\n${ba.level:.2f} held after reclaim. Shorts trapped.\n\nENTRY: Now @ ~${price:.2f}\nSTOP: Below ${ba.level:.2f}\n{rn}{tt}\n\n— TRADE CARD —\n{dte_line}\n{strike_line}\n{_size_guidance()}", "type": "critical", "priority": 5, "alert_key": f"fb_now_{ba.level:.2f}"})
+                        events.append({"msg": f"🟩🚀🔥 FAILED BREAKDOWN — SQUEEZE LONG 🟩🚀🔥\n\n${ba.level:.2f} held after reclaim. Shorts trapped.\n\nENTRY: Now @ ~${price:.2f}\nSTOP: Below ${ba.level:.2f}\n{rn}\n\n— TRADE CARD —\n{dte_line}\n{contract_line}", "type": "critical", "priority": 5, "alert_key": f"fb_now_{ba.level:.2f}"})
                 else:
                     direction = "SHORT"
                     rn = ("GEX+ — fade probability HIGH." if thesis.gex_sign == "positive" else "GEX- downside can accelerate.")
-                    tt = ("\n💰 TRADE TYPE: Put debit spread — GEX+ reversal capped." if thesis.gex_sign == "positive" else "\n💰 TRADE TYPE: Naked puts — GEX- dump can run.")
-                    strike_line = _strike_guidance(direction, price)
+                    contract_line = _contract_suggestion(_SETUP_FAILED_BREAKOUT, direction, price, thesis, state, phase=tp["phase"])
                     if late:
-                        events.append({"msg": f"🟩🚀🔥 FAILED BREAKOUT — FADE SHORT 🟩🚀🔥\n\nLost + held. Longs trapped.\n⚠️ Extended {ext:.2f}% — DON'T CHASE.\nWait for retest.\nSTOP: above ${ba.level:.2f}\n{rn}{tt}\n\n— TRADE CARD —\n{dte_line}\n{strike_line}\n{_size_guidance()}", "type": "critical", "priority": 5, "alert_key": f"fbo_late_{ba.level:.2f}"})
+                        events.append({"msg": f"🟩🚀🔥 FAILED BREAKOUT — FADE SHORT 🟩🚀🔥\n\nLost + held. Longs trapped.\n⚠️ Extended {ext:.2f}% — DON'T CHASE.\nWait for retest.\nSTOP: above ${ba.level:.2f}\n{rn}\n\n— TRADE CARD —\n{dte_line}\n{contract_line}", "type": "critical", "priority": 5, "alert_key": f"fbo_late_{ba.level:.2f}"})
                     else:
-                        events.append({"msg": f"🟩🚀🔥 FAILED BREAKOUT — FADE SHORT 🟩🚀🔥\n\n${ba.level:.2f} lost and held. Longs trapped.\n\nENTRY: Now @ ~${price:.2f}\nSTOP: Above ${ba.level:.2f}\n{rn}{tt}\n\n— TRADE CARD —\n{dte_line}\n{strike_line}\n{_size_guidance()}", "type": "critical", "priority": 5, "alert_key": f"fbo_now_{ba.level:.2f}"})
+                        events.append({"msg": f"🟩🚀🔥 FAILED BREAKOUT — FADE SHORT 🟩🚀🔥\n\n${ba.level:.2f} lost and held. Longs trapped.\n\nENTRY: Now @ ~${price:.2f}\nSTOP: Above ${ba.level:.2f}\n{rn}\n\n— TRADE CARD —\n{dte_line}\n{contract_line}", "type": "critical", "priority": 5, "alert_key": f"fbo_now_{ba.level:.2f}"})
             else:
                 if ba.reclaim_seen and not ba.detected_as_failed:
                     ba.reclaim_seen = False; ba.reclaim_price = None; ba.reclaim_time = 0.0; ba.reclaim_holds = 0
@@ -1378,16 +1725,16 @@ class ThesisMonitorEngine:
             if ba.detected_as_failed and ba.direction == "UP" and price > ba.level: continue       # fade retest must be at/below
             if ba.detected_as_confirmed and ba.direction == "DOWN" and net < -(ba.level * 0.0008):
                 ba.retest_fired = True; tt = "💰 Naked puts" if thesis.gex_sign == "negative" else "💰 Put debit spread"
-                events.append({"msg": f"🎯 RETEST SHORT ENTRY\n\nBreakdown retested ${ba.level:.2f} and rejecting.\n\nENTRY: Now @ ~${price:.2f}\nSTOP: above ${ba.level:.2f}\n{tt}\n\n— TRADE CARD —\n{dte_line}\n{_strike_guidance('SHORT', price)}\n{_size_guidance()}", "type": "critical", "priority": 5, "alert_key": f"rt_short_{ba.level:.2f}"})
+                events.append({"msg": f"🎯 RETEST SHORT ENTRY\n\nBreakdown retested ${ba.level:.2f} and rejecting.\n\nENTRY: Now @ ~${price:.2f}\nSTOP: above ${ba.level:.2f}\n\n— TRADE CARD —\n{dte_line}\n{_contract_suggestion(_SETUP_RETEST_SHORT, 'SHORT', price, thesis, state, phase=tp['phase'])}", "type": "critical", "priority": 5, "alert_key": f"rt_short_{ba.level:.2f}"})
             elif ba.detected_as_confirmed and ba.direction == "UP" and net > (ba.level * 0.0008):
                 ba.retest_fired = True; tt = "💰 Naked calls" if thesis.gex_sign == "negative" else "💰 Call debit spread"
-                events.append({"msg": f"🎯 RETEST LONG ENTRY\n\nBreakout retested ${ba.level:.2f} and holding.\n\nENTRY: Now @ ~${price:.2f}\nSTOP: below ${ba.level:.2f}\n{tt}\n\n— TRADE CARD —\n{dte_line}\n{_strike_guidance('LONG', price)}\n{_size_guidance()}", "type": "critical", "priority": 5, "alert_key": f"rt_long_{ba.level:.2f}"})
+                events.append({"msg": f"🎯 RETEST LONG ENTRY\n\nBreakout retested ${ba.level:.2f} and holding.\n\nENTRY: Now @ ~${price:.2f}\nSTOP: below ${ba.level:.2f}\n\n— TRADE CARD —\n{dte_line}\n{_contract_suggestion(_SETUP_RETEST_LONG, 'LONG', price, thesis, state, phase=tp['phase'])}", "type": "critical", "priority": 5, "alert_key": f"rt_long_{ba.level:.2f}"})
             elif ba.detected_as_failed and ba.direction == "DOWN" and net > (ba.level * 0.0008):
                 ba.retest_fired = True; tt = "💰 Call debit spread" if thesis.gex_sign == "positive" else "💰 Naked calls"
-                events.append({"msg": f"🎯 RETEST LONG (squeeze)\n\nFailed breakdown retested ${ba.level:.2f} and holding.\n\nENTRY: Now @ ~${price:.2f}\nSTOP: below ${ba.level:.2f}\n{tt}\n\n— TRADE CARD —\n{dte_line}\n{_strike_guidance('LONG', price)}\n{_size_guidance()}", "type": "critical", "priority": 5, "alert_key": f"rt_fl_{ba.level:.2f}"})
+                events.append({"msg": f"🎯 RETEST LONG (squeeze)\n\nFailed breakdown retested ${ba.level:.2f} and holding.\n\nENTRY: Now @ ~${price:.2f}\nSTOP: below ${ba.level:.2f}\n\n— TRADE CARD —\n{dte_line}\n{_contract_suggestion(_SETUP_RETEST_LONG, 'LONG', price, thesis, state, phase=tp['phase'])}", "type": "critical", "priority": 5, "alert_key": f"rt_fl_{ba.level:.2f}"})
             elif ba.detected_as_failed and ba.direction == "UP" and net < -(ba.level * 0.0008):
                 ba.retest_fired = True; tt = "💰 Put debit spread" if thesis.gex_sign == "positive" else "💰 Naked puts"
-                events.append({"msg": f"🎯 RETEST SHORT (fade)\n\nFailed breakout retested ${ba.level:.2f} and rejecting.\n\nENTRY: Now @ ~${price:.2f}\nSTOP: above ${ba.level:.2f}\n{tt}\n\n— TRADE CARD —\n{dte_line}\n{_strike_guidance('SHORT', price)}\n{_size_guidance()}", "type": "critical", "priority": 5, "alert_key": f"rt_fs_{ba.level:.2f}"})
+                events.append({"msg": f"🎯 RETEST SHORT (fade)\n\nFailed breakout retested ${ba.level:.2f} and rejecting.\n\nENTRY: Now @ ~${price:.2f}\nSTOP: above ${ba.level:.2f}\n\n— TRADE CARD —\n{dte_line}\n{_contract_suggestion(_SETUP_RETEST_SHORT, 'SHORT', price, thesis, state, phase=tp['phase'])}", "type": "critical", "priority": 5, "alert_key": f"rt_fs_{ba.level:.2f}"})
         return events
 
     def _check_gamma_flip(self, thesis, state, price):
