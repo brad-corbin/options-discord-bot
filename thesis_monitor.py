@@ -77,6 +77,13 @@ class ThesisContext:
     prior_day_close: Optional[float] = None; prior_day_context: str = "NORMAL"
     session_label: str = ""; levels: ThesisLevels = field(default_factory=ThesisLevels)
     created_at: str = ""; spot_at_creation: float = 0.0
+    # ── ATM option snapshot from pre-market chain ────────────────────────────
+    # Populated once at em card time. Used to approximate the 20% premium stop
+    # during live monitoring without needing live option quote fetches.
+    atm_call_delta:   float = 0.0   # delta of the nearest ATM call at em time
+    atm_call_premium: float = 0.0   # mid price of the nearest ATM call ($)
+    atm_put_delta:    float = 0.0   # delta of the nearest ATM put at em time
+    atm_put_premium:  float = 0.0   # mid price of the nearest ATM put ($)
 
 @dataclass
 class BreakAttempt:
@@ -1059,6 +1066,24 @@ class ThesisMonitorEngine:
             policy_config=policy.to_config(),
             max_favorable=0.0, min_favorable=0.0,
         )
+
+        # ── Wire ATM delta/premium from thesis snapshot ───────────────────
+        # LONG trades use call delta/premium; SHORT trades use put delta/premium.
+        # These were captured at em card time from the live chain and stored on
+        # the thesis so we can approximate the 20% premium stop each poll
+        # without fetching a live option quote.
+        if direction == "LONG":
+            trade.entry_delta   = getattr(thesis, "atm_call_delta",   0.0) or 0.0
+            trade.entry_premium = getattr(thesis, "atm_call_premium", 0.0) or 0.0
+        else:
+            trade.entry_delta   = getattr(thesis, "atm_put_delta",   0.0) or 0.0
+            trade.entry_premium = getattr(thesis, "atm_put_premium", 0.0) or 0.0
+        if trade.entry_delta > 0 and trade.entry_premium > 0:
+            log.info(f"Premium stop armed: {ticker} {direction} δ={trade.entry_delta:.2f} "
+                     f"prem=${trade.entry_premium:.2f} — 20% stop at ~${trade.entry_premium * 0.20:.2f} adverse")
+        else:
+            log.info(f"Premium stop not armed for {ticker} {direction} — no ATM data on thesis "
+                     f"(delta={trade.entry_delta}, premium={trade.entry_premium})")
 
         state.active_trades.append(trade)
         self._persist_trades(ticker, state)
@@ -2633,7 +2658,9 @@ class ThesisMonitorDaemon:
         try: self.post_fn("\n".join(lines)); log.info(f"Alert: {ticker} | {event.get('type','')} | {event.get('msg','')[:80]}")
         except Exception as e: log.error(f"Alert post failed: {e}")
 
-def build_thesis_from_em_card(ticker, spot, bias, eng, em, walls, cagf=None, vix=None, v4_result=None, session_label="", local_walls=None, prior_day_close=None):
+def build_thesis_from_em_card(ticker, spot, bias, eng, em, walls, cagf=None, vix=None, v4_result=None, session_label="", local_walls=None, prior_day_close=None,
+                              atm_call_delta=0.0, atm_call_premium=0.0,
+                              atm_put_delta=0.0, atm_put_premium=0.0):
     eng = eng or {}; walls = walls or {}; em = em or {}; lw = local_walls or walls or {}; cagf = cagf or {}; vix = vix or {}
     levels = ThesisLevels(gamma_flip=eng.get("flip_price"), local_resistance=lw.get("local_resistance_1") or walls.get("call_wall"), local_support=lw.get("local_support_1") or walls.get("put_wall"), call_wall=walls.get("call_wall"), put_wall=walls.get("put_wall"), gamma_wall=walls.get("gamma_wall"), pin_zone_low=lw.get("pin_zone_low"), pin_zone_high=lw.get("pin_zone_high"), micro_trigger_up=lw.get("local_resistance_1") or walls.get("call_wall"), micro_trigger_down=lw.get("local_support_1") or walls.get("put_wall"), range_break_up=lw.get("pin_zone_high") or walls.get("call_wall"), range_break_down=lw.get("pin_zone_low") or walls.get("put_wall"), pivot=lw.get("pivot"), r1=lw.get("r1"), s1=lw.get("s1"), fib_support=lw.get("fib_support"), fib_resistance=lw.get("fib_resistance"), vpoc=lw.get("vpoc"), max_pain=lw.get("max_pain") or eng.get("max_pain"), em_high=em.get("bull_1sd"), em_low=em.get("bear_1sd"), em_2sd_high=em.get("bull_2sd"), em_2sd_low=em.get("bear_2sd"))
     prior_ctx = "NORMAL"
@@ -2652,7 +2679,12 @@ def build_thesis_from_em_card(ticker, spot, bias, eng, em, walls, cagf=None, vix
     try:
         from zoneinfo import ZoneInfo; ts = datetime.now(ZoneInfo("America/Chicago")).isoformat()
     except Exception: ts = datetime.now(timezone.utc).isoformat()
-    return ThesisContext(ticker=ticker, bias=bias.get("direction", "NEUTRAL"), bias_score=bias.get("score", 0), gex_sign=gex_sign, gex_value=round(gex_val, 2), dex_value=round(eng.get("dex", 0), 2), vanna_value=round(eng.get("vanna", 0), 2), charm_value=round(eng.get("charm", 0), 2), regime=regime, volatility_regime=v4_result.get("vol_regime", {}).get("label", "NORMAL") if v4_result else "NORMAL", vix=vix.get("vix", 20) if isinstance(vix, dict) else 20, iv=v4_result.get("iv", 0.20) if v4_result else 0.20, prior_day_close=prior_day_close, prior_day_context=prior_ctx, session_label=session_label, levels=levels, created_at=ts, spot_at_creation=spot)
+    ctx = ThesisContext(ticker=ticker, bias=bias.get("direction", "NEUTRAL"), bias_score=bias.get("score", 0), gex_sign=gex_sign, gex_value=round(gex_val, 2), dex_value=round(eng.get("dex", 0), 2), vanna_value=round(eng.get("vanna", 0), 2), charm_value=round(eng.get("charm", 0), 2), regime=regime, volatility_regime=v4_result.get("vol_regime", {}).get("label", "NORMAL") if v4_result else "NORMAL", vix=vix.get("vix", 20) if isinstance(vix, dict) else 20, iv=v4_result.get("iv", 0.20) if v4_result else 0.20, prior_day_close=prior_day_close, prior_day_context=prior_ctx, session_label=session_label, levels=levels, created_at=ts, spot_at_creation=spot)
+    ctx.atm_call_delta   = float(atm_call_delta   or 0.0)
+    ctx.atm_call_premium = float(atm_call_premium or 0.0)
+    ctx.atm_put_delta    = float(atm_put_delta    or 0.0)
+    ctx.atm_put_premium  = float(atm_put_premium  or 0.0)
+    return ctx
 
 _monitor_engine = ThesisMonitorEngine()
 _monitor_daemon: Optional[ThesisMonitorDaemon] = None
