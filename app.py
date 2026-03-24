@@ -5231,6 +5231,78 @@ def _build_action_block(
 # Added v4_result parameter for confidence gating.
 # ─────────────────────────────────────────────────────────────────────
 
+def _app_spread_width(
+    setup_type: str,          # "FAILED" | "BREAK" | "RETEST"
+    direction: str,           # "LONG" | "SHORT"  (bull/bear normalised below)
+    spot: float,
+    em_1sd: float,
+    local_wall: float | None, # nearest opposing level price (resistance for longs, support for shorts)
+    gex_sign: str,            # "positive" | "negative"
+    bias_score: int,
+    step: float = 1.0,        # strike increment (1 for SPY/QQQ, 5 for SPX)
+) -> float:
+    """Compute spread width using the same ladder algorithm as thesis_monitor._contract_suggestion.
+
+    Ensures app.py trade cards and thesis monitor alerts always agree on width.
+
+    Steps:
+      1  usable EM fraction by setup type
+      2  d3 = em_1sd × fraction
+      3  d1 = distance to nearest opposing level
+      4  target_move = min(d1, d3) if both available, else whichever exists
+      5  raw_width = 0.80 × target_move
+      6  snap to step increments, apply hard caps
+      7  quality modifier (narrow on weak conditions, widen on strong)
+    """
+    # Step 1 — usable EM fraction
+    fracs = {"FAILED": 0.30, "RETEST": 0.35, "BREAK": 0.50}
+    frac = fracs.get(setup_type, 0.30)
+
+    # Step 2 — EM budget
+    d3 = (em_1sd * frac) if em_1sd > 0 else None
+
+    # Step 3 — nearest opposing level distance
+    d1 = None
+    if local_wall is not None and local_wall > 0:
+        d1 = abs(local_wall - spot)
+        if d1 <= 0:
+            d1 = None
+
+    # Step 4 — target move
+    candidates = [x for x in [d1, d3] if x is not None and x > 0]
+    target_move = min(candidates) if candidates else step  # floor at minimum step
+
+    # Step 5 — raw width
+    raw_width = 0.80 * target_move
+
+    # Step 6 — snap to step increments
+    snapped = max(step, round(raw_width / step) * step)
+
+    # Hard caps by setup type
+    max_widths = {"FAILED": 2 * step, "RETEST": 3 * step, "BREAK": 4 * step}
+    snapped = min(snapped, max_widths.get(setup_type, 2 * step))
+
+    # Step 7 — quality modifier
+    narrow = (
+        (gex_sign == "positive" and setup_type == "BREAK") or
+        abs(bias_score) <= 2 or
+        (d1 is not None and d1 < 0.75)
+    )
+    widen = (
+        setup_type == "BREAK" and
+        (d1 is not None and d1 > 2.0) and
+        abs(bias_score) >= 4 and
+        gex_sign == "negative"
+    )
+
+    if narrow:
+        snapped = max(step, snapped - step)
+    elif widen:
+        snapped = min(max_widths.get(setup_type, 2 * step), snapped + step)
+
+    return float(snapped)
+
+
 def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
                      is_0dte=True, v4_result=None, cagf=None, dte_rec=None,
                      now_ct=None, session_progress=None, is_next_day=False,
@@ -5637,26 +5709,37 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
                 cagf_conflict = True
                 cagf_conflict_note = f"⚠️ CAGF conflict: bias BEAR but flow {cagf_prob:.0f}% upside ({cagf_dir})"
 
-        # ══════ EM-AWARE WIDTH (personalized ladder) ══════
+        # ══════ EM-AWARE WIDTH — ladder aligned with thesis monitor ══════
         ticker_up = ticker.upper()
         step = 5 if ticker_up in ("SPX", "NDX") else 1
 
         em_1sd = em.get("em_1sd", 0) if em else 0
-        if em_1sd > 0:
-            max_em_width = int(em_1sd / step) * step
-            max_em_width = max(max_em_width, step)
-        else:
-            max_em_width = 999
 
-        # Brad's width ladder: never 0.50. Prefer $1 → $2.50 → $5 on shorter trades.
-        preferred_widths = [1.0, 2.5, 5.0]
-        if effective_dte >= 10:
-            preferred_widths += [10.0, 20.0]
-        available_widths = [w for w in preferred_widths if w >= step and w <= max_em_width + 1e-9]
-        if not available_widths:
+        # Derive setup_type from what we know at trade card time.
+        # Trade cards fire on confirmed bias + passing gates — closest to BREAK.
+        # Downgraded to FAILED if bias is weak (mean-reversion scenario).
+        gex_sign_str = "negative" if tgex < 0 else "positive"
+        tc_setup_type = "BREAK" if abs(score) >= 4 else "FAILED"
+
+        # Nearest opposing level: local_call for bulls, local_put for bears
+        local_call = walls.get("call_wall") if walls else None
+        local_put  = walls.get("put_wall")  if walls else None
+        tc_local_wall = local_call if is_bull else local_put
+
+        width = _app_spread_width(
+            setup_type=tc_setup_type,
+            direction="LONG" if is_bull else "SHORT",
+            spot=spot,
+            em_1sd=em_1sd,
+            local_wall=tc_local_wall,
+            gex_sign=gex_sign_str,
+            bias_score=score,
+            step=step,
+        )
+
+        # Safety floor: never below minimum step
+        if width < step:
             width = float(step)
-        else:
-            width = float(available_widths[0])
 
         # ══════ EM-AWARE STRIKES (v4.2 fix) ══════
         bull_1sd = em.get("bull_1sd", spot + 999) if em else spot + 999
