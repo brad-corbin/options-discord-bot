@@ -38,6 +38,33 @@ MONITOR_DEFAULT_TICKERS = ["SPY", "QQQ"]
 MONITOR_HAIRLINE_STOP_PCT    = 0.03   # 0.03% = ~$0.20 on SPY $660, ~$0.18 on QQQ $590
 MONITOR_HAIRLINE_EXTRA_HOLDS = 2      # extra candles of structure hold required
 MONITOR_ENTRY_COOLDOWN_SEC   = 300    # minimum 5 minutes between new trade entries per ticker
+
+# ── Gamma Flip Oscillation Gate ───────────────────────────────────────────
+# When price chops around the gamma flip, the bot fires alternating
+# LONG/SHORT signals that bleed capital.  If the flip has been crossed
+# MONITOR_GF_OSCILLATION_MAX times within MONITOR_GF_OSCILLATION_WINDOW_SEC,
+# all new entries within MONITOR_GF_OSCILLATION_BLOCK_PCT of the flip are
+# blocked until price establishes outside the zone for the full window.
+MONITOR_GF_OSCILLATION_MAX       = 3     # crossings to trigger the gate
+MONITOR_GF_OSCILLATION_WINDOW_SEC = 1800  # 30 minutes
+MONITOR_GF_OSCILLATION_BLOCK_PCT = 0.50  # 0.50% of price (~$3.30 on SPY)
+
+# ── Minimum Hold Bars ─────────────────────────────────────────────────────
+# Exit policy Layer 2 (scale / trail / giveback) is suppressed until the
+# trade has been held for at least this many bar closes.  Hard stop (Layer 1)
+# always remains active.  This prevents the giveback threshold from killing
+# trades that need 5-10 minutes to develop.
+MONITOR_MIN_HOLD_BARS = 5   # 5 × 1m bars for SPY (5 min); 5 × 5m = 25 min for others
+
+# ── Minimum Stop Distance ────────────────────────────────────────────────
+# Hard floor on stop distance.  Any setup whose stop is closer than this
+# (in dollars) is rejected outright — the risk/reward is noise-level.
+MONITOR_MIN_STOP_DISTANCE = {
+    "SPY": 0.40,   # ~$0.40 = 0.06% on SPY ~$655
+    "QQQ": 0.40,
+    "DEFAULT": 0.30,
+}
+
 INTRADAY_MIN_TOUCHES = 3
 INTRADAY_ZONE_TOLERANCE_PCT = 0.04
 INTRADAY_MIN_PRICES_FOR_LEVELS = 6
@@ -162,6 +189,7 @@ class MonitorState:
     session_high_time: str = ""; session_low_time: str = ""
     active_trades: list = field(default_factory=list)  # List[ActiveTrade]
     last_entry_time: float = 0.0   # monotonic — time of most recent trade entry
+    gamma_flip_crossings: list = field(default_factory=list)  # List[float] — epoch timestamps of flip crosses
 
 def _get_time_phase_ct() -> dict:
     try:
@@ -902,6 +930,37 @@ class ThesisMonitorEngine:
         else:  # LONG
             targets = sorted([l for l in unique if l > price + tol])
             targets = targets[:3]  # nearest 3 above, closest first
+
+        # ── Fallback targets — never return empty ─────────────────────
+        # If structural levels are too far or absent, synthesise reasonable
+        # intraday targets from VWAP, gamma flip, or EM boundaries.
+        if not targets:
+            fallbacks = []
+            if direction == "LONG":
+                if lvl.gamma_flip and lvl.gamma_flip > price + tol:
+                    fallbacks.append(lvl.gamma_flip)
+                if lvl.em_high and lvl.em_high > price + tol:
+                    fallbacks.append(lvl.em_high)
+                if lvl.local_resistance and lvl.local_resistance > price + tol:
+                    fallbacks.append(lvl.local_resistance)
+                if lvl.call_wall and lvl.call_wall > price + tol:
+                    fallbacks.append(lvl.call_wall)
+            else:  # SHORT
+                if lvl.gamma_flip and lvl.gamma_flip < price - tol:
+                    fallbacks.append(lvl.gamma_flip)
+                if lvl.em_low and lvl.em_low < price - tol:
+                    fallbacks.append(lvl.em_low)
+                if lvl.local_support and lvl.local_support < price - tol:
+                    fallbacks.append(lvl.local_support)
+                if lvl.put_wall and lvl.put_wall < price - tol:
+                    fallbacks.append(lvl.put_wall)
+            # Deduplicate and sort
+            fallbacks = sorted(set(fallbacks))
+            if direction == "SHORT":
+                targets = fallbacks[-3:][::-1]
+            else:
+                targets = fallbacks[:3]
+
         return targets
 
     # ── Exit Monitor: Auto-Create Trade ──
@@ -963,6 +1022,52 @@ class ThesisMonitorEngine:
             if abs(t.stop_level - stop) / stop < 0.005 or abs(t.entry_price - price) / price < 0.005:
                 log.info(f"Trade already open for {ticker} {direction} stop=${t.stop_level:.2f} near new stop=${stop:.2f}, skipping")
                 return
+
+        # ── Gamma Flip Oscillation Gate ───────────────────────────────────
+        # If price has been whipsawing around gamma flip, block entries near it.
+        flip = thesis.levels.gamma_flip
+        if flip is not None and len(state.gamma_flip_crossings) >= MONITOR_GF_OSCILLATION_MAX:
+            block_zone = price * MONITOR_GF_OSCILLATION_BLOCK_PCT / 100
+            if abs(price - flip) <= block_zone:
+                log.info(f"GF oscillation gate: {ticker} — {len(state.gamma_flip_crossings)} "
+                         f"crossings in {MONITOR_GF_OSCILLATION_WINDOW_SEC}s, price ${price:.2f} "
+                         f"within {MONITOR_GF_OSCILLATION_BLOCK_PCT}% of flip ${flip:.2f}, blocking {ak}")
+                _log_filtered_trade(
+                    ticker=ticker, filter_reason="GF_OSCILLATION_GATE",
+                    direction=direction, entry_type=entry_type,
+                    setup_score=0, gate_summary=f"gf_crossings={len(state.gamma_flip_crossings)}",
+                    level_name=level_name, level_tier="C",
+                    time_phase=_get_time_phase_ct()["phase"], regime=thesis.regime,
+                    gex_sign=thesis.gex_sign, volatility_regime=thesis.volatility_regime,
+                    prior_day_context=thesis.prior_day_context, bias=thesis.bias,
+                    price=price, stop_level=stop,
+                    stop_dist_pct=abs(price - stop) / price * 100 if price > 0 else 0,
+                    badge="",
+                )
+                return
+
+        # ── Minimum Stop Distance Gate ────────────────────────────────────
+        # Hard floor — if the stop is closer than the minimum for this ticker,
+        # the setup is noise-level and gets rejected outright.
+        min_stop = MONITOR_MIN_STOP_DISTANCE.get(ticker.upper(),
+                    MONITOR_MIN_STOP_DISTANCE["DEFAULT"])
+        stop_dist_abs = abs(price - stop)
+        if stop_dist_abs < min_stop:
+            log.info(f"Min stop gate: {ticker} — stop ${stop:.2f} is ${stop_dist_abs:.2f} "
+                     f"from entry ${price:.2f} (min ${min_stop:.2f}), blocking {ak}")
+            _log_filtered_trade(
+                ticker=ticker, filter_reason="MIN_STOP_DISTANCE",
+                direction=direction, entry_type=entry_type,
+                setup_score=0, gate_summary=f"stop_dist=${stop_dist_abs:.2f}<${min_stop:.2f}",
+                level_name=level_name, level_tier="C",
+                time_phase=_get_time_phase_ct()["phase"], regime=thesis.regime,
+                gex_sign=thesis.gex_sign, volatility_regime=thesis.volatility_regime,
+                prior_day_context=thesis.prior_day_context, bias=thesis.bias,
+                price=price, stop_level=stop,
+                stop_dist_pct=abs(price - stop) / price * 100 if price > 0 else 0,
+                badge="",
+            )
+            return
 
         # ── v2.0: Level quality from registry ──
         level_quality = 0
@@ -1232,6 +1337,18 @@ class ThesisMonitorEngine:
             if latest_bar.timestamp <= trade.last_exit_bar_ts:
                 continue
             trade.last_exit_bar_ts = latest_bar.timestamp
+
+            # ── Minimum hold gate — let trade develop before giveback eval ──
+            # Hard stop (Layer 1) always active. Policy evaluation (scale,
+            # trail, giveback) is suppressed for the first N bars to prevent
+            # the giveback threshold from killing trades that need 5-10 min.
+            bars_held = 0
+            if bm and trade.entry_epoch > 0:
+                for b in bm.state.bars_5m:
+                    if b.timestamp > trade.entry_epoch:
+                        bars_held += 1
+            if bars_held < MONITOR_MIN_HOLD_BARS and trade.status == "OPEN":
+                continue  # too early — let the trade breathe
 
             policy = ExitPolicy.from_config(trade.policy_config)
             signal = evaluate_exit(policy, trade, latest_bar, recent_bars,
@@ -1787,6 +1904,18 @@ class ThesisMonitorEngine:
                 # can watch the level. Once holds are satisfied the normal
                 # entry message fires with the full trade card.
                 stop_dist_pct = abs(price - ba.level) / price * 100
+                # ── Also enforce hard minimum stop distance ───────────────
+                min_stop = MONITOR_MIN_STOP_DISTANCE.get(
+                    getattr(thesis, "ticker", "").upper(),
+                    MONITOR_MIN_STOP_DISTANCE["DEFAULT"])
+                if abs(price - ba.level) < min_stop:
+                    log.info(f"Min stop gate (failed move): ${ba.level:.2f} is "
+                             f"${abs(price - ba.level):.2f} from price (min ${min_stop:.2f}), skipping")
+                    ba.detected_as_failed = False
+                    continue
+                # Derive direction/entry_type early — needed for hairline logging
+                _fm_direction = "LONG" if ba.direction == "DOWN" else "SHORT"
+                _fm_entry_type = "FAILED"
                 is_hairline = stop_dist_pct < MONITOR_HAIRLINE_STOP_PCT
                 if is_hairline:
                     ba.hairline_holds += 1
@@ -1811,7 +1940,7 @@ class ThesisMonitorEngine:
                         _log_filtered_trade(
                             ticker=getattr(thesis, "ticker", "UNKNOWN"),
                             filter_reason="HAIRLINE_GATE",
-                            direction=direction, entry_type=entry_type,
+                            direction=_fm_direction, entry_type=_fm_entry_type,
                             setup_score=0, gate_summary=f"stop_dist={stop_dist_pct:.4f}%",
                             level_name=ba.level_name, level_tier="C",
                             time_phase=tp["phase"], regime=thesis.regime,
@@ -1886,6 +2015,12 @@ class ThesisMonitorEngine:
         if flip is None: return events
         above = price > flip
         if state.above_gamma_flip is not None and above != state.above_gamma_flip:
+            # ── Track crossing timestamp for oscillation gate ──
+            now_epoch = time.time()
+            state.gamma_flip_crossings.append(now_epoch)
+            # Prune crossings older than the oscillation window
+            cutoff = now_epoch - MONITOR_GF_OSCILLATION_WINDOW_SEC
+            state.gamma_flip_crossings = [t for t in state.gamma_flip_crossings if t >= cutoff]
             if above: events.append({"msg": f"📈 RECLAIMED GAMMA FLIP ${flip:.2f} — bullish improving.", "type": "critical", "priority": 5, "alert_key": "gf_reclaim"})
             else: events.append({"msg": f"📉 LOST GAMMA FLIP ${flip:.2f} — bearish pressure.", "type": "critical", "priority": 5, "alert_key": "gf_lost"})
         state.above_gamma_flip = above; return events
@@ -2701,6 +2836,58 @@ class ThesisMonitorDaemon:
                 il = IntradayLevelTracker.get_active_levels(state, price)
                 if il["support"]: lines.append(f"Nearest support: ${il['support'].price:.2f}")
                 if il["resistance"]: lines.append(f"Nearest resistance: ${il['resistance'].price:.2f}")
+
+        # ── Natural Targets — show where the trade SHOULD go ──────────
+        # Displayed on entry alerts AND trade mgmt so you can decide hold vs exit.
+        if active_trade and active_trade.targets:
+            tgt_lines = []
+            for i, t in enumerate(active_trade.targets):
+                dist = abs(t - price)
+                dist_pct = dist / price * 100 if price > 0 else 0
+                label = f"T{i+1}"
+                # Mark gamma flip target specially
+                if thesis and thesis.levels.gamma_flip and abs(t - thesis.levels.gamma_flip) < 0.10:
+                    label += " (γ flip)"
+                tgt_lines.append(f"  {label}: ${t:.2f} ({dist_pct:.2f}% / ${dist:.2f})")
+            if tgt_lines:
+                lines.append("")
+                if is_exit:
+                    lines.append(f"🎯 TARGET REVIEW ({active_trade.direction}):")
+                else:
+                    lines.append(f"🎯 NATURAL TARGETS ({active_trade.direction}):")
+                lines.extend(tgt_lines)
+                # Show risk/reward ratio
+                stop_ref = active_trade.trail_stop or active_trade.stop_level
+                risk = abs(price - stop_ref)
+                if risk > 0 and active_trade.targets:
+                    reward = abs(active_trade.targets[0] - price)
+                    rr = reward / risk if risk > 0 else 0
+                    lines.append(f"  R:R to T1 = {rr:.1f}:1 (risk ${risk:.2f} / reward ${reward:.2f})")
+                # ── Exit-specific: show MFE and how far target was missed by ──
+                if is_exit and active_trade.max_favorable > 0:
+                    mfe = active_trade.max_favorable
+                    lines.append(f"  📈 MFE: ${mfe:.2f} (best move in your direction)")
+                    if active_trade.targets:
+                        t1_dist_at_entry = abs(active_trade.targets[0] - active_trade.entry_price)
+                        if t1_dist_at_entry > 0:
+                            t1_capture = mfe / t1_dist_at_entry * 100
+                            lines.append(f"  📊 T1 capture: {t1_capture:.0f}% of ${t1_dist_at_entry:.2f} move")
+        elif is_entry and not is_exit:
+            # Entry event but no trade created (validator rejected) — show where
+            # targets WOULD be so the trader can evaluate manually.
+            if thesis and state:
+                ak = event.get("alert_key", "")
+                _tgt_dir = "SHORT" if any(x in ak for x in ("fbo_", "conf_short", "rt_short", "rt_fs")) else "LONG"
+                _manual_targets = self.engine._find_targets(ticker, thesis, state, price, _tgt_dir)
+                if _manual_targets:
+                    tgt_lines = []
+                    for i, t in enumerate(_manual_targets[:3]):
+                        dist = abs(t - price)
+                        tgt_lines.append(f"  T{i+1}: ${t:.2f} (${dist:.2f})")
+                    lines.append("")
+                    lines.append(f"🎯 LEVEL TARGETS ({_tgt_dir}):")
+                    lines.extend(tgt_lines)
+
         lines.append(""); lines.append(f"Phase: {tp['label']} | {thesis.bias} ({thesis.bias_score:+d}/14)")
         lines.append("— Not financial advice —")
         try: self.post_fn("\n".join(lines)); log.info(f"Alert: {ticker} | {event.get('type','')} | {event.get('msg','')[:80]}")
