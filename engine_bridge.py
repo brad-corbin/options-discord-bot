@@ -47,10 +47,14 @@ def _as_int(val, default=0):
         return default
 
 
-def build_option_rows(chain_data: dict, spot: float, days_to_exp: float) -> List[OptionRow]:
+def build_option_rows(chain_data: dict, spot: float = 0, days_to_exp: float = 1.0) -> List[OptionRow]:
     """
     Convert MarketData.app chain response into v4 OptionRow objects.
     Reads 'oiChange' array if present (populated by OICache).
+
+    v15: spot and days_to_exp are now optional. When called without spot
+    (e.g. from _extract_atm_option_data), the function still parses rows
+    using underlying_price=0 — callers that need spot should pass it.
     """
     sym_list = chain_data.get("optionSymbol") or []
     n = len(sym_list)
@@ -102,6 +106,79 @@ def build_option_rows(chain_data: dict, spot: float, days_to_exp: float) -> List
             theta            = _as_float(theta_l[i]),
             oi_change        = oi_change,
         ))
+
+    return rows
+
+
+def build_chain_dicts(chain_data: dict) -> List[Dict]:
+    """Convert raw MarketData.app chain into plain dicts with standardized field names.
+
+    v15: Added for callers that expect dicts with .get("side"), .get("delta"), etc.
+    build_option_rows returns OptionRow dataclasses (option_type, not side) which
+    breaks dict-style access. This function returns simple dicts that work with
+    _extract_atm_option_data Path A, _iter_chain_contract_rows, and any other
+    code that does row.get("field").
+
+    Filters: skips rows with strike <= 0 or side not in (call, put).
+    Does NOT filter on iv — ATM contracts may have iv=0 early in the session
+    but still have valid delta and bid/ask from market makers.
+    """
+    sym_list = chain_data.get("optionSymbol") or []
+    n = len(sym_list)
+    if n == 0:
+        return []
+
+    def col(name, default=None):
+        v = chain_data.get(name, default)
+        return v if isinstance(v, list) else [default] * n
+
+    strikes  = col("strike", None)
+    iv_list  = col("iv", None)
+    oi_list  = col("openInterest", 0)
+    vol_list = col("volume", 0)
+    delta_l  = col("delta", None)
+    gamma_l  = col("gamma", None)
+    theta_l  = col("theta", None)
+    vega_l   = col("vega", None)
+    bid_l    = col("bid", None)
+    ask_l    = col("ask", None)
+    sides    = col("side", "")
+    last_l   = col("last", col("lastPrice", None))
+
+    rows = []
+    for i in range(n):
+        strike = _as_float(strikes[i], 0)
+        side   = str(sides[i] or "").lower()
+
+        if strike <= 0 or side not in ("call", "put"):
+            continue
+
+        bid = _as_float(bid_l[i])
+        ask = _as_float(ask_l[i])
+        mid = None
+        if bid is not None and ask is not None and bid > 0 and ask > 0:
+            mid = round((bid + ask) / 2.0, 4)
+        elif ask is not None and ask > 0:
+            mid = ask
+        elif bid is not None and bid > 0:
+            mid = bid
+
+        rows.append({
+            "strike": strike,
+            "side": side,
+            "right": side,          # alias — some code checks "right"
+            "delta": _as_float(delta_l[i]),
+            "gamma": _as_float(gamma_l[i]),
+            "theta": _as_float(theta_l[i]),
+            "vega": _as_float(vega_l[i]),
+            "iv": _as_float(iv_list[i]),
+            "bid": bid,
+            "ask": ask,
+            "mid": mid,
+            "last": _as_float(last_l[i] if i < len(last_l) else None),
+            "openInterest": _as_int(oi_list[i], 0),
+            "volume": _as_int(vol_list[i], 0),
+        })
 
     return rows
 
