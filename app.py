@@ -1295,9 +1295,51 @@ def _process_job(worker_id: int, job: dict):
         structure_ctx = _build_canonical_structure_context(ticker, spot, _get_daily_ohlcv_rows(ticker, days=90))
         webhook_data = dict(webhook_data or {})
         webhook_data["vol_regime_module"] = vol_regime
-        if webhook_data.get("source") == "check" or webhook_data.get("tier") == "manual":
-            manual_ctx = _compute_manual_swing_signal_context(ticker, spot, _get_daily_ohlcv_rows(ticker, days=90), webhook_data.get("bias") or bias, structure_ctx)
+
+        # ── v4.3: Always enrich swing signals with candle-derived context ──
+        # Previously only manual /checkswing got this enrichment.
+        # Automated TradingView swing alerts often don't send htf_confirmed,
+        # weekly_bull, rsi_mfi_bull, vol_contracting — causing massive
+        # confidence penalties (−20, −8, −5, −5) that make passing impossible.
+        # Now we compute these from candle data for ALL swing signals,
+        # but only BACKFILL fields that TradingView didn't provide.
+        is_manual = webhook_data.get("source") == "check" or webhook_data.get("tier") == "manual"
+        manual_ctx = _compute_manual_swing_signal_context(ticker, spot, _get_daily_ohlcv_rows(ticker, days=90), webhook_data.get("bias") or bias, structure_ctx)
+
+        if is_manual:
+            # Manual mode: overwrite everything (existing behavior)
             webhook_data.update(manual_ctx)
+        else:
+            # Automated mode: only backfill fields that TV didn't send
+            # These boolean fields default to False when missing from the webhook,
+            # which is indistinguishable from "TV sent false" vs "TV didn't send".
+            # We use the candle-derived values as the ground truth when TV is silent.
+            _backfill_keys = [
+                "htf_confirmed", "htf_converging", "weekly_bull", "weekly_bear",
+                "daily_bull", "rsi_mfi_bull", "vol_contracting",
+                "structure_bias_score", "structure_reasons",
+                "fib_level", "fib_distance_pct",
+            ]
+            for k in _backfill_keys:
+                # Only backfill if the webhook value is the "empty" default
+                # For booleans: False is the default (TV didn't send it)
+                # For strings/numbers: use manual_ctx value if webhook has default
+                wv = webhook_data.get(k)
+                mv = manual_ctx.get(k)
+                if mv is not None:
+                    if isinstance(wv, bool) and wv is False and mv:
+                        webhook_data[k] = mv
+                    elif k == "fib_distance_pct" and wv == 2.0 and mv != 2.0:
+                        # 2.0 is the default — replace with computed value
+                        webhook_data[k] = mv
+                    elif k == "fib_level" and wv == "61.8" and mv != "61.8":
+                        # "61.8" is the default — replace with computed value
+                        webhook_data[k] = mv
+                    elif k in ("structure_bias_score", "structure_reasons") and not wv:
+                        webhook_data[k] = mv
+            log.info(f"Swing enrichment for {ticker}: htf_confirmed={webhook_data.get('htf_confirmed')} "
+                     f"weekly_bull={webhook_data.get('weekly_bull')} weekly_bear={webhook_data.get('weekly_bear')} "
+                     f"vol_contracting={webhook_data.get('vol_contracting')} rsi_mfi_bull={webhook_data.get('rsi_mfi_bull')}")
         rec = recommend_swing_trade(
             ticker=ticker, spot=spot, chains=chains,
             webhook_data=webhook_data, iv_rank=iv_rank,
@@ -5366,7 +5408,9 @@ def _app_spread_width(
       7  quality modifier (narrow on weak conditions, widen on strong)
     """
     # Step 1 — usable EM fraction
-    fracs = {"FAILED": 0.30, "RETEST": 0.35, "BREAK": 0.50}
+    # v4.3: FAILED raised from 0.30→0.40 — narrow spreads ($1-$2) can't
+    # overcome theta intraday. Need at least $3 wide for delta to dominate.
+    fracs = {"FAILED": 0.40, "RETEST": 0.35, "BREAK": 0.50}
     frac = fracs.get(setup_type, 0.30)
 
     # Step 2 — EM budget
@@ -5380,8 +5424,15 @@ def _app_spread_width(
             d1 = None
 
     # Step 4 — target move
+    # v4.3: EM floor — nearby levels cap the width via min(d1, d3), but the
+    # result can't go below 50% of the EM budget. This prevents pin zones
+    # (where every level is $1-2 away) from forcing $1-wide spreads that
+    # can't overcome theta intraday. The EM budget always gets at least
+    # half its weight so delta has room to work.
     candidates = [x for x in [d1, d3] if x is not None and x > 0]
-    target_move = min(candidates) if candidates else step  # floor at minimum step
+    level_capped = min(candidates) if candidates else step
+    em_floor = (d3 * 0.50) if d3 is not None and d3 > 0 else step
+    target_move = max(level_capped, em_floor)
 
     # Step 5 — raw width
     raw_width = 0.80 * target_move
@@ -5390,8 +5441,11 @@ def _app_spread_width(
     snapped = max(step, round(raw_width / step) * step)
 
     # Hard caps by setup type
-    max_widths = {"FAILED": 2 * step, "RETEST": 3 * step, "BREAK": 4 * step}
-    snapped = min(snapped, max_widths.get(setup_type, 2 * step))
+    # v4.3: FAILED raised from 2→3 — $1-$2 spreads need the underlying to
+    # blow past the short strike to profit, which rarely happens intraday.
+    # $3-wide gives delta room to work before theta eats the gain.
+    max_widths = {"FAILED": 3 * step, "RETEST": 3 * step, "BREAK": 4 * step}
+    snapped = min(snapped, max_widths.get(setup_type, 3 * step))
 
     # Step 7 — quality modifier
     narrow = (
@@ -5409,7 +5463,7 @@ def _app_spread_width(
     if narrow:
         snapped = max(step, snapped - step)
     elif widen:
-        snapped = min(max_widths.get(setup_type, 2 * step), snapped + step)
+        snapped = min(max_widths.get(setup_type, 3 * step), snapped + step)
 
     return float(snapped)
 
@@ -5791,6 +5845,22 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
             no_trade(f"GEX positive (+${tgex:.1f}M), score only {score:+d}/14 — not enough edge.", "🧲")
             return
 
+        # G5.5 — Pin zone trade card block (v4.3)
+        # When GEX+ and price is trapped inside the pin zone (between put wall
+        # and call wall), directional debit spreads contradict the thesis.
+        # The action guide already says "fade edges, don't chase direction" —
+        # this makes the trade card match. Score ≥ 4 can override with size cut.
+        _pin_low = (walls or {}).get("put_wall") or (walls or {}).get("pin_zone_low")
+        _pin_high = (walls or {}).get("call_wall") or (walls or {}).get("pin_zone_high")
+        if not neg_gex and _pin_low and _pin_high and _pin_low < _pin_high:
+            if _pin_low <= spot <= _pin_high and abs(score) <= 3:
+                no_trade(
+                    f"Inside pin zone ${_pin_low:.0f}-${_pin_high:.0f} with GEX+ — "
+                    f"debit spreads fight the pin. Score {score:+d}/14 not enough to override.",
+                    "📌"
+                )
+                return
+
         # ── v4.3: Resolve unified regime if not passed from caller ──
         if unified_regime is None:
             unified_regime = resolve_unified_regime(eng, cagf, spot)
@@ -5899,9 +5969,27 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
             stop_level = flip if flip else round(spot * (1 + 0.007), 2)
 
         actual_width = abs(short_strike - long_strike)
-        cost_est = round(actual_width * 0.60, 2)
+        # v4.3: Width-aware cost estimate. Narrow spreads ($1-2) cost ~60-65% of width.
+        # Wider spreads ($3-5) cost less as a % because the short leg offsets more.
+        # Old flat 60% overestimated cost on wider spreads, underestimated on narrow ones.
+        if actual_width >= 5:
+            cost_pct_est = 0.50
+        elif actual_width >= 3:
+            cost_pct_est = 0.55
+        else:
+            cost_pct_est = 0.62
+        cost_est = round(actual_width * cost_pct_est, 2)
         max_profit = round(actual_width - cost_est, 2)
         rr = round(max_profit / cost_est, 2) if cost_est > 0 else 0
+
+        # v4.3: Theta warning for narrow intraday spreads
+        _theta_warn = ""
+        if actual_width <= 2 and effective_dte <= 1:
+            _theta_warn = (
+                f"⚠️ NARROW SPREAD WARNING: ${actual_width:.0f}-wide at {effective_dte} DTE — "
+                f"theta dominates. Spread won't reach max value until near expiry. "
+                f"Consider wider ($3-$4) or single-leg if high conviction."
+            )
 
         # ══════ SIZE ══════
         if v >= 28: base_pct = 25
@@ -6019,6 +6107,8 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
         ]
         if em_zone_note:
             lines.append(em_zone_note)
+        if _theta_warn:
+            lines.append(f"  {_theta_warn}")
 
         lines += [
             "",
