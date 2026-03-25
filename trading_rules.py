@@ -50,15 +50,18 @@ NO_ENTRY_FIRST_MINUTES       = 15
 # REGIME-SPECIFIC GATES (v4.2)
 # ─────────────────────────────────────────────────────────
 # LOW VOL CHOP (VIX 22-25, ADX < 20): reduce size, raise confidence gate.
-# Today's run (VIX 22.4, ADX 19) correctly skipped 12 signals — make explicit.
-CHOP_REGIME_CONF_GATE        = 75    # vs normal MIN_CONFIDENCE_TO_TRADE=60
+# v4.3: lowered from 75 → 65 — 75 was too aggressive, blocked all T2 signals.
+# Normal gate is 60; 65 is only 5 above normal, enough to filter noise
+# without making CHOP regime = zero trades.
+CHOP_REGIME_CONF_GATE        = 65    # vs normal MIN_CONFIDENCE_TO_TRADE=60
 CHOP_REGIME_SIZE_MULT        = 0.65  # vs REGIME_CHOPPY_SIZE_MULT=0.75 — tighter
 
 # PIN regime: block directional debit spreads when gamma is pinning price.
-# CAT was MODERATE PIN today → correctly rejected (no ITM puts found).
-# These flags make the intent auditable independent of check_ticker logic.
+# v4.3: Only block the OPPOSING side in PIN. If bias confirms direction
+# and v4 shows PIN, we still block the side fighting the pin.
+# Setting both to True was too aggressive — blocked ALL entries.
 PIN_REGIME_BLOCK_BEAR_PUTS   = True  # Block bear puts if v4 regime contains PIN
-PIN_REGIME_BLOCK_BULL_CALLS  = True  # Block bull calls if v4 regime contains PIN
+PIN_REGIME_BLOCK_BULL_CALLS  = False # v4.3: Allow bull calls in PIN — calls can work if price drifts up to pin
 
 # ─────────────────────────────────────────────────────────
 # EXIT RULES
@@ -86,22 +89,29 @@ MIN_VOLUME_LEG           = 0
 # HARD LIQUIDITY FILTERS (v4.1)
 # ═══════════════════════════════════════════════════════════
 
-MIN_OPEN_INTEREST        = 500
-MAX_BID_ASK_SPREAD       = 0.15
-MAX_SPREAD_PCT_OF_MID    = 0.12
+# v4.3: Relaxed significantly for elevated vol environments (VIX 25+).
+# At VIX 27, bid-ask spreads on $10-50 stocks routinely hit $0.30-$0.50.
+# Old thresholds (500 OI, $0.15 spread, 12% pct) filtered ALL strikes
+# for mid-cap tickers (IREN, MRNA, RTX, HD, BWXT, BE, INOD).
+# The relaxed pass (2.5x) is the real safety net; strict pass should
+# let through "tradeable" contracts, not "perfect" ones.
+MIN_OPEN_INTEREST        = 100
+MAX_BID_ASK_SPREAD       = 0.40
+MAX_SPREAD_PCT_OF_MID    = 0.25
 
 INDEX_ETF_TICKERS        = {"SPY", "QQQ", "IWM", "DIA", "SPX", "GLD"}
-INDEX_MIN_OPEN_INTEREST  = 2000
-INDEX_MAX_BID_ASK_SPREAD = 0.06
-INDEX_MAX_SPREAD_PCT     = 0.05
+INDEX_MIN_OPEN_INTEREST  = 1000
+INDEX_MAX_BID_ASK_SPREAD = 0.08
+INDEX_MAX_SPREAD_PCT     = 0.06
 
 LARGE_CAP_TICKERS        = {
     "AAPL", "MSFT", "NVDA", "AMZN", "META",
     "TSLA", "GOOGL", "AMD", "NFLX", "COIN",
 }
-LARGE_CAP_MIN_OI         = 1000
-LARGE_CAP_MAX_SPREAD     = 0.10
-LARGE_CAP_MAX_SPREAD_PCT = 0.08
+# v4.3: Relaxed for elevated vol — MRNA, HD, RTX were all getting blocked.
+LARGE_CAP_MIN_OI         = 250
+LARGE_CAP_MAX_SPREAD     = 0.25
+LARGE_CAP_MAX_SPREAD_PCT = 0.15
 
 
 def get_liquidity_thresholds(ticker: str) -> dict:
@@ -169,7 +179,7 @@ CONFIDENCE_BOOSTS = {
 }
 
 CONFIDENCE_PENALTIES = {
-    "htf_diverging":     -20,
+    "htf_diverging":     -10,    # v4.3: was -20, which destroyed confidence when TV didn't send the field
     "daily_bear":        -10,
     "daily_bull":        -10,
     "wave_overbought":   -15,
