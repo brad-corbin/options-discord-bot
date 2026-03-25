@@ -618,8 +618,10 @@ def compute_swing_confidence(
         score += 6
         reasons.append("Daily trend converging")
     else:
-        score -= 8 if manual_mode else 20
-        reasons.append("Daily trend diverging")
+        # v1.2: Reduced penalty — absence of confirmation ≠ active divergence.
+        # The old -20 made it mathematically impossible for any T2 signal to pass.
+        score -= 8 if manual_mode else 10
+        reasons.append("Daily trend not confirmed")
 
     weekly_bull = webhook_data.get("weekly_bull", False)
     weekly_bear = webhook_data.get("weekly_bear", False)
