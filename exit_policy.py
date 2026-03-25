@@ -73,6 +73,7 @@ class ExitPolicy:
     scale_at_target: bool = True
     # Giveback limits
     max_giveback_pct: float = 0.40      # max % of MFE to give back
+    min_mfe_before_giveback: float = 0.30  # v15: don't eval giveback until MFE ≥ this ($)
     # Extension / exhaustion
     exhaustion_decel_mult: float = 0.4  # momentum decel = exhaustion
     # Regime context
@@ -89,6 +90,7 @@ class ExitPolicy:
             "trail_min_profit_pct": self.trail_min_profit_pct,
             "scale_fraction": self.scale_fraction, "scale_at_target": self.scale_at_target,
             "max_giveback_pct": self.max_giveback_pct,
+            "min_mfe_before_giveback": self.min_mfe_before_giveback,
             "exhaustion_decel_mult": self.exhaustion_decel_mult,
             "gex_at_entry": self.gex_at_entry, "setup_score": self.setup_score,
             "is_0dte": self.is_0dte,
@@ -106,6 +108,7 @@ class ExitPolicy:
             scale_fraction=cfg.get("scale_fraction", "1/2"),
             scale_at_target=cfg.get("scale_at_target", True),
             max_giveback_pct=cfg.get("max_giveback_pct", 0.40),
+            min_mfe_before_giveback=cfg.get("min_mfe_before_giveback", 0.30),
             exhaustion_decel_mult=cfg.get("exhaustion_decel_mult", 0.4),
             gex_at_entry=cfg.get("gex_at_entry", "positive"),
             setup_score=cfg.get("setup_score", 3),
@@ -143,6 +146,10 @@ class ExitPolicy:
                                     max_favorable: float, direction: str) -> bool:
         """Has the trade given back too much of its best move?"""
         if max_favorable <= 0:
+            return False
+        # v15: Don't evaluate giveback on tiny MFE — noise-level moves
+        # shouldn't trigger exit logic. Let the hard stop handle those.
+        if max_favorable < self.min_mfe_before_giveback:
             return False
         if direction == "LONG":
             current_profit = current_price - entry_price
@@ -230,6 +237,7 @@ def select_exit_policy(setup_score: int, gex_sign: str, setup_type: str,
             scale_fraction="1/3" if setup_score >= 5 else "1/2",
             scale_at_target=True,
             max_giveback_pct=0.50,
+            min_mfe_before_giveback=0.50, # v15: trends need room to breathe
             exhaustion_decel_mult=0.35,
             gex_at_entry=gex_sign,
             setup_score=setup_score,
@@ -241,11 +249,12 @@ def select_exit_policy(setup_score: int, gex_sign: str, setup_type: str,
     if gex_sign == "positive" and setup_type in ("FAILED", "RETEST"):
         return ExitPolicy(
             name="MEAN_REVERSION",
-            trail_pct_of_profit=0.30,    # tight: reversion caps move
+            trail_pct_of_profit=0.35,    # v15: 0.30→0.35 — give reversion room
             trail_min_profit_pct=0.10,
             scale_fraction="2/3",
             scale_at_target=True,
-            max_giveback_pct=0.30,
+            max_giveback_pct=0.50,       # v15: 0.30→0.50 — was killing winners
+            min_mfe_before_giveback=0.30, # v15: $0.30 min before giveback eval
             exhaustion_decel_mult=0.45,
             gex_at_entry=gex_sign,
             setup_score=setup_score,
@@ -261,7 +270,8 @@ def select_exit_policy(setup_score: int, gex_sign: str, setup_type: str,
             trail_min_profit_pct=0.12,
             scale_fraction="1/2",
             scale_at_target=True,
-            max_giveback_pct=0.45,
+            max_giveback_pct=0.55,       # v15: 0.45→0.55
+            min_mfe_before_giveback=0.40, # v15: squeezes need room
             exhaustion_decel_mult=0.35,
             gex_at_entry=gex_sign,
             setup_score=setup_score,
@@ -277,7 +287,8 @@ def select_exit_policy(setup_score: int, gex_sign: str, setup_type: str,
             trail_min_profit_pct=0.08,
             scale_fraction="2/3",
             scale_at_target=True,
-            max_giveback_pct=0.25,
+            max_giveback_pct=0.35,       # v15: 0.25→0.35
+            min_mfe_before_giveback=0.30,
             exhaustion_decel_mult=0.50,
             gex_at_entry=gex_sign,
             setup_score=setup_score,
@@ -293,7 +304,8 @@ def select_exit_policy(setup_score: int, gex_sign: str, setup_type: str,
             trail_min_profit_pct=0.08,
             scale_fraction="2/3",
             scale_at_target=True,
-            max_giveback_pct=0.25,
+            max_giveback_pct=0.35,       # v15: 0.25→0.35
+            min_mfe_before_giveback=0.25,
             exhaustion_decel_mult=0.50,
             gex_at_entry=gex_sign,
             setup_score=setup_score,
@@ -308,7 +320,8 @@ def select_exit_policy(setup_score: int, gex_sign: str, setup_type: str,
         trail_min_profit_pct=0.12,
         scale_fraction="1/2",
         scale_at_target=True,
-        max_giveback_pct=0.40,
+        max_giveback_pct=0.50,           # v15: 0.40→0.50
+        min_mfe_before_giveback=0.30,
         exhaustion_decel_mult=0.40,
         gex_at_entry=gex_sign,
         setup_score=setup_score,
