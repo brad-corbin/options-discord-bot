@@ -96,7 +96,7 @@ class EntryValidator:
         score_parts = {}
 
         # ── Gate 1: Location ──
-        g1 = self._gate_location(level_quality, level_tier)
+        g1 = self._gate_location(level_quality, level_tier, level_sources)
         result.gates.append(g1)
         score_parts["location"] = g1.score_contribution
 
@@ -185,10 +185,11 @@ class EntryValidator:
 
     # ── Individual Gates ──
 
-    def _gate_location(self, quality: int, tier: str) -> GateResult:
-        # Graceful degradation: if no registry scored this level (quality=0),
-        # pass with neutral score — don't block entries just because registry is unavailable
-        if quality == 0 and tier == "C":
+    def _gate_location(self, quality: int, tier: str, sources: set = None) -> GateResult:
+        # v15: Distinguish "no registry data" (quality=0, no sources) from
+        # "weak level found" (quality=0, has sources). The old check passed
+        # both with neutral score, letting weak-location trades through.
+        if quality == 0 and tier == "C" and not sources:
             return GateResult("location", True, 3, "no registry data — neutral")
         passed = quality >= LOCATION_MIN_SCORE
         if tier == "A":
