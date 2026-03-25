@@ -79,6 +79,7 @@ from trading_rules import (
 from engine_bridge import (
     run_institutional_snapshot,
     build_option_rows,
+    build_chain_dicts,
     format_confidence_header,
     format_trade_sign_line,
     format_vol_regime_line,
@@ -3695,7 +3696,7 @@ def _option_mid_price(contract: dict) -> float | None:
 
 def _iter_chain_contract_rows(chain_data: dict) -> list:
     try:
-        return build_option_rows(chain_data or {}) or []
+        return build_chain_dicts(chain_data or {}) or []
     except Exception:
         return []
 
@@ -4731,7 +4732,7 @@ def _extract_atm_option_data(chain_data: dict, spot: float) -> dict:
         best_call = None; best_call_dist = float("inf")
         best_put  = None; best_put_dist  = float("inf")
 
-        rows = build_option_rows(chain_data) or []
+        rows = build_chain_dicts(chain_data) or []
         rows_checked = 0; rows_no_side = 0; rows_no_delta = 0; rows_no_mid = 0
 
         for row in rows:
