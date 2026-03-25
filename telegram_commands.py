@@ -8,6 +8,7 @@
 # v3.9 — /em command for 0DTE Expected Move (SPY & QQQ)
 
 import os
+import json
 import logging
 import threading
 from datetime import datetime, timezone
@@ -23,35 +24,95 @@ TELEGRAM_ADMIN_IDS = [
     if x.strip()
 ]
 
+_STATE_KEY = "omega:telegram_state"
+_state_lock = threading.Lock()
+_state_store_get = None
+_state_store_set = None
+
 _state = {
-    "paused":          False,
+    "paused": False,
     "confidence_gate": int(os.getenv("MIN_CONFIDENCE_TO_POST", "40") or 40),
-    "last_scan_time":  None,
-    "scan_count":      0,
-    "start_time":      datetime.now(timezone.utc),
+    "last_scan_time": None,
+    "scan_count": 0,
+    "last_scan_posted": 0,
+    "last_scan_total": 0,
+    "start_time": datetime.now(timezone.utc).isoformat(),
 }
 
 # Reference to get_regime_fn — set by handle_command on each call
 _get_regime_ref = None
 
 
+def init_shared_state(store_get_fn, store_set_fn):
+    global _state_store_get, _state_store_set
+    _state_store_get = store_get_fn
+    _state_store_set = store_set_fn
+    with _state_lock:
+        loaded = _load_state_unlocked()
+        _state.update(loaded)
+        _save_state_unlocked()
+
+
+def _load_state_unlocked() -> dict:
+    if not _state_store_get:
+        return dict(_state)
+    try:
+        raw = _state_store_get(_STATE_KEY)
+        if not raw:
+            return dict(_state)
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            merged = dict(_state)
+            merged.update(data)
+            return merged
+    except Exception as e:
+        log.warning(f"state load error: {e}")
+    return dict(_state)
+
+
+def _save_state_unlocked():
+    if not _state_store_set:
+        return
+    try:
+        _state_store_set(_STATE_KEY, json.dumps(_state))
+    except Exception as e:
+        log.warning(f"state save error: {e}")
+
+
+def _mutate_state(mutator):
+    with _state_lock:
+        latest = _load_state_unlocked()
+        _state.update(latest)
+        mutator(_state)
+        _save_state_unlocked()
+        return dict(_state)
+
+
 def get_state() -> dict:
-    return _state
+    with _state_lock:
+        latest = _load_state_unlocked()
+        _state.update(latest)
+        return dict(_state)
 
 
 def set_last_scan(posted: int, total: int):
-    _state["last_scan_time"]    = datetime.now(timezone.utc)
-    _state["scan_count"]       += 1
-    _state["last_scan_posted"]  = posted
-    _state["last_scan_total"]   = total
+    def _update(s):
+        s["last_scan_time"] = datetime.now(timezone.utc).isoformat()
+        s["scan_count"] = int(s.get("scan_count", 0) or 0) + 1
+        s["last_scan_posted"] = posted
+        s["last_scan_total"] = total
+    _mutate_state(_update)
 
 
 def is_paused() -> bool:
-    return _state.get("paused", False)
+    return bool(get_state().get("paused", False))
 
 
 def get_confidence_gate() -> int:
-    return _state.get("confidence_gate", 40)
+    try:
+        return int(get_state().get("confidence_gate", 40) or 40)
+    except Exception:
+        return 40
 
 
 def is_authorized(user_id: str) -> bool:
@@ -560,13 +621,25 @@ def handle_command(
     # /status
     # ─────────────────────────────────────
     if cmd in ("/status", "/status@omegabot"):
-        uptime     = datetime.now(timezone.utc) - _state["start_time"]
+        state = get_state()
+        start_time = state.get("start_time")
+        if isinstance(start_time, str):
+            try:
+                start_time = datetime.fromisoformat(start_time)
+            except Exception:
+                start_time = datetime.now(timezone.utc)
+        uptime = datetime.now(timezone.utc) - start_time
         uptime_str = f"{int(uptime.total_seconds() // 3600)}h {int((uptime.total_seconds() % 3600) // 60)}m"
 
-        last_scan = _state.get("last_scan_time")
+        last_scan = state.get("last_scan_time")
+        if isinstance(last_scan, str):
+            try:
+                last_scan = datetime.fromisoformat(last_scan)
+            except Exception:
+                last_scan = None
         if last_scan:
             mins_ago = int((datetime.now(timezone.utc) - last_scan).total_seconds() / 60)
-            scan_str = f"{mins_ago}m ago ({_state.get('last_scan_posted', 0)}/{_state.get('last_scan_total', 0)} posted)"
+            scan_str = f"{mins_ago}m ago ({state.get('last_scan_posted', 0)}/{state.get('last_scan_total', 0)} posted)"
         else:
             scan_str = "No scan run yet"
 
@@ -585,11 +658,11 @@ def handle_command(
 
         reply(
             f"🤖 Omega 3000 Status\n"
-            f"State: {'⏸ PAUSED' if _state['paused'] else '▶️ Running'}\n"
+            f"State: {'⏸ PAUSED' if state.get('paused') else '▶️ Running'}\n"
             f"Uptime: {uptime_str}\n"
             f"Last Scan: {scan_str}\n"
-            f"Total Scans: {_state['scan_count']}\n"
-            f"Confidence Gate: {_state['confidence_gate']}/100\n"
+            f"Total Scans: {state.get('scan_count', 0)}\n"
+            f"Confidence Gate: {state.get('confidence_gate', 40)}/100\n"
             f"Watchlist: {len(watchlist)} tickers\n"
             f"Brad: {brad_holdings} hold | {brad_opts} opts | {brad_spreads} spreads\n"
             f"Mom:  {mom_holdings} hold | {mom_opts} opts | {mom_spreads} spreads\n"
@@ -634,12 +707,12 @@ def handle_command(
         return
 
     if cmd in ("/pause", "/pause@omegabot"):
-        _state["paused"] = True
+        _mutate_state(lambda s: s.__setitem__("paused", True))
         reply("⏸ Bot paused. Scheduled scans will be skipped. Use /resume to restart.")
         return
 
     if cmd in ("/resume", "/resume@omegabot"):
-        _state["paused"] = False
+        _mutate_state(lambda s: s.__setitem__("paused", False))
         reply("▶️ Bot resumed. Scheduled scans will run normally.")
         return
 
