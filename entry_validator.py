@@ -139,8 +139,18 @@ class EntryValidator:
         hard_fail_gates = {"structure", "extension"}
         hard_failed = any(not g.passed for g in result.gates if g.name in hard_fail_gates)
 
-        if hard_failed:
+        # ── v15: Critical-pair rejection ──────────────────────────────────
+        # If BOTH location AND momentum fail, the setup has neither a good
+        # price nor confirming direction. This combination produced 5 losers
+        # on 2026-03-24 (trades #4, #9, #13, #15, #17). Hard reject.
+        loc_failed = not g1.passed
+        mom_failed = not g3.passed
+        critical_pair_failed = loc_failed and mom_failed
+
+        if hard_failed or critical_pair_failed:
             total = min(total, 8)  # forces score ≤ 2
+            if critical_pair_failed:
+                log.info(f"Critical-pair rejection: location({g1.reason}) + momentum({g3.reason}) both failed")
 
         # Map total to 1-5 score
         # Max possible: ~7 per gate * 7 gates = 49, realistic max ~35
