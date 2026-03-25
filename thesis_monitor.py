@@ -17,7 +17,7 @@ log = logging.getLogger(__name__)
 MONITOR_POLL_INTERVAL_SEC = 300
 MONITOR_POLL_INTERVAL_FAST_SEC = 60
 MONITOR_FAST_POLL_TICKERS = ["SPY"]
-MONITOR_ALERT_COOLDOWN_SEC = 600
+MONITOR_ALERT_COOLDOWN_SEC = 300       # v4.3: was 600 (10 min) — 5 min is enough to prevent spam
 MONITOR_ZONE_CLUSTER_PCT   = 0.08   # break attempts / level alerts within 0.08% of each other are treated as the same zone
 MONITOR_MAX_BREAK_AGE_SEC = 900
 MONITOR_MOMENTUM_LOOKBACK = 5
@@ -45,9 +45,12 @@ MONITOR_ENTRY_COOLDOWN_SEC   = 300    # minimum 5 minutes between new trade entr
 # MONITOR_GF_OSCILLATION_MAX times within MONITOR_GF_OSCILLATION_WINDOW_SEC,
 # all new entries within MONITOR_GF_OSCILLATION_BLOCK_PCT of the flip are
 # blocked until price establishes outside the zone for the full window.
-MONITOR_GF_OSCILLATION_MAX       = 3     # crossings to trigger the gate
+# v4.3: Raised max from 3→5 and narrowed block zone from 0.50→0.35%.
+# At 3 crossings / 0.50%, the gate was blocking nearly ALL entries in
+# consolidation sessions where SPY oscillates near the flip for hours.
+MONITOR_GF_OSCILLATION_MAX       = 5     # crossings to trigger the gate
 MONITOR_GF_OSCILLATION_WINDOW_SEC = 1800  # 30 minutes
-MONITOR_GF_OSCILLATION_BLOCK_PCT = 0.50  # 0.50% of price (~$3.30 on SPY)
+MONITOR_GF_OSCILLATION_BLOCK_PCT = 0.35  # 0.35% of price (~$2.30 on SPY)
 
 # ── Minimum Hold Bars ─────────────────────────────────────────────────────
 # Exit policy Layer 2 (scale / trail / giveback) is suppressed until the
@@ -348,14 +351,14 @@ def _contract_suggestion(
 
     # ── Step 2: usable EM fraction by setup type ─────────────────────────────
     usable_fracs = {
-        _SETUP_FAILED_BREAKDOWN:  0.30,
-        _SETUP_FAILED_BREAKOUT:   0.30,
+        _SETUP_FAILED_BREAKDOWN:  0.40,  # v4.3: was 0.30
+        _SETUP_FAILED_BREAKOUT:   0.40,  # v4.3: was 0.30
         _SETUP_RETEST_LONG:       0.35,
         _SETUP_RETEST_SHORT:      0.35,
         _SETUP_BREAKOUT_FOLLOW:   0.50,
         _SETUP_BREAKDOWN_FOLLOW:  0.50,
     }
-    usable_frac = usable_fracs.get(setup_type, 0.30)
+    usable_frac = usable_fracs.get(setup_type, 0.40)
 
     # 1DTE EM scale: overnight expected move is ~1.5× the same-day EM.
     # Scaling prevents the system from recommending too-tight spreads on
@@ -394,8 +397,12 @@ def _contract_suggestion(
     is_naked = instrument in ("naked_call", "naked_put")
 
     # ── Step 4: target move ──────────────────────────────────────────────────
+    # v4.3: EM floor — nearby levels cap width, but can't go below 50% of EM
+    # budget. Prevents pin zones from forcing $1-wide spreads.
     candidates = [x for x in [d1, d3] if x is not None and x > 0]
-    target_move = min(candidates) if candidates else 1.0
+    level_capped = min(candidates) if candidates else 1.0
+    em_floor = (d3 * 0.50) if d3 is not None and d3 > 0 else 1.0
+    target_move = max(level_capped, em_floor)
 
     atm = int(price)
 
@@ -450,8 +457,8 @@ def _contract_suggestion(
         width = 4
 
     max_widths = {
-        _SETUP_FAILED_BREAKDOWN:  2,
-        _SETUP_FAILED_BREAKOUT:   2,
+        _SETUP_FAILED_BREAKDOWN:  3,    # v4.3: was 2 — too narrow for intraday theta
+        _SETUP_FAILED_BREAKOUT:   3,    # v4.3: was 2
         _SETUP_RETEST_LONG:       3,
         _SETUP_RETEST_SHORT:      3,
         _SETUP_BREAKOUT_FOLLOW:   4,
