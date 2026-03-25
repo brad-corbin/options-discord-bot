@@ -30,6 +30,9 @@ MARKET_OPEN_MINS_CT = 510      # 8:30 AM CT in minutes
 MARKET_CLOSE_MINS_CT = 915     # 3:15 PM CT (SPY/QQQ options close)
 BAR_BUFFER_MAX_5M = 120        # ~10 hours of 5m bars
 BAR_BUFFER_MAX_1M = 420        # 7 hours of 1m bars
+BAR_FETCH_MAX_RETRIES = 2     # v15: retry count for transient API failures
+BAR_FETCH_RETRY_DELAY = 1.5   # v15: seconds between retries (backoff: 1.5, 3.0)
+BAR_STALE_CACHE_SEC = 300     # v15: serve cached bars for up to 5 min during outages
 
 
 @dataclass
@@ -197,6 +200,48 @@ class BarStateManager:
         self._update_countback = 5 if resolution == 1 else 3
         self.state = ExecutionState(ticker=ticker)
         self._initialized = False
+        # v15: stale bar cache for transient API failures
+        self._last_good_raw = None        # last successful raw fetch result
+        self._last_good_raw_ts = 0.0      # epoch of last successful fetch
+        self._consecutive_failures = 0    # count of sequential fetch failures
+
+    def _fetch_with_retry(self, countback: int):
+        """Fetch bars with retry + backoff. Falls back to stale cache on failure.
+
+        v15: Up to BAR_FETCH_MAX_RETRIES attempts with exponential backoff.
+        On total failure, returns stale cached result if within BAR_STALE_CACHE_SEC.
+        """
+        last_err = None
+        for attempt in range(1 + BAR_FETCH_MAX_RETRIES):
+            try:
+                raw = self._get_bars(self.ticker, self._resolution, countback)
+                if raw:
+                    self._last_good_raw = raw
+                    self._last_good_raw_ts = _time.time()
+                    if self._consecutive_failures > 0:
+                        log.info(f"BarState [{self.ticker}]: fetch recovered after "
+                                 f"{self._consecutive_failures} failures")
+                    self._consecutive_failures = 0
+                    return raw
+            except Exception as e:
+                last_err = e
+                if attempt < BAR_FETCH_MAX_RETRIES:
+                    delay = BAR_FETCH_RETRY_DELAY * (2 ** attempt)
+                    log.info(f"BarState [{self.ticker}]: fetch attempt {attempt+1} failed "
+                             f"({e}), retrying in {delay:.1f}s")
+                    _time.sleep(delay)
+
+        # All attempts failed — try stale cache
+        self._consecutive_failures += 1
+        stale_age = _time.time() - self._last_good_raw_ts if self._last_good_raw_ts > 0 else float("inf")
+        if self._last_good_raw and stale_age < BAR_STALE_CACHE_SEC:
+            log.warning(f"BarState [{self.ticker}]: fetch failed ({last_err}), "
+                        f"using stale cache ({stale_age:.0f}s old, "
+                        f"failures={self._consecutive_failures})")
+            return self._last_good_raw
+        log.warning(f"BarState [{self.ticker}]: fetch failed ({last_err}), "
+                    f"no stale cache available (failures={self._consecutive_failures})")
+        return None
 
     def initialize(self) -> bool:
         """Fetch today's bars to build initial state. Call once at session start."""
@@ -204,7 +249,7 @@ class BarStateManager:
             log.warning(f"BarState [{self.ticker}]: no get_bars_fn, cannot initialize")
             return False
         try:
-            raw_bars = self._get_bars(self.ticker, self._resolution, self._init_countback)
+            raw_bars = self._fetch_with_retry(self._init_countback)
             if not raw_bars:
                 log.warning(f"BarState [{self.ticker}]: no bars returned")
                 return False
@@ -244,11 +289,15 @@ class BarStateManager:
         """
         Fetch latest bars and append new ones. Returns the newest bar if new,
         else None. Call this on each poll cycle.
+
+        v15: Retry with backoff on fetch failure. Cache last successful fetch
+        for up to BAR_STALE_CACHE_SEC so downstream logic keeps working during
+        transient API outages (404s, timeouts).
         """
         if not self._get_bars:
             return None
         try:
-            raw = self._get_bars(self.ticker, self._resolution, self._update_countback)
+            raw = self._fetch_with_retry(self._update_countback)
             if not raw:
                 return None
             bars = self._parse_bars(raw, resolution=self._resolution)
