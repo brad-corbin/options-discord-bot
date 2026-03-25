@@ -26,6 +26,7 @@ from telegram_commands import (
     set_last_scan,
     get_state,
     send_reply,
+    init_shared_state,
 )
 
 import jwt
@@ -39,6 +40,7 @@ import logging
 import csv
 import threading
 import queue
+import fcntl
 import portfolio
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
@@ -641,7 +643,7 @@ def mark_trade_sent(ticker, direction, short_k, long_k):
 # ─────────────────────────────────────────────────────────
 
 QUEUE_MAX        = 80
-QUEUE_WORKERS    = 6
+QUEUE_WORKERS    = max(1, SCAN_WORKERS)
 SIGNAL_TTL_SEC   = 480
 TG_MIN_GAP_SEC   = 0.8
 WAVE_COLLECT_SEC = 90
@@ -889,7 +891,6 @@ def _digest_poster_thread():
                 log.error(f"Digest flush error: {e}", exc_info=True)
 
 
-threading.Thread(target=_digest_poster_thread, daemon=True, name="digest-poster").start()
 
 
 def _tg_rate_limited_post(text: str, max_retries: int = 6, chat_id: str = None):
@@ -1404,7 +1405,7 @@ def _start_workers():
     return threads
 
 
-_queue_worker_threads = _start_workers()
+_queue_worker_threads = []
 
 
 # ─────────────────────────────────────────────────────────
@@ -6587,28 +6588,70 @@ def _em_scheduler():
         time.sleep(60)
 
 
-threading.Thread(target=_em_scheduler, daemon=True, name="em-scheduler").start()
-
-
 # ─────────────────────────────────────────────────────────
 # STARTUP
 # ─────────────────────────────────────────────────────────
 
-with app.app_context():
-    _tg_ws = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
-    if _tg_ws and BOT_URL:
-        register_webhook(BOT_URL, _tg_ws)
-    portfolio.init_store(store_get, store_set)
-    trade_journal.init_store(store_get, store_set)
-    _oi_cache = OICache(store_get, store_set)
-    log.info(f"OI cache initialized (Redis: {_get_redis() is not None})")
-    # ── Thesis Monitor Daemon ──
-    _thesis_daemon = init_thesis_daemon(
-        get_spot_fn=get_spot, intraday_post_fn=post_to_intraday,
-        store_get_fn=store_get, store_set_fn=store_set,
-        get_bars_fn=lambda ticker, res, count: get_intraday_bars(ticker, res, count),
-    )
-    log.info("Thesis monitor daemon started")
+_background_lock_fh = None
+_background_services_started = False
+_background_services_lock = threading.Lock()
+
+
+def _acquire_background_leader() -> bool:
+    """Ensure only one local process starts daemon threads under Gunicorn/Render."""
+    global _background_lock_fh
+    if _background_lock_fh is not None:
+        return True
+    lock_path = os.getenv("OMEGA_BG_LOCK_PATH", "/tmp/omega_background.lock").strip() or "/tmp/omega_background.lock"
+    try:
+        fh = open(lock_path, "a+")
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fh.seek(0)
+        fh.truncate()
+        fh.write(str(os.getpid()))
+        fh.flush()
+        _background_lock_fh = fh
+        return True
+    except OSError:
+        return False
+
+
+def _start_background_services_once():
+    global _background_services_started, _queue_worker_threads
+    with _background_services_lock:
+        if _background_services_started:
+            return True
+        if not _acquire_background_leader():
+            log.info("Background services not started in this worker (leader lock held elsewhere)")
+            return False
+        threading.Thread(target=_digest_poster_thread, daemon=True, name="digest-poster").start()
+        _queue_worker_threads = _start_workers()
+        threading.Thread(target=_em_scheduler, daemon=True, name="em-scheduler").start()
+        init_thesis_daemon(
+            get_spot_fn=get_spot, intraday_post_fn=post_to_intraday,
+            store_get_fn=store_get, store_set_fn=store_set,
+            get_bars_fn=lambda ticker, res, count: get_intraday_bars(ticker, res, count),
+        )
+        _background_services_started = True
+        log.info("Background services started in leader process")
+        return True
+
+
+def _initialize_app():
+    global _oi_cache
+    with app.app_context():
+        portfolio.init_store(store_get, store_set)
+        trade_journal.init_store(store_get, store_set)
+        init_shared_state(store_get, store_set)
+        _oi_cache = OICache(store_get, store_set)
+        log.info(f"OI cache initialized (Redis: {_get_redis() is not None})")
+        _tg_ws = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
+        if _tg_ws and BOT_URL and _acquire_background_leader():
+            register_webhook(BOT_URL, _tg_ws)
+        _start_background_services_once()
+
+
+_initialize_app()
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
