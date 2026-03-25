@@ -1,457 +1,544 @@
-# exit_policy.py
+# bar_state.py
 # ═══════════════════════════════════════════════════════════════════
-# Exit Policy Engine
+# Bar-Aware Market State Layer
 #
-# Replaces fixed exit rules with regime-aware, time-decayed policies.
-# Selected at entry based on setup score + regime + DTE.
+# Replaces point-to-point spot sampling with true OHLCV bar structure.
+# Manages 1m and 5m bar buffers, rolling VWAP, opening range, and
+# per-bar derived metrics (body %, wick %, expansion, distance from
+# key levels). Everything downstream validates from bar closes, not
+# sampled spot prices.
 #
-# Policies:
-#   TREND_CONTINUATION  — GEX-, confirmed break, let it run
-#   MEAN_REVERSION      — GEX+, failed move, monetize faster
-#   SCALP               — low score or late-day, tight management
-#
-# Features:
-#   - Regime-aware trail widths
-#   - Time-decay urgency curve
-#   - Partial scale sizing tied to setup quality
-#   - GEX flip mid-trade recalibration
-#   - MFE-based giveback limits
+# API cost: one 5m candle fetch per poll cycle (~60s cache).
+# Initial fill: one call fetching today's bars since open.
+# Incremental: cache hit most cycles, one call on expiry.
 # ═══════════════════════════════════════════════════════════════════
 
 import logging
 import time as _time
+import math
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, List, Dict
 
 log = logging.getLogger(__name__)
 
-
-# ── Time-of-Day Urgency (minutes since 8:30 CT open) ──
-# Returns urgency multiplier 1.0-3.0 that tightens everything late
-def _time_urgency(minutes_since_open: int = 0, is_0dte: bool = True) -> float:
-    """
-    Urgency multiplier based on time of day.
-    Higher = tighter stops, faster scales, less patience.
-    """
-    if not is_0dte:
-        return 1.0  # multi-day: no intraday decay pressure
-    if minutes_since_open < 120:       # before 10:30
-        return 1.0
-    elif minutes_since_open < 210:     # 10:30–12:00
-        return 1.2
-    elif minutes_since_open < 300:     # 12:00–1:30
-        return 1.5
-    elif minutes_since_open < 345:     # 1:30–2:15
-        return 2.0
-    else:                              # after 2:15
-        return 3.0
-
-
-def _minutes_since_open() -> int:
-    """Current minutes since 8:30 AM CT."""
-    try:
-        from zoneinfo import ZoneInfo
-        from datetime import datetime
-        now = datetime.now(ZoneInfo("America/Chicago"))
-        return now.hour * 60 + now.minute - 510  # 510 = 8:30 AM
-    except Exception:
-        return 180  # assume midday if we can't compute
+# ── Constants ──
+OR_5_MINUTES = 5
+OR_15_MINUTES = 15
+OR_30_MINUTES = 30
+MARKET_OPEN_MINS_CT = 510      # 8:30 AM CT in minutes
+MARKET_CLOSE_MINS_CT = 915     # 3:15 PM CT (SPY/QQQ options close)
+BAR_BUFFER_MAX_5M = 120        # ~10 hours of 5m bars
+BAR_BUFFER_MAX_1M = 420        # 7 hours of 1m bars
+BAR_FETCH_MAX_RETRIES = 2     # v15: retry count for transient API failures
+BAR_FETCH_RETRY_DELAY = 1.5   # v15: seconds between retries (backoff: 1.5, 3.0)
+BAR_STALE_CACHE_SEC = 300     # v15: serve cached bars for up to 5 min during outages
 
 
 @dataclass
-class ExitPolicy:
-    """
-    Immutable exit policy selected at trade entry.
-    Drives all management decisions for the trade's lifetime.
-    """
-    name: str = "DEFAULT"
-    # Trail parameters
-    trail_pct_of_profit: float = 0.45   # trail at 45% of open profit
-    trail_min_profit_pct: float = 0.15  # don't trail until 0.15% in profit
-    # Scale parameters
-    scale_fraction: str = "1/2"         # how much at T1
-    scale_at_target: bool = True
-    # Giveback limits
-    max_giveback_pct: float = 0.40      # max % of MFE to give back
-    min_mfe_before_giveback: float = 0.30  # v15: don't eval giveback until MFE ≥ this ($)
-    # Extension / exhaustion
-    exhaustion_decel_mult: float = 0.4  # momentum decel = exhaustion
-    # Regime context
-    gex_at_entry: str = "positive"
-    setup_score: int = 3
-    is_0dte: bool = True
-    # Time urgency
-    urgency: float = 1.0
+class Bar:
+    """Single OHLCV bar."""
+    timestamp: float      # epoch seconds
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: int = 0
+    resolution: int = 5   # minutes
 
-    def to_config(self) -> dict:
-        """Serialize to dict for persistence on ActiveTrade."""
+    @property
+    def body(self) -> float:
+        return abs(self.close - self.open)
+
+    @property
+    def range(self) -> float:
+        return self.high - self.low
+
+    @property
+    def body_pct(self) -> float:
+        """Body as fraction of range. 1.0 = no wicks."""
+        return self.body / self.range if self.range > 0 else 0.0
+
+    @property
+    def upper_wick(self) -> float:
+        return self.high - max(self.open, self.close)
+
+    @property
+    def lower_wick(self) -> float:
+        return min(self.open, self.close) - self.low
+
+    @property
+    def upper_wick_pct(self) -> float:
+        return self.upper_wick / self.range if self.range > 0 else 0.0
+
+    @property
+    def lower_wick_pct(self) -> float:
+        return self.lower_wick / self.range if self.range > 0 else 0.0
+
+    @property
+    def is_bullish(self) -> bool:
+        return self.close > self.open
+
+    @property
+    def is_bearish(self) -> bool:
+        return self.close < self.open
+
+    @property
+    def midpoint(self) -> float:
+        return (self.high + self.low) / 2
+
+    def closed_through(self, level: float, direction: str) -> bool:
+        """Did this bar CLOSE through a level (not just wick)?"""
+        if direction == "DOWN":
+            return self.close < level
+        return self.close > level
+
+    def wicked_through(self, level: float, direction: str) -> bool:
+        """Did this bar wick through a level without closing through it?"""
+        if direction == "DOWN":
+            return self.low < level <= self.close
+        return self.high > level >= self.close
+
+
+@dataclass
+class OpeningRange:
+    """Opening range computed from first N minutes of session."""
+    high: float = 0.0
+    low: float = 0.0
+    width: float = 0.0
+    width_pct: float = 0.0
+    range_type: str = "UNKNOWN"   # narrow / normal / wide
+    minutes: int = 30
+    bar_count: int = 0
+    vwap_at_or_close: float = 0.0
+    is_complete: bool = False
+
+    @property
+    def midpoint(self) -> float:
+        return (self.high + self.low) / 2 if self.high > 0 else 0.0
+
+
+@dataclass
+class VWAPState:
+    """Rolling VWAP tracker."""
+    cumulative_tpv: float = 0.0   # sum(typical_price * volume)
+    cumulative_vol: float = 0.0   # sum(volume)
+    value: float = 0.0
+
+    def update(self, bar: Bar):
+        tp = (bar.high + bar.low + bar.close) / 3
+        vol = max(bar.volume, 1)  # avoid div-by-zero if volume missing
+        self.cumulative_tpv += tp * vol
+        self.cumulative_vol += vol
+        self.value = self.cumulative_tpv / self.cumulative_vol if self.cumulative_vol > 0 else bar.close
+
+    def reset(self):
+        self.cumulative_tpv = 0.0
+        self.cumulative_vol = 0.0
+        self.value = 0.0
+
+
+@dataclass
+class BarMetrics:
+    """Derived metrics from recent bar history."""
+    avg_range_5: float = 0.0        # avg true range of last 5 bars
+    avg_body_pct_5: float = 0.0     # avg body% of last 5 bars
+    expansion_ratio: float = 1.0    # current bar range / avg range
+    consecutive_direction: int = 0  # +N bullish, -N bearish
+    net_move_5: float = 0.0         # close[now] - close[5 ago]
+    net_move_pct_5: float = 0.0
+
+
+@dataclass
+class ExecutionState:
+    """
+    Complete bar-aware market state for a single ticker.
+    This replaces the old price_history list of spot samples.
+    """
+    ticker: str = ""
+    # Bar buffers
+    bars_5m: List[Bar] = field(default_factory=list)
+    bars_1m: List[Bar] = field(default_factory=list)
+    # Opening ranges
+    or_5: OpeningRange = field(default_factory=lambda: OpeningRange(minutes=5))
+    or_15: OpeningRange = field(default_factory=lambda: OpeningRange(minutes=15))
+    or_30: OpeningRange = field(default_factory=lambda: OpeningRange(minutes=30))
+    # VWAP
+    vwap: VWAPState = field(default_factory=VWAPState)
+    # Derived
+    metrics: BarMetrics = field(default_factory=BarMetrics)
+    # Current state
+    last_close: float = 0.0
+    last_bar_ts: float = 0.0
+    session_high: float = 0.0
+    session_low: float = 999999.0
+    session_date: str = ""
+    bars_since_open: int = 0
+
+
+class BarStateManager:
+    """
+    Manages bar ingestion, OR computation, VWAP, and derived metrics.
+    One instance per monitored ticker.
+    """
+
+    def __init__(self, ticker: str, get_bars_fn=None, resolution: int = 5):
+        """
+        Args:
+            ticker: Symbol
+            get_bars_fn: callable(ticker, resolution, countback) -> list[dict]
+                         Each dict: {t: epoch, o, h, l, c, v}
+            resolution: Bar size in minutes. Default 5. Use 1 for SPY to reduce lag.
+        """
+        self.ticker = ticker
+        self._get_bars = get_bars_fn
+        self._resolution = resolution
+        # Countback for init: cover ~6.5 hours of session
+        # 5m: 80 bars, 1m: 400 bars
+        self._init_countback = 400 if resolution == 1 else 80
+        # Countback for update: last 3 bars (same logic, faster resolution = more recent data)
+        self._update_countback = 5 if resolution == 1 else 3
+        self.state = ExecutionState(ticker=ticker)
+        self._initialized = False
+        # v15: stale bar cache for transient API failures
+        self._last_good_raw = None        # last successful raw fetch result
+        self._last_good_raw_ts = 0.0      # epoch of last successful fetch
+        self._consecutive_failures = 0    # count of sequential fetch failures
+
+    def _fetch_with_retry(self, countback: int):
+        """Fetch bars with retry + backoff. Falls back to stale cache on failure.
+
+        v15: Up to BAR_FETCH_MAX_RETRIES attempts with exponential backoff.
+        On total failure, returns stale cached result if within BAR_STALE_CACHE_SEC.
+        """
+        last_err = None
+        for attempt in range(1 + BAR_FETCH_MAX_RETRIES):
+            try:
+                raw = self._get_bars(self.ticker, self._resolution, countback)
+                if raw:
+                    self._last_good_raw = raw
+                    self._last_good_raw_ts = _time.time()
+                    if self._consecutive_failures > 0:
+                        log.info(f"BarState [{self.ticker}]: fetch recovered after "
+                                 f"{self._consecutive_failures} failures")
+                    self._consecutive_failures = 0
+                    return raw
+            except Exception as e:
+                last_err = e
+                if attempt < BAR_FETCH_MAX_RETRIES:
+                    delay = BAR_FETCH_RETRY_DELAY * (2 ** attempt)
+                    log.info(f"BarState [{self.ticker}]: fetch attempt {attempt+1} failed "
+                             f"({e}), retrying in {delay:.1f}s")
+                    _time.sleep(delay)
+
+        # All attempts failed — try stale cache
+        self._consecutive_failures += 1
+        stale_age = _time.time() - self._last_good_raw_ts if self._last_good_raw_ts > 0 else float("inf")
+        if self._last_good_raw and stale_age < BAR_STALE_CACHE_SEC:
+            log.warning(f"BarState [{self.ticker}]: fetch failed ({last_err}), "
+                        f"using stale cache ({stale_age:.0f}s old, "
+                        f"failures={self._consecutive_failures})")
+            return self._last_good_raw
+        log.warning(f"BarState [{self.ticker}]: fetch failed ({last_err}), "
+                    f"no stale cache available (failures={self._consecutive_failures})")
+        return None
+
+    def initialize(self) -> bool:
+        """Fetch today's bars to build initial state. Call once at session start."""
+        if not self._get_bars:
+            log.warning(f"BarState [{self.ticker}]: no get_bars_fn, cannot initialize")
+            return False
+        try:
+            raw_bars = self._fetch_with_retry(self._init_countback)
+            if not raw_bars:
+                log.warning(f"BarState [{self.ticker}]: no bars returned")
+                return False
+            bars = self._parse_bars(raw_bars, resolution=self._resolution)
+            if not bars:
+                return False
+            # Filter to today only
+            today = _get_today_str()
+            today_bars = [b for b in bars if _epoch_to_date(b.timestamp) == today]
+            if not today_bars:
+                today_bars = bars[-40:]  # fallback: last 40 bars
+            self.state.bars_5m = today_bars[-BAR_BUFFER_MAX_5M:]
+            self.state.session_date = today
+            # Build opening ranges from bars
+            self._compute_opening_ranges()
+            # Build VWAP from all today's bars
+            self.state.vwap.reset()
+            for bar in self.state.bars_5m:
+                self.state.vwap.update(bar)
+            # Update metrics
+            self._update_session_extremes()
+            self._update_metrics()
+            if self.state.bars_5m:
+                self.state.last_close = self.state.bars_5m[-1].close
+                self.state.last_bar_ts = self.state.bars_5m[-1].timestamp
+                self.state.bars_since_open = len(self.state.bars_5m)
+            self._initialized = True
+            log.info(f"BarState [{self.ticker}]: initialized with {len(self.state.bars_5m)} {self._resolution}m bars, "
+                     f"VWAP=${self.state.vwap.value:.2f}, "
+                     f"OR30=${self.state.or_30.low:.2f}-${self.state.or_30.high:.2f}")
+            return True
+        except Exception as e:
+            log.error(f"BarState [{self.ticker}]: init failed: {e}", exc_info=True)
+            return False
+
+    def update(self) -> Optional[Bar]:
+        """
+        Fetch latest bars and append new ones. Returns the newest bar if new,
+        else None. Call this on each poll cycle.
+
+        v15: Retry with backoff on fetch failure. Cache last successful fetch
+        for up to BAR_STALE_CACHE_SEC so downstream logic keeps working during
+        transient API outages (404s, timeouts).
+        """
+        if not self._get_bars:
+            return None
+        try:
+            raw = self._fetch_with_retry(self._update_countback)
+            if not raw:
+                return None
+            bars = self._parse_bars(raw, resolution=self._resolution)
+            if not bars:
+                return None
+            # Check for new session BEFORE appending — prevents clearing just-appended bars
+            today = _get_today_str()
+            if today != self.state.session_date:
+                self._new_session(today)
+                # Reinitialize with full backfill for new session
+                return self._reinit_from_bars(bars)
+            new_bar = None
+            for bar in bars:
+                if bar.timestamp > self.state.last_bar_ts:
+                    self.state.bars_5m.append(bar)
+                    self.state.vwap.update(bar)
+                    new_bar = bar
+                    self.state.last_bar_ts = bar.timestamp
+                    self.state.last_close = bar.close
+                    self.state.bars_since_open += 1
+            # Trim buffer
+            if len(self.state.bars_5m) > BAR_BUFFER_MAX_5M:
+                self.state.bars_5m = self.state.bars_5m[-BAR_BUFFER_MAX_5M:]
+            # Update OR if still forming
+            if not self.state.or_30.is_complete:
+                self._compute_opening_ranges()
+            # Update derived metrics
+            self._update_session_extremes()
+            self._update_metrics()
+            return new_bar
+        except Exception as e:
+            log.warning(f"BarState [{self.ticker}]: update failed: {e}")
+            return None
+
+    def _reinit_from_bars(self, seed_bars: list) -> Optional['Bar']:
+        """After session reset, seed with available bars and re-init."""
+        for bar in seed_bars:
+            self.state.bars_5m.append(bar)
+            self.state.vwap.update(bar)
+            self.state.last_bar_ts = bar.timestamp
+            self.state.last_close = bar.close
+            self.state.bars_since_open += 1
+        self._compute_opening_ranges()
+        self._update_session_extremes()
+        self._update_metrics()
+        # Then do a full backfill
+        self.initialize()
+        return self.state.bars_5m[-1] if self.state.bars_5m else None
+
+    def get_latest_bar(self) -> Optional[Bar]:
+        return self.state.bars_5m[-1] if self.state.bars_5m else None
+
+    def get_close(self) -> float:
+        return self.state.last_close
+
+    def get_recent_bars(self, n: int = 5) -> List[Bar]:
+        return self.state.bars_5m[-n:]
+
+    def bar_closed_through(self, level: float, direction: str, lookback: int = 1) -> bool:
+        """Did any of the last N bars close through a level?"""
+        for bar in self.state.bars_5m[-lookback:]:
+            if bar.closed_through(level, direction):
+                return True
+        return False
+
+    def bar_wicked_only(self, level: float, direction: str, lookback: int = 1) -> bool:
+        """Did bars wick through but NOT close through?"""
+        wicked = False
+        for bar in self.state.bars_5m[-lookback:]:
+            if bar.wicked_through(level, direction):
+                wicked = True
+            if bar.closed_through(level, direction):
+                return False
+        return wicked
+
+    def distance_from_vwap(self, price: float = None) -> float:
+        """Distance from VWAP as percentage."""
+        p = price or self.state.last_close
+        if self.state.vwap.value <= 0 or p <= 0:
+            return 0.0
+        return (p - self.state.vwap.value) / self.state.vwap.value * 100
+
+    def distance_from_or(self, price: float = None, or_minutes: int = 30) -> dict:
+        """Distance from opening range boundaries."""
+        p = price or self.state.last_close
+        orng = {5: self.state.or_5, 15: self.state.or_15, 30: self.state.or_30}.get(or_minutes, self.state.or_30)
+        if not orng.is_complete or orng.high <= 0:
+            return {"above_or": False, "below_or": False, "inside_or": False, "dist_high": 0, "dist_low": 0}
         return {
-            "name": self.name, "trail_pct_of_profit": self.trail_pct_of_profit,
-            "trail_min_profit_pct": self.trail_min_profit_pct,
-            "scale_fraction": self.scale_fraction, "scale_at_target": self.scale_at_target,
-            "max_giveback_pct": self.max_giveback_pct,
-            "min_mfe_before_giveback": self.min_mfe_before_giveback,
-            "exhaustion_decel_mult": self.exhaustion_decel_mult,
-            "gex_at_entry": self.gex_at_entry, "setup_score": self.setup_score,
-            "is_0dte": self.is_0dte,
+            "above_or": p > orng.high,
+            "below_or": p < orng.low,
+            "inside_or": orng.low <= p <= orng.high,
+            "dist_high": (p - orng.high) / orng.high * 100 if orng.high > 0 else 0,
+            "dist_low": (p - orng.low) / orng.low * 100 if orng.low > 0 else 0,
+            "dist_mid": (p - orng.midpoint) / orng.midpoint * 100 if orng.midpoint > 0 else 0,
         }
 
-    @classmethod
-    def from_config(cls, cfg: dict) -> 'ExitPolicy':
-        """Reconstruct from persisted config dict."""
-        if not cfg:
-            return cls()
-        return cls(
-            name=cfg.get("name", "DEFAULT"),
-            trail_pct_of_profit=cfg.get("trail_pct_of_profit", 0.45),
-            trail_min_profit_pct=cfg.get("trail_min_profit_pct", 0.15),
-            scale_fraction=cfg.get("scale_fraction", "1/2"),
-            scale_at_target=cfg.get("scale_at_target", True),
-            max_giveback_pct=cfg.get("max_giveback_pct", 0.40),
-            min_mfe_before_giveback=cfg.get("min_mfe_before_giveback", 0.30),
-            exhaustion_decel_mult=cfg.get("exhaustion_decel_mult", 0.4),
-            gex_at_entry=cfg.get("gex_at_entry", "positive"),
-            setup_score=cfg.get("setup_score", 3),
-            is_0dte=cfg.get("is_0dte", True),
-            urgency=_time_urgency(_minutes_since_open(), cfg.get("is_0dte", True)),
-        )
+    def is_expanding(self, threshold: float = 1.5) -> bool:
+        """Is the current bar range expanding vs recent average?"""
+        return self.state.metrics.expansion_ratio >= threshold
 
-    def compute_trail_stop(self, entry_price: float, current_price: float,
-                           direction: str, current_stop: float = None) -> float:
-        """Compute trail stop accounting for urgency and regime."""
-        if direction == "LONG":
-            profit = current_price - entry_price
-        else:
-            profit = entry_price - current_price
-        if profit <= entry_price * (self.trail_min_profit_pct / 100):
-            return current_stop or (entry_price * (1 - 0.005) if direction == "LONG" else entry_price * (1 + 0.005))
-        # Effective trail width narrows with urgency
-        eff_pct = self.trail_pct_of_profit / self.urgency
-        trail_width = profit * eff_pct
-        if direction == "LONG":
-            new_stop = current_price - trail_width
-            new_stop = max(new_stop, entry_price)  # never below BE
-        else:
-            new_stop = current_price + trail_width
-            new_stop = min(new_stop, entry_price)  # never above BE
-        # Only tighten, never loosen
-        if current_stop is not None:
-            if direction == "LONG":
-                new_stop = max(new_stop, current_stop)
+    # ── Internal: Parse raw API response into Bar objects ──
+
+    def _parse_bars(self, raw: list, resolution: int = 5) -> List[Bar]:
+        """Parse list of dicts or API-style response into Bar objects."""
+        bars = []
+        if isinstance(raw, dict):
+            # MarketData.app format: {s: "ok", o: [...], h: [...], ...}
+            opens = raw.get("o") or []
+            highs = raw.get("h") or []
+            lows = raw.get("l") or []
+            closes = raw.get("c") or []
+            volumes = raw.get("v") or []
+            timestamps = raw.get("t") or []
+            n = min(len(opens), len(highs), len(lows), len(closes))
+            for i in range(n):
+                bars.append(Bar(
+                    timestamp=timestamps[i] if i < len(timestamps) else 0,
+                    open=float(opens[i]),
+                    high=float(highs[i]),
+                    low=float(lows[i]),
+                    close=float(closes[i]),
+                    volume=int(volumes[i]) if i < len(volumes) and volumes[i] else 0,
+                    resolution=resolution,
+                ))
+        elif isinstance(raw, list) and raw:
+            if isinstance(raw[0], dict):
+                for d in raw:
+                    bars.append(Bar(
+                        timestamp=d.get("t", d.get("timestamp", 0)),
+                        open=float(d.get("o", d.get("open", 0))),
+                        high=float(d.get("h", d.get("high", 0))),
+                        low=float(d.get("l", d.get("low", 0))),
+                        close=float(d.get("c", d.get("close", 0))),
+                        volume=int(d.get("v", d.get("volume", 0))),
+                        resolution=resolution,
+                    ))
+        return bars
+
+    # ── Internal: Opening Range ──
+
+    def _compute_opening_ranges(self):
+        """Compute OR5, OR15, OR30 from the 5m bar buffer."""
+        if not self.state.bars_5m:
+            return
+        # Find session open timestamp (first bar of today)
+        open_ts = self.state.bars_5m[0].timestamp
+        for minutes, orng in [(5, self.state.or_5), (15, self.state.or_15), (30, self.state.or_30)]:
+            cutoff = open_ts + (minutes * 60)
+            or_bars = [b for b in self.state.bars_5m if b.timestamp < cutoff]
+            if not or_bars:
+                continue
+            orng.high = max(b.high for b in or_bars)
+            orng.low = min(b.low for b in or_bars)
+            orng.width = orng.high - orng.low
+            mid = (orng.high + orng.low) / 2
+            orng.width_pct = orng.width / mid * 100 if mid > 0 else 0
+            orng.bar_count = len(or_bars)
+            orng.vwap_at_or_close = self.state.vwap.value
+            # Enough bars to consider complete?
+            expected_bars = minutes // 5
+            orng.is_complete = len(or_bars) >= expected_bars
+            # Classify
+            if orng.width_pct > 0.6:
+                orng.range_type = "WIDE"
+            elif orng.width_pct < 0.2:
+                orng.range_type = "NARROW"
             else:
-                new_stop = min(new_stop, current_stop)
-        return round(new_stop, 2)
+                orng.range_type = "NORMAL"
 
-    def should_force_exit_giveback(self, entry_price: float, current_price: float,
-                                    max_favorable: float, direction: str) -> bool:
-        """Has the trade given back too much of its best move?"""
-        if max_favorable <= 0:
-            return False
-        # v15: Don't evaluate giveback on tiny MFE — noise-level moves
-        # shouldn't trigger exit logic. Let the hard stop handle those.
-        if max_favorable < self.min_mfe_before_giveback:
-            return False
-        if direction == "LONG":
-            current_profit = current_price - entry_price
-        else:
-            current_profit = entry_price - current_price
-        if current_profit < 0:
-            return True  # already a loss after having been profitable
-        giveback = 1.0 - (current_profit / max_favorable)
-        # Tighten giveback limit with urgency
-        effective_max = self.max_giveback_pct / self.urgency
-        return giveback > effective_max
+    # ── Internal: Session Extremes ──
 
-    def should_scale(self, price: float, target: float, direction: str) -> bool:
-        """Has first target been reached?"""
-        if not self.scale_at_target:
-            return False
-        if direction == "LONG":
-            return price >= target
-        return price <= target
+    def _update_session_extremes(self):
+        if not self.state.bars_5m:
+            return
+        self.state.session_high = max(b.high for b in self.state.bars_5m)
+        self.state.session_low = min(b.low for b in self.state.bars_5m)
 
-    def get_urgency_label(self) -> str:
-        if self.urgency >= 3.0:
-            return "CRITICAL — close everything"
-        elif self.urgency >= 2.0:
-            return "HIGH — monetize winners, cut laggards"
-        elif self.urgency >= 1.5:
-            return "MODERATE — profit-taking bias"
-        elif self.urgency >= 1.2:
-            return "MILD — normal but tightening"
-        return "NORMAL"
+    # ── Internal: Derived Metrics ──
 
-    def recalibrate_for_gex_flip(self, new_gex_sign: str) -> 'ExitPolicy':
-        """
-        Return a new policy adjusted for a mid-trade GEX regime change.
-        Does NOT modify the original.
-        """
-        if new_gex_sign == self.gex_at_entry:
-            return self  # no change
-        # GEX flipped — adjust policy
-        new = ExitPolicy(
-            name=f"{self.name}_FLIPPED",
-            trail_pct_of_profit=self.trail_pct_of_profit,
-            trail_min_profit_pct=self.trail_min_profit_pct,
-            scale_fraction=self.scale_fraction,
-            scale_at_target=self.scale_at_target,
-            max_giveback_pct=self.max_giveback_pct,
-            exhaustion_decel_mult=self.exhaustion_decel_mult,
-            gex_at_entry=self.gex_at_entry,
-            setup_score=self.setup_score,
-            is_0dte=self.is_0dte,
-            urgency=self.urgency,
-        )
-        if self.gex_at_entry == "negative" and new_gex_sign == "positive":
-            # Entered in trend, now pinning — tighten
-            new.trail_pct_of_profit = min(self.trail_pct_of_profit, 0.30)
-            new.max_giveback_pct = min(self.max_giveback_pct, 0.30)
-            new.name = f"{self.name}_TREND→PIN"
-            log.info(f"ExitPolicy: GEX flip neg→pos, tightening trail to {new.trail_pct_of_profit:.0%}")
-        elif self.gex_at_entry == "positive" and new_gex_sign == "negative":
-            # Entered in pin, now trending — widen
-            new.trail_pct_of_profit = max(self.trail_pct_of_profit, 0.55)
-            new.max_giveback_pct = max(self.max_giveback_pct, 0.50)
-            new.name = f"{self.name}_PIN→TREND"
-            log.info(f"ExitPolicy: GEX flip pos→neg, widening trail to {new.trail_pct_of_profit:.0%}")
-        return new
+    def _update_metrics(self):
+        bars = self.state.bars_5m
+        m = self.state.metrics
+        if len(bars) < 2:
+            return
+        recent = bars[-5:] if len(bars) >= 5 else bars
+        m.avg_range_5 = sum(b.range for b in recent) / len(recent)
+        m.avg_body_pct_5 = sum(b.body_pct for b in recent) / len(recent)
+        current = bars[-1]
+        m.expansion_ratio = current.range / m.avg_range_5 if m.avg_range_5 > 0 else 1.0
+        # Consecutive direction
+        count = 0
+        for b in reversed(bars):
+            if b.is_bullish:
+                if count < 0:
+                    break
+                count += 1
+            elif b.is_bearish:
+                if count > 0:
+                    break
+                count -= 1
+            else:
+                break
+        m.consecutive_direction = count
+        # Net move over last 5 bars
+        lookback = min(5, len(bars))
+        m.net_move_5 = bars[-1].close - bars[-lookback].close
+        ref = bars[-lookback].close
+        m.net_move_pct_5 = m.net_move_5 / ref * 100 if ref > 0 else 0
+
+    # ── Internal: Session Management ──
+
+    def _new_session(self, date: str):
+        """Reset for new trading day."""
+        self.state.session_date = date
+        self.state.bars_5m.clear()
+        self.state.bars_1m.clear()
+        self.state.vwap.reset()
+        self.state.or_5 = OpeningRange(minutes=5)
+        self.state.or_15 = OpeningRange(minutes=15)
+        self.state.or_30 = OpeningRange(minutes=30)
+        self.state.session_high = 0.0
+        self.state.session_low = 999999.0
+        self.state.bars_since_open = 0
+        self.state.metrics = BarMetrics()
+        log.info(f"BarState [{self.ticker}]: new session {date}")
 
 
-# ── Policy Factory ──
+# ── Helpers ──
 
-def select_exit_policy(setup_score: int, gex_sign: str, setup_type: str,
-                       is_0dte: bool = True, vix: float = 20.0,
-                       time_phase: str = "MORNING") -> ExitPolicy:
-    """
-    Select the appropriate exit policy based on entry conditions.
-    Called once at trade creation.
-    """
-    urgency = _time_urgency(_minutes_since_open(), is_0dte)
-
-    # ── TREND_CONTINUATION: GEX-, confirmed break, high score ──
-    if gex_sign == "negative" and setup_type == "BREAK" and setup_score >= 4:
-        return ExitPolicy(
-            name="TREND_CONTINUATION",
-            trail_pct_of_profit=0.55,    # wide: let it run
-            trail_min_profit_pct=0.15,
-            scale_fraction="1/3" if setup_score >= 5 else "1/2",
-            scale_at_target=True,
-            max_giveback_pct=0.50,
-            min_mfe_before_giveback=0.50, # v15: trends need room to breathe
-            exhaustion_decel_mult=0.35,
-            gex_at_entry=gex_sign,
-            setup_score=setup_score,
-            is_0dte=is_0dte,
-            urgency=urgency,
-        )
-
-    # ── MEAN_REVERSION: GEX+, failed move, squeeze ──
-    if gex_sign == "positive" and setup_type in ("FAILED", "RETEST"):
-        return ExitPolicy(
-            name="MEAN_REVERSION",
-            trail_pct_of_profit=0.35,    # v15: 0.30→0.35 — give reversion room
-            trail_min_profit_pct=0.10,
-            scale_fraction="2/3",
-            scale_at_target=True,
-            max_giveback_pct=0.50,       # v15: 0.30→0.50 — was killing winners
-            min_mfe_before_giveback=0.30, # v15: $0.30 min before giveback eval
-            exhaustion_decel_mult=0.45,
-            gex_at_entry=gex_sign,
-            setup_score=setup_score,
-            is_0dte=is_0dte,
-            urgency=urgency,
-        )
-
-    # ── GEX- SQUEEZE: failed move in negative gamma ──
-    if gex_sign == "negative" and setup_type == "FAILED":
-        return ExitPolicy(
-            name="GEX_NEG_SQUEEZE",
-            trail_pct_of_profit=0.50,    # wide: squeeze can run hard
-            trail_min_profit_pct=0.12,
-            scale_fraction="1/2",
-            scale_at_target=True,
-            max_giveback_pct=0.55,       # v15: 0.45→0.55
-            min_mfe_before_giveback=0.40, # v15: squeezes need room
-            exhaustion_decel_mult=0.35,
-            gex_at_entry=gex_sign,
-            setup_score=setup_score,
-            is_0dte=is_0dte,
-            urgency=urgency,
-        )
-
-    # ── GEX+ BREAK: lower conviction continuation ──
-    if gex_sign == "positive" and setup_type == "BREAK":
-        return ExitPolicy(
-            name="GEX_POS_BREAK",
-            trail_pct_of_profit=0.25,    # very tight: mean reversion likely
-            trail_min_profit_pct=0.08,
-            scale_fraction="2/3",
-            scale_at_target=True,
-            max_giveback_pct=0.35,       # v15: 0.25→0.35
-            min_mfe_before_giveback=0.30,
-            exhaustion_decel_mult=0.50,
-            gex_at_entry=gex_sign,
-            setup_score=setup_score,
-            is_0dte=is_0dte,
-            urgency=urgency,
-        )
-
-    # ── SCALP: low score, late day, or unclear regime ──
-    if setup_score <= 3 or time_phase in ("POWER_HOUR", "CLOSE"):
-        return ExitPolicy(
-            name="SCALP",
-            trail_pct_of_profit=0.25,
-            trail_min_profit_pct=0.08,
-            scale_fraction="2/3",
-            scale_at_target=True,
-            max_giveback_pct=0.35,       # v15: 0.25→0.35
-            min_mfe_before_giveback=0.25,
-            exhaustion_decel_mult=0.50,
-            gex_at_entry=gex_sign,
-            setup_score=setup_score,
-            is_0dte=is_0dte,
-            urgency=max(urgency, 1.5),  # always at least moderate urgency
-        )
-
-    # ── DEFAULT: moderate management ──
-    return ExitPolicy(
-        name="DEFAULT",
-        trail_pct_of_profit=0.40,
-        trail_min_profit_pct=0.12,
-        scale_fraction="1/2",
-        scale_at_target=True,
-        max_giveback_pct=0.50,           # v15: 0.40→0.50
-        min_mfe_before_giveback=0.30,
-        exhaustion_decel_mult=0.40,
-        gex_at_entry=gex_sign,
-        setup_score=setup_score,
-        is_0dte=is_0dte,
-        urgency=urgency,
-    )
+def _get_today_str() -> str:
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("America/Chicago")).strftime("%Y-%m-%d")
+    except Exception:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
-@dataclass
-class ExitSignal:
-    """Output from the exit policy evaluation."""
-    action: str = "HOLD"        # HOLD / SCALE / TRAIL / REDUCE / EXIT / INVALIDATE
-    reason: str = ""
-    new_stop: Optional[float] = None
-    scale_fraction: str = ""
-    urgency_label: str = ""
-    pnl_pct: float = 0.0
-    mfe_pct: float = 0.0
-
-
-def evaluate_exit(policy: ExitPolicy, trade, bar, bars_recent: list,
-                  current_gex: str = None) -> ExitSignal:
-    """
-    Evaluate exit conditions for an active trade using its policy.
-    Returns an ExitSignal describing what to do.
-
-    Args:
-        policy: The trade's ExitPolicy
-        trade: ActiveTrade object
-        bar: Current Bar (latest 5m close)
-        bars_recent: Last 4-5 bars for momentum check
-        current_gex: Current GEX sign (for mid-trade flip detection)
-    """
-    price = bar.close
-    signal = ExitSignal()
-
-    # Update urgency based on current time FIRST, then label
-    policy.urgency = _time_urgency(_minutes_since_open(), policy.is_0dte)
-    signal.urgency_label = policy.get_urgency_label()
-
-    # P&L
-    if trade.direction == "LONG":
-        signal.pnl_pct = (price - trade.entry_price) / trade.entry_price * 100
-        profit = price - trade.entry_price
-    else:
-        signal.pnl_pct = (trade.entry_price - price) / trade.entry_price * 100
-        profit = trade.entry_price - price
-
-    signal.mfe_pct = trade.max_favorable / trade.entry_price * 100 if trade.entry_price > 0 else 0
-
-    # ── 1. GEX flip detection ──
-    if current_gex and current_gex != policy.gex_at_entry:
-        adjusted = policy.recalibrate_for_gex_flip(current_gex)
-        if adjusted.name != policy.name:
-            signal.action = "REDUCE"
-            signal.reason = f"GEX flipped {policy.gex_at_entry}→{current_gex}. Adjusting management."
-            signal.new_stop = adjusted.compute_trail_stop(
-                trade.entry_price, price, trade.direction, trade.trail_stop)
-            return signal
-
-    # ── 2. Invalidation — bar closed through stop ──
-    stop_ref = trade.trail_stop if trade.trail_stop else trade.stop_level
-    if trade.direction == "LONG" and bar.close < stop_ref:
-        signal.action = "INVALIDATE"
-        signal.reason = f"Bar closed below stop ${stop_ref:.2f}"
-        signal.pnl_pct = signal.pnl_pct
-        return signal
-    if trade.direction == "SHORT" and bar.close > stop_ref:
-        signal.action = "INVALIDATE"
-        signal.reason = f"Bar closed above stop ${stop_ref:.2f}"
-        return signal
-
-    # ── 3. Giveback limit ──
-    if trade.max_favorable > 0 and policy.should_force_exit_giveback(
-            trade.entry_price, price, trade.max_favorable, trade.direction):
-        signal.action = "EXIT"
-        signal.reason = f"Giveback exceeded {policy.max_giveback_pct:.0%} of MFE"
-        return signal
-
-    # ── 4. Scale at target ──
-    if trade.status == "OPEN" and trade.targets:
-        first_target = trade.targets[0]
-        if policy.should_scale(price, first_target, trade.direction):
-            signal.action = "SCALE"
-            signal.reason = f"Target ${first_target:.2f} reached"
-            signal.scale_fraction = policy.scale_fraction
-            signal.new_stop = trade.entry_price  # move to breakeven
-            return signal
-
-    # ── 5. Trail stop update ──
-    if trade.status in ("SCALED", "TRAILED"):
-        new_stop = policy.compute_trail_stop(
-            trade.entry_price, price, trade.direction, trade.trail_stop)
-        if trade.trail_stop is None or (
-            (trade.direction == "LONG" and new_stop > trade.trail_stop) or
-            (trade.direction == "SHORT" and new_stop < trade.trail_stop)
-        ):
-            signal.action = "TRAIL"
-            signal.reason = f"Trail tightened → ${new_stop:.2f}"
-            signal.new_stop = new_stop
-            return signal
-
-    # ── 6. Momentum exhaustion ──
-    if trade.status in ("SCALED", "TRAILED") and len(bars_recent) >= 3:
-        diffs = [bars_recent[i].close - bars_recent[i - 1].close for i in range(1, len(bars_recent))]
-        avg_d = sum(diffs) / len(diffs) if diffs else 0
-        last_d = diffs[-1] if diffs else 0
-        decel = False
-        if trade.direction == "LONG" and avg_d > 0:
-            decel = abs(last_d) < abs(avg_d) * policy.exhaustion_decel_mult
-        elif trade.direction == "SHORT" and avg_d < 0:
-            decel = abs(last_d) < abs(avg_d) * policy.exhaustion_decel_mult
-        # Also check reversal
-        reversal = (trade.direction == "LONG" and last_d < 0) or (trade.direction == "SHORT" and last_d > 0)
-        if (decel or reversal) and trade.max_favorable > trade.entry_price * 0.003:
-            signal.action = "EXIT"
-            signal.reason = "Momentum exhaustion after scaling"
-            return signal
-
-    # ── 7. Time urgency forced exit ──
-    if policy.urgency >= 3.0 and profit > 0:
-        signal.action = "EXIT"
-        signal.reason = "Session closing — monetize remaining"
-        return signal
-
-    if policy.urgency >= 2.0 and profit <= 0 and trade.max_favorable > trade.entry_price * 0.002:
-        signal.action = "EXIT"
-        signal.reason = "Late session + losing after having been profitable — cut"
-        return signal
-
-    signal.action = "HOLD"
-    signal.reason = "No exit trigger"
-    return signal
+def _epoch_to_date(epoch: float) -> str:
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.fromtimestamp(epoch, ZoneInfo("America/Chicago")).strftime("%Y-%m-%d")
+    except Exception:
+        return datetime.fromtimestamp(epoch, timezone.utc).strftime("%Y-%m-%d")
