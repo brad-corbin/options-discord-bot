@@ -104,6 +104,12 @@ def _fetch_economic_calendar(from_date: str, to_date: str) -> List[Dict]:
             params={"from": from_date, "to": to_date, "token": FINNHUB_TOKEN},
             timeout=5,
         )
+        # Handle 403 (paid feature) gracefully — don't retry, cache empty for longer
+        if resp.status_code == 403:
+            log.warning("Economic calendar: Finnhub returned 403 (paid feature). "
+                        "Macro event detection disabled. Consider upgrading Finnhub plan.")
+            _cache_set(cache_key, [])
+            return []
         resp.raise_for_status()
         data = resp.json()
 
@@ -134,7 +140,9 @@ def _fetch_economic_calendar(from_date: str, to_date: str) -> List[Dict]:
         return events
 
     except Exception as e:
-        log.warning(f"Economic calendar fetch failed: {e}")
+        # Sanitize: never log the token
+        err_str = str(e).replace(FINNHUB_TOKEN, "***")
+        log.warning(f"Economic calendar fetch failed: {err_str}")
         _cache_set(cache_key, [])
         return []
 
