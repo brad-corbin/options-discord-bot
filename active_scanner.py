@@ -167,10 +167,25 @@ def _analyze_ticker(
     """
     Run technical analysis on a ticker using intraday + daily data.
     Returns a signal dict if setup is detected, None otherwise.
+
+    Designed to work from early session (10+ bars) through full day.
+    Indicators that need more data gracefully return empty/None and
+    scoring adjusts accordingly — early session signals rely more on
+    EMA + VWAP + daily trend, less on MACD/WaveTrend.
     """
     try:
-        # Fetch 5-minute bars (80 bars = ~6.5 hours)
-        bars = intraday_fn(ticker, resolution=5, countback=80)
+        # Fetch 5-minute bars. Request 80 but accept fewer early in session.
+        # MarketData returns 404 when countback exceeds available bars,
+        # so we also try smaller countback values.
+        bars = None
+        for cb in [80, 40, 20]:
+            try:
+                bars = intraday_fn(ticker, resolution=5, countback=cb)
+                if bars and bars.get("c"):
+                    break
+            except Exception:
+                continue
+
         if not bars or not bars.get("c"):
             return None
 
@@ -179,7 +194,8 @@ def _analyze_ticker(
         lows = [l for l in bars.get("l", []) if l is not None]
         volumes = [v for v in bars.get("v", []) if v is not None]
 
-        if len(closes) < 40:
+        # Minimum 12 bars (~1 hour of 5-min data) for EMA5/12 to be meaningful
+        if len(closes) < 12:
             return None
 
         spot = closes[-1]
