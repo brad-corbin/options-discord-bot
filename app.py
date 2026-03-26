@@ -1014,8 +1014,14 @@ def _enqueue_signal(job_type: str, ticker: str, bias: str,
         "enqueued_at": time.time(),
     }
 
-    # v4.3: Track tickers for wave prefetch
-    _record_prefetch_ticker(ticker)
+    # v5.0: Skip prefetch for stale signals — the worker's pre-chain gate
+    # will reject them anyway, so don't waste 5 chain API calls.
+    _received_at = webhook_data.get("received_at_epoch", 0)
+    _signal_age = time.time() - _received_at if _received_at else 0
+    if _signal_age < 300:  # only prefetch for fresh signals (< 5 min)
+        _record_prefetch_ticker(ticker)
+    else:
+        log.debug(f"Skipping prefetch for {ticker}: signal age {_signal_age:.0f}s (stale)")
 
     r = _get_redis()
     if r:
