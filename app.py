@@ -76,6 +76,13 @@ from trading_rules import (
     PIN_REGIME_BLOCK_BEAR_PUTS, PIN_REGIME_BLOCK_BULL_CALLS,
     SWING_IV_MIN, SWING_IV_MAX, SWING_IV_ATM_BAND_PCT,
     OHLC_WARN_ONCE_PER_CYCLE,
+    # v5.0
+    PRECHAIN_GATE_ENABLED,
+    ACTIVE_SCANNER_ENABLED,
+    FUNDAMENTAL_SCREENING_ENABLED,
+    CONFIDENCE_BOOSTS, CONFIDENCE_PENALTIES,
+    IV_RV_RATIO_BUYER_EDGE, IV_RV_RATIO_SELLER_EDGE,
+    HIGH_VOLUME_TICKERS,
 )
 # ── v4 engine bridge ──
 from engine_bridge import (
@@ -118,6 +125,24 @@ from em_reconciler import (
 
 import risk_manager
 import trade_journal
+
+# ── v5.0 imports ──
+from prechain_gate import should_pull_chains
+from vix_term_structure import get_vix_term_structure, format_term_structure_line
+from economic_calendar import (
+    get_events_in_window, has_high_impact_today,
+    get_confidence_adjustment as get_macro_confidence,
+    format_calendar_line,
+)
+from fundamental_screener import (
+    get_fundamentals, get_swing_confidence_adjustments,
+    classify_lynch, batch_fetch_fundamentals,
+)
+from sector_rotation import (
+    get_sector_rank, get_all_sector_rankings,
+    format_sector_line,
+)
+from active_scanner import ActiveScanner
 
 # ── v4.3: Thesis Monitor ──
 from thesis_monitor import (
@@ -684,8 +709,26 @@ def _prefetch_set(ticker: str, data: dict):
 
 def _prefetch_ticker(ticker: str):
     """
-    Fetch all data needed by check_ticker for one ticker.
-    Stores in prefetch cache. Called once per unique ticker in a wave.
+    v5.0: Fetch data with pre-chain qualification gate.
+
+    OLD ORDER (v4.3):
+      1. Spot (1 API call)
+      2. CHAINS (5 API calls) ← EXPENSIVE, done before any checks
+      3. Enrichment, Candles, Regime, V4
+
+    NEW ORDER (v5.0):
+      1. Spot (1 API call)
+      2. Enrichment (Finnhub, 0 MarketData calls)
+      3. Candles (usually cached, 0-1 calls)
+      4. Regime + vol regime (cached, 0 calls)
+      5. VIX term structure (Yahoo, 0 MarketData calls)
+      6. Economic calendar (Finnhub cached, 0 calls)
+      7. Sector data (Yahoo cached, 0 calls)
+      8. >>> PRE-CHAIN GATE DECISION <<<
+      9. CHAINS (5 calls) — ONLY IF QUALIFIED
+      10. V4 prefilter
+
+    Saves ~5 API calls for every rejected signal (~60% rejection rate).
     """
     ticker = ticker.strip().upper()
 
@@ -696,16 +739,10 @@ def _prefetch_ticker(ticker: str):
     try:
         t0 = time.time()
 
-        # 1. Spot price
+        # 1. Spot price (1 call — always needed)
         spot = get_spot(ticker)
 
-        # 2. Options chains (the slowest part — multiple expirations)
-        chains = get_options_chain(ticker)
-
-        # 3. Enrichment (earnings check) — run in a thread with strict deadline.
-        # Finnhub regularly stalls for 4s+. With 6 concurrent workers that's 24s
-        # of wasted budget before the chain fetch even completes. We cap it at 2s:
-        # if Finnhub hasn't responded by then we skip earnings and continue.
+        # 2. Enrichment: earnings (Finnhub, 0 MarketData calls)
         enrichment = {"has_earnings": False, "earnings_warn": None}
         try:
             import threading as _threading
@@ -717,20 +754,79 @@ def _prefetch_ticker(ticker: str):
                     pass
             _et = _threading.Thread(target=_fetch_enrich, daemon=True)
             _et.start()
-            _et.join(timeout=2.0)  # give Finnhub 2s max — don't burn prefetch budget
+            _et.join(timeout=2.0)
             if _enrich_result:
                 enrichment = _enrich_result
         except Exception:
             pass
 
-        # 4. Daily candles for RV
+        # 3. Daily candles (usually cached at 10 min TTL)
         candle_closes = get_daily_candles(ticker, days=RV_LOOKBACK_DAYS + 5)
 
-        # 5. Regime (cached globally, so this is fast after first call)
+        # 4. Regime (cached)
         regime = get_current_regime()
         vol_regime = get_canonical_vol_regime(ticker, candle_closes)
 
-        # 6. V4 prefilter (institutional snapshot)
+        # 5. VIX term structure (Yahoo Finance, 0 MarketData calls)
+        term_structure = {}
+        try:
+            term_structure = get_vix_term_structure()
+        except Exception as e:
+            log.debug(f"Prefetch {ticker}: VIX term structure failed: {e}")
+
+        # 6. Economic calendar (Finnhub, cached 6hrs, 0 MarketData calls)
+        econ_events = []
+        try:
+            econ_events = get_events_in_window(dte_days=MAX_DTE)
+        except Exception as e:
+            log.debug(f"Prefetch {ticker}: econ calendar failed: {e}")
+
+        # 7. Sector data (Yahoo Finance, cached 30min, 0 MarketData calls)
+        sector_data = {}
+        try:
+            sector_data = get_sector_rank(ticker)
+        except Exception as e:
+            log.debug(f"Prefetch {ticker}: sector rank failed: {e}")
+
+        # ═══ PRE-CHAIN GATE (v5.0) ═══
+        # All checks above used 0-2 API calls total.
+        # Chains cost 5 calls. Only pull if signal qualifies.
+        if PRECHAIN_GATE_ENABLED:
+            if enrichment.get("has_earnings") and NO_EARNINGS_WEEK:
+                log.info(f"Prefetch {ticker}: SKIPPING CHAINS — earnings block "
+                         f"(saved ~5 API calls)")
+                _prefetch_set(ticker, {
+                    "spot": spot, "chains": None,
+                    "enrichment": enrichment, "candle_closes": candle_closes,
+                    "regime": regime, "vol_regime": vol_regime,
+                    "v4_flow": {}, "term_structure": term_structure,
+                    "econ_events": econ_events, "sector_data": sector_data,
+                    "prechain_skip": True,
+                    "prechain_reason": "earnings in DTE window",
+                })
+                return
+
+            vl = (vol_regime.get("label") or "").upper()
+            vc = vol_regime.get("caution_score", 0)
+            if vl == "CRISIS" or vc >= 6:
+                log.info(f"Prefetch {ticker}: SKIPPING CHAINS — CRISIS regime "
+                         f"(VIX {vol_regime.get('vix', '?')}, caution {vc}/8, "
+                         f"saved ~5 API calls)")
+                _prefetch_set(ticker, {
+                    "spot": spot, "chains": None,
+                    "enrichment": enrichment, "candle_closes": candle_closes,
+                    "regime": regime, "vol_regime": vol_regime,
+                    "v4_flow": {}, "term_structure": term_structure,
+                    "econ_events": econ_events, "sector_data": sector_data,
+                    "prechain_skip": True,
+                    "prechain_reason": f"CRISIS vol regime (VIX {vol_regime.get('vix', '?')})",
+                })
+                return
+
+        # ═══ CHAINS (only reached if pre-chain gate passed) ═══
+        chains = get_options_chain(ticker)
+
+        # V4 prefilter (reuses chains — no extra API calls)
         v4_flow = _run_v4_prefilter(ticker, spot, chains, candle_closes)
 
         elapsed = time.time() - t0
@@ -743,18 +839,24 @@ def _prefetch_ticker(ticker: str):
             "regime": regime,
             "vol_regime": vol_regime,
             "v4_flow": v4_flow,
+            "term_structure": term_structure,
+            "econ_events": econ_events,
+            "sector_data": sector_data,
+            "prechain_skip": False,
         })
 
         log.info(f"Prefetch {ticker}: {len(chains)} exps, vol={vol_regime.get('label','?')}, "
+                 f"sector={sector_data.get('relative_strength','?')}, "
+                 f"term={term_structure.get('term_structure','?')}, "
                  f"v4={v4_flow.get('composite_regime', '?') if v4_flow else 'N/A'}, "
                  f"{elapsed:.1f}s")
 
     except Exception as e:
         log.warning(f"Prefetch failed for {ticker}: {e}")
-        # Store a minimal entry so workers don't re-fetch and also timeout
         _prefetch_set(ticker, {
             "spot": None, "chains": None, "enrichment": {},
             "candle_closes": [], "regime": {}, "vol_regime": {}, "v4_flow": {},
+            "term_structure": {}, "econ_events": [], "sector_data": {},
             "error": str(e),
         })
 
@@ -1244,6 +1346,49 @@ def _process_job(worker_id: int, job: dict):
                     _record_wave_result(base)
                     return
 
+        # ── v5.0: UNIFIED PRE-CHAIN GATE ──────────────────────────────
+        # Runs all cheap checks before any chain API calls.
+        # Catches signals that prefetch didn't block (e.g. webhook-specific
+        # checks like signal freshness, price drift, pre-confidence).
+        if PRECHAIN_GATE_ENABLED:
+            _cached = _prefetch_get(ticker)
+
+            # Check if prefetch already skipped chains
+            if _cached and _cached.get("prechain_skip"):
+                base["reason"] = f"Pre-chain gate: {_cached.get('prechain_reason', 'rejected')}"
+                log.info(f"[worker-{worker_id}] {ticker} blocked by prefetch pre-chain gate")
+                _record_wave_result(base)
+                return
+
+            # Run full pre-chain gate with webhook data
+            _gate_result = should_pull_chains(
+                ticker=ticker,
+                bias=bias,
+                webhook_data=webhook_data,
+                live_spot=_cached.get("spot") if _cached else None,
+                candle_closes=_cached.get("candle_closes") if _cached else None,
+                regime=_cached.get("regime") if _cached else None,
+                vol_regime=_cached.get("vol_regime") if _cached else None,
+                enrichment=_cached.get("enrichment") if _cached else None,
+                econ_events=_cached.get("econ_events") if _cached else None,
+                sector_data=_cached.get("sector_data") if _cached else None,
+                job_type="tv",
+            )
+
+            if not _gate_result["qualified"]:
+                base["reason"] = (f"Pre-chain gate [{_gate_result['gate_failed']}]: "
+                                  f"{_gate_result['reason']}")
+                log.info(f"[worker-{worker_id}] {ticker} blocked by pre-chain gate: "
+                         f"{_gate_result['gate_failed']} "
+                         f"(saved {_gate_result['api_calls_saved']} API calls)")
+                _record_wave_result(base)
+                return
+
+            log.info(f"[worker-{worker_id}] {ticker} passed pre-chain gate "
+                     f"(pre-conf={_gate_result['pre_confidence']}, "
+                     f"gates={','.join(_gate_result['gates_passed'])})")
+        # ── end pre-chain gate ────────────────────────────────────────
+
         rec = check_ticker_with_timeout(ticker, direction=bias, webhook_data=webhook_data)
         base["confidence"] = rec.get("confidence")
 
@@ -1278,6 +1423,57 @@ def _process_job(worker_id: int, job: dict):
         from swing_engine import recommend_swing_trade, format_swing_card
         try:
             spot   = get_spot(ticker)
+        except Exception as e:
+            base["reason"] = f"spot fetch error: {e}"
+            _record_wave_result(base)
+            return
+
+        # ── v5.0: Fundamental + sector enrichment for swing ──
+        _swing_fundamental_data = {}
+        _swing_sector_data = {}
+        if FUNDAMENTAL_SCREENING_ENABLED:
+            try:
+                _swing_fundamental_data = get_fundamentals(ticker)
+                _swing_sector_data = get_sector_rank(ticker)
+
+                # Apply Lynch classification confidence adjustment
+                _lynch = _swing_fundamental_data.get("lynch_category", {})
+                _lynch_boost = _lynch.get("confidence_boost", 0)
+                if _lynch_boost != 0:
+                    webhook_data["lynch_boost"] = _lynch_boost
+                    webhook_data["lynch_category"] = _lynch.get("category", "UNCLASSIFIED")
+                    webhook_data["peg_signal"] = _lynch.get("peg_signal", "N/A")
+
+                _sector_adj = _swing_sector_data.get("confidence_adjustment", 0)
+                if _sector_adj != 0:
+                    webhook_data["sector_adjustment"] = _sector_adj
+                    webhook_data["sector_strength"] = _swing_sector_data.get("relative_strength", "NEUTRAL")
+
+                log.info(f"[worker-{worker_id}] Swing fundamentals {ticker}: "
+                         f"score={_swing_fundamental_data.get('fundamental_score', '?')}/100, "
+                         f"lynch={_lynch.get('category', '?')}, "
+                         f"sector=#{_swing_sector_data.get('rank', '?')}")
+            except Exception as e:
+                log.warning(f"[worker-{worker_id}] Swing fundamental enrichment failed for {ticker}: {e}")
+
+        # ── v5.0: Swing pre-chain gate ──
+        if PRECHAIN_GATE_ENABLED:
+            _sw_vol_regime = get_canonical_vol_regime(ticker, get_daily_candles(ticker, days=30))
+            _sw_gate = should_pull_chains(
+                ticker=ticker, bias=bias, webhook_data=webhook_data,
+                live_spot=spot, vol_regime=_sw_vol_regime,
+                fundamental_data=_swing_fundamental_data,
+                sector_data=_swing_sector_data,
+                job_type="swing",
+            )
+            if not _sw_gate["qualified"]:
+                base["reason"] = f"Pre-chain gate (swing) [{_sw_gate['gate_failed']}]: {_sw_gate['reason']}"
+                log.info(f"[worker-{worker_id}] {ticker} swing blocked by pre-chain gate "
+                         f"(saved {_sw_gate['api_calls_saved']} API calls)")
+                _record_wave_result(base)
+                return
+
+        try:
             chains = get_options_chain_swing(ticker)
         except Exception as e:
             base["reason"] = f"data fetch error: {e}"
@@ -3439,7 +3635,22 @@ def scan_watchlist_internal(tickers: list, max_posts: int = 6):
 
 @app.route("/scan", methods=["POST"])
 def scan_watchlist():
-    return jsonify({"status": "disabled", "reason": "Use TradingView webhooks only"}), 200
+    """v5.0: Re-enabled. Triggers an immediate scan cycle via the active scanner."""
+    data = request.get_json(force=True, silent=True) or {}
+    supplied = (data.get("secret") or request.args.get("secret") or "").strip()
+    if SCAN_SECRET and supplied != SCAN_SECRET:
+        return jsonify({"error": "Unauthorized"}), 403
+
+    if _scanner and _scanner._running:
+        from active_scanner import TIER_A, TIER_B, TIER_C
+        def _force_scan():
+            for t in TIER_A + TIER_B + TIER_C:
+                _scanner._last_scan[t] = 0
+                _scanner._scan_ticker(t)
+        threading.Thread(target=_force_scan, daemon=True).start()
+        return jsonify({"status": "accepted", "tickers": _scanner.watchlist_size})
+    else:
+        return jsonify({"status": "error", "reason": "Scanner not running — set ACTIVE_SCANNER_ENABLED=True"}), 503
 
 
 # ─────────────────────────────────────────────────────────
@@ -6684,6 +6895,7 @@ def _em_scheduler():
 
 _background_lock_fh = None
 _background_services_started = False
+_scanner = None  # v5.0: active scanner instance
 _background_services_lock = threading.Lock()
 
 
@@ -6708,6 +6920,7 @@ def _acquire_background_leader() -> bool:
 
 def _start_background_services_once():
     global _background_services_started, _queue_worker_threads
+    global _scanner  # v5.0
     with _background_services_lock:
         if _background_services_started:
             return True
@@ -6722,6 +6935,21 @@ def _start_background_services_once():
             store_get_fn=store_get, store_set_fn=store_set,
             get_bars_fn=lambda ticker, res, count: get_intraday_bars(ticker, res, count),
         )
+        # v5.0: Start active scanner
+        global _scanner
+        if ACTIVE_SCANNER_ENABLED:
+            _scanner = ActiveScanner(
+                enqueue_fn=_enqueue_signal,
+                spot_fn=get_spot,
+                candle_fn=get_daily_candles,
+                intraday_fn=get_intraday_bars,
+                regime_fn=get_current_regime,
+                vol_regime_fn=get_canonical_vol_regime,
+            )
+            _scanner.start()
+            log.info(f"Active scanner started: {_scanner.watchlist_size} tickers")
+        else:
+            log.info("Active scanner disabled by ACTIVE_SCANNER_ENABLED=False")
         _background_services_started = True
         log.info("Background services started in leader process")
         return True
@@ -6739,6 +6967,76 @@ def _initialize_app():
         if _tg_ws and BOT_URL and _acquire_background_leader():
             register_webhook(BOT_URL, _tg_ws)
         _start_background_services_once()
+
+
+# ─────────────────────────────────────────────────────────
+# v5.0 ENDPOINTS
+# ─────────────────────────────────────────────────────────
+
+@app.route("/scanner", methods=["GET"])
+def scanner_status():
+    """Active scanner status and watchlist info."""
+    if _scanner:
+        return jsonify(_scanner.status)
+    return jsonify({"running": False, "reason": "Scanner not initialized"})
+
+
+@app.route("/fundamentals/<ticker>", methods=["GET"])
+def get_ticker_fundamentals(ticker):
+    """Get fundamental data + Lynch classification for a ticker."""
+    try:
+        data = get_fundamentals(ticker.strip().upper())
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/screen", methods=["POST"])
+def run_fundamental_screen():
+    """Trigger nightly fundamental screen for all watchlist tickers."""
+    data = request.get_json(force=True, silent=True) or {}
+    supplied = (data.get("secret") or request.args.get("secret") or "").strip()
+    if SCAN_SECRET and supplied != SCAN_SECRET:
+        return jsonify({"error": "Unauthorized"}), 403
+
+    def _run():
+        tickers = HIGH_VOLUME_TICKERS
+        log.info(f"Fundamental screen: {len(tickers)} tickers")
+        results = batch_fetch_fundamentals(tickers)
+        fast_growers = [t for t, d in results.items()
+                        if d.get("lynch_category", {}).get("category") == "FAST_GROWER"]
+        if fast_growers:
+            post_to_telegram(
+                f"📊 Nightly Screen: {len(fast_growers)} fast growers detected\n"
+                + "\n".join(f"  • {t} (PEG={results[t].get('peg_ratio', '?')})"
+                            for t in fast_growers[:10])
+            )
+        log.info(f"Fundamental screen complete: {len(fast_growers)} fast growers")
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"status": "accepted", "tickers": len(HIGH_VOLUME_TICKERS)})
+
+
+@app.route("/sectors", methods=["GET"])
+def sector_rankings():
+    """Current sector relative strength rankings."""
+    rankings = get_all_sector_rankings()
+    return jsonify(rankings)
+
+
+@app.route("/vix_term", methods=["GET"])
+def vix_term():
+    """VIX term structure: contango/backwardation, VIX9D, VVIX."""
+    ts = get_vix_term_structure()
+    return jsonify(ts)
+
+
+@app.route("/calendar", methods=["GET"])
+def economic_calendar_endpoint():
+    """US economic events in DTE window. ?dte=5 (default)."""
+    dte = int(request.args.get("dte", 5))
+    events = get_events_in_window(dte_days=dte)
+    return jsonify(events)
 
 
 _initialize_app()
