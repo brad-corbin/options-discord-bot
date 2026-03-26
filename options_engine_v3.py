@@ -29,6 +29,17 @@ from trading_rules import (
     JOURNAL_SUPPRESS_WIN_RATE, JOURNAL_REDUCE_WIN_RATE,
     JOURNAL_REDUCE_SIZE_MULT, JOURNAL_LOOKBACK_SIGNALS,
 )
+# v5.0 imports for adaptive strike placement, trailing stops, dynamic exits
+from trading_rules import (
+    SHORT_LEG_PLACEMENT, SHORT_LEG_MIN_DELTA_CALL,
+    SHORT_LEG_MIN_DELTA_PUT, SHORT_LEG_DTE_ITM_THRESHOLD,
+    TRAILING_STOP_ENABLED, TRAILING_STOP_ACTIVATION_PCT,
+    TRAILING_STOP_DISTANCE_PCT, TRAILING_STOP_MIN_DISTANCE,
+    DYNAMIC_EXIT_0DTE_ENABLED,
+    DYNAMIC_EXIT_EARLY_MULT, DYNAMIC_EXIT_MID_MULT,
+    DYNAMIC_EXIT_LATE_MULT, DYNAMIC_EXIT_POWER_HOUR_MULT,
+    IV_RV_RATIO_BUYER_EDGE, IV_RV_RATIO_SELLER_EDGE,
+)
 
 
 # ─────────────────────────────────────────────────────────
@@ -582,6 +593,7 @@ def _determine_entry_plan(
     regime: Optional[Dict] = None,
     v4_flow: Optional[Dict] = None,
     vol_edge: Optional[Dict] = None,
+    dte: int = 3,  # v5.0: DTE-aware entry plan
 ) -> Dict[str, Any]:
     regime = regime or {}
     v4_flow = v4_flow or {}
@@ -683,6 +695,33 @@ def _determine_entry_plan(
     elif edge_label == "SELLER":
         score -= 0.15
 
+    # ── v5.0: DTE-based aggression adjustment ──
+    # 0-1 DTE: push toward early_atm/balanced — cheaper spreads work,
+    #          theta is your friend on the short leg.
+    # 2-3 DTE: neutral — let other signals decide.
+    # 4+ DTE: push toward conservative — more time = more risk on short leg.
+    if dte <= 1:
+        score += 1.2
+        reasons.append("0-1 DTE favors ATM short leg")
+    elif dte <= 3:
+        score += 0.4
+        reasons.append("short DTE favors balanced entry")
+    elif dte >= 7:
+        score -= 0.6
+        reasons.append("multi-day hold favors ITM protection")
+
+    # v5.0: IV/RV ratio in entry plan
+    _iv_val = vol_edge.get("iv", 0) if vol_edge else 0
+    _rv_val = vol_edge.get("rv", 0) if vol_edge else 0
+    if _rv_val > 0 and _iv_val > 0:
+        _iv_rv_ratio = _iv_val / _rv_val
+        if _iv_rv_ratio < 0.90:
+            score += 0.5
+            reasons.append("cheap IV — aggressive entry OK")
+        elif _iv_rv_ratio > 1.15:
+            score -= 0.4
+            reasons.append("rich IV — conservative entry preferred")
+
     if score >= 4.0:
         aggression = "early"
         preferred = ["early_atm", "balanced_transition", "conservative_itm"]
@@ -774,6 +813,15 @@ def build_bull_call_spreads(
             short_q = quotes.get(short_k)
             if short_q is None:
                 continue
+
+            # v5.0: Delta-based short leg filter
+            # Replaces rigid BOTH_LEGS_ITM with continuous delta constraint.
+            # Allows ATM short leg for 0-3 DTE while preventing far OTM.
+            _short_delta_val = abs(short_q.get("delta") or 0)
+            if SHORT_LEG_PLACEMENT == "DELTA":
+                _min_delta = 0.55 if dte >= SHORT_LEG_DTE_ITM_THRESHOLD else abs(SHORT_LEG_MIN_DELTA_CALL)
+                if _short_delta_val > 0 and _short_delta_val < _min_delta:
+                    continue
 
             profile_info = _classify_bull_profile(long_k, short_k, spot, atm_band)
             if not profile_info:
@@ -905,6 +953,13 @@ def build_bear_put_spreads(
             short_q = quotes.get(short_k)
             if short_q is None:
                 continue
+
+            # v5.0: Delta-based short leg filter (bear puts)
+            _short_delta_val = abs(short_q.get("delta") or 0)
+            if SHORT_LEG_PLACEMENT == "DELTA":
+                _min_delta = 0.55 if dte >= SHORT_LEG_DTE_ITM_THRESHOLD else abs(SHORT_LEG_MIN_DELTA_PUT)
+                if _short_delta_val > 0 and _short_delta_val < _min_delta:
+                    continue
 
             profile_info = _classify_bear_profile(long_k, short_k, spot, atm_band)
             if not profile_info:
@@ -1673,7 +1728,7 @@ def recommend_trade(
     }
 
     regime = regime or {}
-    entry_plan = _determine_entry_plan(webhook_data, bias, regime=regime, v4_flow=v4_flow, vol_edge=vol_edge)
+    entry_plan = _determine_entry_plan(webhook_data, bias, regime=regime, v4_flow=v4_flow, vol_edge=vol_edge, dte=dte)
     atm_band = _atm_band(spot)
 
     if bias == "bear":
@@ -1850,6 +1905,27 @@ def recommend_trade(
         "regime": regime,
         "entry_plan": entry_plan,
         "min_win_prob_required": min_win_prob_required,
+        # v5.0: trailing stop fields
+        "trailing_stop": {
+            "enabled": TRAILING_STOP_ENABLED,
+            "activation_pct": TRAILING_STOP_ACTIVATION_PCT,
+            "trail_distance_pct": TRAILING_STOP_DISTANCE_PCT,
+            "min_distance_pct": TRAILING_STOP_MIN_DISTANCE,
+            "activation_price": round(best["debit"] * (1 + TRAILING_STOP_ACTIVATION_PCT), 2),
+        } if TRAILING_STOP_ENABLED else {"enabled": False},
+        # v5.0: dynamic 0DTE exit targets
+        "dynamic_exit": {
+            "enabled": True,
+            "base_target_pct": SAME_DAY_EXIT_PCT,
+            "early_target_pct": round(SAME_DAY_EXIT_PCT * DYNAMIC_EXIT_EARLY_MULT, 3),
+            "mid_target_pct": round(SAME_DAY_EXIT_PCT * DYNAMIC_EXIT_MID_MULT, 3),
+            "late_target_pct": round(SAME_DAY_EXIT_PCT * DYNAMIC_EXIT_LATE_MULT, 3),
+            "power_hour_target_pct": round(SAME_DAY_EXIT_PCT * DYNAMIC_EXIT_POWER_HOUR_MULT, 3),
+        } if DYNAMIC_EXIT_0DTE_ENABLED and dte == 0 else {"enabled": False},
+        # v5.0: IV/RV ratio for downstream confidence
+        "iv_rv_ratio": round(avg_iv / rv, 3) if rv > 0 and avg_iv > 0 else None,
+        "avg_iv": avg_iv,
+        "hv20": rv,
     }
 
 
