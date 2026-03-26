@@ -1,10 +1,11 @@
-name: Watchlist Scan
+name: Watchlist Scan + Fundamental Screen
 on:
   schedule:
     # GitHub schedules are UTC
-    - cron: "45 13 * * 1-5"   # 8:45am Central
-    - cron: "30 16 * * 1-5"   # 11:30am Central
-    - cron: "00 18 * * 1-5"   # 2:30pm Central
+    - cron: "45 13 * * 1-5"   # 8:45am Central — pre-market scan
+    - cron: "30 16 * * 1-5"   # 11:30am Central — mid-day scan
+    - cron: "00 18 * * 1-5"   # 1:00pm Central — afternoon scan
+    - cron: "00 23 * * 1-5"   # 5:00pm Central — nightly fundamental screen
   workflow_dispatch:
 jobs:
   scan:
@@ -28,5 +29,19 @@ jobs:
           SCAN_SECRET: ${{ secrets.SCAN_SECRET }}
         run: |
           curl -X POST "$BOT_URL/holdings_scan" \
+          -H "Content-Type: application/json" \
+          -d "{\"secret\":\"$SCAN_SECRET\"}"
+
+  fundamental-screen:
+    runs-on: ubuntu-latest
+    # Only run at 5 PM CT (23:00 UTC)
+    if: github.event.schedule == '00 23 * * 1-5' || github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Trigger fundamental screen
+        env:
+          BOT_URL: ${{ secrets.BOT_URL }}
+          SCAN_SECRET: ${{ secrets.SCAN_SECRET }}
+        run: |
+          curl -X POST "$BOT_URL/screen" \
           -H "Content-Type: application/json" \
           -d "{\"secret\":\"$SCAN_SECRET\"}"
