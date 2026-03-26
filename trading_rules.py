@@ -2,6 +2,19 @@
 # Brad's Trading Rules — encoded from conversation
 # NOTE: Educational/demo code. Not financial advice. Use at your own risk.
 #
+# v5.0 additions (2026-03-26):
+#   - ADAPTIVE STRIKE PLACEMENT: BOTH_LEGS_ITM=False, delta-based short leg
+#   - PRE-CHAIN GATE: qualification checks before expensive chain API calls
+#   - ACTIVE SCANNER: continuous 35-ticker watchlist monitoring
+#   - NEW CONFIDENCE FACTORS: volume, sector, macro, fundamentals, VIX term structure
+#   - ECONOMIC CALENDAR: FOMC/CPI/NFP awareness, 0DTE blocking
+#   - FUNDAMENTAL SCREENING: PEG, EPS growth, Lynch classification for swing
+#   - SECTOR ROTATION: relative strength ranking for confidence scoring
+#   - VIX TERM STRUCTURE: contango/backwardation regime nuance
+#   - TRAILING STOPS: activation after 20%+ profit
+#   - EXPANDED WATCHLIST: 35 tickers across 3 scan tiers
+#   - EXPANDED SECTOR MAP: all scanned tickers mapped
+#
 # v4.2 additions (2026-03-17):
 #   - LOW VOL CHOP regime: tighter position sizing and confidence gate
 #   - check_ticker timeout reduced 75s → 45s (CAT timeout wasted a full worker)
@@ -25,7 +38,17 @@ TIER2_SIZE_MULTIPLIER    = 0.75
 # ─────────────────────────────────────────────────────────
 SPREAD_TYPE              = "debit"
 OPTION_SIDE              = "call"
-BOTH_LEGS_ITM            = True
+# v5.0: Adaptive strike placement replaces rigid BOTH_LEGS_ITM=True.
+# Long leg always ITM for directional exposure. Short leg uses
+# delta-based placement — can be ATM for cheaper spreads on 0-3 DTE.
+BOTH_LEGS_ITM            = False
+ITM_LONG_LEG_REQUIRED    = True     # Long leg must always be ITM
+SHORT_LEG_PLACEMENT      = "DELTA"  # "ITM" (old behavior) or "DELTA" (new)
+SHORT_LEG_MIN_DELTA_CALL = 0.40     # Short call delta floor (prevents far OTM)
+SHORT_LEG_MIN_DELTA_PUT  = -0.40    # Short put delta floor (absolute value)
+# For 0-3 DTE: allow ATM short leg (delta ~0.45-0.55) for cheaper spreads.
+# For 4+ DTE: prefer ITM short leg (delta >= 0.55) for higher probability.
+SHORT_LEG_DTE_ITM_THRESHOLD = 4     # DTE above this prefers ITM short leg
 WIDTH_PREFERENCE         = [1.0, 2.50, 5.0]
 NO_HALF_DOLLAR_WIDTHS    = True
 
@@ -72,9 +95,17 @@ EXTENDED_HOLD_EXIT_PCT   = 0.50
 
 STOP_LOSS_PCT            = 0.40
 HIGH_VOLUME_TICKERS      = [
-    "SPY", "QQQ", "GLD", "IWM", "DIA",
+    # Tier A — scanned every 5 min
+    "SPY", "QQQ", "IWM",
+    # Tier B — scanned every 10 min
     "AAPL", "MSFT", "NVDA", "AMZN", "META",
-    "TSLA", "GOOGL", "AMD", "SPX",
+    "TSLA", "GOOGL", "AMD", "NFLX", "COIN",
+    "AVGO", "PLTR",
+    # Tier C — scanned every 15 min
+    "DIA", "GLD", "SPX", "CRM", "ORCL",
+    "ARM", "SMCI", "MSTR", "XLF", "XLE",
+    "XLV", "SOXX", "TLT", "JPM", "GS",
+    "BA", "CAT", "LLY", "UNH",
 ]
 USE_STOP_LOSS_ALL        = False
 
@@ -176,6 +207,18 @@ CONFIDENCE_BOOSTS = {
     "within_em":         5,
     "regime_trending":   8,
     "regime_low_vix":    5,
+    # v5.0 — new confidence factors
+    "volume_surge":      10,    # Current volume > 1.5x 20-day avg
+    "volume_above_avg":  5,     # Current volume > 1.0x avg
+    "sector_strong":     5,     # Ticker's sector in top 3 relative strength
+    "term_structure_contango": 3,  # VIX in contango — normal conditions
+    "insider_buying":    5,     # Net insider buying last 90 days (swing only)
+    "peg_under_1":       8,     # PEG < 1.0 — Lynch golden metric (swing only)
+    "peg_under_1_5":     3,     # PEG 1.0-1.5 — fairly valued (swing only)
+    "lynch_fast_grower": 10,    # Lynch: fast grower classification (swing only)
+    "lynch_stalwart":    5,     # Lynch: stalwart classification (swing only)
+    "consistent_growth": 5,     # 2+ years of positive EPS growth (swing only)
+    "iv_cheap_vs_rv":    8,     # IV < RV (implied EM < realized EM) — buyer edge
 }
 
 CONFIDENCE_PENALTIES = {
@@ -188,11 +231,25 @@ CONFIDENCE_PENALTIES = {
     "wide_spread":       -5,
     "earnings_week":     -100,
     "dividend_in_dte":   -100,
-    "iv_crushed":        -5,
+    "iv_crushed":        -8,     # v5.0: raised from -5 — IV crush matters more for debit buyer
     "beyond_em":         -8,
     "regime_choppy":     -10,
     "regime_high_vix":   -5,
     "regime_crisis":     -10,
+    # v5.0 — new penalties
+    "volume_dry":        -8,     # Current volume < 0.5x average
+    "sector_weak":       -5,     # Sector in bottom 3 of 11
+    "macro_event_today": -15,    # High-impact econ event TODAY (FOMC, CPI, NFP)
+    "macro_event_window":-8,     # High-impact event within DTE window (not today)
+    "term_structure_backwardation": -8,  # VIX in backwardation — stress
+    "term_structure_severe": -15, # Severe backwardation — panic
+    "vvix_extreme":      -5,     # VVIX > 130 — regime instability
+    "eod_approach_0dte": -5,     # Signal after 2:30 PM CT for 0DTE
+    "insider_selling":   -5,     # Net insider selling (swing only)
+    "peg_over_2_5":      -8,     # PEG > 2.5 — overvalued (swing only)
+    "negative_eps":      -12,    # Negative EPS growth (swing only)
+    "lynch_slow_grower": -8,     # Lynch: slow grower (swing only)
+    "iv_rich_vs_rv":     -5,     # IV > RV — seller has edge, not buyer
 }
 
 MIN_CONFIDENCE_TO_TRADE  = 60
@@ -237,10 +294,17 @@ MAX_OPEN_SPREADS         = 8
 MAX_SAME_SECTOR_SPREADS  = 4
 
 SECTOR_MAP = {
-    "AAPL":  "tech", "MSFT":  "tech", "GOOGL": "tech", "META":  "tech",
-    "AMZN":  "tech", "NVDA":  "tech", "AMD":   "tech", "TSLA":  "auto",
+    "AAPL":  "tech", "MSFT":  "tech", "GOOGL": "comm_svc", "META":  "comm_svc",
+    "AMZN":  "cons_disc", "NVDA":  "tech", "AMD":   "tech", "TSLA":  "cons_disc",
     "SPY":   "index", "QQQ":  "index", "IWM":  "index", "DIA":  "index",
     "SPX":   "index", "GLD":  "commodity",
+    # v5.0 — expanded for full watchlist
+    "NFLX":  "comm_svc", "COIN": "fintech", "AVGO": "tech", "PLTR": "tech",
+    "CRM":   "tech", "ORCL": "tech", "ARM":  "tech", "SMCI": "tech",
+    "MSTR":  "tech", "JPM":  "financial", "GS":  "financial",
+    "BA":    "industrial", "CAT": "industrial", "LLY": "healthcare",
+    "UNH":   "healthcare", "XLF": "sector_etf", "XLE": "sector_etf",
+    "XLV":   "sector_etf", "SOXX": "sector_etf", "TLT": "bond",
 }
 
 MAX_PORTFOLIO_DELTA      = 300
@@ -305,3 +369,82 @@ SWING_IV_ATM_BAND_PCT        = 0.05  # Use ATM-only IV (within 5% of spot) when 
 # Today's run logged 32 identical "Cached OHLC bars fetch failed for MA" lines.
 # app.py should track warned_tickers per cycle and skip subsequent log lines.
 OHLC_WARN_ONCE_PER_CYCLE     = True
+
+
+# ═══════════════════════════════════════════════════════════
+# TRAILING STOP & DYNAMIC EXIT SETTINGS (v5.0)
+# ═══════════════════════════════════════════════════════════
+
+# Trailing stop activates after position reaches this profit threshold.
+# Once activated, stop trails at DISTANCE below the max favorable excursion.
+TRAILING_STOP_ENABLED         = True
+TRAILING_STOP_ACTIVATION_PCT  = 0.20    # Activate after 20% profit achieved
+TRAILING_STOP_DISTANCE_PCT    = 0.50    # Trail at 50% of max profit (give back half)
+TRAILING_STOP_MIN_DISTANCE    = 0.10    # Never trail tighter than 10% of max profit
+
+# Time-weighted exit targets for 0DTE.
+# Early in session: hold for bigger target. Late: take what you have.
+# Applied as multiplier to SAME_DAY_EXIT_PCT.
+# session_progress 0.0=open, 1.0=close
+DYNAMIC_EXIT_0DTE_ENABLED     = True
+DYNAMIC_EXIT_EARLY_MULT       = 1.5     # Before 10:30 AM: target 45% (0.30 × 1.5)
+DYNAMIC_EXIT_MID_MULT         = 1.0     # 10:30-1:30: target 30% (normal)
+DYNAMIC_EXIT_LATE_MULT        = 0.65    # After 1:30: target 20% (0.30 × 0.65)
+DYNAMIC_EXIT_POWER_HOUR_MULT  = 0.50    # After 2:30: target 15% (take anything)
+
+
+# ═══════════════════════════════════════════════════════════
+# PRE-CHAIN GATE SETTINGS (v5.0)
+# ═══════════════════════════════════════════════════════════
+
+# Pre-chain gate: run cheap checks before pulling option chains.
+# Saves ~5 API calls per rejected signal (1 expirations + 4 chains).
+PRECHAIN_GATE_ENABLED             = True
+PRECHAIN_MIN_CONFIDENCE_ESTIMATE  = 45    # Below this, chains won't save the trade
+PRECHAIN_STALE_LIMIT_SEC          = 300   # Don't pull chains for signals > 5 min old
+PRECHAIN_HARD_DRIFT_PCT           = 1.5   # Don't pull chains if price drifted > 1.5%
+PRECHAIN_EARNINGS_BLOCK           = True  # Block before chains if earnings in window
+PRECHAIN_MACRO_EVENT_BLOCK_0DTE   = True  # Block 0DTE if FOMC/CPI/NFP today
+
+
+# ═══════════════════════════════════════════════════════════
+# ACTIVE SCANNER SETTINGS (v5.0)
+# ═══════════════════════════════════════════════════════════
+
+# Enable/disable the active scanner background thread
+ACTIVE_SCANNER_ENABLED       = True
+SCANNER_SIGNAL_DEDUP_TTL     = 900   # Don't re-signal same ticker+bias within 15 min
+SCANNER_MIN_SIGNAL_SCORE     = 50    # Minimum technical score to generate signal
+SCANNER_T1_THRESHOLD         = 75    # Score for Tier 1 signal
+SCANNER_T2_THRESHOLD         = 55    # Score for Tier 2 signal
+
+
+# ═══════════════════════════════════════════════════════════
+# FUNDAMENTAL SCREENING SETTINGS (v5.0)
+# ═══════════════════════════════════════════════════════════
+
+# Enable fundamental data for swing trade qualification
+FUNDAMENTAL_SCREENING_ENABLED = True
+FUNDAMENTAL_MIN_SCORE_SWING   = 30    # Min fundamental score for swing entry
+FUNDAMENTAL_BATCH_HOUR_CT     = 17    # 5 PM CT — nightly batch fetch
+
+# Lynch-specific thresholds
+LYNCH_PEG_BUY_THRESHOLD      = 1.0   # PEG < 1.0 = strong buy signal
+LYNCH_PEG_AVOID_THRESHOLD    = 2.5   # PEG > 2.5 = avoid for options
+LYNCH_EPS_FAST_GROWER_PCT    = 0.20  # 20%+ EPS growth = fast grower
+LYNCH_EPS_STALWART_PCT       = 0.05  # 5-20% = stalwart
+
+
+# ═══════════════════════════════════════════════════════════
+# IV vs RV EDGE ENHANCEMENT (v5.0)
+# ═══════════════════════════════════════════════════════════
+
+# Skew-adjusted expected move: asymmetric EM based on put/call skew
+SKEW_ADJUSTED_EM_ENABLED     = True
+SKEW_PUT_CALL_DELTA           = 25    # Use 25-delta for skew measurement
+SKEW_ADJUSTMENT_WEIGHT        = 0.30  # How much skew shifts the EM center
+
+# IV/RV ratio for confidence scoring
+IV_RV_RATIO_BUYER_EDGE       = 0.90  # IV < 90% of RV → boost for debit buyer
+IV_RV_RATIO_SELLER_EDGE      = 1.10  # IV > 110% of RV → penalty for debit buyer
+
