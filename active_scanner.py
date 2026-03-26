@@ -407,13 +407,22 @@ class ActiveScanner:
         )
 
         if not signal:
+            self._scan_no_signal_count = getattr(self, '_scan_no_signal_count', 0) + 1
             return
 
         bias = signal["bias"]
         tier = signal["tier"]
+        score = signal["score"]
+
+        # Log all scored setups, even if below threshold or deduped
+        if score < MIN_SIGNAL_SCORE:
+            log.debug(f"Scanner {ticker}: score={score} ({bias}) — below minimum {MIN_SIGNAL_SCORE}")
+            self._scan_below_threshold_count = getattr(self, '_scan_below_threshold_count', 0) + 1
+            return
 
         # Dedup: don't re-signal same direction within 15 min
         if self._is_deduped(ticker, bias):
+            log.debug(f"Scanner {ticker}: {bias} T{tier} score={score} — deduped (recent signal)")
             return
 
         log.info(f"Scanner signal: {ticker} {bias.upper()} T{tier} "
@@ -471,26 +480,49 @@ class ActiveScanner:
     def _loop(self):
         """Main scanner loop. Runs during market hours."""
         log.info("Scanner loop started")
+        _cycle_count = 0
+        _last_summary = time.time()
+        SUMMARY_INTERVAL = 300  # log summary every 5 min
         while self._running:
             try:
                 if not self._is_market_hours():
                     time.sleep(60)
                     continue
 
+                _scanned_this_cycle = 0
+
                 # Tier A: every 5 min
                 for ticker in TIER_A:
                     if self._should_scan(ticker, SCAN_INTERVAL_A):
                         self._scan_ticker(ticker)
+                        _scanned_this_cycle += 1
 
                 # Tier B: every 10 min
                 for ticker in TIER_B:
                     if self._should_scan(ticker, SCAN_INTERVAL_B):
                         self._scan_ticker(ticker)
+                        _scanned_this_cycle += 1
 
                 # Tier C: every 15 min
                 for ticker in TIER_C:
                     if self._should_scan(ticker, SCAN_INTERVAL_C):
                         self._scan_ticker(ticker)
+                        _scanned_this_cycle += 1
+
+                _cycle_count += 1
+
+                # Periodic summary log so we know the scanner is alive
+                if time.time() - _last_summary >= SUMMARY_INTERVAL:
+                    _no_sig = getattr(self, '_scan_no_signal_count', 0)
+                    _below = getattr(self, '_scan_below_threshold_count', 0)
+                    _sigs = len(self._signal_dedup)
+                    log.info(f"Scanner summary: {len(self._last_scan)} tickers tracked, "
+                             f"{_sigs} signals generated, "
+                             f"{_no_sig} no-data, {_below} below-threshold, "
+                             f"cycle #{_cycle_count}")
+                    self._scan_no_signal_count = 0
+                    self._scan_below_threshold_count = 0
+                    _last_summary = time.time()
 
                 time.sleep(30)  # check loop every 30s
 
