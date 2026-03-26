@@ -34,12 +34,11 @@ import time
 import logging
 import threading
 from datetime import datetime
-from zoneinfo import ZoneInfo
 from typing import Dict, List, Callable, Optional
 
-log = logging.getLogger(__name__)
+from market_clock import is_equity_session, current_phase, CT
 
-CT = ZoneInfo("America/Chicago")
+log = logging.getLogger(__name__)
 
 # ── Watchlist tiers ──
 TIER_A = ["SPY", "QQQ", "IWM"]   # 5 min
@@ -235,43 +234,61 @@ def _analyze_ticker(
         score = 0
         bias = "bull" if ema_bull else "bear"
 
-        # EMA alignment: +15
-        score += 15 if ema_bull or not ema_bull else 0  # always gets this
+        # EMA alignment: award points only when EMA spread is meaningful
+        # v5.0 fix: old line was `score += 15 if ema_bull or not ema_bull else 0`
+        # which is always true. Now requires actual EMA separation.
+        if abs(ema_dist_pct) > 0.03:  # EMAs must be >0.03% apart
+            score += 15
+        elif abs(ema_dist_pct) > 0.01:
+            score += 8   # weak alignment — partial credit
 
-        # MACD confirmation: +20
+        # MACD confirmation: +15/+10, penalty -10 for counter-signal
         if macd:
             if bias == "bull" and macd.get("macd_hist", 0) > 0:
                 score += 15
             elif bias == "bear" and macd.get("macd_hist", 0) < 0:
                 score += 15
+            elif macd.get("macd_hist", 0) != 0:
+                score -= 10  # MACD disagrees with EMA bias
+
             if macd.get("macd_cross_bull") and bias == "bull":
                 score += 10
             elif macd.get("macd_cross_bear") and bias == "bear":
                 score += 10
 
-        # WaveTrend zone: +15
+        # WaveTrend zone: +15/+10, penalty -10 for wrong zone
         if wt:
             if bias == "bull" and wt.get("wt_oversold"):
                 score += 15
             elif bias == "bear" and wt.get("wt_overbought"):
                 score += 15
+            elif bias == "bull" and wt.get("wt_overbought"):
+                score -= 10  # bull signal but WT overbought
+            elif bias == "bear" and wt.get("wt_oversold"):
+                score -= 10  # bear signal but WT oversold
             elif bias == "bull" and wt.get("wt_cross_bull"):
                 score += 10
             elif bias == "bear" and wt.get("wt_cross_bear"):
                 score += 10
 
-        # VWAP position: +10
+        # VWAP position: +10, penalty -5 for wrong side
         if vwap:
             if bias == "bull" and spot > vwap:
                 score += 10
             elif bias == "bear" and spot < vwap:
                 score += 10
+            elif bias == "bull" and spot < vwap:
+                score -= 5  # bull bias but below VWAP
+            elif bias == "bear" and spot > vwap:
+                score -= 5  # bear bias but above VWAP
 
-        # Daily trend alignment: +15
+        # Daily trend alignment: +15/+10, penalty -10 for fighting daily
         if htf_confirmed:
             score += 15
         elif (bias == "bull" and daily_bull) or (bias == "bear" and not daily_bull):
             score += 10
+        elif daily_bull is not None:
+            score -= 10  # fighting the daily trend
 
         # Volume confirmation: +10
         if volume_ratio > 1.5:
@@ -364,13 +381,7 @@ class ActiveScanner:
         log.info("Active scanner stopping")
 
     def _is_market_hours(self) -> bool:
-        now = datetime.now(CT)
-        # Mon-Fri, 8:30 AM - 3:00 PM CT
-        if now.weekday() >= 5:
-            return False
-        market_open = now.replace(hour=8, minute=30, second=0)
-        market_close = now.replace(hour=15, minute=0, second=0)
-        return market_open <= now <= market_close
+        return is_equity_session()
 
     def _should_scan(self, ticker: str, interval: int) -> bool:
         last = self._last_scan.get(ticker, 0)
