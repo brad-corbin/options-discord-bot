@@ -28,6 +28,7 @@ from trading_rules import (
     JOURNAL_FEEDBACK_ENABLED, JOURNAL_MIN_TRADES_FOR_STATS,
     JOURNAL_SUPPRESS_WIN_RATE, JOURNAL_REDUCE_WIN_RATE,
     JOURNAL_REDUCE_SIZE_MULT, JOURNAL_LOOKBACK_SIGNALS,
+    get_slippage_factor,  # v5.0: index-tier slippage
 )
 # v5.0 imports for adaptive strike placement, trailing stops, dynamic exits
 from trading_rules import (
@@ -1100,17 +1101,22 @@ def build_itm_bear_put_spreads(
 # RANKING
 # ─────────────────────────────────────────────────────────
 
-def rank_candidates(candidates: List[Dict], iv_edge_label: str = "NEUTRAL", entry_plan: Dict = None) -> List[Dict]:
+def rank_candidates(candidates: List[Dict], iv_edge_label: str = "NEUTRAL", entry_plan: Dict = None, ticker: str = "") -> List[Dict]:
     """
     Composite scoring model with hybrid-entry preference.
     Candidates are scored on quality, then nudged toward the entry profile
     that best matches the current directional conviction.
+
+    v5.0: ticker parameter for index-tier slippage override.
     """
     if not candidates:
         return []
 
     entry_plan = entry_plan or {}
     aggression = entry_plan.get("aggression", "balanced")
+
+    # v5.0: Use ticker-aware slippage factor
+    _slippage_factor = get_slippage_factor(ticker) if ticker else SLIPPAGE_SPREAD_FACTOR
 
     evs = [c.get("expected_value", 0) for c in candidates]
     ev_max = max(abs(e) for e in evs) if evs else 1.0
@@ -1126,7 +1132,7 @@ def rank_candidates(candidates: List[Dict], iv_edge_label: str = "NEUTRAL", entr
 
         debit = c.get("debit", 0)
         warnings = c.get("warnings", [])
-        est_slippage = debit * SLIPPAGE_SPREAD_FACTOR * spread_pct_avg if spread_pct_avg > 0 else 0.01
+        est_slippage = debit * _slippage_factor * spread_pct_avg if spread_pct_avg > 0 else 0.01
         ev_raw = c.get("expected_value", 0)
         ev_after_slippage = ev_raw - est_slippage
         c["ev_after_slippage"] = round(ev_after_slippage, 4)
@@ -1772,6 +1778,7 @@ def recommend_trade(
         candidates,
         iv_edge_label=vol_edge.get("edge_label", "NEUTRAL") if vol_edge else "NEUTRAL",
         entry_plan=entry_plan,
+        ticker=ticker,  # v5.0: index-tier slippage
     )
     if not ranked:
         rejected = {}
