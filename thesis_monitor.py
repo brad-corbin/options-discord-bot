@@ -1,5 +1,6 @@
 # thesis_monitor.py
 # v2.0 Thesis Monitor — Bar-Aware + Confluence Scoring + Policy Engine
+# v2.1 (v5.0): Alert hierarchy fixes, VIX-scaled stops, EM guide matching
 # v1.5 base: entry detection, exit monitor, ActiveTrade, persistence
 # v2.0 adds: OHLCV bars, level registry, entry validator, exit policies
 import logging, threading, time, json, uuid
@@ -13,6 +14,26 @@ from entry_validator import EntryValidator, ValidationResult
 from exit_policy import ExitPolicy, ExitSignal, select_exit_policy, evaluate_exit
 
 log = logging.getLogger(__name__)
+
+# v5.0: Alert hierarchy + VIX-scaled stops
+try:
+    from trading_rules import (
+        ALERT_SUPPRESS_ON_VALIDATOR_REJECT,
+        ALERT_OPPOSITE_DIRECTION_COOLDOWN_SEC,
+        ALERT_MOMENTUM_FADE_COOLDOWN_SEC,
+        ALERT_DEMOTE_REPEAT_FAILED_MOVE,
+        VIX_STOP_SCALE_ENABLED,
+        EM_GUIDE_MATCHING_ENABLED,
+        get_vix_scaled_min_stop,
+    )
+except ImportError:
+    ALERT_SUPPRESS_ON_VALIDATOR_REJECT = True
+    ALERT_OPPOSITE_DIRECTION_COOLDOWN_SEC = 300
+    ALERT_MOMENTUM_FADE_COOLDOWN_SEC = 600
+    ALERT_DEMOTE_REPEAT_FAILED_MOVE = True
+    VIX_STOP_SCALE_ENABLED = False
+    EM_GUIDE_MATCHING_ENABLED = False
+    def get_vix_scaled_min_stop(ticker, vix=20): return 0.40
 
 MONITOR_POLL_INTERVAL_SEC = 300
 MONITOR_POLL_INTERVAL_FAST_SEC = 60
@@ -899,13 +920,87 @@ class ThesisMonitorEngine:
             entry_events.extend(self._detect_confirmed_breaks(thesis, state, price, now, bar=bar, bm=bm))
             entry_events.extend(self._detect_failed_moves(thesis, state, price, now, bm=bm))
             entry_events.extend(self._detect_retests(thesis, state, price, now, bm=bm))
+
+            # ── v5.0: Track which events the validator rejects ──
+            _rejected_keys = set()
+
             # Auto-create ActiveTrade — runs through EntryValidator + ExitPolicy
             for ev in entry_events:
                 if ev.get("type") in ("trade_confirmed", "critical") and ev.get("priority", 0) >= 5:
                     ak = ev.get("alert_key", "")
                     if "wait" not in ak and "late" not in ak:
-                        self._create_trade_from_event(ticker, thesis, state, price, ev, now, ts,
-                                                       registry=registry, bar=bar, bm=bm)
+                        _trade_created = self._create_trade_from_event(
+                            ticker, thesis, state, price, ev, now, ts,
+                            registry=registry, bar=bar, bm=bm)
+                        # v5.0: If validator rejected, mark this key for downgrade
+                        if not _trade_created and ALERT_SUPPRESS_ON_VALIDATOR_REJECT:
+                            _rejected_keys.add(ak)
+
+            # ── v5.0: Downgrade rejected critical alerts to info ──
+            # This prevents "FADE SHORT 🔥" from firing when the validator
+            # just said "score=2, location + momentum failed."
+            for ev in entry_events:
+                ak = ev.get("alert_key", "")
+                if ak in _rejected_keys and ev.get("type") == "critical":
+                    ev["type"] = "info"
+                    ev["priority"] = 3  # below the threshold=4 for posting
+                    ev["msg"] = "⚠️ [Validator rejected] " + ev.get("msg", "")
+                    log.info(f"Alert downgraded (validator rejected): {ak}")
+
+            # ── v5.0: Opposite-direction suppression ──
+            # After a critical SHORT alert, suppress critical LONG alerts
+            # for ALERT_OPPOSITE_DIRECTION_COOLDOWN_SEC, and vice versa.
+            _last_critical_dir = getattr(state, '_last_critical_direction', None)
+            _last_critical_ts = getattr(state, '_last_critical_ts', 0)
+            for ev in entry_events:
+                if ev.get("type") == "critical" and ev.get("priority", 0) >= 5:
+                    ak = ev.get("alert_key", "")
+                    # Determine direction of this alert
+                    _ev_dir = None
+                    if any(x in ak for x in ("fbo_", "conf_short", "rt_short", "rt_fs")):
+                        _ev_dir = "SHORT"
+                    elif any(x in ak for x in ("fb_", "conf_long", "rt_long", "rt_fl")):
+                        _ev_dir = "LONG"
+
+                    if (_ev_dir and _last_critical_dir and
+                            _ev_dir != _last_critical_dir and
+                            (now - _last_critical_ts) < ALERT_OPPOSITE_DIRECTION_COOLDOWN_SEC):
+                        ev["type"] = "alert"
+                        ev["priority"] = 4  # still visible but not "critical"
+                        ev["msg"] = ev.get("msg", "").replace("🟩🚀🔥", "⚡")
+                        log.info(f"Alert demoted (opposite direction within {ALERT_OPPOSITE_DIRECTION_COOLDOWN_SEC}s): {ak}")
+                    elif _ev_dir and ev.get("type") == "critical":
+                        state._last_critical_direction = _ev_dir
+                        state._last_critical_ts = now
+
+            # ── v5.0: Demote repeat failed-move alerts at same level ──
+            if ALERT_DEMOTE_REPEAT_FAILED_MOVE:
+                _seen_failed_levels = getattr(state, '_seen_failed_levels', {})
+                for ev in entry_events:
+                    ak = ev.get("alert_key", "")
+                    if ev.get("type") == "critical" and ("fb_" in ak or "fbo_" in ak):
+                        # Extract level price from alert key
+                        try:
+                            _level_str = ak.split("_")[-1]
+                            if _level_str in _seen_failed_levels:
+                                ev["type"] = "alert"
+                                ev["priority"] = 4
+                                ev["msg"] = ev.get("msg", "").replace("🟩🚀🔥", "📋").replace("TRADE ALERT", "MGMT NOTE")
+                                log.info(f"Alert demoted (repeat failed move at {_level_str}): {ak}")
+                            else:
+                                _seen_failed_levels[_level_str] = now
+                        except Exception:
+                            pass
+                state._seen_failed_levels = _seen_failed_levels
+
+            # ── v5.0: EM Guide matching annotation ──
+            if EM_GUIDE_MATCHING_ENABLED:
+                for ev in entry_events:
+                    if ev.get("type") == "critical" and ev.get("priority", 0) >= 5:
+                        _em_match = self._check_em_guide_match(thesis, state, price, ev)
+                        if _em_match:
+                            ev["msg"] = f"📋 MATCHES EM GUIDE: {_em_match}\n\n" + ev.get("msg", "")
+
             events.extend(entry_events)
             events.extend(self._check_gamma_flip(thesis, state, price))
             # ── v2.0: Exit monitoring with policy engine ──
@@ -986,7 +1081,8 @@ class ThesisMonitorEngine:
     # ── Exit Monitor: Auto-Create Trade ──
     def _create_trade_from_event(self, ticker, thesis, state, price, event, now, ts,
                                    registry=None, bar=None, bm=None):
-        """Create an ActiveTrade from a clean entry signal. v2.0: validates through EntryValidator."""
+        """Create an ActiveTrade from a clean entry signal. v2.0: validates through EntryValidator.
+        v5.0: Returns True if trade was created, False if rejected/blocked."""
         ak = event.get("alert_key", "")
 
         # ── Entry cooldown — prevent rapid re-entry ───────────────────────────
@@ -996,7 +1092,7 @@ class ThesisMonitorEngine:
         if time_since_last < MONITOR_ENTRY_COOLDOWN_SEC:
             log.info(f"Entry cooldown: {ticker} — {time_since_last:.0f}s since last entry "
                      f"(need {MONITOR_ENTRY_COOLDOWN_SEC}s), skipping {ak}")
-            return
+            return False
 
         msg = event.get("msg", "")
         # Parse direction and entry_type from alert_key
@@ -1006,7 +1102,7 @@ class ThesisMonitorEngine:
             direction = "LONG"
         else:
             log.info(f"Cannot parse direction from alert_key={ak}, skipping trade creation")
-            return
+            return False
         if "conf_" in ak:
             entry_type = "BREAK"
         elif "fb_" in ak or "fbo_" in ak:
@@ -1041,7 +1137,7 @@ class ThesisMonitorEngine:
                 continue
             if abs(t.stop_level - stop) / stop < 0.005 or abs(t.entry_price - price) / price < 0.005:
                 log.info(f"Trade already open for {ticker} {direction} stop=${t.stop_level:.2f} near new stop=${stop:.2f}, skipping")
-                return
+                return False
 
         # ── Gamma Flip Oscillation Gate ───────────────────────────────────
         # If price has been whipsawing around gamma flip, block entries near it.
@@ -1064,13 +1160,17 @@ class ThesisMonitorEngine:
                     stop_dist_pct=abs(price - stop) / price * 100 if price > 0 else 0,
                     badge="",
                 )
-                return
+                return False
 
         # ── Minimum Stop Distance Gate ────────────────────────────────────
         # Hard floor — if the stop is closer than the minimum for this ticker,
         # the setup is noise-level and gets rejected outright.
-        min_stop = MONITOR_MIN_STOP_DISTANCE.get(ticker.upper(),
-                    MONITOR_MIN_STOP_DISTANCE["DEFAULT"])
+        # v5.0: Scale min stop with VIX — at VIX 25, a $0.40 SPY stop is noise.
+        if VIX_STOP_SCALE_ENABLED and thesis.vix > 0:
+            min_stop = get_vix_scaled_min_stop(ticker, thesis.vix)
+        else:
+            min_stop = MONITOR_MIN_STOP_DISTANCE.get(ticker.upper(),
+                        MONITOR_MIN_STOP_DISTANCE["DEFAULT"])
         stop_dist_abs = abs(price - stop)
         if stop_dist_abs < min_stop:
             log.info(f"Min stop gate: {ticker} — stop ${stop:.2f} is ${stop_dist_abs:.2f} "
@@ -1087,7 +1187,7 @@ class ThesisMonitorEngine:
                 stop_dist_pct=abs(price - stop) / price * 100 if price > 0 else 0,
                 badge="",
             )
-            return
+            return False
 
         # ── v2.0: Level quality from registry ──
         level_quality = 0
@@ -1165,7 +1265,7 @@ class ThesisMonitorEngine:
                 price=price, stop_level=stop, stop_dist_pct=stop_dist_pct,
                 badge="",  # no badge — never reached badging
             )
-            return
+            return False
 
         # ── v2.0: Select ExitPolicy ──
         policy = select_exit_policy(
@@ -1251,6 +1351,7 @@ class ThesisMonitorEngine:
                  f"policy={policy.name} | scale={validation.scale_advice} | "
                  f"stop=${stop:.2f} | targets={[f'${t:.2f}' for t in targets]} | "
                  f"gates=[{validation.gate_summary}]")
+        return True
 
     # ── Exit Monitor: Core Loop ──
     def _monitor_exits(self, ticker, thesis, state, price, now, bar=None, bm=None):
@@ -1735,10 +1836,18 @@ class ThesisMonitorEngine:
         else:
             state.momentum = "STALLING"
         if state.momentum != old:
+            # v5.0: Dedicated momentum fade cooldown (longer than general alert cooldown).
+            # Prevents the "upside fading / downside fading" ping-pong every 60 seconds.
+            _mom_fade_last_up = state.alert_history.get("mom_fade_up", 0)
+            _mom_fade_last_dn = state.alert_history.get("mom_fade_dn", 0)
+            _now_mono = time.monotonic()
+
             if state.momentum == "LOSING_UPSIDE_MOMENTUM" and old in ("ACCELERATING_UP", "DRIFTING_UP"):
-                events.append({"msg": "⚠️ Upside momentum fading. Tighten if long.", "type": "warning", "priority": 4, "alert_key": "mom_fade_up"})
+                if (_now_mono - _mom_fade_last_up) >= ALERT_MOMENTUM_FADE_COOLDOWN_SEC:
+                    events.append({"msg": "⚠️ Upside momentum fading. Tighten if long.", "type": "warning", "priority": 4, "alert_key": "mom_fade_up"})
             elif state.momentum == "LOSING_DOWNSIDE_MOMENTUM" and old in ("ACCELERATING_DOWN", "DRIFTING_DOWN"):
-                events.append({"msg": "⚠️ Downside momentum fading. Tighten if short.", "type": "warning", "priority": 4, "alert_key": "mom_fade_dn"})
+                if (_now_mono - _mom_fade_last_dn) >= ALERT_MOMENTUM_FADE_COOLDOWN_SEC:
+                    events.append({"msg": "⚠️ Downside momentum fading. Tighten if short.", "type": "warning", "priority": 4, "alert_key": "mom_fade_dn"})
         return events
 
     def _detect_breaks(self, thesis, state, price, prev_price, now, bar=None, bm=None):
@@ -1925,9 +2034,14 @@ class ThesisMonitorEngine:
                 # entry message fires with the full trade card.
                 stop_dist_pct = abs(price - ba.level) / price * 100
                 # ── Also enforce hard minimum stop distance ───────────────
-                min_stop = MONITOR_MIN_STOP_DISTANCE.get(
-                    getattr(thesis, "ticker", "").upper(),
-                    MONITOR_MIN_STOP_DISTANCE["DEFAULT"])
+                # v5.0: VIX-scaled stop distance
+                _fm_ticker = getattr(thesis, "ticker", "").upper()
+                if VIX_STOP_SCALE_ENABLED and thesis.vix > 0:
+                    min_stop = get_vix_scaled_min_stop(_fm_ticker, thesis.vix)
+                else:
+                    min_stop = MONITOR_MIN_STOP_DISTANCE.get(
+                        _fm_ticker,
+                        MONITOR_MIN_STOP_DISTANCE["DEFAULT"])
                 if abs(price - ba.level) < min_stop:
                     log.info(f"Min stop gate (failed move): ${ba.level:.2f} is "
                              f"${abs(price - ba.level):.2f} from price (min ${min_stop:.2f}), skipping")
@@ -2029,6 +2143,74 @@ class ThesisMonitorEngine:
                 ba.retest_fired = True; tt = "💰 Put debit spread" if thesis.gex_sign == "positive" else "💰 Naked puts"
                 events.append({"msg": f"🎯 RETEST SHORT (fade)\n\nFailed breakout retested ${ba.level:.2f} and rejecting.\n\nENTRY: Now @ ~${price:.2f}\nSTOP: above ${ba.level:.2f}\n\n— TRADE CARD —\n{dte_line}\n{_contract_suggestion(_SETUP_RETEST_SHORT, 'SHORT', price, thesis, state, phase=tp['phase'])}", "type": "critical", "priority": 5, "alert_key": f"rt_fs_{ba.level:.2f}"})
         return events
+
+    # ── v5.0: EM Guide Matching ──
+    def _check_em_guide_match(self, thesis, state, price, event) -> Optional[str]:
+        """
+        Check if a trade alert matches one of the EM guide's "SETUPS TO WATCH."
+
+        The EM guide posts setups like:
+          "IF price breaks above $654.22 AND fails → GO SHORT. Stop above $654.22."
+          "IF price breaks below $647.92 AND fails → GO LONG. Stop below $647.92."
+
+        This method checks if the current alert matches one of those patterns
+        by comparing the alert direction + level against the thesis levels.
+
+        Returns a description string if matched, None otherwise.
+        """
+        if not EM_GUIDE_MATCHING_ENABLED:
+            return None
+
+        ak = event.get("alert_key", "")
+        lvl = thesis.levels
+
+        # Determine alert direction
+        is_short = any(x in ak for x in ("fbo_", "conf_short", "rt_short", "rt_fs"))
+        is_long = any(x in ak for x in ("fb_", "conf_long", "rt_long", "rt_fl"))
+
+        if not is_short and not is_long:
+            return None
+
+        # Extract level price from alert key
+        try:
+            level_price = float(ak.split("_")[-1])
+        except (ValueError, IndexError):
+            return None
+
+        tol_pct = 0.15  # 0.15% tolerance for level matching
+        matches = []
+
+        # Check against thesis levels (micro triggers from EM guide)
+        if is_short and lvl.local_resistance is not None:
+            if abs(level_price - lvl.local_resistance) / lvl.local_resistance * 100 < tol_pct:
+                matches.append(f"failed breakout at R ${lvl.local_resistance:.2f}")
+        if is_short and lvl.micro_trigger_up is not None:
+            if abs(level_price - lvl.micro_trigger_up) / lvl.micro_trigger_up * 100 < tol_pct:
+                matches.append(f"fade above micro trigger ${lvl.micro_trigger_up:.2f}")
+
+        if is_long and lvl.local_support is not None:
+            if abs(level_price - lvl.local_support) / lvl.local_support * 100 < tol_pct:
+                matches.append(f"failed breakdown at S ${lvl.local_support:.2f}")
+        if is_long and lvl.micro_trigger_down is not None:
+            if abs(level_price - lvl.micro_trigger_down) / lvl.micro_trigger_down * 100 < tol_pct:
+                matches.append(f"squeeze below micro trigger ${lvl.micro_trigger_down:.2f}")
+
+        # Check against gamma flip
+        if lvl.gamma_flip is not None:
+            if abs(level_price - lvl.gamma_flip) / lvl.gamma_flip * 100 < tol_pct:
+                if is_long:
+                    matches.append(f"reclaim gamma flip ${lvl.gamma_flip:.2f}")
+                elif is_short:
+                    matches.append(f"rejection at gamma flip ${lvl.gamma_flip:.2f}")
+
+        # Check GEX alignment
+        if thesis.gex_sign == "positive":
+            if "fbo_" in ak or "fb_" in ak:
+                matches.append("GEX+ confirms failed-move setup")
+
+        if matches:
+            return " + ".join(matches)
+        return None
 
     def _check_gamma_flip(self, thesis, state, price):
         events = []; flip = thesis.levels.gamma_flip
