@@ -159,11 +159,28 @@ def get_liquidity_thresholds(ticker: str) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════
-# SLIPPAGE MODEL (v4.1)
+# SLIPPAGE MODEL (v4.1, v5.0 index override)
 # ═══════════════════════════════════════════════════════════
 
 SLIPPAGE_SPREAD_FACTOR   = 0.35
 SLIPPAGE_MIN_EV_AFTER    = 0.0
+
+# v5.0: Index ETFs have the tightest spreads in the market.
+# At VIX 25, SPY put spread B/A is still ~$0.03-0.06 wide.
+# The default 0.35 factor was rejecting every SPY spread as
+# slippage_or_negative_ev on a day where the thesis was 5/5
+# and SPY moved $9. Override for liquid index products.
+INDEX_SLIPPAGE_SPREAD_FACTOR = 0.15  # SPY/QQQ/SPX can fill at mid
+LARGE_CAP_SLIPPAGE_SPREAD_FACTOR = 0.25  # AAPL/NVDA/AMZN etc
+
+def get_slippage_factor(ticker: str) -> float:
+    """Return tier-appropriate slippage factor."""
+    t = ticker.upper()
+    if t in INDEX_ETF_TICKERS:
+        return INDEX_SLIPPAGE_SPREAD_FACTOR
+    elif t in LARGE_CAP_TICKERS:
+        return LARGE_CAP_SLIPPAGE_SPREAD_FACTOR
+    return SLIPPAGE_SPREAD_FACTOR
 
 
 # ═══════════════════════════════════════════════════════════
@@ -447,4 +464,69 @@ SKEW_ADJUSTMENT_WEIGHT        = 0.30  # How much skew shifts the EM center
 # IV/RV ratio for confidence scoring
 IV_RV_RATIO_BUYER_EDGE       = 0.90  # IV < 90% of RV → boost for debit buyer
 IV_RV_RATIO_SELLER_EDGE      = 1.10  # IV > 110% of RV → penalty for debit buyer
+
+
+# ═══════════════════════════════════════════════════════════
+# ALERT HIERARCHY & SUPPRESSION (v5.0)
+# ═══════════════════════════════════════════════════════════
+#
+# Fixes the "validator rejects but critical alert still fires" problem.
+# Also suppresses repeated momentum fades and opposite-direction whipsaw.
+
+# After EntryValidator rejects a setup, don't fire the critical trade alert.
+# Instead downgrade to "info" priority so it appears only in logs.
+ALERT_SUPPRESS_ON_VALIDATOR_REJECT = True
+
+# After a critical trade alert (FADE SHORT / SQUEEZE LONG), suppress
+# opposite-direction critical alerts for this many seconds unless a
+# real level shift occurs (new break attempt at a different level).
+ALERT_OPPOSITE_DIRECTION_COOLDOWN_SEC = 300  # 5 minutes
+
+# Momentum fade alerts: only fire once per direction per this window.
+# Prevents "downside fading / upside fading" ping-pong every 60 seconds.
+ALERT_MOMENTUM_FADE_COOLDOWN_SEC = 600  # 10 min (was 300 via general cooldown)
+
+# After the first clean failed-move signal per level, demote subsequent
+# alerts at the same level from "critical" to "alert" (shown but not shouted).
+ALERT_DEMOTE_REPEAT_FAILED_MOVE = True
+
+
+# ═══════════════════════════════════════════════════════════
+# VIX-SCALED STOP DISTANCE (v5.0)
+# ═══════════════════════════════════════════════════════════
+#
+# At VIX 25, a $0.40 stop on SPY ($655) is 0.06% — noise level.
+# The thesis monitor kept getting stopped out on minor wicks before
+# the real move happened. Scale the minimum stop with VIX.
+
+VIX_STOP_SCALE_ENABLED       = True
+VIX_STOP_SCALE_BASE_VIX      = 15.0    # base VIX for stop calibration
+VIX_STOP_SCALE_FACTOR        = 1.5     # stop distance grows 1.5x per 10 VIX pts
+VIX_STOP_MIN_FLOOR_SPY       = 0.40    # absolute minimum even at low VIX
+VIX_STOP_MIN_FLOOR_DEFAULT   = 0.30
+
+def get_vix_scaled_min_stop(ticker: str, vix: float = 20.0) -> float:
+    """Compute VIX-scaled minimum stop distance in dollars."""
+    if not VIX_STOP_SCALE_ENABLED:
+        base = {"SPY": 0.40, "QQQ": 0.40}.get(ticker.upper(), 0.30)
+        return base
+
+    base = {"SPY": VIX_STOP_MIN_FLOOR_SPY, "QQQ": VIX_STOP_MIN_FLOOR_SPY}.get(
+        ticker.upper(), VIX_STOP_MIN_FLOOR_DEFAULT)
+
+    # Scale: at VIX 15 = base, at VIX 25 = base * 1.5, at VIX 35 = base * 2.0
+    vix_excess = max(0, vix - VIX_STOP_SCALE_BASE_VIX) / 10.0
+    multiplier = 1.0 + vix_excess * (VIX_STOP_SCALE_FACTOR - 1.0)
+    return round(base * multiplier, 2)
+
+
+# ═══════════════════════════════════════════════════════════
+# EM GUIDE MATCHING (v5.0)
+# ═══════════════════════════════════════════════════════════
+#
+# When a trade alert fires, check if it matches one of the EM guide's
+# "SETUPS TO WATCH" recommendations. If so, annotate the alert with
+# "📋 MATCHES EM GUIDE" to boost trader confidence in the signal.
+
+EM_GUIDE_MATCHING_ENABLED = True
 
