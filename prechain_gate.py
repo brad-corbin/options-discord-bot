@@ -248,18 +248,21 @@ def should_pull_chains(
                 )
     gates_passed.append("econ_calendar")
 
-    # ── Gate 5: Vol Regime (CRISIS block) ──
+    # ── Gate 5: Vol Regime (CRISIS — direction-aware) ──
+    # v5.0: Bears are the correct trade in CRISIS. Only block bulls.
     if vol_regime:
         label = (vol_regime.get("label") or "").upper()
         caution = vol_regime.get("caution_score", 0)
 
         if label == "CRISIS" or caution >= 6:
-            if job_type == "swing":
+            if job_type == "swing" and bias == "bull":
                 return _reject("vol_regime",
-                    f"CRISIS regime (VIX {vol_regime.get('vix', '?')}, caution {caution}/8) — swing blocked")
-            if bias == "bull":
+                    f"CRISIS regime (VIX {vol_regime.get('vix', '?')}, caution {caution}/8) — bull swing blocked")
+            if job_type == "tv" and bias == "bull":
                 return _reject("vol_regime",
                     f"CRISIS regime (VIX {vol_regime.get('vix', '?')}) — bull calls blocked")
+            # Bears in CRISIS: log but allow through
+            log.debug(f"Pre-chain gate: CRISIS regime but {bias} signal — allowing through")
     gates_passed.append("vol_regime")
 
     # ── Gate 6: Fundamental Score (swing trades only) ──
