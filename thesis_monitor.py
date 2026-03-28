@@ -1346,6 +1346,7 @@ class ThesisMonitorEngine:
         self._persist_trades(ticker, state)
         badge = _trade_quality_badge(trade)
         _log_trade_event(trade, event="OPEN", badge=badge)
+        _pg_register(trade)  # v5.1: register with portfolio Greeks
         log.info(f"ActiveTrade created: {ticker} {direction} {entry_type} @ ${price:.2f} | "
                  f"score={validation.setup_score}/5 [{validation.setup_label}] | "
                  f"policy={policy.name} | scale={validation.scale_advice} | "
@@ -1518,6 +1519,7 @@ class ThesisMonitorEngine:
                     trade.close_time = now; trade.close_epoch = time.time()
                     trade.close_reason = signal.reason
                     self._persist_trades(ticker, state)
+                    _pg_close(trade)  # v5.1: not covered by _log_trade_event here
                     events.append({"msg": f"\U0001f6d1 TRADE INVALIDATED — {trade.direction}\n\n{signal.reason}\nEntry: ${trade.entry_price:.2f} → Now: ${price:.2f} ({pnl_pct:+.2f}%)\nDon't hope. Close it.", "type": "exit", "priority": 5, "alert_key": f"exit_inv_{trade.trade_id}"})
             # HOLD = do nothing
         return events
@@ -2410,6 +2412,10 @@ def _log_trade_event(trade, event: str, close_price: float = None,
                 writer.writeheader()
             writer.writerow(row)
 
+        # v5.1: notify portfolio Greeks on trade close
+        if event == "CLOSE":
+            _pg_close(trade)
+
     except Exception as e:
         log.warning(f"Trade log write failed: {e}")
 
@@ -3125,8 +3131,46 @@ def build_thesis_from_em_card(ticker, spot, bias, eng, em, walls, cagf=None, vix
 
 _monitor_engine = ThesisMonitorEngine()
 _monitor_daemon: Optional[ThesisMonitorDaemon] = None
+_portfolio_greeks = None  # v5.1: set by app.py via set_portfolio_greeks()
+
 def get_engine(): return _monitor_engine
 def get_daemon(): return _monitor_daemon
+
+def set_portfolio_greeks(pg):
+    """Wire the portfolio Greeks aggregator from app.py."""
+    global _portfolio_greeks
+    _portfolio_greeks = pg
+    log.info("Portfolio Greeks aggregator connected to thesis monitor")
+
+def _pg_register(trade):
+    """Register a new trade with the portfolio Greeks aggregator."""
+    if not _portfolio_greeks:
+        return
+    try:
+        _portfolio_greeks.register_position(
+            trade_id=trade.trade_id,
+            ticker=trade.ticker,
+            direction=trade.direction,
+            trade_type=getattr(trade, "trade_type_label", "spread"),
+            option_type="put" if trade.direction == "SHORT" else "call",
+            contracts=1,
+            entry_price=trade.entry_premium or trade.entry_price,
+            total_risk=trade.entry_premium * 100 if trade.entry_premium else trade.entry_price * 100,
+            delta=trade.entry_delta or (0.50 if trade.direction == "LONG" else -0.50),
+            spot=trade.entry_price,
+        )
+    except Exception as e:
+        log.debug(f"Portfolio Greeks register failed: {e}")
+
+def _pg_close(trade):
+    """Remove a closed trade from the portfolio Greeks aggregator."""
+    if not _portfolio_greeks:
+        return
+    try:
+        reason = getattr(trade, "close_reason", None) or trade.status
+        _portfolio_greeks.close_position(trade.trade_id, reason)
+    except Exception as e:
+        log.debug(f"Portfolio Greeks close failed: {e}")
 
 # ── Channel routing ──────────────────────────────────────────────────────────
 #
