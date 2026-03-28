@@ -236,15 +236,30 @@ def _analyze_ticker(
 
         # Daily trend (for HTF confirmation)
         daily_closes = daily_candle_fn(ticker, days=30)
-        daily_bull = False
+        daily_bull = None  # v5.0 fix: None = unknown, not False = bearish
         htf_confirmed = False
+        htf_converging = False  # v5.1: true convergence = daily EMAs narrowing toward intraday bias
+        htf_status = "UNKNOWN"  # CONFIRMED | CONVERGING | OPPOSING | UNKNOWN
         if daily_closes and len(daily_closes) >= 21:
             daily_ema8 = _compute_ema(daily_closes, 8)
             daily_ema21 = _compute_ema(daily_closes, 21)
-            if daily_ema8 and daily_ema21:
+            if daily_ema8 and daily_ema21 and len(daily_ema8) >= 2:
                 daily_bull = daily_ema8[-1] > daily_ema21[-1]
                 # HTF confirmed if daily trend aligns with intraday
                 htf_confirmed = (daily_bull == ema_bull)
+
+                if htf_confirmed:
+                    htf_status = "CONFIRMED"
+                else:
+                    # Check if daily EMAs are genuinely converging:
+                    # gap is narrowing = daily trend weakening = shifting toward intraday
+                    daily_gap_now = abs(daily_ema8[-1] - daily_ema21[-1])
+                    daily_gap_prev = abs(daily_ema8[-2] - daily_ema21[-2])
+                    if daily_gap_now < daily_gap_prev * 0.98:  # gap shrinking by 2%+
+                        htf_converging = True
+                        htf_status = "CONVERGING"
+                    else:
+                        htf_status = "OPPOSING"  # daily disagrees and not narrowing
 
         # ── Score the setup ──
         score = 0
@@ -299,12 +314,14 @@ def _analyze_ticker(
                 score -= 5  # bear bias but above VWAP
 
         # Daily trend alignment: +15/+10, penalty -10 for fighting daily
+        # v5.0 fix: daily_bull=None means no data — skip scoring entirely
         if htf_confirmed:
             score += 15
-        elif (bias == "bull" and daily_bull) or (bias == "bear" and not daily_bull):
-            score += 10
         elif daily_bull is not None:
-            score -= 10  # fighting the daily trend
+            if (bias == "bull" and daily_bull) or (bias == "bear" and not daily_bull):
+                score += 10
+            else:
+                score -= 10  # fighting the daily trend
 
         # Volume confirmation: +10
         if volume_ratio > 1.5:
@@ -343,7 +360,8 @@ def _analyze_ticker(
             "vwap": vwap,
             "above_vwap": spot > vwap if vwap else False,
             "htf_confirmed": htf_confirmed,
-            "htf_converging": not htf_confirmed and daily_bull is not None,
+            "htf_converging": htf_converging,
+            "htf_status": htf_status,
             "daily_bull": daily_bull,
             "volume": current_vol,
             "volume_ratio": round(volume_ratio, 2),
@@ -479,11 +497,16 @@ class ActiveScanner:
         wave_zone = "🟢 Oversold" if wt2 < -30 else "🔴 Overbought" if wt2 > 60 else "⚪ Neutral"
         vol_str = f"📊 {signal['volume_ratio']:.1f}x avg" if signal.get("volume_ratio", 0) > 1.2 else ""
 
+        # HTF status display
+        _htf_s = signal.get("htf_status", "UNKNOWN")
+        _htf_display = {"CONFIRMED": "✅ Confirmed", "CONVERGING": "🟡 Converging",
+                        "OPPOSING": "🔴 Opposing", "UNKNOWN": "⚪ No data"}.get(_htf_s, f"❓ {_htf_s}")
+
         signal_msg = "\n".join([
             f"{tier_emoji} SCAN Signal — {ticker} (T{tier} {dir_emoji} {bias.upper()})",
             f"Close: ${signal['close']:.2f} | 5m scan",
-            f"1H Trend: {'✅ Confirmed' if signal['htf_confirmed'] else '🟡 Converging'} | "
-            f"Daily: {'🟢' if signal['daily_bull'] else '🔴'}",
+            f"HTF: {_htf_display} | "
+            f"Daily: {'🟢' if signal['daily_bull'] is True else '🔴' if signal['daily_bull'] is False else '⚪ N/A'}",
             f"Wave: {wave_zone} (wt2={wt2:.1f})",
             f"VWAP: {'Above ✅' if signal['above_vwap'] else 'Below'} | "
             f"RSI: {signal.get('rsi_mfi', 0):.0f}" + (f" | {vol_str}" if vol_str else ""),
