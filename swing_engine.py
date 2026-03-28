@@ -19,6 +19,17 @@ from typing import Any, Dict, List, Optional, Tuple
 
 log = logging.getLogger(__name__)
 
+# v5.0: Long option fallback when spreads fail
+try:
+    from options_engine_v3 import (
+        should_use_long_option, build_long_option_candidate,
+        build_put_quotes, build_call_quotes,
+    )
+    from trading_rules import NAKED_SIZE_MULT, MIN_WIN_PROBABILITY
+    _NAKED_AVAILABLE = True
+except ImportError:
+    _NAKED_AVAILABLE = False
+
 # ─────────────────────────────────────────────────────────
 # SWING RULES
 # ─────────────────────────────────────────────────────────
@@ -924,6 +935,99 @@ def recommend_swing_trade(
         break
 
     if not best_rec:
+        # ── v5.0: Long option fallback for swing trades ──
+        # If no spreads found but conditions favor directional long options,
+        # try a single put/call from the nearest-DTE chain.
+        if _NAKED_AVAILABLE and sorted_chains:
+            _sw_exp, _sw_dte, _sw_contracts = sorted_chains[0]
+            _sw_vix = webhook_data.get("vix", avg_iv * 100 if avg_iv < 1 else avg_iv)
+            _sw_gex = webhook_data.get("gex_sign", "positive")
+            _sw_conf = webhook_data.get("pre_confidence", 55)
+            _sw_is_snapback = webhook_data.get("is_snapback", False)
+
+            from trading_rules import NAKED_PUT_MAX_DTE_SWING, NAKED_CALL_MAX_DTE_SWING
+            _sw_max_dte = NAKED_PUT_MAX_DTE_SWING if direction == "bear" else NAKED_CALL_MAX_DTE_SWING
+
+            _naked_check = should_use_long_option(
+                bias=direction, vix=_sw_vix, gex_sign=_sw_gex,
+                confidence=_sw_conf, dte=_sw_dte,
+                is_snapback=_sw_is_snapback,
+                max_dte_override=_sw_max_dte,
+            )
+            if _naked_check.get("use_naked"):
+                _option_type = _naked_check["option_type"]
+                if _option_type == "put":
+                    _sw_quotes = build_put_quotes(_sw_contracts, spot, ticker=ticker, include_otm=True)
+                else:
+                    _sw_quotes = build_call_quotes(_sw_contracts, spot, ticker=ticker, include_otm=True)
+
+                _naked_trade = build_long_option_candidate(
+                    _sw_quotes, spot, _option_type,
+                    dte=_sw_dte, expected_move=swing_em,
+                    gex_note=_naked_check.get("gex_note", ""),
+                )
+                if _naked_trade:
+                    _label = "LONG PUT" if _option_type == "put" else "LONG CALL"
+                    log.info(f"Swing long {_option_type} fallback: {ticker} "
+                             f"strike=${_naked_trade['strike']:.2f}, "
+                             f"premium=${_naked_trade['premium']:.2f}, "
+                             f"DTE={_sw_dte}, reason={_naked_check['reason']}")
+                    tier = webhook_data.get("tier", "2")
+                    return {
+                        "ok": True,
+                        "ticker": ticker, "spot": spot, "type": "swing",
+                        "dte": _sw_dte, "exp": _sw_exp,
+                        "direction": direction,
+                        "requested_direction": direction,
+                        "matched_requested_direction": True,
+                        "scoreable": bool(webhook_data.get("manual_scoreable", True)),
+                        "rejection_bucket": None,
+                        "spread_label": _label,
+                        "spread_type": "long_option",
+                        "trade_type": "long_option",
+                        "trade": {
+                            "strike": _naked_trade["strike"],
+                            "delta": _naked_trade["delta"],
+                            "debit": _naked_trade["premium"],
+                            "width": _naked_trade["premium"],
+                            "win_prob": abs(_naked_trade.get("delta", 0.5)),
+                            "entry_profile": "long_option",
+                            "long_strike": _naked_trade["strike"],
+                            "long_bid": _naked_trade["bid"],
+                            "long_ask": _naked_trade["ask"],
+                            "long_mid": _naked_trade["mid"],
+                            "long_delta": _naked_trade["delta"],
+                            "long_iv": _naked_trade["iv"],
+                            "long_oi": _naked_trade["oi"],
+                            "long_gamma": _naked_trade["gamma"],
+                            "long_theta": _naked_trade["theta"],
+                            "long_vega": _naked_trade["vega"],
+                            "long_spread_pct": _naked_trade["spread_pct"],
+                            "short_strike": None, "short_bid": None,
+                            "short_ask": None, "short_delta": None,
+                            "gex_note": _naked_trade.get("gex_note", ""),
+                        },
+                        "ladder": [],
+                        "contracts": max(1, int(1 * NAKED_SIZE_MULT)),
+                        "total_risk": round(_naked_trade["premium"] * 100 * max(1, int(1 * NAKED_SIZE_MULT)), 2),
+                        "sizing_note": f"Swing long {_option_type} — reduced sizing",
+                        "exits": [
+                            {"pct": 0.5, "label": "50% gain", "price": round(_naked_trade["premium"] * 1.5, 2)},
+                            {"pct": 1.0, "label": "100% gain", "price": round(_naked_trade["premium"] * 2.0, 2)},
+                        ],
+                        "confidence": _sw_conf,
+                        "conf_reasons": [_naked_check["reason"]],
+                        "tier": tier,
+                        "fib_level": fib_level,
+                        "fib_distance": fib_distance,
+                        "fib_score": fib_score,
+                        "avg_iv": avg_iv,
+                        "iv_rank": iv_rank,
+                        "swing_em": swing_em,
+                        "webhook_data": webhook_data,
+                        "naked_option_reason": _naked_check["reason"],
+                    }
+
         combined = "No valid swing spread found"
         if all_reasons:
             combined += "\n" + "\n".join(all_reasons[:4])
