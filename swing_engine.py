@@ -19,13 +19,19 @@ from typing import Any, Dict, List, Optional, Tuple
 
 log = logging.getLogger(__name__)
 
-# v5.0: Long option fallback when spreads fail
+# v5.1: Institutional long option fallback when spreads fail
 try:
     from options_engine_v3 import (
         should_use_long_option, build_long_option_candidate,
         build_put_quotes, build_call_quotes,
     )
-    from trading_rules import NAKED_SIZE_MULT, MIN_WIN_PROBABILITY
+    from trading_rules import (
+        NAKED_SIZE_MULT, NAKED_SWING_TARGET_DTE, NAKED_SWING_MIN_DTE,
+        NAKED_SWING_MAX_DTE, NAKED_SWING_EXIT_BY_DTE,
+        NAKED_LOSS_STOP_PCT, NAKED_PROFIT_TARGET_1_PCT,
+        NAKED_PROFIT_TARGET_2_PCT, NAKED_TRAIL_GIVEBACK_PCT,
+        NAKED_TIME_STOP_PCT,
+    )
     _NAKED_AVAILABLE = True
 except ImportError:
     _NAKED_AVAILABLE = False
@@ -935,24 +941,41 @@ def recommend_swing_trade(
         break
 
     if not best_rec:
-        # ── v5.0: Long option fallback for swing trades ──
-        # If no spreads found but conditions favor directional long options,
-        # try a single put/call from the nearest-DTE chain.
+        # ── v5.1: Institutional long option fallback ──
+        # If no spreads found, try a directional long option using:
+        #   - EM-based strike selection (1.0-1.5× expected move, vol-adjusted)
+        #   - DTE targeting the slow theta curve (45-60 DTE ideal)
+        #   - Level-aligned strike snapping to nearest S/R
+        #   - Institutional exit framework (time stop, scaled profit, trail)
         if _NAKED_AVAILABLE and sorted_chains:
-            _sw_exp, _sw_dte, _sw_contracts = sorted_chains[0]
             _sw_vix = webhook_data.get("vix", avg_iv * 100 if avg_iv < 1 else avg_iv)
             _sw_gex = webhook_data.get("gex_sign", "positive")
             _sw_conf = webhook_data.get("pre_confidence", 55)
             _sw_is_snapback = webhook_data.get("is_snapback", False)
 
-            from trading_rules import NAKED_PUT_MAX_DTE_SWING, NAKED_CALL_MAX_DTE_SWING
-            _sw_max_dte = NAKED_PUT_MAX_DTE_SWING if direction == "bear" else NAKED_CALL_MAX_DTE_SWING
+            # Find the chain closest to the institutional target DTE (45-60)
+            _best_chain = None
+            _best_dte_dist = float("inf")
+            for _ch_exp, _ch_dte, _ch_contracts in sorted_chains:
+                if NAKED_SWING_MIN_DTE <= _ch_dte <= NAKED_SWING_MAX_DTE:
+                    dist = abs(_ch_dte - NAKED_SWING_TARGET_DTE)
+                    if dist < _best_dte_dist:
+                        _best_dte_dist = dist
+                        _best_chain = (_ch_exp, _ch_dte, _ch_contracts)
+
+            # If no chain in ideal range, use the longest available
+            if not _best_chain:
+                _best_chain = sorted_chains[-1]  # longest DTE available
+                log.info(f"Swing long option: no chain in {NAKED_SWING_MIN_DTE}-{NAKED_SWING_MAX_DTE} DTE, "
+                         f"using {_best_chain[1]} DTE")
+
+            _sw_exp, _sw_dte, _sw_contracts = _best_chain
 
             _naked_check = should_use_long_option(
                 bias=direction, vix=_sw_vix, gex_sign=_sw_gex,
                 confidence=_sw_conf, dte=_sw_dte,
                 is_snapback=_sw_is_snapback,
-                max_dte_override=_sw_max_dte,
+                is_swing=True,
             )
             if _naked_check.get("use_naked"):
                 _option_type = _naked_check["option_type"]
@@ -961,18 +984,38 @@ def recommend_swing_trade(
                 else:
                     _sw_quotes = build_call_quotes(_sw_contracts, spot, ticker=ticker, include_otm=True)
 
+                # Build S/R levels from webhook data for strike alignment
+                _support_levels = []
+                _resistance_levels = []
+                for _lvl_key in ("fib_support", "daily_support", "put_wall", "s1", "swing_low"):
+                    _v = webhook_data.get(_lvl_key)
+                    if _v and isinstance(_v, (int, float)) and _v > 0:
+                        _support_levels.append(float(_v))
+                for _lvl_key in ("fib_resistance", "daily_resistance", "call_wall", "r1", "swing_high"):
+                    _v = webhook_data.get(_lvl_key)
+                    if _v and isinstance(_v, (int, float)) and _v > 0:
+                        _resistance_levels.append(float(_v))
+
                 _naked_trade = build_long_option_candidate(
                     _sw_quotes, spot, _option_type,
                     dte=_sw_dte, expected_move=swing_em,
+                    vix=_sw_vix,
                     gex_note=_naked_check.get("gex_note", ""),
+                    support_levels=_support_levels,
+                    resistance_levels=_resistance_levels,
                 )
                 if _naked_trade:
                     _label = "LONG PUT" if _option_type == "put" else "LONG CALL"
-                    log.info(f"Swing long {_option_type} fallback: {ticker} "
-                             f"strike=${_naked_trade['strike']:.2f}, "
+                    log.info(f"Swing long {_option_type} (institutional): {ticker} "
+                             f"strike=${_naked_trade['strike']:.2f} "
+                             f"(EM target=${_naked_trade.get('target_strike', 0):.2f}), "
                              f"premium=${_naked_trade['premium']:.2f}, "
                              f"DTE={_sw_dte}, reason={_naked_check['reason']}")
+
                     tier = webhook_data.get("tier", "2")
+                    _num_contracts = max(1, int(1 * NAKED_SIZE_MULT))
+                    _total_risk = round(_naked_trade["premium"] * 100 * _num_contracts, 2)
+
                     return {
                         "ok": True,
                         "ticker": ticker, "spot": spot, "type": "swing",
@@ -1006,15 +1049,28 @@ def recommend_swing_trade(
                             "short_strike": None, "short_bid": None,
                             "short_ask": None, "short_delta": None,
                             "gex_note": _naked_trade.get("gex_note", ""),
+                            "target_strike": _naked_trade.get("target_strike"),
                         },
                         "ladder": [],
-                        "contracts": max(1, int(1 * NAKED_SIZE_MULT)),
-                        "total_risk": round(_naked_trade["premium"] * 100 * max(1, int(1 * NAKED_SIZE_MULT)), 2),
-                        "sizing_note": f"Swing long {_option_type} — reduced sizing",
+                        "contracts": _num_contracts,
+                        "total_risk": _total_risk,
+                        "sizing_note": f"Institutional {NAKED_SIZE_MULT:.0%} sizing — "
+                                       f"{_num_contracts}x ${_naked_trade['premium']:.2f}",
+                        # Institutional exit framework
                         "exits": [
-                            {"pct": 0.5, "label": "50% gain", "price": round(_naked_trade["premium"] * 1.5, 2)},
-                            {"pct": 1.0, "label": "100% gain", "price": round(_naked_trade["premium"] * 2.0, 2)},
+                            {"pct": NAKED_PROFIT_TARGET_1_PCT,
+                             "label": f"{NAKED_PROFIT_TARGET_1_PCT:.0%} gain — scale 1/3",
+                             "price": round(_naked_trade["premium"] * (1 + NAKED_PROFIT_TARGET_1_PCT), 2)},
+                            {"pct": NAKED_PROFIT_TARGET_2_PCT,
+                             "label": f"{NAKED_PROFIT_TARGET_2_PCT:.0%} gain — scale 1/3, trail rest",
+                             "price": round(_naked_trade["premium"] * (1 + NAKED_PROFIT_TARGET_2_PCT), 2)},
                         ],
+                        "stop_price": round(_naked_trade["premium"] * (1 - NAKED_LOSS_STOP_PCT), 2),
+                        "stop_note": f"{NAKED_LOSS_STOP_PCT:.0%} premium stop — thesis failed",
+                        "exit_by_dte": NAKED_SWING_EXIT_BY_DTE,
+                        "time_stop_note": f"Sell by {NAKED_SWING_EXIT_BY_DTE} DTE remaining "
+                                          f"(avoid theta acceleration zone)",
+                        "trail_giveback_pct": NAKED_TRAIL_GIVEBACK_PCT,
                         "confidence": _sw_conf,
                         "conf_reasons": [_naked_check["reason"]],
                         "tier": tier,
