@@ -146,6 +146,8 @@ from sector_rotation import (
 )
 from active_scanner import ActiveScanner
 from swing_scanner import SwingScanner
+from portfolio_greeks import PortfolioGreeks
+from regime_detector import RegimeDetector
 
 # ── v4.3: Thesis Monitor ──
 from thesis_monitor import (
@@ -6909,6 +6911,34 @@ def _em_scheduler():
                     log.info("EM reconciler firing (4:15 PM CT)")
                     threading.Thread(target=_run_reconciler_auto, daemon=True, name="reconciler").start()
 
+            # ── v5.1: Regime transition detector (every 30 min during market hours) ──
+            if 8 <= now_ct.hour < 16:
+                _regime_key = (date_str, now_ct.hour, now_ct.minute // 30)
+                if _regime_key not in fired_today:
+                    fired_today.add(_regime_key)
+                    try:
+                        _vd = _get_vix_data() or {}
+                        _vix_val = _vd.get("vix", 0)
+                        _vix9d = _vd.get("vix9d", 0)
+                        if _vix_val > 0:
+                            _gex_data = _vd.get("gex", {}) if isinstance(_vd.get("gex"), dict) else {}
+                            _gex_sign = "negative" if _gex_data.get("gex", 0) < 0 else "positive"
+                            _term = "inverted" if _vix9d > _vix_val + 0.5 else "contango" if _vix9d < _vix_val - 2 else "flat"
+                            _transition = _regime_detector.update(
+                                vix=_vix_val,
+                                vix9d=_vix9d,
+                                gex_sign=_gex_sign,
+                                term_structure=_term,
+                            )
+                            if _transition:
+                                log.info(f"Regime transition: {_transition.transition_type}")
+                                try:
+                                    post_to_telegram(_transition.format_alert())
+                                except Exception:
+                                    pass
+                    except Exception as _re:
+                        log.debug(f"Regime detector update error: {_re}")
+
             fired_today = {k for k in fired_today if k[0] == date_str}
         except Exception as e:
             log.error(f"EM scheduler error: {e}", exc_info=True)
@@ -6923,6 +6953,8 @@ _background_lock_fh = None
 _background_services_started = False
 _scanner = None  # v5.0: active scanner instance
 _swing_scanner = None  # v5.1: swing scanner instance
+_portfolio_greeks = PortfolioGreeks()  # v5.1: portfolio-level Greeks aggregator
+_regime_detector = RegimeDetector()    # v5.1: regime transition detector
 _background_services_lock = threading.Lock()
 
 
@@ -6963,6 +6995,9 @@ def _start_background_services_once():
             store_get_fn=store_get, store_set_fn=store_set,
             get_bars_fn=lambda ticker, res, count: get_intraday_bars(ticker, res, count),
         )
+        # v5.1: Wire portfolio Greeks into thesis monitor
+        from thesis_monitor import set_portfolio_greeks
+        set_portfolio_greeks(_portfolio_greeks)
         # v5.0: Start active scanner
         global _scanner
         if ACTIVE_SCANNER_ENABLED:
@@ -7109,6 +7144,21 @@ def trigger_swing_scan():
         threading.Thread(target=_run, daemon=True).start()
         return jsonify({"status": "accepted", "watchlist_size": _swing_scanner.status.get("watchlist_size", 0)})
     return jsonify({"status": "error", "reason": "Swing scanner not running"}), 503
+
+
+@app.route("/portfolio", methods=["GET"])
+def portfolio_status():
+    """Portfolio-level Greeks aggregator summary."""
+    fmt = request.args.get("format", "json")
+    if fmt == "text":
+        return _portfolio_greeks.format_summary(), 200, {"Content-Type": "text/plain"}
+    return jsonify(_portfolio_greeks.get_summary())
+
+
+@app.route("/regime", methods=["GET"])
+def regime_status():
+    """Regime transition detector status."""
+    return jsonify(_regime_detector.get_status())
 
 
 _initialize_app()
