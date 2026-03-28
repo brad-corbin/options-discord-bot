@@ -83,6 +83,8 @@ from trading_rules import (
     CONFIDENCE_BOOSTS, CONFIDENCE_PENALTIES,
     IV_RV_RATIO_BUYER_EDGE, IV_RV_RATIO_SELLER_EDGE,
     HIGH_VOLUME_TICKERS,
+    # v5.1
+    SWING_SCANNER_ENABLED,
 )
 # ── v4 engine bridge ──
 from engine_bridge import (
@@ -143,6 +145,7 @@ from sector_rotation import (
     format_sector_line,
 )
 from active_scanner import ActiveScanner
+from swing_scanner import SwingScanner
 
 # ── v4.3: Thesis Monitor ──
 from thesis_monitor import (
@@ -6919,6 +6922,7 @@ def _em_scheduler():
 _background_lock_fh = None
 _background_services_started = False
 _scanner = None  # v5.0: active scanner instance
+_swing_scanner = None  # v5.1: swing scanner instance
 _background_services_lock = threading.Lock()
 
 
@@ -6944,6 +6948,7 @@ def _acquire_background_leader() -> bool:
 def _start_background_services_once():
     global _background_services_started, _queue_worker_threads
     global _scanner  # v5.0
+    global _swing_scanner  # v5.1
     with _background_services_lock:
         if _background_services_started:
             return True
@@ -6973,6 +6978,25 @@ def _start_background_services_once():
             log.info(f"Active scanner started: {_scanner.watchlist_size} tickers")
         else:
             log.info("Active scanner disabled by ACTIVE_SCANNER_ENABLED=False")
+        # v5.1: Start swing scanner
+        if SWING_SCANNER_ENABLED:
+            def _get_vix_for_scanner():
+                try:
+                    vd = _get_vix_data()
+                    return vd.get("vix", 20) if vd else 20
+                except Exception:
+                    return 20
+            _swing_scanner = SwingScanner(
+                enqueue_fn=_enqueue_signal,
+                post_fn=post_to_telegram,
+                earnings_fn=lambda t: enrich_ticker(t),
+                vix_fn=_get_vix_for_scanner,
+            )
+            _swing_scanner.start()
+            log.info(f"Swing scanner started: {_swing_scanner.status.get('watchlist_size', 0)} tickers "
+                     f"({_swing_scanner.status.get('swing_only_tickers', 0)} swing-only)")
+        else:
+            log.info("Swing scanner disabled by SWING_SCANNER_ENABLED=False")
         _background_services_started = True
         log.info("Background services started in leader process")
         return True
@@ -7060,6 +7084,31 @@ def economic_calendar_endpoint():
     dte = int(request.args.get("dte", 5))
     events = get_events_in_window(dte_days=dte)
     return jsonify(events)
+
+
+@app.route("/swing_scanner", methods=["GET"])
+def swing_scanner_status():
+    """Swing scanner status and watchlist info."""
+    if _swing_scanner:
+        return jsonify(_swing_scanner.status)
+    return jsonify({"running": False, "reason": "Swing scanner not initialized"})
+
+
+@app.route("/swing_scan", methods=["POST"])
+def trigger_swing_scan():
+    """Trigger an immediate swing scan of the full watchlist."""
+    data = request.get_json(force=True, silent=True) or {}
+    supplied = (data.get("secret") or request.args.get("secret") or "").strip()
+    if SCAN_SECRET and supplied != SCAN_SECRET:
+        return jsonify({"error": "Unauthorized"}), 403
+
+    if _swing_scanner:
+        def _run():
+            signals = _swing_scanner.force_scan()
+            log.info(f"Manual swing scan complete: {len(signals)} signals")
+        threading.Thread(target=_run, daemon=True).start()
+        return jsonify({"status": "accepted", "watchlist_size": _swing_scanner.status.get("watchlist_size", 0)})
+    return jsonify({"status": "error", "reason": "Swing scanner not running"}), 503
 
 
 _initialize_app()
