@@ -808,20 +808,16 @@ def _prefetch_ticker(ticker: str):
 
             vl = (vol_regime.get("label") or "").upper()
             vc = vol_regime.get("caution_score", 0)
+            # v5.0 fix: DON'T skip chains in CRISIS at prefetch level.
+            # Prefetch doesn't know signal direction. Bear signals are
+            # valid in CRISIS and need chains. The per-signal pre-chain
+            # gate in _process_job handles direction-aware blocking.
+            # Only skip if caution=8 AND this is clearly not a bear day
+            # (we can't know that here, so we just log and proceed).
             if vl == "CRISIS" or vc >= 6:
-                log.info(f"Prefetch {ticker}: SKIPPING CHAINS — CRISIS regime "
-                         f"(VIX {vol_regime.get('vix', '?')}, caution {vc}/8, "
-                         f"saved ~5 API calls)")
-                _prefetch_set(ticker, {
-                    "spot": spot, "chains": None,
-                    "enrichment": enrichment, "candle_closes": candle_closes,
-                    "regime": regime, "vol_regime": vol_regime,
-                    "v4_flow": {}, "term_structure": term_structure,
-                    "econ_events": econ_events, "sector_data": sector_data,
-                    "prechain_skip": True,
-                    "prechain_reason": f"CRISIS vol regime (VIX {vol_regime.get('vix', '?')})",
-                })
-                return
+                log.info(f"Prefetch {ticker}: CRISIS regime "
+                         f"(VIX {vol_regime.get('vix', '?')}, caution {vc}/8) "
+                         f"— fetching chains anyway (bears valid in CRISIS)")
 
         # ═══ CHAINS (only reached if pre-chain gate passed) ═══
         chains = get_options_chain(ticker)
@@ -1212,13 +1208,23 @@ def _process_job(worker_id: int, job: dict):
         _early_vix = (_early_vol or {}).get("vix", 0)
 
         if _early_label == "CRISIS" or _early_caution >= 6:
-            # Swing: always block in CRISIS
-            if job_type == "swing":
-                reason = f"🚨 VIX Crisis Regime (VIX {_early_vix:.1f}, caution {_early_caution}/8) — swing blocked before chain fetch"
+            # v5.0: Direction-aware CRISIS gate.
+            # Bears in CRISIS = correct trade direction. Allow through.
+            # Bulls in CRISIS = fighting the market. Block.
+            if job_type == "swing" and bias == "bull":
+                reason = f"🚨 VIX Crisis Regime (VIX {_early_vix:.1f}, caution {_early_caution}/8) — bull swing blocked"
                 base["reason"] = reason
                 log.info(f"[worker-{worker_id}] {ticker} {job_type} EARLY BLOCK: {reason}")
                 _record_wave_result(base)
                 return
+
+            if job_type == "swing" and bias == "bear":
+                log.info(f"[worker-{worker_id}] {ticker} CRISIS regime but bear swing — allowing through "
+                         f"(VIX {_early_vix:.1f}, caution {_early_caution}/8)")
+
+            # Manual swing (/checkswing BOTH): allow through with warning
+            if job_type == "swing" and bias not in ("bull", "bear"):
+                log.info(f"[worker-{worker_id}] {ticker} CRISIS regime, manual swing check — allowing through")
 
             # TV scalp: block bull calls in CRISIS (risk_manager blocks anyway)
             if job_type == "tv" and bias == "bull":
@@ -1549,9 +1555,20 @@ def _process_job(worker_id: int, job: dict):
         rec = _apply_canonical_vol_overlay_to_rec(rec, vol_regime, mode="swing") if rec.get("ok") else rec
         rec = _apply_canonical_structure_overlay_to_rec(rec, structure_ctx, mode="swing") if rec.get("ok") else rec
         base["confidence"] = rec.get("confidence")
-        if rec.get("ok") and vol_regime.get("label") == "CRISIS" and int(rec.get("confidence") or 0) < 80:
-            rec = {"ok": False, "reason": "CRISIS volatility regime — swing setups require exceptional confidence", "confidence": rec.get("confidence")}
-            base["confidence"] = rec.get("confidence")
+        # v5.0: Direction-aware CRISIS gate for swing trades.
+        # Bears in CRISIS = correct trade (market tanking). Lower confidence gate.
+        # Bulls in CRISIS = fighting the tide. Require exceptional confidence.
+        if rec.get("ok") and vol_regime.get("label") == "CRISIS":
+            _sw_conf = int(rec.get("confidence") or 0)
+            if bias == "bull" and _sw_conf < 80:
+                rec = {"ok": False, "reason": f"CRISIS regime — bull swing requires conf >= 80 (got {_sw_conf})", "confidence": _sw_conf}
+                base["confidence"] = _sw_conf
+            elif bias == "bear" and _sw_conf < 55:
+                rec = {"ok": False, "reason": f"CRISIS regime — bear swing requires conf >= 55 (got {_sw_conf})", "confidence": _sw_conf}
+                base["confidence"] = _sw_conf
+            elif bias == "bear":
+                # Bear passed — add CRISIS note to card
+                rec["vol_regime_note"] = (rec.get("vol_regime_note") or "") + "\n⚠️ CRISIS REGIME — reduced sizing recommended. Bears valid but volatility is extreme."
 
         if not rec.get("ok"):
             base["reason"] = rec.get("reason", "no valid setup")
