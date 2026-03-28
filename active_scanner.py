@@ -118,8 +118,13 @@ def _compute_macd(closes: list) -> Dict:
         "macd_line": macd_line[-1] if macd_line else 0,
         "signal_line": signal[-1] if signal else 0,
         "macd_hist": hist,
-        "macd_cross_bull": len(macd_line) >= 2 and macd_line[-2] < signal[-1] and macd_line[-1] > signal[-1] if signal else False,
-        "macd_cross_bear": len(macd_line) >= 2 and macd_line[-2] > signal[-1] and macd_line[-1] < signal[-1] if signal else False,
+        # v5.1 fix: cross detection compares prior-to-prior, not prior-to-current
+        "macd_cross_bull": (len(macd_line) >= 2 and len(signal) >= 2
+                           and macd_line[-2] < signal[-2]
+                           and macd_line[-1] > signal[-1]) if signal else False,
+        "macd_cross_bear": (len(macd_line) >= 2 and len(signal) >= 2
+                           and macd_line[-2] > signal[-2]
+                           and macd_line[-1] < signal[-1]) if signal else False,
     }
 
 
@@ -153,8 +158,13 @@ def _compute_wavetrend(hlc3: list) -> Dict:
         "wt2": wt2_vals[-1],
         "wt_oversold": wt2_vals[-1] < -30,
         "wt_overbought": wt2_vals[-1] > 60,
-        "wt_cross_bull": len(wt1) >= 2 and wt1[-2] < wt2_vals[-1] and wt1[-1] > wt2_vals[-1],
-        "wt_cross_bear": len(wt1) >= 2 and wt1[-2] > wt2_vals[-1] and wt1[-1] < wt2_vals[-1],
+        # v5.1 fix: cross detection compares prior-to-prior, not prior-to-current
+        "wt_cross_bull": (len(wt1) >= 2 and len(wt2_vals) >= 2
+                         and wt1[-2] < wt2_vals[-2]
+                         and wt1[-1] > wt2_vals[-1]),
+        "wt_cross_bear": (len(wt1) >= 2 and len(wt2_vals) >= 2
+                         and wt1[-2] > wt2_vals[-2]
+                         and wt1[-1] < wt2_vals[-1]),
     }
 
 
@@ -162,45 +172,70 @@ def _analyze_ticker(
     ticker: str,
     intraday_fn: Callable,
     daily_candle_fn: Callable,
-    spot_fn: Callable,
 ) -> Optional[Dict]:
     """
     Run technical analysis on a ticker using intraday + daily data.
-    Returns a signal dict if setup is detected, None otherwise.
 
-    Designed to work from early session (10+ bars) through full day.
-    Indicators that need more data gracefully return empty/None and
-    scoring adjusts accordingly — early session signals rely more on
-    EMA + VWAP + daily trend, less on MACD/WaveTrend.
+    v5.1 institutional fixes:
+      - Reject telemetry: every exit path returns a reason via _reject()
+      - Data quality flags: full/partial/minimal based on bar count
+      - ADTV liquidity gating: rejects tickers with very low dollar volume
+      - Removed unused spot_fn parameter
+
+    Returns signal dict if setup is detected, None otherwise.
+    Reject reasons are logged for tuning telemetry.
     """
+    def _reject(reason: str) -> None:
+        """Structured reject logging for scanner telemetry."""
+        log.debug(f"Scanner reject {ticker}: {reason}")
+        return None
+
     try:
-        # Fetch 5-minute bars. Request 80 but accept fewer early in session.
-        # MarketData returns 404 when countback exceeds available bars,
-        # so we also try smaller countback values.
+        # Fetch 5-minute bars with fallback for early session / thin tickers
         bars = None
+        bars_requested = 0
         for cb in [80, 40, 20]:
             try:
                 bars = intraday_fn(ticker, resolution=5, countback=cb)
                 if bars and bars.get("c"):
+                    bars_requested = cb
                     break
             except Exception:
                 continue
 
         if not bars or not bars.get("c"):
-            return None
+            return _reject("no_intraday_data")
 
         closes = [c for c in bars["c"] if c is not None]
         highs = [h for h in bars.get("h", []) if h is not None]
         lows = [l for l in bars.get("l", []) if l is not None]
         volumes = [v for v in bars.get("v", []) if v is not None]
 
-        # Minimum 12 bars (~1 hour of 5-min data) for EMA5/12 to be meaningful
         if len(closes) < 12:
-            return None
+            return _reject(f"insufficient_bars ({len(closes)} < 12)")
 
         spot = closes[-1]
 
-        # VWAP approximation (volume-weighted average of typical prices)
+        # ── Data quality classification ──
+        bar_count = len(closes)
+        if bar_count >= 40:
+            data_quality = "full"       # all indicators available
+        elif bar_count >= 20:
+            data_quality = "partial"    # RSI available, MACD/WT may not be
+        else:
+            data_quality = "minimal"    # EMA + VWAP only
+
+        # ── ADTV liquidity gating ──
+        # Reject tickers with very low average daily dollar volume
+        # (they'll have garbage option liquidity downstream)
+        if volumes and len(volumes) >= 10:
+            avg_vol_10 = sum(volumes[-10:]) / 10
+            adtv = avg_vol_10 * spot * 5 * 60  # rough daily estimate from 5-min bars
+            # ~$5M daily min for 0DTE options liquidity
+            if adtv < 5_000_000 and ticker not in ("SPY", "QQQ", "IWM", "DIA"):
+                return _reject(f"low_adtv (est ${adtv/1e6:.1f}M < $5M)")
+
+        # VWAP approximation
         vwap = None
         if highs and lows and volumes and len(highs) == len(lows) == len(volumes) == len(closes):
             tp_vol_sum = sum((highs[i] + lows[i] + closes[i]) / 3 * volumes[i]
@@ -213,7 +248,7 @@ def _analyze_ticker(
         ema5 = _compute_ema(closes, EMA_FAST)
         ema12 = _compute_ema(closes, EMA_SLOW)
         if not ema5 or not ema12:
-            return None
+            return _reject("ema_computation_failed")
 
         ema_bull = ema5[-1] > ema12[-1]
         ema_dist_pct = ((ema5[-1] - ema12[-1]) / ema12[-1]) * 100 if ema12[-1] > 0 else 0
@@ -236,108 +271,134 @@ def _analyze_ticker(
 
         # Daily trend (for HTF confirmation)
         daily_closes = daily_candle_fn(ticker, days=30)
-        daily_bull = None  # v5.0 fix: None = unknown, not False = bearish
+        daily_bull = None
         htf_confirmed = False
-        htf_converging = False  # v5.1: true convergence = daily EMAs narrowing toward intraday bias
-        htf_status = "UNKNOWN"  # CONFIRMED | CONVERGING | OPPOSING | UNKNOWN
+        htf_converging = False
+        htf_status = "UNKNOWN"
         if daily_closes and len(daily_closes) >= 21:
             daily_ema8 = _compute_ema(daily_closes, 8)
             daily_ema21 = _compute_ema(daily_closes, 21)
             if daily_ema8 and daily_ema21 and len(daily_ema8) >= 2:
                 daily_bull = daily_ema8[-1] > daily_ema21[-1]
-                # HTF confirmed if daily trend aligns with intraday
                 htf_confirmed = (daily_bull == ema_bull)
 
                 if htf_confirmed:
                     htf_status = "CONFIRMED"
                 else:
-                    # Check if daily EMAs are genuinely converging:
-                    # gap is narrowing = daily trend weakening = shifting toward intraday
                     daily_gap_now = abs(daily_ema8[-1] - daily_ema21[-1])
                     daily_gap_prev = abs(daily_ema8[-2] - daily_ema21[-2])
-                    if daily_gap_now < daily_gap_prev * 0.98:  # gap shrinking by 2%+
+                    if daily_gap_now < daily_gap_prev * 0.98:
                         htf_converging = True
                         htf_status = "CONVERGING"
                     else:
-                        htf_status = "OPPOSING"  # daily disagrees and not narrowing
+                        htf_status = "OPPOSING"
 
         # ── Score the setup ──
         score = 0
         bias = "bull" if ema_bull else "bear"
+        score_breakdown = {}  # telemetry: what contributed to the score
 
-        # EMA alignment: award points only when EMA spread is meaningful
-        # v5.0 fix: old line was `score += 15 if ema_bull or not ema_bull else 0`
-        # which is always true. Now requires actual EMA separation.
-        if abs(ema_dist_pct) > 0.03:  # EMAs must be >0.03% apart
+        # EMA alignment
+        if abs(ema_dist_pct) > 0.03:
             score += 15
+            score_breakdown["ema"] = 15
         elif abs(ema_dist_pct) > 0.01:
-            score += 8   # weak alignment — partial credit
+            score += 8
+            score_breakdown["ema"] = 8
+        else:
+            score_breakdown["ema"] = 0
 
-        # MACD confirmation: +15/+10, penalty -10 for counter-signal
+        # MACD confirmation
         if macd:
             if bias == "bull" and macd.get("macd_hist", 0) > 0:
-                score += 15
+                score += 15; score_breakdown["macd_hist"] = 15
             elif bias == "bear" and macd.get("macd_hist", 0) < 0:
-                score += 15
+                score += 15; score_breakdown["macd_hist"] = 15
             elif macd.get("macd_hist", 0) != 0:
-                score -= 10  # MACD disagrees with EMA bias
+                score -= 10; score_breakdown["macd_hist"] = -10
+            else:
+                score_breakdown["macd_hist"] = 0
 
             if macd.get("macd_cross_bull") and bias == "bull":
-                score += 10
+                score += 10; score_breakdown["macd_cross"] = 10
             elif macd.get("macd_cross_bear") and bias == "bear":
-                score += 10
+                score += 10; score_breakdown["macd_cross"] = 10
+            else:
+                score_breakdown["macd_cross"] = 0
+        else:
+            score_breakdown["macd_hist"] = 0
+            score_breakdown["macd_cross"] = 0
 
-        # WaveTrend zone: +15/+10, penalty -10 for wrong zone
+        # WaveTrend zone
         if wt:
             if bias == "bull" and wt.get("wt_oversold"):
-                score += 15
+                score += 15; score_breakdown["wt"] = 15
             elif bias == "bear" and wt.get("wt_overbought"):
-                score += 15
+                score += 15; score_breakdown["wt"] = 15
             elif bias == "bull" and wt.get("wt_overbought"):
-                score -= 10  # bull signal but WT overbought
+                score -= 10; score_breakdown["wt"] = -10
             elif bias == "bear" and wt.get("wt_oversold"):
-                score -= 10  # bear signal but WT oversold
+                score -= 10; score_breakdown["wt"] = -10
             elif bias == "bull" and wt.get("wt_cross_bull"):
-                score += 10
+                score += 10; score_breakdown["wt"] = 10
             elif bias == "bear" and wt.get("wt_cross_bear"):
-                score += 10
+                score += 10; score_breakdown["wt"] = 10
+            else:
+                score_breakdown["wt"] = 0
+        else:
+            score_breakdown["wt"] = 0
 
-        # VWAP position: +10, penalty -5 for wrong side
+        # VWAP position
         if vwap:
             if bias == "bull" and spot > vwap:
-                score += 10
+                score += 10; score_breakdown["vwap"] = 10
             elif bias == "bear" and spot < vwap:
-                score += 10
+                score += 10; score_breakdown["vwap"] = 10
             elif bias == "bull" and spot < vwap:
-                score -= 5  # bull bias but below VWAP
+                score -= 5; score_breakdown["vwap"] = -5
             elif bias == "bear" and spot > vwap:
-                score -= 5  # bear bias but above VWAP
+                score -= 5; score_breakdown["vwap"] = -5
+        else:
+            score_breakdown["vwap"] = 0
 
-        # Daily trend alignment: +15/+10, penalty -10 for fighting daily
-        # v5.0 fix: daily_bull=None means no data — skip scoring entirely
+        # Daily trend alignment
         if htf_confirmed:
-            score += 15
+            score += 15; score_breakdown["htf"] = 15
         elif daily_bull is not None:
             if (bias == "bull" and daily_bull) or (bias == "bear" and not daily_bull):
-                score += 10
+                score += 10; score_breakdown["htf"] = 10
             else:
-                score -= 10  # fighting the daily trend
+                score -= 10; score_breakdown["htf"] = -10
+        else:
+            score_breakdown["htf"] = 0
 
-        # Volume confirmation: +10
+        # Volume confirmation
         if volume_ratio > 1.5:
-            score += 10
+            score += 10; score_breakdown["volume"] = 10
         elif volume_ratio > 1.0:
-            score += 5
+            score += 5; score_breakdown["volume"] = 5
+        else:
+            score_breakdown["volume"] = 0
 
-        # RSI: +5
+        # RSI
         if rsi:
             if bias == "bull" and 40 < rsi < 65:
-                score += 5  # bullish but not overbought
+                score += 5; score_breakdown["rsi"] = 5
             elif bias == "bear" and 35 < rsi < 60:
-                score += 5
+                score += 5; score_breakdown["rsi"] = 5
+            else:
+                score_breakdown["rsi"] = 0
+        else:
+            score_breakdown["rsi"] = 0
+
+        # Data quality penalty for partial/minimal data
+        if data_quality == "partial":
+            score_breakdown["data_quality_note"] = "partial (20-39 bars)"
+        elif data_quality == "minimal":
+            score_breakdown["data_quality_note"] = "minimal (12-19 bars)"
 
         if score < MIN_SIGNAL_SCORE:
-            return None
+            return _reject(f"below_threshold (score={score}, breakdown={score_breakdown})")
 
         tier = "1" if score >= SIGNAL_TIER_1_SCORE else "2"
 
@@ -346,6 +407,9 @@ def _analyze_ticker(
             "bias": bias,
             "tier": tier,
             "score": score,
+            "score_breakdown": score_breakdown,
+            "data_quality": data_quality,
+            "bar_count": bar_count,
             "close": spot,
             "ema5": ema5[-1],
             "ema12": ema12[-1],
@@ -353,8 +417,12 @@ def _analyze_ticker(
             "macd_hist": macd.get("macd_hist", 0),
             "macd_line": macd.get("macd_line", 0),
             "signal_line": macd.get("signal_line", 0),
+            "macd_cross_bull": macd.get("macd_cross_bull", False),
+            "macd_cross_bear": macd.get("macd_cross_bear", False),
             "wt1": wt.get("wt1", 0),
             "wt2": wt.get("wt2", 0),
+            "wt_cross_bull": wt.get("wt_cross_bull", False),
+            "wt_cross_bear": wt.get("wt_cross_bear", False),
             "rsi_mfi": rsi,
             "rsi_mfi_bull": rsi > 50 if rsi else False,
             "vwap": vwap,
@@ -421,13 +489,30 @@ class ActiveScanner:
         last = self._last_scan.get(ticker, 0)
         return (time.time() - last) >= interval
 
-    def _is_deduped(self, ticker: str, bias: str) -> bool:
-        key = f"{ticker}:{bias}"
+    def _is_deduped(self, ticker: str, signal: dict) -> bool:
+        """
+        v5.1: Setup-hash dedup. Deduplicates on a richer signature than
+        just ticker:bias, so materially different setups at the same ticker
+        can fire while identical re-fires are suppressed.
+
+        Hash components: ticker, direction, htf_status, vwap_side, score_bucket
+        """
+        key = self._setup_hash(ticker, signal)
         last = self._signal_dedup.get(key, 0)
         return (time.time() - last) < self._signal_dedup_ttl
 
-    def _mark_signaled(self, ticker: str, bias: str):
-        self._signal_dedup[f"{ticker}:{bias}"] = time.time()
+    def _mark_signaled(self, ticker: str, signal: dict):
+        key = self._setup_hash(ticker, signal)
+        self._signal_dedup[key] = time.time()
+
+    @staticmethod
+    def _setup_hash(ticker: str, signal: dict) -> str:
+        """Build a setup signature for dedup."""
+        bias = signal.get("bias", "?")
+        htf = signal.get("htf_status", "?")
+        vwap_side = "above" if signal.get("above_vwap") else "below"
+        score_bucket = (signal.get("score", 0) // 10) * 10  # 50, 60, 70, etc
+        return f"{ticker}:{bias}:{htf}:{vwap_side}:{score_bucket}"
 
     def _scan_ticker(self, ticker: str):
         """Analyze one ticker and enqueue signal if setup detected."""
@@ -437,7 +522,6 @@ class ActiveScanner:
             ticker=ticker,
             intraday_fn=self._intraday,
             daily_candle_fn=self._candles,
-            spot_fn=self._spot,
         )
 
         if not signal:
@@ -454,9 +538,10 @@ class ActiveScanner:
             self._scan_below_threshold_count = getattr(self, '_scan_below_threshold_count', 0) + 1
             return
 
-        # Dedup: don't re-signal same direction within 15 min
-        if self._is_deduped(ticker, bias):
-            log.debug(f"Scanner {ticker}: {bias} T{tier} score={score} — deduped (recent signal)")
+        # v5.1: Setup-hash dedup — materially different setups can fire
+        if self._is_deduped(ticker, signal):
+            log.debug(f"Scanner {ticker}: {bias} T{tier} score={score} — deduped "
+                      f"(hash={self._setup_hash(ticker, signal)})")
             return
 
         log.info(f"Scanner signal: {ticker} {bias.upper()} T{tier} "
@@ -475,8 +560,12 @@ class ActiveScanner:
             "macd_hist": signal["macd_hist"],
             "macd_line": signal["macd_line"],
             "signal_line": signal["signal_line"],
+            "macd_cross_bull": signal.get("macd_cross_bull", False),
+            "macd_cross_bear": signal.get("macd_cross_bear", False),
             "wt1": signal["wt1"],
             "wt2": signal["wt2"],
+            "wt_cross_bull": signal.get("wt_cross_bull", False),
+            "wt_cross_bear": signal.get("wt_cross_bear", False),
             "rsi_mfi": signal["rsi_mfi"],
             "rsi_mfi_bull": signal["rsi_mfi_bull"],
             "stoch_k": None,
@@ -485,10 +574,16 @@ class ActiveScanner:
             "above_vwap": signal["above_vwap"],
             "htf_confirmed": signal["htf_confirmed"],
             "htf_converging": signal["htf_converging"],
+            "htf_status": signal.get("htf_status", "UNKNOWN"),
             "daily_bull": signal["daily_bull"],
             "volume": signal["volume"],
             "timeframe": "5",
             "source": "active_scanner",
+            # v5.1: institutional additions
+            "data_quality": signal.get("data_quality", "unknown"),
+            "bar_count": signal.get("bar_count", 0),
+            "score_breakdown": signal.get("score_breakdown", {}),
+            "setup_hash": self._setup_hash(ticker, signal),
         }
 
         tier_emoji = "🥇" if tier == "1" else "🥈"
@@ -502,9 +597,13 @@ class ActiveScanner:
         _htf_display = {"CONFIRMED": "✅ Confirmed", "CONVERGING": "🟡 Converging",
                         "OPPOSING": "🔴 Opposing", "UNKNOWN": "⚪ No data"}.get(_htf_s, f"❓ {_htf_s}")
 
+        # Data quality indicator
+        _dq = signal.get("data_quality", "unknown")
+        _dq_display = {"full": "", "partial": " ⚠️partial-data", "minimal": " ⚠️minimal-data"}.get(_dq, "")
+
         signal_msg = "\n".join([
-            f"{tier_emoji} SCAN Signal — {ticker} (T{tier} {dir_emoji} {bias.upper()})",
-            f"Close: ${signal['close']:.2f} | 5m scan",
+            f"{tier_emoji} SCAN Signal — {ticker} (T{tier} {dir_emoji} {bias.upper()}){_dq_display}",
+            f"Close: ${signal['close']:.2f} | 5m scan | {signal.get('bar_count', 0)} bars",
             f"HTF: {_htf_display} | "
             f"Daily: {'🟢' if signal['daily_bull'] is True else '🔴' if signal['daily_bull'] is False else '⚪ N/A'}",
             f"Wave: {wave_zone} (wt2={wt2:.1f})",
@@ -514,7 +613,7 @@ class ActiveScanner:
         ])
 
         self._enqueue("tv", ticker, bias, webhook_data, signal_msg)
-        self._mark_signaled(ticker, bias)
+        self._mark_signaled(ticker, signal)
 
     def _loop(self):
         """Main scanner loop. Runs during market hours."""
