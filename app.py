@@ -148,6 +148,7 @@ from active_scanner import ActiveScanner
 from swing_scanner import SwingScanner
 from portfolio_greeks import PortfolioGreeks
 from regime_detector import RegimeDetector
+from oi_tracker import OITracker
 
 # ── v4.3: Thesis Monitor ──
 from thesis_monitor import (
@@ -158,6 +159,7 @@ from thesis_monitor import (
 
 # OI cache will be initialized after store_get/store_set are defined
 _oi_cache = None
+_oi_tracker = None  # v5.1: daily OI change tracker
 
 # ─────────────────────────────────────────────────────────
 # LOGGING
@@ -2763,6 +2765,8 @@ def _run_v4_prefilter(ticker: str, spot: float, chains: list, candle_closes: lis
 
         # Save OI snapshot for next run
         _oi_cache.save_snapshot(ticker, exp, chain_data)
+        if _oi_tracker:
+            _oi_tracker.record_chain(ticker, exp, chain_data)
 
         if v4.get("error"):
             log.warning(f"v4 prefilter failed for {ticker}: {v4['error']}")
@@ -3908,6 +3912,8 @@ def _get_0dte_iv(ticker: str, target_date_str: str = None) -> tuple:
 
         # ── Save current OI as reference for next run ──
         _oi_cache.save_snapshot(ticker, target, data)
+        if _oi_tracker:
+            _oi_tracker.record_chain(ticker, target, data)
 
         iv_meta = {"iv": v4.get("iv"), "source": "institutional_snapshot", "inferred": False, "notes": []}
         if v4.get("iv") is None:
@@ -4079,6 +4085,8 @@ def _get_chain_iv_for_expiry(ticker: str, target_date_str: str, dte: float) -> t
 
         # ── Save OI snapshot ──
         _oi_cache.save_snapshot(ticker, target, data)
+        if _oi_tracker:
+            _oi_tracker.record_chain(ticker, target, data)
 
         iv_meta = {"iv": v4.get("iv"), "source": "institutional_snapshot", "inferred": False, "notes": []}
         if v4.get("iv") is None:
@@ -6939,6 +6947,31 @@ def _em_scheduler():
                     except Exception as _re:
                         log.debug(f"Regime detector update error: {_re}")
 
+            # ── v5.1: OI Tracker — morning summary + end-of-day flush ──
+            if _oi_tracker:
+                # Morning summary at 9:00 AM CT
+                _oi_sum_key = (date_str, "oi_summary")
+                if _oi_sum_key not in fired_today and _oi_tracker.should_post_summary():
+                    fired_today.add(_oi_sum_key)
+                    try:
+                        _oi_msg = _oi_tracker.format_morning_summary()
+                        if _oi_msg and "No significant" not in _oi_msg:
+                            post_to_telegram(_oi_msg)
+                            log.info("OI tracker: morning summary posted")
+                    except Exception as _oe:
+                        log.debug(f"OI tracker summary error: {_oe}")
+
+                # End-of-day flush at 4:20 PM CT
+                _oi_flush_key = (date_str, "oi_flush")
+                if _oi_flush_key not in fired_today:
+                    if now_ct.hour == 16 and 18 <= now_ct.minute <= 22:
+                        fired_today.add(_oi_flush_key)
+                        try:
+                            _oi_tracker.flush()
+                            log.info("OI tracker: end-of-day flush complete")
+                        except Exception as _oe:
+                            log.debug(f"OI tracker flush error: {_oe}")
+
             fired_today = {k for k in fired_today if k[0] == date_str}
         except Exception as e:
             log.error(f"EM scheduler error: {e}", exc_info=True)
@@ -7039,12 +7072,14 @@ def _start_background_services_once():
 
 def _initialize_app():
     global _oi_cache
+    global _oi_tracker
     with app.app_context():
         portfolio.init_store(store_get, store_set)
         trade_journal.init_store(store_get, store_set)
         init_shared_state(store_get, store_set)
         _oi_cache = OICache(store_get, store_set)
-        log.info(f"OI cache initialized (Redis: {_get_redis() is not None})")
+        _oi_tracker = OITracker(store_get, store_set)
+        log.info(f"OI cache + tracker initialized (Redis: {_get_redis() is not None})")
         _tg_ws = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
         if _tg_ws and BOT_URL and _acquire_background_leader():
             register_webhook(BOT_URL, _tg_ws)
@@ -7159,6 +7194,34 @@ def portfolio_status():
 def regime_status():
     """Regime transition detector status."""
     return jsonify(_regime_detector.get_status())
+
+
+@app.route("/oi", methods=["GET"])
+def oi_movers():
+    """OI change summary — daily movers."""
+    if not _oi_tracker:
+        return jsonify({"error": "OI tracker not initialized"}), 503
+    fmt = request.args.get("format", "json")
+    if fmt == "text":
+        return _oi_tracker.format_morning_summary(), 200, {"Content-Type": "text/plain"}
+    return jsonify({
+        "movers": _oi_tracker.get_daily_movers(),
+        "status": _oi_tracker.status,
+    })
+
+
+@app.route("/oi/<ticker>", methods=["GET"])
+def oi_ticker_detail(ticker):
+    """Detailed OI breakdown for one ticker."""
+    if not _oi_tracker:
+        return jsonify({"error": "OI tracker not initialized"}), 503
+    fmt = request.args.get("format", "json")
+    if fmt == "text":
+        return _oi_tracker.format_ticker_detail(ticker), 200, {"Content-Type": "text/plain"}
+    change = _oi_tracker.get_ticker_change(ticker.upper())
+    if change:
+        return jsonify(change)
+    return jsonify({"ticker": ticker.upper(), "message": "No data available"}), 404
 
 
 _initialize_app()
