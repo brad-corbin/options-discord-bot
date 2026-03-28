@@ -2699,6 +2699,16 @@ class ThesisMonitorDaemon:
             self._cycle_count += 1; self._stop_event.wait(MONITOR_POLL_INTERVAL_FAST_SEC)
     def _poll_cycle(self):
         if not self._enabled: return
+        # Weekend guard — no equity session Sat/Sun
+        try:
+            from zoneinfo import ZoneInfo
+            _now_ct = datetime.now(ZoneInfo("America/Chicago"))
+        except Exception:
+            try:
+                import pytz; _now_ct = datetime.now(pytz.timezone("America/Chicago"))
+            except Exception:
+                _now_ct = datetime.utcnow()
+        if _now_ct.weekday() >= 5: return  # Saturday=5, Sunday=6
         tp = _get_time_phase_ct()
         if tp["phase"] in ("PRE_MARKET", "AFTER_HOURS"): return
         # ── Phase transition digest ──
