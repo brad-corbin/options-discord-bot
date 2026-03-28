@@ -387,6 +387,13 @@ def analyze_swing_setup(
     bar = daily_bars[-1]  # latest bar
     spot = bar["c"]
 
+    # ── ADTV liquidity gate (real 20-day average daily dollar volume) ──
+    if len(daily_bars) >= 20:
+        adtv = sum(b["v"] * b["c"] for b in daily_bars[-20:]) / 20
+        if adtv < 5_000_000 and ticker not in ("SPY", "QQQ", "IWM", "DIA"):
+            log.debug(f"Swing scanner {ticker}: ADTV ${adtv/1e6:.1f}M < $5M, skipping")
+            return None
+
     # ── Weekly trend (aggregated from daily) ──
     weekly_bars = _aggregate_weekly(daily_bars)
     if len(weekly_bars) < SWING_WEEKLY_EMA_SLOW + 2:
