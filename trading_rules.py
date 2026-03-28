@@ -530,3 +530,104 @@ def get_vix_scaled_min_stop(ticker: str, vix: float = 20.0) -> float:
 
 EM_GUIDE_MATCHING_ENABLED = True
 
+
+# ═══════════════════════════════════════════════════════════
+# LONG OPTIONS MODE (v5.0)
+# ═══════════════════════════════════════════════════════════
+#
+# In certain high-conviction, high-vol environments, long puts/calls
+# beat debit spreads because:
+#   - No profit cap (spreads max out at width - debit)
+#   - Single leg = one B/A crossing, not two (less slippage)
+#   - Positive vega: benefits from vol expansion (puts in crash)
+#                    or vol collapse (calls on reversal)
+#
+# The engine prefers long options over spreads when ALL of these
+# conditions are met simultaneously.
+
+LONG_OPTIONS_ENABLED = True
+
+# ── Long Put conditions (bearish) ──
+LONG_PUT_MIN_VIX           = 22.0    # VIX must be elevated
+LONG_PUT_GEX_REQUIRED      = "negative"  # dealers short gamma = moves accelerate
+LONG_PUT_MIN_CONFIDENCE    = 65      # high conviction only
+LONG_PUT_MAX_DTE           = 3       # 0-3 DTE only (minimize theta bleed)
+LONG_PUT_DELTA_TARGET      = 0.50    # ATM delta target
+LONG_PUT_DELTA_RANGE       = (0.40, 0.60)  # acceptable delta range
+LONG_PUT_MAX_PREMIUM_PCT   = 0.035   # max premium as % of spot (3.5%)
+LONG_PUT_MIN_OI            = 500     # minimum open interest
+
+# ── Long Call conditions (bullish — rarer, reversal setups) ──
+LONG_CALL_MIN_VIX          = 25.0    # higher bar — need vol to be collapsing
+LONG_CALL_GEX_REQUIRED     = "any"   # GEX neg→pos flip is ideal but hard to detect
+LONG_CALL_MIN_CONFIDENCE   = 70      # even higher conviction for reversal
+LONG_CALL_MAX_DTE          = 3
+LONG_CALL_DELTA_TARGET     = 0.50
+LONG_CALL_DELTA_RANGE      = (0.40, 0.60)
+LONG_CALL_MAX_PREMIUM_PCT  = 0.035
+LONG_CALL_MIN_OI           = 500
+# Additional call condition: must be a reversal setup
+# (VIX declining from recent peak, or GEX flipping positive)
+LONG_CALL_REQUIRE_VIX_DECLINING = True
+LONG_CALL_VIX_DECLINE_PCT  = 5.0    # VIX must be 5%+ off recent high
+
+# ── Sizing ──
+LONG_OPTION_SIZE_MULT      = 0.5    # half normal size (premium at risk, no cap)
+LONG_OPTION_STOP_PCT       = 0.50   # stop at 50% loss of premium
+LONG_OPTION_TARGET_1_PCT   = 1.00   # first target: 100% gain (2x entry)
+LONG_OPTION_TARGET_2_PCT   = 2.00   # second target: 200% gain (3x entry)
+
+
+# ═══════════════════════════════════════════════════════════
+# DIRECTIONAL LONG OPTIONS MODE (v5.0)
+# ═══════════════════════════════════════════════════════════
+#
+# When spread candidates all fail (slippage, liquidity) but
+# the setup is high-conviction, fall back to naked long options.
+# One-leg B/A crossing eliminates the compound slippage problem.
+#
+# Long puts vs put spreads:
+#   Puts in CRISIS: VIX goes HIGHER as market falls → delta + vega
+#   both work for you. Uncapped downside capture.
+#
+# Long calls vs call spreads:
+#   Calls in LOW VIX: premium is cheap, breakout + vol expansion
+#   both work for you. Uncapped upside capture.
+#   Calls in HIGH VIX: vol crush on bounce hurts you → spreads
+#   are usually better (short leg hedges vega).
+#
+# The asymmetry:
+#   Put buyer in crash: vol expands → double benefit (delta + vega)
+#   Call buyer in bounce: vol contracts → partial offset (delta - vega)
+#   So long puts are favored in high-VIX, long calls in low-VIX.
+
+NAKED_OPTION_ENABLED         = True
+
+# ── Long Put conditions (bearish, high VIX) ──
+NAKED_PUT_MIN_VIX            = 22.0    # VIX must be >= 22 for long puts
+NAKED_PUT_PREFER_GEX_NEG     = True    # strongly prefer GEX negative (moves accelerate)
+NAKED_PUT_MIN_CONFIDENCE     = 60      # confidence threshold for naked puts
+NAKED_PUT_MAX_DTE            = 5       # 0-5 DTE for directional puts
+
+# ── Long Call conditions (bullish, low VIX or snap-back) ──
+NAKED_CALL_MAX_VIX           = 18.0    # VIX must be <= 18 for standard long calls
+NAKED_CALL_SNAPBACK_MIN_VIX  = 22.0    # OR: snap-back calls when VIX high + squeeze
+NAKED_CALL_MIN_CONFIDENCE    = 65      # confidence threshold for naked calls
+NAKED_CALL_MAX_DTE           = 5       # 0-5 DTE for directional calls
+
+# ── Swing-specific overrides (longer DTE chains) ──
+NAKED_PUT_MAX_DTE_SWING      = 21      # swing puts can use 10-21 DTE
+NAKED_CALL_MAX_DTE_SWING     = 14      # swing calls can use 10-14 DTE
+
+# ── Strike selection ──
+NAKED_STRIKE_PREFERENCE      = "ATM"   # ATM, SLIGHT_ITM, SLIGHT_OTM
+NAKED_MAX_DELTA_LONG_PUT     = -0.35   # minimum delta magnitude for puts
+NAKED_MIN_DELTA_LONG_PUT     = -0.55   # maximum delta magnitude for puts
+NAKED_MIN_DELTA_LONG_CALL    = 0.40    # minimum delta for calls
+NAKED_MAX_DELTA_LONG_CALL    = 0.60    # maximum delta for calls
+
+# ── Sizing (smaller than spreads — max loss = full premium) ──
+NAKED_SIZE_MULT              = 0.50    # half the normal contract count
+NAKED_MAX_PREMIUM_USD        = 500     # max premium per trade ($5.00 × 1 contract)
+NAKED_MAX_PREMIUM_PCT_ACCT   = 0.01   # max 1% of account per naked trade
+
