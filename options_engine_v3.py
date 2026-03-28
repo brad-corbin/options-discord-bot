@@ -41,6 +41,17 @@ from trading_rules import (
     DYNAMIC_EXIT_LATE_MULT, DYNAMIC_EXIT_POWER_HOUR_MULT,
     IV_RV_RATIO_BUYER_EDGE, IV_RV_RATIO_SELLER_EDGE,
 )
+# v5.0: Directional long option mode
+from trading_rules import (
+    NAKED_OPTION_ENABLED,
+    NAKED_PUT_MIN_VIX, NAKED_PUT_PREFER_GEX_NEG,
+    NAKED_PUT_MIN_CONFIDENCE, NAKED_PUT_MAX_DTE,
+    NAKED_CALL_MAX_VIX, NAKED_CALL_SNAPBACK_MIN_VIX,
+    NAKED_CALL_MIN_CONFIDENCE, NAKED_CALL_MAX_DTE,
+    NAKED_MAX_DELTA_LONG_PUT, NAKED_MIN_DELTA_LONG_PUT,
+    NAKED_MIN_DELTA_LONG_CALL, NAKED_MAX_DELTA_LONG_CALL,
+    NAKED_SIZE_MULT, NAKED_MAX_PREMIUM_USD, NAKED_MAX_PREMIUM_PCT_ACCT,
+)
 
 
 # ─────────────────────────────────────────────────────────
@@ -1072,6 +1083,281 @@ def build_bear_put_spreads(
     return candidates
 
 
+# ═══════════════════════════════════════════════════════════
+# LONG OPTIONS BUILDERS (v5.0)
+# ═══════════════════════════════════════════════════════════
+
+def build_long_puts(
+    quotes: Dict[float, Dict],
+    spot: float,
+    expected_move: float = 0,
+    dte: int = 0,
+    ticker: str = "",
+) -> List[Dict]:
+    """
+    Build long put candidates for bearish high-vol setups.
+
+    Selects ATM/near-ATM puts with:
+    - Delta in LONG_PUT_DELTA_RANGE
+    - Premium <= LONG_PUT_MAX_PREMIUM_PCT of spot
+    - Minimum OI for liquidity
+    - Reasonable bid-ask spread
+    """
+    from trading_rules import (
+        LONG_PUT_DELTA_RANGE, LONG_PUT_MAX_PREMIUM_PCT,
+        LONG_PUT_MIN_OI, LONG_OPTION_TARGET_1_PCT, LONG_OPTION_TARGET_2_PCT,
+        SAME_DAY_EXIT_PCT, NEXT_DAY_EXIT_PCT, EXTENDED_HOLD_EXIT_PCT,
+    )
+
+    candidates = []
+    delta_min, delta_max = LONG_PUT_DELTA_RANGE
+    max_premium = spot * LONG_PUT_MAX_PREMIUM_PCT
+
+    for strike, q in sorted(quotes.items(), reverse=True):
+        delta = abs(q.get("delta") or 0)
+        if delta < delta_min or delta > delta_max:
+            continue
+
+        mid = q.get("mid", 0)
+        if mid <= 0 or mid > max_premium:
+            continue
+
+        oi = q.get("oi", 0) or 0
+        if oi < LONG_PUT_MIN_OI:
+            continue
+
+        bid = q.get("bid", 0) or 0
+        ask = q.get("ask", 0) or 0
+        if bid <= 0 or ask <= 0:
+            continue
+
+        spread_pct = (ask - bid) / mid if mid > 0 else 99
+        if spread_pct > 0.15:  # max 15% bid-ask spread
+            continue
+
+        # Long put: max loss = premium, max profit = unlimited (to zero)
+        max_loss = mid
+        breakeven = strike - mid
+        target_1 = round(mid * (1 + LONG_OPTION_TARGET_1_PCT), 2)
+        target_2 = round(mid * (1 + LONG_OPTION_TARGET_2_PCT), 2)
+
+        # Win prob estimate: use delta as proxy (ATM put ≈ 50% ITM at exp)
+        win_prob = delta  # rough but reasonable for directional bet
+
+        # EV for a long option: (win_prob * avg_win) - ((1-win_prob) * premium)
+        avg_win = mid * 1.5  # conservative: average win = 1.5x premium
+        ev = (win_prob * avg_win) - ((1 - win_prob) * mid)
+
+        candidates.append({
+            "long": strike,
+            "short": None,  # no short leg
+            "width": None,
+            "debit": round(mid, 2),
+            "natural_debit": round(ask, 2),
+            "cost_pct": round(mid / spot * 100, 2),
+            "max_profit": None,  # uncapped
+            "max_loss": round(max_loss, 2),
+            "ror": None,  # uncapped upside
+            "long_itm": q.get("itm_amount", 0),
+            "short_itm": None,
+            "long_delta": q.get("delta"),
+            "short_delta": None,
+            "long_oi": oi,
+            "short_oi": None,
+            "long_bid": bid,
+            "long_ask": ask,
+            "short_bid": None,
+            "short_ask": None,
+            "long_spread_pct": q.get("spread_pct"),
+            "short_spread_pct": None,
+            "net_theta": q.get("theta"),
+            "net_vega": q.get("vega"),
+            "net_delta": q.get("delta"),
+            "net_gamma": q.get("gamma"),
+            "win_prob": win_prob,
+            "max_profit_prob": None,
+            "breakeven": round(breakeven, 2),
+            "expected_value": round(ev, 4),
+            "em_proximity": round(strike - (spot - expected_move), 2) if expected_move > 0 else None,
+            "em_zone": "inside" if expected_move > 0 and strike >= (spot - expected_move) else "outside",
+            "same_day_exit": target_1,
+            "next_day_exit": target_2,
+            "extended_exit": round(mid * (1 + LONG_OPTION_TARGET_2_PCT * 1.5), 2),
+            "entry_profile": "long_put",
+            "profile_label": "Long Put (uncapped)",
+            "long_bucket": "ATM",
+            "short_bucket": None,
+            "warnings": q.get("warnings", []),
+            "is_long_option": True,
+            "spread_type": "long_put",
+        })
+
+    # Sort by delta closest to 0.50 (ATM)
+    candidates.sort(key=lambda c: abs(abs(c.get("long_delta") or 0) - 0.50))
+    return candidates[:5]  # top 5 closest to ATM
+
+
+def build_long_calls(
+    quotes: Dict[float, Dict],
+    spot: float,
+    expected_move: float = 0,
+    dte: int = 0,
+    ticker: str = "",
+) -> List[Dict]:
+    """
+    Build long call candidates for bullish reversal setups.
+
+    Same structure as build_long_puts but for calls. Used in
+    CRISIS reversal scenarios where VIX is declining from peak.
+    """
+    from trading_rules import (
+        LONG_CALL_DELTA_RANGE, LONG_CALL_MAX_PREMIUM_PCT,
+        LONG_CALL_MIN_OI, LONG_OPTION_TARGET_1_PCT, LONG_OPTION_TARGET_2_PCT,
+    )
+
+    candidates = []
+    delta_min, delta_max = LONG_CALL_DELTA_RANGE
+    max_premium = spot * LONG_CALL_MAX_PREMIUM_PCT
+
+    for strike, q in sorted(quotes.items()):
+        delta = abs(q.get("delta") or 0)
+        if delta < delta_min or delta > delta_max:
+            continue
+
+        mid = q.get("mid", 0)
+        if mid <= 0 or mid > max_premium:
+            continue
+
+        oi = q.get("oi", 0) or 0
+        if oi < LONG_CALL_MIN_OI:
+            continue
+
+        bid = q.get("bid", 0) or 0
+        ask = q.get("ask", 0) or 0
+        if bid <= 0 or ask <= 0:
+            continue
+
+        spread_pct = (ask - bid) / mid if mid > 0 else 99
+        if spread_pct > 0.15:
+            continue
+
+        max_loss = mid
+        breakeven = strike + mid
+        target_1 = round(mid * (1 + LONG_OPTION_TARGET_1_PCT), 2)
+        target_2 = round(mid * (1 + LONG_OPTION_TARGET_2_PCT), 2)
+
+        win_prob = delta
+        avg_win = mid * 1.5
+        ev = (win_prob * avg_win) - ((1 - win_prob) * mid)
+
+        candidates.append({
+            "long": strike,
+            "short": None,
+            "width": None,
+            "debit": round(mid, 2),
+            "natural_debit": round(ask, 2),
+            "cost_pct": round(mid / spot * 100, 2),
+            "max_profit": None,
+            "max_loss": round(max_loss, 2),
+            "ror": None,
+            "long_itm": q.get("itm_amount", 0),
+            "short_itm": None,
+            "long_delta": q.get("delta"),
+            "short_delta": None,
+            "long_oi": oi,
+            "short_oi": None,
+            "long_bid": bid,
+            "long_ask": ask,
+            "short_bid": None,
+            "short_ask": None,
+            "long_spread_pct": q.get("spread_pct"),
+            "short_spread_pct": None,
+            "net_theta": q.get("theta"),
+            "net_vega": q.get("vega"),
+            "net_delta": q.get("delta"),
+            "net_gamma": q.get("gamma"),
+            "win_prob": win_prob,
+            "max_profit_prob": None,
+            "breakeven": round(breakeven, 2),
+            "expected_value": round(ev, 4),
+            "em_proximity": round((spot + expected_move) - strike, 2) if expected_move > 0 else None,
+            "em_zone": "inside" if expected_move > 0 and strike <= (spot + expected_move) else "outside",
+            "same_day_exit": target_1,
+            "next_day_exit": target_2,
+            "extended_exit": round(mid * (1 + LONG_OPTION_TARGET_2_PCT * 1.5), 2),
+            "entry_profile": "long_call",
+            "profile_label": "Long Call (uncapped)",
+            "long_bucket": "ATM",
+            "short_bucket": None,
+            "warnings": q.get("warnings", []),
+            "is_long_option": True,
+            "spread_type": "long_call",
+        })
+
+    candidates.sort(key=lambda c: abs(abs(c.get("long_delta") or 0) - 0.50))
+    return candidates[:5]
+
+
+def _should_use_long_options(
+    bias: str,
+    vol_regime: Dict,
+    v4_flow: Dict,
+    confidence: int = 0,
+    dte: int = 0,
+) -> bool:
+    """
+    Decide whether long options are preferred over debit spreads.
+
+    Returns True when all conditions for the directional long option
+    mode are met. The caller should try long options first, then
+    fall back to spreads if no long option candidate passes filters.
+    """
+    from trading_rules import (
+        LONG_OPTIONS_ENABLED,
+        LONG_PUT_MIN_VIX, LONG_PUT_GEX_REQUIRED,
+        LONG_PUT_MIN_CONFIDENCE, LONG_PUT_MAX_DTE,
+        LONG_CALL_MIN_VIX, LONG_CALL_MIN_CONFIDENCE,
+        LONG_CALL_MAX_DTE, LONG_CALL_REQUIRE_VIX_DECLINING,
+    )
+
+    if not LONG_OPTIONS_ENABLED:
+        return False
+
+    vix = (vol_regime or {}).get("vix", 0)
+    gex_sign = "negative"  # default
+    if v4_flow:
+        gex = v4_flow.get("gex", 0) or 0
+        gex_sign = "negative" if gex < 0 else "positive"
+
+    if bias == "bear":
+        if vix < LONG_PUT_MIN_VIX:
+            return False
+        if dte > LONG_PUT_MAX_DTE:
+            return False
+        if LONG_PUT_GEX_REQUIRED == "negative" and gex_sign != "negative":
+            return False
+        if confidence < LONG_PUT_MIN_CONFIDENCE:
+            return False
+        return True
+
+    elif bias == "bull":
+        if vix < LONG_CALL_MIN_VIX:
+            return False
+        if dte > LONG_CALL_MAX_DTE:
+            return False
+        if confidence < LONG_CALL_MIN_CONFIDENCE:
+            return False
+        # Calls need VIX declining — reversal, not continuation
+        if LONG_CALL_REQUIRE_VIX_DECLINING:
+            vix9d = (vol_regime or {}).get("vix9d", 0)
+            # VIX9D < VIX = near-term vol declining = reversal setup
+            if vix9d >= vix:
+                return False
+        return True
+
+    return False
+
+
 def build_itm_debit_spreads(
     quotes: Dict[float, Dict],
     spot: float,
@@ -1095,6 +1381,241 @@ def build_itm_bear_put_spreads(
     candidates = build_bear_put_spreads(quotes, spot, available_widths, expected_move, dte=dte, atm_band=_atm_band(spot))
     return [c for c in candidates if c.get("entry_profile") == "conservative_itm"]
 
+
+# ─────────────────────────────────────────────────────────
+# DIRECTIONAL LONG OPTIONS (v5.0)
+# ─────────────────────────────────────────────────────────
+
+import logging as _naked_log
+_naked_logger = _naked_log.getLogger(__name__)
+
+
+def should_use_long_option(
+    bias: str,
+    vix: float,
+    gex_sign: str = "positive",
+    confidence: int = 50,
+    dte: int = 0,
+    is_snapback: bool = False,
+    max_dte_override: int = 0,  # v5.0: swing trades pass higher DTE limit
+) -> dict:
+    """
+    Determine whether a naked long option is appropriate instead of a spread.
+
+    The asymmetry:
+      - Long puts in CRISIS: vol expands as market falls → delta + vega both help.
+      - Long calls in low VIX: vol is cheap, breakout expands vol → delta + vega.
+      - Long calls in HIGH VIX: vol crush on bounce hurts → spreads usually win.
+        Exception: snap-back/squeeze where delta move overwhelms vega loss.
+    """
+    if not NAKED_OPTION_ENABLED:
+        return {"use_naked": False, "reason": "Naked option mode disabled"}
+
+    if bias == "bear":
+        _put_max_dte = max_dte_override if max_dte_override > 0 else NAKED_PUT_MAX_DTE
+        if vix < NAKED_PUT_MIN_VIX:
+            return {"use_naked": False, "reason": f"VIX {vix:.1f} < {NAKED_PUT_MIN_VIX} — spreads better in low vol"}
+        if confidence < NAKED_PUT_MIN_CONFIDENCE:
+            return {"use_naked": False, "reason": f"Confidence {confidence} < {NAKED_PUT_MIN_CONFIDENCE}"}
+        if dte > _put_max_dte:
+            return {"use_naked": False, "reason": f"DTE {dte} > {_put_max_dte} — theta too expensive"}
+        gex_note = "GEX- (accelerant)" if gex_sign == "negative" else "⚠️ GEX+ (watch for mean reversion)"
+        return {
+            "use_naked": True,
+            "reason": f"LONG PUT: VIX {vix:.1f}, conf {confidence}, DTE {dte}, {gex_note}",
+            "option_type": "put",
+            "gex_note": gex_note,
+        }
+
+    elif bias == "bull":
+        _call_max_dte = max_dte_override if max_dte_override > 0 else NAKED_CALL_MAX_DTE
+        # Case 1: Low VIX — cheap premium, vol expansion on breakout
+        if vix <= NAKED_CALL_MAX_VIX:
+            if confidence < NAKED_CALL_MIN_CONFIDENCE:
+                return {"use_naked": False, "reason": f"Confidence {confidence} < {NAKED_CALL_MIN_CONFIDENCE}"}
+            if dte > _call_max_dte:
+                return {"use_naked": False, "reason": f"DTE {dte} > {_call_max_dte}"}
+            gex_note = "GEX- (breakout accelerant)" if gex_sign == "negative" else "GEX+"
+            return {
+                "use_naked": True,
+                "reason": f"LONG CALL (low vol): VIX {vix:.1f}, conf {confidence}, {gex_note}",
+                "option_type": "call",
+                "gex_note": gex_note,
+            }
+
+        # Case 2: High VIX snap-back (squeeze / failed breakdown bounce)
+        if vix >= NAKED_CALL_SNAPBACK_MIN_VIX and is_snapback:
+            if confidence < NAKED_CALL_MIN_CONFIDENCE:
+                return {"use_naked": False, "reason": f"Snap-back: confidence {confidence} too low"}
+            if dte > _call_max_dte:
+                return {"use_naked": False, "reason": f"Snap-back: DTE {dte} too high"}
+            return {
+                "use_naked": True,
+                "reason": f"LONG CALL (snap-back): VIX {vix:.1f} squeeze, conf {confidence}",
+                "option_type": "call",
+                "gex_note": "Snap-back — delta should outpace vega crush",
+            }
+
+        return {"use_naked": False, "reason": f"VIX {vix:.1f} > {NAKED_CALL_MAX_VIX}, no snap-back — spreads hedge vol crush"}
+
+    return {"use_naked": False, "reason": f"Unknown bias '{bias}'"}
+
+
+def build_long_option_candidate(
+    quotes: dict,
+    spot: float,
+    option_type: str,  # "put" or "call"
+    dte: int = 0,
+    expected_move: float = 0.0,
+    gex_note: str = "",
+) -> Optional[dict]:
+    """
+    Find the best single put or call from the existing quote dict.
+    Returns a trade dict compatible with the spread result format, or None.
+    """
+    if not quotes:
+        return None
+
+    if option_type == "put":
+        min_d, max_d = NAKED_MAX_DELTA_LONG_PUT, NAKED_MIN_DELTA_LONG_PUT  # -0.35 to -0.55
+    else:
+        min_d, max_d = NAKED_MIN_DELTA_LONG_CALL, NAKED_MAX_DELTA_LONG_CALL  # 0.40 to 0.60
+
+    candidates = []
+    for strike, q in quotes.items():
+        delta = q.get("delta")
+        if delta is None:
+            continue
+        # Delta filter
+        if option_type == "put":
+            if delta > min_d or delta < max_d:
+                continue
+        else:
+            if delta < min_d or delta > max_d:
+                continue
+
+        bid = q.get("bid", 0) or 0
+        ask = q.get("ask", 0) or 0
+        mid = q.get("mid", 0) or 0
+        if mid <= 0 or bid <= 0:
+            continue
+        spread_pct = q.get("spread_pct", 1.0)
+        if spread_pct > 0.15:
+            continue
+        oi = q.get("oi", 0) or 0
+        if oi < 100:
+            continue
+
+        atm_dist = abs(strike - spot) / spot
+        gamma = q.get("gamma", 0) or 0
+        score = (1.0 - atm_dist * 20) + min(gamma * 500, 0.5) + min(oi / 10000, 0.3) - spread_pct * 2
+
+        candidates.append({
+            "strike": strike, "delta": delta, "bid": bid, "ask": ask,
+            "mid": mid, "premium": mid, "spread_pct": spread_pct,
+            "oi": oi, "volume": q.get("volume", 0) or 0,
+            "iv": q.get("iv", 0) or 0, "gamma": gamma,
+            "theta": q.get("theta", 0) or 0, "vega": q.get("vega", 0) or 0,
+            "score": score, "option_type": option_type, "gex_note": gex_note,
+        })
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda c: c["score"], reverse=True)
+    best = candidates[0]
+
+    if best["mid"] * 100 > NAKED_MAX_PREMIUM_USD:
+        _naked_logger.info(f"Long {option_type}: premium ${best['mid']:.2f} × 100 = "
+                           f"${best['mid'] * 100:.0f} > max ${NAKED_MAX_PREMIUM_USD}")
+        return None
+
+    return {
+        "ok": True, "trade_type": "long_option", "option_type": option_type,
+        "strike": best["strike"], "delta": best["delta"],
+        "premium": best["mid"], "bid": best["bid"], "ask": best["ask"],
+        "mid": best["mid"], "spread_pct": best["spread_pct"],
+        "oi": best["oi"], "volume": best["volume"], "iv": best["iv"],
+        "gamma": best["gamma"], "theta": best["theta"], "vega": best["vega"],
+        "gex_note": best["gex_note"], "expected_move": expected_move,
+        "dte": dte, "candidates_found": len(candidates),
+        "size_mult": NAKED_SIZE_MULT,
+    }
+
+
+def _build_naked_result(
+    ticker, spot, dte, expiration, bias, naked_trade, webhook_data,
+    expected_move, vol_edge, em_data, regime, entry_plan, avg_iv, rv, vol_regime,
+):
+    """Package a long option into the standard check_ticker result format."""
+    option_type = naked_trade["option_type"]
+    strike = naked_trade["strike"]
+    premium = naked_trade["premium"]
+
+    tier = webhook_data.get("tier", "2")
+    base_contracts, _, _ = compute_position_size(premium, tier)
+    num_contracts = max(1, int(base_contracts * NAKED_SIZE_MULT))
+    total_risk = round(premium * num_contracts * 100, 2)
+
+    stop_price = round(premium * 0.50, 2)
+    stop_note = "50% premium stop (max loss = full premium)"
+    exits = [
+        {"pct": 1.0, "label": "100% — double", "price": round(premium * 2, 2)},
+        {"pct": 2.0, "label": "200% — triple", "price": round(premium * 3, 2)},
+    ]
+
+    confidence, conf_reasons = compute_confidence(
+        webhook_data,
+        {"debit": premium, "width": premium, "win_prob": abs(naked_trade.get("delta", 0.5))},
+        False, False, vol_edge=vol_edge, em_data=em_data, regime=regime, vol_regime=vol_regime,
+    )
+
+    direction_label = "LONG PUT" if option_type == "put" else "LONG CALL"
+
+    return {
+        "ok": True,
+        "ticker": ticker, "spot": spot, "dte": dte, "exp": expiration,
+        "direction": bias,
+        "spread_type": "long_option",
+        "side": option_type,
+        "spread_label": direction_label,
+        "trade": {
+            "strike": strike, "delta": naked_trade["delta"],
+            "debit": premium, "width": premium,
+            "win_prob": abs(naked_trade.get("delta", 0.5)),
+            "expected_value": round(premium * abs(naked_trade.get("delta", 0.5)) * 2 - premium, 2),
+            "entry_profile": "long_option",
+            "long_strike": strike,
+            "long_bid": naked_trade["bid"], "long_ask": naked_trade["ask"],
+            "long_mid": naked_trade["mid"], "long_delta": naked_trade["delta"],
+            "long_iv": naked_trade["iv"], "long_oi": naked_trade["oi"],
+            "long_volume": naked_trade["volume"],
+            "long_gamma": naked_trade["gamma"],
+            "long_theta": naked_trade["theta"], "long_vega": naked_trade["vega"],
+            "long_spread_pct": naked_trade["spread_pct"],
+            "short_strike": None, "short_bid": None,
+            "short_ask": None, "short_delta": None,
+            "gex_note": naked_trade.get("gex_note", ""),
+        },
+        "ladder": [],
+        "candidate_count": naked_trade.get("candidates_found", 1),
+        "contracts": num_contracts,
+        "total_risk": total_risk,
+        "sizing_note": f"{num_contracts}x ${premium:.2f} = ${total_risk:.2f} "
+                       f"(naked {NAKED_SIZE_MULT:.0%} sizing)",
+        "stop_price": stop_price, "stop_note": stop_note,
+        "exits": exits,
+        "confidence": confidence, "conf_reasons": conf_reasons,
+        "tier": tier, "webhook_data": webhook_data,
+        "expected_move": expected_move, "vol_edge": vol_edge,
+        "em_data": em_data, "regime": regime,
+        "entry_plan": entry_plan,
+        "min_win_prob_required": MIN_WIN_PROBABILITY,
+        "trade_type": "long_option",
+        "naked_option_reason": naked_trade.get("gex_note", ""),
+        "iv_rv_ratio": round(avg_iv / rv, 3) if rv > 0 and avg_iv > 0 else None,
+        "avg_iv": avg_iv, "hv20": rv,
+    }
 
 
 # ─────────────────────────────────────────────────────────
@@ -1737,6 +2258,9 @@ def recommend_trade(
     entry_plan = _determine_entry_plan(webhook_data, bias, regime=regime, v4_flow=v4_flow, vol_edge=vol_edge, dte=dte)
     atm_band = _atm_band(spot)
 
+    # ═══ Build spread candidates ═══
+    # v5.0: If spreads fail (no candidates or all slippage-rejected),
+    # the fallback to long options is handled below.
     if bias == "bear":
         quotes = build_put_quotes(contracts, spot, ticker=ticker, include_otm=HYBRID_ENTRY_ENABLED)
         if len(quotes) < 2:
@@ -1767,6 +2291,33 @@ def recommend_trade(
         spread_label = "BULL CALL"
 
     if not candidates:
+        # v5.0: Try long option fallback before giving up
+        _naked_check = should_use_long_option(
+            bias=bias, vix=avg_iv * 100 if avg_iv < 1 else avg_iv,
+            gex_sign=webhook_data.get("gex_sign", v4_flow.get("gex_sign", "positive") if v4_flow else "positive"),
+            confidence=webhook_data.get("pre_confidence", 50),
+            dte=dte,
+            is_snapback=webhook_data.get("is_snapback", False),
+        )
+        if _naked_check.get("use_naked"):
+            _naked_trade = build_long_option_candidate(
+                quotes, spot, _naked_check["option_type"],
+                dte=dte, expected_move=expected_move,
+                gex_note=_naked_check.get("gex_note", ""),
+            )
+            if _naked_trade:
+                _naked_logger.info(f"Long {_naked_check['option_type']} fallback: "
+                                   f"strike=${_naked_trade['strike']:.2f}, "
+                                   f"premium=${_naked_trade['premium']:.2f}, "
+                                   f"delta={_naked_trade['delta']:.3f}, "
+                                   f"reason={_naked_check['reason']}")
+                # Package as check_ticker result
+                return _build_naked_result(
+                    ticker, spot, dte, expiration, bias, _naked_trade,
+                    webhook_data, expected_move, vol_edge, em_data, regime,
+                    entry_plan, avg_iv, rv, vol_regime,
+                )
+
         result["reason"] = (
             f"No valid hybrid debit spreads found "
             f"(widths tried: {available_widths}, liquid strikes: {len(quotes)}, entry mode: {entry_plan.get('aggression')})"
@@ -1791,6 +2342,32 @@ def recommend_trade(
             p = c.get("entry_profile", "unknown")
             profiles[p] = profiles.get(p, 0) + 1
         profile_txt = ", ".join(f"{k}:{v}" for k, v in sorted(profiles.items()))
+
+        # v5.0: Try long option fallback when all spreads fail slippage
+        _naked_check = should_use_long_option(
+            bias=bias, vix=avg_iv * 100 if avg_iv < 1 else avg_iv,
+            gex_sign=webhook_data.get("gex_sign", v4_flow.get("gex_sign", "positive") if v4_flow else "positive"),
+            confidence=webhook_data.get("pre_confidence", 50),
+            dte=dte,
+            is_snapback=webhook_data.get("is_snapback", False),
+        )
+        if _naked_check.get("use_naked"):
+            _naked_trade = build_long_option_candidate(
+                quotes, spot, _naked_check["option_type"],
+                dte=dte, expected_move=expected_move,
+                gex_note=_naked_check.get("gex_note", ""),
+            )
+            if _naked_trade:
+                _naked_logger.info(f"Long {_naked_check['option_type']} fallback (spreads failed slippage): "
+                                   f"strike=${_naked_trade['strike']:.2f}, "
+                                   f"premium=${_naked_trade['premium']:.2f}, "
+                                   f"rejects={rej_txt}, reason={_naked_check['reason']}")
+                return _build_naked_result(
+                    ticker, spot, dte, expiration, bias, _naked_trade,
+                    webhook_data, expected_move, vol_edge, em_data, regime,
+                    entry_plan, avg_iv, rv, vol_regime,
+                )
+
         result["reason"] = (
             f"No ranked {spread_label} spreads passed quality filters "
             f"(widths tried: {available_widths}; profiles: {profile_txt}; rejects: {rej_txt})"
