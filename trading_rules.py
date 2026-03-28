@@ -645,3 +645,99 @@ def get_naked_dte_range(is_swing: bool) -> tuple:
     else:
         return (NAKED_SCALP_MIN_DTE, NAKED_SCALP_MAX_DTE, NAKED_SCALP_MAX_DTE)
 
+
+# ═══════════════════════════════════════════════════════════
+# SWING SCANNER (v5.1)
+# ═══════════════════════════════════════════════════════════
+#
+# Python translation of Brad's Fibonacci Swing Signal v3.0
+# plus institutional enhancements. Runs daily on Yahoo Finance
+# data (free, unlimited). Separate watchlist from scalp scanner.
+
+SWING_SCANNER_ENABLED        = True
+
+# ── Swing-only tickers (not liquid enough for 0DTE, fine for 45-60 DTE) ──
+# Add tickers here anytime. They get swing-scanned but never scalp-scanned.
+SWING_ONLY_TICKERS = {
+    "INOD", "BWXT", "PLTR", "SNOW", "CRWD", "NET", "DDOG", "ZS",
+    "PANW", "FTNT", "ABNB", "DASH", "RBLX", "U", "TTD", "SHOP",
+    "MELI", "SE", "GRAB", "NU", "SQ", "PYPL", "AFRM", "UPST",
+    "ENPH", "SEDG", "FSLR", "RUN", "PLUG", "RIVN", "LCID", "NIO",
+    "LI", "XPEV", "DKNG", "PENN", "MGM", "WYNN", "LVS",
+    "EL", "LULU", "NKE", "SBUX", "CMG", "MCD",
+    "PFE", "MRNA", "ABBV", "LLY", "UNH", "JNJ",
+    "XOM", "CVX", "OXY", "SLB", "HAL",
+    "JPM", "GS", "MS", "BAC", "C", "WFC",
+    "CAT", "DE", "HON", "GE", "RTX", "LMT", "NOC",
+    "COST", "WMT", "TGT", "HD", "LOW",
+    "CRM", "ORCL", "NOW", "ADBE", "INTU",
+}
+
+# Combined swing watchlist = scalp tickers + swing-only
+SWING_WATCHLIST = set(HIGH_VOLUME_TICKERS) | SWING_ONLY_TICKERS
+
+# ── Scanner schedule ──
+SWING_SCAN_TIMES_CT          = ["08:15", "15:30"]  # pre-market + post-close
+SWING_SCAN_LOOKBACK_DAYS     = 120     # daily bars to fetch (need 50+ for pivots)
+
+# ── Fibonacci settings (mirrors Pine v3.0 inputs) ──
+SWING_FIB_LOOKBACK           = 50      # pivot lookback bars
+SWING_FIB_TOUCH_ZONE_PCT     = 1.25    # % zone for touch detection
+
+# ── Trend filters ──
+SWING_WEEKLY_EMA_FAST        = 5
+SWING_WEEKLY_EMA_SLOW        = 20
+SWING_WEEKLY_MIN_SEP_PCT     = 0.15
+SWING_DAILY_EMA_FAST         = 8
+SWING_DAILY_EMA_SLOW         = 21
+
+# ── Momentum ──
+SWING_RSI_LENGTH             = 14
+SWING_RSI_OVERSOLD           = 48
+SWING_RSI_OVERBOUGHT         = 52
+SWING_VOL_MA_LENGTH          = 20
+SWING_VOL_CONTRACT_MULT      = 0.90
+SWING_VOL_EXPAND_MULT        = 1.15
+
+# ── Candle quality ──
+SWING_WICK_MIN_PCT           = 35.0
+SWING_CLOSE_ZONE_PCT         = 35.0
+SWING_COOLDOWN_BARS          = 3
+
+# ── Institutional: Relative strength ──
+SWING_RS_LOOKBACK_DAYS       = 20      # RS ratio computed over this window
+SWING_RS_REJECT_LONG_BELOW   = -3.0    # reject bull if ticker RS < SPY by this %
+SWING_RS_REJECT_SHORT_ABOVE  = 3.0     # reject bear if ticker RS > SPY by this %
+
+# ── Institutional: Correlation grouping ──
+SWING_MAX_PER_SECTOR         = 2       # max signals per sector per scan
+SWING_SECTOR_MAP = {
+    "XLK": ["AAPL", "MSFT", "NVDA", "AMD", "GOOGL", "META", "AVGO", "CRM",
+            "ORCL", "NOW", "ADBE", "INTU", "PLTR", "SNOW", "CRWD", "NET",
+            "DDOG", "ZS", "PANW", "FTNT", "TTD", "SHOP", "U"],
+    "XLF": ["JPM", "GS", "MS", "BAC", "C", "WFC", "SOFI", "COIN", "AFRM", "UPST", "SQ", "PYPL"],
+    "XLE": ["XOM", "CVX", "OXY", "SLB", "HAL"],
+    "XLY": ["AMZN", "TSLA", "ABNB", "DASH", "RBLX", "DKNG", "PENN", "MGM",
+            "WYNN", "LVS", "NKE", "SBUX", "CMG", "MCD", "LULU", "EL",
+            "HD", "LOW", "TGT", "COST", "WMT"],
+    "XLV": ["PFE", "MRNA", "ABBV", "LLY", "UNH", "JNJ"],
+    "XLI": ["CAT", "DE", "HON", "GE", "RTX", "LMT", "NOC", "BWXT", "ITA"],
+    "XLRE": ["RIVN", "LCID", "NIO", "LI", "XPEV"],  # EV cluster
+    "XLC": ["NFLX", "GOOG"],
+    "ENERGY_ALT": ["ENPH", "SEDG", "FSLR", "RUN", "PLUG"],
+    "INDEX": ["SPY", "QQQ", "IWM", "DIA"],
+    "CRYPTO": ["COIN", "MSTR", "CIFR", "IREN", "MARA"],
+}
+
+# ── Institutional: Primary trend filter ──
+SWING_PRIMARY_TREND_SMA      = 50      # 50-day SMA
+SWING_PRIMARY_TREND_LMA      = 200     # 200-day SMA
+# Don't fight the primary trend:
+# If 50 < 200, reject bull signals (death cross environment)
+# If 50 > 200, reject bear signals only if RS is strong (golden cross)
+SWING_PRIMARY_TREND_ENABLED  = True
+
+# ── ATR-based sizing ──
+SWING_ATR_LENGTH             = 14
+SWING_ATR_RISK_PCT           = 0.01    # risk 1% of account per trade
+
