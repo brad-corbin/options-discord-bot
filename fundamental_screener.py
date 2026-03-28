@@ -52,6 +52,21 @@ CACHE_TTL_INSIDER = 43200        # 12 hours
 FMP_BASE = "https://financialmodelingprep.com/api/v3"
 FINNHUB_BASE = "https://finnhub.io/api/v1"
 
+# v5.0: ETFs don't have EPS/revenue/PEG — skip FMP entirely
+# and return lynch_category="ETF" with no confidence penalty.
+KNOWN_ETFS = {
+    "SPY", "QQQ", "IWM", "DIA", "SPX",      # broad index
+    "SOXX", "SMH", "XBI", "IBB",              # sector/thematic
+    "XLF", "XLE", "XLV", "XLK", "XLI",       # SPDR sectors
+    "XLP", "XLU", "XLY", "XLC", "XLRE", "XLB",
+    "GLD", "SLV", "TLT", "HYG", "LQD",       # commodities/bonds
+    "ITA", "ARKK", "ARKG", "ARKW",            # thematic
+    "EEM", "EFA", "VTI", "VOO", "VTV",        # broad market
+    "KWEB", "FXI", "BITO", "MSTR",            # other ETFs
+}
+
+PRECHAIN_MIN_FUNDAMENTAL_SCORE = 30  # swing trades need >= 30/100
+
 
 def _cache_get(key):
     with _cache_lock:
@@ -82,7 +97,11 @@ def _fmp_get(endpoint: str, params: dict = None) -> Optional[dict]:
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
-        log.warning(f"FMP {endpoint} error: {e}")
+        # v5.0: Sanitize API key from error logs
+        err_str = str(e)
+        if FMP_TOKEN:
+            err_str = err_str.replace(FMP_TOKEN, "***")
+        log.warning(f"FMP {endpoint} error: {err_str}")
         return None
 
 
@@ -234,12 +253,40 @@ def get_fundamentals(ticker: str) -> Dict:
 
     Returns a comprehensive dict with profile, ratios, growth, and
     insider/analyst data, plus a composite fundamental_score 0-100.
+
+    v5.0: ETFs skip FMP entirely (no EPS/revenue/PEG for ETFs).
+    Returns lynch_category="ETF" with confidence_boost=0.
     """
     ticker = ticker.strip().upper()
     cache_key = f"fund:{ticker}"
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
+
+    # v5.0: ETF detection — skip FMP, no Lynch penalty
+    if ticker in KNOWN_ETFS:
+        result = {
+            "ticker": ticker,
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+            "is_etf": True,
+            "fundamental_score": 60,  # neutral — no penalty, no boost
+            "lynch_category": {
+                "category": "ETF",
+                "peg_signal": "N/A",
+                "growth_quality": "N/A",
+                "risk_flag": None,
+                "dte_preference": "0-21",
+                "confidence_boost": 0,  # no penalty, no boost
+            },
+        }
+        # Still fetch analyst/insider data from Finnhub if available
+        try:
+            result.update(_fetch_recommendation_trends(ticker))
+        except Exception:
+            pass
+        _cache_set(cache_key, result, CACHE_TTL_FUNDAMENTALS)
+        log.info(f"Fundamentals for {ticker}: ETF — skipping FMP, score=60, lynch=ETF")
+        return result
 
     profile = _fetch_fmp_profile(ticker)
     ratios = _fetch_fmp_ratios(ticker)
