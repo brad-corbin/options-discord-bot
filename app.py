@@ -6579,60 +6579,79 @@ def _post_checkswing_card(ticker: str, forced_direction: str = None):
             return
 
         valid.sort(key=lambda r: ((r.get("confidence") or 0), ((r.get("trade") or {}).get("expected_value") or 0), ((r.get("trade") or {}).get("ror") or 0)), reverse=True)
-        rec = valid[0]
-        expiration = rec.get("exp")
-        dte = rec.get("dte")
-        try:
-            result_tuple = _get_chain_iv_for_expiry(ticker, expiration, dte)
-            eng, walls = result_tuple[3], result_tuple[4]
-        except Exception:
-            eng, walls = {}, {}
-        unified_regime = resolve_unified_regime(eng or {}, None, spot)
-        rec["shared_model_snapshot"] = _um_build_shared_model_snapshot(
-            ticker=ticker,
-            spot=spot,
-            vol_regime=canonical_vol,
-            structure_ctx=structure_ctx,
-            rec=rec,
-            eng=eng,
-            walls=walls,
-            mode="swing",
-        )
-        eff_allowed, eff_reason, rec = _um_apply_effective_regime_gate_to_rec(
-            rec,
-            rec.get("shared_model_snapshot"),
-            mode="swing",
-            has_confirmed_trigger=False,
-        )
-        rec["shared_model_snapshot"] = _um_build_shared_model_snapshot(
-            ticker=ticker,
-            spot=spot,
-            vol_regime=canonical_vol,
-            structure_ctx=structure_ctx,
-            rec=rec,
-            eng=eng,
-            walls=walls,
-            mode="swing",
-        )
-        if not eff_allowed:
-            reason = eff_reason or "Effective regime blocks fresh swing entry here."
-            parts = [
-                f"❌ {ticker} — NO SWING SETUP",
-                f"🧪 Checked: {(forced_direction or rec.get('direction') or 'both').upper()} | Spot: ${spot:.2f}",
-                f"🔎 Closest fail: {'🐂' if rec.get('direction') == 'bull' else '🐻'} {str(rec.get('direction') or '').upper()} — {reason}",
-                "",
-            ]
-            parts.extend(_um_format_shared_snapshot_lines(rec.get("shared_model_snapshot")))
+
+        # v5.1 fix: try each valid rec against the regime gate.
+        # If the best one gets blocked, try the next. If all blocked,
+        # combine regime rejections with spread rejections for full picture.
+        approved_rec = None
+        regime_rejects = []
+        for rec in valid:
+            expiration = rec.get("exp")
+            dte = rec.get("dte")
+            try:
+                result_tuple = _get_chain_iv_for_expiry(ticker, expiration, dte)
+                eng, walls = result_tuple[3], result_tuple[4]
+            except Exception:
+                eng, walls = {}, {}
+            unified_regime = resolve_unified_regime(eng or {}, None, spot)
+            rec["shared_model_snapshot"] = _um_build_shared_model_snapshot(
+                ticker=ticker, spot=spot, vol_regime=canonical_vol,
+                structure_ctx=structure_ctx, rec=rec, eng=eng, walls=walls, mode="swing",
+            )
+            eff_allowed, eff_reason, rec = _um_apply_effective_regime_gate_to_rec(
+                rec, rec.get("shared_model_snapshot"), mode="swing", has_confirmed_trigger=False,
+            )
+            rec["shared_model_snapshot"] = _um_build_shared_model_snapshot(
+                ticker=ticker, spot=spot, vol_regime=canonical_vol,
+                structure_ctx=structure_ctx, rec=rec, eng=eng, walls=walls, mode="swing",
+            )
+            if eff_allowed:
+                approved_rec = rec
+                break
+            else:
+                regime_rejects.append((
+                    rec.get("direction", "?"),
+                    eff_reason or "Effective regime blocks fresh swing entry here.",
+                ))
+
+        if not approved_rec:
+            # All valid recs were regime-gated. Combine with spread rejects for full picture.
+            all_rejects = rejects + regime_rejects
+            checked = forced_direction.upper() if forced_direction else "BOTH"
+            parts = [f"❌ {ticker} — NO SWING SETUP", f"🧪 Checked: {checked} | Spot: ${spot:.2f}"]
+
+            ranked_rejects = sorted(all_rejects, key=lambda dr: (_swing_reject_rank(dr[1]), -len(dr[1] or "")), reverse=True)
+            if ranked_rejects:
+                best_dir, best_reason = ranked_rejects[0]
+                best_emoji = "🐂" if best_dir == "bull" else "🐻"
+                parts.append(f"🔎 Closest fail: {best_emoji} {best_dir.upper()} — {_summarize_swing_reject_reason(best_reason)}")
+
+            if len(all_rejects) > 1:
+                parts.append("")
+                parts.append("📋 Side-by-side")
+                for direction, reason in all_rejects:
+                    emoji = "🐂" if direction == "bull" else "🐻"
+                    parts.append(f"• {emoji} {direction.upper()}: {_summarize_swing_reject_reason(reason)}")
+
+            # Add snapshot from last evaluated rec
+            last_rec = valid[-1] if valid else {}
+            shared_snapshot = last_rec.get("shared_model_snapshot")
+            if shared_snapshot:
+                fail_lines = _um_format_shared_snapshot_lines(shared_snapshot)
+                if fail_lines:
+                    parts.append("")
+                    parts.extend(fail_lines)
+
             parts.append("")
             parts.append("— Not financial advice —")
             post_to_telegram("\n".join([p for p in parts if p is not None]))
             try:
                 _log_signal_dataset_event(
                     ticker=ticker,
-                    webhook_data={"type": "swing", "source": "check", "bias": rec.get("direction"), "requested_bias": forced_direction or rec.get("direction"), "tier": rec.get("tier", "manual"), "manual_scoreable": rec.get("scoreable")},
+                    webhook_data={"type": "swing", "source": "check", "bias": forced_direction or "both", "requested_bias": forced_direction or "both", "tier": "manual", "manual_scoreable": bool(raw_rows and len(raw_rows) >= 25)},
                     outcome="rejected_effective_regime",
-                    reason=reason,
-                    best_rec=rec,
+                    reason=" | ".join(f"{d}:{_summarize_swing_reject_reason(r)}" for d, r in all_rejects)[:300],
+                    best_rec=last_rec,
                     spot=spot,
                     expirations_checked=len(chains),
                     vol_regime=canonical_vol,
@@ -6640,6 +6659,8 @@ def _post_checkswing_card(ticker: str, forced_direction: str = None):
             except Exception:
                 pass
             return
+
+        rec = approved_rec
         card = format_swing_card(rec)
         extras = []
         _append_shared_regime_lines(extras, canonical_vol, unified_regime, structure_ctx=structure_ctx, rec=rec, eng=eng, walls=walls, mode="swing")
