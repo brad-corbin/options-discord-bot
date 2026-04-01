@@ -732,6 +732,9 @@ MULTI_TOUCH_LOOKBACK_MIN         = 30      # level must have existed for 30+ min
 MULTI_TOUCH_STOP_ZONE_BUFFER     = 0.10    # add $0.10 above/below zone for safety
 MULTI_TOUCH_CONFIRM_POLLS        = 3       # consecutive spot polls beyond level
 MULTI_TOUCH_MAX_ACTIVE           = 1       # max active Change 9 trades per ticker
+MULTI_TOUCH_MAX_TOUCHES          = 10      # levels tested >10x are ranges, not fresh breaks
+MULTI_TOUCH_MAX_AGE_MIN          = 180     # level must be < 3 hours old (first_seen)
+MULTI_TOUCH_RECENT_TOUCH_MIN     = 60      # last touch must be within 60 min
 
 # ── v5.1 Change 3: Spot-poll confirmation ───
 # Dedicated constant for normal break confirmation (separate from multi-touch)
