@@ -131,16 +131,42 @@ class CachedMarketData:
 
     # ── Spot Price ──
     def get_spot(self, ticker: str, as_float_fn=None) -> float:
-        """Cached spot price. Falls back to raw md_get on miss."""
+        """Cached spot price using SmartMid (real-time on all plans).
+        v5.1: Switched from /stocks/quotes/ (15-min delayed on Trader plan)
+              to /stocks/prices/ (SmartMid, real-time on all plans).
+              Falls back to /stocks/quotes/ if SmartMid fails.
+        """
         key = ticker.upper()
         cached = self._spot_cache.get(key)
         if cached is not None:
             return cached
 
+        af = as_float_fn or _default_as_float
+
+        # Primary: SmartMid (real-time on all plans)
+        try:
+            data = self._md_get(
+                f"https://api.marketdata.app/v1/stocks/prices/{key}/"
+            )
+            if isinstance(data, dict) and data.get("s") == "ok":
+                mid_arr = data.get("mid")
+                if isinstance(mid_arr, list) and mid_arr:
+                    v = af(mid_arr[0], 0.0)
+                    if v > 0:
+                        self._spot_cache.set(key, v)
+                        return v
+                elif isinstance(mid_arr, (int, float)):
+                    v = af(mid_arr, 0.0)
+                    if v > 0:
+                        self._spot_cache.set(key, v)
+                        return v
+        except Exception as e:
+            log.debug(f"SmartMid failed for {key}, falling back to quotes: {e}")
+
+        # Fallback: /stocks/quotes/ (15-min delayed but better than nothing)
         data = self._md_get(
             f"https://api.marketdata.app/v1/stocks/quotes/{key}/"
         )
-        af = as_float_fn or _default_as_float
         for field in ("last", "mid", "bid", "ask"):
             v = af(data.get(field), 0.0)
             if v > 0:
