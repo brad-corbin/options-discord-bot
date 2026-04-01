@@ -156,6 +156,7 @@ class OITracker:
                 "call_oi": 0, "put_oi": 0,
                 "strikes": {}, "expirations": set(),
                 "updated_at": time.time(), "spot": spot,
+                "per_exp": {},  # v5.1: per-expiration totals {exp_str: {call_oi, put_oi, dte}}
             }
         entry = self._today[ticker]
         if spot > 0:
@@ -167,6 +168,18 @@ class OITracker:
                 entry["strikes"][k] = entry["strikes"].get(k, 0) + v
             entry["expirations"].add(expiration)
             entry["updated_at"] = time.time()
+            # v5.1: store per-expiration totals
+            if "per_exp" not in entry:
+                entry["per_exp"] = {}
+            try:
+                _dte = max(0, (datetime.strptime(expiration, "%Y-%m-%d").date() -
+                              datetime.now().date()).days)
+            except Exception:
+                _dte = -1
+            entry["per_exp"][expiration] = {
+                "call_oi": call_oi, "put_oi": put_oi,
+                "total": call_oi + put_oi, "dte": _dte,
+            }
 
     def _flush_to_store(self, date_str: str):
         for ticker, data in self._today.items():
@@ -324,6 +337,8 @@ class OITracker:
             "call_zones": call_zones[:3], "put_zones": put_zones[:3],
             "is_mover": abs(total_change_pct) >= OI_MOVER_THRESHOLD,
             "is_spike": abs(total_change_pct) >= OI_SPIKE_THRESHOLD,
+            # v5.1: per-expiration breakdown
+            "per_exp": today_data.get("per_exp", {}),
         }
 
     def get_daily_movers(self) -> List[dict]:
@@ -359,6 +374,20 @@ class OITracker:
             lines.append(f"   Calls: {m['call_change_pct']:+.1f}% | "
                         f"Puts: {m['put_change_pct']:+.1f}% | "
                         f"C/P: {m['call_put_ratio']:.2f}")
+
+            # v5.1: Expiration breakdown — show which expirations the OI is built for
+            per_exp = m.get("per_exp", {})
+            if per_exp:
+                _exp_parts = []
+                for _exp, _edata in sorted(per_exp.items()):
+                    _dte = _edata.get("dte", -1)
+                    _total = _edata.get("total", 0)
+                    if _total > 0 and _dte >= 0:
+                        _dte_label = "0DTE" if _dte == 0 else f"{_dte}DTE"
+                        _exp_short = _exp[5:] if len(_exp) > 5 else _exp  # strip year
+                        _exp_parts.append(f"{_exp_short} ({_dte_label}: {_total:,})")
+                if _exp_parts:
+                    lines.append(f"   📅 Expirations: {' | '.join(_exp_parts[:4])}")
 
             # Walls with shift detection
             pw = m.get("put_wall")
