@@ -16,6 +16,7 @@ from exit_policy import ExitPolicy, ExitSignal, select_exit_policy, evaluate_exi
 log = logging.getLogger(__name__)
 
 # v5.0: Alert hierarchy + VIX-scaled stops
+# v5.1: CRISIS exit framework, circuit breaker, multi-touch break
 try:
     from trading_rules import (
         ALERT_SUPPRESS_ON_VALIDATOR_REJECT,
@@ -25,6 +26,30 @@ try:
         VIX_STOP_SCALE_ENABLED,
         EM_GUIDE_MATCHING_ENABLED,
         get_vix_scaled_min_stop,
+        # v5.1 Change 6: Circuit breaker
+        CIRCUIT_BREAKER_ENABLED,
+        CIRCUIT_BREAKER_MAX_CONSEC_STOPS,
+        CIRCUIT_BREAKER_PAUSE_MIN,
+        # v5.1 Change 8: CRISIS long option exit framework
+        CRISIS_LONG_OPTION_PRIMARY,
+        CRISIS_HOLD_WINDOW_MIN,
+        CRISIS_PREMIUM_STOP_PCT,
+        CRISIS_SCALE_1_PCT,
+        CRISIS_SCALE_2_PCT,
+        CRISIS_TRAIL_GIVEBACK_PCT,
+        CRISIS_FINAL_HOUR_GIVEBACK_PCT,
+        CRISIS_FINAL_HOUR_MINUTES,
+        CRISIS_0DTE_DELTA_TARGET,
+        CRISIS_0DTE_DELTA_RANGE,
+        CRISIS_PUTS_ALWAYS_PRIMARY,
+        CRISIS_CALLS_REQUIRE_GEX_NEG,
+        # v5.1 Change 9: Multi-touch level break
+        MULTI_TOUCH_BREAK_ENABLED,
+        MULTI_TOUCH_MIN_TOUCHES,
+        MULTI_TOUCH_LOOKBACK_MIN,
+        MULTI_TOUCH_STOP_ZONE_BUFFER,
+        MULTI_TOUCH_CONFIRM_POLLS,
+        MULTI_TOUCH_MAX_ACTIVE,
     )
 except ImportError:
     ALERT_SUPPRESS_ON_VALIDATOR_REJECT = True
@@ -34,10 +59,31 @@ except ImportError:
     VIX_STOP_SCALE_ENABLED = False
     EM_GUIDE_MATCHING_ENABLED = False
     def get_vix_scaled_min_stop(ticker, vix=20): return 0.40
+    CIRCUIT_BREAKER_ENABLED = False
+    CIRCUIT_BREAKER_MAX_CONSEC_STOPS = 2
+    CIRCUIT_BREAKER_PAUSE_MIN = 30
+    CRISIS_LONG_OPTION_PRIMARY = False
+    CRISIS_HOLD_WINDOW_MIN = 15
+    CRISIS_PREMIUM_STOP_PCT = 0.45
+    CRISIS_SCALE_1_PCT = 0.50
+    CRISIS_SCALE_2_PCT = 1.00
+    CRISIS_TRAIL_GIVEBACK_PCT = 0.30
+    CRISIS_FINAL_HOUR_GIVEBACK_PCT = 0.15
+    CRISIS_FINAL_HOUR_MINUTES = 60
+    CRISIS_0DTE_DELTA_TARGET = 0.30
+    CRISIS_0DTE_DELTA_RANGE = (0.25, 0.35)
+    CRISIS_PUTS_ALWAYS_PRIMARY = True
+    CRISIS_CALLS_REQUIRE_GEX_NEG = True
+    MULTI_TOUCH_BREAK_ENABLED = False
+    MULTI_TOUCH_MIN_TOUCHES = 3
+    MULTI_TOUCH_LOOKBACK_MIN = 30
+    MULTI_TOUCH_STOP_ZONE_BUFFER = 0.10
+    MULTI_TOUCH_CONFIRM_POLLS = 3
+    MULTI_TOUCH_MAX_ACTIVE = 1
 
 MONITOR_POLL_INTERVAL_SEC = 300
 MONITOR_POLL_INTERVAL_FAST_SEC = 60
-MONITOR_FAST_POLL_TICKERS = ["SPY"]
+MONITOR_FAST_POLL_TICKERS = ["SPY", "QQQ"]   # v5.1 Change 5: QQQ parity
 MONITOR_ALERT_COOLDOWN_SEC = 300       # v4.3: was 600 (10 min) — 5 min is enough to prevent spam
 MONITOR_ZONE_CLUSTER_PCT   = 0.08   # break attempts / level alerts within 0.08% of each other are treated as the same zone
 MONITOR_MAX_BREAK_AGE_SEC = 900
@@ -196,6 +242,22 @@ class ActiveTrade:
     # Used for 20% premium stop without live quote fetching.
     entry_premium: float = 0.0   # estimated option mid price at entry (dollars)
     entry_delta: float = 0.0     # option delta at entry (0–1 for calls, 0–1 for puts)
+    # ── v5.1 Change 8: CRISIS long option tracking ────────────────────────
+    is_crisis_long_option: bool = False   # True = use CRISIS exit framework
+    crisis_phase: str = "HOLD"           # HOLD → SCALE_1 → SCALE_2 → TRAIL
+    est_premium: float = 0.0             # current estimated premium
+    peak_premium: float = 0.0            # highest est premium (for trailing)
+    contracts_remaining: int = 20        # contracts still held (scale 1/3 each time)
+    crisis_hold_until: float = 0.0       # epoch — no exit before this (except premium stop)
+    crisis_scale1_done: bool = False
+    crisis_scale2_done: bool = False
+    # ── v5.1 Change 9: Multi-touch level break ────────────────────────────
+    is_multi_touch_entry: bool = False    # True = Change 9 structural entry
+    consolidation_zone_high: float = 0.0 # top of the range for wide stop
+    consolidation_zone_low: float = 0.0  # bottom of the range for wide stop
+    touch_count: int = 0                 # how many same-side touches triggered this
+    # ── v5.1 Change 6: Bias tracking for circuit breaker ──────────────────
+    bias_direction: str = ""             # "bearish" or "bullish" for circuit breaker
 
 @dataclass
 class MonitorState:
@@ -214,6 +276,18 @@ class MonitorState:
     active_trades: list = field(default_factory=list)  # List[ActiveTrade]
     last_entry_time: float = 0.0   # monotonic — time of most recent trade entry
     gamma_flip_crossings: list = field(default_factory=list)  # List[float] — epoch timestamps of flip crosses
+    # ── v5.1 Change 1: Real-time ORB from SmartMid ────────────────────────
+    orb_high: Optional[float] = None     # 15-min opening range high
+    orb_low: Optional[float] = None      # 15-min opening range low
+    orb_ready: bool = False              # True after 15 min of data
+    orb_prices: list = field(default_factory=list)  # spot polls during ORB window
+    # ── v5.1 Change 3: Spot-poll confirmation ─────────────────────────────
+    break_confirm_polls: dict = field(default_factory=dict)  # {level_key: consecutive_count}
+    # ── v5.1 Change 6: Circuit breaker state ──────────────────────────────
+    consec_stops: dict = field(default_factory=dict)    # {"bearish": 0, "bullish": 0}
+    cb_paused_until: dict = field(default_factory=dict) # {"bearish": epoch, "bullish": epoch}
+    # ── v5.1 Change 9: Multi-touch level break tracking ───────────────────
+    multi_touch_confirm_polls: dict = field(default_factory=dict)  # {level_price_str: count}
 
 def _get_time_phase_ct() -> dict:
     try:
@@ -675,7 +749,7 @@ class ThesisMonitorEngine:
 
     # Tickers that use 1-minute bars for lower latency.
     # All others use 5-minute bars.
-    _HIGH_RES_TICKERS = {"SPY"}
+    _HIGH_RES_TICKERS = {"SPY", "QQQ"}   # v5.1 Change 5: QQQ parity
 
     def _get_or_create_bar_manager(self, ticker: str) -> Optional[BarStateManager]:
         """Lazy-init bar manager for a ticker.
@@ -882,16 +956,56 @@ class ThesisMonitorEngine:
                 from zoneinfo import ZoneInfo; ts = datetime.now(ZoneInfo("America/Chicago")).strftime("%I:%M %p")
             except Exception: ts = datetime.utcnow().strftime("%H:%M")
             # ── v2.0: Bar-aware price source ──
+            # v5.1 fix: Do NOT override spot price with bar.close.
+            # Bar candles come from UTP (15-minute delayed). Spot comes from
+            # IEX (real-time). Use real-time spot for level break detection
+            # and exit monitoring. Bar is still passed separately for:
+            #   - Wick filtering (prevent false breaks from intrabar spikes)
+            #   - Bar-count confirmation (N bars of follow-through)
+            #   - Indicator computation (VWAP, volume profile)
             bar = None
             bm = self._get_or_create_bar_manager(ticker)
             if bm:
                 bar = bm.update()
-                if bar:
-                    price = bar.close  # canonical price = bar close, not spot sample
+                # Bar updates VWAP and indicators internally.
+                # Do NOT do: price = bar.close (that's 15 min delayed)
             prev_price = state.price_history[-1]["price"] if state.price_history else None
             state.price_history.append({"price": price, "time_str": ts, "ts_mono": now})
             if len(state.price_history) > 240: state.price_history = state.price_history[-240:]
             state.check_count += 1
+            # ── v5.1 Change 1: Real-time ORB from SmartMid polls ──────────
+            # Build 15-min opening range from live spot polls. Available at
+            # 8:45 AM CT (15 min after 8:30 open). Replaces OR30 from delayed bars.
+            if ticker.upper() in self._HIGH_RES_TICKERS and not state.orb_ready:
+                tp_now = _get_time_phase_ct()
+                _mins_ct = 0
+                try:
+                    from zoneinfo import ZoneInfo
+                    _now_ct = datetime.now(ZoneInfo("America/Chicago"))
+                    _mins_ct = _now_ct.hour * 60 + _now_ct.minute
+                except Exception:
+                    _mins_ct = 0
+                # Market open is 8:30 CT = 510 minutes
+                if 510 <= _mins_ct <= 525:  # first 15 minutes of session
+                    state.orb_prices.append(price)
+                    state.orb_high = max(state.orb_high or price, price)
+                    state.orb_low = min(state.orb_low or price, price)
+                elif _mins_ct > 525 and state.orb_prices:
+                    # ORB window closed — finalize
+                    state.orb_ready = True
+                    orb_range = (state.orb_high or 0) - (state.orb_low or 0)
+                    log.info(f"ORB15 ready: {ticker} high=${state.orb_high:.2f} "
+                             f"low=${state.orb_low:.2f} range=${orb_range:.2f} "
+                             f"({len(state.orb_prices)} polls)")
+                    # Feed ORB levels into intraday level tracker
+                    if state.orb_high:
+                        IntradayLevelTracker._upsert_level(
+                            state, state.orb_high, "resistance", "ORB15_HIGH",
+                            time.time(), touches=2)
+                    if state.orb_low:
+                        IntradayLevelTracker._upsert_level(
+                            state, state.orb_low, "support", "ORB15_LOW",
+                            time.time(), touches=2)
             # ── v2.0: Build level registry with confluence scoring ──
             registry = self._build_level_registry(ticker, thesis, state, price)
             events.extend(self._evaluate_momentum(state, price, bm=bm))
@@ -920,6 +1034,12 @@ class ThesisMonitorEngine:
             entry_events.extend(self._detect_confirmed_breaks(thesis, state, price, now, bar=bar, bm=bm))
             entry_events.extend(self._detect_failed_moves(thesis, state, price, now, bm=bm))
             entry_events.extend(self._detect_retests(thesis, state, price, now, bm=bm))
+
+            # ── v5.1 Change 9: Multi-touch level break detection ──────────
+            if MULTI_TOUCH_BREAK_ENABLED and ticker.upper() in self._HIGH_RES_TICKERS:
+                mt_events = self._detect_multi_touch_break(
+                    ticker, thesis, state, price, now, registry=registry)
+                entry_events.extend(mt_events)
 
             # ── v5.0: Track which events the validator rejects ──
             _rejected_keys = set()
@@ -1096,9 +1216,9 @@ class ThesisMonitorEngine:
 
         msg = event.get("msg", "")
         # Parse direction and entry_type from alert_key
-        if "conf_short" in ak or "fbo_now" in ak or "rt_short" in ak or "rt_fs" in ak:
+        if "conf_short" in ak or "fbo_now" in ak or "rt_short" in ak or "rt_fs" in ak or "mt_break_dn" in ak:
             direction = "SHORT"
-        elif "conf_long" in ak or "fb_now" in ak or "rt_long" in ak or "rt_fl" in ak:
+        elif "conf_long" in ak or "fb_now" in ak or "rt_long" in ak or "rt_fl" in ak or "mt_break_up" in ak:
             direction = "LONG"
         else:
             log.info(f"Cannot parse direction from alert_key={ak}, skipping trade creation")
@@ -1109,21 +1229,43 @@ class ThesisMonitorEngine:
             entry_type = "FAILED"
         elif "rt_" in ak:
             entry_type = "RETEST"
+        elif "mt_break_" in ak:
+            entry_type = "MULTI_TOUCH"
         else:
             entry_type = "BREAK"
         # Find the stop level
+
+        # ── v5.1 Change 6: Circuit breaker check ─────────────────────────
+        # After 2 consecutive stops in the same bias direction, pause that
+        # direction for 30 minutes. Tracks bias (bearish/bullish).
+        if CIRCUIT_BREAKER_ENABLED:
+            _bias_dir = "bearish" if direction == "SHORT" else "bullish"
+            _cb_until = state.cb_paused_until.get(_bias_dir, 0)
+            if _cb_until > 0 and time.time() < _cb_until:
+                _remaining = int((_cb_until - time.time()) / 60)
+                # v5.1: Change 9 entries bypass circuit breaker (structural confirmation)
+                _is_mt = event.get("_is_multi_touch", False)
+                if not _is_mt:
+                    log.info(f"Circuit breaker: {ticker} {_bias_dir} paused for "
+                             f"{_remaining} more min (2 consecutive stops), blocking {ak}")
+                    return False
         stop = 0.0
         level_name = ""
-        for ba in state.break_attempts + state.failed_moves + state.confirmed_breaks:
-            bak = ak.split("_")[-1]
-            try:
-                ba_price_str = f"{ba.level:.2f}"
-                if ba_price_str == bak or ba_price_str in ak:
-                    stop = ba.level
-                    level_name = ba.level_name
-                    break
-            except Exception:
-                continue
+        # v5.1 Change 9: Multi-touch events carry pre-computed stop
+        if event.get("_is_multi_touch") and event.get("_mt_stop"):
+            stop = event["_mt_stop"]
+            level_name = f"MT_BREAK_{event.get('_touch_count', 0)}x"
+        else:
+            for ba in state.break_attempts + state.failed_moves + state.confirmed_breaks:
+                bak = ak.split("_")[-1]
+                try:
+                    ba_price_str = f"{ba.level:.2f}"
+                    if ba_price_str == bak or ba_price_str in ak:
+                        stop = ba.level
+                        level_name = ba.level_name
+                        break
+                except Exception:
+                    continue
         if stop == 0.0:
             if direction == "LONG":
                 stop = price * 0.995
@@ -1193,7 +1335,12 @@ class ThesisMonitorEngine:
         level_quality = 0
         level_tier = "C"
         level_sources = set()
-        if registry:
+        if event.get("_is_multi_touch"):
+            # v5.1 Change 9: multi-touch entries have proven levels
+            level_quality = 90
+            level_tier = "A"
+            level_sources = {"intraday_multi_touch", f"touch_{event.get('_touch_count', 3)}x"}
+        elif registry:
             reg_level = registry.get_level_at(stop)
             if reg_level:
                 level_quality = reg_level.quality_score
@@ -1321,25 +1468,66 @@ class ThesisMonitorEngine:
             level_tier=level_tier, validation_summary=validation.gate_summary,
             policy_config=policy.to_config(),
             max_favorable=0.0, min_favorable=0.0,
+            # v5.1 Change 6: bias direction for circuit breaker
+            bias_direction="bearish" if direction == "SHORT" else "bullish",
+            # v5.1 Change 9: multi-touch entry flag
+            is_multi_touch_entry=event.get("_is_multi_touch", False),
+            touch_count=event.get("_touch_count", 0),
+            consolidation_zone_high=event.get("_zone_high", 0.0),
+            consolidation_zone_low=event.get("_zone_low", 0.0),
         )
+
+        # ── v5.1 Change 8: CRISIS long option detection ──────────────────
+        # When vol regime is CRISIS and conditions are met, flag trade for
+        # the CRISIS long option exit framework (scale in thirds, wide trail).
+        _is_crisis = thesis.volatility_regime == "CRISIS"
+        _is_0dte = tp["phase"] not in ("POWER_HOUR", "CLOSE")
+        if CRISIS_LONG_OPTION_PRIMARY and _is_crisis and _is_0dte:
+            # Puts: always primary in CRISIS (vol expands on drops)
+            # Calls: require GEX negative (squeeze context)
+            _use_crisis = False
+            if direction == "SHORT":  # bearish = put buyer
+                _use_crisis = True  # CRISIS_PUTS_ALWAYS_PRIMARY
+            elif direction == "LONG" and thesis.gex_sign == "negative":
+                _use_crisis = True  # squeeze/snap-back context
+            if _use_crisis:
+                trade.is_crisis_long_option = True
+                trade.crisis_phase = "HOLD"
+                trade.crisis_hold_until = time.time() + (CRISIS_HOLD_WINDOW_MIN * 60)
+                trade.contracts_remaining = 20
+                # Estimate entry premium from delta × distance to strike
+                # For slightly OTM (delta 0.30), premium ≈ delta × 5-6
+                _delta_target = CRISIS_0DTE_DELTA_TARGET
+                trade.entry_delta = _delta_target
+                if trade.entry_premium <= 0:
+                    # Approximate: ATM premium at VIX 30 ≈ $3-4 for SPY 0DTE
+                    # OTM delta 0.30 ≈ 60-70% of ATM premium
+                    trade.entry_premium = round(thesis.vix * 0.06 * 0.65, 2)
+                trade.est_premium = trade.entry_premium
+                trade.peak_premium = trade.entry_premium
+                log.info(f"CRISIS long option armed: {ticker} {direction} "
+                         f"δ={_delta_target:.2f} est_prem=${trade.entry_premium:.2f} "
+                         f"hold_until={CRISIS_HOLD_WINDOW_MIN}min "
+                         f"premium_stop={CRISIS_PREMIUM_STOP_PCT:.0%}")
 
         # ── Wire ATM delta/premium from thesis snapshot ───────────────────
         # LONG trades use call delta/premium; SHORT trades use put delta/premium.
         # These were captured at em card time from the live chain and stored on
         # the thesis so we can approximate the 20% premium stop each poll
         # without fetching a live option quote.
-        if direction == "LONG":
-            trade.entry_delta   = getattr(thesis, "atm_call_delta",   0.0) or 0.0
-            trade.entry_premium = getattr(thesis, "atm_call_premium", 0.0) or 0.0
-        else:
-            trade.entry_delta   = getattr(thesis, "atm_put_delta",   0.0) or 0.0
-            trade.entry_premium = getattr(thesis, "atm_put_premium", 0.0) or 0.0
-        if trade.entry_delta > 0 and trade.entry_premium > 0:
-            log.info(f"Premium stop armed: {ticker} {direction} δ={trade.entry_delta:.2f} "
-                     f"prem=${trade.entry_premium:.2f} — 20% stop at ~${trade.entry_premium * 0.20:.2f} adverse")
-        else:
-            log.info(f"Premium stop not armed for {ticker} {direction} — no ATM data on thesis "
-                     f"(delta={trade.entry_delta}, premium={trade.entry_premium})")
+        if not trade.is_crisis_long_option:  # CRISIS trades use their own premium tracking
+            if direction == "LONG":
+                trade.entry_delta   = getattr(thesis, "atm_call_delta",   0.0) or 0.0
+                trade.entry_premium = getattr(thesis, "atm_call_premium", 0.0) or 0.0
+            else:
+                trade.entry_delta   = getattr(thesis, "atm_put_delta",   0.0) or 0.0
+                trade.entry_premium = getattr(thesis, "atm_put_premium", 0.0) or 0.0
+            if trade.entry_delta > 0 and trade.entry_premium > 0:
+                log.info(f"Premium stop armed: {ticker} {direction} δ={trade.entry_delta:.2f} "
+                         f"prem=${trade.entry_premium:.2f} — 20% stop at ~${trade.entry_premium * 0.20:.2f} adverse")
+            else:
+                log.info(f"Premium stop not armed for {ticker} {direction} — no ATM data on thesis "
+                         f"(delta={trade.entry_delta}, premium={trade.entry_premium})")
 
         state.active_trades.append(trade)
         state.last_entry_time = now   # stamp cooldown timer
@@ -1406,6 +1594,8 @@ class ThesisMonitorEngine:
                     trade.status = "INVALIDATED"; trade.close_price = price
                     trade.close_time = now; trade.close_epoch = time.time()
                     trade.close_reason = f"Hard stop ${stop_ref:.2f} breached"
+                    # v5.1 Change 6: increment circuit breaker
+                    self._update_circuit_breaker(state, trade.bias_direction, is_stop=True)
                     self._persist_trades(ticker, state)
                     events.append({"msg": f"\U0001f6d1 TRADE INVALIDATED — {trade.direction}\n\nHard stop ${stop_ref:.2f} breached.\nEntry: ${trade.entry_price:.2f} → Now: ${price:.2f} ({pnl_pct:+.2f}%)\nDon't hope. Close it.", "type": "exit", "priority": 5, "alert_key": f"exit_inv_{trade.trade_id}"})
                     log.info(f"Trade {trade.trade_id} INVALIDATED: hard stop ${stop_ref:.2f} breached at ${price:.2f}")
@@ -1413,6 +1603,16 @@ class ThesisMonitorEngine:
                                       close_reason=f"Hard stop ${stop_ref:.2f} breached",
                                       badge=_trade_quality_badge(trade))
                 continue
+
+            # ── v5.1 Change 8: CRISIS long option exit framework ──────────
+            # Replaces standard premium stop + Layer 2 for CRISIS long option trades.
+            # Scale out in thirds with premium tracking from delta × spot move.
+            if getattr(trade, 'is_crisis_long_option', False):
+                _crisis_exit = self._crisis_long_option_exit(
+                    trade, ticker, thesis, state, price, now)
+                if _crisis_exit:
+                    events.extend(_crisis_exit)
+                continue  # CRISIS trades skip standard Layer 1b + Layer 2
 
             # ── LAYER 1b: Delta-based 20% premium stop ───────────────────────
             # No live quote needed. Uses entry_delta (from em chain at session
@@ -1436,6 +1636,8 @@ class ThesisMonitorEngine:
                             trade.close_time = now; trade.close_epoch = time.time()
                             trade.close_reason = (f"Premium stop: est. {est_loss_pct:.0%} loss "
                                                    f"(${adverse_move:.2f} adverse × δ{trade.entry_delta:.2f})")
+                            # v5.1 Change 6: increment circuit breaker
+                            self._update_circuit_breaker(state, trade.bias_direction, is_stop=True)
                             self._persist_trades(ticker, state)
                             events.append({"msg": (
                                 f"🛑 PREMIUM STOP — {trade.direction}\n\n"
@@ -1480,6 +1682,8 @@ class ThesisMonitorEngine:
                 if self._exit_alert_ok(trade, "scale", now):
                     trade.status = "SCALED"; trade.scaled_at_price = price
                     trade.trail_stop = trade.entry_price
+                    # v5.1 Change 6: scale = trade is working, reset circuit breaker
+                    self._update_circuit_breaker(state, trade.bias_direction, is_stop=False)
                     self._persist_trades(ticker, state)
                     events.append({"msg": f"\U0001f4b0 SCALE {signal.scale_fraction} — {trade.direction}\n\n{signal.reason}\nEntry: ${trade.entry_price:.2f} → Now: ${price:.2f} ({signal.pnl_pct:+.2f}%)\nMove stop to breakeven. {trade.scale_advice}", "type": "exit", "priority": 5, "alert_key": f"exit_scale_{trade.trade_id}"})
             elif signal.action == "TRAIL" and signal.new_stop:
@@ -1506,6 +1710,8 @@ class ThesisMonitorEngine:
                     trade.status = "CLOSED"; trade.close_price = price
                     trade.close_time = now; trade.close_epoch = time.time()
                     trade.close_reason = signal.reason
+                    # v5.1 Change 6: non-stop exit resets circuit breaker
+                    self._update_circuit_breaker(state, trade.bias_direction, is_stop=False)
                     _log_trade_event(trade, event="CLOSE", close_price=price,
                                       close_reason=signal.reason,
                                       badge=_trade_quality_badge(trade))
@@ -1518,6 +1724,8 @@ class ThesisMonitorEngine:
                     trade.status = "INVALIDATED"; trade.close_price = price
                     trade.close_time = now; trade.close_epoch = time.time()
                     trade.close_reason = signal.reason
+                    # v5.1 Change 6: bar-close invalidation counts as stop
+                    self._update_circuit_breaker(state, trade.bias_direction, is_stop=True)
                     self._persist_trades(ticker, state)
                     _pg_close(trade)  # v5.1: not covered by _log_trade_event here
                     events.append({"msg": f"\U0001f6d1 TRADE INVALIDATED — {trade.direction}\n\n{signal.reason}\nEntry: ${trade.entry_price:.2f} → Now: ${price:.2f} ({pnl_pct:+.2f}%)\nDon't hope. Close it.", "type": "exit", "priority": 5, "alert_key": f"exit_inv_{trade.trade_id}"})
@@ -1531,6 +1739,315 @@ class ThesisMonitorEngine:
             return False
         trade.exit_alert_history[key] = now
         return True
+
+    # ── v5.1 Change 6: Circuit Breaker ──
+    def _update_circuit_breaker(self, state, bias_direction, is_stop=True):
+        """Update circuit breaker state after trade close.
+        is_stop=True: hard stop or premium stop → increment counter.
+        is_stop=False: non-stop exit (scale, giveback, trail) → reset counter."""
+        if not CIRCUIT_BREAKER_ENABLED or not bias_direction:
+            return
+        if is_stop:
+            count = state.consec_stops.get(bias_direction, 0) + 1
+            state.consec_stops[bias_direction] = count
+            if count >= CIRCUIT_BREAKER_MAX_CONSEC_STOPS:
+                pause_until = time.time() + (CIRCUIT_BREAKER_PAUSE_MIN * 60)
+                state.cb_paused_until[bias_direction] = pause_until
+                log.info(f"Circuit breaker TRIGGERED: {bias_direction} paused for "
+                         f"{CIRCUIT_BREAKER_PAUSE_MIN}min ({count} consecutive stops)")
+            else:
+                log.info(f"Circuit breaker: {bias_direction} consecutive stops = {count}")
+        else:
+            if state.consec_stops.get(bias_direction, 0) > 0:
+                log.info(f"Circuit breaker RESET: {bias_direction} "
+                         f"(was {state.consec_stops.get(bias_direction, 0)} consecutive)")
+            state.consec_stops[bias_direction] = 0
+            # Don't clear cb_paused_until — let the timer expire naturally
+
+    # ── v5.1 Change 8: CRISIS Long Option Exit Framework ──
+    def _crisis_long_option_exit(self, trade, ticker, thesis, state, price, now):
+        """CRISIS long option exit: scale in thirds with premium tracking.
+        Returns list of events, or empty list if HOLD."""
+        events = []
+        now_epoch = time.time()
+
+        # Estimate current premium from delta × spot move
+        if trade.direction == "LONG":
+            spot_move = price - trade.entry_price
+        else:  # SHORT direction = put buyer
+            spot_move = trade.entry_price - price
+
+        # Approximate premium: entry_premium + (spot_move × delta)
+        # Delta shifts as option moves ITM/OTM, but this is close enough for 0DTE
+        trade.est_premium = max(0.01, trade.entry_premium + spot_move * trade.entry_delta)
+        trade.peak_premium = max(trade.peak_premium, trade.est_premium)
+
+        pnl_pct = ((price - trade.entry_price) / trade.entry_price * 100) if trade.direction == "LONG" else ((trade.entry_price - price) / trade.entry_price * 100)
+        gain_pct = (trade.est_premium - trade.entry_premium) / trade.entry_premium if trade.entry_premium > 0 else 0
+        giveback_pct = (trade.peak_premium - trade.est_premium) / trade.peak_premium if trade.peak_premium > 0 else 0
+
+        # ── Phase 1: HOLD window — no exit except premium stop ──
+        if now_epoch < trade.crisis_hold_until:
+            # Only 45% premium stop active during hold window
+            if trade.est_premium <= trade.entry_premium * (1 - CRISIS_PREMIUM_STOP_PCT):
+                if self._exit_alert_ok(trade, "crisis_prem_stop", now):
+                    trade.status = "INVALIDATED"; trade.close_price = price
+                    trade.close_time = now; trade.close_epoch = now_epoch
+                    trade.close_reason = f"CRISIS premium stop: est. {gain_pct:.0%} loss during hold window"
+                    self._update_circuit_breaker(state, trade.bias_direction, is_stop=True)
+                    self._persist_trades(ticker, state)
+                    events.append({"msg": (
+                        f"🛑 CRISIS PREMIUM STOP — {trade.direction}\n\n"
+                        f"Est. premium ${trade.est_premium:.2f} (was ${trade.entry_premium:.2f})\n"
+                        f"Loss ~{abs(gain_pct):.0%} during {CRISIS_HOLD_WINDOW_MIN}min hold window.\n"
+                        f"Entry: ${trade.entry_price:.2f} → Now: ${price:.2f} ({pnl_pct:+.2f}%)\n"
+                        f"Thesis failed. Cut it."
+                    ), "type": "exit", "priority": 5, "alert_key": f"exit_crisis_prem_{trade.trade_id}"})
+                    _log_trade_event(trade, event="CLOSE", close_price=price,
+                                      close_reason=trade.close_reason,
+                                      badge=_trade_quality_badge(trade))
+            return events  # hold window still active
+
+        # ── Phase 2: Scale out in thirds ──
+        # Scale 1: 50% premium gain → sell 1/3
+        if not trade.crisis_scale1_done and gain_pct >= CRISIS_SCALE_1_PCT:
+            if self._exit_alert_ok(trade, "crisis_scale1", now):
+                trade.crisis_scale1_done = True
+                trade.crisis_phase = "SCALE_1"
+                contracts_sold = trade.contracts_remaining // 3
+                trade.contracts_remaining -= contracts_sold
+                self._update_circuit_breaker(state, trade.bias_direction, is_stop=False)
+                self._persist_trades(ticker, state)
+                events.append({"msg": (
+                    f"💰 CRISIS SCALE 1/3 — {trade.direction}\n\n"
+                    f"Est. premium ${trade.est_premium:.2f} (+{gain_pct:.0%} from ${trade.entry_premium:.2f})\n"
+                    f"SELL {contracts_sold} contracts. {trade.contracts_remaining} remaining.\n"
+                    f"Entry: ${trade.entry_price:.2f} → Now: ${price:.2f} ({pnl_pct:+.2f}%)\n"
+                    f"Lock in profit. Let the rest run."
+                ), "type": "exit", "priority": 5, "alert_key": f"exit_crisis_s1_{trade.trade_id}"})
+
+        # Scale 2: 100% premium gain → sell another 1/3
+        if trade.crisis_scale1_done and not trade.crisis_scale2_done and gain_pct >= CRISIS_SCALE_2_PCT:
+            if self._exit_alert_ok(trade, "crisis_scale2", now):
+                trade.crisis_scale2_done = True
+                trade.crisis_phase = "SCALE_2"
+                contracts_sold = trade.contracts_remaining // 2
+                trade.contracts_remaining -= contracts_sold
+                self._persist_trades(ticker, state)
+                events.append({"msg": (
+                    f"💰 CRISIS SCALE 2/3 — {trade.direction}\n\n"
+                    f"Est. premium ${trade.est_premium:.2f} (+{gain_pct:.0%} = DOUBLED)\n"
+                    f"SELL {contracts_sold} more. {trade.contracts_remaining} remaining.\n"
+                    f"Entry: ${trade.entry_price:.2f} → Now: ${price:.2f} ({pnl_pct:+.2f}%)\n"
+                    f"Trail the rest with {CRISIS_TRAIL_GIVEBACK_PCT:.0%} giveback."
+                ), "type": "exit", "priority": 5, "alert_key": f"exit_crisis_s2_{trade.trade_id}"})
+
+        # ── Phase 3: Trail last contracts ──
+        if trade.crisis_scale2_done:
+            trade.crisis_phase = "TRAIL"
+            # Determine giveback threshold
+            _mins_ct = 0
+            try:
+                from zoneinfo import ZoneInfo
+                _now_ct = datetime.now(ZoneInfo("America/Chicago"))
+                _mins_ct = _now_ct.hour * 60 + _now_ct.minute
+            except Exception:
+                _mins_ct = 0
+            # Phase 4: Last 60 min — tighten trail
+            _close_mins = 870  # 14:30 CT = market close
+            _minutes_to_close = _close_mins - _mins_ct
+            if _minutes_to_close <= CRISIS_FINAL_HOUR_MINUTES:
+                _gb_threshold = CRISIS_FINAL_HOUR_GIVEBACK_PCT
+                trade.crisis_phase = "TRAIL_TIGHT"
+            else:
+                _gb_threshold = CRISIS_TRAIL_GIVEBACK_PCT
+
+            if giveback_pct >= _gb_threshold:
+                if self._exit_alert_ok(trade, "crisis_trail_exit", now):
+                    trade.status = "CLOSED"; trade.close_price = price
+                    trade.close_time = now; trade.close_epoch = now_epoch
+                    trade.close_reason = (f"CRISIS trail: {giveback_pct:.0%} giveback from "
+                                          f"peak ${trade.peak_premium:.2f} (threshold {_gb_threshold:.0%})")
+                    self._update_circuit_breaker(state, trade.bias_direction, is_stop=False)
+                    self._persist_trades(ticker, state)
+                    events.append({"msg": (
+                        f"🏃 CRISIS TRAIL EXIT — {trade.direction}\n\n"
+                        f"Peak premium ${trade.peak_premium:.2f} → Now ${trade.est_premium:.2f}\n"
+                        f"Giveback {giveback_pct:.0%} exceeded {_gb_threshold:.0%} threshold.\n"
+                        f"Remaining {trade.contracts_remaining} contracts closed.\n"
+                        f"Entry: ${trade.entry_price:.2f} → Now: ${price:.2f} ({pnl_pct:+.2f}%)\n"
+                        f"Pay yourself."
+                    ), "type": "exit", "priority": 5, "alert_key": f"exit_crisis_trail_{trade.trade_id}"})
+                    _log_trade_event(trade, event="CLOSE", close_price=price,
+                                      close_reason=trade.close_reason,
+                                      badge=_trade_quality_badge(trade))
+
+        # ── 45% premium stop (all phases after hold window) ──
+        if trade.status not in ("CLOSED", "INVALIDATED"):
+            if trade.est_premium <= trade.entry_premium * (1 - CRISIS_PREMIUM_STOP_PCT):
+                if self._exit_alert_ok(trade, "crisis_prem_stop", now):
+                    trade.status = "INVALIDATED"; trade.close_price = price
+                    trade.close_time = now; trade.close_epoch = now_epoch
+                    trade.close_reason = f"CRISIS premium stop: est. {abs(gain_pct):.0%} loss"
+                    self._update_circuit_breaker(state, trade.bias_direction, is_stop=True)
+                    self._persist_trades(ticker, state)
+                    events.append({"msg": (
+                        f"🛑 CRISIS PREMIUM STOP — {trade.direction}\n\n"
+                        f"Est. premium ${trade.est_premium:.2f} (was ${trade.entry_premium:.2f})\n"
+                        f"Loss ~{abs(gain_pct):.0%} of entry premium.\n"
+                        f"Entry: ${trade.entry_price:.2f} → Now: ${price:.2f} ({pnl_pct:+.2f}%)"
+                    ), "type": "exit", "priority": 5, "alert_key": f"exit_crisis_prem_{trade.trade_id}"})
+                    _log_trade_event(trade, event="CLOSE", close_price=price,
+                                      close_reason=trade.close_reason,
+                                      badge=_trade_quality_badge(trade))
+
+        return events
+
+    # ── v5.1 Change 9: Multi-Touch Level Break Detection ──
+    def _detect_multi_touch_break(self, ticker, thesis, state, price, now, registry=None):
+        """Scan intraday levels for 3+ same-side touches and confirmed break.
+        Returns entry events if a structural break is detected."""
+        events = []
+        if not state.intraday_levels:
+            return events
+
+        # Check for active Change 9 trades — only 1 at a time per ticker
+        _active_mt = [t for t in state.active_trades
+                      if t.status in ("OPEN", "SCALED", "TRAILED")
+                      and getattr(t, 'is_multi_touch_entry', False)]
+        if len(_active_mt) >= MULTI_TOUCH_MAX_ACTIVE:
+            return events
+
+        # Also block counter-direction entries if a Change 9 trade is active
+        if _active_mt:
+            return events
+
+        now_epoch = time.time()
+
+        for il in state.intraday_levels:
+            if not il.active:
+                continue
+            if il.touches < MULTI_TOUCH_MIN_TOUCHES:
+                continue
+            # Level must have existed for minimum lookback
+            age_min = (now_epoch - il.first_seen_ts) / 60 if il.first_seen_ts > 0 else 0
+            if age_min < MULTI_TOUCH_LOOKBACK_MIN:
+                continue
+
+            level_key = f"{il.price:.2f}_{il.kind}"
+            broken = False
+            direction = ""
+
+            # Support break → bearish (long put)
+            if il.kind == "support" and price < il.price:
+                # Price is below support level
+                broken = True
+                direction = "SHORT"  # bearish bias = put buyer
+
+            # Resistance break → bullish (long call)
+            elif il.kind == "resistance" and price > il.price:
+                broken = True
+                direction = "LONG"  # bullish bias = call buyer
+
+            if not broken:
+                # Reset confirmation count if price came back inside
+                state.multi_touch_confirm_polls.pop(level_key, None)
+                continue
+
+            # ── Spot-poll confirmation (Change 3 style) ──
+            confirm_count = state.multi_touch_confirm_polls.get(level_key, 0) + 1
+            state.multi_touch_confirm_polls[level_key] = confirm_count
+
+            if confirm_count < MULTI_TOUCH_CONFIRM_POLLS:
+                log.debug(f"Multi-touch break polling: {ticker} {il.kind} "
+                          f"${il.price:.2f} ({il.touches} touches) — "
+                          f"confirm poll {confirm_count}/{MULTI_TOUCH_CONFIRM_POLLS}")
+                continue
+
+            # ── CONFIRMED — build the entry ──
+            # Find the consolidation zone for stop placement
+            zone_high = il.price
+            zone_low = il.price
+            for other in state.intraday_levels:
+                if not other.active:
+                    continue
+                if abs(other.price - il.price) < il.price * 0.005:  # within 0.5%
+                    zone_high = max(zone_high, other.price)
+                    zone_low = min(zone_low, other.price)
+
+            # Also check sharp move origins and resistance/support from thesis
+            if direction == "SHORT":
+                # Put: stop above consolidation zone
+                if thesis.levels.local_resistance and thesis.levels.local_resistance > zone_high:
+                    if abs(thesis.levels.local_resistance - il.price) < il.price * 0.005:
+                        zone_high = max(zone_high, thesis.levels.local_resistance)
+                stop = zone_high + MULTI_TOUCH_STOP_ZONE_BUFFER
+            else:
+                # Call: stop below consolidation zone
+                if thesis.levels.local_support and thesis.levels.local_support < zone_low:
+                    if abs(thesis.levels.local_support - il.price) < il.price * 0.005:
+                        zone_low = min(zone_low, thesis.levels.local_support)
+                stop = zone_low - MULTI_TOUCH_STOP_ZONE_BUFFER
+
+            stop_dist = abs(price - stop)
+
+            # VIX gate check (must pass)
+            if VIX_STOP_SCALE_ENABLED and thesis.vix > 0:
+                min_stop = get_vix_scaled_min_stop(ticker, thesis.vix)
+                if stop_dist < min_stop:
+                    log.info(f"Multi-touch break VIX gate: {ticker} stop dist "
+                             f"${stop_dist:.2f} < min ${min_stop:.2f}, skipping")
+                    continue
+
+            # Determine instrument label
+            _is_crisis = thesis.volatility_regime == "CRISIS"
+            if direction == "SHORT":
+                _instr = "LONG PUT" if _is_crisis else "Put debit spread"
+            else:
+                _instr = "LONG CALL" if (_is_crisis and thesis.gex_sign == "negative") else "Call debit spread"
+
+            # Build the entry event
+            _type_label = "support break" if il.kind == "support" else "resistance break"
+            msg = (
+                f"⭐⭐⭐⭐⭐ 🚀 {ticker} STRUCTURAL BREAK — {_instr.upper()}\n\n"
+                f"📐 MULTI-TOUCH {_type_label.upper()}: "
+                f"${il.price:.2f} tested {il.touches}x, CONFIRMED BROKEN\n\n"
+                f"{'🟥🔥 BREAKDOWN' if direction == 'SHORT' else '🟩🔥 BREAKOUT'} "
+                f"— {_instr}\n\n"
+                f"ENTRY: ~${price:.2f}\n"
+                f"STOP: ${stop:.2f} (above full consolidation zone)\n"
+                f"Stop distance: ${stop_dist:.2f}\n"
+                f"Instrument: {_instr}\n"
+                f"Zone: ${zone_low:.2f}-${zone_high:.2f} ({il.touches} touches)"
+            )
+
+            _ak = f"mt_break_{'dn' if direction == 'SHORT' else 'up'}_{il.price:.2f}"
+            events.append({
+                "msg": msg,
+                "type": "critical",
+                "priority": 5,
+                "alert_key": _ak,
+                # Pass multi-touch metadata for _create_trade_from_event
+                "_is_multi_touch": True,
+                "_touch_count": il.touches,
+                "_zone_high": zone_high,
+                "_zone_low": zone_low,
+                "_mt_stop": stop,
+            })
+
+            log.info(f"Multi-touch break CONFIRMED: {ticker} {_type_label} "
+                     f"${il.price:.2f} ({il.touches} touches) → {direction} "
+                     f"stop=${stop:.2f} dist=${stop_dist:.2f}")
+
+            # Clear confirmation counter — don't re-fire
+            state.multi_touch_confirm_polls.pop(level_key, None)
+            # Mark level as consumed
+            il.active = False
+
+            # Only fire one multi-touch event per evaluate cycle
+            break
+
+        return events
 
     # ── Expire Stale Trades ──
     def _expire_stale_trades(self, state, now):
@@ -1918,25 +2435,63 @@ class ThesisMonitorEngine:
 
     def _detect_confirmed_breaks(self, thesis, state, price, now, bar=None, bm=None):
         events = []; tp = _get_time_phase_ct()
+        _ticker = getattr(thesis, 'ticker', '')
+        _is_high_res = _ticker.upper() in self._HIGH_RES_TICKERS
         for ba in state.break_attempts:
             if ba.detected_as_failed or ba.detected_as_confirmed: continue
             if (now - ba.break_time) > MONITOR_MAX_BREAK_AGE_SEC: continue
-            req = 2 if tp["phase"] in ("OPEN", "MORNING", "AFTERNOON") else 3
-            bars_since_break = (bm.state.bars_since_open - ba.break_bar_index) if (bm and ba.break_bar_index >= 0) else 999
-            if bars_since_break < req: continue
-            buf = ba.level * (MONITOR_CONFIRM_BUFFER_PCT / 100); net = self._recent_net_move(state, 3, bm=bm)
-            if ba.direction == "DOWN":
-                ok = price < (ba.level - buf) and net < -(ba.level * 0.0012)
-                # v2.0: If bars available, require bar close through, not just spot
-                if ok and bm and not bm.bar_closed_through(ba.level, "DOWN", lookback=2):
-                    ok = False
-                    log.info(f"Confirm [{ba.level_name}] ${ba.level:.2f}: spot below but no bar close — waiting")
+
+            # ── v5.1 Change 3: Spot-poll confirmation for high-res tickers ──
+            # Instead of waiting for 2-3 bars (10-20 min with delayed data),
+            # count consecutive 60-second spot polls beyond the level.
+            # Confirmation in 2-3 minutes instead of 15-20 minutes.
+            if _is_high_res:
+                _confirm_key = f"brk_{ba.direction}_{ba.level:.2f}"
+                buf = ba.level * (MONITOR_CONFIRM_BUFFER_PCT / 100)
+                if ba.direction == "DOWN":
+                    _beyond = price < (ba.level - buf)
+                else:
+                    _beyond = price > (ba.level + buf)
+
+                if _beyond:
+                    _polls = state.break_confirm_polls.get(_confirm_key, 0) + 1
+                    state.break_confirm_polls[_confirm_key] = _polls
+                else:
+                    # Price came back — reset
+                    state.break_confirm_polls[_confirm_key] = 0
+                    continue
+
+                _req_polls = MULTI_TOUCH_CONFIRM_POLLS  # reuse same constant (3)
+                if _polls < _req_polls:
+                    continue  # not enough consecutive polls yet
+
+                # Confirmed via spot polls — proceed to entry logic
+                net = self._recent_net_move(state, 3, bm=bm)
+                if ba.direction == "DOWN":
+                    ok = net < -(ba.level * 0.0012)
+                else:
+                    ok = net > (ba.level * 0.0012)
+                if not ok:
+                    continue
+                # Clear the poll counter
+                state.break_confirm_polls.pop(_confirm_key, None)
             else:
-                ok = price > (ba.level + buf) and net > (ba.level * 0.0012)
-                if ok and bm and not bm.bar_closed_through(ba.level, "UP", lookback=2):
-                    ok = False
-                    log.info(f"Confirm [{ba.level_name}] ${ba.level:.2f}: spot above but no bar close — waiting")
-            if not ok: continue
+                # Standard bar-count confirmation for non-high-res tickers
+                req = 2 if tp["phase"] in ("OPEN", "MORNING", "AFTERNOON") else 3
+                bars_since_break = (bm.state.bars_since_open - ba.break_bar_index) if (bm and ba.break_bar_index >= 0) else 999
+                if bars_since_break < req: continue
+                buf = ba.level * (MONITOR_CONFIRM_BUFFER_PCT / 100); net = self._recent_net_move(state, 3, bm=bm)
+                if ba.direction == "DOWN":
+                    ok = price < (ba.level - buf) and net < -(ba.level * 0.0012)
+                    if ok and bm and not bm.bar_closed_through(ba.level, "DOWN", lookback=2):
+                        ok = False
+                        log.info(f"Confirm [{ba.level_name}] ${ba.level:.2f}: spot below but no bar close — waiting")
+                else:
+                    ok = price > (ba.level + buf) and net > (ba.level * 0.0012)
+                    if ok and bm and not bm.bar_closed_through(ba.level, "UP", lookback=2):
+                        ok = False
+                        log.info(f"Confirm [{ba.level_name}] ${ba.level:.2f}: spot above but no bar close — waiting")
+                if not ok: continue
             ba.detected_as_confirmed = True; ba.retest_armed = True
             state.confirmed_breaks.append(ba); state.status = "BREAK_CONFIRMED"
             ext = abs(price - ba.level) / ba.level * 100; chase = ext > MONITOR_EXTENSION_LIMIT_PCT
@@ -2238,6 +2793,30 @@ class ThesisMonitorEngine:
            'sharp_sup', 'sharp_res') is treated as a cluster duplicate and skipped.
            This is what eliminates the burst of 4 alerts in 3 seconds on nearby levels.
         """
+        # ── v5.1 Change 4: Noise reduction ────────────────────────────────
+        # Demote non-essential alerts to prevent Telegram spam.
+        # Target: ~75% reduction in Telegram volume.
+        _has_active_trade = any(
+            t.status in ("OPEN", "SCALED", "TRAILED")
+            for t in state.active_trades
+        )
+        for e in events:
+            k = e.get("alert_key", "")
+            msg = e.get("msg", "")
+            etype = e.get("type", "")
+
+            # Break attempts → log only (never Telegram)
+            if k.startswith("brk_dn_") or k.startswith("brk_up_"):
+                if etype not in ("trade_confirmed", "critical"):
+                    e["priority"] = min(e.get("priority", 0), 2)
+                    e["type"] = "info"
+
+            # Momentum warnings → Telegram only when active trade exists
+            elif "momentum" in k.lower() or "momentum" in msg.lower():
+                if not _has_active_trade:
+                    e["priority"] = min(e.get("priority", 0), 2)
+                    e["type"] = "info"
+
         # Build a quick lookup: family_prefix → list of (price, last_fired_ts)
         # We store zone fires in alert_history under a synthetic key "zone:{family}:{price:.2f}"
         out = []
