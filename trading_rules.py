@@ -500,24 +500,31 @@ ALERT_DEMOTE_REPEAT_FAILED_MOVE = True
 # the real move happened. Scale the minimum stop with VIX.
 
 VIX_STOP_SCALE_ENABLED       = True
-VIX_STOP_SCALE_BASE_VIX      = 15.0    # base VIX for stop calibration
-VIX_STOP_SCALE_FACTOR        = 1.5     # stop distance grows 1.5x per 10 VIX pts
-VIX_STOP_MIN_FLOOR_SPY       = 0.40    # absolute minimum even at low VIX
+VIX_STOP_SCALE_BASE_VIX      = 15.0    # VIX reference point (min stop = BASE at this VIX)
+VIX_STOP_SCALE_PER_POINT     = 0.023   # additional $ per VIX point above baseline
+# v5.1: Linear model replaces multiplicative. At VIX 30, SPY moves $1+ per
+# 5-min candle routinely. A $0.60 stop is noise, not a wrong thesis.
+# Formula: min_stop = BASE + (VIX - BASELINE) × SCALE_PER_POINT
+# VIX 15: $0.71 | VIX 20: $0.83 | VIX 25: $0.94 | VIX 30: $1.06 | VIX 35: $1.17
+VIX_STOP_MIN_FLOOR_SPY       = 0.71    # base min stop at VIX 15
+VIX_STOP_MIN_FLOOR_QQQ       = 0.65    # QQQ is slightly less volatile per point
 VIX_STOP_MIN_FLOOR_DEFAULT   = 0.30
 
 def get_vix_scaled_min_stop(ticker: str, vix: float = 20.0) -> float:
-    """Compute VIX-scaled minimum stop distance in dollars."""
+    """Compute VIX-scaled minimum stop distance in dollars.
+    v5.1: Linear model — $0.71 + (VIX - 15) × $0.023.
+    Replay validated: blocked 20 trades across 3 days that were 7W/13L = -$14,676."""
     if not VIX_STOP_SCALE_ENABLED:
-        base = {"SPY": 0.40, "QQQ": 0.40}.get(ticker.upper(), 0.30)
+        base = {"SPY": 0.71, "QQQ": 0.65}.get(ticker.upper(), 0.30)
         return base
 
-    base = {"SPY": VIX_STOP_MIN_FLOOR_SPY, "QQQ": VIX_STOP_MIN_FLOOR_SPY}.get(
+    base = {"SPY": VIX_STOP_MIN_FLOOR_SPY, "QQQ": VIX_STOP_MIN_FLOOR_QQQ}.get(
         ticker.upper(), VIX_STOP_MIN_FLOOR_DEFAULT)
 
-    # Scale: at VIX 15 = base, at VIX 25 = base * 1.5, at VIX 35 = base * 2.0
-    vix_excess = max(0, vix - VIX_STOP_SCALE_BASE_VIX) / 10.0
-    multiplier = 1.0 + vix_excess * (VIX_STOP_SCALE_FACTOR - 1.0)
-    return round(base * multiplier, 2)
+    # Linear scale: base + (VIX - baseline) × per-point increment
+    vix_excess = max(0, vix - VIX_STOP_SCALE_BASE_VIX)
+    scaled = base + vix_excess * VIX_STOP_SCALE_PER_POINT
+    return round(scaled, 2)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -644,6 +651,87 @@ def get_naked_dte_range(is_swing: bool) -> tuple:
         return (NAKED_SWING_MIN_DTE, NAKED_SWING_TARGET_DTE, NAKED_SWING_MAX_DTE)
     else:
         return (NAKED_SCALP_MIN_DTE, NAKED_SCALP_MAX_DTE, NAKED_SCALP_MAX_DTE)
+
+
+# ═══════════════════════════════════════════════════════════
+# CRISIS REGIME — LONG OPTION EXIT FRAMEWORK (v5.1 Change 8)
+# ═══════════════════════════════════════════════════════════
+#
+# When vol regime is CRISIS, long puts/calls are PRIMARY instrument.
+# Spreads become fallback. The exit framework scales out in thirds
+# to capture asymmetric moves while protecting capital.
+#
+# Phase 1: Hold window (no exit except premium stop)
+# Phase 2: Scale 1/3 at 50% gain, 1/3 at 100% gain
+# Phase 3: Trail last 1/3 at 30% giveback from peak
+# Phase 4: Last 60 min — tighten to 15% giveback (theta acceleration)
+#
+# Replay validated: March 31 spread = +$486. Long option = +$5,000-$10,000.
+
+CRISIS_LONG_OPTION_PRIMARY       = True    # long options primary in CRISIS
+CRISIS_HOLD_WINDOW_MIN           = 15      # minutes — no exit (except premium stop)
+CRISIS_PREMIUM_STOP_PCT          = 0.45    # 45% loss of entry premium → exit all
+CRISIS_SCALE_1_PCT               = 0.50    # 50% premium gain → sell 1/3
+CRISIS_SCALE_2_PCT               = 1.00    # 100% premium gain → sell 1/3
+CRISIS_TRAIL_GIVEBACK_PCT        = 0.30    # trail last 1/3: 30% giveback from peak
+CRISIS_FINAL_HOUR_GIVEBACK_PCT   = 0.15    # last 60 min: tighten to 15%
+CRISIS_FINAL_HOUR_MINUTES        = 60      # when to tighten trail
+
+# ─── CRISIS 0DTE Strike Targeting ───
+# Slightly OTM in CRISIS: cheaper premium, explosive gamma when
+# strike approaches ATM. VIX 30+ means $5-10 moves are routine,
+# so delta 0.25-0.35 ($1-3 OTM) is high probability.
+CRISIS_0DTE_DELTA_TARGET         = 0.30    # target delta for CRISIS 0DTE
+CRISIS_0DTE_DELTA_RANGE          = (0.25, 0.35)  # acceptable range
+# Standard (non-CRISIS):
+LONG_OPTION_DELTA_TARGET         = 0.45
+LONG_OPTION_DELTA_RANGE          = (0.35, 0.55)
+
+# ─── CRISIS GEX conditions ───
+# Puts in CRISIS: always primary (vol expands on drops = double tailwind)
+# Calls in CRISIS: only if GEX negative (squeeze/snap-back context)
+CRISIS_PUTS_ALWAYS_PRIMARY       = True    # no GEX requirement for puts
+CRISIS_CALLS_REQUIRE_GEX_NEG     = True    # calls need GEX- for squeeze context
+
+
+# ═══════════════════════════════════════════════════════════
+# CONSECUTIVE LOSS CIRCUIT BREAKER (v5.1 Change 6)
+# ═══════════════════════════════════════════════════════════
+#
+# After 2 consecutive stops in the same direction, pause that
+# direction for 30 minutes. Prevents revenge trading.
+# Tracks bias (bearish/bullish), not position type.
+# A long put = bearish bias.
+
+CIRCUIT_BREAKER_ENABLED          = True
+CIRCUIT_BREAKER_MAX_CONSEC_STOPS = 2       # stops before pause
+CIRCUIT_BREAKER_PAUSE_MIN        = 30      # minutes to pause
+# What counts as a stop: hard stop, premium stop
+# What does NOT count: giveback, scale, momentum exhaustion, trail
+
+
+# ═══════════════════════════════════════════════════════════
+# MULTI-TOUCH LEVEL BREAK (v5.1 Change 9)
+# ═══════════════════════════════════════════════════════════
+#
+# When a support/resistance level has been tested 3+ times on the
+# same side and then breaks with spot-poll confirmation, fire a
+# long option entry with the stop above the FULL consolidation zone.
+#
+# This naturally produces $1.00+ stop distances that pass the
+# VIX gate, and captures structural breakdowns/breakouts that
+# the tight-stop fades miss.
+#
+# Replay validated:
+#   March 27: $640 support broke → $633 → +$4,710 with long put
+#   March 30: $636 support broke → $630 → +$4,180 with long put
+
+MULTI_TOUCH_BREAK_ENABLED        = True
+MULTI_TOUCH_MIN_TOUCHES          = 3       # same-side touches before break qualifies
+MULTI_TOUCH_LOOKBACK_MIN         = 30      # level must have existed for 30+ minutes
+MULTI_TOUCH_STOP_ZONE_BUFFER     = 0.10    # add $0.10 above/below zone for safety
+MULTI_TOUCH_CONFIRM_POLLS        = 3       # consecutive spot polls beyond level
+MULTI_TOUCH_MAX_ACTIVE           = 1       # max active Change 9 trades per ticker
 
 
 # ═══════════════════════════════════════════════════════════
