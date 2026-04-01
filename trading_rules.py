@@ -733,6 +733,10 @@ MULTI_TOUCH_STOP_ZONE_BUFFER     = 0.10    # add $0.10 above/below zone for safe
 MULTI_TOUCH_CONFIRM_POLLS        = 3       # consecutive spot polls beyond level
 MULTI_TOUCH_MAX_ACTIVE           = 1       # max active Change 9 trades per ticker
 
+# ── v5.1 Change 3: Spot-poll confirmation ───
+# Dedicated constant for normal break confirmation (separate from multi-touch)
+BREAK_CONFIRM_POLLS              = 3       # consecutive 60s spot polls beyond level
+
 
 # ═══════════════════════════════════════════════════════════
 # SWING SCANNER (v5.1)
