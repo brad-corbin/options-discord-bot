@@ -50,6 +50,9 @@ try:
         MULTI_TOUCH_STOP_ZONE_BUFFER,
         MULTI_TOUCH_CONFIRM_POLLS,
         MULTI_TOUCH_MAX_ACTIVE,
+        MULTI_TOUCH_MAX_TOUCHES,
+        MULTI_TOUCH_MAX_AGE_MIN,
+        MULTI_TOUCH_RECENT_TOUCH_MIN,
         # v5.1 Change 3: Spot-poll confirmation
         BREAK_CONFIRM_POLLS,
     )
@@ -82,6 +85,9 @@ except ImportError:
     MULTI_TOUCH_STOP_ZONE_BUFFER = 0.10
     MULTI_TOUCH_CONFIRM_POLLS = 3
     MULTI_TOUCH_MAX_ACTIVE = 1
+    MULTI_TOUCH_MAX_TOUCHES = 10
+    MULTI_TOUCH_MAX_AGE_MIN = 180
+    MULTI_TOUCH_RECENT_TOUCH_MIN = 60
     BREAK_CONFIRM_POLLS = 3
 
 MONITOR_POLL_INTERVAL_SEC = 300
@@ -261,6 +267,9 @@ class ActiveTrade:
     touch_count: int = 0                 # how many same-side touches triggered this
     # ── v5.1 Change 6: Bias tracking for circuit breaker ──────────────────
     bias_direction: str = ""             # "bearish" or "bullish" for circuit breaker
+    # ── v5.1: Scale-in entry framework ────────────────────────────────
+    scale_in_stage: int = 1              # 1=initial 1/3, 2=added on confirm, 3=full
+    initial_contracts: int = 7           # 1/3 of 20 — initial position size
 
 @dataclass
 class MonitorState:
@@ -312,8 +321,9 @@ def _get_time_phase_ct() -> dict:
     if mins < 915: return {"phase": "CLOSE", "label": "Into Close", "favor": "pin", "note": "Favor pin / mean reversion. Reduce size."}
     return {"phase": "AFTER_HOURS", "label": "After Hours", "favor": "wait", "note": "Session over."}
 
-def _dte_guidance(phase: str) -> str:
-    """Return explicit DTE instruction based on session phase."""
+def _dte_guidance(phase: str, volatility_regime: str = "NORMAL", vix: float = 20.0) -> str:
+    """Return explicit DTE instruction based on session phase and vol regime.
+    v5.1: In CRISIS, morning entries should use 1-2 DTE to survive theta."""
     if phase in ("POWER_HOUR", "CLOSE"):
         from datetime import date, timedelta
         try:
@@ -326,6 +336,13 @@ def _dte_guidance(phase: str) -> str:
         while next_day.weekday() >= 5:
             next_day += timedelta(days=1)
         return f"📅 DTE: Use TOMORROW's expiry ({next_day.strftime('%m/%d')}) — 1DTE. Session ends soon. DO NOT buy 0DTE."
+    # v5.1: CRISIS morning/midday entries need 1-2 DTE to survive theta
+    # A 0DTE OTM option at VIX 25+ loses 15-20% per hour from theta alone.
+    # Morning entries need 3-5 hours to develop — 0DTE won't survive.
+    if volatility_regime == "CRISIS" and phase in ("OPEN", "MORNING", "MIDDAY"):
+        return ("📅 DTE: Use 1-2 DTE — NOT 0DTE.\n"
+                "   ⚠️ CRISIS vol + morning entry = theta will destroy 0DTE before the move develops.\n"
+                "   1DTE gives the thesis time to work without bleeding premium.")
     return "📅 DTE: Use TODAY's expiry (0DTE)."
 
 
@@ -1065,6 +1082,50 @@ class ThesisMonitorEngine:
                     ticker, thesis, state, price, now, registry=registry)
                 entry_events.extend(mt_events)
 
+            # ── v5.1: Confluence messaging ─────────────────────────────────
+            # When a confirming signal fires while an active trade exists in
+            # the same direction, convert it to a confluence annotation instead
+            # of firing a new trade card. This prevents confusing double-signals
+            # and reinforces the existing trade.
+            _active_longs = [t for t in state.active_trades
+                            if t.status in ("OPEN", "SCALED", "TRAILED") and t.direction == "LONG"]
+            _active_shorts = [t for t in state.active_trades
+                             if t.status in ("OPEN", "SCALED", "TRAILED") and t.direction == "SHORT"]
+            for ev in entry_events:
+                if ev.get("type") not in ("trade_confirmed", "critical"):
+                    continue
+                if ev.get("priority", 0) < 5:
+                    continue
+                ak = ev.get("alert_key", "")
+                # Determine direction of this event
+                _ev_dir = None
+                if any(x in ak for x in ("conf_short", "fbo_now", "rt_short", "rt_fs", "mt_break_dn")):
+                    _ev_dir = "SHORT"
+                elif any(x in ak for x in ("conf_long", "fb_now", "rt_long", "rt_fl", "mt_break_up")):
+                    _ev_dir = "LONG"
+                if _ev_dir is None:
+                    continue
+                # Check for active trade in same direction
+                _matching = _active_longs if _ev_dir == "LONG" else _active_shorts
+                if _matching:
+                    _existing = _matching[0]
+                    _orig_msg = ev.get("msg", "")
+                    # Extract the key info from the original message (first line)
+                    _first_line = _orig_msg.split("\n")[0] if "\n" in _orig_msg else _orig_msg[:60]
+                    ev["msg"] = (
+                        f"📋 CONFLUENCE — adds to active {_ev_dir}\n\n"
+                        f"{_first_line}\n\n"
+                        f"Active trade: {_existing.direction} @ ${_existing.entry_price:.2f} "
+                        f"(stop ${_existing.stop_level:.2f})\n"
+                        f"Thesis strengthening — HOLD position.\n"
+                        f"Consider adding 1/3 size on this confirmation if not full."
+                    )
+                    ev["type"] = "info"
+                    ev["priority"] = 4  # still visible in Telegram
+                    ev["alert_key"] = f"confluence_{ak}"
+                    log.info(f"Confluence: {ticker} {_ev_dir} signal {ak} → "
+                             f"reinforces active trade {_existing.trade_id}")
+
             # ── v5.0: Track which events the validator rejects ──
             _rejected_keys = set()
 
@@ -1308,13 +1369,27 @@ class ThesisMonitorEngine:
         # ── v5.1 Change 9: Block counter-direction when multi-touch active ──
         # If a Change 9 structural trade is open, don't fire entries in the
         # opposite direction — the structural thesis takes priority.
+        # Fix C: Release block if trade has been underwater for 30+ minutes.
         for t in state.active_trades:
             if t.status not in ("OPEN", "SCALED", "TRAILED"):
                 continue
             if getattr(t, 'is_multi_touch_entry', False) and t.direction != direction:
-                log.info(f"Counter-direction blocked: {ticker} {direction} {ak} — "
-                         f"active multi-touch {t.direction} trade {t.trade_id}")
-                return False
+                # Check if trade is underwater for 30+ min
+                _trade_age_min = (time.time() - t.entry_epoch) / 60 if t.entry_epoch > 0 else 0
+                _is_underwater = False
+                if t.direction == "LONG" and price < t.entry_price:
+                    _is_underwater = True
+                elif t.direction == "SHORT" and price > t.entry_price:
+                    _is_underwater = True
+                if _is_underwater and _trade_age_min >= 30:
+                    log.info(f"Counter-direction block RELEASED: {ticker} {direction} {ak} — "
+                             f"multi-touch {t.direction} trade {t.trade_id} underwater "
+                             f"{_trade_age_min:.0f}min (entry ${t.entry_price:.2f} vs spot ${price:.2f})")
+                    # Don't block — let the counter-direction trade through
+                else:
+                    log.info(f"Counter-direction blocked: {ticker} {direction} {ak} — "
+                             f"active multi-touch {t.direction} trade {t.trade_id}")
+                    return False
 
         # ── Gamma Flip Oscillation Gate ───────────────────────────────────
         # If price has been whipsawing around gamma flip, block entries near it.
@@ -1529,7 +1604,11 @@ class ThesisMonitorEngine:
                 trade.is_crisis_long_option = True
                 trade.crisis_phase = "HOLD"
                 trade.crisis_hold_until = time.time() + (CRISIS_HOLD_WINDOW_MIN * 60)
-                trade.contracts_remaining = 20
+                # v5.1: Scale-in — start at 1/3 position (7 contracts)
+                # Add remaining 2/3 on confluence confirmation signals
+                trade.contracts_remaining = 7
+                trade.initial_contracts = 7
+                trade.scale_in_stage = 1
                 # Estimate entry premium from delta × distance to strike
                 # For slightly OTM (delta 0.30), premium ≈ delta × 5-6
                 _delta_target = CRISIS_0DTE_DELTA_TARGET
@@ -1964,6 +2043,9 @@ class ThesisMonitorEngine:
                 continue
             if il.touches < MULTI_TOUCH_MIN_TOUCHES:
                 continue
+            # v5.1 Fix B: Cap touches — levels tested >10x are ranges, not fresh breaks
+            if il.touches > MULTI_TOUCH_MAX_TOUCHES:
+                continue
             # v5.1 fix: Skip levels already consumed by a previous multi-touch trade
             _level_price_str = f"{il.price:.2f}"
             if _level_price_str in state.multi_touch_consumed_levels:
@@ -1971,6 +2053,13 @@ class ThesisMonitorEngine:
             # Level must have existed for minimum lookback
             age_min = (now_epoch - il.first_seen_ts) / 60 if il.first_seen_ts > 0 else 0
             if age_min < MULTI_TOUCH_LOOKBACK_MIN:
+                continue
+            # v5.1 Fix B: Max age — levels older than 3 hours are stale
+            if age_min > MULTI_TOUCH_MAX_AGE_MIN:
+                continue
+            # v5.1 Fix B: Recent touch — level must have been tested within last 60 min
+            last_touch_age = (now_epoch - il.last_touched_ts) / 60 if il.last_touched_ts > 0 else 999
+            if last_touch_age > MULTI_TOUCH_RECENT_TOUCH_MIN:
                 continue
 
             level_key = f"{il.price:.2f}_{il.kind}"
@@ -2066,6 +2155,54 @@ class ThesisMonitorEngine:
 
             # Build the entry event
             _type_label = "support break" if il.kind == "support" else "resistance break"
+            _tp_now = _get_time_phase_ct()
+
+            # v5.1: DTE guidance based on vol regime and time of day
+            _dte_line = _dte_guidance(_tp_now["phase"], thesis.volatility_regime, thesis.vix)
+
+            # v5.1: Strike guidance for long options
+            _atm = int(price)
+            _strike_guidance = ""
+            if "LONG" in _instr.upper():
+                if _is_crisis or _is_elevated:
+                    _delta_tgt = 0.30
+                    _delta_str = "0.25-0.35"
+                    # Slightly OTM: 1-2 strikes from ATM
+                    if direction == "SHORT":  # put buyer
+                        _rec_strike = _atm - 1
+                        _option_desc = f"${_rec_strike} put"
+                    else:  # call buyer
+                        _rec_strike = _atm + 2
+                        _option_desc = f"${_rec_strike} call"
+                    # Estimate premium from VIX
+                    _prem_est = round(thesis.vix * 0.06 * 0.65, 2)
+                    _contracts = 20
+                    _max_risk = int(_prem_est * _contracts * 100)
+                    _strike_guidance = (
+                        f"\n\n— STRIKE GUIDANCE —\n"
+                        f"🎯 STRIKE: {_option_desc} (delta ~{_delta_tgt}, slightly OTM)\n"
+                        f"   Target delta range: {_delta_str}\n"
+                        f"💵 Est. premium: ~${_prem_est:.2f} per contract\n"
+                        f"📐 SIZE: {_contracts} contracts = ${_max_risk:,} max risk\n"
+                        f"   Scale in: enter 1/3 now ({_contracts // 3} contracts), "
+                        f"add on confirmation\n"
+                        f"{_dte_line}"
+                    )
+                else:
+                    # Low vol — ATM strikes, cheaper premium
+                    if direction == "SHORT":
+                        _rec_strike = _atm
+                        _option_desc = f"${_rec_strike} put"
+                    else:
+                        _rec_strike = _atm
+                        _option_desc = f"${_rec_strike} call"
+                    _strike_guidance = (
+                        f"\n\n— TRADE CARD —\n"
+                        f"🎯 STRIKE: {_option_desc} (ATM, delta ~0.50)\n"
+                        f"📐 SIZE: min(floor($2,000 ÷ premium × 100), 20 contracts)\n"
+                        f"{_dte_line}"
+                    )
+
             msg = (
                 f"⭐⭐⭐⭐⭐ 🚀 {ticker} STRUCTURAL BREAK — {_instr.upper()}\n\n"
                 f"📐 MULTI-TOUCH {_type_label.upper()}: "
@@ -2075,8 +2212,8 @@ class ThesisMonitorEngine:
                 f"ENTRY: ~${price:.2f}\n"
                 f"STOP: ${stop:.2f} (above full consolidation zone)\n"
                 f"Stop distance: ${stop_dist:.2f}\n"
-                f"Instrument: {_instr}\n"
                 f"Zone: ${zone_low:.2f}-${zone_high:.2f} ({il.touches} touches)"
+                f"{_strike_guidance}"
             )
 
             _ak = f"mt_break_{'dn' if direction == 'SHORT' else 'up'}_{il.price:.2f}"
@@ -2592,7 +2729,7 @@ class ThesisMonitorEngine:
                     continue
             # ── End hairline gate ─────────────────────────────────────────────
 
-            dte_line = _dte_guidance(tp_now["phase"])
+            dte_line = _dte_guidance(tp_now["phase"], thesis.volatility_regime, thesis.vix)
             if ba.direction == "DOWN":
                 state.active_trend_direction = "SHORT"
                 if thesis.gex_sign == "negative":
@@ -2704,7 +2841,7 @@ class ThesisMonitorEngine:
                     # Enough holds accumulated — fall through to normal entry below
                 # ── End hairline gate ─────────────────────────────────────────
 
-                dte_line = _dte_guidance(tp["phase"])
+                dte_line = _dte_guidance(tp["phase"], thesis.volatility_regime, thesis.vix)
                 if ba.direction == "DOWN":
                     direction = "LONG"
                     rn = ("GEX+ — squeeze probability HIGH." if thesis.gex_sign == "positive" else "GEX- squeeze can run hard.")
@@ -2729,7 +2866,7 @@ class ThesisMonitorEngine:
     def _detect_retests(self, thesis, state, price, now, bm=None):
         events = []; net = self._recent_net_move(state, 3, bm=bm)
         tp = _get_time_phase_ct()
-        dte_line = _dte_guidance(tp["phase"])
+        dte_line = _dte_guidance(tp["phase"], thesis.volatility_regime, thesis.vix)
         for ba in state.break_attempts:
             if not ba.retest_armed or ba.retest_fired: continue
             if (now - ba.break_time) > MONITOR_MAX_BREAK_AGE_SEC: continue
@@ -3765,6 +3902,20 @@ def build_thesis_from_em_card(ticker, spot, bias, eng, em, walls, cagf=None, vix
         from zoneinfo import ZoneInfo; ts = datetime.now(ZoneInfo("America/Chicago")).isoformat()
     except Exception: ts = datetime.now(timezone.utc).isoformat()
     ctx = ThesisContext(ticker=ticker, bias=bias.get("direction", "NEUTRAL"), bias_score=bias.get("score", 0), gex_sign=gex_sign, gex_value=round(gex_val, 2), dex_value=round(eng.get("dex", 0), 2), vanna_value=round(eng.get("vanna", 0), 2), charm_value=round(eng.get("charm", 0), 2), regime=regime, volatility_regime=v4_result.get("vol_regime", {}).get("label", "NORMAL") if v4_result else "NORMAL", vix=vix.get("vix", 20) if isinstance(vix, dict) else 20, iv=v4_result.get("iv", 0.20) if v4_result else 0.20, prior_day_close=prior_day_close, prior_day_context=prior_ctx, session_label=session_label, levels=levels, created_at=ts, spot_at_creation=spot)
+    # v5.1 Fix A: Force volatility_regime from VIX directly.
+    # The options engine (v4_result) may label VIX 25 as "ELEVATED" while
+    # the regime detector calls it "CRISIS". The CRISIS long option framework
+    # depends on this label. Use VIX thresholds as the source of truth.
+    _vix_val = vix.get("vix", 0) if isinstance(vix, dict) else 0
+    if _vix_val >= 25:
+        ctx.volatility_regime = "CRISIS"
+    elif _vix_val >= 20:
+        ctx.volatility_regime = "ELEVATED"
+    elif _vix_val > 0:
+        ctx.volatility_regime = "NORMAL"
+    # else: keep whatever v4_result provided
+    if _vix_val > 0:
+        log.info(f"Thesis vol regime: {ctx.volatility_regime} (VIX {_vix_val:.1f})")
     ctx.atm_call_delta   = float(atm_call_delta   or 0.0)
     ctx.atm_call_premium = float(atm_call_premium or 0.0)
     ctx.atm_put_delta    = float(atm_put_delta    or 0.0)
