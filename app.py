@@ -2766,7 +2766,7 @@ def _run_v4_prefilter(ticker: str, spot: float, chains: list, candle_closes: lis
         # Save OI snapshot for next run
         _oi_cache.save_snapshot(ticker, exp, chain_data)
         if _oi_tracker:
-            _oi_tracker.record_chain(ticker, exp, chain_data)
+            _oi_tracker.record_chain(ticker, exp, chain_data, spot=spot)
 
         if v4.get("error"):
             log.warning(f"v4 prefilter failed for {ticker}: {v4['error']}")
@@ -3913,7 +3913,7 @@ def _get_0dte_iv(ticker: str, target_date_str: str = None) -> tuple:
         # ── Save current OI as reference for next run ──
         _oi_cache.save_snapshot(ticker, target, data)
         if _oi_tracker:
-            _oi_tracker.record_chain(ticker, target, data)
+            _oi_tracker.record_chain(ticker, target, data, spot=spot)
 
         iv_meta = {"iv": v4.get("iv"), "source": "institutional_snapshot", "inferred": False, "notes": []}
         if v4.get("iv") is None:
@@ -4086,7 +4086,7 @@ def _get_chain_iv_for_expiry(ticker: str, target_date_str: str, dte: float) -> t
         # ── Save OI snapshot ──
         _oi_cache.save_snapshot(ticker, target, data)
         if _oi_tracker:
-            _oi_tracker.record_chain(ticker, target, data)
+            _oi_tracker.record_chain(ticker, target, data, spot=spot)
 
         iv_meta = {"iv": v4.get("iv"), "source": "institutional_snapshot", "inferred": False, "notes": []}
         if v4.get("iv") is None:
@@ -6992,6 +6992,31 @@ def _em_scheduler():
                             log.info("OI tracker: end-of-day flush complete")
                         except Exception as _oe:
                             log.debug(f"OI tracker flush error: {_oe}")
+
+                # Daily OI sweep at 4:10 PM CT — fetch chains for broad watchlist
+                _oi_sweep_key = (date_str, "oi_sweep")
+                if _oi_sweep_key not in fired_today and _oi_tracker.should_run_sweep():
+                    fired_today.add(_oi_sweep_key)
+                    try:
+                        def _oi_sweep_chain_fn(ticker):
+                            """Fetch nearest-DTE chain for OI sweep."""
+                            try:
+                                data, _spot, _target = _get_0dte_chain(ticker)
+                                if data and data.get("optionSymbol"):
+                                    dte = max(0, (datetime.strptime(_target, "%Y-%m-%d").date() - datetime.now().date()).days) if _target else 0
+                                    return [(_target, dte, data)]
+                            except Exception:
+                                pass
+                            return []
+                        def _run_sweep():
+                            _oi_tracker.run_daily_sweep(
+                                chain_fn=_oi_sweep_chain_fn,
+                                spot_fn=get_spot,
+                            )
+                        threading.Thread(target=_run_sweep, daemon=True, name="oi-sweep").start()
+                        log.info("OI sweep triggered (background thread)")
+                    except Exception as _oe:
+                        log.debug(f"OI sweep trigger error: {_oe}")
 
             fired_today = {k for k in fired_today if k[0] == date_str}
         except Exception as e:
