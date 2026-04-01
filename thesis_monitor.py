@@ -291,6 +291,7 @@ class MonitorState:
     cb_paused_until: dict = field(default_factory=dict) # {"bearish": epoch, "bullish": epoch}
     # ── v5.1 Change 9: Multi-touch level break tracking ───────────────────
     multi_touch_confirm_polls: dict = field(default_factory=dict)  # {level_price_str: count}
+    multi_touch_consumed_levels: set = field(default_factory=set)  # {price_str} — levels already traded
 
 def _get_time_phase_ct() -> dict:
     try:
@@ -1009,6 +1010,26 @@ class ThesisMonitorEngine:
                         IntradayLevelTracker._upsert_level(
                             state, state.orb_low, "support", "ORB15_LOW",
                             time.time(), touches=2)
+                elif _mins_ct > 525 and not state.orb_prices:
+                    # v5.1 fix: Thesis stored after ORB window — seed from bar manager
+                    # The bar manager may have bars from 8:30-8:45 already.
+                    state.orb_ready = True  # mark done so we don't re-check
+                    if bm and hasattr(bm, 'state') and hasattr(bm.state, 'or_30'):
+                        _or30 = bm.state.or_30
+                        if _or30.is_complete and _or30.high > 0 and _or30.low > 0:
+                            state.orb_high = _or30.high
+                            state.orb_low = _or30.low
+                            log.info(f"ORB15 seeded from bar manager OR30: {ticker} "
+                                     f"high=${_or30.high:.2f} low=${_or30.low:.2f}")
+                            IntradayLevelTracker._upsert_level(
+                                state, _or30.high, "resistance", "ORB15_HIGH",
+                                time.time(), touches=2)
+                            IntradayLevelTracker._upsert_level(
+                                state, _or30.low, "support", "ORB15_LOW",
+                                time.time(), touches=2)
+                        else:
+                            log.info(f"ORB15 unavailable: {ticker} — thesis stored "
+                                     f"after ORB window, no bar data")
             # ── v2.0: Build level registry with confluence scoring ──
             registry = self._build_level_registry(ticker, thesis, state, price)
             events.extend(self._evaluate_momentum(state, price, bm=bm))
@@ -1282,6 +1303,17 @@ class ThesisMonitorEngine:
                 continue
             if abs(t.stop_level - stop) / stop < 0.005 or abs(t.entry_price - price) / price < 0.005:
                 log.info(f"Trade already open for {ticker} {direction} stop=${t.stop_level:.2f} near new stop=${stop:.2f}, skipping")
+                return False
+
+        # ── v5.1 Change 9: Block counter-direction when multi-touch active ──
+        # If a Change 9 structural trade is open, don't fire entries in the
+        # opposite direction — the structural thesis takes priority.
+        for t in state.active_trades:
+            if t.status not in ("OPEN", "SCALED", "TRAILED"):
+                continue
+            if getattr(t, 'is_multi_touch_entry', False) and t.direction != direction:
+                log.info(f"Counter-direction blocked: {ticker} {direction} {ak} — "
+                         f"active multi-touch {t.direction} trade {t.trade_id}")
                 return False
 
         # ── Gamma Flip Oscillation Gate ───────────────────────────────────
@@ -1932,6 +1964,10 @@ class ThesisMonitorEngine:
                 continue
             if il.touches < MULTI_TOUCH_MIN_TOUCHES:
                 continue
+            # v5.1 fix: Skip levels already consumed by a previous multi-touch trade
+            _level_price_str = f"{il.price:.2f}"
+            if _level_price_str in state.multi_touch_consumed_levels:
+                continue
             # Level must have existed for minimum lookback
             age_min = (now_epoch - il.first_seen_ts) / 60 if il.first_seen_ts > 0 else 0
             if age_min < MULTI_TOUCH_LOOKBACK_MIN:
@@ -1980,21 +2016,26 @@ class ThesisMonitorEngine:
 
             # Also check sharp move origins and resistance/support from thesis
             # v5.1 spec: stop = max/min(consolidation_zone, nearest_level, broken_level ± min_stop)
+            # Fix: Only consider levels NEAR the consolidation zone (within 1% of broken level)
+            # to prevent distant daily support/resistance from creating $7+ stops on 0DTE.
             _min_stop_val = get_vix_scaled_min_stop(ticker, thesis.vix) if (VIX_STOP_SCALE_ENABLED and thesis.vix > 0) else 0.40
+            _max_zone_dist = il.price * 0.01  # 1% ≈ $6.50 on SPY — reasonable max zone
 
             if direction == "SHORT":
                 # Put: stop above consolidation zone
                 # Gather candidate stops: consolidation high, nearest resistance, broken level + min_stop
                 _candidates = [zone_high + MULTI_TOUCH_STOP_ZONE_BUFFER]
                 if thesis.levels.local_resistance and thesis.levels.local_resistance > il.price:
-                    _candidates.append(thesis.levels.local_resistance)
+                    if (thesis.levels.local_resistance - il.price) <= _max_zone_dist:
+                        _candidates.append(thesis.levels.local_resistance)
                 _candidates.append(il.price + _min_stop_val)  # broken_level + min_stop
                 stop = max(_candidates)
             else:
                 # Call: stop below consolidation zone
                 _candidates = [zone_low - MULTI_TOUCH_STOP_ZONE_BUFFER]
                 if thesis.levels.local_support and thesis.levels.local_support < il.price:
-                    _candidates.append(thesis.levels.local_support)
+                    if (il.price - thesis.levels.local_support) <= _max_zone_dist:
+                        _candidates.append(thesis.levels.local_support)
                 _candidates.append(il.price - _min_stop_val)  # broken_level - min_stop
                 stop = min(_candidates)
 
@@ -2058,8 +2099,9 @@ class ThesisMonitorEngine:
 
             # Clear confirmation counter — don't re-fire
             state.multi_touch_confirm_polls.pop(level_key, None)
-            # Mark level as consumed
+            # Mark level as consumed — persistent across poll cycles
             il.active = False
+            state.multi_touch_consumed_levels.add(_level_price_str)
 
             # Only fire one multi-touch event per evaluate cycle
             break
