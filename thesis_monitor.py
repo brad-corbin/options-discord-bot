@@ -50,6 +50,8 @@ try:
         MULTI_TOUCH_STOP_ZONE_BUFFER,
         MULTI_TOUCH_CONFIRM_POLLS,
         MULTI_TOUCH_MAX_ACTIVE,
+        # v5.1 Change 3: Spot-poll confirmation
+        BREAK_CONFIRM_POLLS,
     )
 except ImportError:
     ALERT_SUPPRESS_ON_VALIDATOR_REJECT = True
@@ -80,6 +82,7 @@ except ImportError:
     MULTI_TOUCH_STOP_ZONE_BUFFER = 0.10
     MULTI_TOUCH_CONFIRM_POLLS = 3
     MULTI_TOUCH_MAX_ACTIVE = 1
+    BREAK_CONFIRM_POLLS = 3
 
 MONITOR_POLL_INTERVAL_SEC = 300
 MONITOR_POLL_INTERVAL_FAST_SEC = 60
@@ -1976,35 +1979,49 @@ class ThesisMonitorEngine:
                     zone_low = min(zone_low, other.price)
 
             # Also check sharp move origins and resistance/support from thesis
+            # v5.1 spec: stop = max/min(consolidation_zone, nearest_level, broken_level ± min_stop)
+            _min_stop_val = get_vix_scaled_min_stop(ticker, thesis.vix) if (VIX_STOP_SCALE_ENABLED and thesis.vix > 0) else 0.40
+
             if direction == "SHORT":
                 # Put: stop above consolidation zone
-                if thesis.levels.local_resistance and thesis.levels.local_resistance > zone_high:
-                    if abs(thesis.levels.local_resistance - il.price) < il.price * 0.005:
-                        zone_high = max(zone_high, thesis.levels.local_resistance)
-                stop = zone_high + MULTI_TOUCH_STOP_ZONE_BUFFER
+                # Gather candidate stops: consolidation high, nearest resistance, broken level + min_stop
+                _candidates = [zone_high + MULTI_TOUCH_STOP_ZONE_BUFFER]
+                if thesis.levels.local_resistance and thesis.levels.local_resistance > il.price:
+                    _candidates.append(thesis.levels.local_resistance)
+                _candidates.append(il.price + _min_stop_val)  # broken_level + min_stop
+                stop = max(_candidates)
             else:
                 # Call: stop below consolidation zone
-                if thesis.levels.local_support and thesis.levels.local_support < zone_low:
-                    if abs(thesis.levels.local_support - il.price) < il.price * 0.005:
-                        zone_low = min(zone_low, thesis.levels.local_support)
-                stop = zone_low - MULTI_TOUCH_STOP_ZONE_BUFFER
+                _candidates = [zone_low - MULTI_TOUCH_STOP_ZONE_BUFFER]
+                if thesis.levels.local_support and thesis.levels.local_support < il.price:
+                    _candidates.append(thesis.levels.local_support)
+                _candidates.append(il.price - _min_stop_val)  # broken_level - min_stop
+                stop = min(_candidates)
 
             stop_dist = abs(price - stop)
 
-            # VIX gate check (must pass)
+            # VIX gate check — with the spec formula, stop should naturally pass,
+            # but verify explicitly as a safety net
             if VIX_STOP_SCALE_ENABLED and thesis.vix > 0:
-                min_stop = get_vix_scaled_min_stop(ticker, thesis.vix)
+                min_stop = _min_stop_val
                 if stop_dist < min_stop:
                     log.info(f"Multi-touch break VIX gate: {ticker} stop dist "
                              f"${stop_dist:.2f} < min ${min_stop:.2f}, skipping")
                     continue
 
-            # Determine instrument label
-            _is_crisis = thesis.volatility_regime == "CRISIS"
+            # Determine instrument label — Change 9 spec-aligned
+            _vol = (thesis.volatility_regime or "NORMAL").upper()
+            _is_crisis = _vol == "CRISIS"
+            _is_elevated = _vol == "ELEVATED"
+            _is_low_vol = _vol not in ("ELEVATED", "CRISIS")
+
             if direction == "SHORT":
-                _instr = "LONG PUT" if _is_crisis else "Put debit spread"
+                # Support break → long put in CRISIS/ELEVATED, spread in lower vol
+                _instr = "LONG PUT" if (_is_crisis or _is_elevated) else "Put debit spread"
             else:
-                _instr = "LONG CALL" if (_is_crisis and thesis.gex_sign == "negative") else "Call debit spread"
+                # Resistance break → long call in low vol, or in CRISIS squeeze context
+                _call_snapback_ok = _is_crisis and thesis.gex_sign == "negative"
+                _instr = "LONG CALL" if (_is_low_vol or _call_snapback_ok) else "Call debit spread"
 
             # Build the entry event
             _type_label = "support break" if il.kind == "support" else "resistance break"
@@ -2461,18 +2478,12 @@ class ThesisMonitorEngine:
                     state.break_confirm_polls[_confirm_key] = 0
                     continue
 
-                _req_polls = MULTI_TOUCH_CONFIRM_POLLS  # reuse same constant (3)
+                _req_polls = BREAK_CONFIRM_POLLS  # v5.1: dedicated constant
                 if _polls < _req_polls:
                     continue  # not enough consecutive polls yet
 
-                # Confirmed via spot polls — proceed to entry logic
-                net = self._recent_net_move(state, 3, bm=bm)
-                if ba.direction == "DOWN":
-                    ok = net < -(ba.level * 0.0012)
-                else:
-                    ok = net > (ba.level * 0.0012)
-                if not ok:
-                    continue
+                # Confirmed via spot polls — 3 consecutive polls beyond level
+                # is sufficient confirmation. No additional net move filter needed.
                 # Clear the poll counter
                 state.break_confirm_polls.pop(_confirm_key, None)
             else:
