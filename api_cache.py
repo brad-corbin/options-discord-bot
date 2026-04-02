@@ -1,12 +1,17 @@
 # api_cache.py
 # ═══════════════════════════════════════════════════════════════════
-# TTL-aware API response caching layer.
+# TTL-aware API response caching layer + API call counter.
 # Wraps md_get and other API calls to avoid duplicate fetches
 # within the same alert processing cycle.
 #
+# v5.1.1 API optimisation:
+#   - TTLs aligned to poll intervals (spot 55s, chain 120s, bars 55s)
+#   - API call counter with per-endpoint breakdown + periodic logging
+#   - Daily budget tracking (warns at 75K/90K, logs every 5 min)
+#
 # Cache tiers:
-#   spot price    → 10 sec  (changes fast but multiple calls per alert)
-#   option chain  → 20 sec  (expensive call, stable within a cycle)
+#   spot price    → 55 sec  (monitor polls 60s; 10s was 100% miss rate)
+#   option chain  → 120 sec (chains stable within 2 min; 20s was wasteful)
 #   expirations   → 5 min   (changes once per day)
 #   daily candles → 10 min  (changes once per day)
 #   OHLC bars     → 10 min  (same as candles)
@@ -14,6 +19,7 @@
 #   VIX data      → 60 sec  (changes intraday but not per-second)
 #   earnings      → 1 hour  (changes once per day)
 #   stock quote   → 15 sec  (for liquidity estimates)
+#   intraday bars → 55 sec  (monitor polls 60s; 30s was always miss)
 #
 # Thread-safe via threading.Lock per cache namespace.
 # No external dependencies — pure Python.
@@ -23,6 +29,7 @@
 #   cached_md = CachedMarketData(md_get)
 #   spot = cached_md.get_spot("SPY")
 #   chain = cached_md.get_chain("SPY", "2026-03-16")
+#   print(cached_md.get_api_status())  # API call counter
 # ═══════════════════════════════════════════════════════════════════
 
 import time
@@ -91,19 +98,167 @@ class _TTLCache:
 
 # ─────────────────────────────────────────────────────────
 # CACHE TTL CONSTANTS (seconds)
+# v5.1.1: Optimised to reduce MarketData.app API usage.
+#   TTL_SPOT:      10 → 55s  (monitor polls 60s; 10s = always miss)
+#   TTL_CHAIN:     20 → 120s (chains stable within 2 min)
+#   TTL_INTRADAY:  30 → 55s  (same logic as spot)
 # ─────────────────────────────────────────────────────────
 
-TTL_SPOT         = 10
-TTL_CHAIN        = 20
-TTL_EXPIRATIONS  = 300   # 5 min
-TTL_CANDLES      = 600   # 10 min
-TTL_OHLC_BARS    = 600   # 10 min
-TTL_ADV          = 600   # 10 min — ADV + spread, stable intraday
-TTL_VIX          = 60
-TTL_STOCK_QUOTE  = 15
-TTL_EARNINGS     = 3600  # 1 hour
-TTL_REGIME       = 300   # 5 min
-TTL_INTRADAY     = 30    # 30s — intraday bars (5m resolution, fast poll needs fresh data)
+TTL_SPOT         = 55    # was 10 — monitor polls every 60s, 10s = 100% miss rate
+TTL_CHAIN        = 120   # was 20 — chains don't change fast enough to warrant 20s
+TTL_EXPIRATIONS  = 300   # 5 min (unchanged)
+TTL_CANDLES      = 600   # 10 min (unchanged)
+TTL_OHLC_BARS    = 600   # 10 min (unchanged)
+TTL_ADV          = 600   # 10 min (unchanged)
+TTL_VIX          = 60    # (unchanged)
+TTL_STOCK_QUOTE  = 15    # (unchanged)
+TTL_EARNINGS     = 3600  # 1 hour (unchanged)
+TTL_REGIME       = 300   # 5 min (unchanged)
+TTL_INTRADAY     = 55    # was 30 — monitor polls 60s; 30s = always miss
+
+
+# ─────────────────────────────────────────────────────────
+# API CALL COUNTER — tracks every MarketData.app HTTP request
+# ─────────────────────────────────────────────────────────
+
+class _APICallCounter:
+    """Thread-safe per-endpoint API call counter with periodic logging.
+
+    Wraps the raw md_get function to intercept every call, classify it
+    by endpoint category, and log a summary every LOG_INTERVAL seconds.
+
+    Also tracks daily budget against DAILY_BUDGET and logs warnings
+    at 75% and 90% utilisation.
+    """
+    DAILY_BUDGET = 100_000          # MarketData.app daily limit
+    LOG_INTERVAL = 300              # log summary every 5 minutes
+    WARN_75_PCT  = int(DAILY_BUDGET * 0.75)
+    WARN_90_PCT  = int(DAILY_BUDGET * 0.90)
+
+    def __init__(self, raw_md_get_fn):
+        self._raw = raw_md_get_fn
+        self._lock = threading.Lock()
+        self._counts = {}           # endpoint_category → count
+        self._total = 0
+        self._credits = 0           # v5.1.1: estimated CREDIT consumption
+        self._credit_counts = {}    # endpoint_category → credits
+        self._last_log_time = time.time()
+        self._last_log_total = 0
+        self._last_log_credits = 0
+        self._warned_75 = False
+        self._warned_90 = False
+        self._day_key = ""
+        self._start_time = time.time()
+
+    def _classify(self, url: str) -> str:
+        """Map a MarketData.app URL to a short category for logging."""
+        if "/options/chain/" in url:     return "chain"
+        if "/options/expiration" in url:  return "expirations"
+        if "/stocks/prices/" in url:     return "spot_smartmid"
+        if "/stocks/quotes/" in url:     return "spot_quotes"
+        if "/stocks/candles/D/" in url or "/candles/daily/" in url:
+            return "daily_candles"
+        if "/stocks/candles/" in url:     return "intraday_bars"
+        if "/indices/" in url:            return "vix_indices"
+        return "other"
+
+    def __call__(self, url, params=None, retries=2):
+        """Drop-in replacement for md_get — counts calls AND credits."""
+        cat = self._classify(url)
+        with self._lock:
+            self._counts[cat] = self._counts.get(cat, 0) + 1
+            self._total += 1
+            # Check day rollover
+            try:
+                from datetime import datetime, timezone
+                today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            except Exception:
+                today = ""
+            if today != self._day_key:
+                if self._day_key:  # not first run
+                    log.info(f"API counter: day rolled {self._day_key} → {today}, "
+                             f"resetting (prev total: {self._total - 1}, credits: {self._credits})")
+                self._day_key = today
+                self._counts.clear()
+                self._credit_counts.clear()
+                self._total = 1
+                self._credits = 0
+                self._counts[cat] = 1
+                self._warned_75 = False
+                self._warned_90 = False
+
+        # Delegate to real md_get
+        result = self._raw(url, params, retries=retries)
+
+        # Estimate credits consumed from response
+        cred = 1  # default: 1 credit per call
+        if cat == "chain" and isinstance(result, dict) and result.get("s") == "ok":
+            # Chain calls cost 1 credit per option symbol returned
+            symbols = result.get("optionSymbol", [])
+            if isinstance(symbols, list) and symbols:
+                cred = len(symbols)
+
+        with self._lock:
+            self._credits += cred
+            self._credit_counts[cat] = self._credit_counts.get(cat, 0) + cred
+            local_credits = self._credits
+
+        # Budget warnings (based on credits, not calls)
+        if local_credits >= self.WARN_90_PCT and not self._warned_90:
+            self._warned_90 = True
+            log.warning(f"🚨 CREDIT BUDGET 90%: {local_credits:,}/{self.DAILY_BUDGET:,} credits used")
+        elif local_credits >= self.WARN_75_PCT and not self._warned_75:
+            self._warned_75 = True
+            log.warning(f"⚠️ CREDIT BUDGET 75%: {local_credits:,}/{self.DAILY_BUDGET:,} credits used")
+
+        # Periodic summary
+        now = time.time()
+        if now - self._last_log_time >= self.LOG_INTERVAL:
+            self._log_summary(now)
+
+        return result
+
+    def _log_summary(self, now: float):
+        with self._lock:
+            delta_calls = self._total - self._last_log_total
+            delta_credits = self._credits - self._last_log_credits
+            elapsed_min = (now - self._last_log_time) / 60
+            rate_calls = delta_calls / elapsed_min if elapsed_min > 0 else 0
+            rate_credits = delta_credits / elapsed_min if elapsed_min > 0 else 0
+            # Credit breakdown (the important one)
+            cred_cats = sorted(self._credit_counts.items(), key=lambda x: -x[1])
+            breakdown = " | ".join(f"{k}={v:,}" for k, v in cred_cats)
+            self._last_log_time = now
+            self._last_log_total = self._total
+            self._last_log_credits = self._credits
+            credits = self._credits
+            calls = self._total
+        log.info(f"📊 API CREDITS: {credits:,}/{self.DAILY_BUDGET:,} "
+                 f"(+{delta_credits:,} in {elapsed_min:.1f}min, {rate_credits:.0f}/min) "
+                 f"[{breakdown}] "
+                 f"({calls} calls, {rate_calls:.0f} calls/min)")
+
+    @property
+    def total(self) -> int:
+        return self._total
+
+    @property
+    def breakdown(self) -> dict:
+        with self._lock:
+            return dict(self._counts)
+
+    def get_status(self) -> dict:
+        """Full status dict for /status endpoint or diagnostics."""
+        with self._lock:
+            return {
+                "calls": self._total,
+                "credits": self._credits,
+                "budget": self.DAILY_BUDGET,
+                "pct_used": round(self._credits / self.DAILY_BUDGET * 100, 1),
+                "call_breakdown": dict(self._counts),
+                "credit_breakdown": dict(self._credit_counts),
+                "day": self._day_key,
+            }
 
 
 class CachedMarketData:
@@ -111,14 +266,20 @@ class CachedMarketData:
     Caching wrapper around md_get and related API calls.
     Drop-in enhancement for app.py — same interface, fewer API calls.
 
+    v5.1.1: Wraps md_get with _APICallCounter to track per-endpoint
+    usage and log periodic summaries with daily budget warnings.
+
     Usage:
         cached_md = CachedMarketData(md_get)
         spot = cached_md.get_spot("SPY")
         chain = cached_md.get_chain("SPY", "2026-03-16")
+        print(cached_md.get_api_status())  # counter status
     """
 
     def __init__(self, md_get_fn: Callable):
-        self._md_get = md_get_fn
+        # Wrap raw md_get with API call counter
+        self._api_counter = _APICallCounter(md_get_fn)
+        self._md_get = self._api_counter   # counter is callable, same signature
         self._spot_cache = _TTLCache(TTL_SPOT)
         self._chain_cache = _TTLCache(TTL_CHAIN)
         self._exp_cache = _TTLCache(TTL_EXPIRATIONS)
@@ -175,16 +336,40 @@ class CachedMarketData:
         raise RuntimeError(f"Cannot parse spot for {key}")
 
     # ── Option Chain ──
-    def get_chain(self, ticker: str, expiration: str) -> dict:
-        """Cached option chain for a specific expiration."""
-        key = f"{ticker.upper()}:{expiration}"
+    def get_chain(self, ticker: str, expiration: str,
+                  side: str = None, strike_limit: int = None) -> dict:
+        """Cached option chain for a specific expiration.
+
+        v5.1.1 API credit optimization:
+        MarketData.app charges 1 credit PER OPTION SYMBOL in the response.
+        SPY with 390 contracts = 390 credits per fetch!
+
+        Args:
+            side: "call" or "put" — halves credit cost by fetching one side only
+            strike_limit: int — limits to N nearest-ATM strikes per side.
+                          With strike_limit=20: SPY drops from 390 to ~40 contracts.
+                          Combined with side: drops to ~20 contracts (95% savings).
+        """
+        # Cache key includes filters so filtered/unfiltered don't collide
+        filter_tag = ""
+        if side:
+            filter_tag += f":s={side}"
+        if strike_limit:
+            filter_tag += f":sl={strike_limit}"
+        key = f"{ticker.upper()}:{expiration}{filter_tag}"
         cached = self._chain_cache.get(key)
         if cached is not None:
             return cached
 
+        params = {"expiration": expiration}
+        if side:
+            params["side"] = side
+        if strike_limit:
+            params["strikeLimit"] = strike_limit
+
         data = self._md_get(
             f"https://api.marketdata.app/v1/options/chain/{ticker.upper()}/",
-            {"expiration": expiration},
+            params,
         )
         if isinstance(data, dict) and data.get("s") == "ok":
             self._chain_cache.set(key, data)
@@ -280,27 +465,27 @@ class CachedMarketData:
         Returns raw API dict: {s: "ok", o: [...], h: [...], l: [...], c: [...], v: [...], t: [...]}
         Caller (BarStateManager) parses into Bar objects.
 
+        v5.1.1: Now caches ALL countback values (previously skipped cb<=5).
+        With TTL_INTRADAY=55s and monitor polling at 60s, the cache naturally
+        expires before the next poll — no staleness risk, but prevents duplicate
+        fetches within the same cycle (e.g. prefetch + check_ticker).
+
         Args:
             ticker: Symbol
             resolution: Bar size in minutes (1, 5, 15, 30, 60)
             countback: Number of bars to fetch
         """
         key = f"intra:{ticker.upper()}:{resolution}:{countback}"
-        # Don't cache small update polls (countback <= 5) — these are real-time
-        # monitoring calls that need fresh data every time, not cached responses
-        use_cache = countback > 5
-        if use_cache:
-            cached = self._intraday_cache.get(key)
-            if cached is not None:
-                return cached
+        cached = self._intraday_cache.get(key)
+        if cached is not None:
+            return cached
         try:
             data = self._md_get(
                 f"https://api.marketdata.app/v1/stocks/candles/{resolution}/{ticker.upper()}/",
                 {"countback": countback},
             )
             if isinstance(data, dict) and data.get("s") == "ok":
-                if use_cache:
-                    self._intraday_cache.set(key, data)
+                self._intraday_cache.set(key, data)
                 return data
             log.warning(f"Intraday bars {ticker} {resolution}m: bad response")
             return {}
@@ -521,7 +706,7 @@ class CachedMarketData:
 
     # ── Cache Stats ──
     def get_stats(self) -> dict:
-        return {
+        stats = {
             "spot": self._spot_cache.stats,
             "chain": self._chain_cache.stats,
             "expirations": self._exp_cache.stats,
@@ -530,13 +715,25 @@ class CachedMarketData:
             "adv": self._adv_cache.stats,
             "vix": self._vix_cache.stats,
             "quote": self._quote_cache.stats,
+            "intraday": self._intraday_cache.stats,
         }
+        # Include API counter if available
+        if hasattr(self, '_api_counter'):
+            stats["api_counter"] = self._api_counter.get_status()
+        return stats
+
+    def get_api_status(self) -> dict:
+        """Get API call counter status for /status endpoint or diagnostics.
+        Returns dict with total, budget, pct_used, breakdown, day."""
+        if hasattr(self, '_api_counter'):
+            return self._api_counter.get_status()
+        return {"total": 0, "budget": 100000, "pct_used": 0, "breakdown": {}, "day": ""}
 
     def prune_all(self):
         """Remove expired entries from all caches."""
         for cache in (self._spot_cache, self._chain_cache, self._exp_cache,
                       self._candle_cache, self._ohlc_cache, self._adv_cache,
-                      self._vix_cache, self._quote_cache):
+                      self._vix_cache, self._quote_cache, self._intraday_cache):
             cache.prune()
 
 
