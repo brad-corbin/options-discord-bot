@@ -836,3 +836,40 @@ SWING_PRIMARY_TREND_ENABLED  = True
 SWING_ATR_LENGTH             = 14
 SWING_ATR_RISK_PCT           = 0.01    # risk 1% of account per trade
 
+# ─────────────────────────────────────────────────────────
+# CRISIS LONG PUT STRATEGY (v5.1.1)
+# ─────────────────────────────────────────────────────────
+# Entry: CRISIS regime + bear signal + scanner/tv_hourly + high-beta equity
+# Contract: 14 DTE ATM put (single leg, not spread)
+# Target: 30% profit on put premium
+# Max hold: 7 calendar days
+# No stop loss — 14 DTE time cushion IS the risk management
+# Start as recommendation-only; flip to auto after 30-50 validated signals
+
+CRISIS_PUT_ENABLED           = True
+CRISIS_PUT_AUTO_EXECUTE      = False    # False = recommendation only, True = auto-trade
+CRISIS_PUT_DTE_TARGET        = 14       # target DTE for ATM put
+CRISIS_PUT_DTE_MIN           = 10       # minimum acceptable DTE
+CRISIS_PUT_DTE_MAX           = 21       # maximum acceptable DTE
+CRISIS_PUT_PROFIT_TARGET     = 0.30     # 30% profit target
+CRISIS_PUT_MAX_HOLD_DAYS     = 7        # exit by day 7 regardless
+CRISIS_PUT_MAX_POSITIONS     = 3        # max simultaneous crisis put positions
+
+# Source types allowed (actionable same session only)
+CRISIS_PUT_ALLOWED_SOURCES   = {"scanner", "tv_hourly"}
+
+# Ticker whitelist — high-beta equities with liquid options
+CRISIS_PUT_WHITELIST = {
+    "NVDA", "TSLA", "AMZN", "AAPL", "MSFT", "META", "GOOGL", "GOOG",
+    "AVGO", "AMD", "PLTR", "SOFI", "IREN", "COIN", "MSTR",
+    "IONQ", "LMND", "INOD", "SOXX", "CIFR", "CAT", "BA", "ORCL",
+    "CRM", "FDX", "CVX", "XOM", "HD", "LLY", "SNDK", "DIA", "IWM",
+    "NFLX", "DAL", "UAL", "RCL", "MRNA", "XLE", "HOOD",
+}
+
+# Ticker blacklist — safe havens that rally in risk-off (never short these in crisis)
+CRISIS_PUT_BLACKLIST = {
+    "GLD", "SLV", "NEM", "IAU", "BWXT", "TLT", "NOC", "RTX",
+    "PEP", "KO", "JNJ", "PG", "VZ", "T",  # defensive consumer/telecom
+}
+
