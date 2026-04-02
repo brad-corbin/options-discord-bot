@@ -1160,8 +1160,9 @@ def _log_signal_dataset_event(ticker: str, webhook_data: dict, outcome: str, rea
         matched_requested_direction = best_rec.get("matched_requested_direction")
         if matched_requested_direction is None and requested_bias and evaluated_bias and requested_bias != "both":
             matched_requested_direction = str(requested_bias).lower() == str(evaluated_bias).lower()
+        _ts_utc = datetime.now(timezone.utc).isoformat()
         row = {
-            "ts_utc": datetime.now(timezone.utc).isoformat(),
+            "ts_utc": _ts_utc,
             "event": "signal_decision",
             "ticker": ticker,
             "mode": wd.get("type") or "scalp",
@@ -1236,7 +1237,7 @@ def _log_signal_dataset_event(ticker: str, webhook_data: dict, outcome: str, rea
             "structure_outer_bracket_low": (best_rec or {}).get("structure_outer_bracket_low"),
             "structure_outer_bracket_high": (best_rec or {}).get("structure_outer_bracket_high"),
             "structure_confluence": (best_rec or {}).get("structure_confluence"),
-            "source_type": _classify_source_type(wd.get("source") or "tv", row["ts_utc"]),
+            "source_type": _classify_source_type(wd.get("source") or "tv", _ts_utc),
             "log_schema": "v6_effective_regime",
         }
         fieldnames = list(row.keys())
