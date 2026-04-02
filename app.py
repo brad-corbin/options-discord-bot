@@ -7207,6 +7207,90 @@ def scanner_status():
     return jsonify({"running": False, "reason": "Scanner not initialized"})
 
 
+# ─────────────────────────────────────────────────────────
+# v5.1.1: TRADE JOURNAL ENDPOINT — view signals and performance
+# ─────────────────────────────────────────────────────────
+
+@app.route("/journal", methods=["GET"])
+def journal_view():
+    """Query trade journal entries and performance stats.
+
+    Query params:
+        type:    signal | open | close  (default: all)
+        ticker:  filter by ticker
+        days:    lookback days (default: 7)
+        outcome: trade_opened | rejected | pending | duplicate
+        limit:   max entries (default: 50)
+        stats:   if "true", include aggregate stats
+
+    Examples:
+        /journal                         — last 50 entries, 7 days
+        /journal?type=close&days=30      — closed trades, 30 days
+        /journal?ticker=SPY&type=open    — SPY trade opens
+        /journal?stats=true              — entries + aggregate stats
+        /journal?type=signal&outcome=trade_opened  — signals that became trades
+    """
+    try:
+        entry_type = request.args.get("type")
+        ticker = request.args.get("ticker")
+        outcome = request.args.get("outcome")
+        days = int(request.args.get("days", 7))
+        limit = int(request.args.get("limit", 50))
+        include_stats = request.args.get("stats", "").lower() == "true"
+
+        from datetime import timedelta
+        date_from = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+
+        entries = trade_journal.query_journal(
+            entry_type=entry_type,
+            ticker=ticker,
+            outcome=outcome,
+            date_from=date_from,
+            limit=limit,
+        )
+
+        result = {
+            "entries": entries,
+            "count": len(entries),
+            "filters": {
+                "type": entry_type,
+                "ticker": ticker,
+                "outcome": outcome,
+                "days": days,
+                "date_from": date_from,
+            },
+        }
+
+        if include_stats:
+            result["stats"] = trade_journal.calc_journal_stats(ticker=ticker)
+
+        # Also include API credit status
+        result["api_credits"] = get_api_status()
+
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/journal/stats", methods=["GET"])
+def journal_stats():
+    """Aggregate trade performance stats.
+
+    Query params:
+        ticker: filter by ticker (optional)
+
+    Returns: signal count, win rate, P&L by tier/confidence/vol edge,
+             Greeks attribution breakdown.
+    """
+    try:
+        ticker = request.args.get("ticker")
+        stats = trade_journal.calc_journal_stats(ticker=ticker)
+        stats["api_credits"] = get_api_status()
+        return jsonify(stats)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/fundamentals/<ticker>", methods=["GET"])
 def get_ticker_fundamentals(ticker):
     """Get fundamental data + Lynch classification for a ticker."""
