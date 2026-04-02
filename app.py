@@ -1784,7 +1784,13 @@ def md_get(url, params=None, retries=2):
     raise last_err
 
 # v4.1: Cached API layer — reduces duplicate API calls by 70-90%
+# v5.1.1: Counter wraps md_get inside CachedMarketData for per-endpoint tracking
 _cached_md = CachedMarketData(md_get)
+
+def get_api_status() -> dict:
+    """v5.1.1: Get API call counter status for /status endpoint.
+    Returns dict with total, budget, pct_used, breakdown by endpoint, day."""
+    return _cached_md.get_api_status()
 
 def get_spot(ticker: str) -> float:
     return _cached_md.get_spot(ticker, as_float_fn=as_float)
@@ -1802,8 +1808,19 @@ def get_intraday_bars(ticker: str, resolution: int = 5, countback: int = 80) -> 
     the requested number of bars don't exist yet (e.g. early session or slow
     periods with sparse 1-minute activity). Stepping up gives the API more
     time window to find bars.
+
+    v5.1.1: For small countbacks (<=10, from monitor update polls), don't retry
+    with [10, 20, 40] — just try the requested value. Previously countback=5
+    generated [5, 10, 20, 40] = 4 API calls even though the monitor will
+    retry on its own next cycle 60s later. This was wasting ~3 API calls
+    per monitor poll when bars weren't available.
     """
-    countbacks_to_try = sorted(set([countback, max(countback, 10), 20, 40]))
+    # For monitor update polls (small countback), just try the requested value.
+    # For scanner/init calls (large countback), retry with fallback sizes.
+    if countback <= 10:
+        countbacks_to_try = [countback]
+    else:
+        countbacks_to_try = sorted(set([countback, 20, 40]))
     last_err = None
     for cb in countbacks_to_try:
         try:
@@ -1933,7 +1950,7 @@ def _fetch_yahoo_chart_closes(symbol: str, range_days: int = 450) -> list:
         # Indices (VIX, VIX9D, VVIX, DJI, etc.) use /indices/ not /stocks/
         is_index = md_symbol.upper() in ("VIX", "VIX9D", "VVIX", "DJI", "SPX", "NDX", "RUT", "OEX")
         base_path = "indices" if is_index else "stocks"
-        data = md_get(
+        data = _cached_md.raw_get(  # v5.1.1: counter
             f"https://api.marketdata.app/v1/{base_path}/candles/daily/{md_symbol}/",
             {"countback": min(range_days, 500)},
         )
@@ -1959,7 +1976,7 @@ def _fetch_yahoo_last(symbol: str) -> float | None:
         md_symbol = symbol.replace("^", "").replace("$", "")
         is_index = md_symbol.upper() in ("VIX", "VIX9D", "VVIX", "DJI", "SPX", "NDX", "RUT", "OEX")
         base_path = "indices" if is_index else "stocks"
-        data = md_get(f"https://api.marketdata.app/v1/{base_path}/quotes/{md_symbol}/")
+        data = _cached_md.raw_get(f"https://api.marketdata.app/v1/{base_path}/quotes/{md_symbol}/")  # v5.1.1: counter
         if isinstance(data, dict):
             for field in ("last", "mid", "bid"):
                 v = data.get(field)
@@ -2214,7 +2231,19 @@ def _is_http_429(exc: Exception) -> bool:
 # OPTIONS CHAIN — SCALP (0-10 DTE)
 # ─────────────────────────────────────────────────────────
 
-def get_options_chain(ticker: str) -> list:
+def get_options_chain(ticker: str, side: str = None, strike_limit: int = 20) -> list:
+    """Fetch option chains for scalp-eligible expirations (0-10 DTE).
+
+    v5.1.1 API credit optimization:
+    MarketData.app charges 1 credit PER option symbol returned.
+    SPY full chain = 390 credits. With strikeLimit=20 + side filter = ~20 credits.
+    This single change saves ~70,000 credits/day.
+
+    Args:
+        side: "call" or "put" — fetch one side only (50% credit savings)
+        strike_limit: limit to N nearest-ATM strikes per side (default 20).
+                      Set to None for full chain (OI sweep).
+    """
     from trading_rules import MAX_EXPIRATIONS_TO_PULL
     ticker = ticker.strip().upper()
     exps   = get_expirations(ticker)
@@ -2249,7 +2278,7 @@ def get_options_chain(ticker: str) -> list:
 
     for dte, exp in exps_to_fetch:
         try:
-            data = md_get(f"https://api.marketdata.app/v1/options/chain/{ticker}/", {"expiration": exp})
+            data = _cached_md.get_chain(ticker, exp, side=side, strike_limit=strike_limit)  # v5.1.1: strikeLimit + side filter
             if not isinstance(data, dict) or data.get("s") != "ok":
                 continue
             sym_list = data.get("optionSymbol") or []
@@ -2303,7 +2332,9 @@ def get_options_chain(ticker: str) -> list:
 # OPTIONS CHAIN — SWING (7-60 DTE)
 # ─────────────────────────────────────────────────────────
 
-def get_options_chain_swing(ticker: str) -> list:
+def get_options_chain_swing(ticker: str, side: str = None, strike_limit: int = 20) -> list:
+    """Fetch swing chains (7-60 DTE) with credit-saving filters.
+    v5.1.1: strikeLimit + side filter saves ~80-95% of chain credits."""
     from swing_engine import SWING_MIN_DTE, SWING_MAX_DTE, SWING_MAX_EXPIRATIONS
     ticker = ticker.strip().upper()
     exps   = get_expirations(ticker)
@@ -2327,7 +2358,7 @@ def get_options_chain_swing(ticker: str) -> list:
     saw_rate_limit = False
     for dte, exp in valid_exps[:SWING_MAX_EXPIRATIONS]:
         try:
-            data = md_get(f"https://api.marketdata.app/v1/options/chain/{ticker}/", {"expiration": exp})
+            data = _cached_md.get_chain(ticker, exp, side=side, strike_limit=strike_limit)  # v5.1.1: strikeLimit + side filter
             if not isinstance(data, dict) or data.get("s") != "ok":
                 continue
             sym_list = data.get("optionSymbol") or []
@@ -2370,7 +2401,7 @@ def get_options_chain_swing(ticker: str) -> list:
 
 def _get_contracts_for_expiry(ticker: str, exp: str) -> list:
     """Fetch a single-expiry chain snapshot for wheel/monitor suggestions."""
-    data = md_get(f"https://api.marketdata.app/v1/options/chain/{ticker}/", {"expiration": exp})
+    data = _cached_md.get_chain(ticker, exp, strike_limit=20)  # v5.1.1: strikeLimit saves credits
     if not isinstance(data, dict) or data.get("s") != "ok":
         return []
     sym_list = data.get("optionSymbol") or []
@@ -3840,7 +3871,7 @@ def _get_0dte_chain(ticker: str, target_date_str: str = None) -> tuple:
         if cached:
             return cached
         spot = get_spot(ticker)
-        data = md_get(f"https://api.marketdata.app/v1/options/chain/{ticker}/", {"expiration": target})
+        data = _cached_md.get_chain(ticker, target, strike_limit=20)  # v5.1.1: strikeLimit saves credits
         if not isinstance(data, dict) or data.get("s") != "ok" or not data.get("optionSymbol"):
             exps = get_expirations(ticker)
             future_exps = [e for e in exps if e >= target]
@@ -3850,7 +3881,7 @@ def _get_0dte_chain(ticker: str, target_date_str: str = None) -> tuple:
             cached = _chain_cache_get(ticker, target)
             if cached:
                 return cached
-            data = md_get(f"https://api.marketdata.app/v1/options/chain/{ticker}/", {"expiration": target})
+            data = _cached_md.get_chain(ticker, target, strike_limit=20)  # v5.1.1: strikeLimit saves credits
             if not isinstance(data, dict) or data.get("s") != "ok":
                 return None, None, None
         if not data.get("optionSymbol"):
@@ -3953,7 +3984,7 @@ def _get_chain_for_expiry(ticker: str, target_date_str: str) -> tuple:
         if cached:
             return cached
         spot = get_spot(ticker)
-        data = md_get(f"https://api.marketdata.app/v1/options/chain/{ticker}/", {"expiration": target_date_str})
+        data = _cached_md.get_chain(ticker, target_date_str, strike_limit=20)  # v5.1.1: strikeLimit saves credits
         if not isinstance(data, dict) or data.get("s") != "ok" or not data.get("optionSymbol"):
             return None, None, None
         _chain_cache_set(ticker, target_date_str, data, spot)
@@ -4135,7 +4166,7 @@ def _fmt_money(val, decimals: int = 2) -> str:
 def _get_daily_ohlcv_rows(ticker: str, days: int = 90) -> list:
     try:
         from_date = (datetime.now(timezone.utc) - timedelta(days=max(days * 2, 45))).strftime("%Y-%m-%d")
-        raw = md_get(f"https://api.marketdata.app/v1/stocks/candles/D/{ticker}/", {"from": from_date})
+        raw = _cached_md.raw_get(f"https://api.marketdata.app/v1/stocks/candles/D/{ticker}/", {"from": from_date})  # v5.1.1: route through counter
         if not raw or raw.get("s") != "ok":
             return []
         opens = raw.get("o") or []
@@ -4538,7 +4569,7 @@ def _estimate_liquidity(ticker: str, spot: float) -> tuple:
             # candles is a list of close prices from get_daily_candles
             # We need volume too — fetch raw candles
             from_date = (datetime.now(timezone.utc) - timedelta(days=30)).strftime("%Y-%m-%d")
-            raw = md_get(f"https://api.marketdata.app/v1/stocks/candles/D/{ticker}/",
+            raw = _cached_md.raw_get(f"https://api.marketdata.app/v1/stocks/candles/D/{ticker}/",  # v5.1.1: counter
                         {"from": from_date})
             if raw and raw.get("s") == "ok":
                 closes = raw.get("c") or []
@@ -4558,7 +4589,7 @@ def _estimate_liquidity(ticker: str, spot: float) -> tuple:
 
     try:
         # Spread from stock quote
-        stock_data = md_get(f"https://api.marketdata.app/v1/stocks/quotes/{ticker}/")
+        stock_data = _cached_md.raw_get(f"https://api.marketdata.app/v1/stocks/quotes/{ticker}/")  # v5.1.1: counter
         if stock_data and stock_data.get("s") == "ok":
             bid = as_float((stock_data.get("bid") or [None])[0], 0)
             ask = as_float((stock_data.get("ask") or [None])[0], 0)
@@ -6998,15 +7029,47 @@ def _em_scheduler():
                 if _oi_sweep_key not in fired_today and _oi_tracker.should_run_sweep():
                     fired_today.add(_oi_sweep_key)
                     try:
+                        # v5.1.1: SPY/QQQ get FULL chains (no strikeLimit) for complete
+                        # OI wall tracking. All other tickers use strikeLimit=20.
+                        # Cost: ~678 credits/day for full SPY+QQQ vs ~80 with limit.
+                        _FULL_CHAIN_TICKERS = {"SPY", "QQQ"}
+
                         def _oi_sweep_chain_fn(ticker):
-                            """Fetch nearest-DTE chain for OI sweep."""
+                            """Fetch nearest-DTE chain for OI sweep.
+                            SPY/QQQ get full chains for complete OI wall visibility."""
                             try:
-                                data, _spot, _target = _get_0dte_chain(ticker)
-                                if data and data.get("optionSymbol"):
-                                    dte = max(0, (datetime.strptime(_target, "%Y-%m-%d").date() - datetime.now().date()).days) if _target else 0
-                                    return [(_target, dte, data)]
-                            except Exception:
-                                pass
+                                ticker_upper = ticker.strip().upper()
+                                use_full = ticker_upper in _FULL_CHAIN_TICKERS
+
+                                if use_full:
+                                    # Full chain — no strikeLimit, all strikes visible for OI tracking
+                                    spot = get_spot(ticker_upper)
+                                    today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                                    target = today_utc
+                                    data = _cached_md.get_chain(ticker_upper, target, strike_limit=None)
+                                    if not isinstance(data, dict) or data.get("s") != "ok" or not data.get("optionSymbol"):
+                                        exps = get_expirations(ticker_upper)
+                                        future_exps = [e for e in exps if e >= target]
+                                        if future_exps:
+                                            target = future_exps[0]
+                                            data = _cached_md.get_chain(ticker_upper, target, strike_limit=None)
+                                        else:
+                                            return []
+                                    if data and data.get("optionSymbol"):
+                                        n_sym = len(data.get("optionSymbol", []))
+                                        log.info(f"OI sweep {ticker_upper}: FULL chain {n_sym} contracts "
+                                                 f"(~{n_sym} credits) for {target}")
+                                        dte = max(0, (datetime.strptime(target, "%Y-%m-%d").date() - datetime.now().date()).days)
+                                        return [(target, dte, data)]
+                                    return []
+                                else:
+                                    # Normal path — strikeLimit=20 (via _get_0dte_chain)
+                                    data, _spot, _target = _get_0dte_chain(ticker)
+                                    if data and data.get("optionSymbol"):
+                                        dte = max(0, (datetime.strptime(_target, "%Y-%m-%d").date() - datetime.now().date()).days) if _target else 0
+                                        return [(_target, dte, data)]
+                            except Exception as e:
+                                log.debug(f"OI sweep chain error for {ticker}: {e}")
                             return []
                         def _run_sweep():
                             _oi_tracker.run_daily_sweep(
