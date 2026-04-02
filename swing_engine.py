@@ -44,7 +44,7 @@ SWING_MIN_DTE            = 7
 SWING_MAX_DTE            = 60
 SWING_TARGET_DTE         = 32       # Entry DTE target: give a ~21-day thesis extra time to work
 SWING_FORECAST_DAYS      = 21       # Thesis horizon for EM / strike framing
-SWING_MAX_EXPIRATIONS    = 6        # Check more expirations than scalp
+SWING_MAX_EXPIRATIONS    = 3        # v5.1.1: was 6 — halves chain API calls; engine prefers nearest 2-3 anyway
 
 SWING_MAX_COST_PCT       = 0.70
 SWING_MIN_COST_PCT       = 0.20
