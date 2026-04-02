@@ -851,9 +851,17 @@ CRISIS_PUT_AUTO_EXECUTE      = False    # False = recommendation only, True = au
 CRISIS_PUT_DTE_TARGET        = 14       # target DTE for ATM put
 CRISIS_PUT_DTE_MIN           = 10       # minimum acceptable DTE
 CRISIS_PUT_DTE_MAX           = 21       # maximum acceptable DTE
-CRISIS_PUT_PROFIT_TARGET     = 0.30     # 30% profit target
 CRISIS_PUT_MAX_HOLD_DAYS     = 7        # exit by day 7 regardless
 CRISIS_PUT_MAX_POSITIONS     = 3        # max simultaneous crisis put positions
+
+# ── Institutional position building (scale in/out in thirds) ──
+CRISIS_PUT_INITIAL_CONTRACTS = 1        # enter with 1/3 of planned position
+CRISIS_PUT_SCALEIN_CONTRACTS = 1        # add 1 contract on confirmation
+CRISIS_PUT_SCALEIN_DROP_PCT  = 0.02     # stock must drop 2%+ from entry to confirm
+CRISIS_PUT_SCALEIN_MAX_DAYS  = 2        # scale-in must happen within 2 days of entry
+CRISIS_PUT_SCALE1_PCT        = 0.30     # sell 1/3 at +30% premium gain
+CRISIS_PUT_SCALE2_PCT        = 0.60     # sell 1/3 at +60% premium gain
+CRISIS_PUT_TRAIL_GIVEBACK    = 0.25     # trail last 1/3: exit on 25% pullback from peak
 
 # Source types allowed (actionable same session only)
 CRISIS_PUT_ALLOWED_SOURCES   = {"scanner", "tv_hourly"}
