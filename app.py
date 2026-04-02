@@ -544,7 +544,7 @@ def _evaluate_crisis_put(ticker: str, bias: str, source_type: str,
     from trading_rules import (
         CRISIS_PUT_ENABLED, CRISIS_PUT_WHITELIST, CRISIS_PUT_BLACKLIST,
         CRISIS_PUT_ALLOWED_SOURCES, CRISIS_PUT_DTE_TARGET, CRISIS_PUT_DTE_MIN,
-        CRISIS_PUT_DTE_MAX, CRISIS_PUT_PROFIT_TARGET, CRISIS_PUT_MAX_HOLD_DAYS,
+        CRISIS_PUT_DTE_MAX, CRISIS_PUT_SCALE1_PCT, CRISIS_PUT_MAX_HOLD_DAYS,
         CRISIS_PUT_MAX_POSITIONS,
     )
     if not CRISIS_PUT_ENABLED:
@@ -593,7 +593,7 @@ def _evaluate_crisis_put(ticker: str, bias: str, source_type: str,
                 tk, spot, vix, confidence, source_type,
                 vol_regime, today,
                 CRISIS_PUT_DTE_TARGET, CRISIS_PUT_DTE_MIN, CRISIS_PUT_DTE_MAX,
-                CRISIS_PUT_PROFIT_TARGET, CRISIS_PUT_MAX_HOLD_DAYS,
+                CRISIS_PUT_SCALE1_PCT, CRISIS_PUT_MAX_HOLD_DAYS,
             )
             with _crisis_put_seen_lock:
                 if success:
@@ -697,9 +697,14 @@ def _crisis_put_find_and_alert(ticker, spot, vix, confidence, source_type,
     exit_date = (now + timedelta(days=max_hold_days)).strftime("%Y-%m-%d")
     premium_pct = (mid / spot) * 100
 
-    # FIX #2: Check auto-execute mode
-    from trading_rules import CRISIS_PUT_AUTO_EXECUTE
+    from trading_rules import (
+        CRISIS_PUT_AUTO_EXECUTE, CRISIS_PUT_INITIAL_CONTRACTS,
+        CRISIS_PUT_SCALEIN_DROP_PCT, CRISIS_PUT_SCALEIN_MAX_DAYS,
+        CRISIS_PUT_SCALE2_PCT, CRISIS_PUT_TRAIL_GIVEBACK,
+    )
     is_paper = not CRISIS_PUT_AUTO_EXECUTE
+    scale2_price = round(mid * (1 + CRISIS_PUT_SCALE2_PCT), 2)
+    scalein_spot = round(spot * (1 - CRISIS_PUT_SCALEIN_DROP_PCT), 2)
 
     _log_crisis_put_signal(
         ticker=ticker, source_type=source_type, spot=spot, vix=vix,
@@ -713,40 +718,41 @@ def _crisis_put_find_and_alert(ticker, spot, vix, confidence, source_type,
     vix_str = f"VIX {vix:.1f}" if vix else "VIX ?"
     conf_str = f"conf {confidence:.0f}" if confidence else ""
     spread_str = f"${bid:.2f}/${ask:.2f}" if bid and ask else ""
-    mode_label = "PAPER TRACK" if is_paper else "LIVE TRADE"
 
     alert = (
-        f"🔴 CRISIS PUT SIGNAL — {ticker}\n"
+        f"🔴 CRISIS PUT — {ticker} (Tranche 1/3)\n"
         f"\n"
         f"📋 Contract: {symbol}\n"
         f"   Strike: ${strike:.2f} | DTE: {best_dte}\n"
         f"   Exp: {str(best_exp)[:10]}\n"
         f"\n"
-        f"💰 Entry: ${mid:.2f} mid {spread_str}\n"
+        f"💰 BUY {CRISIS_PUT_INITIAL_CONTRACTS} contract @ ${mid:.2f} mid {spread_str}\n"
         f"   Premium: {premium_pct:.1f}% of spot (${spot:.2f})\n"
         f"\n"
-        f"🎯 Target: ${target_price:.2f} (+{profit_target*100:.0f}%)\n"
-        f"📅 Exit by: {exit_date} (day {max_hold_days})\n"
+        f"📐 SCALE PLAN:\n"
+        f"   Add 1 contract if {ticker} drops to ${scalein_spot:.2f} ({CRISIS_PUT_SCALEIN_DROP_PCT*100:.0f}%↓) within {CRISIS_PUT_SCALEIN_MAX_DAYS}d\n"
+        f"   Sell 1/3 @ ${target_price:.2f} (+{profit_target*100:.0f}%)\n"
+        f"   Sell 1/3 @ ${scale2_price:.2f} (+{CRISIS_PUT_SCALE2_PCT*100:.0f}%)\n"
+        f"   Trail last 1/3 w/ {CRISIS_PUT_TRAIL_GIVEBACK*100:.0f}% giveback\n"
+        f"   Hard exit: {exit_date} (day {max_hold_days})\n"
         f"\n"
-        f"📊 {vix_str} | {source_type} | {conf_str}\n"
-        f"📌 Mode: {mode_label}"
+        f"📊 {vix_str} | {source_type} | {conf_str}"
     )
 
     try:
         post_to_telegram(alert)
-        log.info(f"Crisis put alert sent: {ticker} {symbol} ${mid:.2f} ({mode_label})")
+        log.info(f"Crisis put alert sent: {ticker} {symbol} ${mid:.2f}")
     except Exception as e:
         log.warning(f"Crisis put Telegram alert failed for {ticker}: {e}")
 
-    # Store position in Redis for monitoring
-    # FIX #2: Tag paper vs live so monitor can handle them differently
-    # FIX #10: Store source_type in Redis position
+    # Store position in Redis with institutional scaling state
     _crisis_put_store_position(
         ticker=ticker, symbol=symbol, strike=strike,
         expiration=str(best_exp)[:10], dte=best_dte,
         entry_price=mid, target_price=target_price,
         exit_by_date=exit_date, spot=spot,
         source_type=source_type, is_paper=is_paper,
+        scalein_spot=scalein_spot,
     )
     return True
 
@@ -806,13 +812,12 @@ _CRISIS_PUT_REDIS_TTL = 8 * 86400  # auto-expire after 8 days
 
 def _crisis_put_store_position(ticker, symbol, strike, expiration, dte,
                                 entry_price, target_price, exit_by_date, spot,
-                                source_type="", is_paper=True):
+                                source_type="", is_paper=True, scalein_spot=0):
     """Store an open crisis put position in Redis for monitoring."""
     r = _get_redis()
     if not r:
         log.warning("Crisis put: Redis unavailable — position not tracked")
         return
-    # FIX #3: Key includes entry_date to avoid overwrites on later signals
     entry_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     key = f"{_CRISIS_PUT_REDIS_PREFIX}{ticker.upper()}:{entry_date}"
     pos = {
@@ -826,12 +831,21 @@ def _crisis_put_store_position(ticker, symbol, strike, expiration, dte,
         "target_price": target_price,
         "exit_by_date": exit_by_date,
         "entry_spot": spot,
-        "source_type": source_type,      # FIX #10
-        "is_paper": is_paper,            # FIX #2
+        "source_type": source_type,
+        "is_paper": is_paper,
         "status": "open",
+        # Institutional scaling state
+        "phase": "TRANCHE_1",
+        "scalein_spot": scalein_spot,
+        "scalein_done": False,
+        "scalein_alerted": False,
+        "scale1_done": False,
+        "scale2_done": False,
+        "contracts_held": 1,
+        "peak_put_price": entry_price,
     }
     r.set(key, json.dumps(pos), ex=_CRISIS_PUT_REDIS_TTL)
-    log.info(f"Crisis put position stored: {ticker} {symbol} @ ${entry_price:.2f} ({'paper' if is_paper else 'live'})")
+    log.info(f"Crisis put position stored: {ticker} {symbol} @ ${entry_price:.2f}")
 
 
 def _crisis_put_get_open_positions() -> list:
@@ -853,9 +867,16 @@ def _crisis_put_get_open_positions() -> list:
 
 
 def _crisis_put_monitor():
-    """Check all open crisis put positions for target hit or max hold exit.
-    Called every 10 minutes during market hours by the EM scheduler."""
-    from trading_rules import CRISIS_PUT_MAX_HOLD_DAYS
+    """Institutional position monitor: scale-in, scale-out in thirds, trail.
+    Called every 10 minutes during market hours by the EM scheduler.
+
+    Phases: TRANCHE_1 -> SCALED_IN -> SCALE_1 -> SCALE_2 -> TRAIL
+    """
+    from trading_rules import (
+        CRISIS_PUT_MAX_HOLD_DAYS, CRISIS_PUT_SCALEIN_DROP_PCT,
+        CRISIS_PUT_SCALEIN_MAX_DAYS, CRISIS_PUT_SCALE1_PCT,
+        CRISIS_PUT_SCALE2_PCT, CRISIS_PUT_TRAIL_GIVEBACK,
+    )
 
     positions = _crisis_put_get_open_positions()
     if not positions:
@@ -869,24 +890,119 @@ def _crisis_put_monitor():
             entry_date = datetime.strptime(pos["entry_date"], "%Y-%m-%d").date()
             now_date = datetime.now(timezone.utc).date()
             days_held = (now_date - entry_date).days
+            entry_price = pos["entry_price"]
 
-            # FIX #8: Use constant instead of hardcoded 7
+            # -- Hard exit: day 7 max hold --
             if days_held >= CRISIS_PUT_MAX_HOLD_DAYS or today >= pos["exit_by_date"]:
                 _crisis_put_exit(pos, reason="max_hold", days_held=days_held)
                 continue
 
+            # -- Get current put price --
             current_price = _crisis_put_get_current_price(pos)
             if current_price is None:
                 continue
 
-            entry_price = pos["entry_price"]
             pnl_pct = (current_price - entry_price) / entry_price * 100
 
-            if current_price >= pos["target_price"]:
-                _crisis_put_exit(pos, reason="target_hit", days_held=days_held,
-                                 exit_price=current_price, pnl_pct=pnl_pct)
-            elif days_held >= CRISIS_PUT_MAX_HOLD_DAYS - 1:
-                log.info(f"Crisis put: {ticker} day {days_held}, P&L {pnl_pct:+.1f}% — exiting tomorrow")
+            # Track peak put price for trailing stop
+            peak = pos.get("peak_put_price", entry_price)
+            if current_price > peak:
+                peak = current_price
+                pos["peak_put_price"] = peak
+                _crisis_put_update_redis(pos)
+
+            # -- Phase: TRANCHE_1 -- watch for scale-in opportunity --
+            if not pos.get("scalein_done") and not pos.get("scalein_alerted"):
+                if days_held <= CRISIS_PUT_SCALEIN_MAX_DAYS:
+                    current_spot = _crisis_put_get_spot(ticker)
+                    scalein_spot = pos.get("scalein_spot", 0)
+                    if current_spot and scalein_spot and current_spot <= scalein_spot:
+                        pos["scalein_alerted"] = True
+                        _crisis_put_update_redis(pos)
+                        drop_pct = (pos["entry_spot"] - current_spot) / pos["entry_spot"] * 100
+                        alert = (
+                            f"\U0001f7e1 CRISIS PUT SCALE-IN \u2014 {ticker} (Tranche 2/3)\n"
+                            f"\n"
+                            f"\U0001f4cb {pos['symbol']}\n"
+                            f"   Stock dropped {drop_pct:.1f}% to ${current_spot:.2f}\n"
+                            f"\n"
+                            f"\U0001f4b0 ADD 1 contract @ current mid ~${current_price:.2f}\n"
+                            f"   Original entry: ${entry_price:.2f} (now {pnl_pct:+.1f}%)\n"
+                            f"\n"
+                            f"\U0001f4d0 Thesis confirming \u2014 stock moving in your direction"
+                        )
+                        try:
+                            post_to_telegram(alert)
+                        except Exception:
+                            pass
+                elif days_held > CRISIS_PUT_SCALEIN_MAX_DAYS:
+                    pos["scalein_done"] = True
+                    _crisis_put_update_redis(pos)
+
+            # -- Scale-out 1: sell 1/3 at +30% --
+            if not pos.get("scale1_done") and pnl_pct >= CRISIS_PUT_SCALE1_PCT * 100:
+                pos["scale1_done"] = True
+                pos["phase"] = "SCALE_1"
+                contracts = pos.get("contracts_held", 1)
+                sell_qty = max(1, contracts // 3) if contracts > 1 else 0
+                if sell_qty > 0:
+                    pos["contracts_held"] = contracts - sell_qty
+                _crisis_put_update_redis(pos)
+                sell_msg = f"SELL {sell_qty} contract \u2014 lock in profit" if sell_qty > 0 else "+30% HIT \u2014 take partial profit"
+                s2_price = entry_price * (1 + CRISIS_PUT_SCALE2_PCT)
+                alert = (
+                    f"\U0001f4b0 CRISIS PUT SCALE 1/3 \u2014 {ticker}\n"
+                    f"\n"
+                    f"\U0001f4cb {pos['symbol']}\n"
+                    f"   Premium: ${entry_price:.2f} \u2192 ${current_price:.2f} (+{pnl_pct:.0f}%)\n"
+                    f"\n"
+                    f"\U0001f514 {sell_msg}\n"
+                    f"   {pos.get('contracts_held', 1)} contract(s) remaining \u2014 let them run\n"
+                    f"   Next target: +{CRISIS_PUT_SCALE2_PCT*100:.0f}% (${s2_price:.2f})"
+                )
+                try:
+                    post_to_telegram(alert)
+                except Exception:
+                    pass
+
+            # -- Scale-out 2: sell 1/3 at +60% --
+            elif pos.get("scale1_done") and not pos.get("scale2_done") and pnl_pct >= CRISIS_PUT_SCALE2_PCT * 100:
+                pos["scale2_done"] = True
+                pos["phase"] = "SCALE_2"
+                contracts = pos.get("contracts_held", 1)
+                sell_qty = max(1, contracts // 2) if contracts > 1 else 0
+                if sell_qty > 0:
+                    pos["contracts_held"] = contracts - sell_qty
+                _crisis_put_update_redis(pos)
+                sell_msg = f"SELL {sell_qty} contract \u2014 premium nearly doubled" if sell_qty > 0 else "+60% HIT \u2014 take more profit"
+                alert = (
+                    f"\U0001f4b0\U0001f4b0 CRISIS PUT SCALE 2/3 \u2014 {ticker}\n"
+                    f"\n"
+                    f"\U0001f4cb {pos['symbol']}\n"
+                    f"   Premium: ${entry_price:.2f} \u2192 ${current_price:.2f} (+{pnl_pct:.0f}%)\n"
+                    f"\n"
+                    f"\U0001f514 {sell_msg}\n"
+                    f"   {pos.get('contracts_held', 1)} contract(s) remaining\n"
+                    f"   Trailing with {CRISIS_PUT_TRAIL_GIVEBACK*100:.0f}% giveback from peak"
+                )
+                try:
+                    post_to_telegram(alert)
+                except Exception:
+                    pass
+
+            # -- Trail last contracts: exit on 25% giveback from peak --
+            elif pos.get("scale2_done"):
+                pos["phase"] = "TRAIL"
+                if peak > entry_price and current_price < peak:
+                    giveback = (peak - current_price) / (peak - entry_price)
+                    if giveback >= CRISIS_PUT_TRAIL_GIVEBACK:
+                        _crisis_put_exit(pos, reason="trail_giveback", days_held=days_held,
+                                         exit_price=current_price, pnl_pct=pnl_pct)
+                        continue
+
+            # -- Day before max hold warning --
+            if days_held >= CRISIS_PUT_MAX_HOLD_DAYS - 1:
+                log.info(f"Crisis put: {ticker} day {days_held}, P&L {pnl_pct:+.1f}% \u2014 exiting tomorrow")
 
         except Exception as e:
             log.warning(f"Crisis put monitor error for {ticker}: {e}")
@@ -923,28 +1039,41 @@ def _crisis_put_get_current_price(pos) -> float | None:
         return None
 
 
+def _crisis_put_get_spot(ticker: str) -> float | None:
+    """Get current spot price for scale-in check."""
+    try:
+        return get_spot(ticker)
+    except Exception:
+        return None
+
+
+def _crisis_put_update_redis(pos):
+    """Update an open position state in Redis."""
+    r = _get_redis()
+    if not r:
+        return
+    key = f"{_CRISIS_PUT_REDIS_PREFIX}{pos['ticker']}:{pos['entry_date']}"
+    r.set(key, json.dumps(pos), ex=_CRISIS_PUT_REDIS_TTL)
+
+
 def _crisis_put_exit(pos, reason, days_held, exit_price=None, pnl_pct=None):
-    """Close a crisis put position — alert, log to sheets, remove from Redis."""
+    """Close a crisis put position \u2014 alert, log to sheets, remove from Redis."""
     ticker = pos["ticker"]
     entry_price = pos["entry_price"]
-    is_paper = pos.get("is_paper", True)
+    contracts = pos.get("contracts_held", 1)
 
-    # FIX #4: If no exit price provided (max_hold), try to get current price
     if exit_price is None:
         exit_price = _crisis_put_get_current_price(pos)
 
-    # FIX #4: Null-safe P&L calculation
     if exit_price is not None and entry_price:
         pnl_pct = (exit_price - entry_price) / entry_price * 100
-        pnl_dollars = (exit_price - entry_price) * 100
+        pnl_dollars = (exit_price - entry_price) * 100 * contracts
     else:
         pnl_pct = 0.0
         pnl_dollars = 0.0
 
     exit_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-    # Log exit to Google Sheets
-    # FIX #10: Preserve source_type from the original position
     try:
         row = {
             "signal_date": pos["entry_date"],
@@ -966,7 +1095,7 @@ def _crisis_put_exit(pos, reason, days_held, exit_price=None, pnl_pct=None):
             "target_price_30pct": pos["target_price"],
             "exit_by_date": pos["exit_by_date"],
             "premium_pct_of_spot": None,
-            "status": f"{'paper_' if is_paper else ''}closed_{reason}",
+            "status": f"closed_{reason}",
             "exit_date": exit_date,
             "exit_reason": reason,
             "exit_put_price": round(exit_price, 2) if exit_price is not None else None,
@@ -978,34 +1107,37 @@ def _crisis_put_exit(pos, reason, days_held, exit_price=None, pnl_pct=None):
     except Exception as e:
         log.warning(f"Crisis put exit log failed for {ticker}: {e}")
 
-    # FIX #4: Null-safe Telegram exit alert
-    emoji = "✅" if pnl_pct > 0 else "❌"
-    reason_label = "30% TARGET HIT" if reason == "target_hit" else "DAY 7 MAX HOLD"
-    paper_tag = " [PAPER]" if is_paper else ""
+    reason_labels = {
+        "max_hold": "DAY 7 MAX HOLD",
+        "target_hit": "TARGET HIT",
+        "trail_giveback": "TRAIL GIVEBACK EXIT",
+    }
+    emoji = "\u2705" if pnl_pct > 0 else "\u274c"
     exit_price_str = f"${exit_price:.2f}" if exit_price is not None else "N/A (market closed)"
     pnl_dollar_str = f"${pnl_dollars:+,.0f}" if exit_price is not None else "N/A"
+    phase = pos.get("phase", "TRANCHE_1")
 
     alert = (
-        f"{emoji} CRISIS PUT EXIT{paper_tag} — {ticker}\n"
+        f"{emoji} CRISIS PUT EXIT \u2014 {ticker}\n"
         f"\n"
-        f"📋 {pos['symbol']}\n"
-        f"   {reason_label} (day {days_held})\n"
+        f"\U0001f4cb {pos['symbol']}\n"
+        f"   {reason_labels.get(reason, reason.upper())} (day {days_held})\n"
+        f"   Phase: {phase} | {contracts} contract(s)\n"
         f"\n"
-        f"💰 Entry: ${entry_price:.2f} → Exit: {exit_price_str}\n"
-        f"   P&L: {pnl_pct:+.1f}% ({pnl_dollar_str} per contract)\n"
+        f"\U0001f4b0 Entry: ${entry_price:.2f} \u2192 Exit: {exit_price_str}\n"
+        f"   P&L: {pnl_pct:+.1f}% ({pnl_dollar_str} on {contracts} contract(s))\n"
         f"\n"
-        f"⚠️ {'Close position manually' if not is_paper else 'Paper trade — no action needed'}"
+        f"\u26a0\ufe0f Close remaining position manually"
     )
     try:
         post_to_telegram(alert)
     except Exception as e:
         log.warning(f"Crisis put exit alert failed for {ticker}: {e}")
 
-    # FIX #3: Remove from Redis using the correct key with entry_date
     r = _get_redis()
     if r:
         r.delete(f"{_CRISIS_PUT_REDIS_PREFIX}{ticker}:{pos['entry_date']}")
-    log.info(f"Crisis put closed: {ticker} {reason} P&L {pnl_pct:+.1f}%{'(paper)' if is_paper else ''}")
+    log.info(f"Crisis put closed: {ticker} {reason} P&L {pnl_pct:+.1f}% ({contracts} contracts)")
 
 
 def _log_signal_dataset_event(ticker: str, webhook_data: dict, outcome: str, reason: str = "", best_rec: dict = None,
