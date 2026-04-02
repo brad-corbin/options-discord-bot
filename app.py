@@ -226,6 +226,7 @@ GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip
 GOOGLE_SHEET_SIGNAL_TAB = os.getenv("GOOGLE_SHEET_SIGNAL_TAB", "signal_decisions").strip() or "signal_decisions"
 GOOGLE_SHEET_EM_TAB = os.getenv("GOOGLE_SHEET_EM_TAB", "em_predictions").strip() or "em_predictions"
 GOOGLE_SHEET_RECON_TAB = os.getenv("GOOGLE_SHEET_RECON_TAB", "em_reconciliation").strip() or "em_reconciliation"
+GOOGLE_SHEET_CRISIS_TAB = os.getenv("GOOGLE_SHEET_CRISIS_TAB", "crisis_put_signals").strip() or "crisis_put_signals"
 
 # ─────────────────────────────────────────────────────────
 # REDIS
@@ -323,6 +324,7 @@ def _tab_for_filename(filename: str) -> str:
         "signal_decisions.csv": GOOGLE_SHEET_SIGNAL_TAB,
         "em_predictions.csv": GOOGLE_SHEET_EM_TAB,
         "em_reconciliation.csv": GOOGLE_SHEET_RECON_TAB,
+        "crisis_put_signals.csv": GOOGLE_SHEET_CRISIS_TAB,
     }
     return mapping.get(filename, "")
 
@@ -490,6 +492,462 @@ def _post_diagnostic(text: str):
         log.warning(f"Diagnostic post failed: {e}")
 
 
+# ─────────────────────────────────────────────────────────
+# SOURCE TYPE CLASSIFIER (v5.1.1)
+# ─────────────────────────────────────────────────────────
+def _classify_source_type(source: str, ts_utc_str: str) -> str:
+    """Classify signal source into actionable categories.
+    Returns: 'tv_hourly', 'tv_daily', 'scanner', 'manual', or 'other'.
+    tv_daily signals arrive at ~3:00 PM CT (daily candle close) and CANNOT
+    be traded until the next morning. All other types are actionable same session.
+    """
+    source = (source or "").strip().lower()
+    if source == "active_scanner":
+        return "scanner"
+    if source == "check":
+        return "manual"
+    if source != "tv":
+        return "other"
+    try:
+        ts = datetime.fromisoformat(ts_utc_str.replace("Z", "+00:00"))
+        hour_ct = (ts.hour - 5) % 24  # CDT = UTC-5
+        if hour_ct >= 15:  # 3:00 PM CT or later = daily candle close
+            return "tv_daily"
+        return "tv_hourly"
+    except Exception:
+        return "tv_hourly"  # default to hourly if timestamp parsing fails
+
+
+# ─────────────────────────────────────────────────────────
+# CRISIS LONG PUT RECOMMENDATION ENGINE (v5.1.1)
+# ─────────────────────────────────────────────────────────
+_crisis_put_seen_tickers = {}  # ticker → last_signal_date (dedup within same day)
+
+def _evaluate_crisis_put(ticker: str, bias: str, source_type: str,
+                         vol_regime: dict, spot: float, vix: float = None,
+                         confidence: float = None):
+    """Check if a signal qualifies for a CRISIS long put recommendation.
+    If it qualifies, look up the ATM put contract, log to Google Sheets,
+    and send a Telegram alert. Runs in a background thread to not block signal flow.
+    """
+    from trading_rules import (
+        CRISIS_PUT_ENABLED, CRISIS_PUT_WHITELIST, CRISIS_PUT_BLACKLIST,
+        CRISIS_PUT_ALLOWED_SOURCES, CRISIS_PUT_DTE_TARGET, CRISIS_PUT_DTE_MIN,
+        CRISIS_PUT_DTE_MAX, CRISIS_PUT_PROFIT_TARGET, CRISIS_PUT_MAX_HOLD_DAYS,
+    )
+    if not CRISIS_PUT_ENABLED:
+        return
+    vol_label = (vol_regime or {}).get("label", "") if isinstance(vol_regime, dict) else ""
+    if vol_label != "CRISIS":
+        return
+    if bias != "bear":
+        return
+    if source_type not in CRISIS_PUT_ALLOWED_SOURCES:
+        return
+    tk = ticker.upper().strip()
+    if tk not in CRISIS_PUT_WHITELIST:
+        return
+    if tk in CRISIS_PUT_BLACKLIST:
+        return
+    if not spot or spot <= 0:
+        return
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    dedup_key = f"{tk}:{today}"
+    if _crisis_put_seen_tickers.get(dedup_key):
+        log.info(f"Crisis put: {tk} already recommended today, skipping")
+        return
+    _crisis_put_seen_tickers[dedup_key] = True
+    # Prune old entries
+    for k in list(_crisis_put_seen_tickers):
+        if not k.endswith(f":{today}"):
+            _crisis_put_seen_tickers.pop(k, None)
+
+    def _do_crisis_put_lookup():
+        try:
+            _crisis_put_find_and_alert(
+                tk, spot, vix, confidence, source_type,
+                vol_regime, today,
+                CRISIS_PUT_DTE_TARGET, CRISIS_PUT_DTE_MIN, CRISIS_PUT_DTE_MAX,
+                CRISIS_PUT_PROFIT_TARGET, CRISIS_PUT_MAX_HOLD_DAYS,
+            )
+        except Exception as e:
+            log.error(f"Crisis put lookup failed for {tk}: {e}", exc_info=True)
+
+    threading.Thread(target=_do_crisis_put_lookup, daemon=True, name=f"crisis-put-{tk}").start()
+
+
+def _crisis_put_find_and_alert(ticker, spot, vix, confidence, source_type,
+                                vol_regime, today,
+                                dte_target, dte_min, dte_max,
+                                profit_target, max_hold_days):
+    """Look up the best ATM put contract and send recommendation alert."""
+    try:
+        exps = get_expirations(ticker)
+    except Exception as e:
+        log.warning(f"Crisis put: can't get expirations for {ticker}: {e}")
+        return
+    if not exps:
+        log.warning(f"Crisis put: no expirations for {ticker}")
+        return
+
+    now = datetime.now(timezone.utc).date()
+    best_exp = None
+    best_dte = None
+    best_dte_diff = 999
+    for exp_str in exps:
+        try:
+            exp_date = datetime.strptime(str(exp_str)[:10], "%Y-%m-%d").date()
+            dte = (exp_date - now).days
+            if dte < dte_min or dte > dte_max:
+                continue
+            diff = abs(dte - dte_target)
+            if diff < best_dte_diff:
+                best_dte_diff = diff
+                best_exp = exp_str
+                best_dte = dte
+        except Exception:
+            continue
+
+    if not best_exp or not best_dte:
+        log.info(f"Crisis put: no suitable expiration for {ticker} (DTE {dte_min}-{dte_max})")
+        return
+
+    try:
+        chain_data = _cached_md.get_chain(ticker, str(best_exp)[:10], side="put")
+    except Exception as e:
+        log.warning(f"Crisis put: chain fetch failed for {ticker} {best_exp}: {e}")
+        return
+
+    if not chain_data or chain_data.get("s") != "ok":
+        log.warning(f"Crisis put: no chain data for {ticker} {best_exp}")
+        return
+
+    strikes = chain_data.get("strike", [])
+    mids = chain_data.get("mid", [])
+    symbols = chain_data.get("optionSymbol", [])
+    bids = chain_data.get("bid", [])
+    asks = chain_data.get("ask", [])
+
+    if not strikes or not mids:
+        return
+
+    atm_idx = None
+    atm_diff = 999999
+    for i, s in enumerate(strikes):
+        try:
+            diff = abs(float(s) - spot)
+            if diff < atm_diff:
+                atm_diff = diff
+                atm_idx = i
+        except (ValueError, TypeError):
+            continue
+
+    if atm_idx is None:
+        return
+
+    strike = float(strikes[atm_idx])
+    mid = float(mids[atm_idx]) if mids[atm_idx] is not None else None
+    bid = float(bids[atm_idx]) if bids and bids[atm_idx] is not None else None
+    ask = float(asks[atm_idx]) if asks and asks[atm_idx] is not None else None
+    symbol = symbols[atm_idx] if symbols else f"{ticker} P{strike}"
+
+    if not mid or mid <= 0:
+        if bid and ask and bid > 0 and ask > 0:
+            mid = (bid + ask) / 2
+        else:
+            log.info(f"Crisis put: no valid mid price for {ticker} {strike}P")
+            return
+
+    target_price = round(mid * (1 + profit_target), 2)
+    exit_date = (now + timedelta(days=max_hold_days)).strftime("%Y-%m-%d")
+    premium_pct = (mid / spot) * 100
+
+    _log_crisis_put_signal(
+        ticker=ticker, source_type=source_type, spot=spot, vix=vix,
+        confidence=confidence, vol_regime=vol_regime,
+        symbol=symbol, strike=strike, dte=best_dte,
+        expiration=str(best_exp)[:10], put_cost=mid, bid=bid, ask=ask,
+        target_price=target_price, exit_date=exit_date,
+        premium_pct=premium_pct, today=today,
+    )
+
+    vix_str = f"VIX {vix:.1f}" if vix else "VIX ?"
+    conf_str = f"conf {confidence:.0f}" if confidence else ""
+    spread_str = f"${bid:.2f}/${ask:.2f}" if bid and ask else ""
+
+    alert = (
+        f"🔴 CRISIS PUT SIGNAL — {ticker}\n"
+        f"\n"
+        f"📋 Contract: {symbol}\n"
+        f"   Strike: ${strike:.2f} | DTE: {best_dte}\n"
+        f"   Exp: {str(best_exp)[:10]}\n"
+        f"\n"
+        f"💰 Entry: ${mid:.2f} mid {spread_str}\n"
+        f"   Premium: {premium_pct:.1f}% of spot (${spot:.2f})\n"
+        f"\n"
+        f"🎯 Target: ${target_price:.2f} (+{profit_target*100:.0f}%)\n"
+        f"📅 Exit by: {exit_date} (day {max_hold_days})\n"
+        f"\n"
+        f"📊 {vix_str} | {source_type} | {conf_str}\n"
+        f"⚠️ Recommendation only — execute manually"
+    )
+
+    try:
+        post_to_telegram(alert)
+        log.info(f"Crisis put alert sent: {ticker} {symbol} ${mid:.2f}")
+    except Exception as e:
+        log.warning(f"Crisis put Telegram alert failed for {ticker}: {e}")
+
+    # Store position in Redis for monitoring
+    _crisis_put_store_position(
+        ticker=ticker, symbol=symbol, strike=strike,
+        expiration=str(best_exp)[:10], dte=best_dte,
+        entry_price=mid, target_price=target_price,
+        exit_by_date=exit_date, spot=spot,
+    )
+
+
+def _log_crisis_put_signal(ticker, source_type, spot, vix, confidence,
+                           vol_regime, symbol, strike, dte, expiration,
+                           put_cost, bid, ask, target_price, exit_date,
+                           premium_pct, today):
+    """Log a crisis put recommendation to Google Sheets + CSV."""
+    try:
+        now_ct = datetime.now(timezone.utc) - timedelta(hours=5)
+        row = {
+            "signal_date": today,
+            "signal_time_ct": now_ct.strftime("%H:%M"),
+            "source_type": source_type,
+            "ticker": ticker,
+            "signal_spot": round(spot, 2) if spot else None,
+            "bias": "bear",
+            "vol_regime": (vol_regime or {}).get("label") if isinstance(vol_regime, dict) else None,
+            "vix": round(vix, 1) if vix else None,
+            "confidence": round(confidence, 1) if confidence else None,
+            "contract": symbol,
+            "strike": strike,
+            "dte_at_entry": dte,
+            "expiration": expiration,
+            "put_cost_mid": round(put_cost, 2) if put_cost else None,
+            "put_bid": round(bid, 2) if bid else None,
+            "put_ask": round(ask, 2) if ask else None,
+            "target_price_30pct": round(target_price, 2) if target_price else None,
+            "exit_by_date": exit_date,
+            "premium_pct_of_spot": round(premium_pct, 2) if premium_pct else None,
+            "status": "recommended",
+            "exit_date": None,
+            "exit_reason": None,
+            "exit_put_price": None,
+            "pnl_dollars": None,
+            "pnl_pct": None,
+        }
+        fieldnames = list(row.keys())
+        _append_csv_row("crisis_put_signals.csv", fieldnames, row)
+        _append_jsonl("crisis_put_signals.jsonl", row)
+        log.info(f"Crisis put signal logged: {ticker} {symbol}")
+    except Exception as e:
+        log.warning(f"Crisis put signal log failed for {ticker}: {e}")
+
+
+# ─────────────────────────────────────────────────────────
+# CRISIS PUT POSITION TRACKER (v5.1.1)
+# ─────────────────────────────────────────────────────────
+_CRISIS_PUT_REDIS_PREFIX = "crisis_put:open:"
+_CRISIS_PUT_REDIS_TTL = 8 * 86400  # auto-expire after 8 days
+
+def _crisis_put_store_position(ticker, symbol, strike, expiration, dte,
+                                entry_price, target_price, exit_by_date, spot):
+    """Store an open crisis put position in Redis for monitoring."""
+    r = _get_redis()
+    if not r:
+        log.warning("Crisis put: Redis unavailable — position not tracked")
+        return
+    key = f"{_CRISIS_PUT_REDIS_PREFIX}{ticker.upper()}"
+    pos = {
+        "ticker": ticker.upper(),
+        "symbol": symbol,
+        "strike": strike,
+        "expiration": expiration,
+        "dte_at_entry": dte,
+        "entry_date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "entry_price": entry_price,
+        "target_price": target_price,
+        "exit_by_date": exit_by_date,
+        "entry_spot": spot,
+        "status": "open",
+    }
+    r.set(key, json.dumps(pos), ex=_CRISIS_PUT_REDIS_TTL)
+    log.info(f"Crisis put position stored: {ticker} {symbol} @ ${entry_price:.2f}")
+
+
+def _crisis_put_get_open_positions() -> list:
+    """Retrieve all open crisis put positions from Redis."""
+    r = _get_redis()
+    if not r:
+        return []
+    positions = []
+    try:
+        for key in r.scan_iter(f"{_CRISIS_PUT_REDIS_PREFIX}*"):
+            raw = r.get(key)
+            if raw:
+                pos = json.loads(raw)
+                if pos.get("status") == "open":
+                    positions.append(pos)
+    except Exception as e:
+        log.warning(f"Crisis put position scan failed: {e}")
+    return positions
+
+
+def _crisis_put_monitor():
+    """Check all open crisis put positions for target hit or max hold exit.
+    Called every 10 minutes during market hours by the EM scheduler."""
+    positions = _crisis_put_get_open_positions()
+    if not positions:
+        return
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    for pos in positions:
+        ticker = pos["ticker"]
+        try:
+            # Check day count first (cheaper than chain lookup)
+            entry_date = datetime.strptime(pos["entry_date"], "%Y-%m-%d").date()
+            now_date = datetime.now(timezone.utc).date()
+            days_held = (now_date - entry_date).days
+
+            if days_held >= 7 or today >= pos["exit_by_date"]:
+                _crisis_put_exit(pos, reason="max_hold", days_held=days_held)
+                continue
+
+            # Get current put price from chain
+            current_price = _crisis_put_get_current_price(pos)
+            if current_price is None:
+                continue
+
+            entry_price = pos["entry_price"]
+            pnl_pct = (current_price - entry_price) / entry_price * 100
+
+            if current_price >= pos["target_price"]:
+                _crisis_put_exit(pos, reason="target_hit", days_held=days_held,
+                                 exit_price=current_price, pnl_pct=pnl_pct)
+            elif days_held >= 6:
+                # Day 6 warning — exit tomorrow
+                log.info(f"Crisis put: {ticker} day {days_held}, P&L {pnl_pct:+.1f}% — exiting tomorrow")
+
+        except Exception as e:
+            log.warning(f"Crisis put monitor error for {ticker}: {e}")
+
+
+def _crisis_put_get_current_price(pos) -> float | None:
+    """Fetch the current mid price for an open crisis put position."""
+    try:
+        ticker = pos["ticker"]
+        expiration = pos["expiration"]
+        strike = pos["strike"]
+
+        chain_data = _cached_md.get_chain(ticker, expiration, side="put")
+        if not chain_data or chain_data.get("s") != "ok":
+            return None
+
+        strikes = chain_data.get("strike", [])
+        mids = chain_data.get("mid", [])
+        bids = chain_data.get("bid", [])
+        asks = chain_data.get("ask", [])
+
+        for i, s in enumerate(strikes):
+            if abs(float(s) - strike) < 0.01:
+                mid = float(mids[i]) if mids and mids[i] is not None else None
+                if not mid or mid <= 0:
+                    bid = float(bids[i]) if bids and bids[i] is not None else 0
+                    ask = float(asks[i]) if asks and asks[i] is not None else 0
+                    if bid > 0 and ask > 0:
+                        mid = (bid + ask) / 2
+                return mid
+        return None
+    except Exception as e:
+        log.warning(f"Crisis put price fetch failed for {pos.get('ticker')}: {e}")
+        return None
+
+
+def _crisis_put_exit(pos, reason, days_held, exit_price=None, pnl_pct=None):
+    """Close a crisis put position — alert, log to sheets, remove from Redis."""
+    ticker = pos["ticker"]
+    entry_price = pos["entry_price"]
+
+    # If no exit price provided (max_hold), try to get current price
+    if exit_price is None:
+        exit_price = _crisis_put_get_current_price(pos)
+
+    if exit_price and entry_price:
+        pnl_pct = (exit_price - entry_price) / entry_price * 100
+        pnl_dollars = (exit_price - entry_price) * 100  # per contract
+    else:
+        pnl_pct = pnl_pct or 0
+        pnl_dollars = 0
+
+    exit_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    # Log exit to Google Sheets
+    try:
+        row = {
+            "signal_date": pos["entry_date"],
+            "signal_time_ct": "",
+            "source_type": "",
+            "ticker": ticker,
+            "signal_spot": pos.get("entry_spot"),
+            "bias": "bear",
+            "vol_regime": "CRISIS",
+            "vix": None,
+            "confidence": None,
+            "contract": pos["symbol"],
+            "strike": pos["strike"],
+            "dte_at_entry": pos.get("dte_at_entry"),
+            "expiration": pos["expiration"],
+            "put_cost_mid": entry_price,
+            "put_bid": None,
+            "put_ask": None,
+            "target_price_30pct": pos["target_price"],
+            "exit_by_date": pos["exit_by_date"],
+            "premium_pct_of_spot": None,
+            "status": f"closed_{reason}",
+            "exit_date": exit_date,
+            "exit_reason": reason,
+            "exit_put_price": round(exit_price, 2) if exit_price else None,
+            "pnl_dollars": round(pnl_dollars, 2),
+            "pnl_pct": round(pnl_pct, 1),
+        }
+        fieldnames = list(row.keys())
+        _append_csv_row("crisis_put_signals.csv", fieldnames, row)
+    except Exception as e:
+        log.warning(f"Crisis put exit log failed for {ticker}: {e}")
+
+    # Telegram exit alert
+    emoji = "✅" if pnl_pct > 0 else "❌"
+    reason_label = "30% TARGET HIT" if reason == "target_hit" else "DAY 7 MAX HOLD"
+    alert = (
+        f"{emoji} CRISIS PUT EXIT — {ticker}\n"
+        f"\n"
+        f"📋 {pos['symbol']}\n"
+        f"   {reason_label} (day {days_held})\n"
+        f"\n"
+        f"💰 Entry: ${entry_price:.2f} → Exit: ${exit_price:.2f}\n"
+        f"   P&L: {pnl_pct:+.1f}% (${pnl_dollars:+,.0f} per contract)\n"
+        f"\n"
+        f"⚠️ Execute exit manually"
+    )
+    try:
+        post_to_telegram(alert)
+    except Exception as e:
+        log.warning(f"Crisis put exit alert failed for {ticker}: {e}")
+
+    # Remove from Redis
+    r = _get_redis()
+    if r:
+        r.delete(f"{_CRISIS_PUT_REDIS_PREFIX}{ticker}")
+    log.info(f"Crisis put closed: {ticker} {reason} P&L {pnl_pct:+.1f}%")
+
+
 def _log_signal_dataset_event(ticker: str, webhook_data: dict, outcome: str, reason: str = "", best_rec: dict = None,
                               signal_validation: dict = None, regime: dict = None, v4_flow: dict = None,
                               spot: float = None, expirations_checked: int = None, vol_regime: dict = None):
@@ -586,6 +1044,7 @@ def _log_signal_dataset_event(ticker: str, webhook_data: dict, outcome: str, rea
             "structure_outer_bracket_low": (best_rec or {}).get("structure_outer_bracket_low"),
             "structure_outer_bracket_high": (best_rec or {}).get("structure_outer_bracket_high"),
             "structure_confluence": (best_rec or {}).get("structure_confluence"),
+            "source_type": _classify_source_type(wd.get("source") or "tv", datetime.now(timezone.utc).isoformat()),
             "log_schema": "v6_effective_regime",
         }
         fieldnames = list(row.keys())
@@ -595,9 +1054,20 @@ def _log_signal_dataset_event(ticker: str, webhook_data: dict, outcome: str, rea
         diag = (
             f"🧪 {ticker} {str(evaluated_bias or wd.get('bias', '')).upper()} T{wd.get('tier', '?')} | {outcome}\n"
             f"spot ${row['live_spot']} | drift {row['drift_pct']}% | conf {row['confidence']}\n"
-            f"bucket: {row['rejection_bucket']} | reason: {row['reason'] or '—'}"
+            f"bucket: {row['rejection_bucket']} | source: {row['source_type']} | reason: {row['reason'] or '—'}"
         )
         _post_diagnostic(diag)
+
+        # v5.1.1: Evaluate for CRISIS long put recommendation
+        _evaluate_crisis_put(
+            ticker=ticker,
+            bias=str(evaluated_bias or wd.get("bias", "")).lower(),
+            source_type=row["source_type"],
+            vol_regime=vol_regime,
+            spot=spot if spot is not None else as_float(wd.get("live_spot")),
+            vix=as_float((regime or {}).get("vix")) if isinstance(regime, dict) else None,
+            confidence=as_float((best_rec or {}).get("confidence")),
+        )
     except Exception as e:
         log.warning(f"Signal dataset log failed for {ticker}: {e}")
 
@@ -6999,6 +7469,16 @@ def _em_scheduler():
                     except Exception as _re:
                         log.debug(f"Regime detector update error: {_re}")
 
+            # ── v5.1.1: Crisis put position monitor (every 10 min during market hours) ──
+            if 8 <= now_ct.hour < 16:
+                _cpm_key = (date_str, now_ct.hour, now_ct.minute // 10, "crisis_put_mon")
+                if _cpm_key not in fired_today:
+                    fired_today.add(_cpm_key)
+                    try:
+                        threading.Thread(target=_crisis_put_monitor, daemon=True, name="crisis-put-mon").start()
+                    except Exception as _cpe:
+                        log.debug(f"Crisis put monitor error: {_cpe}")
+
             # ── v5.1: OI Tracker — morning summary + end-of-day flush ──
             if _oi_tracker:
                 # Morning summary at 9:00 AM CT
@@ -7297,6 +7777,46 @@ def get_ticker_fundamentals(ticker):
     try:
         data = get_fundamentals(ticker.strip().upper())
         return jsonify(data)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/crisis_puts", methods=["GET"])
+def crisis_puts_status():
+    """View open crisis put positions and their current P&L.
+    Returns all open positions with live pricing if market is open."""
+    try:
+        positions = _crisis_put_get_open_positions()
+        results = []
+        for pos in positions:
+            entry_date = datetime.strptime(pos["entry_date"], "%Y-%m-%d").date()
+            days_held = (datetime.now(timezone.utc).date() - entry_date).days
+            current_price = _crisis_put_get_current_price(pos)
+            entry_price = pos["entry_price"]
+            pnl_pct = ((current_price - entry_price) / entry_price * 100) if current_price else None
+            pnl_dollars = ((current_price - entry_price) * 100) if current_price else None
+            results.append({
+                "ticker": pos["ticker"],
+                "contract": pos["symbol"],
+                "strike": pos["strike"],
+                "expiration": pos["expiration"],
+                "entry_date": pos["entry_date"],
+                "entry_price": entry_price,
+                "current_price": round(current_price, 2) if current_price else None,
+                "target_price": pos["target_price"],
+                "exit_by_date": pos["exit_by_date"],
+                "days_held": days_held,
+                "pnl_pct": round(pnl_pct, 1) if pnl_pct is not None else None,
+                "pnl_dollars": round(pnl_dollars, 0) if pnl_dollars is not None else None,
+            })
+        from trading_rules import CRISIS_PUT_ENABLED, CRISIS_PUT_WHITELIST, CRISIS_PUT_BLACKLIST
+        return jsonify({
+            "enabled": CRISIS_PUT_ENABLED,
+            "open_positions": len(results),
+            "positions": results,
+            "whitelist_count": len(CRISIS_PUT_WHITELIST),
+            "blacklist_count": len(CRISIS_PUT_BLACKLIST),
+        })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
