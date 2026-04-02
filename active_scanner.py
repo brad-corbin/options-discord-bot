@@ -191,17 +191,19 @@ def _analyze_ticker(
         return None
 
     try:
-        # Fetch 5-minute bars with fallback for early session / thin tickers
+        # Fetch 5-minute bars.
+        # v5.1.1: Removed scanner-level [80, 40, 20] retry loop — app.py's
+        # get_intraday_bars already retries with smaller countbacks internally.
+        # The old loop was redundant and caused up to 7 API calls per no-data
+        # ticker (3 scanner attempts × 2-3 app.py retries each).
         bars = None
         bars_requested = 0
-        for cb in [80, 40, 20]:
-            try:
-                bars = intraday_fn(ticker, resolution=5, countback=cb)
-                if bars and bars.get("c"):
-                    bars_requested = cb
-                    break
-            except Exception:
-                continue
+        try:
+            bars = intraday_fn(ticker, resolution=5, countback=80)
+            if bars and bars.get("c"):
+                bars_requested = 80
+        except Exception:
+            pass
 
         if not bars or not bars.get("c"):
             return _reject("no_intraday_data")
