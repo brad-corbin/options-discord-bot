@@ -7818,7 +7818,7 @@ def _start_background_services_once():
         global _scanner
         if ACTIVE_SCANNER_ENABLED:
             _regime_detector = init_regime_detector(notify_fn=post_to_telegram)
-                _scanner = ActiveScanner(
+            _scanner = ActiveScanner(
                 enqueue_fn=_enqueue_signal,
                 spot_fn=get_spot,
                 candle_fn=get_daily_candles,
