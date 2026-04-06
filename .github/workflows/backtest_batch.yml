@@ -1,0 +1,225 @@
+# .github/workflows/backtest_batch.yml
+# ─────────────────────────────────────────────────────────────────────────────
+# Multi-ticker batch backtest.
+#
+# Stage 1 (matrix): Download bars + run backtest_replay for each ticker in
+#                   parallel. Each job uploads its trades.csv as an artifact.
+#
+# Stage 2 (combine): Downloads every artifact, concatenates the trades.csv
+#                    files into one, then runs report_backtest.py to produce a
+#                    single unified report grouped by ticker, entry_type,
+#                    regime, time_phase, etc.
+#
+# How to run:
+#   GitHub → Actions → "Batch Backtest (Multi-Ticker)" → Run workflow
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Batch Backtest (Multi-Ticker)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tickers:
+        description: 'Comma-separated tickers (e.g. AAPL,NVDA,AMZN)'
+        required: true
+        default: 'AAPL,NVDA,AMZN,MSFT,CAT,FDX,IREN,META'
+      days:
+        description: 'Trading days to look back (ignored if from_date is set)'
+        required: false
+        default: '22'
+      from_date:
+        description: 'Start date YYYY-MM-DD  (leave blank for most-recent mode)'
+        required: false
+        default: ''
+      to_date:
+        description: 'End date   YYYY-MM-DD  (leave blank = today)'
+        required: false
+        default: ''
+      contracts:
+        description: 'Option contracts per trade for P&L (default: 1)'
+        required: false
+        default: '1'
+      price_options:
+        description: 'Fetch real options pricing after each backtest? (yes/no)'
+        required: false
+        default: 'no'
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 1 — one job per ticker, all running in parallel
+# ─────────────────────────────────────────────────────────────────────────────
+jobs:
+  prepare:
+    name: Build ticker matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Convert ticker input to JSON array
+        id: set-matrix
+        run: |
+          # Turn "AAPL,NVDA,AMZN" → ["AAPL","NVDA","AMZN"]
+          TICKERS="${{ github.event.inputs.tickers }}"
+          JSON=$(python3 -c "
+          import json, sys
+          raw = sys.argv[1]
+          tickers = [t.strip().upper() for t in raw.split(',') if t.strip()]
+          print(json.dumps(tickers))
+          " "$TICKERS")
+          echo "matrix={\"ticker\":$JSON}" >> "$GITHUB_OUTPUT"
+
+  backtest:
+    name: Backtest ${{ matrix.ticker }}
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false          # let other tickers finish even if one fails
+      matrix:
+        ticker: ${{ fromJson(needs.prepare.outputs.matrix).ticker }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install requests pandas pytz
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Download historical bars
+        env:
+          MARKETDATA_TOKEN: ${{ secrets.MARKETDATA_TOKEN }}
+        run: |
+          if [ -n "${{ github.event.inputs.from_date }}" ]; then
+            TO_ARG=""
+            if [ -n "${{ github.event.inputs.to_date }}" ]; then
+              TO_ARG="--to ${{ github.event.inputs.to_date }}"
+            fi
+            python backtest/download_bars.py \
+              --ticker ${{ matrix.ticker }} \
+              --from ${{ github.event.inputs.from_date }} \
+              $TO_ARG
+          else
+            python backtest/download_bars.py \
+              --ticker ${{ matrix.ticker }} \
+              --days ${{ github.event.inputs.days }}
+          fi
+
+      - name: Run backtest replay
+        env:
+          MARKETDATA_TOKEN: ${{ secrets.MARKETDATA_TOKEN }}
+        run: |
+          DATA_FILE=$(ls backtest/data/*.csv | head -1)
+          echo "Using data file: $DATA_FILE"
+          python backtest/backtest_replay.py \
+            --ticker ${{ matrix.ticker }} \
+            --data "$DATA_FILE"
+
+      - name: Fetch options pricing
+        if: ${{ github.event.inputs.price_options == 'yes' }}
+        env:
+          MARKETDATA_TOKEN: ${{ secrets.MARKETDATA_TOKEN }}
+        run: |
+          python backtest/option_translator.py \
+            --ticker ${{ matrix.ticker }} \
+            --contracts ${{ github.event.inputs.contracts }} \
+            --trades backtest/results/trades.csv
+
+      - name: Upload per-ticker results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bt-${{ matrix.ticker }}-${{ github.run_number }}
+          path: |
+            backtest/results/
+            backtest/data/
+          retention-days: 30
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 2 — combine all trades, produce one unified report
+# ─────────────────────────────────────────────────────────────────────────────
+  combine:
+    name: Combined report
+    needs: backtest
+    runs-on: ubuntu-latest
+    if: always()   # run even if individual tickers failed, report what we have
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install requests pandas pytz
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Download all per-ticker artifacts
+        uses: actions/download-artifact@v4
+        with:
+          # Download every artifact whose name starts with "bt-"
+          pattern: bt-*-${{ github.run_number }}
+          path: downloaded_artifacts
+
+      - name: Concatenate trades.csv files
+        run: |
+          python3 - <<'EOF'
+          import os, glob, sys
+          import pandas as pd
+
+          # Find every trades.csv that was downloaded
+          pattern = "downloaded_artifacts/**/trades.csv"
+          files = glob.glob(pattern, recursive=True)
+
+          if not files:
+              print("ERROR: No trades.csv files found in downloaded artifacts.")
+              sys.exit(1)
+
+          print(f"Found {len(files)} trades file(s):")
+          frames = []
+          for f in sorted(files):
+              df = pd.read_csv(f)
+              print(f"  {f}  →  {len(df)} rows")
+              frames.append(df)
+
+          combined = pd.concat(frames, ignore_index=True)
+          print(f"\nCombined total: {len(combined)} trades across {combined['ticker'].nunique()} ticker(s)")
+
+          os.makedirs("backtest/results", exist_ok=True)
+          combined.to_csv("backtest/results/trades.csv", index=False)
+          print("Saved → backtest/results/trades.csv")
+          EOF
+
+      - name: Run unified report
+        run: |
+          python backtest/report_backtest.py \
+            --input backtest/results/trades.csv \
+            --output backtest/report
+
+      - name: Print summary to log
+        run: |
+          echo ""
+          echo "══════════════════════════════════════════════════"
+          echo "  COMBINED REPORT SUMMARY"
+          echo "══════════════════════════════════════════════════"
+          cat backtest/report/report_summary.txt || echo "(summary not found)"
+
+      - name: Upload combined report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: backtest-combined-report-${{ github.run_number }}
+          path: |
+            backtest/results/trades.csv
+            backtest/report/
+          retention-days: 30
