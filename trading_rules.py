@@ -754,15 +754,20 @@ SWING_SCANNER_ENABLED        = True
 # ── Swing-only tickers (not liquid enough for 0DTE, fine for 45-60 DTE) ──
 # Add tickers here anytime. They get swing-scanned but never scalp-scanned.
 SWING_ONLY_TICKERS = {
-    "INOD", "BWXT", "PLTR", "SNOW", "CRWD", "NET", "DDOG", "ZS",
+    # Confirmed — backtested and approved
+    "SLV", "PLTR", "PEP",
+    "PFE", "MRNA",
+    "JPM", "C",
+    # Deferred — in watchlist, not yet backtested (do not trade)
+    "BWXT", "SNOW", "CRWD", "NET", "DDOG", "ZS",
     "PANW", "FTNT", "ABNB", "DASH", "RBLX", "U", "TTD", "SHOP",
     "MELI", "SE", "GRAB", "NU", "SQ", "PYPL", "AFRM", "UPST",
     "ENPH", "SEDG", "FSLR", "RUN", "PLUG", "RIVN", "LCID", "NIO",
     "LI", "XPEV", "DKNG", "PENN", "MGM", "WYNN", "LVS",
     "EL", "LULU", "NKE", "SBUX", "CMG", "MCD",
-    "PFE", "MRNA", "ABBV", "LLY", "UNH", "JNJ",
+    "ABBV", "LLY", "UNH", "JNJ",
     "XOM", "CVX", "OXY", "SLB", "HAL",
-    "JPM", "GS", "MS", "BAC", "C", "WFC",
+    "GS", "MS", "BAC", "WFC",
     "CAT", "DE", "HON", "GE", "RTX", "LMT", "NOC",
     "COST", "WMT", "TGT", "HD", "LOW",
     "CRM", "ORCL", "NOW", "ADBE", "INTU",
@@ -772,8 +777,91 @@ SWING_ONLY_TICKERS = {
 SWING_WATCHLIST = set(HIGH_VOLUME_TICKERS) | SWING_ONLY_TICKERS
 
 # ── Scanner schedule ──
-SWING_SCAN_TIMES_CT          = ["08:15", "15:30"]  # pre-market + post-close
+# Three scan types run at different times:
+#   post_close   (15:30 CT / 4:30 ET) — full signal scan, fires actionable alerts
+#   approach_warn (14:45 CT / 3:45 ET) — 15 min before close, flags price approaching fib
+#   entry_confirm (08:45 CT / 9:45 ET) — 15 min after open, validates prior-evening signals
+SWING_SCAN_TIMES_CT = {
+    "15:30": "post_close",    # primary — full signal scan (existing behavior)
+    "14:45": "approach_warn", # new — early warning, not actionable
+    "08:45": "entry_confirm", # new — confirm or invalidate prior signal
+}
 SWING_SCAN_LOOKBACK_DAYS     = 120     # daily bars to fetch (need 50+ for pivots)
+
+# ── Confirmed tickers — backtested and approved ──
+# ONLY these tickers fire swing signals. All others are suppressed
+# until backtested. Add tickers here after reviewing backtest results.
+SWING_CONFIRMED_TICKERS = {
+    # Primary — full size, debit spreads
+    "NVDA", "META", "GLD", "SLV", "TSLA", "PLTR", "JPM", "C", "PEP",
+    # Secondary — half size, debit spreads
+    "AMD", "NFLX", "MRNA",
+    # Special structure (see SWING_TICKER_STRUCTURE)
+    "PFE",   # long ATM call only — $77 debit, cheap IV
+    "WMT",   # shares only — ATR too small for options
+}
+
+# ── Confirmed bad — removed from signal generation permanently ──
+SWING_REMOVED_TICKERS = {
+    "AAPL", "MSFT", "AMZN", "QQQ", "SPY", "AVGO", "COIN", "IREN",
+    "UNH", "GS", "BAC", "HD", "KR",
+}
+
+# ── 61.8% fib exception list ──
+# Global rule: block 61.8% fib signals (backtest: 19 trades, PF 0.25, -161 pts).
+# Exception: range-bound, low-beta stocks bounce cleanly at 61.8% — allow it.
+SWING_FIB_61_8_EXCEPTIONS = {"JPM", "PFE", "GLD", "PEP", "WMT"}
+
+# ── Per-ticker fib rules ──
+# "blocked": set of fib levels that never fire for this ticker
+# "allowed": if present, ONLY these levels fire (overrides blocked)
+SWING_TICKER_FIB_RULES = {
+    "NVDA": {"blocked": {"78.6"}},   # 0% win on NVDA 78.6% (3 trades)
+    "SLV":  {"blocked": {"78.6"}},   # 0% win on SLV 78.6% (1 trade, -$9 stop)
+    "TSLA": {"allowed": {"38.2"}},   # 38.2% only — 100% win; other fibs fail on TSLA
+    "MRNA": {"allowed": {"50.0"}},   # 50.0% only — 100% win; 38.2% loses on MRNA
+}
+
+# ── Options structure guidance by ticker ──
+SWING_TICKER_STRUCTURE = {
+    "PFE":  "long_call",  # $77 debit, IV 11.8%, 12+ contracts/$1k
+    "SLV":  "long_call",  # Small ATR, spread economics too tight
+    "MRNA": "long_call",  # Small dollar moves, spread uneconomical
+    "WMT":  "shares",     # ATR $2, options uneconomical
+    # All others: debit spread
+}
+
+# ── DTE and hold guidance by ticker ──
+SWING_TICKER_DTE_GUIDANCE = {
+    "NVDA":  {"dte_min": 30, "dte_max": 45, "hold_days": 10, "width": 10,
+              "note": "Exit Day 7-10 at $190+ target"},
+    "PLTR":  {"dte_min": 30, "dte_max": 45, "hold_days": 10, "width": 10,
+              "note": "Exit Day 8-12"},
+    "TSLA":  {"dte_min": 45, "dte_max": 60, "hold_days": 12, "width": 15,
+              "note": "38.2% only — exit Day 10-12, half size"},
+    "AMD":   {"dte_min": 30, "dte_max": 45, "hold_days": 10, "width": 10,
+              "note": "Exit Day 7-10"},
+    "C":     {"dte_min": 30, "dte_max": 45, "hold_days": 10, "width": 10,
+              "note": "Exit Day 8-12, bull only"},
+    "JPM":   {"dte_min": 30, "dte_max": 45, "hold_days": 12, "width": 15,
+              "note": "Exit Day 8-12, keep 61.8%"},
+    "PEP":   {"dte_min": 45, "dte_max": 60, "hold_days": 12, "width": 7,
+              "note": "Exit Day 8-15, bull only"},
+    "META":  {"dte_min": 60, "dte_max": 90, "hold_days": 15, "width": 25,
+              "note": "Exit Day 8-15, watch bear signals closely"},
+    "GLD":   {"dte_min": 60, "dte_max": 90, "hold_days": 30, "width": 15,
+              "note": "38.2% only — slow macro, exit Day 20-30"},
+    "NFLX":  {"dte_min": 45, "dte_max": 60, "hold_days": 15, "width": 15,
+              "note": "Exit Day 8-15"},
+    "SLV":   {"dte_min": 30, "dte_max": 45, "hold_days": 10, "width": None,
+              "note": "Long ATM call, exit Day 6-10"},
+    "MRNA":  {"dte_min": 30, "dte_max": 45, "hold_days": 10, "width": None,
+              "note": "Long ATM call, 50.0% fib only"},
+    "PFE":   {"dte_min": 30, "dte_max": 47, "hold_days": 10, "width": None,
+              "note": "Long ATM call ~$77 debit, 12+ contracts/$1k"},
+    "WMT":   {"dte_min": None, "dte_max": None, "hold_days": 15, "width": None,
+              "note": "Shares only — ATR $2 too small for options"},
+}
 
 # ── Fibonacci settings (mirrors Pine v3.0 inputs) ──
 SWING_FIB_LOOKBACK           = 50      # pivot lookback bars
@@ -815,6 +903,7 @@ SWING_SECTOR_MAP = {
     "XLY": ["AMZN", "TSLA", "ABNB", "DASH", "RBLX", "DKNG", "PENN", "MGM",
             "WYNN", "LVS", "NKE", "SBUX", "CMG", "MCD", "LULU", "EL",
             "HD", "LOW", "TGT", "COST", "WMT"],
+    "XLP": ["PEP", "WMT", "KO", "PG"],     # Consumer staples
     "XLV": ["PFE", "MRNA", "ABBV", "LLY", "UNH", "JNJ"],
     "XLI": ["CAT", "DE", "HON", "GE", "RTX", "LMT", "NOC", "BWXT", "ITA"],
     "XLRE": ["RIVN", "LCID", "NIO", "LI", "XPEV"],  # EV cluster
@@ -822,6 +911,7 @@ SWING_SECTOR_MAP = {
     "ENERGY_ALT": ["ENPH", "SEDG", "FSLR", "RUN", "PLUG"],
     "INDEX": ["SPY", "QQQ", "IWM", "DIA"],
     "CRYPTO": ["COIN", "MSTR", "CIFR", "IREN", "MARA"],
+    "METALS": ["GLD", "SLV", "GDX", "IAU"],  # Precious metals
 }
 
 # ── Institutional: Primary trend filter ──
@@ -880,4 +970,3 @@ CRISIS_PUT_BLACKLIST = {
     "GLD", "SLV", "NEM", "IAU", "BWXT", "TLT", "NOC", "RTX",
     "PEP", "KO", "JNJ", "PG", "VZ", "T",  # defensive consumer/telecom
 }
-
