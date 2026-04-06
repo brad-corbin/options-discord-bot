@@ -3,77 +3,90 @@
 # Active Watchlist Scanner — Proactive Signal Generation
 # NOTE: Educational/demo code. Not financial advice. Use at your own risk.
 #
-# Replaces the disabled /scan endpoint with a continuous scanning loop
-# that runs during market hours. Computes the same technical signals
-# as the TradingView Pine script (EMA crossovers, WaveTrend, MACD,
-# RSI+MFI, VWAP) using intraday bar data from MarketData.app.
+# v6.0 changes (2026-04-06):
+#   - REGIME-AWARE FILTERING: every signal is checked against TICKER_RULES
+#     before being enqueued. Tickers not active in current regime are silently
+#     dropped. No manual regime override needed — market_regime.py auto-detects.
+#   - FULL-DETAIL ALERTS: signal messages include ALL trade instructions inline.
+#     Trader sees spread type, legs, width, DTE, exact exit date, WR, notes,
+#     and hard DO-NOT rules without needing to reference any other document.
+#   - SLV added to TIER_C watchlist (was missing).
+#   - Daily regime refresh: detector.refresh() called at market open each day.
+#
+# ─── REGIME AUTO-DETECTION ─────────────────────────────────────────
+#   market_regime.py computes BEAR / TRANSITION / BULL from QQQ and IWM
+#   daily closes vs 20-day and 50-day SMAs. Refreshes once per day.
+#   Posts a Telegram alert on regime change.
+#   No manual intervention required.
 #
 # Tiered scanning:
-#   Tier A (SPY, QQQ, IWM):     every 5 min (high priority)
-#   Tier B (mega-cap stocks):    every 10 min
-#   Tier C (extended watchlist): every 15 min
-#
-# Pre-chain gate is enforced: only tickers passing all cheap checks
-# get their option chains pulled. This keeps API usage manageable.
-#
-# Usage (in app.py):
-#   from active_scanner import ActiveScanner
-#   scanner = ActiveScanner(
-#       enqueue_fn=_enqueue_signal,
-#       spot_fn=get_spot,
-#       candle_fn=get_daily_candles,
-#       intraday_fn=get_intraday_bars,
-#       regime_fn=get_current_regime,
-#       vol_regime_fn=get_canonical_vol_regime,
-#   )
-#   scanner.start()  # launches background thread
+#   Tier A (QQQ, IWM):            every 5 min
+#   Tier B (mega-cap stocks):      every 10 min
+#   Tier C (extended watchlist):   every 15 min
 # ═══════════════════════════════════════════════════════════════════
 
 import math
 import time
 import logging
 import threading
-from datetime import datetime
+from datetime import datetime, date
 from typing import Dict, List, Callable, Optional
 
 from market_clock import is_equity_session, current_phase, CT
+from market_regime import MarketRegimeDetector, get_market_regime, DEFAULT_REGIME
+from ticker_rules import (
+    is_signal_valid,
+    build_alert_message,
+    get_active_tickers,
+    TICKER_RULES,
+)
 
 log = logging.getLogger(__name__)
 
 # ── Watchlist tiers ──
-TIER_A = ["SPY", "QQQ", "IWM"]   # 5 min
+# Tier A: index ETFs — highest priority, scanned every 5 min
+TIER_A = ["QQQ", "IWM"]   # SPY removed — not in backtest ruleset
+
+# Tier B: mega-cap stocks — every 10 min
 TIER_B = [
-    "AAPL", "MSFT", "NVDA", "AMZN", "META", "TSLA", "GOOGL", "AMD",
-    "NFLX", "COIN", "AVGO", "PLTR",
-]  # 10 min
+    "AAPL", "MSFT", "NVDA", "AMZN", "META",
+    "TSLA", "GOOGL",
+]
+
+# Tier C: extended watchlist — every 15 min
 TIER_C = [
-    "CRM", "ORCL", "ARM", "SMCI", "MSTR", "DIA", "GLD",
+    "GLD", "SLV",       # metals (active in BULL regime)
+    "AMD", "NFLX", "COIN", "AVGO", "PLTR",   # extended equity
+    "CRM", "ORCL", "ARM", "SMCI", "MSTR", "DIA",
     "XLF", "XLE", "XLV", "SOXX", "TLT",
     "JPM", "GS", "BA", "CAT", "LLY", "UNH",
-]  # 15 min
+]
 
 SCAN_INTERVAL_A = 300    # 5 min
 SCAN_INTERVAL_B = 600    # 10 min
 SCAN_INTERVAL_C = 900    # 15 min
 
 # ── Technical signal thresholds ──
-EMA_FAST = 5
-EMA_SLOW = 12
-MACD_FAST = 12
-MACD_SLOW = 26
+EMA_FAST    = 5
+EMA_SLOW    = 12
+MACD_FAST   = 12
+MACD_SLOW   = 26
 MACD_SIGNAL = 9
-RSI_PERIOD = 14
-WT_CHANNEL = 10
-WT_AVERAGE = 21
+RSI_PERIOD  = 14
+WT_CHANNEL  = 10
+WT_AVERAGE  = 21
 
 # Signal tier mapping
-SIGNAL_TIER_1_SCORE = 75    # scanner-generated T1
-SIGNAL_TIER_2_SCORE = 55    # scanner-generated T2
-MIN_SIGNAL_SCORE = 50       # below this, don't generate signal
+SIGNAL_TIER_1_SCORE = 75
+SIGNAL_TIER_2_SCORE = 55
+MIN_SIGNAL_SCORE    = SIGNAL_TIER_2_SCORE   # 55 — scores 50-54 are rejected
 
+
+# ═══════════════════════════════════════════════════════════
+# TECHNICAL ANALYSIS FUNCTIONS (unchanged from v5.x)
+# ═══════════════════════════════════════════════════════════
 
 def _compute_ema(values: list, period: int) -> list:
-    """Compute EMA series."""
     if len(values) < period:
         return []
     ema = [sum(values[:period]) / period]
@@ -84,7 +97,6 @@ def _compute_ema(values: list, period: int) -> list:
 
 
 def _compute_rsi(closes: list, period: int = 14) -> Optional[float]:
-    """Compute latest RSI value."""
     if len(closes) < period + 1:
         return None
     gains, losses = [], []
@@ -92,7 +104,6 @@ def _compute_rsi(closes: list, period: int = 14) -> Optional[float]:
         diff = closes[i] - closes[i-1]
         gains.append(max(0, diff))
         losses.append(max(0, -diff))
-
     avg_gain = sum(gains[-period:]) / period
     avg_loss = sum(losses[-period:]) / period
     if avg_loss == 0:
@@ -102,7 +113,6 @@ def _compute_rsi(closes: list, period: int = 14) -> Optional[float]:
 
 
 def _compute_macd(closes: list) -> Dict:
-    """Compute MACD line, signal line, histogram."""
     if len(closes) < MACD_SLOW + MACD_SIGNAL:
         return {}
     ema_fast = _compute_ema(closes, MACD_FAST)
@@ -112,13 +122,11 @@ def _compute_macd(closes: list) -> Dict:
     if len(macd_line) < MACD_SIGNAL:
         return {}
     signal = _compute_ema(macd_line, MACD_SIGNAL)
-    offset2 = len(macd_line) - len(signal)
     hist = macd_line[-1] - signal[-1] if signal else 0
     return {
         "macd_line": macd_line[-1] if macd_line else 0,
         "signal_line": signal[-1] if signal else 0,
         "macd_hist": hist,
-        # v5.1 fix: cross detection compares prior-to-prior, not prior-to-current
         "macd_cross_bull": (len(macd_line) >= 2 and len(signal) >= 2
                            and macd_line[-2] < signal[-2]
                            and macd_line[-1] > signal[-1]) if signal else False,
@@ -129,7 +137,6 @@ def _compute_macd(closes: list) -> Dict:
 
 
 def _compute_wavetrend(hlc3: list) -> Dict:
-    """Compute WaveTrend oscillator (wt1, wt2)."""
     if len(hlc3) < WT_AVERAGE + WT_CHANNEL + 4:
         return {}
     esa = _compute_ema(hlc3, WT_CHANNEL)
@@ -158,7 +165,6 @@ def _compute_wavetrend(hlc3: list) -> Dict:
         "wt2": wt2_vals[-1],
         "wt_oversold": wt2_vals[-1] < -30,
         "wt_overbought": wt2_vals[-1] > 60,
-        # v5.1 fix: cross detection compares prior-to-prior, not prior-to-current
         "wt_cross_bull": (len(wt1) >= 2 and len(wt2_vals) >= 2
                          and wt1[-2] < wt2_vals[-2]
                          and wt1[-1] > wt2_vals[-1]),
@@ -168,6 +174,10 @@ def _compute_wavetrend(hlc3: list) -> Dict:
     }
 
 
+# ═══════════════════════════════════════════════════════════
+# TICKER ANALYSIS (unchanged from v5.x)
+# ═══════════════════════════════════════════════════════════
+
 def _analyze_ticker(
     ticker: str,
     intraday_fn: Callable,
@@ -175,42 +185,27 @@ def _analyze_ticker(
 ) -> Optional[Dict]:
     """
     Run technical analysis on a ticker using intraday + daily data.
-
-    v5.1 institutional fixes:
-      - Reject telemetry: every exit path returns a reason via _reject()
-      - Data quality flags: full/partial/minimal based on bar count
-      - ADTV liquidity gating: rejects tickers with very low dollar volume
-      - Removed unused spot_fn parameter
-
-    Returns signal dict if setup is detected, None otherwise.
-    Reject reasons are logged for tuning telemetry.
+    Returns signal dict if a setup is detected, None otherwise.
     """
     def _reject(reason: str) -> None:
-        """Structured reject logging for scanner telemetry."""
         log.debug(f"Scanner reject {ticker}: {reason}")
         return None
 
     try:
-        # Fetch 5-minute bars.
-        # v5.1.1: Removed scanner-level [80, 40, 20] retry loop — app.py's
-        # get_intraday_bars already retries with smaller countbacks internally.
-        # The old loop was redundant and caused up to 7 API calls per no-data
-        # ticker (3 scanner attempts × 2-3 app.py retries each).
         bars = None
-        bars_requested = 0
         try:
             bars = intraday_fn(ticker, resolution=5, countback=80)
             if bars and bars.get("c"):
-                bars_requested = 80
+                pass
         except Exception:
             pass
 
         if not bars or not bars.get("c"):
             return _reject("no_intraday_data")
 
-        closes = [c for c in bars["c"] if c is not None]
-        highs = [h for h in bars.get("h", []) if h is not None]
-        lows = [l for l in bars.get("l", []) if l is not None]
+        closes  = [c for c in bars["c"] if c is not None]
+        highs   = [h for h in bars.get("h", []) if h is not None]
+        lows    = [l for l in bars.get("l", []) if l is not None]
         volumes = [v for v in bars.get("v", []) if v is not None]
 
         if len(closes) < 12:
@@ -218,26 +213,20 @@ def _analyze_ticker(
 
         spot = closes[-1]
 
-        # ── Data quality classification ──
         bar_count = len(closes)
         if bar_count >= 40:
-            data_quality = "full"       # all indicators available
+            data_quality = "full"
         elif bar_count >= 20:
-            data_quality = "partial"    # RSI available, MACD/WT may not be
+            data_quality = "partial"
         else:
-            data_quality = "minimal"    # EMA + VWAP only
+            data_quality = "minimal"
 
-        # ── ADTV liquidity gating ──
-        # Reject tickers with very low average daily dollar volume
-        # (they'll have garbage option liquidity downstream)
         if volumes and len(volumes) >= 10:
             avg_vol_10 = sum(volumes[-10:]) / 10
-            adtv = avg_vol_10 * spot * 5 * 60  # rough daily estimate from 5-min bars
-            # ~$5M daily min for 0DTE options liquidity
+            adtv = avg_vol_10 * spot * 5 * 60
             if adtv < 5_000_000 and ticker not in ("SPY", "QQQ", "IWM", "DIA"):
                 return _reject(f"low_adtv (est ${adtv/1e6:.1f}M < $5M)")
 
-        # VWAP approximation
         vwap = None
         if highs and lows and volumes and len(highs) == len(lows) == len(volumes) == len(closes):
             tp_vol_sum = sum((highs[i] + lows[i] + closes[i]) / 3 * volumes[i]
@@ -246,48 +235,47 @@ def _analyze_ticker(
             if vol_sum > 0:
                 vwap = tp_vol_sum / vol_sum
 
-        # EMA crossovers
-        ema5 = _compute_ema(closes, EMA_FAST)
+        ema5  = _compute_ema(closes, EMA_FAST)
         ema12 = _compute_ema(closes, EMA_SLOW)
         if not ema5 or not ema12:
             return _reject("ema_computation_failed")
 
-        ema_bull = ema5[-1] > ema12[-1]
+        ema_bull     = ema5[-1] > ema12[-1]
         ema_dist_pct = ((ema5[-1] - ema12[-1]) / ema12[-1]) * 100 if ema12[-1] > 0 else 0
 
-        # MACD
-        macd = _compute_macd(closes)
+        macd  = _compute_macd(closes)
+        hlc3  = [(highs[i] + lows[i] + closes[i]) / 3
+                 for i in range(min(len(highs), len(lows), len(closes)))]
+        wt    = _compute_wavetrend(hlc3)
+        rsi   = _compute_rsi(closes, RSI_PERIOD)
 
-        # WaveTrend
-        hlc3 = [(highs[i] + lows[i] + closes[i]) / 3
-                for i in range(min(len(highs), len(lows), len(closes)))]
-        wt = _compute_wavetrend(hlc3)
-
-        # RSI
-        rsi = _compute_rsi(closes, RSI_PERIOD)
-
-        # Volume analysis
-        avg_vol = sum(volumes[-20:]) / min(20, len(volumes)) if volumes else 0
-        current_vol = volumes[-1] if volumes else 0
+        avg_vol      = sum(volumes[-20:]) / min(20, len(volumes)) if volumes else 0
+        current_vol  = volumes[-1] if volumes else 0
         volume_ratio = current_vol / avg_vol if avg_vol > 0 else 1.0
 
-        # Daily trend (for HTF confirmation)
-        daily_closes = daily_candle_fn(ticker, days=30)
-        daily_bull = None
+        # Current market phase (MORNING / MIDDAY / AFTERNOON)
+        try:
+            phase = current_phase()
+        except Exception:
+            phase = "UNKNOWN"
+
+        # Daily trend
+        daily_closes  = daily_candle_fn(ticker, days=30)
+        daily_bull    = None
         htf_confirmed = False
         htf_converging = False
-        htf_status = "UNKNOWN"
+        htf_status    = "UNKNOWN"
         if daily_closes and len(daily_closes) >= 21:
-            daily_ema8 = _compute_ema(daily_closes, 8)
+            daily_ema8  = _compute_ema(daily_closes, 8)
             daily_ema21 = _compute_ema(daily_closes, 21)
             if daily_ema8 and daily_ema21 and len(daily_ema8) >= 2:
-                daily_bull = daily_ema8[-1] > daily_ema21[-1]
+                daily_bull    = daily_ema8[-1] > daily_ema21[-1]
                 htf_confirmed = (daily_bull == ema_bull)
 
                 if htf_confirmed:
                     htf_status = "CONFIRMED"
                 else:
-                    daily_gap_now = abs(daily_ema8[-1] - daily_ema21[-1])
+                    daily_gap_now  = abs(daily_ema8[-1] - daily_ema21[-1])
                     daily_gap_prev = abs(daily_ema8[-2] - daily_ema21[-2])
                     if daily_gap_now < daily_gap_prev * 0.98:
                         htf_converging = True
@@ -297,20 +285,16 @@ def _analyze_ticker(
 
         # ── Score the setup ──
         score = 0
-        bias = "bull" if ema_bull else "bear"
-        score_breakdown = {}  # telemetry: what contributed to the score
+        bias  = "bull" if ema_bull else "bear"
+        score_breakdown = {}
 
-        # EMA alignment
         if abs(ema_dist_pct) > 0.03:
-            score += 15
-            score_breakdown["ema"] = 15
+            score += 15; score_breakdown["ema"] = 15
         elif abs(ema_dist_pct) > 0.01:
-            score += 8
-            score_breakdown["ema"] = 8
+            score += 8;  score_breakdown["ema"] = 8
         else:
             score_breakdown["ema"] = 0
 
-        # MACD confirmation
         if macd:
             if bias == "bull" and macd.get("macd_hist", 0) > 0:
                 score += 15; score_breakdown["macd_hist"] = 15
@@ -331,7 +315,6 @@ def _analyze_ticker(
             score_breakdown["macd_hist"] = 0
             score_breakdown["macd_cross"] = 0
 
-        # WaveTrend zone
         if wt:
             if bias == "bull" and wt.get("wt_oversold"):
                 score += 15; score_breakdown["wt"] = 15
@@ -350,20 +333,18 @@ def _analyze_ticker(
         else:
             score_breakdown["wt"] = 0
 
-        # VWAP position
         if vwap:
             if bias == "bull" and spot > vwap:
                 score += 10; score_breakdown["vwap"] = 10
             elif bias == "bear" and spot < vwap:
                 score += 10; score_breakdown["vwap"] = 10
             elif bias == "bull" and spot < vwap:
-                score -= 5; score_breakdown["vwap"] = -5
+                score -= 5;  score_breakdown["vwap"] = -5
             elif bias == "bear" and spot > vwap:
-                score -= 5; score_breakdown["vwap"] = -5
+                score -= 5;  score_breakdown["vwap"] = -5
         else:
             score_breakdown["vwap"] = 0
 
-        # Daily trend alignment
         if htf_confirmed:
             score += 15; score_breakdown["htf"] = 15
         elif daily_bull is not None:
@@ -374,15 +355,13 @@ def _analyze_ticker(
         else:
             score_breakdown["htf"] = 0
 
-        # Volume confirmation
         if volume_ratio > 1.5:
             score += 10; score_breakdown["volume"] = 10
         elif volume_ratio > 1.0:
-            score += 5; score_breakdown["volume"] = 5
+            score += 5;  score_breakdown["volume"] = 5
         else:
             score_breakdown["volume"] = 0
 
-        # RSI
         if rsi:
             if bias == "bull" and 40 < rsi < 65:
                 score += 5; score_breakdown["rsi"] = 5
@@ -393,14 +372,8 @@ def _analyze_ticker(
         else:
             score_breakdown["rsi"] = 0
 
-        # Data quality penalty for partial/minimal data
-        if data_quality == "partial":
-            score_breakdown["data_quality_note"] = "partial (20-39 bars)"
-        elif data_quality == "minimal":
-            score_breakdown["data_quality_note"] = "minimal (12-19 bars)"
-
         if score < MIN_SIGNAL_SCORE:
-            return _reject(f"below_threshold (score={score}, breakdown={score_breakdown})")
+            return _reject(f"below_threshold (score={score})")
 
         tier = "1" if score >= SIGNAL_TIER_1_SCORE else "2"
 
@@ -413,6 +386,7 @@ def _analyze_ticker(
             "data_quality": data_quality,
             "bar_count": bar_count,
             "close": spot,
+            "phase": phase,
             "ema5": ema5[-1],
             "ema12": ema12[-1],
             "ema_dist_pct": round(ema_dist_pct, 3),
@@ -444,10 +418,17 @@ def _analyze_ticker(
         return None
 
 
+# ═══════════════════════════════════════════════════════════
+# ACTIVE SCANNER CLASS
+# ═══════════════════════════════════════════════════════════
+
 class ActiveScanner:
     """
-    Background scanner that continuously monitors the watchlist
-    during market hours and generates signals.
+    Background scanner that continuously monitors the watchlist during
+    market hours and generates regime-filtered, fully-detailed signals.
+
+    v6.0: Integrates MarketRegimeDetector. Every signal is checked
+    against TICKER_RULES for the current regime before being posted.
     """
 
     def __init__(
@@ -456,50 +437,64 @@ class ActiveScanner:
         spot_fn: Callable,
         candle_fn: Callable,
         intraday_fn: Callable,
-        regime_fn: Callable = None,
-        vol_regime_fn: Callable = None,
+        regime_detector: Optional[MarketRegimeDetector] = None,
+        regime_fn: Callable = None,        # kept for backwards compat
+        vol_regime_fn: Callable = None,    # kept for backwards compat
     ):
-        self._enqueue = enqueue_fn
-        self._spot = spot_fn
-        self._candles = candle_fn
-        self._intraday = intraday_fn
-        self._regime = regime_fn
-        self._vol_regime = vol_regime_fn
+        self._enqueue      = enqueue_fn
+        self._spot         = spot_fn
+        self._candles      = candle_fn
+        self._intraday     = intraday_fn
+        self._vol_regime   = vol_regime_fn
+
+        # v6.0: regime detector (auto-detects BEAR/TRANSITION/BULL)
+        self._regime_detector: Optional[MarketRegimeDetector] = regime_detector
+
         self._thread = None
         self._running = False
-        self._last_scan: Dict[str, float] = {}  # ticker → last scan timestamp
-        self._signal_dedup: Dict[str, float] = {}  # ticker:bias → last signal timestamp
-        self._signal_dedup_ttl = 900  # don't re-signal same ticker+bias within 15 min
+        self._last_scan: Dict[str, float] = {}
+        self._signal_dedup: Dict[str, float] = {}
+        self._signal_dedup_ttl = 900   # 15 min dedup window
 
-    def start(self):
-        if self._thread and self._thread.is_alive():
-            log.info("Scanner already running")
+        # Track last regime refresh date
+        self._last_regime_refresh_date: Optional[date] = None
+
+    # ── Regime helpers ───────────────────────────────────────
+
+    def _get_regime(self) -> str:
+        """Returns current market regime string."""
+        if self._regime_detector:
+            return self._regime_detector.get_regime()
+        return get_market_regime()
+
+    def _refresh_regime_if_needed(self):
+        """Refresh regime once per day at market open."""
+        if self._regime_detector is None:
             return
-        self._running = True
-        self._thread = threading.Thread(target=self._loop, daemon=True, name="active-scanner")
-        self._thread.start()
-        log.info("Active scanner started")
+        today = date.today()
+        if self._last_regime_refresh_date == today:
+            return
+        try:
+            new_regime = self._regime_detector.refresh(
+                daily_candle_fn=lambda t, days=60: self._candles(t, days=days)
+            )
+            self._last_regime_refresh_date = today
+            log.info(f"Regime refreshed: {new_regime}")
+        except Exception as e:
+            log.error(f"Regime refresh failed: {e}", exc_info=True)
 
-    def stop(self):
-        self._running = False
-        log.info("Active scanner stopping")
+    # ── Dedup helpers ────────────────────────────────────────
 
-    def _is_market_hours(self) -> bool:
-        return is_equity_session()
-
-    def _should_scan(self, ticker: str, interval: int) -> bool:
-        last = self._last_scan.get(ticker, 0)
-        return (time.time() - last) >= interval
+    def _setup_hash(self, ticker: str, signal: dict) -> str:
+        bias       = signal.get("bias", "?")
+        htf        = signal.get("htf_status", "?")
+        vwap_side  = "above" if signal.get("above_vwap") else "below"
+        score_bkt  = (signal.get("score", 0) // 10) * 10
+        phase      = signal.get("phase", "?")
+        return f"{ticker}:{bias}:{htf}:{vwap_side}:{score_bkt}:{phase}"
 
     def _is_deduped(self, ticker: str, signal: dict) -> bool:
-        """
-        v5.1: Setup-hash dedup. Deduplicates on a richer signature than
-        just ticker:bias, so materially different setups at the same ticker
-        can fire while identical re-fires are suppressed.
-
-        Hash components: ticker, direction, htf_status, vwap_side, score_bucket
-        """
-        key = self._setup_hash(ticker, signal)
+        key  = self._setup_hash(ticker, signal)
         last = self._signal_dedup.get(key, 0)
         return (time.time() - last) < self._signal_dedup_ttl
 
@@ -507,17 +502,13 @@ class ActiveScanner:
         key = self._setup_hash(ticker, signal)
         self._signal_dedup[key] = time.time()
 
-    @staticmethod
-    def _setup_hash(ticker: str, signal: dict) -> str:
-        """Build a setup signature for dedup."""
-        bias = signal.get("bias", "?")
-        htf = signal.get("htf_status", "?")
-        vwap_side = "above" if signal.get("above_vwap") else "below"
-        score_bucket = (signal.get("score", 0) // 10) * 10  # 50, 60, 70, etc
-        return f"{ticker}:{bias}:{htf}:{vwap_side}:{score_bucket}"
+    # ── Core scan ────────────────────────────────────────────
 
     def _scan_ticker(self, ticker: str):
-        """Analyze one ticker and enqueue signal if setup detected."""
+        """
+        Analyze one ticker. If it passes technical analysis AND the
+        regime-aware rule filter, build a full-detail alert and enqueue.
+        """
         self._last_scan[ticker] = time.time()
 
         signal = _analyze_ticker(
@@ -525,37 +516,50 @@ class ActiveScanner:
             intraday_fn=self._intraday,
             daily_candle_fn=self._candles,
         )
-
         if not signal:
-            self._scan_no_signal_count = getattr(self, '_scan_no_signal_count', 0) + 1
             return
 
-        bias = signal["bias"]
-        tier = signal["tier"]
-        score = signal["score"]
+        score  = signal["score"]
+        bias   = signal["bias"]
+        tier   = signal["tier"]
+        regime = self._get_regime()
 
-        # Log all scored setups, even if below threshold or deduped
-        if score < MIN_SIGNAL_SCORE:
-            log.debug(f"Scanner {ticker}: score={score} ({bias}) — below minimum {MIN_SIGNAL_SCORE}")
-            self._scan_below_threshold_count = getattr(self, '_scan_below_threshold_count', 0) + 1
+        # ── Regime-aware rule filter ──────────────────────────
+        # Only tickers in TICKER_RULES are allowed through.
+        # Everything else is suppressed — no ungated alerts.
+        if ticker not in TICKER_RULES:
+            log.debug(f"Scanner {ticker}: not in TICKER_RULES — suppressed")
             return
 
-        # v5.1: Setup-hash dedup — materially different setups can fire
+        if not is_signal_valid(ticker, regime, signal):
+            log.debug(
+                f"Scanner {ticker}: {bias} score={score} htf={signal['htf_status']} "
+                f"phase={signal.get('phase')} — filtered (regime={regime})"
+            )
+            return
+
+        # ── Dedup ────────────────────────────────────────────
         if self._is_deduped(ticker, signal):
-            log.debug(f"Scanner {ticker}: {bias} T{tier} score={score} — deduped "
-                      f"(hash={self._setup_hash(ticker, signal)})")
+            log.debug(
+                f"Scanner {ticker}: {bias} T{tier} score={score} — deduped"
+            )
             return
 
-        log.info(f"Scanner signal: {ticker} {bias.upper()} T{tier} "
-                 f"(score={signal['score']}, vol_ratio={signal['volume_ratio']:.1f}x)")
+        log.info(
+            f"Scanner signal: {ticker} {bias.upper()} T{tier} "
+            f"(score={score}, regime={regime}, htf={signal['htf_status']}, "
+            f"vol_ratio={signal['volume_ratio']:.1f}x)"
+        )
 
-        # Build webhook_data matching TV format
+        # ── Build webhook data ────────────────────────────────
         webhook_data = {
             "tier": tier,
             "bias": bias,
             "close": signal["close"],
+            "phase": signal.get("phase", ""),
             "time": datetime.now(CT).strftime("%H:%M:%S"),
             "received_at_epoch": time.time(),
+            "market_regime": regime,
             "ema5": signal["ema5"],
             "ema12": signal["ema12"],
             "ema_dist_pct": signal["ema_dist_pct"],
@@ -581,53 +585,93 @@ class ActiveScanner:
             "volume": signal["volume"],
             "timeframe": "5",
             "source": "active_scanner",
-            # v5.1: institutional additions
             "data_quality": signal.get("data_quality", "unknown"),
             "bar_count": signal.get("bar_count", 0),
             "score_breakdown": signal.get("score_breakdown", {}),
             "setup_hash": self._setup_hash(ticker, signal),
         }
 
-        tier_emoji = "🥇" if tier == "1" else "🥈"
-        dir_emoji = "🐻" if bias == "bear" else "🐂"
-        wt2 = signal.get("wt2", 0)
-        wave_zone = "🟢 Oversold" if wt2 < -30 else "🔴 Overbought" if wt2 > 60 else "⚪ Neutral"
-        vol_str = f"📊 {signal['volume_ratio']:.1f}x avg" if signal.get("volume_ratio", 0) > 1.2 else ""
-
-        # HTF status display
-        _htf_s = signal.get("htf_status", "UNKNOWN")
-        _htf_display = {"CONFIRMED": "✅ Confirmed", "CONVERGING": "🟡 Converging",
-                        "OPPOSING": "🔴 Opposing", "UNKNOWN": "⚪ No data"}.get(_htf_s, f"❓ {_htf_s}")
-
-        # Data quality indicator
-        _dq = signal.get("data_quality", "unknown")
-        _dq_display = {"full": "", "partial": " ⚠️partial-data", "minimal": " ⚠️minimal-data"}.get(_dq, "")
-
-        signal_msg = "\n".join([
-            f"{tier_emoji} SCAN Signal — {ticker} (T{tier} {dir_emoji} {bias.upper()}){_dq_display}",
-            f"Close: ${signal['close']:.2f} | 5m scan | {signal.get('bar_count', 0)} bars",
-            f"HTF: {_htf_display} | "
-            f"Daily: {'🟢' if signal['daily_bull'] is True else '🔴' if signal['daily_bull'] is False else '⚪ N/A'}",
-            f"Wave: {wave_zone} (wt2={wt2:.1f})",
-            f"VWAP: {'Above ✅' if signal['above_vwap'] else 'Below'} | "
-            f"RSI: {signal.get('rsi_mfi', 0):.0f}" + (f" | {vol_str}" if vol_str else ""),
-            "",
-        ])
+        # ── Build alert message ───────────────────────────────
+        signal_msg = build_alert_message(ticker, regime, signal)
 
         self._enqueue("tv", ticker, bias, webhook_data, signal_msg)
         self._mark_signaled(ticker, signal)
+
+    def _legacy_message(
+        self,
+        ticker: str,
+        bias: str,
+        tier: str,
+        signal: dict,
+        regime: str,
+    ) -> str:
+        """Fallback message format for tickers not in TICKER_RULES."""
+        tier_emoji  = "🥇" if tier == "1" else "🥈"
+        dir_emoji   = "🐻" if bias == "bear" else "🐂"
+        regime_emoji = {"BEAR": "🔴", "TRANSITION": "🟡", "BULL": "🟢"}.get(regime, "⚪")
+        wt2         = signal.get("wt2", 0)
+        wave_zone   = ("🟢 Oversold" if wt2 < -30 else
+                       "🔴 Overbought" if wt2 > 60 else "⚪ Neutral")
+        vol_str = (f"📊 {signal['volume_ratio']:.1f}x avg"
+                   if signal.get("volume_ratio", 0) > 1.2 else "")
+        htf_display = {
+            "CONFIRMED": "✅ Confirmed", "CONVERGING": "🟡 Converging",
+            "OPPOSING": "🔴 Opposing", "UNKNOWN": "⚪ No data",
+        }.get(signal.get("htf_status", "UNKNOWN"), "❓")
+        dq = signal.get("data_quality", "unknown")
+        dq_display = {"full": "", "partial": " ⚠️partial-data",
+                      "minimal": " ⚠️minimal-data"}.get(dq, "")
+        rsi = signal.get("rsi_mfi")
+        rsi_str = f"RSI: {rsi:.0f}" if rsi else ""
+
+        return "\n".join([
+            f"{tier_emoji} SCAN — {ticker} {dir_emoji} {bias.upper()}{dq_display}  {regime_emoji} {regime}",
+            f"Close: ${signal['close']:.2f} | Phase: {signal.get('phase','')} | Score: {signal['score']}",
+            f"HTF: {htf_display} | Daily: {'🟢' if signal['daily_bull'] else '🔴' if signal['daily_bull'] is False else '⚪'}",
+            f"Wave: {wave_zone} (wt2={wt2:.1f})",
+            f"VWAP: {'Above ✅' if signal['above_vwap'] else 'Below'} | {rsi_str} | {vol_str}",
+            "",
+        ])
+
+    # ── Scanner lifecycle ────────────────────────────────────
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            log.info("Scanner already running")
+            return
+        self._running = True
+        self._thread  = threading.Thread(
+            target=self._loop, daemon=True, name="active-scanner"
+        )
+        self._thread.start()
+        log.info("Active scanner started (v6.0 — regime-aware)")
+
+    def stop(self):
+        self._running = False
+        log.info("Active scanner stopping")
+
+    def _is_market_hours(self) -> bool:
+        return is_equity_session()
+
+    def _should_scan(self, ticker: str, interval: int) -> bool:
+        last = self._last_scan.get(ticker, 0)
+        return (time.time() - last) >= interval
 
     def _loop(self):
         """Main scanner loop. Runs during market hours."""
         log.info("Scanner loop started")
         _cycle_count = 0
         _last_summary = time.time()
-        SUMMARY_INTERVAL = 300  # log summary every 5 min
+        SUMMARY_INTERVAL = 300
+
         while self._running:
             try:
                 if not self._is_market_hours():
                     time.sleep(60)
                     continue
+
+                # Refresh regime once per day (at first scan after open)
+                self._refresh_regime_if_needed()
 
                 _scanned_this_cycle = 0
 
@@ -651,20 +695,18 @@ class ActiveScanner:
 
                 _cycle_count += 1
 
-                # Periodic summary log so we know the scanner is alive
                 if time.time() - _last_summary >= SUMMARY_INTERVAL:
-                    _no_sig = getattr(self, '_scan_no_signal_count', 0)
-                    _below = getattr(self, '_scan_below_threshold_count', 0)
-                    _sigs = len(self._signal_dedup)
-                    log.info(f"Scanner summary: {len(self._last_scan)} tickers tracked, "
-                             f"{_sigs} signals generated, "
-                             f"{_no_sig} no-data, {_below} below-threshold, "
-                             f"cycle #{_cycle_count}")
-                    self._scan_no_signal_count = 0
-                    self._scan_below_threshold_count = 0
+                    regime = self._get_regime()
+                    active = get_active_tickers(regime)
+                    log.info(
+                        f"Scanner summary: regime={regime}, "
+                        f"active_tickers={active}, "
+                        f"cycle=#{_cycle_count}, "
+                        f"dedup_keys={len(self._signal_dedup)}"
+                    )
                     _last_summary = time.time()
 
-                time.sleep(30)  # check loop every 30s
+                time.sleep(30)
 
             except Exception as e:
                 log.error(f"Scanner loop error: {e}", exc_info=True)
@@ -672,17 +714,26 @@ class ActiveScanner:
 
         log.info("Scanner loop stopped")
 
+    # ── Status ───────────────────────────────────────────────
+
     @property
     def watchlist_size(self) -> int:
         return len(TIER_A) + len(TIER_B) + len(TIER_C)
 
     @property
     def status(self) -> Dict:
+        regime = self._get_regime()
         return {
             "running": self._running,
+            "market_regime": regime,
+            "active_tickers": get_active_tickers(regime),
             "watchlist_size": self.watchlist_size,
             "tickers_scanned": len(self._last_scan),
             "signals_generated": len(self._signal_dedup),
+            "regime_detector": (
+                self._regime_detector.get_status()
+                if self._regime_detector else None
+            ),
             "tier_a": TIER_A,
             "tier_b": TIER_B,
             "tier_c": TIER_C,
