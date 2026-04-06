@@ -786,7 +786,14 @@ SWING_SCAN_TIMES_CT = {
     "14:45": "approach_warn", # new — early warning, not actionable
     "08:45": "entry_confirm", # new — confirm or invalidate prior signal
 }
-SWING_SCAN_LOOKBACK_DAYS     = 120     # daily bars to fetch (need 50+ for pivots)
+# v5.2: raised from 120 to 310 calendar days.
+# 120 days (~85 trading days) was too short for two reasons:
+#   1. analyze_swing_setup() requires SWING_WEEKLY_EMA_SLOW+2 = 22 weekly bars,
+#      which needs ~154 calendar days of data to form.
+#   2. The 50/200 SMA primary-trend filter requires 200 trading days
+#      (~280 calendar days). At 120 days it was always "neutral".
+# 310 calendar days ≈ 221 trading days — clears both gates with margin.
+SWING_SCAN_LOOKBACK_DAYS     = 310
 
 # ── Confirmed tickers — backtested and approved ──
 # ONLY these tickers fire swing signals. All others are suppressed
@@ -970,3 +977,4 @@ CRISIS_PUT_BLACKLIST = {
     "GLD", "SLV", "NEM", "IAU", "BWXT", "TLT", "NOC", "RTX",
     "PEP", "KO", "JNJ", "PG", "VZ", "T",  # defensive consumer/telecom
 }
+
