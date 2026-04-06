@@ -183,30 +183,64 @@ def _aggregate_weekly(bars: List[dict]) -> List[dict]:
 
 _yf_cache: Dict[str, tuple] = {}
 _yf_cache_lock = threading.Lock()
-_YF_CACHE_TTL = 14400  # 4 hours
+# v5.2: reduced from 4 h to 55 min.  The old TTL caused the 15:30
+# post-close scan to reuse the cache built by the 14:45 approach scan,
+# so the actionable scan was evaluating pre-close data.
+_YF_CACHE_TTL = 3300  # 55 minutes
+
+
+def _yf_session_key() -> str:
+    """
+    Session bucket: changes at 15:00 CT (market close) so the pre-close
+    approach scan and post-close signal scan are stored under different keys.
+
+    Uses _now_ct() from market_clock — the same CT-aware clock the scheduler
+    uses — so this is correct on UTC-based servers (e.g. Render) where
+    datetime.now() would return UTC time, causing the 14:45 CT and 15:30 CT
+    scans to both land after 15:00 UTC and share the same stale "post" bucket.
+    """
+    try:
+        from market_clock import _now_ct
+        now_ct = _now_ct()
+    except Exception:
+        # Fallback: assume local time if market_clock unavailable (dev machines)
+        from datetime import timezone, timedelta
+        now_ct = datetime.now(tz=timezone(timedelta(hours=-5)))
+
+    sess = "post" if (now_ct.hour > 15 or (now_ct.hour == 15 and now_ct.minute >= 0)) \
+           else "pre"
+    return f"{now_ct.strftime('%Y-%m-%d')}:{sess}"
 
 
 def fetch_daily_bars_yahoo(ticker: str, days: int = 120) -> List[dict]:
     """
     Fetch daily OHLCV from Yahoo Finance. Free, unlimited.
     Returns list of dicts: [{date, o, h, l, c, v}, ...]
-    Cached for 4 hours.
+
+    v5.2 fixes:
+      - end date is now end+1 day: yfinance `end` is exclusive, so
+        without this every scan excludes today's bar entirely.
+      - Cache key includes session bucket so 14:45 and 15:30 scans
+        never share a stale pre-close dataset.
     """
     if not _YF_AVAILABLE:
         log.warning("yfinance not installed — pip install yfinance")
         return []
 
-    cache_key = f"yf:{ticker}:{days}"
+    cache_key = f"yf:{ticker}:{days}:{_yf_session_key()}"
     with _yf_cache_lock:
         cached = _yf_cache.get(cache_key)
         if cached and (time.time() - cached[1]) < _YF_CACHE_TTL:
             return cached[0]
 
     try:
-        end = datetime.now()
+        end   = datetime.now()
         start = end - timedelta(days=days + 10)
+        # yfinance end is EXCLUSIVE — add 1 day so today's bar is included.
+        end_incl = end + timedelta(days=1)
         df = yf.download(ticker, start=start.strftime("%Y-%m-%d"),
-                         end=end.strftime("%Y-%m-%d"), progress=False, auto_adjust=True)
+                         end=end_incl.strftime("%Y-%m-%d"),
+                         progress=False, auto_adjust=True)
         if df is None or df.empty:
             return []
 
@@ -436,6 +470,13 @@ def analyze_swing_setup(
     Includes all institutional enrichment.
     """
     if not daily_bars or len(daily_bars) < 60:
+        return None
+
+    # ── v5.2: SWING_REMOVED_TICKERS gate ──
+    # These tickers were confirmed bad in backtests.  Block them here so they
+    # can never generate signals even if left in the watchlist by accident.
+    if ticker in SWING_REMOVED_TICKERS:
+        log.debug(f"Swing scanner {ticker}: in SWING_REMOVED_TICKERS — skipping")
         return None
 
     closes = [b["c"] for b in daily_bars]
@@ -829,6 +870,8 @@ def analyze_swing_setup(
         "scan_time": datetime.now().isoformat(),
         "source": "swing_scanner",
         "type": "swing",
+        # v5.2: store real VIX so downstream gets actual vol regime, not a fake 20.0 default
+        "vix": round(vix, 1),
     }
 
     log.info(f"Swing scanner {ticker}: T{tier} {direction.upper()} at fib {fib_level}% "
@@ -926,11 +969,14 @@ class SwingScanner:
                 )
 
                 if signal:
-                    # Cooldown: don't re-signal same ticker+direction within 24h
+                    # v5.2: use SWING_COOLDOWN_BARS (daily bars) not a hardcoded 24h.
+                    # SWING_COOLDOWN_BARS = 3 → 3 trading days (~3 * 86400 s).
+                    cooldown_secs = SWING_COOLDOWN_BARS * 86400
                     cd_key = f"{ticker}:{signal['direction']}"
                     last = self._signal_cooldown.get(cd_key, 0)
-                    if time.time() - last < 86400:
-                        log.debug(f"Swing scanner {ticker}: {signal['direction']} cooldown active")
+                    if time.time() - last < cooldown_secs:
+                        log.debug(f"Swing scanner {ticker}: {signal['direction']} "
+                                  f"cooldown active ({SWING_COOLDOWN_BARS}d)")
                         continue
                     self._signal_cooldown[cd_key] = time.time()
                     all_signals.append(signal)
@@ -1081,6 +1127,9 @@ class SwingScanner:
                     del self._prior_signals[key]
                 else:
                     confirmations.append(entry)
+                    # v5.2: also remove confirmed signals so they don't keep
+                    # re-confirming on subsequent mornings until overwritten.
+                    del self._prior_signals[key]
 
             except Exception as e:
                 log.warning(f"Entry confirmation error {ticker}: {e}")
@@ -1319,7 +1368,7 @@ class SwingScanner:
             "scalp_tickers": len(SWING_WATCHLIST - SWING_ONLY_TICKERS),
             "swing_only_tickers": len(SWING_ONLY_TICKERS),
             "signals_today": len([k for k, v in self._signal_cooldown.items()
-                                  if time.time() - v < 86400]),
+                                  if time.time() - v < SWING_COOLDOWN_BARS * 86400]),
             "last_scans": {k: v for k, v in self._last_scan.items()},
         }
 
