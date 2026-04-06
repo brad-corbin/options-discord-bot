@@ -63,10 +63,12 @@ def download_5min(ticker, from_date, to_date):
         print(f"  WARNING: status={data.get('s')}"); return []
     bars = []
     for i, ts in enumerate(data.get("t", [])):
-        dt_ct = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(
+        # MarketData.app sometimes returns timestamps as strings — cast defensively
+        ts_int = int(float(ts))
+        dt_ct = datetime.fromtimestamp(ts_int, tz=timezone.utc).astimezone(
             timezone(timedelta(hours=-5)))
         bars.append({
-            "ts": ts, "date": dt_ct.strftime("%Y-%m-%d"),
+            "ts": ts_int, "date": dt_ct.strftime("%Y-%m-%d"),
             "time_ct": dt_ct.strftime("%H:%M"),
             "o": data["o"][i] if i < len(data.get("o", [])) else None,
             "h": data["h"][i] if i < len(data.get("h", [])) else None,
@@ -89,7 +91,9 @@ def download_daily(ticker, from_date, to_date):
             print(f"  WARNING: status={data.get('s')}"); return []
         bars = []
         for i, ts in enumerate(data.get("t", [])):
-            dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+            # Cast defensively — API can return timestamps as strings
+            ts_int = int(float(ts))
+            dt = datetime.fromtimestamp(ts_int, tz=timezone.utc)
             bars.append({
                 "date": dt.strftime("%Y-%m-%d"),
                 "c": data["c"][i] if i < len(data.get("c", [])) else None,
