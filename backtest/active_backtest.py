@@ -54,6 +54,56 @@ def _md_get(url, params):
     sys.exit("ERROR: max retries")
 
 
+def _parse_ts(ts) -> datetime:
+    """
+    Convert a MarketData.app timestamp to a CT-aware datetime.
+
+    The API is supposed to return Unix timestamps when dateformat=timestamp
+    is requested, but in practice it sometimes returns ISO strings like
+    '2025-10-08 09:30:00 -04:00'. This function handles both cases:
+      - int / float  → treat as Unix timestamp
+      - numeric str  → convert via float() then use as Unix timestamp
+      - ISO str      → parse with strptime, handling the colon in the UTC offset
+    """
+    CT_OFFSET = timezone(timedelta(hours=-5))
+
+    if isinstance(ts, (int, float)):
+        return datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(CT_OFFSET)
+
+    ts_str = str(ts).strip()
+
+    # Try numeric string first ('1728403500' or '1728403500.0')
+    try:
+        return datetime.fromtimestamp(float(ts_str), tz=timezone.utc).astimezone(CT_OFFSET)
+    except (ValueError, OSError):
+        pass
+
+    # ISO datetime string: '2025-10-08 09:30:00 -04:00'
+    # strptime %z understands '+HHMM' but not '+HH:MM' — remove the colon
+    if len(ts_str) >= 6 and ts_str[-3] == ':' and ts_str[-6] in ('+', '-'):
+        ts_str = ts_str[:-3] + ts_str[-2:]      # '2025-10-08 09:30:00 -0400'
+
+    for fmt in ("%Y-%m-%d %H:%M:%S %z", "%Y-%m-%dT%H:%M:%S%z",
+                "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            dt = datetime.strptime(ts_str, fmt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(CT_OFFSET)
+        except ValueError:
+            continue
+
+    raise ValueError(f"Cannot parse timestamp: {ts!r}")
+
+
+def _ts_sort_key(ts) -> int:
+    """Return a sortable integer from any timestamp format."""
+    try:
+        return int(_parse_ts(ts).timestamp())
+    except Exception:
+        return 0
+
+
 def download_5min(ticker, from_date, to_date):
     url = f"https://api.marketdata.app/v1/stocks/candles/5/{ticker}/"
     params = {"from": from_date, "to": to_date, "dateformat": "timestamp"}
@@ -63,12 +113,14 @@ def download_5min(ticker, from_date, to_date):
         print(f"  WARNING: status={data.get('s')}"); return []
     bars = []
     for i, ts in enumerate(data.get("t", [])):
-        # MarketData.app sometimes returns timestamps as strings — cast defensively
-        ts_int = int(float(ts))
-        dt_ct = datetime.fromtimestamp(ts_int, tz=timezone.utc).astimezone(
-            timezone(timedelta(hours=-5)))
+        try:
+            dt_ct = _parse_ts(ts)
+        except ValueError as e:
+            print(f"  WARNING: skipping bar with unparseable timestamp {ts!r}: {e}")
+            continue
         bars.append({
-            "ts": ts_int, "date": dt_ct.strftime("%Y-%m-%d"),
+            "ts":      _ts_sort_key(ts),
+            "date":    dt_ct.strftime("%Y-%m-%d"),
             "time_ct": dt_ct.strftime("%H:%M"),
             "o": data["o"][i] if i < len(data.get("o", [])) else None,
             "h": data["h"][i] if i < len(data.get("h", [])) else None,
@@ -91,9 +143,11 @@ def download_daily(ticker, from_date, to_date):
             print(f"  WARNING: status={data.get('s')}"); return []
         bars = []
         for i, ts in enumerate(data.get("t", [])):
-            # Cast defensively — API can return timestamps as strings
-            ts_int = int(float(ts))
-            dt = datetime.fromtimestamp(ts_int, tz=timezone.utc)
+            try:
+                dt = _parse_ts(ts)
+            except ValueError as e:
+                print(f"  WARNING: skipping daily bar {ts!r}: {e}")
+                continue
             bars.append({
                 "date": dt.strftime("%Y-%m-%d"),
                 "c": data["c"][i] if i < len(data.get("c", [])) else None,
