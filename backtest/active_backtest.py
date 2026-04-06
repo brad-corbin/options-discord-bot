@@ -58,12 +58,12 @@ def _parse_ts(ts) -> datetime:
     """
     Convert a MarketData.app timestamp to a CT-aware datetime.
 
-    The API is supposed to return Unix timestamps when dateformat=timestamp
-    is requested, but in practice it sometimes returns ISO strings like
-    '2025-10-08 09:30:00 -04:00'. This function handles both cases:
-      - int / float  → treat as Unix timestamp
-      - numeric str  → convert via float() then use as Unix timestamp
-      - ISO str      → parse with strptime, handling the colon in the UTC offset
+    Handles all formats the API returns:
+      - int / float        → Unix timestamp
+      - numeric string     → float() then Unix timestamp
+      - 'YYYY-MM-DD HH:MM:SS ±HH:MM'  → ISO with colon offset (strip colon first)
+      - 'YYYY-MM-DDTHH:MM:SS±HH:MM'   → ISO T-format
+      - 'YYYY-MM-DD'                   → bare date (treated as noon UTC to avoid date shift)
     """
     CT_OFFSET = timezone(timedelta(hours=-5))
 
@@ -72,16 +72,16 @@ def _parse_ts(ts) -> datetime:
 
     ts_str = str(ts).strip()
 
-    # Try numeric string first ('1728403500' or '1728403500.0')
+    # Numeric string ('1728403500' or '1728403500.0')
     try:
         return datetime.fromtimestamp(float(ts_str), tz=timezone.utc).astimezone(CT_OFFSET)
     except (ValueError, OSError):
         pass
 
-    # ISO datetime string: '2025-10-08 09:30:00 -04:00'
-    # strptime %z understands '+HHMM' but not '+HH:MM' — remove the colon
+    # ISO string with colon in UTC offset: '2025-10-08 09:30:00 -04:00'
+    # strptime %z handles +HHMM but not +HH:MM — strip the colon
     if len(ts_str) >= 6 and ts_str[-3] == ':' and ts_str[-6] in ('+', '-'):
-        ts_str = ts_str[:-3] + ts_str[-2:]      # '2025-10-08 09:30:00 -0400'
+        ts_str = ts_str[:-3] + ts_str[-2:]
 
     for fmt in ("%Y-%m-%d %H:%M:%S %z", "%Y-%m-%dT%H:%M:%S%z",
                 "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
@@ -93,7 +93,39 @@ def _parse_ts(ts) -> datetime:
         except ValueError:
             continue
 
+    # Bare date string: '2025-12-19' — use noon UTC to avoid CT date-shift
+    try:
+        dt = datetime.strptime(ts_str[:10], "%Y-%m-%d")
+        dt = dt.replace(hour=12, tzinfo=timezone.utc)
+        return dt.astimezone(CT_OFFSET)
+    except ValueError:
+        pass
+
     raise ValueError(f"Cannot parse timestamp: {ts!r}")
+
+
+def _parse_date_str(ts) -> str:
+    """
+    Extract just the YYYY-MM-DD trading date from any timestamp format.
+    For daily bars: the API returns the date as-is ('2025-12-19') — use it directly.
+    For other formats: extract the date portion without timezone conversion so the
+    trading date is preserved regardless of the server's local timezone.
+    """
+    ts_str = str(ts).strip()
+
+    # Bare date already — the daily bars endpoint returns these directly
+    if len(ts_str) == 10 and ts_str[4] == '-' and ts_str[7] == '-':
+        return ts_str
+
+    # Datetime string — first 10 chars are always the date
+    if len(ts_str) > 10 and ts_str[4] == '-' and ts_str[7] == '-':
+        return ts_str[:10]
+
+    # Unix timestamp — convert via _parse_ts and take the CT date
+    try:
+        return _parse_ts(ts).strftime("%Y-%m-%d")
+    except Exception:
+        raise ValueError(f"Cannot parse date from: {ts!r}")
 
 
 def _ts_sort_key(ts) -> int:
@@ -144,12 +176,14 @@ def download_daily(ticker, from_date, to_date):
         bars = []
         for i, ts in enumerate(data.get("t", [])):
             try:
-                dt = _parse_ts(ts)
+                # Use _parse_date_str — preserves the trading date directly
+                # without timezone conversion (daily bars return bare dates)
+                date_str = _parse_date_str(ts)
             except ValueError as e:
                 print(f"  WARNING: skipping daily bar {ts!r}: {e}")
                 continue
             bars.append({
-                "date": dt.strftime("%Y-%m-%d"),
+                "date": date_str,
                 "c": data["c"][i] if i < len(data.get("c", [])) else None,
             })
         bars = [b for b in bars if b["c"] is not None]
