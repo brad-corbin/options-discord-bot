@@ -145,7 +145,6 @@ from sector_rotation import (
     format_sector_line,
 )
 from active_scanner import ActiveScanner
-from market_regime import init_regime_detector 
 from swing_scanner import SwingScanner
 from portfolio_greeks import PortfolioGreeks
 from regime_detector import RegimeDetector
@@ -7675,15 +7674,16 @@ def _em_scheduler():
 
             # ── v5.1: OI Tracker — morning summary + end-of-day flush ──
             if _oi_tracker:
-                # Morning summary at 9:00 AM CT
+                # Morning unusual flow post at 9:00 AM CT (before sweep runs)
+                # Posts yesterday's closing OI vs prior day — overnight positioning.
                 _oi_sum_key = (date_str, "oi_summary")
                 if _oi_sum_key not in fired_today and _oi_tracker.should_post_summary():
                     fired_today.add(_oi_sum_key)
                     try:
-                        _oi_msg = _oi_tracker.format_morning_summary()
-                        if _oi_msg and "No significant" not in _oi_msg:
+                        _oi_msg = _oi_tracker.format_unusual_flow()
+                        if _oi_msg and "No unusual" not in _oi_msg:
                             post_to_telegram(_oi_msg)
-                            log.info("OI tracker: morning summary posted")
+                            log.info("OI tracker: unusual flow summary posted")
                     except Exception as _oe:
                         log.debug(f"OI tracker summary error: {_oe}")
 
@@ -7698,60 +7698,47 @@ def _em_scheduler():
                         except Exception as _oe:
                             log.debug(f"OI tracker flush error: {_oe}")
 
-                # Daily OI sweep at 4:10 PM CT — fetch chains for broad watchlist
+                # Daily OI forward sweep at 9:30 AM CT (market open)
+                # Captures overnight institutional positioning on forward expirations.
+                # Compares today's opening OI vs yesterday's close snapshot.
                 _oi_sweep_key = (date_str, "oi_sweep")
                 if _oi_sweep_key not in fired_today and _oi_tracker.should_run_sweep():
                     fired_today.add(_oi_sweep_key)
                     try:
-                        # v5.1.1: SPY/QQQ get FULL chains (no strikeLimit) for complete
-                        # OI wall tracking. All other tickers use strikeLimit=20.
-                        # Cost: ~678 credits/day for full SPY+QQQ vs ~80 with limit.
-                        _FULL_CHAIN_TICKERS = {"SPY", "QQQ"}
+                        from oi_tracker import OI_FORWARD_MIN_DTE, OI_FORWARD_MAX_DTE
 
-                        def _oi_sweep_chain_fn(ticker):
-                            """Fetch nearest-DTE chain for OI sweep.
-                            SPY/QQQ get full chains for complete OI wall visibility."""
+                        def _oi_forward_chain_fn(ticker: str, expiration: str):
+                            """
+                            Fetch a specific forward expiration chain for OI tracking.
+                            Uses strikeLimit=None for SPY/QQQ (need all strikes for wall detection),
+                            strikeLimit=20 for everything else (cost control).
+                            """
                             try:
-                                ticker_upper = ticker.strip().upper()
-                                use_full = ticker_upper in _FULL_CHAIN_TICKERS
-
-                                if use_full:
-                                    # Full chain — no strikeLimit, all strikes visible for OI tracking
-                                    spot = get_spot(ticker_upper)
-                                    today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-                                    target = today_utc
-                                    data = _cached_md.get_chain(ticker_upper, target, strike_limit=None)
-                                    if not isinstance(data, dict) or data.get("s") != "ok" or not data.get("optionSymbol"):
-                                        exps = get_expirations(ticker_upper)
-                                        future_exps = [e for e in exps if e >= target]
-                                        if future_exps:
-                                            target = future_exps[0]
-                                            data = _cached_md.get_chain(ticker_upper, target, strike_limit=None)
-                                        else:
-                                            return []
-                                    if data and data.get("optionSymbol"):
-                                        n_sym = len(data.get("optionSymbol", []))
-                                        log.info(f"OI sweep {ticker_upper}: FULL chain {n_sym} contracts "
-                                                 f"(~{n_sym} credits) for {target}")
-                                        dte = max(0, (datetime.strptime(target, "%Y-%m-%d").date() - datetime.now().date()).days)
-                                        return [(target, dte, data)]
-                                    return []
-                                else:
-                                    # Normal path — strikeLimit=20 (via _get_0dte_chain)
-                                    data, _spot, _target = _get_0dte_chain(ticker)
-                                    if data and data.get("optionSymbol"):
-                                        dte = max(0, (datetime.strptime(_target, "%Y-%m-%d").date() - datetime.now().date()).days) if _target else 0
-                                        return [(_target, dte, data)]
+                                full_chain_tickers = {"SPY", "QQQ"}
+                                t = ticker.strip().upper()
+                                limit = None if t in full_chain_tickers else 20
+                                data = _cached_md.get_chain(t, expiration, strike_limit=limit)
+                                if isinstance(data, dict) and data.get("s") == "ok" and data.get("optionSymbol"):
+                                    return data
                             except Exception as e:
-                                log.debug(f"OI sweep chain error for {ticker}: {e}")
-                            return []
+                                log.debug(f"OI chain fetch {ticker} {expiration}: {e}")
+                            return None
+
+                        def _oi_expirations_fn(ticker: str):
+                            """Return all available expirations for a ticker."""
+                            try:
+                                return get_expirations(ticker.strip().upper()) or []
+                            except Exception:
+                                return []
+
                         def _run_sweep():
                             _oi_tracker.run_daily_sweep(
-                                chain_fn=_oi_sweep_chain_fn,
+                                chain_fn=_oi_forward_chain_fn,
                                 spot_fn=get_spot,
+                                expirations_fn=_oi_expirations_fn,
                             )
                         threading.Thread(target=_run_sweep, daemon=True, name="oi-sweep").start()
-                        log.info("OI sweep triggered (background thread)")
+                        log.info("OI forward sweep triggered (background thread)")
                     except Exception as _oe:
                         log.debug(f"OI sweep trigger error: {_oe}")
 
@@ -7817,7 +7804,6 @@ def _start_background_services_once():
         # v5.0: Start active scanner
         global _scanner
         if ACTIVE_SCANNER_ENABLED:
-            _regime_detector = init_regime_detector(notify_fn=post_to_telegram)
             _scanner = ActiveScanner(
                 enqueue_fn=_enqueue_signal,
                 spot_fn=get_spot,
@@ -7825,7 +7811,6 @@ def _start_background_services_once():
                 intraday_fn=get_intraday_bars,
                 regime_fn=get_current_regime,
                 vol_regime_fn=get_canonical_vol_regime,
-                regime_detector=_regime_detector,
             )
             _scanner.start()
             log.info(f"Active scanner started: {_scanner.watchlist_size} tickers")
