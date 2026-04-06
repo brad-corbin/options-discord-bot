@@ -7826,7 +7826,7 @@ def _start_background_services_once():
                 regime_fn=get_current_regime,
                 vol_regime_fn=get_canonical_vol_regime,
                 regime_detector=_regime_detector,
-        )
+            )
             _scanner.start()
             log.info(f"Active scanner started: {_scanner.watchlist_size} tickers")
         else:
