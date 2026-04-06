@@ -51,7 +51,7 @@ except ImportError as e:
     sys.exit(1)
 
 # ── Defaults (overridable via CLI) ────────────────────────────────────────────
-DEFAULT_MAX_HOLD_DAYS = 10    # close at next open after this many days
+DEFAULT_MAX_HOLD_DAYS = 15    # close at next open after this many days
 DEFAULT_COOLDOWN_DAYS = 3     # no re-entry in same direction within N days
 DEFAULT_STOP_ATR_MULT = 0.2   # how far beyond swing_low/high to set stop
 DEFAULT_MIN_BARS      = 80    # minimum bars before scanner is allowed to fire
@@ -117,12 +117,18 @@ class SwingTrade:
         self.entry_date   = entry_date
         self.entry_price  = entry_price
 
-        # Stop: just beyond the swing extreme that invalidates the setup
-        atr_buffer = self.atr * DEFAULT_STOP_ATR_MULT
+        # Stop: structural level is the swing extreme, but capped at 2x ATR
+        # from entry so we never risk more than ~2x ATR regardless of how wide
+        # the swing range is. Without this cap, wide swings produce 0.5:1 R:R.
+        ATR_STOP_CAP = 2.0
         if self.direction == "bull":
-            self.stop = self.swing_low - atr_buffer
+            swing_dist = self.entry_price - (self.swing_low - self.atr * DEFAULT_STOP_ATR_MULT)
+            max_dist   = self.atr * ATR_STOP_CAP
+            self.stop  = self.entry_price - min(swing_dist, max_dist)
         else:
-            self.stop = self.swing_high + atr_buffer
+            swing_dist = (self.swing_high + self.atr * DEFAULT_STOP_ATR_MULT) - self.entry_price
+            max_dist   = self.atr * ATR_STOP_CAP
+            self.stop  = self.entry_price + min(swing_dist, max_dist)
 
         # State
         self.close_date   = None
