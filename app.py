@@ -145,6 +145,7 @@ from sector_rotation import (
     format_sector_line,
 )
 from active_scanner import ActiveScanner
+from market_regime import init_regime_detector 
 from swing_scanner import SwingScanner
 from portfolio_greeks import PortfolioGreeks
 from regime_detector import RegimeDetector
@@ -7816,14 +7817,16 @@ def _start_background_services_once():
         # v5.0: Start active scanner
         global _scanner
         if ACTIVE_SCANNER_ENABLED:
-            _scanner = ActiveScanner(
+            _regime_detector = init_regime_detector(notify_fn=post_to_telegram)
+                _scanner = ActiveScanner(
                 enqueue_fn=_enqueue_signal,
                 spot_fn=get_spot,
                 candle_fn=get_daily_candles,
                 intraday_fn=get_intraday_bars,
                 regime_fn=get_current_regime,
                 vol_regime_fn=get_canonical_vol_regime,
-            )
+                regime_detector=_regime_detector,
+        )
             _scanner.start()
             log.info(f"Active scanner started: {_scanner.watchlist_size} tickers")
         else:
