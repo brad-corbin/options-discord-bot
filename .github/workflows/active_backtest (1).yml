@@ -1,0 +1,73 @@
+name: Active Scanner Backtest
+
+on:
+  workflow_dispatch:
+    inputs:
+      ticker:
+        description: "Ticker symbol (e.g. NVDA)"
+        required: true
+        default: "NVDA"
+      from_date:
+        description: "Start date YYYY-MM-DD (leave blank for last 90 days)"
+        required: false
+        default: ""
+      to_date:
+        description: "End date YYYY-MM-DD (leave blank for today)"
+        required: false
+        default: ""
+      days:
+        description: "Shortcut: last N calendar days (overrides from/to if set)"
+        required: false
+        default: ""
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Build date args
+        id: dates
+        run: |
+          TICKER=$(echo "${{ github.event.inputs.ticker }}" | tr '[:lower:]' '[:upper:]')
+          echo "ticker=$TICKER" >> $GITHUB_OUTPUT
+
+          ARGS="--ticker $TICKER"
+
+          if [ -n "${{ github.event.inputs.days }}" ]; then
+            ARGS="$ARGS --days ${{ github.event.inputs.days }}"
+          else
+            if [ -n "${{ github.event.inputs.from_date }}" ]; then
+              ARGS="$ARGS --from ${{ github.event.inputs.from_date }}"
+            fi
+            if [ -n "${{ github.event.inputs.to_date }}" ]; then
+              ARGS="$ARGS --to ${{ github.event.inputs.to_date }}"
+            fi
+          fi
+
+          echo "args=$ARGS" >> $GITHUB_OUTPUT
+
+      - name: Run backtest
+        env:
+          MARKETDATA_TOKEN: ${{ secrets.MARKETDATA_TOKEN }}
+        run: |
+          mkdir -p results
+          python backtest/active_backtest.py ${{ steps.dates.outputs.args }} --out-dir results
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: active-backtest-${{ steps.dates.outputs.ticker }}-${{ github.run_number }}
+          path: results/
+          retention-days: 30
