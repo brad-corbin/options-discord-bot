@@ -1,0 +1,113 @@
+# .github/workflows/swing_backtest.yml
+# ─────────────────────────────────────────────────────────────────────────────
+# Swing backtest runner.
+#
+# Downloads daily bars for the ticker + SPY, then runs the walk-forward
+# swing backtest using the real swing_scanner.py signal logic.
+#
+# How to run:
+#   GitHub → Actions → "Swing Backtest" → Run workflow
+#
+# Key inputs:
+#   ticker         — the stock to backtest
+#   backtest_from  — first date to record trades (bars before this warm indicators)
+#   download_from  — how far back to pull data (needs ~200+ trading days before
+#                    backtest_from for indicators; 2024-06-01 is safe for a
+#                    Jul-2025 backtest start)
+#   to_date        — last date (leave blank = today)
+#   max_hold_days  — max days to hold before force-exiting
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Swing Backtest
+
+on:
+  workflow_dispatch:
+    inputs:
+      ticker:
+        description: 'Ticker to backtest (e.g. AAPL)'
+        required: true
+        default: 'AAPL'
+      backtest_from:
+        description: 'First date to record trades YYYY-MM-DD'
+        required: true
+        default: '2025-07-14'
+      download_from:
+        description: 'Data download start (needs 200+ trading days before backtest_from)'
+        required: false
+        default: '2024-06-01'
+      to_date:
+        description: 'End date YYYY-MM-DD (leave blank = today)'
+        required: false
+        default: ''
+      max_hold_days:
+        description: 'Max days to hold before force-exit (default: 10)'
+        required: false
+        default: '10'
+      cooldown_days:
+        description: 'Cooldown between same-direction re-entries (default: 3)'
+        required: false
+        default: '3'
+
+jobs:
+  swing_backtest:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install requests pandas pytz
+          # yfinance not needed — data comes from MarketData
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Download daily bars (ticker + SPY)
+        env:
+          MARKETDATA_TOKEN: ${{ secrets.MARKETDATA_TOKEN }}
+        run: |
+          TO_ARG=""
+          if [ -n "${{ github.event.inputs.to_date }}" ]; then
+            TO_ARG="--to ${{ github.event.inputs.to_date }}"
+          fi
+          python backtest/download_daily_bars.py \
+            --ticker ${{ github.event.inputs.ticker }} \
+            --from ${{ github.event.inputs.download_from }} \
+            $TO_ARG
+
+      - name: Run swing backtest
+        run: |
+          TICKER_FILE=$(ls backtest/data/${{ github.event.inputs.ticker }}_daily_*.csv | head -1)
+          SPY_FILE=$(ls backtest/data/SPY_daily_*.csv | head -1)
+          echo "Ticker data: $TICKER_FILE"
+          echo "SPY data:    $SPY_FILE"
+          python backtest/swing_backtest.py \
+            --ticker       ${{ github.event.inputs.ticker }} \
+            --data         "$TICKER_FILE" \
+            --spy          "$SPY_FILE" \
+            --backtest-from ${{ github.event.inputs.backtest_from }} \
+            --max-hold     ${{ github.event.inputs.max_hold_days }} \
+            --cooldown     ${{ github.event.inputs.cooldown_days }}
+
+      - name: Print summary
+        run: |
+          echo ""
+          echo "══════════════════════════════════════════════════"
+          cat backtest/results/swing_summary.txt || echo "(summary not found)"
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: swing-backtest-${{ github.event.inputs.ticker }}-${{ github.run_number }}
+          path: |
+            backtest/results/swing_trades.csv
+            backtest/results/swing_summary.txt
+            backtest/data/
+          retention-days: 30
