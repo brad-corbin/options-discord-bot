@@ -54,10 +54,20 @@ try:
         SWING_MAX_PER_SECTOR, SWING_SECTOR_MAP,
         SWING_PRIMARY_TREND_SMA, SWING_PRIMARY_TREND_LMA, SWING_PRIMARY_TREND_ENABLED,
         SWING_ATR_LENGTH,
+        # New v5.2 backtest-derived rules
+        SWING_CONFIRMED_TICKERS, SWING_REMOVED_TICKERS,
+        SWING_FIB_61_8_EXCEPTIONS, SWING_TICKER_FIB_RULES,
+        SWING_TICKER_DTE_GUIDANCE, SWING_TICKER_STRUCTURE,
     )
 except ImportError:
     log.warning("swing_scanner: trading_rules imports failed, using defaults")
     SWING_SCANNER_ENABLED = False
+    SWING_CONFIRMED_TICKERS = set()
+    SWING_REMOVED_TICKERS = set()
+    SWING_FIB_61_8_EXCEPTIONS = set()
+    SWING_TICKER_FIB_RULES = {}
+    SWING_TICKER_DTE_GUIDANCE = {}
+    SWING_TICKER_STRUCTURE = {}
 
 
 # ═══════════════════════════════════════════════════════════
@@ -276,6 +286,55 @@ def check_fib_touch(bar: dict, fibs: dict, touch_pct: float) -> dict:
     return result
 
 
+def check_fib_approach(bar: dict, fibs: dict,
+                        approach_pct: float = 0.03,
+                        touch_pct: float = None) -> dict:
+    """
+    Check if price is approaching (but not yet touching) a fib level.
+    Used for the 14:45 CT early-warning scan.
+    Returns info if within approach_pct of any valid fib level.
+    """
+    if touch_pct is None:
+        touch_pct = SWING_FIB_TOUCH_ZONE_PCT / 100
+
+    result = {"bull_approaching": False, "bear_approaching": False}
+    close = bar["c"]
+
+    # Bull approach: price coming down toward bull fib from above
+    for name, key in [("38.2", "bull_382"), ("50.0", "bull_500"),
+                      ("61.8", "bull_618"), ("78.6", "bull_786")]:
+        level = fibs.get(key, 0)
+        if level <= 0:
+            continue
+        dist_pct = (close - level) / level  # positive = above level
+        if touch_pct < dist_pct <= approach_pct:
+            result.update({
+                "bull_approaching": True,
+                "bull_approach_fib": name,
+                "bull_approach_price": round(level, 2),
+                "bull_approach_dist_pct": round(dist_pct * 100, 2),
+            })
+            break
+
+    # Bear approach: price coming up toward bear fib from below
+    for name, key in [("38.2", "bear_382"), ("50.0", "bear_500"),
+                      ("61.8", "bear_618"), ("78.6", "bear_786")]:
+        level = fibs.get(key, 0)
+        if level <= 0:
+            continue
+        dist_pct = (level - close) / level  # positive = below level
+        if touch_pct < dist_pct <= approach_pct:
+            result.update({
+                "bear_approaching": True,
+                "bear_approach_fib": name,
+                "bear_approach_price": round(level, 2),
+                "bear_approach_dist_pct": round(dist_pct * 100, 2),
+            })
+            break
+
+    return result
+
+
 def count_fib_touches(bars: List[dict], fibs: dict, touch_pct: float,
                       lookback: int = 10) -> dict:
     """Count how many times each fib level was touched in recent bars.
@@ -484,6 +543,35 @@ def analyze_swing_setup(
     if not touch["bull_touched"] and not touch["bear_touched"]:
         return None  # no fib touch on latest bar
 
+    # ── v5.2: Confirmed ticker gate ──
+    # Only fire signals for backtested, approved tickers.
+    # Deferred tickers remain in watchlist for data collection only.
+    if ticker not in SWING_CONFIRMED_TICKERS:
+        log.debug(f"Swing scanner {ticker}: not in confirmed list — signal suppressed")
+        return None
+
+    # ── v5.2: Fib level filters ──
+    touched_fib = touch.get("bull_fib_level") or touch.get("bear_fib_level", "")
+
+    # Global 61.8% block — backtest: 19 trades, PF 0.25, -161 pts
+    # Exception: range-bound financials/staples bounce cleanly at 61.8%
+    if touched_fib == "61.8" and ticker not in SWING_FIB_61_8_EXCEPTIONS:
+        log.info(f"Swing scanner {ticker}: 61.8% fib blocked (not in exception list)")
+        return None
+
+    # Per-ticker fib rules
+    ticker_fib_rule = SWING_TICKER_FIB_RULES.get(ticker, {})
+    if ticker_fib_rule:
+        allowed = ticker_fib_rule.get("allowed")
+        blocked = ticker_fib_rule.get("blocked", set())
+        if allowed is not None and touched_fib not in allowed:
+            log.info(f"Swing scanner {ticker}: fib {touched_fib}% not in allowed set {allowed}")
+            return None
+        if touched_fib in blocked:
+            log.info(f"Swing scanner {ticker}: fib {touched_fib}% is blocked for this ticker")
+            return None
+
+
     # ── Multi-touch scoring ──
     multi_touches = count_fib_touches(daily_bars, fibs, touch_pct, lookback=10)
 
@@ -591,15 +679,35 @@ def analyze_swing_setup(
     elif direction == "bear" and fib_level in multi_touches.get("bear", {}):
         touch_count = multi_touches["bear"][fib_level]
 
-    # ── Fib extensions as targets ──
+    # ── v5.2: Fib extensions as targets — capped at 2xATR if >10% required ──
+    # Backtest finding: targets requiring >10% move hit only 21% of the time in 15d.
+    # When the raw fib extension is unreachable, use 2x ATR as the practical target.
     if direction == "bull":
-        fib_target_1 = fibs.get("bull_ext_127", 0)
-        fib_target_2 = fibs.get("bull_ext_162", 0)
+        raw_target_1 = fibs.get("bull_ext_127", 0)
+        raw_target_2 = fibs.get("bull_ext_162", 0)
+        req_move_pct = (raw_target_1 - spot) / spot * 100 if spot > 0 else 0
+        if req_move_pct > 10.0 and atr_val > 0:
+            fib_target_1 = round(spot + atr_val * 2, 2)
+            fib_target_2 = round(spot + atr_val * 3, 2)
+            target_capped = True
+        else:
+            fib_target_1 = raw_target_1
+            fib_target_2 = raw_target_2
+            target_capped = False
     else:
-        fib_target_1 = fibs.get("bear_ext_127", 0)
-        fib_target_2 = fibs.get("bear_ext_162", 0)
+        raw_target_1 = fibs.get("bear_ext_127", 0)
+        raw_target_2 = fibs.get("bear_ext_162", 0)
+        req_move_pct = (spot - raw_target_1) / spot * 100 if spot > 0 else 0
+        if req_move_pct > 10.0 and atr_val > 0:
+            fib_target_1 = round(spot - atr_val * 2, 2)
+            fib_target_2 = round(spot - atr_val * 3, 2)
+            target_capped = True
+        else:
+            fib_target_1 = raw_target_1
+            fib_target_2 = raw_target_2
+            target_capped = False
 
-    # ── Confidence scoring ──
+    # ── Confidence scoring (v5.2 — calibrated from backtest) ──
     confidence = 50
     conf_reasons = []
 
@@ -610,12 +718,22 @@ def analyze_swing_setup(
         confidence += 5
         conf_reasons.append("T2 signal (+5)")
 
-    if fib_level == "61.8":
+    # v5.2: Removed erroneous +10 for 61.8% "golden ratio" bonus.
+    # Backtest showed 61.8% is the WORST fib level (PF 0.25) on most tickers.
+    # Bonus now reflects actual backtest performance.
+    if fib_level == "38.2":
         confidence += 10
-        conf_reasons.append("Golden ratio 61.8% (+10)")
+        conf_reasons.append("38.2% retracement — highest win rate (+10)")
     elif fib_level == "50.0":
         confidence += 7
         conf_reasons.append("50% retracement (+7)")
+    elif fib_level == "78.6":
+        confidence += 4
+        conf_reasons.append("78.6% deep retracement (+4)")
+    elif fib_level == "61.8" and ticker in SWING_FIB_61_8_EXCEPTIONS:
+        confidence += 6
+        conf_reasons.append("61.8% — range-bound exception (+6)")
+
 
     if touch_count >= 3:
         confidence += 8
@@ -647,8 +765,16 @@ def analyze_swing_setup(
         confidence += 5
         conf_reasons.append("Below 200 SMA (+5)")
 
+    # ── v5.2: Options guidance from backtest ──
+    dte_guidance = SWING_TICKER_DTE_GUIDANCE.get(ticker, {})
+    structure = SWING_TICKER_STRUCTURE.get(ticker, "debit_spread")
+    req_move_abs = abs(fib_target_1 - spot)
+    req_move_pct_final = req_move_abs / spot * 100 if spot > 0 else 0
+
     # Warnings (no penalty, just noted)
-    warnings = list(rejection_reasons)  # includes demotions
+    warnings = list(rejection_reasons)
+    if target_capped:
+        warnings.append(f"Target capped at 2xATR (raw fib required {req_move_pct:.1f}% move)")
 
     signal = {
         "ticker": ticker,
@@ -662,9 +788,19 @@ def analyze_swing_setup(
         "swing_low": round(fibs["swing_low"], 2),
         "fib_target_1": round(fib_target_1, 2),
         "fib_target_2": round(fib_target_2, 2),
+        "target_capped": target_capped,
+        "req_move_pct": round(req_move_pct_final, 1),
         "spot": round(spot, 2),
+        "atr": round(atr_val, 2),
         "confidence": min(confidence, 100),
         "conf_reasons": conf_reasons,
+        # Options guidance (v5.2)
+        "structure": structure,
+        "dte_min": dte_guidance.get("dte_min"),
+        "dte_max": dte_guidance.get("dte_max"),
+        "hold_days": dte_guidance.get("hold_days"),
+        "spread_width": dte_guidance.get("width"),
+        "trade_note": dte_guidance.get("note", ""),
         # Trend context
         "weekly_bull": weekly_bull,
         "weekly_bear": weekly_bear,
@@ -683,7 +819,6 @@ def analyze_swing_setup(
         "vol_expanding": vol_expanding,
         "volume": volumes[-1],
         "vol_ma": round(vol_ma_val, 0),
-        "atr": round(atr_val, 2),
         # Candle quality
         "candle_quality": cq,
         "touch_count": touch_count,
@@ -698,7 +833,8 @@ def analyze_swing_setup(
 
     log.info(f"Swing scanner {ticker}: T{tier} {direction.upper()} at fib {fib_level}% "
              f"(conf={confidence}, RS={rs_vs_spy:+.1f}%, "
-             f"primary={primary_trend}, touches={touch_count})")
+             f"primary={primary_trend}, touches={touch_count}, "
+             f"target_capped={target_capped})")
 
     return signal
 
@@ -732,8 +868,9 @@ class SwingScanner:
         self._vix_fn = vix_fn
         self._running = False
         self._thread = None
-        self._last_scan = {}  # ticker -> last signal time
+        self._last_scan = {}  # scan_key -> timestamp
         self._signal_cooldown = {}  # ticker:direction -> timestamp
+        self._prior_signals = {}    # ticker:direction -> signal dict (for next-day confirm)
 
     def start(self):
         if not SWING_SCANNER_ENABLED:
@@ -813,6 +950,171 @@ class SwingScanner:
 
         return all_signals
 
+    def _scan_approaching(self):
+        """
+        14:45 CT — 15 minutes before close.
+        Flags tickers approaching a valid fib level but not yet touching.
+        Posts a clearly-labelled preliminary warning. NOT actionable.
+        """
+        spy_bars = fetch_daily_bars_yahoo("SPY", SWING_SCAN_LOOKBACK_DAYS)
+        approach_alerts = []
+
+        for ticker in sorted(SWING_CONFIRMED_TICKERS):
+            try:
+                bars = fetch_daily_bars_yahoo(ticker, SWING_SCAN_LOOKBACK_DAYS)
+                if not bars or len(bars) < 60:
+                    continue
+
+                highs  = [b["h"] for b in bars]
+                lows   = [b["l"] for b in bars]
+                bar    = bars[-1]
+                spot   = bar["c"]
+
+                pivot_len   = max(2, round(SWING_FIB_LOOKBACK / 5))
+                swing_highs, swing_lows = _find_pivots(highs, lows, pivot_len)
+                if not swing_highs or not swing_lows:
+                    continue
+
+                fibs    = compute_fib_levels(swing_highs[-1][1], swing_lows[-1][1])
+                touch_pct = SWING_FIB_TOUCH_ZONE_PCT / 100
+                approach = check_fib_approach(bar, fibs, approach_pct=0.03,
+                                               touch_pct=touch_pct)
+
+                if approach.get("bull_approaching"):
+                    fib_name  = approach["bull_approach_fib"]
+                    fib_price = approach["bull_approach_price"]
+                    dist_pct  = approach["bull_approach_dist_pct"]
+                    # Apply per-ticker fib rules to approach warnings too
+                    rule = SWING_TICKER_FIB_RULES.get(ticker, {})
+                    allowed = rule.get("allowed")
+                    blocked = rule.get("blocked", set())
+                    if fib_name == "61.8" and ticker not in SWING_FIB_61_8_EXCEPTIONS:
+                        continue
+                    if allowed and fib_name not in allowed:
+                        continue
+                    if fib_name in blocked:
+                        continue
+                    approach_alerts.append({
+                        "ticker": ticker, "direction": "bull",
+                        "fib": fib_name, "fib_price": fib_price,
+                        "dist_pct": dist_pct, "spot": spot,
+                    })
+
+                if approach.get("bear_approaching"):
+                    fib_name  = approach["bear_approach_fib"]
+                    fib_price = approach["bear_approach_price"]
+                    dist_pct  = approach["bear_approach_dist_pct"]
+                    rule = SWING_TICKER_FIB_RULES.get(ticker, {})
+                    allowed = rule.get("allowed")
+                    blocked = rule.get("blocked", set())
+                    if fib_name == "61.8" and ticker not in SWING_FIB_61_8_EXCEPTIONS:
+                        continue
+                    if allowed and fib_name not in allowed:
+                        continue
+                    if fib_name in blocked:
+                        continue
+                    approach_alerts.append({
+                        "ticker": ticker, "direction": "bear",
+                        "fib": fib_name, "fib_price": fib_price,
+                        "dist_pct": dist_pct, "spot": spot,
+                    })
+
+            except Exception as e:
+                log.warning(f"Approach scan error {ticker}: {e}")
+
+        if approach_alerts and self._post:
+            lines = ["⚠️ ── APPROACHING FIB LEVELS (PRELIMINARY — NOT ACTIONABLE) ──", ""]
+            for a in approach_alerts:
+                dir_emoji = "🟢" if a["direction"] == "bull" else "🔴"
+                lines.append(
+                    f"{dir_emoji} {a['ticker']} {a['direction'].upper()} — "
+                    f"Fib {a['fib']}% @ ${a['fib_price']:.2f} | "
+                    f"Spot ${a['spot']:.2f} | dist {a['dist_pct']:.1f}%"
+                )
+            lines.extend(["", "Signal may fire at post-close scan if touch confirmed."])
+            self._post("\n".join(lines))
+            log.info(f"Approach warning: {len(approach_alerts)} tickers approaching fib levels")
+
+    def _confirm_entries(self):
+        """
+        08:45 CT — 15 minutes after open.
+        Checks prior-evening signals against current price.
+        Posts ENTRY CONFIRMED or SIGNAL STALE for each pending signal.
+        Stale threshold: stock has gapped more than 2x ATR past the fib level.
+        """
+        if not self._prior_signals:
+            log.debug("Entry confirmation: no prior signals to validate")
+            return
+
+        confirmations = []
+        stale = []
+
+        for key, sig in list(self._prior_signals.items()):
+            ticker    = sig["ticker"]
+            direction = sig["direction"]
+            fib_price = sig["fib_price"]
+            atr       = sig.get("atr", 0)
+
+            try:
+                bars = fetch_daily_bars_yahoo(ticker, 5)
+                if not bars:
+                    continue
+                spot = bars[-1]["c"]
+                stale_threshold = atr * 2.0 if atr > 0 else fib_price * 0.03
+
+                if direction == "bull":
+                    # Valid entry: price still near or at fib (not run away above it)
+                    gap = spot - fib_price
+                    is_stale = gap > stale_threshold
+                else:
+                    gap = fib_price - spot
+                    is_stale = gap > stale_threshold
+
+                entry = {"ticker": ticker, "direction": direction,
+                         "fib": sig["fib_level"], "fib_price": fib_price,
+                         "spot": round(spot, 2), "atr": atr,
+                         "confidence": sig.get("confidence", 0),
+                         "trade_note": sig.get("trade_note", "")}
+
+                if is_stale:
+                    stale.append(entry)
+                    del self._prior_signals[key]
+                else:
+                    confirmations.append(entry)
+
+            except Exception as e:
+                log.warning(f"Entry confirmation error {ticker}: {e}")
+
+        if not confirmations and not stale:
+            return
+
+        if self._post:
+            lines = ["📋 ── ENTRY CONFIRMATION (15 MIN AFTER OPEN) ──", ""]
+
+            for e in confirmations:
+                dir_emoji = "🟢" if e["direction"] == "bull" else "🔴"
+                lines.append(
+                    f"✅ ENTER {dir_emoji} {e['ticker']} {e['direction'].upper()} — "
+                    f"Fib {e['fib']}% still valid | "
+                    f"Spot ${e['spot']:.2f} vs fib ${e['fib_price']:.2f} | "
+                    f"Conf {e['confidence']}"
+                )
+                if e["trade_note"]:
+                    lines.append(f"   📝 {e['trade_note']}")
+
+            if stale:
+                lines.append("")
+                for e in stale:
+                    dir_emoji = "🟢" if e["direction"] == "bull" else "🔴"
+                    lines.append(
+                        f"❌ STALE {dir_emoji} {e['ticker']} — "
+                        f"Gapped past fib (spot ${e['spot']:.2f}, "
+                        f"fib ${e['fib_price']:.2f}, ATR ${e['atr']:.2f}) — skip"
+                    )
+
+            self._post("\n".join(lines))
+            log.info(f"Entry confirmation: {len(confirmations)} valid, {len(stale)} stale")
+
     def _apply_correlation_filter(self, signals: List[dict]) -> List[dict]:
         """Limit signals to max N per sector to avoid correlated bets."""
         sector_counts = {}
@@ -889,17 +1191,50 @@ class SwingScanner:
                 "vix": sig.get("vix", 20),
             }
 
+            # ── v5.2: Options guidance line ──
+            structure = sig.get("structure", "debit_spread")
+            dte_min = sig.get("dte_min")
+            dte_max = sig.get("dte_max")
+            hold = sig.get("hold_days")
+            width = sig.get("spread_width")
+            trade_note = sig.get("trade_note", "")
+            target_capped = sig.get("target_capped", False)
+
+            if structure == "long_call":
+                options_line = f"📋 Structure: Long ATM call"
+            elif structure == "shares":
+                options_line = f"📋 Structure: Shares only (ATR too small for options)"
+            else:
+                width_str = f" ${width} wide" if width else ""
+                options_line = f"📋 Structure: Debit spread{width_str}"
+
+            dte_line = ""
+            if dte_min and dte_max:
+                dte_line = f" | DTE: {dte_min}–{dte_max}"
+            if hold:
+                dte_line += f" | Hold: ~{hold}d"
+
+            target_line = (
+                f"Targets: ${sig['fib_target_1']:.2f} / ${sig['fib_target_2']:.2f}"
+                f" ({sig.get('req_move_pct', 0):.1f}% move needed)"
+            )
+            if target_capped:
+                target_line += " ⚠️ capped at 2xATR"
+
             signal_msg = (
                 f"📊 Swing Scanner: {ticker} T{tier} {direction.upper()}\n"
                 f"Fib {sig['fib_level']}% @ ${sig['fib_price']:.2f} "
                 f"(dist {sig['fib_dist_pct']:.1f}%)\n"
-                f"Conf: {sig['confidence']}/100 | RS: {sig['rs_vs_spy']:+.1f}%\n"
+                f"Conf: {sig['confidence']}/100 | RS: {sig['rs_vs_spy']:+.1f}% | "
+                f"ATR: ${sig['atr']:.2f}\n"
                 f"Weekly: {'🟢' if sig['weekly_bull'] else '🔴' if sig['weekly_bear'] else '⚪'} | "
                 f"Daily: {'🟢' if sig['daily_bull'] else '🔴' if sig['daily_bear'] else '⚪'} | "
                 f"RSI: {sig['rsi']:.0f}\n"
                 f"Primary: {sig['primary_trend']} | "
                 f"Vol: {'📉 contracting' if sig['vol_contracting'] else '📈 expanding' if sig['vol_expanding'] else '➡️ normal'}\n"
-                f"Targets: ${sig['fib_target_1']:.2f} / ${sig['fib_target_2']:.2f}\n"
+                f"{target_line}\n"
+                f"{options_line}{dte_line}\n"
+                + (f"📝 {trade_note}\n" if trade_note else "")
                 + (f"⚠️ {', '.join(sig['warnings'])}" if sig.get("warnings") else "")
             )
 
@@ -927,7 +1262,7 @@ class SwingScanner:
             self._post("\n".join(summary_lines))
 
     def _loop(self):
-        """Main loop — runs at scheduled times."""
+        """Main loop — runs at scheduled times for three scan types."""
         log.info("Swing scanner loop started")
         while self._running:
             try:
@@ -938,24 +1273,37 @@ class SwingScanner:
                     time.sleep(300)
                     continue
 
-                current_time = now.strftime("%H:%M")
+                now_minutes = now.hour * 60 + now.minute
 
-                # Check if it's scan time (within 2 minute window)
-                for scan_time in SWING_SCAN_TIMES_CT:
-                    scan_key = f"scan:{now.strftime('%Y-%m-%d')}:{scan_time}"
+                for scan_time_str, scan_type in SWING_SCAN_TIMES_CT.items():
+                    scan_key = f"scan:{now.strftime('%Y-%m-%d')}:{scan_time_str}"
                     if scan_key in self._last_scan:
                         continue
 
-                    # Parse scan time
-                    sh, sm = int(scan_time.split(":")[0]), int(scan_time.split(":")[1])
+                    sh, sm = int(scan_time_str.split(":")[0]), int(scan_time_str.split(":")[1])
                     scan_minutes = sh * 60 + sm
-                    now_minutes = now.hour * 60 + now.minute
 
                     if 0 <= (now_minutes - scan_minutes) <= 2:
-                        log.info(f"Swing scanner firing: {scan_time} CT scan")
+                        log.info(f"Swing scanner firing: {scan_time_str} CT ({scan_type})")
                         self._last_scan[scan_key] = time.time()
-                        signals = self.scan_all()
-                        self._fire_signals(signals)
+
+                        if scan_type == "post_close":
+                            # Full signal scan — existing behavior
+                            signals = self.scan_all()
+                            if signals:
+                                # Store for next-morning confirmation
+                                for sig in signals:
+                                    key = f"{sig['ticker']}:{sig['direction']}"
+                                    self._prior_signals[key] = sig
+                            self._fire_signals(signals)
+
+                        elif scan_type == "approach_warn":
+                            # 15 min before close — flag approaching fib levels
+                            self._scan_approaching()
+
+                        elif scan_type == "entry_confirm":
+                            # 15 min after open — confirm or invalidate prior signals
+                            self._confirm_entries()
 
                 time.sleep(30)
 
