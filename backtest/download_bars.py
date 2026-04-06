@@ -156,11 +156,17 @@ def fetch_date_range(ticker: str, from_date: str, to_date: str) -> tuple:
     print(f"  Mode: date range {from_date} → {to_date}  (native from/to API)")
     print(f"  Fetching {ticker.upper()}...")
 
-    # MarketData accepts YYYY-MM-DD strings directly on paid plans
+    # MarketData's to parameter is exclusive (returns data up to but NOT including
+    # the to date), so bump it forward by one day to include the requested end date.
+    from datetime import timedelta
+    to_dt = datetime.strptime(to_date, "%Y-%m-%d") + timedelta(days=1)
+    to_exclusive = to_dt.strftime("%Y-%m-%d")
+
     params = {
         "from": from_date,
-        "to":   to_date,
+        "to":   to_exclusive,
     }
+    print(f"  (to adjusted to {to_exclusive} so {to_date} is included)")
 
     data = md_get(url, params)
     rows = parse_candles(data)
