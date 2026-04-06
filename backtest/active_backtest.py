@@ -167,7 +167,10 @@ def download_5min(ticker, from_date, to_date):
 
 def download_daily(ticker, from_date, to_date):
     url = f"https://api.marketdata.app/v1/stocks/candles/D/{ticker}/"
-    params = {"from": from_date, "to": to_date, "dateformat": "timestamp"}
+    # No dateformat param — daily endpoint returns Unix int timestamps by default.
+    # Passing dateformat=timestamp causes the API to return bare date strings
+    # ('2025-12-19') instead, which broke parsing. Matches swing backtest behavior.
+    params = {"from": from_date, "to": to_date}
     print(f"  Daily bars {ticker} {from_date}→{to_date}…")
     try:
         data = _md_get(url, params)
