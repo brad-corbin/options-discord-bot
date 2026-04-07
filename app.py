@@ -526,7 +526,7 @@ def _log_shadow_signal(ticker: str, regime: str, signal: dict, why_blocked: str)
             "htf":         signal.get("htf_status", ""),
             "phase":       signal.get("phase", ""),
             "close":       signal.get("close", ""),
-            "vwap_above":  signal.get("above_vwap", ""),
+            "vwap_above":  str(signal.get("above_vwap", "")),
             "wt2":         round(signal.get("wt2", 0), 1),
             "rsi":         round(signal.get("rsi_mfi", 0), 1) if signal.get("rsi_mfi") else "",
             "why_blocked": why_blocked,
