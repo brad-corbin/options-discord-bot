@@ -589,12 +589,14 @@ def _evaluate_crisis_put(ticker: str, bias: str, source_type: str,
         CRISIS_PUT_ENABLED, CRISIS_PUT_WHITELIST, CRISIS_PUT_BLACKLIST,
         CRISIS_PUT_ALLOWED_SOURCES, CRISIS_PUT_DTE_TARGET, CRISIS_PUT_DTE_MIN,
         CRISIS_PUT_DTE_MAX, CRISIS_PUT_SCALE1_PCT, CRISIS_PUT_MAX_HOLD_DAYS,
-        CRISIS_PUT_MAX_POSITIONS,
+        CRISIS_PUT_MAX_POSITIONS, CRISIS_PUT_MIN_CAUTION,
     )
     if not CRISIS_PUT_ENABLED:
         return
+    # v6.1: Gate on caution score not CRISIS label — fires in ELEVATED too (caution 4+).
+    vol_caution = (vol_regime or {}).get("caution_score", 0) if isinstance(vol_regime, dict) else 0
     vol_label = (vol_regime or {}).get("label", "") if isinstance(vol_regime, dict) else ""
-    if vol_label != "CRISIS":
+    if vol_caution < CRISIS_PUT_MIN_CAUTION:
         return
     if bias != "bear":
         return
@@ -2043,10 +2045,18 @@ def _process_job(worker_id: int, job: dict):
             _composite = (_v4f.get("composite_regime") or "").upper()
             if "PIN" in _composite:
                 if bias == "bear" and PIN_REGIME_BLOCK_BEAR_PUTS:
-                    base["reason"] = f"PIN regime ({_composite}) — bear puts blocked"
-                    log.info(f"[worker-{worker_id}] {ticker} blocked: {base['reason']}")
-                    _record_wave_result(base)
-                    return
+                    # v6.1: In a BEAR market regime, PIN days are normal consolidation
+                    # before continuation — don't block bear puts. Only block in
+                    # BULL/TRANSITION where PIN means price is stuck, not continuing.
+                    _mkt_regime_for_pin = get_market_regime()
+                    _mkt_label_for_pin = (_mkt_regime_for_pin.get("label") or "").upper()
+                    if "BEAR" not in _mkt_label_for_pin:
+                        base["reason"] = f"PIN regime ({_composite}) — bear puts blocked (non-BEAR market)"
+                        log.info(f"[worker-{worker_id}] {ticker} blocked: {base['reason']}")
+                        _record_wave_result(base)
+                        return
+                    else:
+                        log.info(f"[worker-{worker_id}] {ticker}: PIN regime but BEAR market — allowing bear puts through")
                 if bias == "bull" and PIN_REGIME_BLOCK_BULL_CALLS:
                     base["reason"] = f"PIN regime ({_composite}) — bull calls blocked"
                     log.info(f"[worker-{worker_id}] {ticker} blocked: {base['reason']}")
