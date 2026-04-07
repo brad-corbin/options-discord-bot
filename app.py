@@ -227,6 +227,7 @@ GOOGLE_SHEET_SIGNAL_TAB = os.getenv("GOOGLE_SHEET_SIGNAL_TAB", "signal_decisions
 GOOGLE_SHEET_EM_TAB = os.getenv("GOOGLE_SHEET_EM_TAB", "em_predictions").strip() or "em_predictions"
 GOOGLE_SHEET_RECON_TAB = os.getenv("GOOGLE_SHEET_RECON_TAB", "em_reconciliation").strip() or "em_reconciliation"
 GOOGLE_SHEET_CRISIS_TAB = os.getenv("GOOGLE_SHEET_CRISIS_TAB", "crisis_put_signals").strip() or "crisis_put_signals"
+GOOGLE_SHEET_SHADOW_TAB = os.getenv("GOOGLE_SHEET_SHADOW_TAB", "shadow_signals").strip() or "shadow_signals"
 
 # ─────────────────────────────────────────────────────────
 # REDIS
@@ -325,6 +326,7 @@ def _tab_for_filename(filename: str) -> str:
         "em_predictions.csv": GOOGLE_SHEET_EM_TAB,
         "em_reconciliation.csv": GOOGLE_SHEET_RECON_TAB,
         "crisis_put_signals.csv": GOOGLE_SHEET_CRISIS_TAB,
+        "shadow_signals.csv": GOOGLE_SHEET_SHADOW_TAB,
     }
     return mapping.get(filename, "")
 
@@ -490,6 +492,48 @@ def _post_diagnostic(text: str):
         post_to_telegram(text, chat_id=DIAGNOSTIC_CHAT_ID)
     except Exception as e:
         log.warning(f"Diagnostic post failed: {e}")
+
+
+# ─────────────────────────────────────────────────────────
+# SHADOW SIGNAL LOGGER (v6.1)
+# ─────────────────────────────────────────────────────────
+_SHADOW_FIELDS = [
+    "date", "time_ct", "ticker", "regime", "bias", "score",
+    "htf", "phase", "close", "vwap_above", "wt2", "rsi", "why_blocked",
+]
+
+def _log_shadow_signal(ticker: str, regime: str, signal: dict, why_blocked: str):
+    """
+    Log a quality signal from a non-active ticker to shadow_signals.csv + Sheets.
+    Called by ActiveScanner when a signal passes technical thresholds but is
+    filtered by the regime-aware rule gate. No Telegram alert is sent.
+
+    why_blocked values:
+      'no_rule_in_regime'       — ticker not in TICKER_RULES for this regime at all
+      'rule_exists_signal_filtered' — ticker has a rule but signal didn't match
+                                      (wrong HTF, score out of range, wrong phase, etc.)
+    """
+    try:
+        from market_clock import CT
+        now = datetime.now(CT)
+        row = {
+            "date":        now.strftime("%Y-%m-%d"),
+            "time_ct":     now.strftime("%H:%M"),
+            "ticker":      ticker,
+            "regime":      regime,
+            "bias":        signal.get("bias", ""),
+            "score":       signal.get("score", ""),
+            "htf":         signal.get("htf_status", ""),
+            "phase":       signal.get("phase", ""),
+            "close":       signal.get("close", ""),
+            "vwap_above":  signal.get("above_vwap", ""),
+            "wt2":         round(signal.get("wt2", 0), 1),
+            "rsi":         round(signal.get("rsi_mfi", 0), 1) if signal.get("rsi_mfi") else "",
+            "why_blocked": why_blocked,
+        }
+        _append_csv_row("shadow_signals.csv", _SHADOW_FIELDS, row)
+    except Exception as e:
+        log.debug(f"Shadow log failed for {ticker}: {e}")
 
 
 # ─────────────────────────────────────────────────────────
@@ -7892,6 +7936,7 @@ def _start_background_services_once():
                 intraday_fn=get_intraday_bars,
                 regime_fn=get_current_regime,
                 vol_regime_fn=get_canonical_vol_regime,
+                shadow_log_fn=_log_shadow_signal,
             )
             _scanner.start()
             log.info(f"Active scanner started: {_scanner.watchlist_size} tickers")
