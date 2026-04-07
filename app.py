@@ -6069,6 +6069,87 @@ def _post_em_card(ticker: str, session: str):
             "", f"📋 {bias['verdict']}", "", "── Signal Breakdown ({}/14) ──".format(bias['n_signals'])]
         for arrow, text in bias["signals"]:
             lines.append(f"  {arrow}  {text}")
+        # ── TRADE DAY GATE ────────────────────────────────────────────────────
+        # Determines whether conditions are suitable for live options trading.
+        # If not, an emphatic banner is added to the card so there is zero
+        # ambiguity.  The intraday engine still runs and logs everything for
+        # analysis — this gate is purely a human communication tool.
+        #
+        # TRADEABLE requires ALL of:
+        #   1. Trend day probability >= 0.60  (cagf says market has direction)
+        #   2. CAGF regime is TRENDING or SUPPRESSING  (not NEUTRAL/pinned)
+        #   3. Vol regime is not CRISIS
+        #   4. VIX term structure is not INVERTED  (contango required)
+        # ─────────────────────────────────────────────────────────────────────
+        _cagf_regime      = (cagf or {}).get("regime", "NEUTRAL")
+        _trend_prob       = (cagf or {}).get("trend_day_probability", 0.0)
+        _vol_base         = (vol_regime or {}).get("regime", "NORMAL")
+        _term_struct      = (vix or {}).get("term", "unknown")
+
+        _regime_ok   = _cagf_regime in ("TRENDING", "SUPPRESSING")
+        _trend_ok    = _trend_prob >= 0.60
+        _vol_ok      = _vol_base not in ("CRISIS",)
+        _term_ok     = _term_struct not in ("inverted",)
+
+        _tradeable   = _regime_ok and _trend_ok and _vol_ok and _term_ok
+
+        # Build the reasons list for the banner so the trader knows exactly why
+        _no_trade_reasons = []
+        if not _regime_ok:
+            _no_trade_reasons.append(
+                f"Regime is {_cagf_regime} — no directional edge (need TRENDING or SUPPRESSING)"
+            )
+        if not _trend_ok:
+            _no_trade_reasons.append(
+                f"Trend probability {_trend_prob:.0%} — below 60% threshold"
+            )
+        if not _vol_ok:
+            _no_trade_reasons.append(
+                f"Vol regime is {_vol_base} — gap risk too high for defined-risk trades"
+            )
+        if not _term_ok:
+            _no_trade_reasons.append(
+                f"VIX term structure INVERTED — elevated tail risk, stand aside"
+            )
+
+        if _tradeable:
+            # Positive confirmation — clear green light with key stat
+            lines += [
+                "",
+                "🟢" * 10,
+                f"✅  VALID TRADE DAY — {ticker}",
+                f"    Regime: {_cagf_regime}  |  Trend prob: {_trend_prob:.0%}  |  Vol: {_vol_base}",
+                "    Intraday alerts are ACTIONABLE. Size normally.",
+                "🟢" * 10,
+            ]
+        else:
+            # No-trade day — make it impossible to miss
+            lines += [
+                "",
+                "🚫" * 10,
+                f"❌  NO VALID TRADES TODAY — {ticker}",
+                "",
+            ]
+            for _r in _no_trade_reasons:
+                lines.append(f"    ▸ {_r}")
+            lines += [
+                "",
+                "    The intraday engine is still running and logging all",
+                "    signals for analysis — DO NOT trade them live.",
+                "    Treat today as observation only.",
+                "",
+                "    Wait for a morning card that shows ✅ VALID TRADE DAY",
+                "    before putting real money on any alert.",
+                "🚫" * 10,
+            ]
+
+        log.info(
+            f"Trade day gate: {ticker} | tradeable={_tradeable} | "
+            f"regime={_cagf_regime} trend_prob={_trend_prob:.0%} "
+            f"vol={_vol_base} term={_term_struct}"
+        )
+        # ─────────────────────────────────────────────────────────────────────
+
         lines += ["═" * 32, "", f"💡 {iv_note}", "— Not financial advice —"]
 
         log.info(f"EM snapshot built: {ticker} | {session_label} | spot={spot} | IV={iv_pct:.1f}% | "
