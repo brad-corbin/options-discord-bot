@@ -7,17 +7,20 @@
 # The active_scanner reads this table, filters signals, and builds
 # the signal alert — the trader sees everything they need inline.
 #
-# Rule derivation: active scanner backtest Oct 2025 – Apr 2026 (10 tickers)
+# Rule derivation: active scanner backtest Apr 2025 – Apr 2026 (14 tickers)
 # plus full-year 2025 SLV backtest and Apr 2025 – Apr 2026 QQQ backtest.
 #
-# Current regime (March 2026): BEAR
+# Current regime (April 2026): BEAR
 # Focused live tickers: MSFT · IWM · QQQ · META · TSLA · AAPL
+# TRANSITION/BULL tickers (regime-gated): NVDA · AMZN · GOOGL · AVGO · AMD
+# BULL-only tickers: GLD · SLV · USO
 #
 # ─── WHAT NEVER CHANGES ────────────────────────────────────────────
-#   MSFT / META / TSLA  — always CONFIRMED+bear (works every regime)
-#   AAPL                — always CONVERGING+bull, always exit 5d
-#   NVDA / AMZN         — always OPPOSING when active, no score gate
-#   Score ≥80 cap       — hard skip on MSFT / GOOGL / GLD / SLV always
+#   MSFT / META / TSLA       — always CONFIRMED+bear (works every regime)
+#   AAPL                     — always CONVERGING+bull, always exit 5d
+#   NVDA / AMZN / AVGO       — always OPPOSING when active, no score gate
+#   AMD                      — OPPOSING+bull only (bear side has no edge)
+#   Score ≥80 cap            — hard skip on MSFT / GOOGL / GLD / SLV always
 # ═══════════════════════════════════════════════════════════════════
 
 from typing import Optional, List
@@ -624,6 +627,201 @@ TICKER_RULES = {
                 "CONFIRMED+bull score ≥80",
                 "Exit at 3d — 5d is mandatory",
                 "Take OPPOSING signals on SLV",
+            ],
+        },
+    },
+
+
+    # ────────────────────────────────────────────────────────
+    # AVGO — OPPOSING (mean reversion). Both directions.
+    # Strongest OPPOSING signal in the dataset: 82.8% spread WR at 3d.
+    # Inactive in BEAR (backtest period was +88.7% bull — no bear data).
+    # Exit at 3d — WR drops from 82.8% to 72.6% at 5d.
+    # Score not gated — all buckets 50–79 perform equally (PF 2.06–3.86).
+    # ────────────────────────────────────────────────────────
+    "AVGO": {
+        BEAR: {
+            "active": False,
+            "htf": "OPPOSING", "bias": "both",
+            "score_min": 0, "score_max": 99,
+            "phase": None, "rsi_max": None, "rsi_min": None,
+            "exit_days": 3, "spread": None,
+            "premium_flag": None, "premium_wr": None,
+            "wr_3d": 0.0, "wr_5d": 0.0, "n": 0, "period": "Apr 25 – Apr 26",
+            "notes": [
+                "SUSPENDED in BEAR — no bear-regime backtest data available",
+                "Backtest period was +88.7% bull run — bear signal WR unknown",
+                "Reactivate in TRANSITION regime",
+            ],
+            "never": ["AVGO signals in BEAR regime — no validated edge"],
+        },
+        TRANSITION: {
+            "active": True,
+            "htf": "OPPOSING", "bias": "both",
+            "score_min": 0, "score_max": 99,
+            "phase": None, "rsi_max": None, "rsi_min": None,
+            "exit_days": 3, "spread": None,
+            "premium_flag": None, "premium_wr": None,
+            "wr_3d": 82.8, "wr_5d": 72.6, "n": 169, "period": "Apr 25 – Apr 26",
+            "notes": [
+                "OPPOSING only — mean reversion, strongest signal in dataset",
+                "Both bull and bear OPPOSING signals valid",
+                "Exit at 3d — WR drops 10 points by 5d (opposite of NVDA)",
+                "No score gate — all score buckets perform equally well",
+                "No phase edge — morning, midday, afternoon all the same",
+            ],
+            "never": [
+                "Hold past 3d — 5d WR degrades to 72.6%",
+                "Gate on score — not inverted, just flat across all buckets",
+                "Take CONFIRMED signals on AVGO",
+                "Take CONVERGING signals on AVGO",
+            ],
+        },
+        BULL: {
+            "active": True,
+            "htf": "OPPOSING", "bias": "both",
+            "score_min": 0, "score_max": 99,
+            "phase": None, "rsi_max": None, "rsi_min": None,
+            "exit_days": 3, "spread": None,
+            "premium_flag": None, "premium_wr": None,
+            "wr_3d": 82.8, "wr_5d": 72.6, "n": 169, "period": "Apr 25 – Apr 26",
+            "notes": [
+                "OPPOSING only — exit 3d",
+                "Both directions valid",
+                "No score gate",
+            ],
+            "never": [
+                "Hold past 3d",
+                "Gate on score",
+                "CONFIRMED or CONVERGING signals",
+            ],
+        },
+    },
+
+    # ────────────────────────────────────────────────────────
+    # AMD — OPPOSING+bull ONLY. Bear side has no edge (PF 0.77).
+    # Similar to NVDA but weaker and bull-only OPPOSING.
+    # Score 60–69 bucket notably stronger (PF 2.75 vs 1.17–1.26 elsewhere).
+    # Exit 3d (72.0%) slightly better than 5d (69.9%).
+    # Inactive in BEAR (backtest period was +158.9% bull).
+    # ────────────────────────────────────────────────────────
+    "AMD": {
+        BEAR: {
+            "active": False,
+            "htf": "OPPOSING", "bias": "bull",
+            "score_min": 0, "score_max": 99,
+            "phase": None, "rsi_max": None, "rsi_min": None,
+            "exit_days": 3, "spread": "bull_call",
+            "premium_flag": None, "premium_wr": None,
+            "wr_3d": 0.0, "wr_5d": 0.0, "n": 0, "period": "Apr 25 – Apr 26",
+            "notes": [
+                "SUSPENDED in BEAR — backtest period was +158.9% bull run",
+                "No bear-regime data available for AMD",
+            ],
+            "never": ["AMD signals in BEAR regime"],
+        },
+        TRANSITION: {
+            "active": True,
+            "htf": "OPPOSING", "bias": "bull",
+            "score_min": 0, "score_max": 99,
+            "phase": None, "rsi_max": None, "rsi_min": None,
+            "exit_days": 3, "spread": "bull_call",
+            "premium_flag": None, "premium_wr": None,
+            "wr_3d": 72.0, "wr_5d": 69.9, "n": 114, "period": "Apr 25 – Apr 26",
+            "notes": [
+                "OPPOSING+bull ONLY — bear side has no edge (PF 0.77 at 1d)",
+                "Unlike NVDA/AVGO, do NOT take OPPOSING bear signals on AMD",
+                "Score 60–69 bucket is notably stronger (PF 2.75, 69% win)",
+                "Exit 3d — 5d degrades slightly",
+                "No score gate needed but 60–69 is sweet spot if sizing up",
+            ],
+            "never": [
+                "OPPOSING+bear on AMD — bear side loses (PF 0.77)",
+                "CONFIRMED signals on AMD",
+                "Hold past 3d",
+            ],
+        },
+        BULL: {
+            "active": True,
+            "htf": "OPPOSING", "bias": "bull",
+            "score_min": 0, "score_max": 99,
+            "phase": None, "rsi_max": None, "rsi_min": None,
+            "exit_days": 3, "spread": "bull_call",
+            "premium_flag": None, "premium_wr": None,
+            "wr_3d": 72.0, "wr_5d": 69.9, "n": 114, "period": "Apr 25 – Apr 26",
+            "notes": [
+                "OPPOSING+bull only",
+                "Score 60–69 = sweet spot (PF 2.75)",
+                "Exit 3d",
+            ],
+            "never": [
+                "OPPOSING+bear — no edge",
+                "CONFIRMED signals",
+                "Hold past 3d",
+            ],
+        },
+    },
+
+    # ────────────────────────────────────────────────────────
+    # USO — CONFIRMED+bull. Oil ETF, clean trending behavior.
+    # BULL/TRANSITION regime only. CONFIRMED+bear barely breaks even.
+    # Score does NOT invert — higher scores stay consistent.
+    # No phase edge — all sessions work equally.
+    # Exit 3d (71.4%) better than 5d (69.7%).
+    # ────────────────────────────────────────────────────────
+    "USO": {
+        BEAR: {
+            "active": False,
+            "htf": "CONFIRMED", "bias": "bull",
+            "score_min": 50, "score_max": 99,
+            "phase": None, "rsi_max": None, "rsi_min": None,
+            "exit_days": 3, "spread": "bull_call",
+            "premium_flag": None, "premium_wr": None,
+            "wr_3d": 0.0, "wr_5d": 0.0, "n": 0, "period": "Apr 25 – Apr 26",
+            "notes": [
+                "SUSPENDED in BEAR — CONFIRMED+bear spread WR is 64.9% (below 65% breakeven)",
+                "Backtest period was +108.3% bull — bull signals only have validated edge",
+            ],
+            "never": ["USO signals in BEAR regime"],
+        },
+        TRANSITION: {
+            "active": True,
+            "htf": "CONFIRMED", "bias": "bull",
+            "score_min": 50, "score_max": 99,
+            "phase": None, "rsi_max": None, "rsi_min": None,
+            "exit_days": 3, "spread": "bull_call",
+            "premium_flag": None, "premium_wr": None,
+            "wr_3d": 71.4, "wr_5d": 69.7, "n": 843, "period": "Apr 25 – Apr 26",
+            "notes": [
+                "CONFIRMED+bull — clean oil trend signals",
+                "Score does NOT invert — consistent PF 1.81–3.03 across all buckets",
+                "No phase preference — all sessions equivalent",
+                "Exit 3d — 5d degrades slightly",
+                "Similar character to GLD and SLV — commodity trending ETF",
+            ],
+            "never": [
+                "Bear signals on USO — CONFIRMED+bear is below breakeven",
+                "Hold past 3d",
+                "OPPOSING signals on USO",
+            ],
+        },
+        BULL: {
+            "active": True,
+            "htf": "CONFIRMED", "bias": "bull",
+            "score_min": 50, "score_max": 99,
+            "phase": None, "rsi_max": None, "rsi_min": None,
+            "exit_days": 3, "spread": "bull_call",
+            "premium_flag": None, "premium_wr": None,
+            "wr_3d": 71.4, "wr_5d": 69.7, "n": 843, "period": "Apr 25 – Apr 26",
+            "notes": [
+                "CONFIRMED+bull only",
+                "No score gate needed",
+                "Exit 3d",
+            ],
+            "never": [
+                "Bear signals",
+                "Hold past 3d",
+                "OPPOSING signals",
             ],
         },
     },
