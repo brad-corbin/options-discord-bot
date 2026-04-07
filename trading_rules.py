@@ -80,11 +80,18 @@ CHOP_REGIME_CONF_GATE        = 65    # vs normal MIN_CONFIDENCE_TO_TRADE=60
 CHOP_REGIME_SIZE_MULT        = 0.65  # vs REGIME_CHOPPY_SIZE_MULT=0.75 — tighter
 
 # PIN regime: block directional debit spreads when gamma is pinning price.
-# v4.3: Only block the OPPOSING side in PIN. If bias confirms direction
-# and v4 shows PIN, we still block the side fighting the pin.
-# Setting both to True was too aggressive — blocked ALL entries.
-PIN_REGIME_BLOCK_BEAR_PUTS   = True  # Block bear puts if v4 regime contains PIN
+# v6.1: PIN only blocks bear puts in BULL/TRANSITION market regime.
+# In a BEAR regime, PIN days are normal consolidation before continuation —
+# blocking bear puts in a BEAR market on a PIN day is overcorrecting.
+# The market_regime check is applied in _process_job at the call site.
+PIN_REGIME_BLOCK_BEAR_PUTS   = True  # Block bear puts in PIN — but only outside BEAR regime (see app.py)
 PIN_REGIME_BLOCK_BULL_CALLS  = False # v4.3: Allow bull calls in PIN — calls can work if price drifts up to pin
+
+# Crisis put min caution score to fire (0-8 scale).
+# caution 4 = ELEVATED vol (VIX ~22-28). caution 6+ = CRISIS (VIX 35+).
+# v6.1: Lowered from implicit 6 (CRISIS-only) to 4 (ELEVATED+) so bear put
+# recommendations fire in sustained BEAR market without needing a VIX spike.
+CRISIS_PUT_MIN_CAUTION       = 4
 
 # ─────────────────────────────────────────────────────────
 # EXIT RULES
@@ -963,13 +970,17 @@ CRISIS_PUT_TRAIL_GIVEBACK    = 0.25     # trail last 1/3: exit on 25% pullback f
 # Source types allowed (actionable same session only)
 CRISIS_PUT_ALLOWED_SOURCES   = {"scanner", "tv_hourly"}
 
-# Ticker whitelist — high-beta equities with liquid options
+# Ticker whitelist — high-beta equities with liquid options and proven edge.
+# v6.1: Trimmed from 35 → 15. Removed: SOFI, IREN, LMND, IONQ, CIFR, SNDK,
+# INOD, FDX, CVX, XOM, DIA, DAL, UAL, RCL, MRNA, XLE, SOXX, CAT, BA, LLY,
+# HD, ORCL, CRM, GOOG (dup of GOOGL), COIN (too illiquid for single-leg puts),
+# HOOD (too small). Kept: TICKER_RULES active tickers + confirmed high-beta
+# liquid-options names with real edge in bear regime.
 CRISIS_PUT_WHITELIST = {
-    "NVDA", "TSLA", "AMZN", "AAPL", "MSFT", "META", "GOOGL", "GOOG",
-    "AVGO", "AMD", "PLTR", "SOFI", "IREN", "COIN", "MSTR",
-    "IONQ", "LMND", "INOD", "SOXX", "CIFR", "CAT", "BA", "ORCL",
-    "CRM", "FDX", "CVX", "XOM", "HD", "LLY", "SNDK", "DIA", "IWM",
-    "NFLX", "DAL", "UAL", "RCL", "MRNA", "XLE", "HOOD",
+    # Active BEAR regime TICKER_RULES tickers
+    "MSFT", "IWM", "QQQ", "META", "TSLA", "AAPL",
+    # High-beta liquid options — strong bear edge
+    "NVDA", "AMZN", "GOOGL", "AVGO", "AMD", "PLTR", "MSTR", "NFLX", "COIN",
 }
 
 # Ticker blacklist — safe havens that rally in risk-off (never short these in crisis)
@@ -977,4 +988,3 @@ CRISIS_PUT_BLACKLIST = {
     "GLD", "SLV", "NEM", "IAU", "BWXT", "TLT", "NOC", "RTX",
     "PEP", "KO", "JNJ", "PG", "VZ", "T",  # defensive consumer/telecom
 }
-
