@@ -440,12 +440,14 @@ class ActiveScanner:
         regime_detector: Optional[MarketRegimeDetector] = None,
         regime_fn: Callable = None,        # kept for backwards compat
         vol_regime_fn: Callable = None,    # kept for backwards compat
+        shadow_log_fn: Callable = None,    # v6.1: shadow log for non-active tickers
     ):
         self._enqueue      = enqueue_fn
         self._spot         = spot_fn
         self._candles      = candle_fn
         self._intraday     = intraday_fn
         self._vol_regime   = vol_regime_fn
+        self._shadow_log_fn = shadow_log_fn  # v6.1
 
         # v6.0: regime detector (auto-detects BEAR/TRANSITION/BULL)
         self._regime_detector: Optional[MarketRegimeDetector] = regime_detector
@@ -529,6 +531,12 @@ class ActiveScanner:
         # Everything else is suppressed — no ungated alerts.
         if ticker not in TICKER_RULES:
             log.debug(f"Scanner {ticker}: not in TICKER_RULES — suppressed")
+            # v6.1: shadow log — ticker has no rule in any regime
+            if score >= MIN_SIGNAL_SCORE and self._shadow_log_fn:
+                try:
+                    self._shadow_log_fn(ticker, regime, signal, "no_rule_in_regime")
+                except Exception:
+                    pass
             return
 
         if not is_signal_valid(ticker, regime, signal):
@@ -536,6 +544,12 @@ class ActiveScanner:
                 f"Scanner {ticker}: {bias} score={score} htf={signal['htf_status']} "
                 f"phase={signal.get('phase')} — filtered (regime={regime})"
             )
+            # v6.1: shadow log — ticker has a rule but this signal didn't pass it
+            if score >= MIN_SIGNAL_SCORE and self._shadow_log_fn:
+                try:
+                    self._shadow_log_fn(ticker, regime, signal, "rule_exists_signal_filtered")
+                except Exception:
+                    pass
             return
 
         # ── Dedup ────────────────────────────────────────────
