@@ -461,6 +461,26 @@ class ActiveScanner:
         # Track last regime refresh date
         self._last_regime_refresh_date: Optional[date] = None
 
+        # v6.1: Stagger startup scans to prevent all 33 tickers hitting the
+        # API simultaneously on deploy. Assign random initial last_scan times
+        # so the first cycle spreads out over the full scan intervals.
+        self._stagger_startup()
+
+    def _stagger_startup(self):
+        """Assign random initial scan offsets so tickers don't all fire at once."""
+        import random
+        now = time.time()
+        all_tiers = [
+            (TIER_A, SCAN_INTERVAL_A),
+            (TIER_B, SCAN_INTERVAL_B),
+            (TIER_C, SCAN_INTERVAL_C),
+        ]
+        for tickers, interval in all_tiers:
+            for ticker in tickers:
+                # Set last_scan to a random point in the past within one interval
+                # so the first scan is staggered across the full interval window
+                self._last_scan[ticker] = now - random.uniform(0, interval)
+
     # ── Regime helpers ───────────────────────────────────────
 
     def _get_regime(self) -> str:
