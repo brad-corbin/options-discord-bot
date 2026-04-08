@@ -13,6 +13,16 @@
 #   - SLV added to TIER_C watchlist (was missing).
 #   - Daily regime refresh: detector.refresh() called at market open each day.
 #
+# v6.1 changes (2026-04-08 — TRANSITION backtest integration):
+#   P2: HTF scoring fix — CONVERGING bulls in TRANSITION get +12 instead
+#       of the -10 opposing-daily penalty. CONVERGING is the premium
+#       TRANSITION signal (+4.91% 5D avg, PF 9.61) but was systematically
+#       under-scored by 22 points vs CONFIRMED.
+#   P4: RSI window shift — TRANSITION bull RSI bonus window moved from
+#       40–65 to 50–75. RSI < 45 gets -5 penalty (avg -2.82%, PF 0.33).
+#       RSI 50–65 is best zone (avg +1.91%, PF 2.02).
+#   Regime is now passed to _analyze_ticker() so scoring is context-aware.
+#
 # ─── REGIME AUTO-DETECTION ─────────────────────────────────────────
 #   market_regime.py computes BEAR / TRANSITION / BULL from QQQ and IWM
 #   daily closes vs 20-day and 50-day SMAs. Refreshes once per day.
@@ -182,6 +192,7 @@ def _analyze_ticker(
     ticker: str,
     intraday_fn: Callable,
     daily_candle_fn: Callable,
+    regime: str = "BEAR",
 ) -> Optional[Dict]:
     """
     Run technical analysis on a ticker using intraday + daily data.
@@ -347,6 +358,10 @@ def _analyze_ticker(
 
         if htf_confirmed:
             score += 15; score_breakdown["htf"] = 15
+        elif htf_converging and regime == "TRANSITION":
+            # P2: CONVERGING is the premium TRANSITION signal (+4.91% 5D avg)
+            # Do NOT penalize for opposing daily — that's expected in convergence
+            score += 12; score_breakdown["htf"] = 12
         elif daily_bull is not None:
             if (bias == "bull" and daily_bull) or (bias == "bear" and not daily_bull):
                 score += 10; score_breakdown["htf"] = 10
@@ -363,7 +378,17 @@ def _analyze_ticker(
             score_breakdown["volume"] = 0
 
         if rsi:
-            if bias == "bull" and 40 < rsi < 65:
+            if regime == "TRANSITION" and bias == "bull":
+                # P4: TRANSITION bull RSI window is 50–75 (not 40–65)
+                # RSI < 45 is strongly negative (-2.82%, PF 0.33)
+                # RSI 50–65 is best zone (+1.91%, PF 2.02)
+                if 50 < rsi < 75:
+                    score += 5; score_breakdown["rsi"] = 5
+                elif rsi < 45:
+                    score -= 5; score_breakdown["rsi"] = -5
+                else:
+                    score_breakdown["rsi"] = 0
+            elif bias == "bull" and 40 < rsi < 65:
                 score += 5; score_breakdown["rsi"] = 5
             elif bias == "bear" and 35 < rsi < 60:
                 score += 5; score_breakdown["rsi"] = 5
@@ -533,10 +558,13 @@ class ActiveScanner:
         """
         self._last_scan[ticker] = time.time()
 
+        regime = self._get_regime()
+
         signal = _analyze_ticker(
             ticker=ticker,
             intraday_fn=self._intraday,
             daily_candle_fn=self._candles,
+            regime=regime,
         )
         if not signal:
             return
@@ -544,7 +572,6 @@ class ActiveScanner:
         score  = signal["score"]
         bias   = signal["bias"]
         tier   = signal["tier"]
-        regime = self._get_regime()
 
         # ── Regime-aware rule filter ──────────────────────────
         # Only tickers in TICKER_RULES are allowed through.
