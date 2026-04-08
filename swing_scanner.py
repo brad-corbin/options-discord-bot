@@ -825,8 +825,35 @@ def analyze_swing_setup(
         confidence += 5
         conf_reasons.append("Below 200 SMA (+5)")
 
+    # RSI sweet spot (backtest-derived: 45-60 for bulls = constructive pullback)
+    if direction == "bull":
+        if 45 <= rsi_val <= 60:
+            confidence += 5
+            conf_reasons.append(f"RSI {rsi_val:.0f} in pullback sweet spot 45–60 (+5)")
+        elif 60 < rsi_val <= 70:
+            confidence += 2
+            conf_reasons.append(f"RSI {rsi_val:.0f} slightly warm (+2)")
+        elif rsi_val > 70:
+            confidence -= 3
+            conf_reasons.append(f"RSI {rsi_val:.0f} already extended — late chase risk (−3)")
+            warnings.append(f"RSI {rsi_val:.0f} extended")
+        elif 35 <= rsi_val < 45:
+            confidence += 1
+            conf_reasons.append(f"RSI {rsi_val:.0f} weak but not broken (+1)")
+        elif rsi_val < 35:
+            confidence -= 2
+            conf_reasons.append(f"RSI {rsi_val:.0f} deeply weak — needs strong support (−2)")
+            warnings.append(f"RSI {rsi_val:.0f} oversold")
+    else:  # bear
+        if 55 <= rsi_val <= 70:
+            confidence += 3
+            conf_reasons.append(f"RSI {rsi_val:.0f} in bear fade zone (+3)")
+        elif rsi_val > 75:
+            confidence += 5
+            conf_reasons.append(f"RSI {rsi_val:.0f} overbought — ripe for fade (+5)")
+
     # Warnings (no penalty, just noted)
-    warnings = list(rejection_reasons)  # includes demotions
+    warnings = list(set(warnings + list(rejection_reasons)))  # merge, deduplicate
 
     signal = {
         "ticker": ticker,
@@ -889,10 +916,39 @@ def analyze_swing_setup(
     signal["t2_policy"] = horizon["t2_policy"]
     signal["hold_note"] = horizon["hold_note"]
 
+    # ── Setup quality classification (backtest-derived) ──
+    # Identifies premium setups that deserve special attention
+    rsi_sweet = 45 <= rsi_val <= 60
+    conf_final = min(confidence, 100)
+
+    if direction == "bear":
+        signal["setup_quality"] = "TACTICAL"
+        signal["setup_label"] = "Bear tactical — 1-3D, strict exits"
+    elif (fib_level == "50.0" and weekly_bull and rsi_sweet
+          and vol_contracting and conf_final >= 70):
+        signal["setup_quality"] = "FLAGSHIP"
+        signal["setup_label"] = (
+            "⭐ FLAGSHIP: 50% fib + weekly bull + RSI pullback + vol contraction — "
+            "strongest backtest edge (+12% at 30D, +19% at 60D)"
+        )
+    elif fib_level == "50.0" and weekly_bull and conf_final >= 70:
+        signal["setup_quality"] = "PREMIUM"
+        signal["setup_label"] = "🔷 PREMIUM: 50% fib + weekly bull — strong hold candidate"
+    elif fib_level in ("78.6", "38.2") and weekly_bull and conf_final >= 65:
+        signal["setup_quality"] = "STRONG"
+        signal["setup_label"] = f"🔹 STRONG: {fib_level}% fib + weekly bull — medium hold"
+    elif fib_level == "61.8":
+        signal["setup_quality"] = "SELECTIVE"
+        signal["setup_label"] = "⚪ SELECTIVE: 61.8% fib — weakest family, trade smaller"
+    else:
+        signal["setup_quality"] = "STANDARD"
+        signal["setup_label"] = "📊 STANDARD: valid signal, standard management"
+
     log.info(f"Swing scanner {ticker}: T{tier} {direction.upper()} at fib {fib_level}% "
-             f"(conf={confidence}, RS={rs_vs_spy:+.1f}%, "
+             f"(conf={conf_final}, RS={rs_vs_spy:+.1f}%, "
              f"primary={primary_trend}, touches={touch_count}, "
-             f"hold={horizon['hold_class']} {horizon['default_hold_days']}D)")
+             f"hold={horizon['hold_class']} {horizon['default_hold_days']}D, "
+             f"quality={signal['setup_quality']})")
 
     # Cache signal for income scanner access
     _cache_signal(signal)
@@ -1092,14 +1148,22 @@ class SwingScanner:
                 "income_eligible": sig["income_eligible"],
             }
 
+            webhook_data["setup_quality"] = sig.get("setup_quality", "STANDARD")
+
             # Hold-horizon labels for display
             hold_class = sig["hold_class"]
             hold_emoji = {"long_hold": "🏗️", "medium_hold": "📅", "selective": "⚡", "tactical": "💨", "standard": "📅"}.get(hold_class, "📅")
             runner_tag = " 🏃 runner" if sig["runner_eligible"] else ""
             income_tag = " 💰 income" if sig["income_eligible"] else ""
 
+            # Setup quality header
+            quality = sig.get("setup_quality", "STANDARD")
+            quality_header = sig.get("setup_label", "")
+
             signal_msg = (
                 f"📊 Swing Scanner: {ticker} T{tier} {direction.upper()}\n"
+                f"{quality_header}\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"Fib {sig['fib_level']}% @ ${sig['fib_price']:.2f} "
                 f"(dist {sig['fib_dist_pct']:.1f}%)\n"
                 f"Conf: {sig['confidence']}/100 | RS: {sig['rs_vs_spy']:+.1f}%\n"
@@ -1116,7 +1180,7 @@ class SwingScanner:
 
             if self._enqueue:
                 self._enqueue("swing", ticker, direction, webhook_data, signal_msg)
-                log.info(f"Swing signal enqueued: {ticker} T{tier} {direction.upper()}")
+                log.info(f"Swing signal enqueued: {ticker} T{tier} {direction.upper()} [{quality}]")
 
         # Post summary to Telegram
         if self._post and signals:
@@ -1125,7 +1189,9 @@ class SwingScanner:
                 "",
             ]
             for sig in signals:
-                emoji = "🥇" if sig["tier"] == 1 else "🥈"
+                quality = sig.get("setup_quality", "STANDARD")
+                q_emoji = {"FLAGSHIP": "⭐", "PREMIUM": "🔷", "STRONG": "🔹",
+                           "SELECTIVE": "⚪", "TACTICAL": "💨", "STANDARD": "📊"}.get(quality, "📊")
                 dir_emoji = "🟢" if sig["direction"] == "bull" else "🔴"
                 hold_tag = f"{sig['default_hold_days']}D"
                 extras = []
@@ -1133,10 +1199,10 @@ class SwingScanner:
                 if sig.get("income_eligible"): extras.append("💰")
                 extra_str = " " + "".join(extras) if extras else ""
                 summary_lines.append(
-                    f"{emoji}{dir_emoji} {sig['ticker']} T{sig['tier']} "
+                    f"{q_emoji}{dir_emoji} {sig['ticker']} T{sig['tier']} "
                     f"{sig['direction'].upper()} — "
-                    f"Fib {sig['fib_level']}% @ ${sig['fib_price']:.2f} | "
-                    f"Conf {sig['confidence']} | {hold_tag}{extra_str}"
+                    f"Fib {sig['fib_level']}% | Conf {sig['confidence']} | "
+                    f"{hold_tag}{extra_str} [{quality}]"
                 )
             summary_lines.append("")
             summary_lines.append("Signals auto-enqueued for swing engine.")
