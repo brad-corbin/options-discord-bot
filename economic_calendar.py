@@ -98,7 +98,7 @@ def _fetch_economic_calendar(from_date: str, to_date: str) -> List[Dict]:
     try:
         from fundamental_screener import _fmp_get, FMP_TOKEN
         if FMP_TOKEN:
-            data = _fmp_get("economics-calendar", {"from": from_date, "to": to_date})
+            data = _fmp_get("economic-calendar", {"from": from_date, "to": to_date})
             if data and isinstance(data, list):
                 events = []
                 for evt in data:
