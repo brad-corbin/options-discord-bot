@@ -148,21 +148,47 @@ def create_income_handlers(
     return income_scan_fn, income_score_fn
 
 
-def create_ohlcv_wrapper(daily_candle_fn: Callable):
+def create_ohlcv_wrapper(daily_candle_fn: Callable, md_get_fn: Callable = None):
     """
-    Wraps the bot's get_daily_candles (returns closes only) into
-    the income scanner's ohlcv_fn format (returns OHLCV dict).
-
-    Falls back to yfinance if the daily_candle_fn only returns closes.
+    Creates an ohlcv_fn that returns full OHLCV dict.
+    Primary: MarketData daily candles (already paid for, never rate-limits)
+    Fallback: yfinance (rate-limits frequently)
+    Last resort: closes-only degraded mode
     """
 
     def ohlcv_fn(ticker, days=250):
-        # The bot's get_daily_candles only returns close prices.
-        # For income scanner we need full OHLCV. Use yfinance.
+        # Strategy 1: MarketData daily candles (full OHLCV, reliable)
+        if md_get_fn:
+            try:
+                from datetime import datetime, timezone, timedelta
+                from_date = (datetime.now(timezone.utc) - timedelta(days=days + 10)).strftime("%Y-%m-%d")
+                data = md_get_fn(
+                    f"https://api.marketdata.app/v1/stocks/candles/daily/{ticker.upper()}/",
+                    {"from": from_date, "countback": days + 5},
+                )
+                if isinstance(data, dict) and data.get("s") == "ok":
+                    opens = data.get("o", [])
+                    highs = data.get("h", [])
+                    lows = data.get("l", [])
+                    closes = data.get("c", [])
+                    volumes = data.get("v", [])
+                    n = min(len(opens), len(highs), len(lows), len(closes))
+                    if n >= 30:
+                        return {
+                            "open": [float(x) for x in opens[:n]],
+                            "high": [float(x) for x in highs[:n]],
+                            "low": [float(x) for x in lows[:n]],
+                            "close": [float(x) for x in closes[:n]],
+                            "volume": [float(x) for x in (volumes[:n] if len(volumes) >= n else [0]*n)],
+                        }
+            except Exception as e:
+                log.debug(f"MarketData OHLCV failed for {ticker}: {e}")
+
+        # Strategy 2: yfinance (can rate-limit and hang)
         try:
             import yfinance as yf
             data = yf.download(ticker, period="1y", interval="1d",
-                               progress=False, multi_level_index=False)
+                               progress=False, multi_level_index=False, timeout=15)
             if data is not None and len(data) >= 30:
                 return {
                     "open": data["Open"].tolist(),
@@ -174,8 +200,7 @@ def create_ohlcv_wrapper(daily_candle_fn: Callable):
         except Exception as e:
             log.debug(f"yfinance OHLCV failed for {ticker}: {e}")
 
-        # Last resort: if we only have closes, build a partial dict
-        # (support detection needs lows, so this is degraded mode)
+        # Strategy 3: closes-only degraded mode
         try:
             closes = daily_candle_fn(ticker, days=days)
             if closes and len(closes) >= 30:
