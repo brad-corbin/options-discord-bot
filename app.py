@@ -7991,20 +7991,16 @@ def _start_background_services_once():
         # v6.0: Wire income scanner
         global _income_scan_fn, _income_score_fn
         try:
+            from market_regime import get_regime_package
             _income_ohlcv = create_ohlcv_wrapper(get_daily_candles)
             _income_scan_fn, _income_score_fn = create_income_handlers(
                 chain_fn=_cached_md.get_chain,
                 expirations_fn=get_expirations,
                 ohlcv_fn=_income_ohlcv,
-                regime_fn=lambda: {
-                    "core_regime": "BEAR_CRISIS",
-                    "event_overlay": "NONE",
-                    "sector_overlays": [],
-                    "v1_regime": "BEAR",
-                },
+                regime_fn=get_regime_package,
                 post_fn=post_to_telegram,
             )
-            log.info("Income scanner wired: /income and /score commands active")
+            log.info("Income scanner wired: /income and /score commands active (3-layer regime)")
         except Exception as e:
             log.error(f"Income scanner wiring failed: {e}")
             _income_scan_fn = None
