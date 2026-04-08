@@ -864,10 +864,13 @@ def handle_command(
                 reply(f"⚠️ Direction must be 'put' or 'call', got '{direction}'")
                 return
             trade_type = "bull_put" if direction == "put" else "bear_call"
-            short_strike = float(args[2])
-            width = float(args[3])
-            credit = float(args[4])
-            expiry = args[5] if len(args) > 5 else None
+            # Strip common user formatting: @ $ ,
+            clean = [a.replace("@", "").replace("$", "").replace(",", "") for a in args[2:]]
+            clean = [a for a in clean if a]  # remove empties from standalone "@"
+            short_strike = float(clean[0])
+            width = float(clean[1])
+            credit = float(clean[2])
+            expiry = clean[3] if len(clean) > 3 else None
 
             if trade_type == "bull_put":
                 long_strike = short_strike - width
