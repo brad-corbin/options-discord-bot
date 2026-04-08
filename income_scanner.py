@@ -898,6 +898,28 @@ def scan_ticker_income(ticker, regime_package, ohlcv_fn=None,
         vwap_st = vwap_state(closes, highs, lows, volumes)
         fibs = auto_fib_levels(highs, lows)
 
+        # ── Swing scanner confluence ──
+        # Check for recent swing signals on this ticker
+        swing_signal = None
+        swing_fib_price = None
+        swing_income_eligible = False
+        try:
+            from swing_scanner import get_recent_signals
+            swing_signal = get_recent_signals(ticker, max_age_days=7)
+            if swing_signal:
+                swing_fib_price = swing_signal.get("fib_price")
+                swing_income_eligible = swing_signal.get("income_eligible", False)
+                if swing_fib_price and swing_fib_price not in fibs:
+                    fibs.append(swing_fib_price)
+                log.info(f"Income scan {ticker}: swing signal found — "
+                         f"fib {swing_signal.get('fib_level')}% @ ${swing_fib_price}, "
+                         f"income_eligible={swing_income_eligible}, "
+                         f"hold={swing_signal.get('hold_class')}")
+        except ImportError:
+            pass
+        except Exception as e:
+            log.debug(f"Swing signal lookup failed for {ticker}: {e}")
+
         # Option chain data (MarketData primary, yfinance fallback for expirations)
         ticker_obj = _fetch_ticker_obj(ticker)
         expiry, dte = _find_weekly_expiry(ticker, expirations_fn=expirations_fn, ticker_obj=ticker_obj)
@@ -942,8 +964,15 @@ def scan_ticker_income(ticker, regime_package, ohlcv_fn=None,
             # Auto liquidity
             liq = auto_liquidity(chain, short_strike, long_strike, "bull_put")
 
-            # Fib confluence
+            # Fib confluence (includes swing scanner fibs if available)
             fib_match = any(abs(f - short_strike) / spot < 0.015 for f in fibs) if fibs else False
+
+            # Swing signal confluence — boost if swing scanner confirms this support
+            swing_confirmed = False
+            if swing_signal and swing_signal.get("direction") == "bull" and swing_fib_price:
+                if abs(swing_fib_price - sup["level"]) / spot < 0.02:
+                    swing_confirmed = True
+                    fib_match = True  # swing signal counts as fib confluence
 
             blocks = check_hard_blocks("bull_put", short_strike, breakeven, sup, failure,
                                        regime_package, return_on_risk=roc,
@@ -970,6 +999,13 @@ def scan_ticker_income(ticker, regime_package, ohlcv_fn=None,
                 "weekly_trend": weekly["trend"], "daily_trend": daily["trend"],
                 "rsi": rsi, "vol_state": vol, "vwap": vwap_st,
                 "fib_confluence": fib_match,
+                "swing_confirmed": swing_confirmed,
+                "swing_signal": {
+                    "fib_level": swing_signal.get("fib_level"),
+                    "confidence": swing_signal.get("confidence"),
+                    "hold_class": swing_signal.get("hold_class"),
+                    "income_eligible": swing_income_eligible,
+                } if swing_confirmed else None,
                 "liquidity_score": liq, "event_risk": event_risk,
                 "chain_available": bool(chain.get("strike")),
                 "hard_blocks": blocks, "itqs": itqs,
@@ -1163,6 +1199,15 @@ def format_income_alert(opp):
         f"Spot: ${opp['spot']:.2f} | Cushion: {opp['cushion_pct']:.1f}%",
         f"Credit: ${opp.get('credit',0):.2f} on ${opp.get('width',0):.2f} wide ({opp.get('roc_pct',0):.1f}% ROC) [{chain_tag}]",
         f"Expiry: {opp.get('expiry','weekly')} ({opp.get('dte',5)}d)",
+    ]
+
+    # Swing scanner confluence
+    if opp.get("swing_confirmed") and opp.get("swing_signal"):
+        ss = opp["swing_signal"]
+        lines.append(f"🧭 SWING CONFIRMED: fib {ss['fib_level']}% | conf {ss['confidence']} | "
+                     f"{ss['hold_class'].replace('_', ' ')} {'💰' if ss['income_eligible'] else ''}")
+
+    lines += [
         f"", f"📊 SCORECARD",
         f"  A. Regime:     {bd.get('A_regime',0):>3}/15  ({opp.get('regime','')})",
         f"  B. Weekly:     {bd.get('B_weekly',0):>3}/15  ({opp.get('weekly_trend','')})",
