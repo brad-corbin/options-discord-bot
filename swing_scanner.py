@@ -774,6 +774,7 @@ def analyze_swing_setup(
     # ── Confidence scoring ──
     confidence = 50
     conf_reasons = []
+    warnings = []
 
     if tier == 1:
         confidence += 15
@@ -852,8 +853,10 @@ def analyze_swing_setup(
             confidence += 5
             conf_reasons.append(f"RSI {rsi_val:.0f} overbought — ripe for fade (+5)")
 
-    # Warnings (no penalty, just noted)
-    warnings = list(set(warnings + list(rejection_reasons)))  # merge, deduplicate
+    # Merge rejection reasons into warnings, deduplicate
+    for r in rejection_reasons:
+        if r not in warnings:
+            warnings.append(r)
 
     signal = {
         "ticker": ticker,
