@@ -146,6 +146,7 @@ from sector_rotation import (
 )
 from active_scanner import ActiveScanner
 from swing_scanner import SwingScanner
+from income_wiring import create_income_handlers, create_ohlcv_wrapper
 from portfolio_greeks import PortfolioGreeks
 from regime_detector import RegimeDetector
 from oi_tracker import OITracker
@@ -4227,6 +4228,8 @@ def telegram_webhook(secret):
             post_em_card_fn=_post_em_card, post_monitor_card_fn=_post_monitor_card,
             post_checkswing_card_fn=_post_checkswing_card,
             thesis_engine=get_thesis_engine(),
+            post_income_scan_fn=_income_scan_fn,
+            post_income_score_fn=_income_score_fn,
         )
 
     threading.Thread(target=run_command, daemon=True).start()
@@ -7877,6 +7880,17 @@ def _em_scheduler():
                     except Exception as _oe:
                         log.debug(f"OI sweep trigger error: {_oe}")
 
+            # ── v6.0: Income scan — daily at 8:15 AM CT ──
+            _income_key = (date_str, "income_scan")
+            if _income_key not in fired_today and _income_scan_fn:
+                if now_ct.hour == 8 and 14 <= now_ct.minute <= 16:
+                    fired_today.add(_income_key)
+                    log.info("Income scanner firing (8:15 AM CT)")
+                    try:
+                        _income_scan_fn(TELEGRAM_CHAT_ID)
+                    except Exception as _ie:
+                        log.debug(f"Income scan error: {_ie}")
+
             fired_today = {k for k in fired_today if k[0] == date_str}
         except Exception as e:
             log.error(f"EM scheduler error: {e}", exc_info=True)
@@ -7891,6 +7905,8 @@ _background_lock_fh = None
 _background_services_started = False
 _scanner = None  # v5.0: active scanner instance
 _swing_scanner = None  # v5.1: swing scanner instance
+_income_scan_fn = None   # v6.0: income scanner scan callback
+_income_score_fn = None  # v6.0: income scanner score callback
 _portfolio_greeks = PortfolioGreeks()  # v5.1: portfolio-level Greeks aggregator
 _regime_detector = RegimeDetector()    # v5.1: regime transition detector
 _background_services_lock = threading.Lock()
@@ -7971,6 +7987,29 @@ def _start_background_services_once():
                      f"({_swing_scanner.status.get('swing_only_tickers', 0)} swing-only)")
         else:
             log.info("Swing scanner disabled by SWING_SCANNER_ENABLED=False")
+
+        # v6.0: Wire income scanner
+        global _income_scan_fn, _income_score_fn
+        try:
+            _income_ohlcv = create_ohlcv_wrapper(get_daily_candles)
+            _income_scan_fn, _income_score_fn = create_income_handlers(
+                chain_fn=_cached_md.get_chain,
+                expirations_fn=get_expirations,
+                ohlcv_fn=_income_ohlcv,
+                regime_fn=lambda: {
+                    "core_regime": "BEAR_CRISIS",
+                    "event_overlay": "NONE",
+                    "sector_overlays": [],
+                    "v1_regime": "BEAR",
+                },
+                post_fn=post_to_telegram,
+            )
+            log.info("Income scanner wired: /income and /score commands active")
+        except Exception as e:
+            log.error(f"Income scanner wiring failed: {e}")
+            _income_scan_fn = None
+            _income_score_fn = None
+
         _background_services_started = True
         log.info("Background services started in leader process")
         return True
@@ -8217,6 +8256,22 @@ def trigger_swing_scan():
         threading.Thread(target=_run, daemon=True).start()
         return jsonify({"status": "accepted", "watchlist_size": _swing_scanner.status.get("watchlist_size", 0)})
     return jsonify({"status": "error", "reason": "Swing scanner not running"}), 503
+
+
+@app.route("/income_scan", methods=["POST"])
+def trigger_income_scan():
+    """Trigger an immediate income scan of the full watchlist."""
+    data = request.get_json(force=True, silent=True) or {}
+    supplied = (data.get("secret") or request.args.get("secret") or "").strip()
+    if SCAN_SECRET and supplied != SCAN_SECRET:
+        return jsonify({"error": "Unauthorized"}), 403
+
+    ticker = (data.get("ticker") or "").strip().upper() or None
+    if _income_scan_fn:
+        from income_scanner import INCOME_TICKERS
+        _income_scan_fn(TELEGRAM_CHAT_ID, ticker)
+        return jsonify({"status": "accepted", "ticker": ticker, "tickers": INCOME_TICKERS})
+    return jsonify({"status": "error", "reason": "Income scanner not wired"}), 503
 
 
 @app.route("/portfolio", methods=["GET"])
