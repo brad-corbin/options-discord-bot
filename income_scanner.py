@@ -1317,27 +1317,48 @@ def run_income_scan(regime_package, ohlcv_fn=None, tickers=None, notify_fn=None,
             try: notify_fn("\n".join(lines))
             except Exception: pass
         else:
-            # Nothing passed — show why
+            # Nothing passed — explain why
             blocked = [o for o in all_opps if o.get("hard_blocks")]
+            scored_well_but_blocked = [o for o in blocked
+                                       if o["itqs"]["grade"] in ("A+", "A", "B", "C")]
+            low_scoring = [o for o in all_opps if not o.get("hard_blocks")
+                          and o["itqs"]["grade"] == "F"]
             top3 = all_opps[:3] if all_opps else []
+
             lines = [
                 f"📊 INCOME SCAN | {core}",
                 "━" * 28,
                 f"Scanned {len(tickers)} tickers — {len(all_opps)} opportunities evaluated",
-                f"❌ None scored above C (65/100)",
             ]
-            if blocked:
+
+            if scored_well_but_blocked:
+                lines.append(f"🚫 {len(scored_well_but_blocked)} scored B or better but HARD-BLOCKED")
+            if low_scoring:
+                lines.append(f"❌ {len(low_scoring)} scored below C (65/100)")
+            if blocked and not scored_well_but_blocked:
                 lines.append(f"🚫 {len(blocked)} hard-blocked")
+
             if top3:
                 lines.append("")
-                lines.append("Top scores (all below threshold):")
+                lines.append("Top scores:")
                 for opp in top3:
                     s = opp["itqs"]["score"]; g = opp["itqs"]["grade"]
                     typ = "PUT" if opp["trade_type"] == "bull_put" else "CALL"
-                    lines.append(f"  {opp['ticker']} {typ} @${opp['short_strike']:.2f} — "
-                               f"{g}={s} ({opp['itqs']['decision']})")
+                    block_reasons = opp.get("hard_blocks", [])
+                    if block_reasons:
+                        # Show first block reason, truncated
+                        reason = block_reasons[0][:50]
+                        lines.append(f"  {opp['ticker']} {typ} @${opp['short_strike']:.2f} — "
+                                   f"{g}={s} 🚫 {reason}")
+                    else:
+                        lines.append(f"  {opp['ticker']} {typ} @${opp['short_strike']:.2f} — "
+                                   f"{g}={s} ({opp['itqs']['decision']})")
+
             lines.append("")
-            lines.append(f"Regime {core} — scores suppressed by bearish regime alignment")
+            if core in ("BEAR_CRISIS", "BEAR_TRANSITION"):
+                lines.append(f"Regime {core} — bull put scores suppressed, call spreads blocked on structure")
+            else:
+                lines.append(f"Regime {core} — no qualifying opportunities this scan")
             try: notify_fn("\n".join(lines))
             except Exception: pass
 
