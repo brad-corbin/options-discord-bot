@@ -1,1265 +1,1320 @@
-# swing_scanner.py
+# income_scanner.py
 # ═══════════════════════════════════════════════════════════════════
-# Fibonacci Swing Scanner — Institutional Framework
+# Income Trade Scanner — Fully Automated Scorecard v5
 # NOTE: Educational/demo code. Not financial advice. Use at your own risk.
 #
-# Python translation of Brad's Fibonacci Swing Signal v3.0 (Pine)
-# plus institutional enhancements:
-#   - Relative strength vs SPY
-#   - Earnings avoidance
-#   - Correlation grouping (max 2 per sector)
-#   - Multi-touch fib scoring
-#   - Primary trend filter (50/200 SMA)
-#   - ATR-based position context
-#   - Fib extensions as targets
-#   - Macro regime awareness (VIX)
+# v5.0 — April 8, 2026
+# All inputs auto-computed — zero manual parameters:
+#   - Event risk: FMP earnings calendar (primary) + yfinance (fallback)
+#                 + economic_calendar.py for FOMC/CPI/NFP/GDP
+#                 + FMP sector/industry for gap risk classification
+#                 + regime event overlay (WAR_CRISIS, MACRO_SHOCK)
+#   - Liquidity: MarketData.app option chain bid/ask + OI (via chain_fn)
+#   - Credit: MarketData.app chain mid-prices (via chain_fn)
+#   - Fib levels: auto from swing-style fib computation on daily OHLCV
+#   - DTE: MarketData.app expirations (via expirations_fn)
+#   - Strikes: chosen from actual chain when available, increment-based fallback
 #
-# Data source: Yahoo Finance (free, unlimited daily OHLCV)
-# Schedule: 8:15 AM CT (pre-market) + 3:30 PM CT (post-close)
-# Zero MarketData API calls.
+# Data sources:
+#   - Option chains + expirations: MarketData.app via chain_fn / expirations_fn
+#     (same CachedMarketData used by OI tracker and active scanner)
+#   - Daily OHLCV: shared via ohlcv_fn (MarketData daily candles or yfinance)
+#   - Earnings calendar: FMP /v3/earning_calendar (primary), yfinance (fallback)
+#   - Sector / industry: FMP /v3/profile (primary), yfinance (fallback)
+#   - Economic events: economic_calendar.py (Finnhub)
+#   - Regime context: market_regime.py get_regime_package()
 #
-# Usage:
-#   from swing_scanner import SwingScanner
-#   scanner = SwingScanner(enqueue_fn=..., spot_fn=...)
-#   scanner.start()
+# Scorecard (100 pts max, capped):
+#   A. Regime alignment      0–15
+#   B. Weekly structure       0–15
+#   C. Daily structure        0–15
+#   D. Support quality        0–15
+#   E. Break-even placement   0–15
+#   F. Distance / cushion     0–10
+#   G. Technical condition    0–10
+#   H. Liquidity              0–5
+#   I. Event / gap penalty    0 to −10
+#   J. DTE adjustment         −5 to +5
 # ═══════════════════════════════════════════════════════════════════
 
-import math
-import time
 import logging
-import threading
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple, Callable
-
-try:
-    import yfinance as yf
-    _YF_AVAILABLE = True
-except ImportError:
-    _YF_AVAILABLE = False
+import math
+from datetime import datetime, date, timedelta
+from typing import Optional, Callable, List, Dict
 
 log = logging.getLogger(__name__)
 
-# Import config from trading_rules
 try:
-    from trading_rules import (
-        SWING_SCANNER_ENABLED, SWING_WATCHLIST, SWING_ONLY_TICKERS,
-        SWING_SCAN_LOOKBACK_DAYS, SWING_SCAN_TIMES_CT,
-        SWING_FIB_LOOKBACK, SWING_FIB_TOUCH_ZONE_PCT,
-        SWING_WEEKLY_EMA_FAST, SWING_WEEKLY_EMA_SLOW, SWING_WEEKLY_MIN_SEP_PCT,
-        SWING_DAILY_EMA_FAST, SWING_DAILY_EMA_SLOW,
-        SWING_RSI_LENGTH, SWING_RSI_OVERSOLD, SWING_RSI_OVERBOUGHT,
-        SWING_VOL_MA_LENGTH, SWING_VOL_CONTRACT_MULT, SWING_VOL_EXPAND_MULT,
-        SWING_WICK_MIN_PCT, SWING_CLOSE_ZONE_PCT, SWING_COOLDOWN_BARS,
-        SWING_RS_LOOKBACK_DAYS, SWING_RS_REJECT_LONG_BELOW, SWING_RS_REJECT_SHORT_ABOVE,
-        SWING_MAX_PER_SECTOR, SWING_SECTOR_MAP,
-        SWING_PRIMARY_TREND_SMA, SWING_PRIMARY_TREND_LMA, SWING_PRIMARY_TREND_ENABLED,
-        SWING_ATR_LENGTH,
-    )
+    import yfinance as yf
+    _YF = True
 except ImportError:
-    log.warning("swing_scanner: trading_rules imports failed, using defaults")
-    SWING_SCANNER_ENABLED = False
+    _YF = False
+    log.warning("yfinance not available — income scanner will need ohlcv_fn")
+
+# FMP integration — earnings calendar, sector/industry, company profile
+try:
+    from fundamental_screener import _fmp_get, FMP_TOKEN
+    _FMP = bool(FMP_TOKEN)
+except ImportError:
+    _FMP = False
+    _fmp_get = None
+    FMP_TOKEN = ""
+
+# Economic calendar — FOMC, CPI, NFP, GDP inside DTE window
+try:
+    from economic_calendar import get_events_in_window
+    _ECON_CAL = True
+except ImportError:
+    _ECON_CAL = False
+    get_events_in_window = None
+
+INCOME_TICKERS = ["AAPL", "NVDA", "MRNA", "PLTR", "MSFT", "AMZN", "GOOGL"]
+
+# Detection parameters
+LOOKBACK_DAYS       = 180
+TOUCH_TOLERANCE_PCT = 1.5
+MIN_TOUCHES         = 2
+MIN_TOUCH_SPACING   = 5
+MAX_LEVELS          = 6
+
+# Biotech / high-gap-risk sectors
+HIGH_GAP_SECTORS = {"Healthcare", "Biotechnology"}
+HIGH_GAP_INDUSTRIES = {"Biotechnology", "Drug Manufacturers", "Diagnostics & Research"}
+
+# Standard option width increments by price
+def _option_increment(spot):
+    if spot > 200: return 2.50
+    if spot > 100: return 1.00
+    return 0.50
 
 
 # ═══════════════════════════════════════════════════════════
-# TECHNICAL INDICATORS
+# DATA LAYER — auto-fetch everything
 # ═══════════════════════════════════════════════════════════
 
-def _ema(data: list, period: int) -> list:
-    """Exponential moving average."""
-    if not data or len(data) < period:
-        return []
-    k = 2.0 / (period + 1)
-    result = [0.0] * len(data)
-    result[period - 1] = sum(data[:period]) / period
-    for i in range(period, len(data)):
-        result[i] = data[i] * k + result[i - 1] * (1 - k)
-    for i in range(period - 1):
-        result[i] = result[period - 1]
-    return result
-
-
-def _sma(data: list, period: int) -> list:
-    """Simple moving average."""
-    if not data or len(data) < period:
-        return []
-    result = [0.0] * len(data)
-    for i in range(period - 1, len(data)):
-        result[i] = sum(data[i - period + 1:i + 1]) / period
-    return result
-
-
-def _rsi(closes: list, period: int = 14) -> list:
-    """RSI. Returns list same length as closes."""
-    if not closes or len(closes) < period + 1:
-        return [50.0] * len(closes)
-    result = [50.0] * len(closes)
-    gains = []
-    losses = []
-    for i in range(1, len(closes)):
-        change = closes[i] - closes[i - 1]
-        gains.append(max(change, 0))
-        losses.append(max(-change, 0))
-    if len(gains) < period:
-        return result
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
-    for i in range(period, len(gains)):
-        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-        if avg_loss == 0:
-            result[i + 1] = 100.0
-        else:
-            result[i + 1] = 100.0 - (100.0 / (1.0 + avg_gain / avg_loss))
-    return result
-
-
-def _atr(highs: list, lows: list, closes: list, period: int = 14) -> list:
-    """Average True Range."""
-    if len(highs) < period + 1:
-        return []
-    trs = [highs[0] - lows[0]]
-    for i in range(1, len(highs)):
-        tr = max(highs[i] - lows[i],
-                 abs(highs[i] - closes[i - 1]),
-                 abs(lows[i] - closes[i - 1]))
-        trs.append(tr)
-    return _sma(trs, period)
-
-
-def _find_pivots(highs: list, lows: list, pivot_len: int) -> Tuple[list, list]:
-    """
-    Swing high/low detection.
-    Returns (swing_highs, swing_lows) as lists of (bar_index, price).
-    """
-    swing_highs = []
-    swing_lows = []
-    for i in range(pivot_len, len(highs) - pivot_len):
-        is_high = all(highs[i] > highs[j]
-                      for j in range(i - pivot_len, i + pivot_len + 1) if j != i)
-        if is_high:
-            swing_highs.append((i, highs[i]))
-        is_low = all(lows[i] < lows[j]
-                     for j in range(i - pivot_len, i + pivot_len + 1) if j != i)
-        if is_low:
-            swing_lows.append((i, lows[i]))
-    return swing_highs, swing_lows
-
-
-def _aggregate_weekly(bars: List[dict]) -> List[dict]:
-    """Aggregate daily OHLCV into weekly bars (Mon-Fri grouping)."""
-    if not bars:
-        return []
-    weeks = {}
-    for b in bars:
-        dt = b["date"]
-        if isinstance(dt, str):
-            dt = datetime.strptime(dt[:10], "%Y-%m-%d")
-        iso_week = dt.isocalendar()[:2]
-        if iso_week not in weeks:
-            weeks[iso_week] = {"date": dt, "o": b["o"], "h": b["h"],
-                               "l": b["l"], "c": b["c"], "v": b["v"]}
-        else:
-            w = weeks[iso_week]
-            w["h"] = max(w["h"], b["h"])
-            w["l"] = min(w["l"], b["l"])
-            w["c"] = b["c"]
-            w["v"] += b["v"]
-    return sorted(weeks.values(), key=lambda w: w["date"])
-
-
-# ═══════════════════════════════════════════════════════════
-# YAHOO FINANCE DATA FETCHER
-# ═══════════════════════════════════════════════════════════
-
-_yf_cache: Dict[str, tuple] = {}
-_yf_cache_lock = threading.Lock()
-_YF_CACHE_TTL = 14400  # 4 hours
-
-
-def fetch_daily_bars_yahoo(ticker: str, days: int = 120) -> List[dict]:
-    """
-    Fetch daily OHLCV from Yahoo Finance. Free, unlimited.
-    Returns list of dicts: [{date, o, h, l, c, v}, ...]
-    Cached for 4 hours.
-    """
-    if not _YF_AVAILABLE:
-        log.warning("yfinance not installed — pip install yfinance")
-        return []
-
-    cache_key = f"yf:{ticker}:{days}"
-    with _yf_cache_lock:
-        cached = _yf_cache.get(cache_key)
-        if cached and (time.time() - cached[1]) < _YF_CACHE_TTL:
-            return cached[0]
-
+def default_ohlcv_fn(ticker, days=250):
+    """Default OHLCV fetcher. Returns dict or None."""
+    if not _YF:
+        return None
     try:
-        end = datetime.now()
-        start = end - timedelta(days=days + 10)
-        # multi_level_index=False: yfinance >=0.2.38 returns MultiIndex columns
-        # by default even for single tickers, making row["Open"] a Series not a
-        # scalar. This flag collapses it back to flat columns.
-        try:
-            df = yf.download(ticker, start=start.strftime("%Y-%m-%d"),
-                             end=end.strftime("%Y-%m-%d"), progress=False,
-                             auto_adjust=True, multi_level_index=False)
-        except TypeError:
-            # Older yfinance that doesn't support multi_level_index param
-            df = yf.download(ticker, start=start.strftime("%Y-%m-%d"),
-                             end=end.strftime("%Y-%m-%d"), progress=False,
-                             auto_adjust=True)
-
-        if df is None or df.empty:
-            return []
-
-        # Flatten MultiIndex columns if still present (belt-and-suspenders)
-        if hasattr(df.columns, "levels"):
-            df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-
-        bars = []
-        for idx, row in df.iterrows():
-            try:
-                bars.append({
-                    "date": idx.to_pydatetime(),
-                    "o": float(row["Open"].item() if hasattr(row["Open"], "item") else row["Open"]),
-                    "h": float(row["High"].item() if hasattr(row["High"], "item") else row["High"]),
-                    "l": float(row["Low"].item() if hasattr(row["Low"], "item") else row["Low"]),
-                    "c": float(row["Close"].item() if hasattr(row["Close"], "item") else row["Close"]),
-                    "v": int(row["Volume"].item() if hasattr(row["Volume"], "item") else row["Volume"]),
-                })
-            except (TypeError, ValueError):
-                continue  # skip malformed rows silently
-
-        with _yf_cache_lock:
-            _yf_cache[cache_key] = (bars, time.time())
-
-        return bars
+        data = yf.download(ticker, period="1y", interval="1d",
+                           progress=False, multi_level_index=False)
+        if data is None or len(data) < 30:
+            return None
+        return {
+            "open": data["Open"].tolist(), "high": data["High"].tolist(),
+            "low": data["Low"].tolist(), "close": data["Close"].tolist(),
+            "volume": data["Volume"].tolist(),
+        }
     except Exception as e:
-        log.warning(f"Yahoo Finance fetch failed for {ticker}: {e}")
-        return []
+        log.error(f"OHLCV fetch failed for {ticker}: {e}")
+        return None
 
 
-# ═══════════════════════════════════════════════════════════
-# HOLD-HORIZON MAP (backtest-derived)
-# ═══════════════════════════════════════════════════════════
-#
-# Based on swing backtest analysis:
-#   50% fib bull: best at 20-60D, runner-eligible, income-eligible
-#   78.6% fib bull: best at 10-20D, income-eligible
-#   38.2% fib bull: selective 15-20D, income-eligible with vol contraction
-#   61.8% fib bull: weakest, needs extra confluence
-#   Bears: 1-3D tactical only
+def _fetch_ticker_obj(ticker):
+    """Get yfinance Ticker object (for earnings/sector fallback only)."""
+    if not _YF:
+        return None
+    try:
+        return yf.Ticker(ticker)
+    except Exception:
+        return None
 
-def classify_hold_horizon(direction, fib_level, weekly_bull, confidence, vol_contracting):
+
+def _find_weekly_expiry(ticker, expirations_fn=None, ticker_obj=None):
     """
-    Classify a swing signal's hold horizon based on backtest findings.
-    Returns dict with hold_class, default_hold_days, runner_eligible, income_eligible.
+    Find nearest weekly expiration and compute DTE.
+    Uses MarketData expirations_fn (primary) or yfinance (fallback).
+    Returns (expiry_string, dte_int) or (None, 5).
     """
-    if direction == "bear":
-        return {
-            "hold_class": "tactical",
-            "default_hold_days": 3,
-            "max_hold_days": 5,
-            "runner_eligible": False,
-            "income_eligible": False,
-            "t1_policy": "Take at first touch — do not wait",
-            "t2_policy": "Not applicable — bears do not hold for T2",
-            "hold_note": "Bear tactical: exit fast, 1-3D max",
-        }
+    exps = []
 
-    # ── Bull setups ──
-    if fib_level == "50.0":
-        if weekly_bull and confidence >= 70:
-            return {
-                "hold_class": "long_hold",
-                "default_hold_days": 30,
-                "max_hold_days": 60,
-                "runner_eligible": True,
-                "income_eligible": True,
-                "t1_policy": "Take partial at T1, hold runner for T2",
-                "t2_policy": "Runner target — 42-48% hit rate by 60D",
-                "hold_note": "Premium 50% fib bull — strongest backtest family (+12% at 30D, +19% at 60D)",
-            }
-        return {
-            "hold_class": "medium_hold",
-            "default_hold_days": 20,
-            "max_hold_days": 40,
-            "runner_eligible": True,
-            "income_eligible": True,
-            "t1_policy": "Take partial at T1, evaluate for runner",
-            "t2_policy": "Runner only if weekly bull and constructive price action",
-            "hold_note": "50% fib bull — strong hold family, needs time",
-        }
+    # MarketData path (primary)
+    if expirations_fn:
+        try:
+            exps = expirations_fn(ticker)
+        except Exception as e:
+            log.debug(f"MarketData expirations failed for {ticker}: {e}")
 
-    if fib_level == "78.6":
-        return {
-            "hold_class": "medium_hold",
-            "default_hold_days": 15 if weekly_bull else 10,
-            "max_hold_days": 20,
-            "runner_eligible": False,
-            "income_eligible": True,
-            "t1_policy": "Take at T1 — this family peaks 10-20D",
-            "t2_policy": "Rarely reaches T2 within the optimal hold window",
-            "hold_note": "78.6% fib bull — medium-term, best 10-20D",
-        }
+    # yfinance fallback
+    if not exps and ticker_obj:
+        try:
+            exps = list(ticker_obj.options)
+        except Exception:
+            pass
 
-    if fib_level == "38.2":
-        if weekly_bull and vol_contracting:
-            return {
-                "hold_class": "medium_hold",
-                "default_hold_days": 20,
-                "max_hold_days": 30,
-                "runner_eligible": False,
-                "income_eligible": True,
-                "t1_policy": "Take at T1 — these need patience but work",
-                "t2_policy": "Possible but inconsistent — do not plan for it",
-                "hold_note": "38.2% fib bull + vol contraction — selective hold",
-            }
-        return {
-            "hold_class": "selective",
-            "default_hold_days": 15,
-            "max_hold_days": 20,
-            "runner_eligible": False,
-            "income_eligible": False,
-            "t1_policy": "Take at T1 — do not extend without strong tape",
-            "t2_policy": "Not recommended",
-            "hold_note": "38.2% fib bull — needs extra confluence",
-        }
+    if not exps:
+        return None, 5
 
-    if fib_level == "61.8":
-        return {
-            "hold_class": "selective",
-            "default_hold_days": 10,
-            "max_hold_days": 15,
-            "runner_eligible": False,
-            "income_eligible": False,
-            "t1_policy": "Take at T1 — weakest bull family",
-            "t2_policy": "Do not hold for T2",
-            "hold_note": "61.8% fib bull — weakest, trade smaller, require extra confluence",
-        }
+    today = date.today()
+    best_exp = None
+    best_dte = 999
 
-    # Fallback for any other fib level
-    return {
-        "hold_class": "standard",
-        "default_hold_days": 10,
-        "max_hold_days": 20,
-        "runner_eligible": False,
-        "income_eligible": direction == "bull",
-        "t1_policy": "Take at T1",
-        "t2_policy": "Evaluate based on context",
-        "hold_note": "Standard setup — no specific backtest edge data",
-    }
-
-
-# ═══════════════════════════════════════════════════════════
-# SIGNAL CACHE — recent signals accessible by income scanner
-# ═══════════════════════════════════════════════════════════
-
-import threading as _threading
-
-_signal_cache = {}
-_signal_cache_lock = _threading.Lock()
-_SIGNAL_CACHE_MAX_AGE = 86400 * 7  # 7 days
-
-
-def _cache_signal(signal):
-    """Store a signal in the cache, keyed by ticker."""
-    with _signal_cache_lock:
-        ticker = signal["ticker"]
-        _signal_cache[ticker] = {
-            "signal": signal,
-            "cached_at": time.time(),
-        }
-
-
-def get_recent_signals(ticker=None, max_age_days=7):
-    """
-    Get recent swing signals from the cache.
-    If ticker is provided, returns the signal for that ticker or None.
-    If ticker is None, returns dict of all cached signals.
-    Used by income_scanner for fib confluence detection.
-    """
-    cutoff = time.time() - (max_age_days * 86400)
-    with _signal_cache_lock:
-        if ticker:
-            entry = _signal_cache.get(ticker.upper())
-            if entry and entry["cached_at"] > cutoff:
-                return entry["signal"]
-            return None
-        else:
-            return {
-                t: e["signal"] for t, e in _signal_cache.items()
-                if e["cached_at"] > cutoff
-            }
-
-
-# ═══════════════════════════════════════════════════════════
-# FIBONACCI ANALYSIS
-# ═══════════════════════════════════════════════════════════
-
-def compute_fib_levels(swing_high: float, swing_low: float) -> dict:
-    """Compute all fib retracement and extension levels."""
-    r = abs(swing_high - swing_low)
-    return {
-        "bull_382": swing_high - r * 0.382,
-        "bull_500": swing_high - r * 0.500,
-        "bull_618": swing_high - r * 0.618,
-        "bull_786": swing_high - r * 0.786,
-        "bull_ext_127": swing_low + r * 1.272,
-        "bull_ext_162": swing_low + r * 1.618,
-        "bear_382": swing_low + r * 0.382,
-        "bear_500": swing_low + r * 0.500,
-        "bear_618": swing_low + r * 0.618,
-        "bear_786": swing_low + r * 0.786,
-        "bear_ext_127": swing_high - r * 1.272,
-        "bear_ext_162": swing_high - r * 1.618,
-        "swing_high": swing_high,
-        "swing_low": swing_low,
-        "fib_range": r,
-    }
-
-
-def check_fib_touch(bar: dict, fibs: dict, touch_pct: float) -> dict:
-    """Check if bar touches any fib level. Returns touch info."""
-    result = {"bull_touched": False, "bear_touched": False}
-    low, high, close = bar["l"], bar["h"], bar["c"]
-
-    for name, key in [("61.8", "bull_618"), ("50.0", "bull_500"),
-                      ("38.2", "bull_382"), ("78.6", "bull_786")]:
-        level = fibs.get(key, 0)
-        if level <= 0:
+    for exp_str in exps:
+        try:
+            exp_date = datetime.strptime(str(exp_str)[:10], "%Y-%m-%d").date()
+            dte = (exp_date - today).days
+            if 2 <= dte <= 9 and dte < best_dte:
+                best_dte = dte
+                best_exp = str(exp_str)[:10]
+        except ValueError:
             continue
-        if abs(low - level) / level <= touch_pct and close > level * (1 - touch_pct * 2):
-            result.update({"bull_touched": True, "bull_fib_level": name,
-                          "bull_fib_price": level,
-                          "bull_fib_dist_pct": abs(close - level) / level * 100})
-            break
 
-    for name, key in [("61.8", "bear_618"), ("50.0", "bear_500"),
-                      ("38.2", "bear_382"), ("78.6", "bear_786")]:
-        level = fibs.get(key, 0)
-        if level <= 0:
-            continue
-        if abs(high - level) / level <= touch_pct and close < level * (1 + touch_pct * 2):
-            result.update({"bear_touched": True, "bear_fib_level": name,
-                          "bear_fib_price": level,
-                          "bear_fib_dist_pct": abs(close - level) / level * 100})
-            break
-
-    return result
-
-
-def count_fib_touches(bars: List[dict], fibs: dict, touch_pct: float,
-                      lookback: int = 10) -> dict:
-    """Count how many times each fib level was touched in recent bars.
-    Multi-touch fibs score higher (institutional confirmation)."""
-    touches = {"bull": {}, "bear": {}}
-    recent = bars[-lookback:] if len(bars) >= lookback else bars
-
-    for bar in recent:
-        t = check_fib_touch(bar, fibs, touch_pct)
-        if t.get("bull_touched"):
-            key = t["bull_fib_level"]
-            touches["bull"][key] = touches["bull"].get(key, 0) + 1
-        if t.get("bear_touched"):
-            key = t["bear_fib_level"]
-            touches["bear"][key] = touches["bear"].get(key, 0) + 1
-
-    return touches
-
-
-# ═══════════════════════════════════════════════════════════
-# CANDLE QUALITY (Pine v3.0 translation)
-# ═══════════════════════════════════════════════════════════
-
-def candle_quality(bar: dict) -> dict:
-    """Assess candle quality for fib touch confirmation."""
-    o, h, l, c = bar["o"], bar["h"], bar["l"], bar["c"]
-    r = h - l
-    if r <= 0:
-        return {"bull_strong": False, "bear_strong": False,
-                "bull_soft": False, "bear_soft": False}
-
-    bull_wick = (min(o, c) - l) / r * 100
-    bull_close = (c - l) / r * 100
-    bull_rev = c >= o or bull_close >= (100 - SWING_CLOSE_ZONE_PCT)
-    bull_ok = bull_wick >= SWING_WICK_MIN_PCT and bull_close >= (100 - SWING_CLOSE_ZONE_PCT)
-
-    bear_wick = (h - max(o, c)) / r * 100
-    bear_close = (h - c) / r * 100
-    bear_rev = c <= o or bear_close >= (100 - SWING_CLOSE_ZONE_PCT)
-    bear_ok = bear_wick >= SWING_WICK_MIN_PCT and bear_close >= (100 - SWING_CLOSE_ZONE_PCT)
-
-    return {
-        "bull_strong": bull_rev and bull_ok,
-        "bull_soft": bull_rev or bull_close >= 55,
-        "bear_strong": bear_rev and bear_ok,
-        "bear_soft": bear_rev or bear_close >= 55,
-        "bull_wick_pct": round(bull_wick, 1),
-        "bull_close_pct": round(bull_close, 1),
-        "bear_wick_pct": round(bear_wick, 1),
-        "bear_close_pct": round(bear_close, 1),
-    }
-
-
-# ═══════════════════════════════════════════════════════════
-# RELATIVE STRENGTH vs SPY
-# ═══════════════════════════════════════════════════════════
-
-_spy_cache = {"bars": None, "ts": 0}
-
-
-def compute_relative_strength(ticker_bars: List[dict], spy_bars: List[dict],
-                               lookback: int = 20) -> float:
-    """
-    Relative strength: ticker % change vs SPY % change over lookback days.
-    Returns the difference: positive = outperforming SPY.
-    """
-    if len(ticker_bars) < lookback + 1 or len(spy_bars) < lookback + 1:
-        return 0.0
-
-    t_now = ticker_bars[-1]["c"]
-    t_then = ticker_bars[-(lookback + 1)]["c"]
-    s_now = spy_bars[-1]["c"]
-    s_then = spy_bars[-(lookback + 1)]["c"]
-
-    if t_then <= 0 or s_then <= 0:
-        return 0.0
-
-    ticker_pct = (t_now - t_then) / t_then * 100
-    spy_pct = (s_now - s_then) / s_then * 100
-
-    return round(ticker_pct - spy_pct, 2)
-
-
-# ═══════════════════════════════════════════════════════════
-# CORE ANALYSIS (one ticker)
-# ═══════════════════════════════════════════════════════════
-
-def analyze_swing_setup(
-    ticker: str,
-    daily_bars: List[dict],
-    spy_bars: List[dict] = None,
-    vix: float = 20.0,
-    earnings_dates: List[str] = None,
-) -> Optional[dict]:
-    """
-    Full swing signal analysis for one ticker.
-
-    Returns signal dict if T1 or T2 setup detected, None otherwise.
-    Includes all institutional enrichment.
-    """
-    if not daily_bars or len(daily_bars) < 60:
-        return None
-
-    closes = [b["c"] for b in daily_bars]
-    highs = [b["h"] for b in daily_bars]
-    lows = [b["l"] for b in daily_bars]
-    volumes = [b.get("v", 0) for b in daily_bars]
-    n = len(daily_bars)
-    bar = daily_bars[-1]  # latest bar
-    spot = bar["c"]
-
-    # ── ADTV liquidity gate (real 20-day average daily dollar volume) ──
-    if len(daily_bars) >= 20:
-        adtv = sum(b["v"] * b["c"] for b in daily_bars[-20:]) / 20
-        if adtv < 5_000_000 and ticker not in ("SPY", "QQQ", "IWM", "DIA"):
-            log.debug(f"Swing scanner {ticker}: ADTV ${adtv/1e6:.1f}M < $5M, skipping")
-            return None
-
-    # ── Weekly trend (aggregated from daily) ──
-    weekly_bars = _aggregate_weekly(daily_bars)
-    if len(weekly_bars) < SWING_WEEKLY_EMA_SLOW + 2:
-        return None
-
-    w_closes = [w["c"] for w in weekly_bars]
-    w_ema_f = _ema(w_closes, SWING_WEEKLY_EMA_FAST)
-    w_ema_s = _ema(w_closes, SWING_WEEKLY_EMA_SLOW)
-
-    wef, wes = w_ema_f[-1], w_ema_s[-1]
-    wef_prev = w_ema_f[-2] if len(w_ema_f) >= 2 else wef
-    wes_prev = w_ema_s[-2] if len(w_ema_s) >= 2 else wes
-
-    w_gap = abs(wef - wes)
-    w_gap_prev = abs(wef_prev - wes_prev)
-    w_min_sep = w_closes[-1] * (SWING_WEEKLY_MIN_SEP_PCT / 100)
-    w_separated = w_gap >= w_min_sep
-
-    weekly_bull = wef > wes and w_separated
-    weekly_bear = wef < wes and w_separated
-    weekly_bull_loose = wef > wes
-    weekly_bear_loose = wef < wes
-    weekly_converging = (weekly_bull_loose or weekly_bear_loose) and w_gap < w_gap_prev
-
-    weekly_bull_ok = weekly_bull or (weekly_bull_loose and weekly_converging)
-    weekly_bear_ok = weekly_bear or (weekly_bear_loose and weekly_converging)
-
-    # ── Daily trend ──
-    d_ema_f = _ema(closes, SWING_DAILY_EMA_FAST)
-    d_ema_s = _ema(closes, SWING_DAILY_EMA_SLOW)
-    if not d_ema_f or not d_ema_s:
-        return None
-
-    daily_bull = d_ema_f[-1] > d_ema_s[-1]
-    daily_bear = d_ema_f[-1] < d_ema_s[-1]
-    d_gap = abs(d_ema_f[-1] - d_ema_s[-1])
-    d_gap_prev = abs(d_ema_f[-2] - d_ema_s[-2]) if len(d_ema_f) >= 2 else d_gap
-    daily_confirmed_bull = daily_bull and d_gap >= d_gap_prev
-    daily_confirmed_bear = daily_bear and d_gap >= d_gap_prev
-    daily_converging = d_gap < d_gap_prev
-
-    bull_trend_ok = daily_bull or daily_converging
-    bear_trend_ok = daily_bear or daily_converging
-
-    # ── Primary trend (50/200 SMA) ──
-    primary_trend = "neutral"
-    if SWING_PRIMARY_TREND_ENABLED and len(closes) >= SWING_PRIMARY_TREND_LMA:
-        sma50 = _sma(closes, SWING_PRIMARY_TREND_SMA)
-        sma200 = _sma(closes, SWING_PRIMARY_TREND_LMA)
-        if sma50 and sma200 and sma50[-1] > 0 and sma200[-1] > 0:
-            if sma50[-1] > sma200[-1]:
-                primary_trend = "bullish"
-            else:
-                primary_trend = "bearish"
-
-    # ── RSI ──
-    rsi_vals = _rsi(closes, SWING_RSI_LENGTH)
-    rsi_val = rsi_vals[-1] if rsi_vals else 50
-    rsi_bull = rsi_val <= SWING_RSI_OVERSOLD
-    rsi_bear = rsi_val >= SWING_RSI_OVERBOUGHT
-
-    # ── Volume ──
-    vol_sma = _sma(volumes, SWING_VOL_MA_LENGTH)
-    vol_ma_val = vol_sma[-1] if vol_sma else 0
-    vol_contracting = volumes[-1] < vol_ma_val * SWING_VOL_CONTRACT_MULT if vol_ma_val > 0 else False
-    vol_expanding = volumes[-1] > vol_ma_val * SWING_VOL_EXPAND_MULT if vol_ma_val > 0 else False
-
-    # ── ATR ──
-    atr_vals = _atr(highs, lows, closes, SWING_ATR_LENGTH)
-    atr_val = atr_vals[-1] if atr_vals else 0
-
-    # ── Swing pivots + Fibs ──
-    pivot_len = max(2, round(SWING_FIB_LOOKBACK / 5))
-    swing_highs, swing_lows = _find_pivots(highs, lows, pivot_len)
-
-    if not swing_highs or not swing_lows:
-        return None
-
-    last_sh = swing_highs[-1][1]
-    last_sl = swing_lows[-1][1]
-
-    fibs = compute_fib_levels(last_sh, last_sl)
-
-    # ── Fib touch detection ──
-    touch_pct = SWING_FIB_TOUCH_ZONE_PCT / 100
-    touch = check_fib_touch(bar, fibs, touch_pct)
-
-    if not touch["bull_touched"] and not touch["bear_touched"]:
-        return None  # no fib touch on latest bar
-
-    # ── Multi-touch scoring ──
-    multi_touches = count_fib_touches(daily_bars, fibs, touch_pct, lookback=10)
-
-    # ── Candle quality ──
-    cq = candle_quality(bar)
-
-    # ── Build signal ──
-    bull_fib_touched = touch.get("bull_touched", False)
-    bear_fib_touched = touch.get("bear_touched", False)
-    fib_level = touch.get("bull_fib_level") or touch.get("bear_fib_level", "")
-    fib_price = touch.get("bull_fib_price") or touch.get("bear_fib_price", 0)
-    fib_dist = touch.get("bull_fib_dist_pct") or touch.get("bear_fib_dist_pct", 0)
-
-    # Pine v3.0 tier logic (exact translation)
-    strong_bull = cq["bull_strong"] and bull_fib_touched
-    soft_bull = cq["bull_soft"] and bull_fib_touched
-    strong_bear = cq["bear_strong"] and bear_fib_touched
-    soft_bear = cq["bear_soft"] and bear_fib_touched
-
-    t1_extras_bull = vol_contracting or rsi_bull
-    t1_extras_bear = vol_contracting or rsi_bear
-
-    tier1_bull = (strong_bull
-                  and fib_level in ("61.8", "50.0")
-                  and weekly_bull_ok
-                  and (daily_confirmed_bull or daily_converging)
-                  and t1_extras_bull)
-    tier2_bull = (soft_bull
-                  and weekly_bull_ok
-                  and bull_trend_ok
-                  and not tier1_bull)
-
-    tier1_bear = (strong_bear
-                  and fib_level in ("61.8", "50.0")
-                  and weekly_bear_ok
-                  and (daily_confirmed_bear or daily_converging)
-                  and t1_extras_bear)
-    tier2_bear = (soft_bear
-                  and weekly_bear_ok
-                  and bear_trend_ok
-                  and not tier1_bear)
-
-    if not (tier1_bull or tier2_bull or tier1_bear or tier2_bear):
-        return None
-
-    # Determine direction and tier
-    if tier1_bull:
-        direction, tier = "bull", 1
-    elif tier1_bear:
-        direction, tier = "bear", 1
-    elif tier2_bull:
-        direction, tier = "bull", 2
-    elif tier2_bear:
-        direction, tier = "bear", 2
-    else:
-        return None
-
-    # ═══ INSTITUTIONAL FILTERS ═══
-
-    rejection_reasons = []
-
-    # ── Relative strength vs SPY ──
-    rs_vs_spy = 0.0
-    if spy_bars:
-        rs_vs_spy = compute_relative_strength(daily_bars, spy_bars, SWING_RS_LOOKBACK_DAYS)
-        if direction == "bull" and rs_vs_spy < SWING_RS_REJECT_LONG_BELOW:
-            rejection_reasons.append(f"RS too weak for long ({rs_vs_spy:+.1f}% vs SPY)")
-        if direction == "bear" and rs_vs_spy > SWING_RS_REJECT_SHORT_ABOVE:
-            rejection_reasons.append(f"RS too strong for short ({rs_vs_spy:+.1f}% vs SPY)")
-
-    # ── Primary trend filter ──
-    if SWING_PRIMARY_TREND_ENABLED:
-        if direction == "bull" and primary_trend == "bearish":
-            # Don't reject outright, but demote T1 → T2
-            if tier == 1:
-                tier = 2
-                rejection_reasons.append("Demoted T1→T2: 50 SMA < 200 SMA (death cross)")
-        if direction == "bear" and primary_trend == "bullish" and rs_vs_spy > 2.0:
-            rejection_reasons.append(f"Rejected: shorting in golden cross + strong RS ({rs_vs_spy:+.1f}%)")
-
-    # ── Earnings check ──
-    if earnings_dates:
-        from datetime import date
-        today = date.today()
-        for ed_str in earnings_dates:
+    if best_exp is None:
+        for exp_str in exps[:5]:
             try:
-                ed = datetime.strptime(ed_str[:10], "%Y-%m-%d").date()
-                days_to_earnings = (ed - today).days
-                if 0 < days_to_earnings <= 60:  # within DTE window
-                    rejection_reasons.append(f"Earnings in {days_to_earnings} days ({ed_str})")
-                    break
+                exp_date = datetime.strptime(str(exp_str)[:10], "%Y-%m-%d").date()
+                dte = (exp_date - today).days
+                if dte > 0 and dte < best_dte:
+                    best_dte = dte
+                    best_exp = str(exp_str)[:10]
             except ValueError:
                 continue
 
-    # Check for hard rejections (RS filter can be hard)
-    hard_rejected = any("Rejected:" in r for r in rejection_reasons)
-    if hard_rejected:
-        log.info(f"Swing scanner {ticker}: REJECTED — {'; '.join(rejection_reasons)}")
-        return None
+    return best_exp, best_dte if best_exp else 5
 
-    # ── Multi-touch bonus ──
-    touch_count = 0
-    if direction == "bull" and fib_level in multi_touches.get("bull", {}):
-        touch_count = multi_touches["bull"][fib_level]
-    elif direction == "bear" and fib_level in multi_touches.get("bear", {}):
-        touch_count = multi_touches["bear"][fib_level]
 
-    # ── Fib extensions as targets ──
-    if direction == "bull":
-        fib_target_1 = fibs.get("bull_ext_127", 0)
-        fib_target_2 = fibs.get("bull_ext_162", 0)
-    else:
-        fib_target_1 = fibs.get("bear_ext_127", 0)
-        fib_target_2 = fibs.get("bear_ext_162", 0)
+def _fetch_option_chain(ticker, expiry, chain_fn=None):
+    """
+    Fetch option chain for an expiration.
+    Uses MarketData chain_fn (primary) — returns columnar dict.
+    Returns {"strike": [], "bid": [], "ask": [], "side": [], "openInterest": [], "volume": []}
+    or empty dict on failure.
+    """
+    if not chain_fn or not expiry:
+        return {}
 
-    # ── Confidence scoring ──
-    confidence = 50
-    conf_reasons = []
+    try:
+        # Fetch puts and calls separately (cheaper on MarketData credits)
+        put_data = chain_fn(ticker, expiry, side="put")
+        call_data = chain_fn(ticker, expiry, side="call")
 
-    if tier == 1:
-        confidence += 15
-        conf_reasons.append("T1 signal (+15)")
-    else:
-        confidence += 5
-        conf_reasons.append("T2 signal (+5)")
+        # Merge into unified structure
+        result = {"strike": [], "bid": [], "ask": [], "mid": [],
+                  "side": [], "openInterest": [], "volume": []}
 
-    if fib_level == "50.0":
-        confidence += 12
-        conf_reasons.append("50% retracement — strongest backtest family (+12)")
-    elif fib_level == "78.6":
-        confidence += 8
-        conf_reasons.append("78.6% deep retracement (+8)")
-    elif fib_level == "61.8":
-        confidence += 6
-        conf_reasons.append("Golden ratio 61.8% (+6)")
-    elif fib_level == "38.2":
-        confidence += 5
-        conf_reasons.append("38.2% shallow pullback (+5)")
+        for data, side_label in [(put_data, "put"), (call_data, "call")]:
+            if not data or data.get("s") != "ok":
+                continue
+            n = len(data.get("strike", []))
+            for i in range(n):
+                result["strike"].append(data.get("strike", [None] * n)[i])
+                result["bid"].append(data.get("bid", [0] * n)[i] or 0)
+                result["ask"].append(data.get("ask", [0] * n)[i] or 0)
+                result["mid"].append(data.get("mid", [0] * n)[i] or 0)
+                result["side"].append(side_label)
+                result["openInterest"].append(data.get("openInterest", [0] * n)[i] or 0)
+                result["volume"].append(data.get("volume", [0] * n)[i] or 0)
 
-    if touch_count >= 3:
-        confidence += 8
-        conf_reasons.append(f"Multi-touch: {touch_count}x (+8)")
-    elif touch_count >= 2:
-        confidence += 4
-        conf_reasons.append(f"Double-touch: {touch_count}x (+4)")
+        return result if result["strike"] else {}
 
-    if weekly_bull and direction == "bull":
-        confidence += 5
-        conf_reasons.append("Weekly bull confirmed (+5)")
-    elif weekly_bear and direction == "bear":
-        confidence += 5
-        conf_reasons.append("Weekly bear confirmed (+5)")
+    except Exception as e:
+        log.debug(f"Chain fetch failed for {ticker} {expiry}: {e}")
+        return {}
 
-    if vol_contracting:
-        confidence += 3
-        conf_reasons.append("Volume contracting on pullback (+3)")
 
-    if abs(rs_vs_spy) > 2:
-        if (direction == "bull" and rs_vs_spy > 2) or (direction == "bear" and rs_vs_spy < -2):
-            confidence += 5
-            conf_reasons.append(f"Strong RS alignment ({rs_vs_spy:+.1f}%) (+5)")
+def _fetch_earnings_date(ticker, ticker_obj=None):
+    """
+    Get next earnings date. FMP primary, yfinance fallback.
+    Returns date or None.
+    """
+    # FMP earnings calendar (preferred — more reliable)
+    if _FMP:
+        try:
+            today_str = date.today().strftime("%Y-%m-%d")
+            future_str = (date.today() + timedelta(days=45)).strftime("%Y-%m-%d")
+            data = _fmp_get("earning_calendar", {"from": today_str, "to": future_str})
+            if data:
+                for item in data:
+                    if item.get("symbol") == ticker:
+                        try:
+                            return datetime.strptime(item["date"], "%Y-%m-%d").date()
+                        except (ValueError, KeyError):
+                            continue
+        except Exception as e:
+            log.debug(f"FMP earnings lookup failed for {ticker}: {e}")
 
-    if primary_trend == "bullish" and direction == "bull":
-        confidence += 5
-        conf_reasons.append("Above 200 SMA (+5)")
-    elif primary_trend == "bearish" and direction == "bear":
-        confidence += 5
-        conf_reasons.append("Below 200 SMA (+5)")
+    # yfinance fallback
+    if ticker_obj:
+        try:
+            cal = ticker_obj.calendar
+            if isinstance(cal, dict):
+                for key in ["Earnings Date", "earningsDate", "earnings_date"]:
+                    val = cal.get(key)
+                    if val is not None:
+                        if isinstance(val, list) and val:
+                            val = val[0]
+                        if hasattr(val, "date"):
+                            return val.date()
+                        if isinstance(val, str):
+                            return datetime.strptime(val[:10], "%Y-%m-%d").date()
+        except Exception:
+            pass
 
-    # RSI sweet spot (backtest-derived: 45-60 for bulls = constructive pullback)
-    if direction == "bull":
-        if 45 <= rsi_val <= 60:
-            confidence += 5
-            conf_reasons.append(f"RSI {rsi_val:.0f} in pullback sweet spot 45–60 (+5)")
-        elif 60 < rsi_val <= 70:
-            confidence += 2
-            conf_reasons.append(f"RSI {rsi_val:.0f} slightly warm (+2)")
-        elif rsi_val > 70:
-            confidence -= 3
-            conf_reasons.append(f"RSI {rsi_val:.0f} already extended — late chase risk (−3)")
-            warnings.append(f"RSI {rsi_val:.0f} extended")
-        elif 35 <= rsi_val < 45:
-            confidence += 1
-            conf_reasons.append(f"RSI {rsi_val:.0f} weak but not broken (+1)")
-        elif rsi_val < 35:
-            confidence -= 2
-            conf_reasons.append(f"RSI {rsi_val:.0f} deeply weak — needs strong support (−2)")
-            warnings.append(f"RSI {rsi_val:.0f} oversold")
-    else:  # bear
-        if 55 <= rsi_val <= 70:
-            confidence += 3
-            conf_reasons.append(f"RSI {rsi_val:.0f} in bear fade zone (+3)")
-        elif rsi_val > 75:
-            confidence += 5
-            conf_reasons.append(f"RSI {rsi_val:.0f} overbought — ripe for fade (+5)")
+    return None
 
-    # Warnings (no penalty, just noted)
-    warnings = list(set(warnings + list(rejection_reasons)))  # merge, deduplicate
 
-    signal = {
-        "ticker": ticker,
-        "direction": direction,
-        "tier": tier,
-        "fib_level": fib_level,
-        "fib_price": round(fib_price, 2),
-        "fib_dist_pct": round(fib_dist, 2),
-        "fib_range": round(fibs["fib_range"], 2),
-        "swing_high": round(fibs["swing_high"], 2),
-        "swing_low": round(fibs["swing_low"], 2),
-        "fib_target_1": round(fib_target_1, 2),
-        "fib_target_2": round(fib_target_2, 2),
-        "spot": round(spot, 2),
-        "confidence": min(confidence, 100),
-        "conf_reasons": conf_reasons,
-        # Trend context
-        "weekly_bull": weekly_bull,
-        "weekly_bear": weekly_bear,
-        "weekly_bull_loose": weekly_bull_loose,
-        "weekly_bear_loose": weekly_bear_loose,
-        "weekly_converging": weekly_converging,
-        "daily_bull": daily_bull,
-        "daily_bear": daily_bear,
-        "htf_confirmed": daily_confirmed_bull if direction == "bull" else daily_confirmed_bear,
-        "htf_converging": daily_converging,
-        "primary_trend": primary_trend,
-        # Momentum
-        "rsi": round(rsi_val, 1),
-        "rsi_bull": rsi_bull,
-        "vol_contracting": vol_contracting,
-        "vol_expanding": vol_expanding,
-        "volume": volumes[-1],
-        "vol_ma": round(vol_ma_val, 0),
-        "atr": round(atr_val, 2),
-        # Candle quality
-        "candle_quality": cq,
-        "touch_count": touch_count,
-        # Relative strength
-        "rs_vs_spy": rs_vs_spy,
-        # Metadata
-        "warnings": warnings,
-        "scan_time": datetime.now().isoformat(),
-        "source": "swing_scanner",
-        "type": "swing",
-    }
+def _fetch_sector(ticker, ticker_obj=None):
+    """
+    Get sector and industry. FMP primary, yfinance fallback.
+    Returns (sector, industry) or (None, None).
+    """
+    # FMP profile (preferred — cached, consistent)
+    if _FMP:
+        try:
+            data = _fmp_get(f"profile/{ticker}")
+            if data and isinstance(data, list) and data:
+                profile = data[0]
+                return profile.get("sector"), profile.get("industry")
+        except Exception:
+            pass
 
-    # ── Hold-horizon classification (backtest-derived) ──
-    horizon = classify_hold_horizon(
-        direction=direction, fib_level=fib_level,
-        weekly_bull=weekly_bull, confidence=confidence,
-        vol_contracting=vol_contracting,
-    )
-    signal["hold_class"] = horizon["hold_class"]
-    signal["default_hold_days"] = horizon["default_hold_days"]
-    signal["max_hold_days"] = horizon["max_hold_days"]
-    signal["runner_eligible"] = horizon["runner_eligible"]
-    signal["income_eligible"] = horizon["income_eligible"]
-    signal["t1_policy"] = horizon["t1_policy"]
-    signal["t2_policy"] = horizon["t2_policy"]
-    signal["hold_note"] = horizon["hold_note"]
+    # yfinance fallback
+    if ticker_obj:
+        try:
+            info = ticker_obj.info
+            return info.get("sector"), info.get("industry")
+        except Exception:
+            pass
 
-    # ── Setup quality classification (backtest-derived) ──
-    # Identifies premium setups that deserve special attention
-    rsi_sweet = 45 <= rsi_val <= 60
-    conf_final = min(confidence, 100)
-
-    if direction == "bear":
-        signal["setup_quality"] = "TACTICAL"
-        signal["setup_label"] = "Bear tactical — 1-3D, strict exits"
-    elif (fib_level == "50.0" and weekly_bull and rsi_sweet
-          and vol_contracting and conf_final >= 70):
-        signal["setup_quality"] = "FLAGSHIP"
-        signal["setup_label"] = (
-            "⭐ FLAGSHIP: 50% fib + weekly bull + RSI pullback + vol contraction — "
-            "strongest backtest edge (+12% at 30D, +19% at 60D)"
-        )
-    elif fib_level == "50.0" and weekly_bull and conf_final >= 70:
-        signal["setup_quality"] = "PREMIUM"
-        signal["setup_label"] = "🔷 PREMIUM: 50% fib + weekly bull — strong hold candidate"
-    elif fib_level in ("78.6", "38.2") and weekly_bull and conf_final >= 65:
-        signal["setup_quality"] = "STRONG"
-        signal["setup_label"] = f"🔹 STRONG: {fib_level}% fib + weekly bull — medium hold"
-    elif fib_level == "61.8":
-        signal["setup_quality"] = "SELECTIVE"
-        signal["setup_label"] = "⚪ SELECTIVE: 61.8% fib — weakest family, trade smaller"
-    else:
-        signal["setup_quality"] = "STANDARD"
-        signal["setup_label"] = "📊 STANDARD: valid signal, standard management"
-
-    log.info(f"Swing scanner {ticker}: T{tier} {direction.upper()} at fib {fib_level}% "
-             f"(conf={conf_final}, RS={rs_vs_spy:+.1f}%, "
-             f"primary={primary_trend}, touches={touch_count}, "
-             f"hold={horizon['hold_class']} {horizon['default_hold_days']}D, "
-             f"quality={signal['setup_quality']})")
-
-    # Cache signal for income scanner access
-    _cache_signal(signal)
-
-    return signal
+    return None, None
 
 
 # ═══════════════════════════════════════════════════════════
-# SCANNER CLASS
+# AUTO-COMPUTATION — replaces all manual inputs
 # ═══════════════════════════════════════════════════════════
 
-class SwingScanner:
+def auto_event_risk(ticker, dte, regime_package, ticker_obj=None):
     """
-    Runs swing analysis across the full watchlist.
-    Scheduled 2x daily. Uses Yahoo Finance for data.
+    Auto-compute event/gap risk penalty (0–10).
+    Sources:
+      - FMP earnings calendar (primary) / yfinance calendar (fallback)
+      - FMP company profile for sector/industry
+      - economic_calendar.py for FOMC/CPI/NFP/GDP inside DTE window
+      - Regime event overlay
     """
+    risk = 0
 
-    def __init__(
-        self,
-        enqueue_fn: Callable = None,
-        post_fn: Callable = None,
-        earnings_fn: Callable = None,
-        vix_fn: Callable = None,
-    ):
-        """
-        enqueue_fn: function(job_type, ticker, bias, webhook_data, signal_msg)
-        post_fn:    function(message) — post to Telegram
-        earnings_fn: function(ticker) -> {"has_earnings": bool, "next_date": str}
-        vix_fn:     function() -> float
-        """
-        self._enqueue = enqueue_fn
-        self._post = post_fn
-        self._earnings_fn = earnings_fn
-        self._vix_fn = vix_fn
-        self._running = False
-        self._thread = None
-        self._last_scan = {}  # ticker -> last signal time
-        self._signal_cooldown = {}  # ticker:direction -> timestamp
+    # 1. Earnings inside trade window
+    earnings_date = _fetch_earnings_date(ticker, ticker_obj)
+    if earnings_date:
+        days_to_earnings = (earnings_date - date.today()).days
+        if 0 <= days_to_earnings <= dte:
+            risk += 8  # earnings inside window = severe
+            log.info(f"{ticker}: earnings in {days_to_earnings}d (inside {dte}d DTE)")
+        elif 0 <= days_to_earnings <= dte + 2:
+            risk += 4  # just after expiry — IV crush risk
+        elif 0 <= days_to_earnings <= dte + 5:
+            risk += 2  # approaching
 
-    def start(self):
-        if not SWING_SCANNER_ENABLED:
-            log.info("Swing scanner disabled")
-            return
-        if not _YF_AVAILABLE:
-            log.error("Swing scanner requires yfinance — pip install yfinance")
-            return
-        self._running = True
-        self._thread = threading.Thread(target=self._loop, daemon=True, name="swing-scanner")
-        self._thread.start()
-        log.info(f"Swing scanner started: {len(SWING_WATCHLIST)} tickers")
+    # 2. Sector gap risk (biotech, etc.)
+    sector, industry = _fetch_sector(ticker, ticker_obj)
+    if sector in HIGH_GAP_SECTORS or industry in HIGH_GAP_INDUSTRIES:
+        risk += 2
 
-    def stop(self):
-        self._running = False
+    # 3. Economic calendar — FOMC, CPI, NFP, GDP inside DTE window
+    if _ECON_CAL:
+        try:
+            econ_events = get_events_in_window(dte_days=dte)
+            if econ_events:
+                # Count high-impact events
+                high_impact = [e for e in econ_events if e.get("impact") == "high"]
+                medium_impact = [e for e in econ_events if e.get("impact") == "medium"]
+                if high_impact:
+                    risk += min(3, len(high_impact))  # up to +3 for FOMC/CPI/NFP
+                    events_str = ", ".join(e.get("event", "?")[:20] for e in high_impact[:2])
+                    log.info(f"High-impact econ events in {dte}d window: {events_str}")
+                if medium_impact:
+                    risk += 1
+        except Exception as e:
+            log.debug(f"Economic calendar check failed: {e}")
 
-    def scan_all(self) -> List[dict]:
-        """Run a full scan of the watchlist. Returns list of signals."""
-        vix = self._vix_fn() if self._vix_fn else 20.0
+    # 4. Regime event overlay
+    event = regime_package.get("event_overlay", "NONE")
+    if event == "WAR_CRISIS":
+        risk += 3
+    elif event == "MACRO_SHOCK":
+        risk += 2
 
-        # Fetch SPY bars first (needed for relative strength)
-        spy_bars = fetch_daily_bars_yahoo("SPY", SWING_SCAN_LOOKBACK_DAYS)
-        if not spy_bars:
-            log.warning("Swing scanner: failed to fetch SPY bars, RS disabled")
+    return min(10, risk)
 
-        all_signals = []
-        no_data = 0
-        no_signal = 0
 
-        for ticker in sorted(SWING_WATCHLIST):
-            try:
-                bars = fetch_daily_bars_yahoo(ticker, SWING_SCAN_LOOKBACK_DAYS)
-                if not bars or len(bars) < 60:
-                    no_data += 1
-                    continue
+def auto_liquidity(chain, short_strike, long_strike, trade_type):
+    """
+    Auto-compute liquidity score (0–5) from MarketData option chain.
+    Chain is columnar: {"strike": [...], "bid": [...], "ask": [...], ...}
+    """
+    if not chain or not chain.get("strike"):
+        return 1  # no chain data = assume weak liquidity, not neutral
 
-                # Earnings check
-                earnings_dates = []
-                if self._earnings_fn:
-                    try:
-                        ed = self._earnings_fn(ticker)
-                        if ed and ed.get("next_date"):
-                            earnings_dates = [ed["next_date"]]
-                    except Exception:
-                        pass
+    target_side = "put" if trade_type == "bull_put" else "call"
+    score = 0
 
-                signal = analyze_swing_setup(
-                    ticker=ticker,
-                    daily_bars=bars,
-                    spy_bars=spy_bars,
-                    vix=vix,
-                    earnings_dates=earnings_dates,
-                )
+    # Find the short strike in the columnar chain
+    short_idx = None
+    strikes = chain.get("strike", [])
+    sides = chain.get("side", [])
+    for i in range(len(strikes)):
+        sd = sides[i] if i < len(sides) else ""
+        if strikes[i] is not None and abs(strikes[i] - short_strike) < 0.01 and sd == target_side:
+            short_idx = i
+            break
 
-                if signal:
-                    # Cooldown: don't re-signal same ticker+direction within 24h
-                    cd_key = f"{ticker}:{signal['direction']}"
-                    last = self._signal_cooldown.get(cd_key, 0)
-                    if time.time() - last < 86400:
-                        log.debug(f"Swing scanner {ticker}: {signal['direction']} cooldown active")
-                        continue
-                    self._signal_cooldown[cd_key] = time.time()
-                    all_signals.append(signal)
-                else:
-                    no_signal += 1
+    if short_idx is None:
+        return 2
 
-            except Exception as e:
-                log.warning(f"Swing scanner error for {ticker}: {e}")
+    bids = chain.get("bid", [])
+    asks = chain.get("ask", [])
+    ois = chain.get("openInterest", [])
+    vols = chain.get("volume", [])
 
-        log.info(f"Swing scan complete: {len(all_signals)} signals, "
-                 f"{no_signal} no-setup, {no_data} no-data "
-                 f"({len(SWING_WATCHLIST)} tickers)")
+    bid = (bids[short_idx] or 0) if short_idx < len(bids) else 0
+    ask = (asks[short_idx] or 0) if short_idx < len(asks) else 0
+    oi = int(ois[short_idx] or 0) if short_idx < len(ois) else 0
+    vol = int(vols[short_idx] or 0) if short_idx < len(vols) else 0
 
-        # ── Correlation grouping: max per sector ──
-        if all_signals:
-            all_signals = self._apply_correlation_filter(all_signals)
+    if ask > 0 and bid > 0:
+        spread_pct = (ask - bid) / ask * 100
+        if spread_pct < 10: score += 2
+        elif spread_pct < 25: score += 1
 
-        return all_signals
+    if oi >= 500: score += 2
+    elif oi >= 100: score += 1
 
-    def _apply_correlation_filter(self, signals: List[dict]) -> List[dict]:
-        """Limit signals to max N per sector to avoid correlated bets."""
-        sector_counts = {}
-        filtered = []
+    if vol >= 50: score += 1
 
-        # Sort by confidence descending — keep highest conviction per sector
-        signals.sort(key=lambda s: s.get("confidence", 0), reverse=True)
+    return min(5, score)
 
-        for sig in signals:
-            ticker = sig["ticker"]
-            sector = self._get_sector(ticker)
 
-            count = sector_counts.get(sector, 0)
-            if count >= SWING_MAX_PER_SECTOR:
-                log.info(f"Swing scanner: {ticker} filtered (sector {sector} "
-                         f"already has {count} signals)")
+def auto_credit(chain, short_strike, long_strike, trade_type):
+    """
+    Get actual credit from MarketData option chain mid-prices.
+    Validates BOTH legs for stale/wide quotes before accepting.
+    Returns (credit, width) or (None, None) if strikes not found or quotes bad.
+    """
+    if not chain or not chain.get("strike"):
+        return None, None
+
+    target_side = "put" if trade_type == "bull_put" else "call"
+
+    strikes = chain.get("strike", [])
+    sides = chain.get("side", [])
+    mids = chain.get("mid", [])
+    bids = chain.get("bid", [])
+    asks = chain.get("ask", [])
+
+    def _find_leg(target_strike):
+        """Find a leg and validate its quote quality. Returns mid or None."""
+        for i in range(len(strikes)):
+            if strikes[i] is None:
+                continue
+            sd = sides[i] if i < len(sides) else ""
+            if sd != target_side or abs(strikes[i] - target_strike) >= 0.01:
                 continue
 
-            sector_counts[sector] = count + 1
-            filtered.append(sig)
+            bid = (bids[i] or 0) if i < len(bids) else 0
+            ask = (asks[i] or 0) if i < len(asks) else 0
+            mid = (mids[i] if i < len(mids) and mids[i] else (bid + ask) / 2)
 
-        if len(filtered) < len(signals):
-            log.info(f"Correlation filter: {len(signals)} → {len(filtered)} signals "
-                     f"(max {SWING_MAX_PER_SECTOR} per sector)")
+            # Reject stale: both bid and ask are 0
+            if bid == 0 and ask == 0:
+                return None
+            # Reject wide: spread > 50% of ask
+            if ask > 0 and bid > 0 and (ask - bid) / ask > 0.50:
+                return None
 
-        return filtered
+            return mid
+        return None  # strike not found in chain
 
-    def _get_sector(self, ticker: str) -> str:
-        """Map ticker to sector for correlation grouping."""
-        t = ticker.upper()
-        for sector, tickers in SWING_SECTOR_MAP.items():
-            if t in tickers:
-                return sector
-        return "OTHER"
+    short_mid = _find_leg(short_strike)
+    long_mid = _find_leg(long_strike)
 
-    def _fire_signals(self, signals: List[dict]):
-        """Enqueue signals into the swing engine and post summary."""
-        if not signals:
-            return
+    if short_mid is None or long_mid is None:
+        return None, None
 
-        for sig in signals:
-            ticker = sig["ticker"]
-            direction = sig["direction"]
-            tier = sig["tier"]
+    credit = round(max(0, short_mid - long_mid), 2)
+    width = round(abs(short_strike - long_strike), 2)
+    return credit, width
 
-            webhook_data = {
-                "bias": direction,
-                "tier": str(tier),
-                "type": "swing",
-                "source": "swing_scanner",
-                "fib_level": sig["fib_level"],
-                "fib_distance_pct": sig["fib_dist_pct"],
-                "fib_high": sig["swing_high"],
-                "fib_low": sig["swing_low"],
-                "fib_range": sig["fib_range"],
-                "weekly_bull": sig["weekly_bull"],
-                "weekly_bear": sig["weekly_bear"],
-                "htf_confirmed": sig["htf_confirmed"],
-                "htf_converging": sig["htf_converging"],
-                "daily_bull": sig["daily_bull"],
-                "daily_bear": sig["daily_bear"],
-                "rsi": sig["rsi"],
-                "vol_contracting": sig["vol_contracting"],
-                "vol_expanding": sig["vol_expanding"],
-                "volume": sig["volume"],
-                "vol_ma": sig["vol_ma"],
-                "fib_ext_127": sig["fib_target_1"],
-                "fib_ext_162": sig["fib_target_2"],
-                "pre_confidence": sig["confidence"],
-                "rs_vs_spy": sig["rs_vs_spy"],
-                "primary_trend": sig["primary_trend"],
-                "atr": sig["atr"],
-                "is_snapback": (direction == "bull" and sig["primary_trend"] == "bearish"),
-                "vix": sig.get("vix", 20),
-                # Hold-horizon (backtest-derived)
-                "hold_class": sig["hold_class"],
-                "default_hold_days": sig["default_hold_days"],
-                "max_hold_days": sig["max_hold_days"],
-                "runner_eligible": sig["runner_eligible"],
-                "income_eligible": sig["income_eligible"],
-            }
 
-            webhook_data["setup_quality"] = sig.get("setup_quality", "STANDARD")
+def auto_fib_levels(highs, lows, lookback=60):
+    """
+    Compute fib retracement levels from recent swing high/low.
+    Returns list of fib price levels.
+    """
+    if len(highs) < lookback or len(lows) < lookback:
+        return []
 
-            # Hold-horizon labels for display
-            hold_class = sig["hold_class"]
-            hold_emoji = {"long_hold": "🏗️", "medium_hold": "📅", "selective": "⚡", "tactical": "💨", "standard": "📅"}.get(hold_class, "📅")
-            runner_tag = " 🏃 runner" if sig["runner_eligible"] else ""
-            income_tag = " 💰 income" if sig["income_eligible"] else ""
+    recent_highs = highs[-lookback:]
+    recent_lows = lows[-lookback:]
 
-            # Setup quality header
-            quality = sig.get("setup_quality", "STANDARD")
-            quality_header = sig.get("setup_label", "")
+    swing_high = max(recent_highs)
+    swing_low = min(recent_lows)
 
-            signal_msg = (
-                f"📊 Swing Scanner: {ticker} T{tier} {direction.upper()}\n"
-                f"{quality_header}\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"Fib {sig['fib_level']}% @ ${sig['fib_price']:.2f} "
-                f"(dist {sig['fib_dist_pct']:.1f}%)\n"
-                f"Conf: {sig['confidence']}/100 | RS: {sig['rs_vs_spy']:+.1f}%\n"
-                f"Weekly: {'🟢' if sig['weekly_bull'] else '🔴' if sig['weekly_bear'] else '⚪'} | "
-                f"Daily: {'🟢' if sig['daily_bull'] else '🔴' if sig['daily_bear'] else '⚪'} | "
-                f"RSI: {sig['rsi']:.0f}\n"
-                f"Primary: {sig['primary_trend']} | "
-                f"Vol: {'📉 contracting' if sig['vol_contracting'] else '📈 expanding' if sig['vol_expanding'] else '➡️ normal'}\n"
-                f"Targets: ${sig['fib_target_1']:.2f} / ${sig['fib_target_2']:.2f}\n"
-                f"{hold_emoji} Hold: {sig['default_hold_days']}–{sig['max_hold_days']}D ({hold_class.replace('_', ' ')}){runner_tag}{income_tag}\n"
-                f"T1: {sig['t1_policy']}\n"
-                + (f"⚠️ {', '.join(sig['warnings'])}" if sig.get("warnings") else "")
+    if swing_high <= swing_low:
+        return []
+
+    fib_range = swing_high - swing_low
+    levels = [
+        round(swing_high - fib_range * 0.236, 2),
+        round(swing_high - fib_range * 0.382, 2),
+        round(swing_high - fib_range * 0.500, 2),
+        round(swing_high - fib_range * 0.618, 2),
+        round(swing_high - fib_range * 0.786, 2),
+    ]
+    return levels
+
+
+# ═══════════════════════════════════════════════════════════
+# LEVEL DETECTION (same as v3)
+# ═══════════════════════════════════════════════════════════
+
+def _cluster_levels(prices, current_price, tolerance_pct, min_touches,
+                    min_spacing, max_levels, side):
+    if len(prices) < 20:
+        return []
+
+    n = len(prices)
+    tolerance = current_price * (tolerance_pct / 100)
+
+    if side == "support":
+        candidates = [(i, prices[i]) for i in range(n) if prices[i] < current_price]
+    else:
+        candidates = [(i, prices[i]) for i in range(n) if prices[i] > current_price]
+
+    if not candidates:
+        return []
+
+    sorted_cands = sorted(candidates, key=lambda x: x[1])
+    levels = []
+    used = set()
+
+    for idx, price in sorted_cands:
+        if idx in used:
+            continue
+        cluster_idx = []
+        cluster_px = []
+        for j, p in sorted_cands:
+            if j not in used and abs(p - price) <= tolerance:
+                cluster_idx.append(j)
+                cluster_px.append(p)
+                used.add(j)
+        if len(cluster_px) < min_touches:
+            continue
+        cluster_idx.sort()
+        distinct = [cluster_idx[0]]
+        for ci in cluster_idx[1:]:
+            if ci - distinct[-1] >= min_spacing:
+                distinct.append(ci)
+        if len(distinct) < min_touches:
+            continue
+
+        level_price = sum(cluster_px) / len(cluster_px)
+        last_age = n - 1 - max(distinct)
+        recency_wt = max(0.1, 1.0 - (last_age / 120))
+
+        if side == "support":
+            cushion = ((current_price - level_price) / current_price) * 100
+        else:
+            cushion = ((level_price - current_price) / current_price) * 100
+
+        levels.append({
+            "level": round(level_price, 2), "touches": len(distinct),
+            "last_touch_days_ago": last_age, "held": True,
+            "quality": round(len(distinct) * recency_wt, 2),
+            "cushion_pct": round(cushion, 2),
+        })
+
+    levels.sort(key=lambda x: x["quality"], reverse=True)
+    return levels[:max_levels]
+
+
+def detect_support_levels(daily_lows, spot):
+    return _cluster_levels(daily_lows, spot, TOUCH_TOLERANCE_PCT, MIN_TOUCHES, MIN_TOUCH_SPACING, MAX_LEVELS, "support")
+
+def detect_resistance_levels(daily_highs, spot):
+    return _cluster_levels(daily_highs, spot, TOUCH_TOLERANCE_PCT, MIN_TOUCHES, MIN_TOUCH_SPACING, MAX_LEVELS, "resistance")
+
+def find_support_failure_level(supports, primary):
+    below = [s for s in supports if s["level"] < primary * 0.98]
+    if below:
+        below.sort(key=lambda x: x["quality"], reverse=True)
+        return below[0]["level"]
+    return round(primary * 0.97, 2)
+
+def find_resistance_failure_level(resistances, primary):
+    above = [r for r in resistances if r["level"] > primary * 1.02]
+    if above:
+        above.sort(key=lambda x: x["quality"], reverse=True)
+        return above[0]["level"]
+    return round(primary * 1.03, 2)
+
+def _strike_below_support(support, spot, chain=None):
+    """
+    Pick the nearest valid strike below a support level.
+    Uses actual listed strikes from chain when available.
+    Falls back to increment-based rounding when chain is unavailable.
+    """
+    level = support["level"]
+
+    # Chain-aware: find the highest listed put strike below the support level
+    if chain and chain.get("strike"):
+        put_strikes = sorted(set(
+            s for s, sd in zip(chain["strike"], chain.get("side", []))
+            if s is not None and sd == "put" and s < level
+        ), reverse=True)
+        if put_strikes:
+            return put_strikes[0]  # highest listed strike below support
+
+    # Fallback: increment-based
+    inc = _option_increment(spot)
+    return round(math.floor((level - 0.01) / inc) * inc, 2)
+
+
+def _strike_above_resistance(resistance, spot, chain=None):
+    """
+    Pick the nearest valid strike above a resistance level.
+    Uses actual listed strikes from chain when available.
+    """
+    level = resistance["level"]
+
+    if chain and chain.get("strike"):
+        call_strikes = sorted(set(
+            s for s, sd in zip(chain["strike"], chain.get("side", []))
+            if s is not None and sd == "call" and s > level
+        ))
+        if call_strikes:
+            return call_strikes[0]  # lowest listed strike above resistance
+
+    inc = _option_increment(spot)
+    return round(math.ceil((level + 0.01) / inc) * inc, 2)
+
+
+def _long_strike_from_chain(short_strike, trade_type, spot, chain=None):
+    """
+    Pick the long leg strike from the chain (one increment away from short).
+    Uses actual listed strikes when available.
+    """
+    target_side = "put" if trade_type == "bull_put" else "call"
+
+    if chain and chain.get("strike"):
+        listed = sorted(set(
+            s for s, sd in zip(chain["strike"], chain.get("side", []))
+            if s is not None and sd == target_side
+        ))
+        if trade_type == "bull_put":
+            # Next listed strike below the short strike
+            below = [s for s in listed if s < short_strike]
+            if below:
+                return below[-1]  # highest strike below short
+        else:
+            # Next listed strike above the short strike
+            above = [s for s in listed if s > short_strike]
+            if above:
+                return above[0]  # lowest strike above short
+
+    # Fallback: one increment away
+    inc = _option_increment(spot)
+    if trade_type == "bull_put":
+        return round(short_strike - inc, 2)
+    else:
+        return round(short_strike + inc, 2)
+
+
+# ═══════════════════════════════════════════════════════════
+# TREND / TECHNICAL (same as v3)
+# ═══════════════════════════════════════════════════════════
+
+def _ema(data, period):
+    if len(data) < period: return None
+    mult = 2 / (period + 1)
+    ema = sum(data[:period]) / period
+    for val in data[period:]:
+        ema = (val - ema) * mult + ema
+    return ema
+
+def detect_weekly_trend(closes):
+    if len(closes) < 105:
+        return {"weekly_bull": False, "weekly_bear": False, "trend": "unknown"}
+    weekly = closes[::5]
+    if len(weekly) < 21:
+        return {"weekly_bull": False, "weekly_bear": False, "trend": "unknown"}
+    e8 = _ema(weekly, 8); e21 = _ema(weekly, 21)
+    if e8 is None or e21 is None:
+        return {"weekly_bull": False, "weekly_bear": False, "trend": "unknown"}
+    return {"weekly_bull": e8 > e21, "weekly_bear": e8 < e21,
+            "trend": "bull" if e8 > e21 else "bear"}
+
+def detect_daily_trend(closes):
+    if len(closes) < 55:
+        return {"daily_bull": False, "daily_bear": False, "trend": "unknown",
+                "reclaiming": False, "breaking_down": False, "above_50sma": False}
+    e8 = _ema(closes, 8); e21 = _ema(closes, 21)
+    sma50 = sum(closes[-50:]) / 50; spot = closes[-1]
+    daily_bull = e8 > e21 if (e8 and e21) else False
+    daily_bear = e8 < e21 if (e8 and e21) else False
+    reclaiming = False
+    if e8 and e21 and len(closes) >= 30:
+        pe8 = _ema(closes[:-5], 8); pe21 = _ema(closes[:-5], 21)
+        if pe8 and pe21: reclaiming = (pe8 < pe21) and (e8 > e21)
+    breaking_down = daily_bear and spot < sma50
+    return {"daily_bull": daily_bull, "daily_bear": daily_bear,
+            "trend": "bull" if daily_bull else ("bear" if daily_bear else "neutral"),
+            "above_50sma": spot > sma50, "reclaiming": reclaiming, "breaking_down": breaking_down}
+
+def compute_rsi(closes, period=14):
+    if len(closes) < period + 1: return None
+    changes = [closes[i] - closes[i-1] for i in range(1, len(closes))]
+    gains = [max(0, c) for c in changes[-period:]]
+    losses = [max(0, -c) for c in changes[-period:]]
+    avg_g = sum(gains) / period; avg_l = sum(losses) / period
+    if avg_l == 0: return 100.0
+    return round(100 - (100 / (1 + avg_g / avg_l)), 1)
+
+def volume_state(volumes, lookback=10):
+    if len(volumes) < lookback + 5: return "unknown"
+    ma = sum(volumes[-(lookback+5):-5]) / lookback
+    recent = sum(volumes[-5:]) / 5
+    if recent < ma * 0.80: return "contracting"
+    elif recent > ma * 1.30: return "expanding"
+    return "normal"
+
+def vwap_state(closes, highs, lows, volumes):
+    if len(closes) < 2: return "unknown"
+    n = min(20, len(closes))
+    hlc3 = [(highs[-i] + lows[-i] + closes[-i]) / 3 for i in range(1, n+1)]
+    vols = [volumes[-i] for i in range(1, n+1)]
+    tv = sum(vols)
+    if tv == 0: return "unknown"
+    vw = sum(p*v for p, v in zip(hlc3, vols)) / tv
+    return "above" if closes[-1] > vw else "below"
+
+
+# ═══════════════════════════════════════════════════════════
+# HARD BLOCKS
+# ═══════════════════════════════════════════════════════════
+
+def check_hard_blocks(trade_type, short_strike, breakeven, support_level,
+                      failure_level, regime_package, return_on_risk=None,
+                      earnings_in_window=False):
+    blocks = []
+    level = support_level["level"]
+
+    if trade_type == "bull_put":
+        if short_strike >= level:
+            blocks.append(f"Short strike ${short_strike:.2f} at/above support ${level:.2f}")
+        if breakeven > failure_level:
+            blocks.append(f"Break-even ${breakeven:.2f} above failure ${failure_level:.2f}")
+    else:
+        if short_strike <= level:
+            blocks.append(f"Short strike ${short_strike:.2f} at/below resistance ${level:.2f}")
+        if breakeven < failure_level:
+            blocks.append(f"Break-even ${breakeven:.2f} below resistance failure ${failure_level:.2f}")
+
+    if return_on_risk is not None and return_on_risk < 5.0:
+        blocks.append(f"ROC {return_on_risk:.1f}% below minimum 5%")
+
+    if earnings_in_window:
+        blocks.append("Earnings inside trade window — binary event risk")
+
+    core = regime_package.get("core_regime", "")
+    event = regime_package.get("event_overlay", "NONE")
+    if trade_type == "bull_put" and core == "BEAR_CRISIS" and event == "WAR_CRISIS":
+        blocks.append("BEAR_CRISIS + WAR_CRISIS — hard block on put sales")
+
+    return blocks
+
+
+# ═══════════════════════════════════════════════════════════
+# ITQS SCORING (same framework as v3)
+# ═══════════════════════════════════════════════════════════
+
+def compute_itqs(trade_type, short_strike, breakeven, spot, support_level,
+                 failure_level, regime_package, weekly_trend, daily_trend,
+                 rsi, vol, vwap, fib_confluence=False, return_on_risk=None,
+                 liquidity_score=3, event_risk=0, dte=5):
+    score = 0; breakdown = {}; notes = []
+    level = support_level["level"]; touches = support_level.get("touches", 0)
+
+    if trade_type == "bull_put":
+        spot_to_strike_pct = ((spot - short_strike) / spot) * 100 if spot > 0 else 0
+        be_to_failure_pct = ((failure_level - breakeven) / failure_level) * 100 if failure_level > 0 else 0
+        strike_below = short_strike < level
+    else:
+        spot_to_strike_pct = ((short_strike - spot) / spot) * 100 if spot > 0 else 0
+        be_to_failure_pct = ((breakeven - failure_level) / failure_level) * 100 if failure_level > 0 else 0
+        strike_below = short_strike > level
+
+    # A. Regime (0-15)
+    core = regime_package.get("core_regime", "BEAR_CRISIS")
+    if trade_type == "bull_put":
+        a = {"BULL_BASE": 15, "BULL_TRANSITION": 12, "CHOP": 8, "BEAR_TRANSITION": 5, "BEAR_CRISIS": 2}.get(core, 5)
+    else:
+        a = {"BULL_BASE": 2, "BULL_TRANSITION": 5, "CHOP": 8, "BEAR_TRANSITION": 12, "BEAR_CRISIS": 15}.get(core, 5)
+    breakdown["A_regime"] = a; score += a
+
+    # B. Weekly (0-15)
+    bull_side = trade_type == "bull_put"
+    if (bull_side and weekly_trend.get("weekly_bull")) or (not bull_side and weekly_trend.get("weekly_bear")):
+        b = 15; notes.append(f"Weekly {'bull' if bull_side else 'bear'} confirmed")
+    elif (bull_side and not weekly_trend.get("weekly_bear")) or (not bull_side and not weekly_trend.get("weekly_bull")):
+        b = 10
+    else:
+        b = 3; notes.append("⚠️ Weekly trend opposes trade direction")
+    breakdown["B_weekly"] = b; score += b
+
+    # C. Daily (0-15)
+    if trade_type == "bull_put":
+        if daily_trend.get("reclaiming"): c = 15; notes.append("Daily reclaiming")
+        elif daily_trend.get("daily_bull"): c = 13
+        elif daily_trend.get("above_50sma") and not daily_trend.get("breaking_down"): c = 10
+        elif daily_trend.get("breaking_down"): c = 3; notes.append("⚠️ Daily breakdown")
+        elif daily_trend.get("daily_bear"): c = 5
+        else: c = 8
+    else:
+        if daily_trend.get("breaking_down"): c = 15
+        elif daily_trend.get("daily_bear"): c = 13
+        elif daily_trend.get("daily_bull"): c = 3
+        else: c = 8
+    breakdown["C_daily"] = c; score += c
+
+    # D. Support quality (0-15)
+    if strike_below and touches >= 3: d = 15
+    elif strike_below and touches >= 2: d = 12
+    elif abs(short_strike - level)/level < 0.01 and touches >= 3: d = 10
+    elif strike_below: d = 8
+    elif abs(short_strike - level)/level < 0.01: d = 5
+    else: d = 2; notes.append("Strike not below support")
+    breakdown["D_support"] = d; score += d
+
+    # E. Break-even (0-15)
+    be_safe = (breakeven < failure_level) if trade_type == "bull_put" else (breakeven > failure_level)
+    if be_safe and be_to_failure_pct > 2: e = 15; notes.append("Break-even well past failure level")
+    elif be_safe and be_to_failure_pct > 0.5: e = 12
+    elif be_safe: e = 8
+    elif abs(be_to_failure_pct) < 0.5: e = 5; notes.append("Break-even near failure")
+    else: e = 2; notes.append("⚠️ Break-even past failure zone")
+    breakdown["E_breakeven"] = e; score += e
+
+    # F. Cushion (0-10) — from actual trade
+    if 4 <= spot_to_strike_pct <= 8: f = 10
+    elif 3 <= spot_to_strike_pct < 4: f = 7
+    elif 8 < spot_to_strike_pct <= 12: f = 7
+    elif 2 <= spot_to_strike_pct < 3: f = 4; notes.append("Cushion tight")
+    elif spot_to_strike_pct > 12: f = 4
+    elif spot_to_strike_pct < 2: f = 0; notes.append("⚠️ Cushion < 2%")
+    else: f = 5
+    breakdown["F_cushion"] = f; score += f
+
+    # G. Technical (0-10)
+    g = 0
+    if rsi is not None:
+        if trade_type == "bull_put":
+            if 40 <= rsi <= 55: g += 3
+            elif 55 < rsi <= 65 or 35 <= rsi < 40: g += 2
+            elif rsi < 30: notes.append("⚠️ RSI oversold")
+            else: g += 1
+        else:
+            if 55 <= rsi <= 70: g += 3
+            elif rsi > 75: g += 1; notes.append("RSI overbought")
+            else: g += 2
+    if vol == "contracting": g += 3; notes.append("Volume contracting")
+    elif vol == "normal": g += 2
+    if (trade_type == "bull_put" and vwap == "above") or (trade_type == "bear_call" and vwap == "below"): g += 2
+    else: g += 1
+    if fib_confluence: g += 2; notes.append("Fib confluence")
+    breakdown["G_technical"] = min(10, g); score += breakdown["G_technical"]
+
+    # H. Liquidity (0-5)
+    breakdown["H_liquidity"] = min(5, max(0, liquidity_score)); score += breakdown["H_liquidity"]
+
+    # I. Event penalty (0 to -10)
+    breakdown["I_event_penalty"] = -min(10, max(0, event_risk)); score += breakdown["I_event_penalty"]
+    if event_risk >= 5: notes.append(f"⚠️ Event risk elevated (−{event_risk})")
+    if event_risk >= 8: notes.append("🚫 Earnings inside trade window")
+
+    # J. DTE (−5 to +5)
+    if 4 <= dte <= 7: j = 5
+    elif dte == 3: j = 2
+    elif 8 <= dte <= 14: j = 2
+    elif dte <= 2: j = -5; notes.append("⚠️ DTE ≤2 — no room to roll")
+    elif dte > 14: j = -2
+    else: j = 0
+    breakdown["J_dte"] = j; score += j
+
+    score = max(0, min(100, score))
+    if score >= 90: grade, label = "A+", "A+ elite income trade"
+    elif score >= 85: grade, label = "A", "A strong trade"
+    elif score >= 75: grade, label = "B", "B good trade"
+    elif score >= 65: grade, label = "C", "C acceptable"
+    else: grade, label = "F", "Pass"
+
+    decision = label
+    if grade in ("A+", "A", "B"):
+        if trade_type == "bull_put" and weekly_trend.get("weekly_bull") and touches >= 2 and spot_to_strike_pct >= 3:
+            decision = "Wheel-friendly entry"
+        if event_risk >= 5: decision = "Support-qualified, elevated gap risk"
+    elif grade == "C":
+        if spot_to_strike_pct < 3: decision = "Pass — strike too close"
+        elif c <= 5: decision = "Pass — chart quality too weak"
+        elif event_risk >= 7: decision = "Pass — event risk too high"
+
+    return {"score": score, "grade": grade, "label": label, "decision": decision,
+            "breakdown": breakdown, "notes": notes, "trade_type": trade_type,
+            "spot_to_strike_pct": round(spot_to_strike_pct, 1),
+            "be_to_failure_pct": round(be_to_failure_pct, 1)}
+
+
+# ═══════════════════════════════════════════════════════════
+# SCAN ONE TICKER — FULLY AUTOMATED
+# ═══════════════════════════════════════════════════════════
+
+def scan_ticker_income(ticker, regime_package, ohlcv_fn=None,
+                       chain_fn=None, expirations_fn=None):
+    """
+    Fully automated scan. Zero manual inputs.
+    chain_fn(ticker, expiry, side=) → MarketData columnar dict
+    expirations_fn(ticker) → list of expiration strings
+    """
+    fetch = ohlcv_fn or default_ohlcv_fn
+    try:
+        ohlcv = fetch(ticker)
+        if ohlcv is None:
+            return []
+
+        closes = ohlcv["close"]; highs = ohlcv["high"]
+        lows = ohlcv["low"]; volumes = ohlcv["volume"]
+        if len(closes) < 60:
+            return []
+        spot = closes[-1]
+
+        # Auto-detect everything
+        supports = detect_support_levels(lows, spot)
+        resistances = detect_resistance_levels(highs, spot)
+        weekly = detect_weekly_trend(closes)
+        daily = detect_daily_trend(closes)
+        rsi = compute_rsi(closes)
+        vol = volume_state(volumes)
+        vwap_st = vwap_state(closes, highs, lows, volumes)
+        fibs = auto_fib_levels(highs, lows)
+
+        # ── Swing scanner confluence ──
+        # Check for recent swing signals on this ticker
+        swing_signal = None
+        swing_fib_price = None
+        swing_income_eligible = False
+        try:
+            from swing_scanner import get_recent_signals
+            swing_signal = get_recent_signals(ticker, max_age_days=7)
+            if swing_signal:
+                swing_fib_price = swing_signal.get("fib_price")
+                swing_income_eligible = swing_signal.get("income_eligible", False)
+                if swing_fib_price and swing_fib_price not in fibs:
+                    fibs.append(swing_fib_price)
+                log.info(f"Income scan {ticker}: swing signal found — "
+                         f"fib {swing_signal.get('fib_level')}% @ ${swing_fib_price}, "
+                         f"income_eligible={swing_income_eligible}, "
+                         f"hold={swing_signal.get('hold_class')}")
+        except ImportError:
+            pass
+        except Exception as e:
+            log.debug(f"Swing signal lookup failed for {ticker}: {e}")
+
+        # Option chain data (MarketData primary, yfinance fallback for expirations)
+        ticker_obj = _fetch_ticker_obj(ticker)
+        expiry, dte = _find_weekly_expiry(ticker, expirations_fn=expirations_fn, ticker_obj=ticker_obj)
+        chain = _fetch_option_chain(ticker, expiry, chain_fn=chain_fn) if expiry else {}
+
+        # Auto event risk (FMP primary, yfinance fallback)
+        event_risk = auto_event_risk(ticker, dte, regime_package, ticker_obj=ticker_obj)
+
+        # Check earnings for hard block
+        earnings_date = _fetch_earnings_date(ticker, ticker_obj=ticker_obj)
+        earnings_in_window = False
+        if earnings_date:
+            days_to_earn = (earnings_date - date.today()).days
+            earnings_in_window = 0 <= days_to_earn <= dte
+
+        opportunities = []
+
+        # ── Bull put candidates ──
+        for sup in supports:
+            short_strike = _strike_below_support(sup, spot, chain=chain)
+            if short_strike <= 0 or short_strike >= spot:
+                continue
+
+            # Long strike from actual chain or increment fallback
+            long_strike = _long_strike_from_chain(short_strike, "bull_put", spot, chain=chain)
+
+            # Try to get real credit from chain
+            real_credit, real_width = auto_credit(chain, short_strike, long_strike, "bull_put")
+
+            if real_credit is not None and real_width and real_width > 0:
+                credit = real_credit
+                width = real_width
+            else:
+                width = abs(short_strike - long_strike)
+                credit = width * 0.15  # fallback estimate
+
+            breakeven = short_strike - credit
+            roc = (credit / width) * 100 if width > 0 else 0
+            cushion_pct = ((spot - short_strike) / spot) * 100
+            failure = find_support_failure_level(supports, sup["level"])
+
+            # Auto liquidity
+            liq = auto_liquidity(chain, short_strike, long_strike, "bull_put")
+
+            # Fib confluence (includes swing scanner fibs if available)
+            fib_match = any(abs(f - short_strike) / spot < 0.015 for f in fibs) if fibs else False
+
+            # Swing signal confluence — boost if swing scanner confirms this support
+            swing_confirmed = False
+            if swing_signal and swing_signal.get("direction") == "bull" and swing_fib_price:
+                if abs(swing_fib_price - sup["level"]) / spot < 0.02:
+                    swing_confirmed = True
+                    fib_match = True  # swing signal counts as fib confluence
+
+            blocks = check_hard_blocks("bull_put", short_strike, breakeven, sup, failure,
+                                       regime_package, return_on_risk=roc,
+                                       earnings_in_window=earnings_in_window)
+
+            itqs = compute_itqs(
+                "bull_put", short_strike, breakeven, spot, sup, failure,
+                regime_package, weekly, daily, rsi, vol, vwap_st,
+                fib_confluence=fib_match, return_on_risk=roc,
+                liquidity_score=liq, event_risk=event_risk, dte=dte,
             )
 
-            if self._enqueue:
-                self._enqueue("swing", ticker, direction, webhook_data, signal_msg)
-                log.info(f"Swing signal enqueued: {ticker} T{tier} {direction.upper()} [{quality}]")
+            opportunities.append({
+                "ticker": ticker, "trade_type": "bull_put",
+                "spot": round(spot, 2), "short_strike": short_strike,
+                "long_strike": long_strike, "width": width,
+                "credit": round(credit, 2), "roc_pct": round(roc, 1),
+                "breakeven": round(breakeven, 2), "failure_level": failure,
+                "dte": dte, "expiry": expiry,
+                "level": sup["level"], "level_type": "support",
+                "touches": sup["touches"],
+                "last_touch_days_ago": sup["last_touch_days_ago"],
+                "cushion_pct": round(cushion_pct, 1), "quality": sup["quality"],
+                "weekly_trend": weekly["trend"], "daily_trend": daily["trend"],
+                "rsi": rsi, "vol_state": vol, "vwap": vwap_st,
+                "fib_confluence": fib_match,
+                "swing_confirmed": swing_confirmed,
+                "swing_signal": {
+                    "fib_level": swing_signal.get("fib_level"),
+                    "confidence": swing_signal.get("confidence"),
+                    "hold_class": swing_signal.get("hold_class"),
+                    "income_eligible": swing_income_eligible,
+                } if swing_confirmed else None,
+                "liquidity_score": liq, "event_risk": event_risk,
+                "chain_available": bool(chain.get("strike")),
+                "hard_blocks": blocks, "itqs": itqs,
+                "regime": regime_package.get("core_regime", "UNKNOWN"),
+            })
 
-        # Post summary to Telegram
-        if self._post and signals:
-            summary_lines = [
-                f"📊 ── SWING SCAN RESULTS ({len(signals)} setups) ──",
-                "",
-            ]
-            for sig in signals:
-                quality = sig.get("setup_quality", "STANDARD")
-                q_emoji = {"FLAGSHIP": "⭐", "PREMIUM": "🔷", "STRONG": "🔹",
-                           "SELECTIVE": "⚪", "TACTICAL": "💨", "STANDARD": "📊"}.get(quality, "📊")
-                dir_emoji = "🟢" if sig["direction"] == "bull" else "🔴"
-                hold_tag = f"{sig['default_hold_days']}D"
-                extras = []
-                if sig.get("runner_eligible"): extras.append("🏃")
-                if sig.get("income_eligible"): extras.append("💰")
-                extra_str = " " + "".join(extras) if extras else ""
-                summary_lines.append(
-                    f"{q_emoji}{dir_emoji} {sig['ticker']} T{sig['tier']} "
-                    f"{sig['direction'].upper()} — "
-                    f"Fib {sig['fib_level']}% | Conf {sig['confidence']} | "
-                    f"{hold_tag}{extra_str} [{quality}]"
-                )
-            summary_lines.append("")
-            summary_lines.append("Signals auto-enqueued for swing engine.")
-            self._post("\n".join(summary_lines))
+        # ── Bear call candidates ──
+        for res in resistances:
+            short_strike = _strike_above_resistance(res, spot, chain=chain)
+            if short_strike <= spot:
+                continue
 
-    def _loop(self):
-        """Main loop — runs at scheduled times."""
-        log.info("Swing scanner loop started")
-        while self._running:
-            try:
-                from market_clock import is_weekday, _now_ct
-                now = _now_ct()
+            long_strike = _long_strike_from_chain(short_strike, "bear_call", spot, chain=chain)
+            real_credit, real_width = auto_credit(chain, short_strike, long_strike, "bear_call")
 
-                if not is_weekday(now):
-                    time.sleep(300)
-                    continue
+            if real_credit is not None and real_width and real_width > 0:
+                credit = real_credit; width = real_width
+            else:
+                width = abs(long_strike - short_strike); credit = width * 0.15
 
-                current_time = now.strftime("%H:%M")
+            breakeven = short_strike + credit
+            roc = (credit / width) * 100 if width > 0 else 0
+            cushion_pct = ((short_strike - spot) / spot) * 100
+            failure = find_resistance_failure_level(resistances, res["level"])
+            liq = auto_liquidity(chain, short_strike, long_strike, "bear_call")
+            fib_match = any(abs(f - short_strike) / spot < 0.015 for f in fibs) if fibs else False
 
-                # Check if it's scan time (within 2 minute window)
-                for scan_time in SWING_SCAN_TIMES_CT:
-                    scan_key = f"scan:{now.strftime('%Y-%m-%d')}:{scan_time}"
-                    if scan_key in self._last_scan:
-                        continue
+            blocks = check_hard_blocks("bear_call", short_strike, breakeven, res, failure,
+                                       regime_package, return_on_risk=roc,
+                                       earnings_in_window=earnings_in_window)
 
-                    # Parse scan time
-                    sh, sm = int(scan_time.split(":")[0]), int(scan_time.split(":")[1])
-                    scan_minutes = sh * 60 + sm
-                    now_minutes = now.hour * 60 + now.minute
+            itqs = compute_itqs(
+                "bear_call", short_strike, breakeven, spot, res, failure,
+                regime_package, weekly, daily, rsi, vol, vwap_st,
+                fib_confluence=fib_match, return_on_risk=roc,
+                liquidity_score=liq, event_risk=event_risk, dte=dte,
+            )
 
-                    if 0 <= (now_minutes - scan_minutes) <= 2:
-                        log.info(f"Swing scanner firing: {scan_time} CT scan")
-                        self._last_scan[scan_key] = time.time()
-                        signals = self.scan_all()
-                        self._fire_signals(signals)
+            opportunities.append({
+                "ticker": ticker, "trade_type": "bear_call",
+                "spot": round(spot, 2), "short_strike": short_strike,
+                "long_strike": long_strike, "width": width,
+                "credit": round(credit, 2), "roc_pct": round(roc, 1),
+                "breakeven": round(breakeven, 2), "failure_level": failure,
+                "dte": dte, "expiry": expiry,
+                "level": res["level"], "level_type": "resistance",
+                "touches": res["touches"],
+                "last_touch_days_ago": res["last_touch_days_ago"],
+                "cushion_pct": round(cushion_pct, 1), "quality": res["quality"],
+                "weekly_trend": weekly["trend"], "daily_trend": daily["trend"],
+                "rsi": rsi, "vol_state": vol, "vwap": vwap_st,
+                "fib_confluence": fib_match,
+                "liquidity_score": liq, "event_risk": event_risk,
+                "chain_available": bool(chain.get("strike")),
+                "hard_blocks": blocks, "itqs": itqs,
+                "regime": regime_package.get("core_regime", "UNKNOWN"),
+            })
 
-                time.sleep(30)
+        opportunities.sort(key=lambda x: x["itqs"]["score"], reverse=True)
+        return opportunities
 
-            except Exception as e:
-                log.error(f"Swing scanner loop error: {e}", exc_info=True)
-                time.sleep(300)
+    except Exception as e:
+        log.error(f"Income scanner error for {ticker}: {e}", exc_info=True)
+        return []
 
-    @property
-    def status(self) -> dict:
+
+# ═══════════════════════════════════════════════════════════
+# MANUAL TRADE SCORING — also fully automated context
+# ═══════════════════════════════════════════════════════════
+
+def score_trade(ticker, trade_type, short_strike, width, credit, regime_package,
+                ohlcv_fn=None, chain_fn=None, expirations_fn=None, expiry=None):
+    """
+    Score a specific trade. All context auto-computed.
+    Pass expiry="2026-04-11" to score against a specific expiration.
+    If omitted, auto-selects nearest weekly.
+    Example: score_trade("MRNA", "bull_put", 47.0, 2.0, 0.45, regime_pkg)
+    Example: score_trade("MRNA", "bull_put", 47.0, 2.0, 0.45, regime_pkg, expiry="2026-04-11")
+    """
+    fetch = ohlcv_fn or default_ohlcv_fn
+    try:
+        ohlcv = fetch(ticker)
+        if ohlcv is None:
+            return {"error": f"No data for {ticker}"}
+
+        closes = ohlcv["close"]; highs = ohlcv["high"]
+        lows = ohlcv["low"]; volumes = ohlcv["volume"]
+        if len(closes) < 60:
+            return {"error": "Insufficient data"}
+        spot = closes[-1]
+
+        # Expiry: use explicit if provided, otherwise auto-detect
+        ticker_obj = _fetch_ticker_obj(ticker)
+        if expiry:
+            dte = max(0, (datetime.strptime(str(expiry)[:10], "%Y-%m-%d").date() - date.today()).days)
+        else:
+            expiry, dte = _find_weekly_expiry(ticker, expirations_fn=expirations_fn, ticker_obj=ticker_obj)
+
+        chain = _fetch_option_chain(ticker, expiry, chain_fn=chain_fn) if expiry else {}
+        event_risk = auto_event_risk(ticker, dte, regime_package, ticker_obj=ticker_obj)
+        earnings_date = _fetch_earnings_date(ticker, ticker_obj=ticker_obj)
+        earnings_in_window = earnings_date and 0 <= (earnings_date - date.today()).days <= dte
+
+        # Auto fib + levels
+        fibs = auto_fib_levels(highs, lows)
+
+        if trade_type == "bull_put":
+            breakeven = short_strike - credit
+            long_strike = short_strike - width
+            levels = detect_support_levels(lows, spot)
+            best = min(levels, key=lambda s: abs(s["level"] - short_strike)) if levels else None
+            if best is None:
+                best = {"level": short_strike, "touches": 0, "last_touch_days_ago": 999,
+                        "cushion_pct": ((spot-short_strike)/spot)*100, "quality": 0, "held": True}
+            failure = find_support_failure_level(levels, best["level"])
+        else:
+            breakeven = short_strike + credit
+            long_strike = short_strike + width
+            levels = detect_resistance_levels(highs, spot)
+            best = min(levels, key=lambda r: abs(r["level"] - short_strike)) if levels else None
+            if best is None:
+                best = {"level": short_strike, "touches": 0, "last_touch_days_ago": 999,
+                        "cushion_pct": ((short_strike-spot)/spot)*100, "quality": 0, "held": True}
+            failure = find_resistance_failure_level(levels, best["level"])
+
+        weekly = detect_weekly_trend(closes)
+        daily = detect_daily_trend(closes)
+        rsi = compute_rsi(closes)
+        vol = volume_state(volumes)
+        vwap_st = vwap_state(closes, highs, lows, volumes)
+        roc = (credit / width) * 100 if width > 0 else 0
+
+        liq = auto_liquidity(chain, short_strike, long_strike, trade_type)
+        fib_match = any(abs(f - short_strike) / spot < 0.015 for f in fibs) if fibs else False
+
+        blocks = check_hard_blocks(trade_type, short_strike, breakeven, best, failure,
+                                   regime_package, return_on_risk=roc,
+                                   earnings_in_window=bool(earnings_in_window))
+
+        itqs = compute_itqs(
+            trade_type, short_strike, breakeven, spot, best, failure,
+            regime_package, weekly, daily, rsi, vol, vwap_st,
+            fib_confluence=fib_match, return_on_risk=roc,
+            liquidity_score=liq, event_risk=event_risk, dte=dte,
+        )
+
         return {
-            "running": self._running,
-            "watchlist_size": len(SWING_WATCHLIST),
-            "scalp_tickers": len(SWING_WATCHLIST - SWING_ONLY_TICKERS),
-            "swing_only_tickers": len(SWING_ONLY_TICKERS),
-            "signals_today": len([k for k, v in self._signal_cooldown.items()
-                                  if time.time() - v < 86400]),
-            "last_scans": {k: v for k, v in self._last_scan.items()},
+            "ticker": ticker, "trade_type": trade_type,
+            "spot": round(spot, 2), "short_strike": short_strike,
+            "long_strike": long_strike, "width": width, "credit": credit,
+            "breakeven": round(breakeven, 2), "roc_pct": round(roc, 1), "dte": dte,
+            "expiry": expiry,
+            "support_level": best["level"], "support_touches": best["touches"],
+            "failure_level": failure,
+            "regime": regime_package.get("core_regime", "UNKNOWN"),
+            "weekly_trend": weekly["trend"], "daily_trend": daily["trend"],
+            "rsi": rsi, "vol_state": vol, "vwap": vwap_st,
+            "fib_confluence": fib_match,
+            "liquidity_score": liq, "event_risk": event_risk,
+            "chain_available": bool(chain.get("strike")),
+            "hard_blocks": blocks, "itqs": itqs,
         }
 
-    def force_scan(self) -> List[dict]:
-        """Manual trigger — run scan immediately."""
-        log.info("Swing scanner: manual scan triggered")
-        signals = self.scan_all()
-        self._fire_signals(signals)
-        return signals
+    except Exception as e:
+        log.error(f"Trade scoring error: {e}", exc_info=True)
+        return {"error": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════
+# FORMATTING (updated for auto-computed fields)
+# ═══════════════════════════════════════════════════════════
+
+def format_income_alert(opp):
+    itqs = opp["itqs"]; bd = itqs["breakdown"]
+    grade = itqs["grade"]; score = itqs["score"]
+    div = "━" * 30
+    ge = {"A+": "🟢", "A": "🟢", "B": "🟡", "C": "🟠", "F": "🔴"}.get(grade, "⚪")
+    te = "🐂" if opp["trade_type"] == "bull_put" else "🐻"
+
+    lines = [f"{ge} INCOME SCAN — {opp['ticker']}", f"Grade: {grade} (ITQS: {score}) | {itqs['decision']}", div]
+
+    blocks = opp.get("hard_blocks", [])
+    if blocks:
+        lines.append("🚫 HARD BLOCKS:"); [lines.append(f"  ✗ {b}") for b in blocks]; lines.append(div)
+
+    ll = "Support" if opp["trade_type"] == "bull_put" else "Resistance"
+    chain_tag = "📡 live chain" if opp.get("chain_available") else "📊 estimated"
+    lines += [
+        f"{ll}: ${opp['level']:.2f} ({opp['touches']}T, last {opp['last_touch_days_ago']}d)",
+        f"Strike: ${opp['short_strike']:.2f}/{opp.get('long_strike', opp['short_strike'] - opp.get('width',1)):.2f} | Failure: ${opp.get('failure_level',0):.2f}",
+        f"Spot: ${opp['spot']:.2f} | Cushion: {opp['cushion_pct']:.1f}%",
+        f"Credit: ${opp.get('credit',0):.2f} on ${opp.get('width',0):.2f} wide ({opp.get('roc_pct',0):.1f}% ROC) [{chain_tag}]",
+        f"Expiry: {opp.get('expiry','weekly')} ({opp.get('dte',5)}d)",
+    ]
+
+    # Swing scanner confluence
+    if opp.get("swing_confirmed") and opp.get("swing_signal"):
+        ss = opp["swing_signal"]
+        lines.append(f"🧭 SWING CONFIRMED: fib {ss['fib_level']}% | conf {ss['confidence']} | "
+                     f"{ss['hold_class'].replace('_', ' ')} {'💰' if ss['income_eligible'] else ''}")
+
+    lines += [
+        f"", f"📊 SCORECARD",
+        f"  A. Regime:     {bd.get('A_regime',0):>3}/15  ({opp.get('regime','')})",
+        f"  B. Weekly:     {bd.get('B_weekly',0):>3}/15  ({opp.get('weekly_trend','')})",
+        f"  C. Daily:      {bd.get('C_daily',0):>3}/15  ({opp.get('daily_trend','')})",
+        f"  D. Support:    {bd.get('D_support',0):>3}/15  ({opp['touches']}T)",
+        f"  E. Break-even: {bd.get('E_breakeven',0):>3}/15",
+        f"  F. Cushion:    {bd.get('F_cushion',0):>3}/10  ({itqs.get('spot_to_strike_pct','?')}%)",
+        f"  G. Technical:  {bd.get('G_technical',0):>3}/10  (RSI {opp.get('rsi','?')} | {opp.get('vol_state','')})",
+        f"  H. Liquidity:  {bd.get('H_liquidity',0):>3}/5   {'(chain)' if opp.get('chain_available') else '(est)'}",
+        f"  I. Event:      {bd.get('I_event_penalty',0):>3}   (auto: {opp.get('event_risk',0)})",
+        f"  J. DTE:        {bd.get('J_dte',0):>+3}   ({opp.get('dte',5)}d)",
+        f"  {'─'*24}",
+        f"  TOTAL:         {score:>3}    Grade {grade}",
+    ]
+    if itqs["notes"]: lines.append(""); [lines.append(f"  {n}") for n in itqs["notes"]]
+    lines.append(div)
+    return "\n".join(lines)
+
+
+def format_scorecard(result):
+    """Format score_trade() result as full scorecard."""
+    if "error" in result: return f"❌ {result['error']}"
+    itqs = result["itqs"]; bd = itqs["breakdown"]; div = "━" * 34
+
+    if result["trade_type"] == "bull_put":
+        strikes = f"{result['short_strike']}/{result['long_strike']}"
+        ttype = "Bull Put Spread"
+    else:
+        strikes = f"{result['short_strike']}/{result['long_strike']}"
+        ttype = "Bear Call Spread"
+
+    chain_tag = "chain context" if result.get("chain_available") else "no chain"
+    lines = [
+        f"📋 INCOME TRADE SCORECARD", div,
+        f"Underlying:   {result['ticker']}",
+        f"Trade Type:   {ttype}",
+        f"Strikes:      {strikes}",
+        f"Credit:       ${result['credit']:.2f}  (your entry)",
+        f"Width:        ${result['width']:.2f}",
+        f"Break-even:   ${result['breakeven']:.2f}",
+        f"ROC on Risk:  {result['roc_pct']:.1f}%",
+        f"DTE:          {result['dte']}  (exp: {result.get('expiry','?')})",
+        f"Chain:        {chain_tag}", div,
+    ]
+    blocks = result.get("hard_blocks", [])
+    if blocks:
+        lines.append("🚫 HARD BLOCKS:"); [lines.append(f"  ✗ {b}") for b in blocks]; lines.append(div)
+
+    lines += [
+        f"A. Regime:     {bd.get('A_regime',0):>3}/15  ({result['regime']})",
+        f"B. Weekly:     {bd.get('B_weekly',0):>3}/15  ({result['weekly_trend']})",
+        f"C. Daily:      {bd.get('C_daily',0):>3}/15  ({result['daily_trend']})",
+        f"D. Support:    {bd.get('D_support',0):>3}/15  (${result['support_level']:.2f}, {result['support_touches']}T)",
+        f"E. Break-even: {bd.get('E_breakeven',0):>3}/15  (${result['breakeven']:.2f} vs fail ${result['failure_level']:.2f})",
+        f"F. Cushion:    {bd.get('F_cushion',0):>3}/10  ({itqs['spot_to_strike_pct']}% spot→strike)",
+        f"G. Technical:  {bd.get('G_technical',0):>3}/10  (RSI {result['rsi']} | {result['vol_state']} | VWAP {result['vwap']})",
+        f"H. Liquidity:  {bd.get('H_liquidity',0):>3}/5   (auto: {'chain' if result.get('chain_available') else 'est'})",
+        f"I. Event:      {bd.get('I_event_penalty',0):>3}   (auto: {result.get('event_risk',0)})",
+        f"J. DTE:        {bd.get('J_dte',0):>+3}   ({result['dte']}d)",
+        f"{'─'*28}",
+        f"TOTAL:         {itqs['score']:>3}/100",
+        f"GRADE:         {itqs['grade']}",
+        f"DECISION:      {itqs['decision']}", "",
+    ]
+    if itqs["notes"]: [lines.append(f"  {n}") for n in itqs["notes"]]
+    lines.append(div)
+    return "\n".join(lines)
+
+
+# ═══════════════════════════════════════════════════════════
+# FULL SCAN
+# ═══════════════════════════════════════════════════════════
+
+def run_income_scan(regime_package, ohlcv_fn=None, tickers=None, notify_fn=None,
+                    chain_fn=None, expirations_fn=None):
+    """Fully automated scan across all income tickers."""
+    tickers = tickers or INCOME_TICKERS
+    all_opps = []
+
+    for ticker in tickers:
+        log.info(f"Income scan: {ticker}")
+        opps = scan_ticker_income(ticker, regime_package, ohlcv_fn=ohlcv_fn,
+                                  chain_fn=chain_fn, expirations_fn=expirations_fn)
+        all_opps.extend(opps)
+        if notify_fn:
+            for opp in opps:
+                if opp["itqs"]["grade"] in ("A+", "A") and not opp.get("hard_blocks"):
+                    try: notify_fn(format_income_alert(opp))
+                    except Exception as e: log.error(f"Alert failed: {e}")
+
+    all_opps.sort(key=lambda x: x["itqs"]["score"], reverse=True)
+
+    if notify_fn:
+        passing = [o for o in all_opps if o["itqs"]["grade"] in ("A+","A","B","C") and not o.get("hard_blocks")]
+        if passing:
+            core = regime_package.get("core_regime", "?")
+            lines = [f"📊 INCOME SCAN | {core}", "━" * 28]
+            for opp in passing[:10]:
+                g = opp["itqs"]["grade"]; s = opp["itqs"]["score"]
+                emoji = {"A+":"🟢","A":"🟢","B":"🟡","C":"🟠"}.get(g, "⚪")
+                typ = "PUT" if opp["trade_type"] == "bull_put" else "CALL"
+                ct = "📡" if opp.get("chain_available") else "📊"
+                lines.append(f"{emoji} {opp['ticker']} {typ} {opp['short_strike']}/{opp.get('long_strike','')} "
+                           f"${opp.get('credit',0):.2f} ({opp.get('roc_pct',0):.0f}% ROC) "
+                           f"{g}={s} {ct}")
+            try: notify_fn("\n".join(lines))
+            except Exception: pass
+
+    log.info(f"Income scan: {len(all_opps)} opps across {len(tickers)} tickers")
+    return all_opps
