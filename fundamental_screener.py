@@ -49,7 +49,7 @@ _cache_lock = threading.Lock()
 CACHE_TTL_FUNDAMENTALS = 86400   # 24 hours
 CACHE_TTL_INSIDER = 43200        # 12 hours
 
-FMP_BASE = "https://financialmodelingprep.com/api/v3"
+FMP_BASE = "https://financialmodelingprep.com/stable"
 FINNHUB_BASE = "https://finnhub.io/api/v1"
 
 # v5.0: ETFs don't have EPS/revenue/PEG — skip FMP entirely
@@ -107,46 +107,48 @@ def _fmp_get(endpoint: str, params: dict = None) -> Optional[dict]:
 
 def _fetch_fmp_profile(ticker: str) -> Dict:
     """Company profile: sector, industry, market cap, beta, etc."""
-    data = _fmp_get(f"profile/{ticker}")
-    if isinstance(data, list) and data:
-        p = data[0]
-        return {
-            "sector": p.get("sector", ""),
-            "industry": p.get("industry", ""),
-            "market_cap": p.get("mktCap", 0),
-            "beta": p.get("beta", 1.0),
-            "dividend_yield": p.get("lastDiv", 0),
-            "description": (p.get("description") or "")[:200],
-            "exchange": p.get("exchangeShortName", ""),
-            "ipo_date": p.get("ipoDate", ""),
-            "is_etf": p.get("isEtf", False),
-        }
+    data = _fmp_get("profile", {"symbol": ticker})
+    if data:
+        p = data[0] if isinstance(data, list) else data
+        if isinstance(p, dict):
+            return {
+                "sector": p.get("sector", ""),
+                "industry": p.get("industry", ""),
+                "market_cap": p.get("mktCap", 0),
+                "beta": p.get("beta", 1.0),
+                "dividend_yield": p.get("lastDiv", 0),
+                "description": (p.get("description") or "")[:200],
+                "exchange": p.get("exchangeShortName", ""),
+                "ipo_date": p.get("ipoDate", ""),
+                "is_etf": p.get("isEtf", False),
+            }
     return {}
 
 
 def _fetch_fmp_ratios(ticker: str) -> Dict:
     """Key financial ratios: PEG, P/E, debt/equity, ROE, FCF yield."""
-    data = _fmp_get(f"ratios-ttm/{ticker}")
-    if isinstance(data, list) and data:
-        r = data[0]
-        return {
-            "peg_ratio": r.get("pegRatioTTM"),
-            "pe_ratio": r.get("peRatioTTM"),
-            "price_to_sales": r.get("priceToSalesRatioTTM"),
-            "price_to_book": r.get("priceToBookRatioTTM"),
-            "debt_to_equity": r.get("debtEquityRatioTTM"),
-            "roe": r.get("returnOnEquityTTM"),
-            "roa": r.get("returnOnAssetsTTM"),
-            "current_ratio": r.get("currentRatioTTM"),
-            "fcf_yield": r.get("freeCashFlowYieldTTM"),
-            "dividend_yield_ttm": r.get("dividendYieldTTM"),
-        }
+    data = _fmp_get("ratios-ttm", {"symbol": ticker})
+    if data:
+        r = data[0] if isinstance(data, list) else data
+        if isinstance(r, dict):
+            return {
+                "peg_ratio": r.get("pegRatioTTM"),
+                "pe_ratio": r.get("peRatioTTM"),
+                "price_to_sales": r.get("priceToSalesRatioTTM"),
+                "price_to_book": r.get("priceToBookRatioTTM"),
+                "debt_to_equity": r.get("debtEquityRatioTTM"),
+                "roe": r.get("returnOnEquityTTM"),
+                "roa": r.get("returnOnAssetsTTM"),
+                "current_ratio": r.get("currentRatioTTM"),
+                "fcf_yield": r.get("freeCashFlowYieldTTM"),
+                "dividend_yield_ttm": r.get("dividendYieldTTM"),
+            }
     return {}
 
 
 def _fetch_fmp_growth(ticker: str) -> Dict:
     """Income statement growth: EPS growth, revenue growth."""
-    data = _fmp_get(f"income-statement-growth/{ticker}", {"period": "annual", "limit": 3})
+    data = _fmp_get("income-statement-growth", {"symbol": ticker, "period": "annual", "limit": 3})
     if isinstance(data, list) and data:
         latest = data[0]
         prev = data[1] if len(data) > 1 else {}
