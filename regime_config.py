@@ -1,6 +1,6 @@
 # regime_config.py
 # ═══════════════════════════════════════════════════════════════════
-# 3-Layer Regime System — Configuration & Feature Flags
+# 3-Layer Regime System — Configuration & Feature Flags 
 # NOTE: Educational/demo code. Not financial advice. Use at your own risk.
 #
 # Architecture:
