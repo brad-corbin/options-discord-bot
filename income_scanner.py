@@ -223,7 +223,7 @@ def _fetch_earnings_date(ticker, ticker_obj=None):
         try:
             today_str = date.today().strftime("%Y-%m-%d")
             future_str = (date.today() + timedelta(days=45)).strftime("%Y-%m-%d")
-            data = _fmp_get("earning_calendar", {"from": today_str, "to": future_str})
+            data = _fmp_get("earnings-calendar", {"from": today_str, "to": future_str})
             if data:
                 for item in data:
                     if item.get("symbol") == ticker:
@@ -262,9 +262,9 @@ def _fetch_sector(ticker, ticker_obj=None):
     # FMP profile (preferred — cached, consistent)
     if _FMP:
         try:
-            data = _fmp_get(f"profile/{ticker}")
-            if data and isinstance(data, list) and data:
-                profile = data[0]
+            data = _fmp_get("profile", {"symbol": ticker})
+            if data:
+                profile = data[0] if isinstance(data, list) else data
                 return profile.get("sector"), profile.get("industry")
         except Exception:
             pass
