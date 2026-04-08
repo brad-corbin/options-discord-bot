@@ -7992,7 +7992,7 @@ def _start_background_services_once():
         global _income_scan_fn, _income_score_fn
         try:
             from market_regime import get_regime_package
-            _income_ohlcv = create_ohlcv_wrapper(get_daily_candles)
+            _income_ohlcv = create_ohlcv_wrapper(get_daily_candles, md_get_fn=md_get)
             _income_scan_fn, _income_score_fn = create_income_handlers(
                 chain_fn=_cached_md.get_chain,
                 expirations_fn=get_expirations,
