@@ -1302,8 +1302,9 @@ def run_income_scan(regime_package, ohlcv_fn=None, tickers=None, notify_fn=None,
 
     if notify_fn:
         passing = [o for o in all_opps if o["itqs"]["grade"] in ("A+","A","B","C") and not o.get("hard_blocks")]
+        core = regime_package.get("core_regime", "?")
+
         if passing:
-            core = regime_package.get("core_regime", "?")
             lines = [f"📊 INCOME SCAN | {core}", "━" * 28]
             for opp in passing[:10]:
                 g = opp["itqs"]["grade"]; s = opp["itqs"]["score"]
@@ -1313,6 +1314,30 @@ def run_income_scan(regime_package, ohlcv_fn=None, tickers=None, notify_fn=None,
                 lines.append(f"{emoji} {opp['ticker']} {typ} {opp['short_strike']}/{opp.get('long_strike','')} "
                            f"${opp.get('credit',0):.2f} ({opp.get('roc_pct',0):.0f}% ROC) "
                            f"{g}={s} {ct}")
+            try: notify_fn("\n".join(lines))
+            except Exception: pass
+        else:
+            # Nothing passed — show why
+            blocked = [o for o in all_opps if o.get("hard_blocks")]
+            top3 = all_opps[:3] if all_opps else []
+            lines = [
+                f"📊 INCOME SCAN | {core}",
+                "━" * 28,
+                f"Scanned {len(tickers)} tickers — {len(all_opps)} opportunities evaluated",
+                f"❌ None scored above C (65/100)",
+            ]
+            if blocked:
+                lines.append(f"🚫 {len(blocked)} hard-blocked")
+            if top3:
+                lines.append("")
+                lines.append("Top scores (all below threshold):")
+                for opp in top3:
+                    s = opp["itqs"]["score"]; g = opp["itqs"]["grade"]
+                    typ = "PUT" if opp["trade_type"] == "bull_put" else "CALL"
+                    lines.append(f"  {opp['ticker']} {typ} @${opp['short_strike']:.2f} — "
+                               f"{g}={s} ({opp['itqs']['decision']})")
+            lines.append("")
+            lines.append(f"Regime {core} — scores suppressed by bearish regime alignment")
             try: notify_fn("\n".join(lines))
             except Exception: pass
 
