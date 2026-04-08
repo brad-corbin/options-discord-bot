@@ -191,6 +191,8 @@ def handle_command(
     post_monitor_card_fn=None,
     post_checkswing_card_fn=None,
     thesis_engine=None,
+    post_income_scan_fn=None,
+    post_income_score_fn=None,
 ) -> None:
     if not is_authorized(user_id):
         send_reply(chat_id, "⛔ You are not authorized to use this bot.")
@@ -826,6 +828,57 @@ def handle_command(
             reply(thesis_engine.format_status(t))
         return
 
+    # ─────────────────────────────────────
+    # /income [TICKER] — Income trade scanner
+    # ─────────────────────────────────────
+    if cmd in ("/income", "/income@omegabot"):
+        if not post_income_scan_fn:
+            reply("⚠️ Income scanner not wired — post_income_scan_fn missing.")
+            return
+        ticker = args[0].upper() if args else None
+        label = ticker or "full universe"
+        reply(f"📊 Running income scan ({label})...")
+        post_income_scan_fn(chat_id, ticker)
+        return
+
+    # ─────────────────────────────────────
+    # /score TICKER put|call STRIKE WIDTH CREDIT [EXPIRY]
+    # ─────────────────────────────────────
+    if cmd in ("/score", "/score@omegabot"):
+        if not post_income_score_fn:
+            reply("⚠️ Income scorer not wired — post_income_score_fn missing.")
+            return
+        if len(args) < 5:
+            reply(
+                "Usage: /score MRNA put 47 2 0.45\n"
+                "       /score MRNA put 47 2 0.45 2026-04-11\n\n"
+                "Args: TICKER put|call SHORT_STRIKE WIDTH CREDIT [EXPIRY]\n\n"
+                "Scores a specific credit spread with full automated context:\n"
+                "earnings risk, chain liquidity, support quality, regime, and more."
+            )
+            return
+        try:
+            ticker = args[0].upper()
+            direction = args[1].lower()
+            if direction not in ("put", "call"):
+                reply(f"⚠️ Direction must be 'put' or 'call', got '{direction}'")
+                return
+            trade_type = "bull_put" if direction == "put" else "bear_call"
+            short_strike = float(args[2])
+            width = float(args[3])
+            credit = float(args[4])
+            expiry = args[5] if len(args) > 5 else None
+
+            if trade_type == "bull_put":
+                long_strike = short_strike - width
+            else:
+                long_strike = short_strike + width
+            reply(f"📋 Scoring {ticker} {direction} {short_strike}/{long_strike} @ ${credit:.2f}...")
+            post_income_score_fn(chat_id, ticker, trade_type, short_strike, width, credit, expiry)
+        except (ValueError, IndexError) as e:
+            reply(f"⚠️ Parse error: {e}\nUsage: /score MRNA put 47 2 0.45")
+        return
+
     if cmd in ("/help", "/help@omegabot", "/start"):
         reply(
             "🤖 Omega 3000 Commands:\n\n"
@@ -913,6 +966,12 @@ def handle_command(
             "/journal signals — recent signal log\n"
             "/journal trades — recent trade log\n"
             "/journal attrs — Greeks P/L attribution\n"
+            "\n── Income Scanner ──\n"
+            "/income — scan all income tickers for credit spread opportunities\n"
+            "/income MRNA — scan single ticker\n"
+            "/score MRNA put 47 2 0.45 — score a specific bull put spread\n"
+            "/score MRNA put 47 2 0.45 2026-04-11 — score with explicit expiry\n"
+            "/score NVDA call 195 2.50 0.35 — score a bear call spread\n"
             "/help — this message\n\n"
             "💡 -mom on any portfolio command for mom's account\n"
             "⚡ TV signals auto-warn if you have opposite spreads open\n"
