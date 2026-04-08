@@ -1,6 +1,6 @@
 # regime_config.py
 # ═══════════════════════════════════════════════════════════════════
-# 3-Layer Regime System — Configuration & Feature Flags 
+# 3-Layer Regime System — Configuration & Feature Flags
 # NOTE: Educational/demo code. Not financial advice. Use at your own risk.
 #
 # Architecture:
@@ -21,12 +21,12 @@
 # ═══════════════════════════════════════════════════════════
 #
 # Release 1: Core v2 live, overlays log-only
-# Release 2: Turn on event overlays
-# Release 3: Turn on sector overlays
+# Release 2: Event overlays live ← ACTIVATED
+# Release 3: Sector overlays live ← ACTIVATED
 
 ENABLE_CORE_REGIME_V2    = True     # 5-regime model replaces 3-regime
-ENABLE_EVENT_OVERLAYS    = False    # Event overlays modify live rules
-ENABLE_SECTOR_OVERLAYS   = False    # Sector overlays modify live rules
+ENABLE_EVENT_OVERLAYS    = True     # Event overlays modify live rules
+ENABLE_SECTOR_OVERLAYS   = True     # Sector overlays modify live rules
 LOG_ONLY_EVENT_OVERLAYS  = True     # Compute + log events even when disabled
 LOG_ONLY_SECTOR_OVERLAYS = True     # Compute + log sectors even when disabled
 
