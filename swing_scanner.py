@@ -239,6 +239,160 @@ def fetch_daily_bars_yahoo(ticker: str, days: int = 120) -> List[dict]:
 
 
 # ═══════════════════════════════════════════════════════════
+# HOLD-HORIZON MAP (backtest-derived)
+# ═══════════════════════════════════════════════════════════
+#
+# Based on swing backtest analysis:
+#   50% fib bull: best at 20-60D, runner-eligible, income-eligible
+#   78.6% fib bull: best at 10-20D, income-eligible
+#   38.2% fib bull: selective 15-20D, income-eligible with vol contraction
+#   61.8% fib bull: weakest, needs extra confluence
+#   Bears: 1-3D tactical only
+
+def classify_hold_horizon(direction, fib_level, weekly_bull, confidence, vol_contracting):
+    """
+    Classify a swing signal's hold horizon based on backtest findings.
+    Returns dict with hold_class, default_hold_days, runner_eligible, income_eligible.
+    """
+    if direction == "bear":
+        return {
+            "hold_class": "tactical",
+            "default_hold_days": 3,
+            "max_hold_days": 5,
+            "runner_eligible": False,
+            "income_eligible": False,
+            "t1_policy": "Take at first touch — do not wait",
+            "t2_policy": "Not applicable — bears do not hold for T2",
+            "hold_note": "Bear tactical: exit fast, 1-3D max",
+        }
+
+    # ── Bull setups ──
+    if fib_level == "50.0":
+        if weekly_bull and confidence >= 70:
+            return {
+                "hold_class": "long_hold",
+                "default_hold_days": 30,
+                "max_hold_days": 60,
+                "runner_eligible": True,
+                "income_eligible": True,
+                "t1_policy": "Take partial at T1, hold runner for T2",
+                "t2_policy": "Runner target — 42-48% hit rate by 60D",
+                "hold_note": "Premium 50% fib bull — strongest backtest family (+12% at 30D, +19% at 60D)",
+            }
+        return {
+            "hold_class": "medium_hold",
+            "default_hold_days": 20,
+            "max_hold_days": 40,
+            "runner_eligible": True,
+            "income_eligible": True,
+            "t1_policy": "Take partial at T1, evaluate for runner",
+            "t2_policy": "Runner only if weekly bull and constructive price action",
+            "hold_note": "50% fib bull — strong hold family, needs time",
+        }
+
+    if fib_level == "78.6":
+        return {
+            "hold_class": "medium_hold",
+            "default_hold_days": 15 if weekly_bull else 10,
+            "max_hold_days": 20,
+            "runner_eligible": False,
+            "income_eligible": True,
+            "t1_policy": "Take at T1 — this family peaks 10-20D",
+            "t2_policy": "Rarely reaches T2 within the optimal hold window",
+            "hold_note": "78.6% fib bull — medium-term, best 10-20D",
+        }
+
+    if fib_level == "38.2":
+        if weekly_bull and vol_contracting:
+            return {
+                "hold_class": "medium_hold",
+                "default_hold_days": 20,
+                "max_hold_days": 30,
+                "runner_eligible": False,
+                "income_eligible": True,
+                "t1_policy": "Take at T1 — these need patience but work",
+                "t2_policy": "Possible but inconsistent — do not plan for it",
+                "hold_note": "38.2% fib bull + vol contraction — selective hold",
+            }
+        return {
+            "hold_class": "selective",
+            "default_hold_days": 15,
+            "max_hold_days": 20,
+            "runner_eligible": False,
+            "income_eligible": False,
+            "t1_policy": "Take at T1 — do not extend without strong tape",
+            "t2_policy": "Not recommended",
+            "hold_note": "38.2% fib bull — needs extra confluence",
+        }
+
+    if fib_level == "61.8":
+        return {
+            "hold_class": "selective",
+            "default_hold_days": 10,
+            "max_hold_days": 15,
+            "runner_eligible": False,
+            "income_eligible": False,
+            "t1_policy": "Take at T1 — weakest bull family",
+            "t2_policy": "Do not hold for T2",
+            "hold_note": "61.8% fib bull — weakest, trade smaller, require extra confluence",
+        }
+
+    # Fallback for any other fib level
+    return {
+        "hold_class": "standard",
+        "default_hold_days": 10,
+        "max_hold_days": 20,
+        "runner_eligible": False,
+        "income_eligible": direction == "bull",
+        "t1_policy": "Take at T1",
+        "t2_policy": "Evaluate based on context",
+        "hold_note": "Standard setup — no specific backtest edge data",
+    }
+
+
+# ═══════════════════════════════════════════════════════════
+# SIGNAL CACHE — recent signals accessible by income scanner
+# ═══════════════════════════════════════════════════════════
+
+import threading as _threading
+
+_signal_cache = {}
+_signal_cache_lock = _threading.Lock()
+_SIGNAL_CACHE_MAX_AGE = 86400 * 7  # 7 days
+
+
+def _cache_signal(signal):
+    """Store a signal in the cache, keyed by ticker."""
+    with _signal_cache_lock:
+        ticker = signal["ticker"]
+        _signal_cache[ticker] = {
+            "signal": signal,
+            "cached_at": time.time(),
+        }
+
+
+def get_recent_signals(ticker=None, max_age_days=7):
+    """
+    Get recent swing signals from the cache.
+    If ticker is provided, returns the signal for that ticker or None.
+    If ticker is None, returns dict of all cached signals.
+    Used by income_scanner for fib confluence detection.
+    """
+    cutoff = time.time() - (max_age_days * 86400)
+    with _signal_cache_lock:
+        if ticker:
+            entry = _signal_cache.get(ticker.upper())
+            if entry and entry["cached_at"] > cutoff:
+                return entry["signal"]
+            return None
+        else:
+            return {
+                t: e["signal"] for t, e in _signal_cache.items()
+                if e["cached_at"] > cutoff
+            }
+
+
+# ═══════════════════════════════════════════════════════════
 # FIBONACCI ANALYSIS
 # ═══════════════════════════════════════════════════════════
 
@@ -628,12 +782,18 @@ def analyze_swing_setup(
         confidence += 5
         conf_reasons.append("T2 signal (+5)")
 
-    if fib_level == "61.8":
-        confidence += 10
-        conf_reasons.append("Golden ratio 61.8% (+10)")
-    elif fib_level == "50.0":
-        confidence += 7
-        conf_reasons.append("50% retracement (+7)")
+    if fib_level == "50.0":
+        confidence += 12
+        conf_reasons.append("50% retracement — strongest backtest family (+12)")
+    elif fib_level == "78.6":
+        confidence += 8
+        conf_reasons.append("78.6% deep retracement (+8)")
+    elif fib_level == "61.8":
+        confidence += 6
+        conf_reasons.append("Golden ratio 61.8% (+6)")
+    elif fib_level == "38.2":
+        confidence += 5
+        conf_reasons.append("38.2% shallow pullback (+5)")
 
     if touch_count >= 3:
         confidence += 8
@@ -714,9 +874,28 @@ def analyze_swing_setup(
         "type": "swing",
     }
 
+    # ── Hold-horizon classification (backtest-derived) ──
+    horizon = classify_hold_horizon(
+        direction=direction, fib_level=fib_level,
+        weekly_bull=weekly_bull, confidence=confidence,
+        vol_contracting=vol_contracting,
+    )
+    signal["hold_class"] = horizon["hold_class"]
+    signal["default_hold_days"] = horizon["default_hold_days"]
+    signal["max_hold_days"] = horizon["max_hold_days"]
+    signal["runner_eligible"] = horizon["runner_eligible"]
+    signal["income_eligible"] = horizon["income_eligible"]
+    signal["t1_policy"] = horizon["t1_policy"]
+    signal["t2_policy"] = horizon["t2_policy"]
+    signal["hold_note"] = horizon["hold_note"]
+
     log.info(f"Swing scanner {ticker}: T{tier} {direction.upper()} at fib {fib_level}% "
              f"(conf={confidence}, RS={rs_vs_spy:+.1f}%, "
-             f"primary={primary_trend}, touches={touch_count})")
+             f"primary={primary_trend}, touches={touch_count}, "
+             f"hold={horizon['hold_class']} {horizon['default_hold_days']}D)")
+
+    # Cache signal for income scanner access
+    _cache_signal(signal)
 
     return signal
 
@@ -905,7 +1084,19 @@ class SwingScanner:
                 "atr": sig["atr"],
                 "is_snapback": (direction == "bull" and sig["primary_trend"] == "bearish"),
                 "vix": sig.get("vix", 20),
+                # Hold-horizon (backtest-derived)
+                "hold_class": sig["hold_class"],
+                "default_hold_days": sig["default_hold_days"],
+                "max_hold_days": sig["max_hold_days"],
+                "runner_eligible": sig["runner_eligible"],
+                "income_eligible": sig["income_eligible"],
             }
+
+            # Hold-horizon labels for display
+            hold_class = sig["hold_class"]
+            hold_emoji = {"long_hold": "🏗️", "medium_hold": "📅", "selective": "⚡", "tactical": "💨", "standard": "📅"}.get(hold_class, "📅")
+            runner_tag = " 🏃 runner" if sig["runner_eligible"] else ""
+            income_tag = " 💰 income" if sig["income_eligible"] else ""
 
             signal_msg = (
                 f"📊 Swing Scanner: {ticker} T{tier} {direction.upper()}\n"
@@ -918,6 +1109,8 @@ class SwingScanner:
                 f"Primary: {sig['primary_trend']} | "
                 f"Vol: {'📉 contracting' if sig['vol_contracting'] else '📈 expanding' if sig['vol_expanding'] else '➡️ normal'}\n"
                 f"Targets: ${sig['fib_target_1']:.2f} / ${sig['fib_target_2']:.2f}\n"
+                f"{hold_emoji} Hold: {sig['default_hold_days']}–{sig['max_hold_days']}D ({hold_class.replace('_', ' ')}){runner_tag}{income_tag}\n"
+                f"T1: {sig['t1_policy']}\n"
                 + (f"⚠️ {', '.join(sig['warnings'])}" if sig.get("warnings") else "")
             )
 
@@ -934,11 +1127,16 @@ class SwingScanner:
             for sig in signals:
                 emoji = "🥇" if sig["tier"] == 1 else "🥈"
                 dir_emoji = "🟢" if sig["direction"] == "bull" else "🔴"
+                hold_tag = f"{sig['default_hold_days']}D"
+                extras = []
+                if sig.get("runner_eligible"): extras.append("🏃")
+                if sig.get("income_eligible"): extras.append("💰")
+                extra_str = " " + "".join(extras) if extras else ""
                 summary_lines.append(
                     f"{emoji}{dir_emoji} {sig['ticker']} T{sig['tier']} "
                     f"{sig['direction'].upper()} — "
                     f"Fib {sig['fib_level']}% @ ${sig['fib_price']:.2f} | "
-                    f"Conf {sig['confidence']} | RS {sig['rs_vs_spy']:+.1f}%"
+                    f"Conf {sig['confidence']} | {hold_tag}{extra_str}"
                 )
             summary_lines.append("")
             summary_lines.append("Signals auto-enqueued for swing engine.")
