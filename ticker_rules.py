@@ -7,20 +7,39 @@
 # The active_scanner reads this table, filters signals, and builds
 # the signal alert — the trader sees everything they need inline.
 #
-# Rule derivation: active scanner backtest Apr 2025 – Apr 2026 (14 tickers)
-# plus full-year 2025 SLV backtest and Apr 2025 – Apr 2026 QQQ backtest.
+# Rule derivation:
+#   BEAR/BULL: active scanner backtest Apr 2025 – Apr 2026 (14 tickers)
+#   TRANSITION: Jan 4 – Mar 31 2023 backtest (Omega3000 decision memo)
+#              16 tickers, prices corrected, bull-first framework
 #
 # Current regime (April 2026): BEAR
 # Focused live tickers: MSFT · IWM · QQQ · META · TSLA · AAPL
 # TRANSITION/BULL tickers (regime-gated): NVDA · AMZN · GOOGL · AVGO · AMD
 # BULL-only tickers: GLD · SLV · USO
 #
-# ─── WHAT NEVER CHANGES ────────────────────────────────────────────
-#   MSFT / META / TSLA       — always CONFIRMED+bear (works every regime)
-#   AAPL                     — always CONVERGING+bull, always exit 5d
-#   NVDA / AMZN / AVGO       — always OPPOSING when active, no score gate
-#   AMD                      — OPPOSING+bull only (bear side has no edge)
-#   Score ≥80 cap            — hard skip on MSFT / GOOGL / GLD / SLV always
+# ─── TRANSITION CHANGES (Apr 8 2026) ─────────────────────────────
+#   TSLA   CONFIRMED+bear → CONVERGING+bull afternoon 5D (was −12.17%)
+#   AAPL   CONVERGING+bull 3d → CONFIRMED+bull morning 5D
+#   GOOGL  CONFIRMED+bull → CONVERGING+bull afternoon 5D
+#   META   CONFIRMED+bear → CONFIRMED+bull afternoon 5D
+#   MSFT   bear 5d → bear 1D afternoon only
+#   IWM    bear any phase → bear MIDDAY only
+#   QQQ    bull morning → bear afternoon 1D
+#   NVDA   OPPOSING both → CONFIRMED/CONVERGING bull afternoon 5D (shadow)
+#   AMZN   OPPOSING both 3d → CONFIRMED bull afternoon 5D
+#   AVGO   OPPOSING both 3d → CONFIRMED bear 1D (shadow, n=10)
+#   AMD    OPPOSING+bull 3d → CONFIRMED bull midday 5D (shadow, n=17)
+#   GLD/SLV  remain OFF in TRANSITION
+#
+# ─── P3 GATES ADDED ──────────────────────────────────────────────
+#   above_vwap_required  — below-VWAP longs net negative at every horizon
+#   ema_min / ema_max    — EMA dist < −0.25 is hard block (PF 0.10)
+#   Global TRANSITION blocks: RSI < 45, EMA dist < −0.25
+#
+# ─── WHAT NEVER CHANGES (BEAR regime) ────────────────────────────
+#   MSFT / META / TSLA       — always CONFIRMED+bear in BEAR regime
+#   AAPL                     — always CONVERGING+bull in BEAR, exit 5d
+#   Score ≥80 cap            — hard skip on MSFT / GOOGL / GLD / SLV
 # ═══════════════════════════════════════════════════════════════════
 
 from typing import Optional, List
@@ -88,13 +107,23 @@ TICKER_RULES = {
             "active": True,
             "htf": "CONFIRMED", "bias": "bear",
             "score_min": 60, "score_max": 79,
-            "phase": None, "rsi_max": None, "rsi_min": None,
-            "exit_days": 5, "spread": "bear_put",
+            "phase": "AFTERNOON", "rsi_max": None, "rsi_min": None,
+            "exit_days": 1, "spread": "bear_put",
             "premium_flag": "RSI>50",
             "premium_wr": 81.0,
-            "wr_3d": 60.3, "wr_5d": 64.2, "n": 151, "period": "Oct 25 – Feb 26",
-            "notes": ["Hold to 5d", "RSI>50 = premium"],
-            "never": ["Exit at 3d", "Score ≥80", "Bull signals"],
+            "wr_3d": 60.3, "wr_5d": 64.2, "n": 37, "period": "Jan–Mar 2023 backtest",
+            "notes": [
+                "Bear exception in bull-first TRANSITION — 1D hold ONLY",
+                "MSFT bear-only filtered signal is positive; full signal set is negative at 5D",
+                "Afternoon CONFIRMED+bear, exit next day — do NOT hold multi-day",
+                "RSI>50 = premium entry",
+            ],
+            "never": [
+                "Hold past 1d — MSFT 5D is net negative in TRANSITION (-2.41%)",
+                "Bull signals on MSFT in TRANSITION",
+                "Morning bears",
+                "Score ≥80",
+            ],
         },
         BULL: {
             "active": True,
@@ -139,12 +168,21 @@ TICKER_RULES = {
             "active": True,
             "htf": "CONFIRMED", "bias": "bear",
             "score_min": 60, "score_max": 99,
-            "phase": None, "rsi_max": None, "rsi_min": None,
+            "phase": "MIDDAY", "rsi_max": None, "rsi_min": None,
             "exit_days": 5, "spread": "bear_put",
             "premium_flag": None, "premium_wr": None,
-            "wr_3d": 69.6, "wr_5d": 73.9, "n": 23, "period": "Oct 25 – Feb 26",
-            "notes": ["Hold to 5d"],
-            "never": ["Exit at 3d", "Bull signals", "OPPOSING"],
+            "wr_3d": 69.6, "wr_5d": 94.0, "n": 57, "period": "Jan–Mar 2023 backtest",
+            "notes": [
+                "Only viable bear ETF rule in TRANSITION",
+                "MIDDAY timing is critical — morning bears are worst cluster",
+                "Hold to 5d — 94% WR at 5D in 2023 transition tape",
+            ],
+            "never": [
+                "Morning bears — worst cluster in TRANSITION (-4.28% avg)",
+                "Bull signals on IWM in TRANSITION",
+                "OPPOSING signals",
+                "Exit at 3d",
+            ],
         },
         BULL: {
             "active": True,
@@ -187,21 +225,23 @@ TICKER_RULES = {
         },
         TRANSITION: {
             "active": True,
-            "htf": "CONFIRMED", "bias": "bull",
+            "htf": "CONFIRMED", "bias": "bear",
             "score_min": 60, "score_max": 79,
-            "phase": "MORNING", "rsi_max": None, "rsi_min": None,
-            "exit_days": 3, "spread": "bull_call",
+            "phase": "AFTERNOON", "rsi_max": None, "rsi_min": None,
+            "exit_days": 1, "spread": "bear_put",
             "premium_flag": None, "premium_wr": None,
-            "wr_3d": 77.8, "wr_5d": 72.4, "n": 406, "period": "Apr 25 – Oct 25",
+            "wr_3d": 77.8, "wr_5d": 72.4, "n": 19, "period": "Jan–Mar 2023 backtest",
             "notes": [
-                "Flipped to BULL — regime has transitioned",
-                "MORNING signals only",
-                "Exit at 3d — 5d degrades",
+                "FLIPPED to bear — one of only two viable bear rules in TRANSITION",
+                "1D exit ONLY — 5D is negative on QQQ in TRANSITION",
+                "AFTERNOON only — morning phase filter is permanent",
+                "Short hold bear exception alongside IWM",
             ],
             "never": [
-                "Trade midday or afternoon",
-                "Hold past 3d",
+                "Hold past 1d — 5D WR degrades",
+                "Morning signals in TRANSITION",
                 "Score ≥80",
+                "Bull signals in TRANSITION — use BEAR/BULL regime bull rule instead",
             ],
         },
         BULL: {
@@ -245,14 +285,26 @@ TICKER_RULES = {
         },
         TRANSITION: {
             "active": True,
-            "htf": "CONFIRMED", "bias": "bear",
-            "score_min": 75, "score_max": 99,
-            "phase": None, "rsi_max": None, "rsi_min": None,
-            "exit_days": 3, "spread": "bear_put",
+            "htf": "CONFIRMED", "bias": "bull",
+            "score_min": 60, "score_max": 99,
+            "phase": "AFTERNOON", "rsi_max": 75, "rsi_min": 50,
+            "exit_days": 5, "spread": "bull_call",
             "premium_flag": None, "premium_wr": None,
-            "wr_3d": 58.6, "wr_5d": 51.7, "n": 29, "period": "Oct 25 – Feb 26",
-            "notes": ["Score ≥75 only", "Exit 3d"],
-            "never": ["Score 60–74", "Hold past 3d", "Bull signals"],
+            "above_vwap_required": True,
+            "ema_min": 0.05, "ema_max": None,
+            "wr_3d": 58.6, "wr_5d": 79.0, "n": 29, "period": "Jan–Mar 2023 backtest",
+            "notes": [
+                "FLIPPED to bull — TRANSITION is bull-first",
+                "CONFIRMED+bull afternoon 5D (T2, ratio 0.74)",
+                "Score ≥60 required — same gate as bear regime",
+                "Requires above VWAP, RSI 50–75",
+            ],
+            "never": [
+                "Bear signals on META in TRANSITION",
+                "Score <60",
+                "Below-VWAP entries",
+                "Exit at 3d — hold to 5d",
+            ],
         },
         BULL: {
             "active": True,
@@ -295,14 +347,26 @@ TICKER_RULES = {
         },
         TRANSITION: {
             "active": True,
-            "htf": "CONFIRMED", "bias": "bear",
-            "score_min": 65, "score_max": 79,
-            "phase": None, "rsi_max": None, "rsi_min": None,
-            "exit_days": 5, "spread": "bear_put",
+            "htf": "CONVERGING", "bias": "bull",
+            "score_min": 60, "score_max": 99,
+            "phase": "AFTERNOON", "rsi_max": 75, "rsi_min": 50,
+            "exit_days": 5, "spread": "bull_call",
             "premium_flag": None, "premium_wr": None,
-            "wr_3d": 63.3, "wr_5d": 69.4, "n": 49, "period": "Oct 25 – Feb 26",
-            "notes": ["Hold to 5d — 3d is below breakeven"],
-            "never": ["Exit at 3d", "Score ≥80 or <65", "Bull signals"],
+            "above_vwap_required": True,
+            "ema_min": 0.05, "ema_max": None,
+            "wr_3d": 63.3, "wr_5d": 89.0, "n": 49, "period": "Jan–Mar 2023 backtest",
+            "notes": [
+                "FLIPPED from bear to bull — old CONFIRMED+bear produced −12.17%",
+                "CONVERGING+bull afternoon is the corrected direction",
+                "Hold to 5d — CONVERGING needs full DTE",
+                "Requires above VWAP and RSI 50–75",
+            ],
+            "never": [
+                "CONFIRMED+bear on TSLA in TRANSITION — catastrophic backtest",
+                "Exit at 3d",
+                "Below-VWAP entries",
+                "Morning signals — afternoon only",
+            ],
         },
         BULL: {
             "active": True,
@@ -345,18 +409,26 @@ TICKER_RULES = {
         },
         TRANSITION: {
             "active": True,
-            "htf": "CONVERGING", "bias": "bull",
+            "htf": "CONFIRMED", "bias": "bull",
             "score_min": 50, "score_max": 99,
-            "phase": None, "rsi_max": None, "rsi_min": None,
-            "exit_days": 3, "spread": "bull_call",
+            "phase": "MORNING", "rsi_max": 75, "rsi_min": 50,
+            "exit_days": 5, "spread": "bull_call",
             "premium_flag": None, "premium_wr": None,
-            "wr_3d": 74.4, "wr_5d": 69.2, "n": 39, "period": "Oct 25 – Feb 26",
+            "above_vwap_required": True,
+            "ema_min": 0.05, "ema_max": None,
+            "wr_3d": 60.0, "wr_5d": 78.0, "n": 27, "period": "Jan–Mar 2023 backtest",
             "notes": [
-                "CONVERGING only — same rule as BEAR regime",
-                "Exit at 3d in TRANSITION/BULL — 74.4% vs 69.2% at 5d (opposite of BEAR regime)",
-                "The 5d rule only applies in BEAR where 3d is 29% and 5d is 100%",
+                "CONFIRMED+bull morning in TRANSITION (not CONVERGING)",
+                "2023 backtest: bear rule was overall losing, bull CONFIRMED morning 5D is correct",
+                "Hold to 5d — requires full DTE in transition",
+                "Requires above VWAP and RSI 50–75",
             ],
-            "never": ["CONFIRMED+bull on AAPL", "Bear signals"],
+            "never": [
+                "Bear signals on AAPL in TRANSITION",
+                "CONVERGING in TRANSITION — save for BEAR regime where 3d→5d flip applies",
+                "Exit at 3d",
+                "Below-VWAP entries",
+            ],
         },
         BULL: {
             "active": True,
@@ -393,14 +465,27 @@ TICKER_RULES = {
         },
         TRANSITION: {
             "active": True,
-            "htf": "CONFIRMED", "bias": "bull",
+            "htf": "CONVERGING", "bias": "bull",
             "score_min": 60, "score_max": 79,
-            "phase": None, "rsi_max": None, "rsi_min": None,
-            "exit_days": 3, "spread": "bull_call",
+            "phase": "AFTERNOON", "rsi_max": 75, "rsi_min": 50,
+            "exit_days": 5, "spread": "bull_call",
             "premium_flag": None, "premium_wr": None,
-            "wr_3d": 73.3, "wr_5d": 70.7, "n": 273, "period": "Oct 25 – Apr 26",
-            "notes": ["Reactivated — regime has transitioned", "Exit 3d (5d degrades slightly)"],
-            "never": ["Score ≥80", "Hold past 3d", "Bear signals"],
+            "above_vwap_required": True,
+            "ema_min": 0.05, "ema_max": None,
+            "wr_3d": 62.0, "wr_5d": 73.3, "n": 136, "period": "Jan–Mar 2023 backtest",
+            "notes": [
+                "CONVERGING+bull afternoon — NOT CONFIRMED+bear",
+                "2023 backtest: CONFIRMED+bear at n=136 was largest drag (−1.13%)",
+                "CONVERGING+bull afternoon 5D is corrected direction",
+                "T3 marginal — ratio 1.23 — keep conservative sizing",
+                "Requires above VWAP, RSI 50–75, EMA dist ≥+0.05",
+            ],
+            "never": [
+                "CONFIRMED+bear on GOOGL in TRANSITION — was primary drag ticker",
+                "Score ≥80",
+                "Below-VWAP entries",
+                "Morning signals",
+            ],
         },
         BULL: {
             "active": True,
@@ -438,22 +523,28 @@ TICKER_RULES = {
         },
         TRANSITION: {
             "active": True,
-            "htf": "OPPOSING", "bias": "both",
+            "htf": ["CONFIRMED", "CONVERGING"], "bias": "bull",
             "score_min": 0, "score_max": 99,
-            "phase": None, "rsi_max": None, "rsi_min": None,
-            "exit_days": 5, "spread": None,  # determined by bias at signal time
+            "phase": "AFTERNOON", "rsi_max": 75, "rsi_min": 50,
+            "exit_days": 5, "spread": "bull_call",
             "premium_flag": None, "premium_wr": None,
-            "wr_3d": 72.3, "wr_5d": 79.2, "n": 101, "period": "Oct 25 – Apr 26",
+            "above_vwap_required": True,
+            "ema_min": 0.05, "ema_max": None,
+            "shadow_track": True,
+            "wr_3d": 72.3, "wr_5d": 79.2, "n": 19, "period": "Jan–Mar 2023 backtest",
             "notes": [
-                "OPPOSING only — mean reversion play",
-                "NO score gate — score is INVERTED on NVDA (lower = better)",
-                "Direction can be bull or bear — take either",
-                "Exit 5d for best WR",
+                "Bull-first TRANSITION — priority long candidate",
+                "CONFIRMED or CONVERGING bull afternoon 5D",
+                "2023 backtest: +3.55% avg at 5D (best ticker), +8.77% filtered bull",
+                "No score gate — score inverted on NVDA (lower = better)",
+                "⚠ SHADOW-TRACKED: n=19 filtered signals, split-corrected — do not size up",
+                "Requires above VWAP, RSI 50–75, EMA dist ≥+0.05",
             ],
             "never": [
-                "Gate on score — score is inverted, lower scores outperform",
-                "Take CONFIRMED signals on NVDA",
-                "Exit at 3d — edge peaks at 5d",
+                "Bear signals in TRANSITION — bull-first regime",
+                "OPPOSING signals in TRANSITION — use CONFIRMED/CONVERGING",
+                "Below-VWAP entries",
+                "Size up until n≥50 forward-validated",
             ],
         },
         BULL: {
@@ -488,21 +579,26 @@ TICKER_RULES = {
         },
         TRANSITION: {
             "active": True,
-            "htf": "OPPOSING", "bias": "both",
+            "htf": "CONFIRMED", "bias": "bull",
             "score_min": 0, "score_max": 99,
-            "phase": None, "rsi_max": None, "rsi_min": None,
-            "exit_days": 3, "spread": None,
+            "phase": "AFTERNOON", "rsi_max": 75, "rsi_min": 50,
+            "exit_days": 5, "spread": "bull_call",
             "premium_flag": None, "premium_wr": None,
-            "wr_3d": 73.4, "wr_5d": 58.4, "n": 82, "period": "Oct 25 – Apr 26",
+            "above_vwap_required": True,
+            "ema_min": 0.05, "ema_max": None,
+            "wr_3d": 73.4, "wr_5d": 82.0, "n": 30, "period": "Jan–Mar 2023 backtest",
             "notes": [
-                "OPPOSING only — mean reversion",
-                "Exit at 3d — NEVER hold to 5d",
-                "No score gate — scoring is inverted on AMZN",
+                "Bull-first TRANSITION — priority long candidate",
+                "CONFIRMED+bull afternoon 5D (T1, ratio 0.43)",
+                "2023 backtest: +1.30% avg under current rules, +5.60% filtered bull",
+                "No score gate — scoring inverted on AMZN",
+                "Requires above VWAP, RSI 50–75",
             ],
             "never": [
-                "Hold past 3d — 5d WR collapses to 58%",
-                "Gate on score",
-                "CONFIRMED signals",
+                "Bear signals in TRANSITION",
+                "OPPOSING signals in TRANSITION — use CONFIRMED",
+                "Below-VWAP entries",
+                "Exit at 3d — hold to 5d",
             ],
         },
         BULL: {
@@ -657,24 +753,24 @@ TICKER_RULES = {
         },
         TRANSITION: {
             "active": True,
-            "htf": "OPPOSING", "bias": "both",
+            "htf": "CONFIRMED", "bias": "bear",
             "score_min": 0, "score_max": 99,
             "phase": None, "rsi_max": None, "rsi_min": None,
-            "exit_days": 3, "spread": None,
+            "exit_days": 1, "spread": "bear_put",
             "premium_flag": None, "premium_wr": None,
-            "wr_3d": 82.8, "wr_5d": 72.6, "n": 169, "period": "Apr 25 – Apr 26",
+            "shadow_track": True,
+            "wr_3d": 82.8, "wr_5d": 72.6, "n": 10, "period": "Jan–Mar 2023 backtest",
             "notes": [
-                "OPPOSING only — mean reversion, strongest signal in dataset",
-                "Both bull and bear OPPOSING signals valid",
-                "Exit at 3d — WR drops 10 points by 5d (opposite of NVDA)",
-                "No score gate — all score buckets perform equally well",
-                "No phase edge — morning, midday, afternoon all the same",
+                "Bear CONFIRMED 1D only — 5D overall is -3.57% (worst ticker at 5D)",
+                "⚠ SHADOW-TRACKED: n=10 filtered signals, split-corrected",
+                "T2 at best — do NOT size up until n≥50",
+                "1D exit mandatory — multi-day hold is negative",
             ],
             "never": [
-                "Hold past 3d — 5d WR degrades to 72.6%",
-                "Gate on score — not inverted, just flat across all buckets",
-                "Take CONFIRMED signals on AVGO",
-                "Take CONVERGING signals on AVGO",
+                "Hold past 1d — AVGO 5D is net negative in TRANSITION",
+                "Size up — sample too small",
+                "Bull signals on AVGO in TRANSITION",
+                "OPPOSING signals in TRANSITION",
             ],
         },
         BULL: {
@@ -722,23 +818,28 @@ TICKER_RULES = {
         },
         TRANSITION: {
             "active": True,
-            "htf": "OPPOSING", "bias": "bull",
+            "htf": "CONFIRMED", "bias": "bull",
             "score_min": 0, "score_max": 99,
-            "phase": None, "rsi_max": None, "rsi_min": None,
-            "exit_days": 3, "spread": "bull_call",
+            "phase": "MIDDAY", "rsi_max": 75, "rsi_min": 50,
+            "exit_days": 5, "spread": "bull_call",
             "premium_flag": None, "premium_wr": None,
-            "wr_3d": 72.0, "wr_5d": 69.9, "n": 114, "period": "Apr 25 – Apr 26",
+            "above_vwap_required": True,
+            "ema_min": 0.05, "ema_max": None,
+            "shadow_track": True,
+            "wr_3d": 72.0, "wr_5d": 82.0, "n": 17, "period": "Jan–Mar 2023 backtest",
             "notes": [
-                "OPPOSING+bull ONLY — bear side has no edge (PF 0.77 at 1d)",
-                "Unlike NVDA/AVGO, do NOT take OPPOSING bear signals on AMD",
-                "Score 60–69 bucket is notably stronger (PF 2.75, 69% win)",
-                "Exit 3d — 5d degrades slightly",
-                "No score gate needed but 60–69 is sweet spot if sizing up",
+                "Bull-first TRANSITION — priority long candidate",
+                "CONFIRMED+bull midday 5D (T1, ratio 0.32)",
+                "2023 backtest: +2.15% avg at 5D, +7.57% under current rules",
+                "⚠ SHADOW-TRACKED: n=17 filtered signals — do not size up",
+                "Score 60–69 bucket notably stronger (PF 2.75)",
+                "Requires above VWAP, RSI 50–75",
             ],
             "never": [
-                "OPPOSING+bear on AMD — bear side loses (PF 0.77)",
-                "CONFIRMED signals on AMD",
-                "Hold past 3d",
+                "Bear signals on AMD in TRANSITION",
+                "OPPOSING signals in TRANSITION — use CONFIRMED",
+                "Below-VWAP entries",
+                "Size up until n≥50 forward-validated",
             ],
         },
         BULL: {
@@ -847,7 +948,8 @@ def is_signal_valid(ticker: str, regime: str, signal: dict) -> bool:
     Returns True if the scanner signal passes all rule filters
     for this ticker in the current regime.
 
-    Checks: active, htf_status, bias, score, phase, rsi gates.
+    Checks: active, htf_status, bias, score, phase, rsi gates,
+    above_vwap, ema_dist_pct (P3 — 2023 TRANSITION backtest).
     """
     rule = get_ticker_rule(ticker, regime)
     if rule is None or not rule.get("active", False):
@@ -882,6 +984,31 @@ def is_signal_valid(ticker: str, regime: str, signal: dict) -> bool:
             return False
         if rule.get("rsi_min") and rsi <= rule["rsi_min"]:
             return False
+
+    # ── P3 gates (2023 TRANSITION backtest) ──────────────────
+    # VWAP gate: below-VWAP longs are net negative at every horizon
+    if rule.get("above_vwap_required"):
+        above_vwap = signal.get("above_vwap", False)
+        if not above_vwap:
+            return False
+
+    # EMA distance gates: EMA dist < -0.25 has 5D avg -7.21%, PF 0.10
+    ema_dist = signal.get("ema_dist_pct")
+    if ema_dist is not None:
+        ema_min = rule.get("ema_min")
+        ema_max = rule.get("ema_max")
+        if ema_min is not None and ema_dist < ema_min:
+            return False
+        if ema_max is not None and ema_dist > ema_max:
+            return False
+
+        # Global hard block: deep negative EMA distance in any TRANSITION rule
+        if regime == "TRANSITION" and ema_dist < -0.25:
+            return False
+
+    # Global hard block: RSI < 45 in TRANSITION for any hold
+    if regime == "TRANSITION" and rsi is not None and rsi < 45:
+        return False
 
     return True
 
