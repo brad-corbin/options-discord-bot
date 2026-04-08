@@ -88,15 +88,48 @@ def _classify_impact(event_name: str) -> str:
 
 
 def _fetch_economic_calendar(from_date: str, to_date: str) -> List[Dict]:
-    """Fetch economic calendar from Finnhub. Returns list of events."""
-    if not FINNHUB_TOKEN:
-        log.debug("FINNHUB_TOKEN not set — economic calendar disabled")
-        return []
-
+    """Fetch economic calendar. FMP primary (Premium plan), Finnhub fallback."""
     cache_key = f"econ:{from_date}:{to_date}"
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached
+
+    # Strategy 1: FMP economic calendar (Premium plan includes this)
+    try:
+        from fundamental_screener import _fmp_get, FMP_TOKEN
+        if FMP_TOKEN:
+            data = _fmp_get("economics-calendar", {"from": from_date, "to": to_date})
+            if data and isinstance(data, list):
+                events = []
+                for evt in data:
+                    if evt.get("country", "").upper() != "US":
+                        continue
+                    event_name = evt.get("event", "")
+                    impact = _classify_impact(event_name)
+                    if impact == "low":
+                        continue
+                    events.append({
+                        "date": evt.get("date", ""),
+                        "time": evt.get("time", ""),
+                        "event": event_name,
+                        "impact": impact,
+                        "actual": evt.get("actual"),
+                        "estimate": evt.get("estimate"),
+                        "prev": evt.get("previous"),
+                        "unit": evt.get("unit", ""),
+                    })
+                _cache_set(cache_key, events)
+                log.info(f"Economic calendar (FMP): {len(events)} US events ({from_date} to {to_date})")
+                return events
+    except ImportError:
+        pass
+    except Exception as e:
+        log.debug(f"FMP economic calendar failed, trying Finnhub: {e}")
+
+    # Strategy 2: Finnhub fallback
+    if not FINNHUB_TOKEN:
+        log.debug("FINNHUB_TOKEN not set — economic calendar disabled")
+        return []
 
     try:
         resp = requests.get(
@@ -104,10 +137,9 @@ def _fetch_economic_calendar(from_date: str, to_date: str) -> List[Dict]:
             params={"from": from_date, "to": to_date, "token": FINNHUB_TOKEN},
             timeout=5,
         )
-        # Handle 403 (paid feature) gracefully — don't retry, cache empty for longer
         if resp.status_code == 403:
             log.warning("Economic calendar: Finnhub returned 403 (paid feature). "
-                        "Macro event detection disabled. Consider upgrading Finnhub plan.")
+                        "Using FMP economic calendar instead when available.")
             _cache_set(cache_key, [])
             return []
         resp.raise_for_status()
@@ -118,12 +150,10 @@ def _fetch_economic_calendar(from_date: str, to_date: str) -> List[Dict]:
         for evt in raw_events:
             if evt.get("country", "").upper() != "US":
                 continue
-
             event_name = evt.get("event", "")
             impact = _classify_impact(event_name)
             if impact == "low":
-                continue  # skip low-impact events
-
+                continue
             events.append({
                 "date": evt.get("date", ""),
                 "time": evt.get("time", ""),
@@ -136,12 +166,11 @@ def _fetch_economic_calendar(from_date: str, to_date: str) -> List[Dict]:
             })
 
         _cache_set(cache_key, events)
-        log.info(f"Economic calendar: {len(events)} US events ({from_date} to {to_date})")
+        log.info(f"Economic calendar (Finnhub): {len(events)} US events ({from_date} to {to_date})")
         return events
 
     except Exception as e:
-        # Sanitize: never log the token
-        err_str = str(e).replace(FINNHUB_TOKEN, "***")
+        err_str = str(e).replace(FINNHUB_TOKEN, "***") if FINNHUB_TOKEN else str(e)
         log.warning(f"Economic calendar fetch failed: {err_str}")
         _cache_set(cache_key, [])
         return []
