@@ -7975,12 +7975,13 @@ def _em_scheduler():
                         log.debug(f"Income scan error: {_ie}")
 
             # ── v6.1: Potter Box Scan — 8:15 AM CT + 3:05 PM CT ──
+            # MUST run AFTER flow confirmation so campaigns are fresh
             if _potter_scanner:
-                _pb_key = (date_str, "potter_box_scan")
-                if _pb_key not in fired_today:
-                    if (now_ct.hour == 8 and 14 <= now_ct.minute <= 16) or \
-                       (now_ct.hour == 15 and 4 <= now_ct.minute <= 6):
-                        fired_today.add(_pb_key)
+                # Morning scan (after flow confirmation has written campaigns)
+                _pb_am_key = (date_str, "potter_box_am")
+                if _pb_am_key not in fired_today:
+                    if now_ct.hour == 8 and 17 <= now_ct.minute <= 19:
+                        fired_today.add(_pb_am_key)
                         def _run_potter_scan():
                             try:
                                 from oi_flow import FLOW_TICKERS
@@ -7999,11 +8000,9 @@ def _em_scheduler():
                                     expirations_fn=lambda t: get_expirations(t) or [],
                                 )
                                 if setups:
-                                    # Post summary
                                     summary = _potter_scanner.format_summary(setups)
                                     if summary:
                                         post_to_telegram(summary)
-                                    # Post individual alerts for setups with flow + trade structure
                                     for s in setups:
                                         if s.get("trade") and s.get("flow_direction"):
                                             try:
@@ -8013,8 +8012,46 @@ def _em_scheduler():
                             except Exception as _pe:
                                 log.warning(f"Potter Box scan error: {_pe}")
                         threading.Thread(target=_run_potter_scan, daemon=True,
-                                       name="potter-box").start()
-                        log.info("Potter Box scan triggered")
+                                       name="potter-box-am").start()
+                        log.info("Potter Box AM scan triggered (8:18 CT, after flow confirm)")
+
+                # Afternoon scan (separate key so it fires independently)
+                _pb_pm_key = (date_str, "potter_box_pm")
+                if _pb_pm_key not in fired_today:
+                    if now_ct.hour == 15 and 4 <= now_ct.minute <= 6:
+                        fired_today.add(_pb_pm_key)
+                        def _run_potter_scan_pm():
+                            try:
+                                from oi_flow import FLOW_TICKERS
+                                from swing_scanner import fetch_daily_bars_yahoo
+
+                                def _pb_ohlcv(ticker):
+                                    bars = fetch_daily_bars_yahoo(ticker, days=504)
+                                    return bars if bars else None
+
+                                setups = _potter_scanner.scan_all(
+                                    tickers=FLOW_TICKERS,
+                                    ohlcv_fn=_pb_ohlcv,
+                                    chain_fn=lambda t, e: _cached_md.get_chain(
+                                        t, e, feed="cached"),
+                                    spot_fn=get_spot,
+                                    expirations_fn=lambda t: get_expirations(t) or [],
+                                )
+                                if setups:
+                                    summary = _potter_scanner.format_summary(setups)
+                                    if summary:
+                                        post_to_telegram(summary)
+                                    for s in setups:
+                                        if s.get("trade") and s.get("flow_direction"):
+                                            try:
+                                                post_to_telegram(_potter_scanner.format_alert(s))
+                                            except Exception:
+                                                pass
+                            except Exception as _pe:
+                                log.warning(f"Potter Box PM scan error: {_pe}")
+                        threading.Thread(target=_run_potter_scan_pm, daemon=True,
+                                       name="potter-box-pm").start()
+                        log.info("Potter Box PM scan triggered (3:05 CT)")
 
             # ── v6.1: Institutional Flow Detection ──
             if _flow_detector and _persistent_state:
