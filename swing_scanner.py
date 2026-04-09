@@ -359,16 +359,36 @@ import threading as _threading
 _signal_cache = {}
 _signal_cache_lock = _threading.Lock()
 _SIGNAL_CACHE_MAX_AGE = 86400 * 7  # 7 days
+_persistent_state_ref = None  # set by app.py on startup
+_flow_fn_ref = None           # set by app.py for flow scoring
+
+
+def set_persistent_state(ps):
+    """Called by app.py to inject PersistentState for Redis-backed caching."""
+    global _persistent_state_ref
+    _persistent_state_ref = ps
+
+
+def set_flow_fn(fn):
+    """Called by app.py to inject FlowDetector scoring function."""
+    global _flow_fn_ref
+    _flow_fn_ref = fn
 
 
 def _cache_signal(signal):
-    """Store a signal in the cache, keyed by ticker."""
+    """Store a signal in the cache, keyed by ticker. Persists to Redis."""
     with _signal_cache_lock:
         ticker = signal["ticker"]
         _signal_cache[ticker] = {
             "signal": signal,
             "cached_at": time.time(),
         }
+    # Also persist to Redis (survives redeploy)
+    if _persistent_state_ref:
+        try:
+            _persistent_state_ref.save_swing_signal(ticker, signal)
+        except Exception:
+            pass
 
 
 def get_recent_signals(ticker=None, max_age_days=7):
@@ -377,6 +397,7 @@ def get_recent_signals(ticker=None, max_age_days=7):
     If ticker is provided, returns the signal for that ticker or None.
     If ticker is None, returns dict of all cached signals.
     Used by income_scanner for fib confluence detection.
+    Falls back to Redis if not in memory (post-redeploy).
     """
     cutoff = time.time() - (max_age_days * 86400)
     with _signal_cache_lock:
@@ -384,12 +405,31 @@ def get_recent_signals(ticker=None, max_age_days=7):
             entry = _signal_cache.get(ticker.upper())
             if entry and entry["cached_at"] > cutoff:
                 return entry["signal"]
+            # Redis fallback
+            if _persistent_state_ref:
+                try:
+                    sig = _persistent_state_ref.get_swing_signal(ticker.upper())
+                    if sig:
+                        # Re-populate in-memory cache
+                        _signal_cache[ticker.upper()] = {
+                            "signal": sig, "cached_at": time.time(),
+                        }
+                        return sig
+                except Exception:
+                    pass
             return None
         else:
-            return {
+            # Try Redis for full set if memory is empty (post-redeploy)
+            result = {
                 t: e["signal"] for t, e in _signal_cache.items()
                 if e["cached_at"] > cutoff
             }
+            if not result and _persistent_state_ref:
+                try:
+                    result = _persistent_state_ref.get_all_swing_signals()
+                except Exception:
+                    pass
+            return result
 
 
 # ═══════════════════════════════════════════════════════════
@@ -852,6 +892,18 @@ def analyze_swing_setup(
         elif rsi_val > 75:
             confidence += 5
             conf_reasons.append(f"RSI {rsi_val:.0f} overbought — ripe for fade (+5)")
+
+    # ── Institutional flow scoring ──
+    if _flow_fn_ref:
+        try:
+            flow_result = _flow_fn_ref(ticker, fib_price, direction)
+            flow_adj = flow_result.get("score_adj", 0)
+            if flow_adj != 0:
+                confidence += flow_adj
+                for fr in flow_result.get("reasons", []):
+                    conf_reasons.append(fr)
+        except Exception:
+            pass
 
     # Merge rejection reasons into warnings, deduplicate
     for r in rejection_reasons:
