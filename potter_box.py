@@ -423,7 +423,12 @@ class PotterBoxScanner:
         self._state = persistent_state; self._flow = flow_detector; self._post = post_fn
 
     def _active_key(self, t): return f"potter_box:active:{t.upper()}"
-    def _history_key(self, t, d): return f"potter_box:history:{t.upper()}:{d}"
+    def _history_key(self, t, d, box=None):
+        """History key includes box identity so multiple boxes per ticker per day don't overwrite."""
+        base = f"potter_box:history:{t.upper()}:{d}"
+        if box:
+            base += f":{box.get('floor',0)}:{box.get('roof',0)}"
+        return base
     def _void_key(self, t): return f"potter_box:void:{t.upper()}"
     def _zone_key(self, t): return f"potter_box:zones:{t.upper()}"
     def _defaults_key(self, t): return f"potter_box:avg_duration:{t.upper()}"
@@ -461,7 +466,7 @@ class PotterBoxScanner:
         """Log a completed box — only if not already counted."""
         if self._is_box_already_logged(ticker, box):
             return  # already counted, skip
-        self._save(self._history_key(ticker, date.today().isoformat()), box, TTL_HISTORY_BOX)
+        self._save(self._history_key(ticker, date.today().isoformat(), box), box, TTL_HISTORY_BOX)
         self._update_avg(ticker, box["duration_bars"])
         self._mark_box_logged(ticker, box)
 
