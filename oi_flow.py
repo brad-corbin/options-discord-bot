@@ -1237,6 +1237,7 @@ class FlowDetector:
         trigger = idea["flow_trigger"]
         trade = "Bull Put Spread" if idea["trade_type"] == "bull_put" else "Bear Call Spread"
         dir_emoji = "🟢" if idea["trade_type"] == "bull_put" else "🔴"
+        exp_str = str(idea.get("recommended_expiry", ""))[:10]
 
         lines = [
             f"🚨 FLOW-GENERATED INCOME IDEA — {idea['ticker']}",
@@ -1247,13 +1248,115 @@ class FlowDetector:
             "",
             f"{dir_emoji} Suggested: {trade} "
             f"${idea['suggested_short_strike']:.0f}/${idea['suggested_long_strike']:.0f}",
-            f"🧭 Recommended expiry: {idea['recommended_expiry']} "
+            f"🧭 Recommended expiry: {exp_str} "
             f"(where flow concentrated — strong edge)",
             "",
-            "⚠️ This is an institutional thesis, not a technical setup.",
-            "Run /score to see the full structural scorecard.",
+            f"📋 Run: /score {idea['ticker']} {idea['suggested_short_strike']:.0f} {exp_str}",
         ]
         return "\n".join(lines)
+
+    def format_flow_ideas_digest(self, ideas: List[dict]) -> str:
+        """Batch all flow income ideas into a single digest message."""
+        if not ideas:
+            return ""
+
+        lines = [
+            f"🚨 FLOW INCOME IDEAS — {len(ideas)} setups",
+            "━" * 28,
+        ]
+
+        for idea in ideas:
+            trigger = idea["flow_trigger"]
+            trade = "BPS" if idea["trade_type"] == "bull_put" else "BCS"
+            dir_emoji = "🟢" if idea["trade_type"] == "bull_put" else "🔴"
+            exp_str = str(idea.get("recommended_expiry", ""))[:10]
+
+            lines.append(
+                f"{dir_emoji} {idea['ticker']} — {trade} "
+                f"${idea['suggested_short_strike']:.0f}/${idea['suggested_long_strike']:.0f} "
+                f"({trigger['volume']:,} {trigger['side']}s @ ${trigger['strike']:.0f}, "
+                f"{trigger['vol_oi_ratio']:.1f}x)"
+            )
+            lines.append(
+                f"   /score {idea['ticker']} {idea['suggested_short_strike']:.0f} {exp_str}"
+            )
+
+        return "\n".join(lines)
+
+    def format_grouped_flow_alerts(self, alerts: List[dict]) -> List[str]:
+        """
+        Group flow alerts by ticker into one card per ticker.
+        Returns list of formatted messages (one per ticker).
+        """
+        if not alerts:
+            return []
+
+        # Group by ticker
+        by_ticker = {}
+        for a in alerts:
+            t = a["ticker"]
+            if t not in by_ticker:
+                by_ticker[t] = []
+            by_ticker[t].append(a)
+
+        messages = []
+        for ticker, ticker_alerts in by_ticker.items():
+            # Sort by flow level (extreme first) then volume
+            level_order = {"extreme": 0, "significant": 1, "notable": 2}
+            ticker_alerts.sort(key=lambda x: (
+                level_order.get(x.get("flow_level", "notable"), 3),
+                -x.get("volume", 0),
+            ))
+
+            # Determine highest level for the card header
+            top_level = ticker_alerts[0].get("flow_level", "notable")
+            if top_level == "extreme":
+                emoji, label = "🚨", "EXTREME FLOW"
+            elif top_level == "significant":
+                emoji, label = "🔥", "SIGNIFICANT FLOW"
+            else:
+                emoji, label = "📊", "NOTABLE FLOW"
+
+            # Check for any bursts or new strikes
+            has_burst = any(a.get("is_burst") for a in ticker_alerts)
+            has_new = any(a.get("is_new_strike") for a in ticker_alerts)
+            tags = ""
+            if has_burst:
+                tags += " ⚡ BURST"
+            if has_new:
+                tags += " 🆕 NEW"
+
+            spot = ticker_alerts[0].get("spot", 0)
+
+            lines = [
+                f"{emoji} {label} — {ticker}{tags}",
+                "━" * 28,
+                f"Spot: ${spot:.2f} | {len(ticker_alerts)} strikes active",
+                "",
+            ]
+
+            for a in ticker_alerts:
+                side_emoji = "📗" if a["side"] == "call" else "📕"
+                dist_dir = "above" if a.get("dist_from_spot_pct", 0) > 0 else "below"
+                lvl = a.get("flow_level", "")[0].upper() if a.get("flow_level") else "?"
+                burst = " ⚡" if a.get("is_burst") else ""
+                new = " 🆕" if a.get("is_new_strike") else ""
+
+                lines.append(
+                    f"{side_emoji} ${a['strike']:.0f} {a['side'].upper()} "
+                    f"| Vol {a['volume']:,} / OI {a['oi']:,} "
+                    f"({a['vol_oi_ratio']:.1f}x) "
+                    f"| {a.get('directional_bias', '?')}{burst}{new}"
+                )
+
+            # Add expiry info from first alert
+            exp = ticker_alerts[0].get("expiry", "")
+            if exp:
+                lines.append(f"\nExp: {exp}")
+
+            messages.append("\n".join(lines))
+
+        return messages
 
     def format_sector_flow_alert(self, sector: dict) -> str:
         """Format a sector flow alert."""
