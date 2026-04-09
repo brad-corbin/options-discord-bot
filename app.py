@@ -3563,31 +3563,16 @@ def _run_v4_prefilter(ticker: str, spot: float, chains: list, candle_closes: lis
             _oi_tracker.record_chain(ticker, exp, chain_data, spot=spot)
 
         # ── Intraday flow detection (volume/OI + direction approx) ──
+        # Flow data is collected and stored for scoring (Component K, swing boost,
+        # EntryValidator, Potter Box) but NOT posted as standalone alerts.
+        # Standalone flow alerts were noise — flow only fires Telegram when it
+        # converges with another signal (shadow, swing, potter box).
         try:
             if _flow_detector:
                 _persistent_state.save_oi_baseline(ticker, exp,
                     _oi_cache._parse_chain_oi(chain_data) if _oi_cache else {})
-                flow_alerts = _flow_detector.check_intraday_flow(ticker, exp, chain_data, spot)
-                postable = [fa for fa in flow_alerts
-                           if fa.get("should_alert") and
-                           fa.get("flow_level") in ("significant", "extreme")]
-                if postable:
-                    grouped = _flow_detector.format_grouped_flow_alerts(postable)
-                    for msg in grouped:
-                        try:
-                            post_to_telegram(msg)
-                            log.info(f"Flow alert: {ticker} ({len(postable)} strikes)")
-                        except Exception:
-                            pass
-                # Generate trade ideas for extreme flow
-                ideas = _flow_detector.generate_flow_trade_ideas(flow_alerts)
-                if ideas:
-                    try:
-                        digest_msgs = _flow_detector.format_flow_ideas_digest(ideas)
-                        for dm in digest_msgs:
-                            post_to_telegram(dm)
-                    except Exception:
-                        pass
+                _flow_detector.check_intraday_flow(ticker, exp, chain_data, spot)
+                # Flow data now stored in Redis for downstream scoring
         except Exception as _ofe:
             log.debug(f"Flow check error for {ticker}: {_ofe}")
 
@@ -4739,21 +4724,12 @@ def _get_0dte_iv(ticker: str, target_date_str: str = None) -> tuple:
         _oi_cache.save_snapshot(ticker, target, data)
         if _oi_tracker:
             _oi_tracker.record_chain(ticker, target, data, spot=spot)
-        # Intraday flow detection
+        # Intraday flow detection — silent collection for scoring
         try:
             if _flow_detector:
                 _persistent_state.save_oi_baseline(ticker, target,
                     _oi_cache._parse_chain_oi(data) if _oi_cache else {})
-                flow_alerts = _flow_detector.check_intraday_flow(ticker, target, data, spot)
-                postable = [fa for fa in flow_alerts
-                           if fa.get("should_alert") and
-                           fa.get("flow_level") in ("significant", "extreme")]
-                if postable:
-                    for msg in _flow_detector.format_grouped_flow_alerts(postable):
-                        try:
-                            post_to_telegram(msg)
-                        except Exception:
-                            pass
+                _flow_detector.check_intraday_flow(ticker, target, data, spot)
         except Exception:
             pass
 
@@ -4929,21 +4905,12 @@ def _get_chain_iv_for_expiry(ticker: str, target_date_str: str, dte: float) -> t
         _oi_cache.save_snapshot(ticker, target, data)
         if _oi_tracker:
             _oi_tracker.record_chain(ticker, target, data, spot=spot)
-        # Intraday flow detection
+        # Intraday flow detection — silent collection for scoring
         try:
             if _flow_detector:
                 _persistent_state.save_oi_baseline(ticker, target,
                     _oi_cache._parse_chain_oi(data) if _oi_cache else {})
-                flow_alerts = _flow_detector.check_intraday_flow(ticker, target, data, spot)
-                postable = [fa for fa in flow_alerts
-                           if fa.get("should_alert") and
-                           fa.get("flow_level") in ("significant", "extreme")]
-                if postable:
-                    for msg in _flow_detector.format_grouped_flow_alerts(postable):
-                        try:
-                            post_to_telegram(msg)
-                        except Exception:
-                            pass
+                _flow_detector.check_intraday_flow(ticker, target, data, spot)
         except Exception:
             pass
 
@@ -8172,62 +8139,48 @@ def _em_scheduler():
                                         except Exception:
                                             continue
 
-                                    # Post significant+ alerts — GROUPED BY TICKER
-                                    postable_alerts = [fa for fa in sweep_alerts
-                                                      if fa.get("should_alert") and
-                                                      fa.get("flow_level") in ("significant", "extreme")]
-                                    grouped_msgs = _flow_detector.format_grouped_flow_alerts(postable_alerts)
-                                    for msg in grouped_msgs:
-                                        try:
-                                            post_to_telegram(msg)
-                                        except Exception:
-                                            pass
+                                    # Flow data collected silently — NO standalone alerts.
+                                    # Data feeds into Component K, swing boost, Potter Box.
+                                    # EOD summary posted at 3:05 PM instead of per-sweep spam.
+                                    postable_count = sum(1 for fa in sweep_alerts
+                                                        if fa.get("should_alert") and
+                                                        fa.get("flow_level") in ("significant", "extreme"))
 
-                                    # Generate trade ideas — post as digest
-                                    ideas = _flow_detector.generate_flow_trade_ideas(sweep_alerts)
-                                    if ideas:
-                                        try:
-                                            digest_msgs = _flow_detector.format_flow_ideas_digest(ideas)
-                                            for dm in digest_msgs:
-                                                post_to_telegram(dm)
-                                        except Exception:
-                                            pass
-
-                                    # Sector flow
-                                    sectors = _flow_detector.detect_sector_flow(sweep_alerts)
-                                    for sf in sectors:
-                                        try:
-                                            post_to_telegram(_flow_detector.format_sector_flow_alert(sf))
-                                        except Exception:
-                                            pass
-
-                                    # Expiry clustering
-                                    try:
-                                        from economic_calendar import get_events_in_window
-                                        econ = get_events_in_window(dte_days=30)
-                                    except Exception:
-                                        econ = []
-                                    clusters = _flow_detector.detect_expiry_clustering(sweep_alerts, econ)
-                                    for cl in clusters:
-                                        try:
-                                            post_to_telegram(_flow_detector.format_expiry_cluster_alert(cl))
-                                        except Exception:
-                                            pass
+                                    # Store sweep alerts for EOD summary
+                                    if not hasattr(_flow_detector, '_eod_sweep_alerts'):
+                                        _flow_detector._eod_sweep_alerts = []
+                                    _flow_detector._eod_sweep_alerts.extend(
+                                        [fa for fa in sweep_alerts if fa.get("should_alert")])
 
                                     log.info(f"Flow sweep {_hour}:{_minute:02d} complete: "
-                                           f"{len(sweep_alerts)} alerts across {len(FLOW_TICKERS)} tickers")
+                                           f"{len(sweep_alerts)} alerts ({postable_count} significant+) "
+                                           f"across {len(FLOW_TICKERS)} tickers — stored for EOD summary")
                                 except Exception as _fe:
                                     log.warning(f"Flow sweep error: {_fe}")
                             threading.Thread(target=_run_flow_sweep, daemon=True,
                                            name=f"flow-sweep-{_fh}{_fm}").start()
                             log.info(f"Flow sweep triggered ({_fh}:{_fm:02d} CT)")
 
-                # 3:05 PM CT — End-of-day: save volume flags + OI baseline
+                # 3:05 PM CT — End-of-day: save volume flags + post flow summary
                 _flow_eod_key = (date_str, "flow_eod")
                 if _flow_eod_key not in fired_today:
                     if now_ct.hour == 15 and 4 <= now_ct.minute <= 6:
                         fired_today.add(_flow_eod_key)
                         log.info("Flow end-of-day save triggered (3:05 PM CT)")
+                        # Post single EOD flow summary
+                        try:
+                            eod_alerts = getattr(_flow_detector, '_eod_sweep_alerts', [])
+                            if eod_alerts:
+                                summary_msgs = _flow_detector.format_eod_flow_summary(eod_alerts)
+                                for sm in summary_msgs:
+                                    try:
+                                        post_to_telegram(sm)
+                                    except Exception:
+                                        pass
+                                log.info(f"EOD flow summary posted ({len(eod_alerts)} alerts)")
+                                _flow_detector._eod_sweep_alerts = []  # reset for next day
+                        except Exception as _eod_e:
+                            log.warning(f"EOD flow summary error: {_eod_e}")
 
             fired_today = {k for k in fired_today if k[0] == date_str}
         except Exception as e:
