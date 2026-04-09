@@ -332,7 +332,8 @@ def classify_maturity(box, historical_avg):
 # STRIKE SELECTION
 # ═══════════════════════════════════════════════════════════
 
-def select_strikes(chain_data, spot, direction, box, void_above, void_below, target_dte):
+def select_strikes(chain_data, spot, direction, box, void_above, void_below,
+                   target_dte, box_above=None, box_below=None):
     sym_list = chain_data.get("optionSymbol") or []; n = len(sym_list)
     if n == 0: return None
     def col(name, default=None):
@@ -365,7 +366,8 @@ def select_strikes(chain_data, spot, direction, box, void_above, void_below, tar
         if not hp: hp = [p for p in puts if p["strike"] < spot and p["mid"] >= 0.05]
         if not hp: return None
         hp.sort(key=lambda c: abs(abs(c["delta"])-0.20)); hedge = hp[0]
-        tp = void["high"]
+        # Target: floor of next box above (box-to-box), fallback to void edge
+        tp = box_above["floor"] if box_above else void["high"]
     else:
         void = void_below
         if not void: return None
@@ -378,7 +380,8 @@ def select_strikes(chain_data, spot, direction, box, void_above, void_below, tar
         if not hp: hp = [c for c in calls if c["strike"] > spot and c["mid"] >= 0.05]
         if not hp: return None
         hp.sort(key=lambda c: abs(abs(c["delta"])-0.20)); hedge = hp[0]
-        tp = void["low"]
+        # Target: roof of next box below (box-to-box), fallback to void edge
+        tp = box_below["roof"] if box_below else void["low"]
 
     pc = primary["ask"]*4*100; hc = hedge["ask"]*1*100; tc = pc + hc
     if direction == "bullish": intr = max(0, tp - primary["strike"])
@@ -455,6 +458,22 @@ class PotterBoxScanner:
 
         if not active: return None
         box = active[-1]; self._save(self._active_key(ticker), box, TTL_ACTIVE_BOX)
+
+        # Map adjacent boxes: nearest box ABOVE and BELOW the current box
+        # These are the breakout targets — price travels box-to-box
+        other_boxes = [b for b in all_boxes if b is not box]
+        box_above = None  # nearest box whose floor > current roof
+        box_below = None  # nearest box whose roof < current floor
+        for ob in other_boxes:
+            # Box above: its floor is above our roof
+            if ob["floor"] > box["roof"] * 0.98:
+                if box_above is None or ob["floor"] < box_above["floor"]:
+                    box_above = ob
+            # Box below: its roof is below our floor
+            if ob["roof"] < box["floor"] * 1.02:
+                if box_below is None or ob["roof"] > box_below["roof"]:
+                    box_below = ob
+
         avg_dur = self.get_avg_duration(ticker); mat = classify_maturity(box, avg_dur)
         if mat["maturity"] == "early": return None
 
@@ -486,6 +505,7 @@ class PotterBoxScanner:
             except: pass
 
         setup = {"ticker": ticker, "box": box, "spot": round(spot,2),
+            "box_above": box_above, "box_below": box_below,
             "void_above": va, "void_below": vb, "maturity": mat,
             "wave_label": box.get("wave_label","established"),
             "flow_direction": flow_dir, "flow_context": flow_ctx, "iv_percentile": iv_pct,
@@ -508,7 +528,8 @@ class PotterBoxScanner:
                     if be:
                         chain = chain_fn(ticker, be)
                         if isinstance(chain, dict) and chain.get("s") == "ok":
-                            trade = select_strikes(chain, spot, flow_dir, box, va, vb, tdte)
+                            trade = select_strikes(chain, spot, flow_dir, box, va, vb, tdte,
+                                                   box_above=box_above, box_below=box_below)
                             if trade: setup["trade"] = trade; setup["expiry"] = be
                 except Exception as e: log.debug(f"Potter strike select failed {ticker}: {e}")
         return setup
@@ -548,6 +569,10 @@ class PotterBoxScanner:
             f"Range: {box['range_pct']:.1f}% | Touches: {box['roof_touches']}R / {box['floor_touches']}F",
             f"{me} Duration: {box['duration_bars']} bars (avg {mat['historical_avg']:.0f} — {mat['maturity'].upper()})"]
         if we: lines.append(f"{we} Wave: {wave.replace('_',' ').title()} (touch {box['max_touches']} — boundary eroding)")
+        # Adjacent boxes (breakout targets)
+        ba = setup.get("box_above"); bb = setup.get("box_below")
+        if ba: lines.append(f"🎯 Box Above: ${ba['floor']:.2f}–${ba['roof']:.2f} (breakout UP target: ${ba['floor']:.2f})")
+        if bb: lines.append(f"🎯 Box Below: ${bb['floor']:.2f}–${bb['roof']:.2f} (breakout DOWN target: ${bb['roof']:.2f})")
         if va: lines.append(f"⬆️ Void Above: ${va['low']:.2f} → ${va['high']:.2f} ({va['height_pct']:.1f}%)")
         if vb: lines.append(f"⬇️ Void Below: ${vb['high']:.2f} → ${vb['low']:.2f} ({vb['height_pct']:.1f}%)")
         for z in setup.get("supply_demand_zones",[])[:2]:
