@@ -7987,7 +7987,7 @@ def _em_scheduler():
                                 from swing_scanner import fetch_daily_bars_yahoo
 
                                 def _pb_ohlcv(ticker):
-                                    bars = fetch_daily_bars_yahoo(ticker, days=120)
+                                    bars = fetch_daily_bars_yahoo(ticker, days=504)
                                     return bars if bars else None
 
                                 setups = _potter_scanner.scan_all(
