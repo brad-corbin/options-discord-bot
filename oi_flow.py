@@ -1255,33 +1255,55 @@ class FlowDetector:
         ]
         return "\n".join(lines)
 
-    def format_flow_ideas_digest(self, ideas: List[dict]) -> str:
-        """Batch all flow income ideas into a single digest message."""
+    def format_flow_ideas_digest(self, ideas: List[dict]) -> List[str]:
+        """Batch flow income ideas into digest messages, chunked to fit Telegram's 4096 char limit."""
         if not ideas:
-            return ""
+            return []
 
-        lines = [
-            f"🚨 FLOW INCOME IDEAS — {len(ideas)} setups",
-            "━" * 28,
-        ]
-
+        # Build all idea lines
+        idea_lines = []
         for idea in ideas:
             trigger = idea["flow_trigger"]
             trade = "BPS" if idea["trade_type"] == "bull_put" else "BCS"
             dir_emoji = "🟢" if idea["trade_type"] == "bull_put" else "🔴"
             exp_str = str(idea.get("recommended_expiry", ""))[:10]
 
-            lines.append(
+            idea_lines.append(
                 f"{dir_emoji} {idea['ticker']} — {trade} "
                 f"${idea['suggested_short_strike']:.0f}/${idea['suggested_long_strike']:.0f} "
                 f"({trigger['volume']:,} {trigger['side']}s @ ${trigger['strike']:.0f}, "
-                f"{trigger['vol_oi_ratio']:.1f}x)"
-            )
-            lines.append(
+                f"{trigger['vol_oi_ratio']:.1f}x)\n"
                 f"   /score {idea['ticker']} {idea['suggested_short_strike']:.0f} {exp_str}"
             )
 
-        return "\n".join(lines)
+        # Chunk into messages under 3800 chars (leave margin for header)
+        messages = []
+        chunk_lines = []
+        chunk_len = 0
+        chunk_count = 0
+
+        for line in idea_lines:
+            line_len = len(line) + 1  # +1 for newline
+            if chunk_len + line_len > 3600 and chunk_lines:
+                # Flush current chunk
+                chunk_count += 1
+                header = f"🚨 FLOW INCOME IDEAS ({len(ideas)} total, part {chunk_count})\n" + "━" * 28
+                messages.append(header + "\n" + "\n".join(chunk_lines))
+                chunk_lines = []
+                chunk_len = 0
+            chunk_lines.append(line)
+            chunk_len += line_len
+
+        # Flush remaining
+        if chunk_lines:
+            chunk_count += 1
+            if chunk_count == 1:
+                header = f"🚨 FLOW INCOME IDEAS — {len(ideas)} setups\n" + "━" * 28
+            else:
+                header = f"🚨 FLOW INCOME IDEAS ({len(ideas)} total, part {chunk_count})\n" + "━" * 28
+            messages.append(header + "\n" + "\n".join(chunk_lines))
+
+        return messages
 
     def format_grouped_flow_alerts(self, alerts: List[dict]) -> List[str]:
         """
