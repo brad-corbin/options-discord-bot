@@ -732,7 +732,7 @@ def check_hard_blocks(trade_type, short_strike, breakeven, support_level,
 def compute_itqs(trade_type, short_strike, breakeven, spot, support_level,
                  failure_level, regime_package, weekly_trend, daily_trend,
                  rsi, vol, vwap, fib_confluence=False, return_on_risk=None,
-                 liquidity_score=3, event_risk=0, dte=5):
+                 liquidity_score=3, event_risk=0, dte=5, flow_data=None):
     score = 0; breakdown = {}; notes = []
     level = support_level["level"]; touches = support_level.get("touches", 0)
 
@@ -842,6 +842,17 @@ def compute_itqs(trade_type, short_strike, breakeven, spot, support_level,
     else: j = 0
     breakdown["J_dte"] = j; score += j
 
+    # K. Institutional Flow (−10 to +15)
+    k = 0; flow_reasons = []; recommended_expiry = None; expiry_note = ""
+    if flow_data:
+        k = flow_data.get("score_adj", 0)
+        flow_reasons = flow_data.get("reasons", [])
+        recommended_expiry = flow_data.get("recommended_expiry")
+        expiry_note = flow_data.get("expiry_note", "")
+        for fr in flow_reasons:
+            notes.append(fr)
+    breakdown["K_flow"] = max(-10, min(15, k)); score += breakdown["K_flow"]
+
     score = max(0, min(100, score))
     if score >= 90: grade, label = "A+", "A+ elite income trade"
     elif score >= 85: grade, label = "A", "A strong trade"
@@ -862,7 +873,9 @@ def compute_itqs(trade_type, short_strike, breakeven, spot, support_level,
     return {"score": score, "grade": grade, "label": label, "decision": decision,
             "breakdown": breakdown, "notes": notes, "trade_type": trade_type,
             "spot_to_strike_pct": round(spot_to_strike_pct, 1),
-            "be_to_failure_pct": round(be_to_failure_pct, 1)}
+            "be_to_failure_pct": round(be_to_failure_pct, 1),
+            "recommended_expiry": recommended_expiry,
+            "expiry_note": expiry_note}
 
 
 # ═══════════════════════════════════════════════════════════
@@ -870,7 +883,7 @@ def compute_itqs(trade_type, short_strike, breakeven, spot, support_level,
 # ═══════════════════════════════════════════════════════════
 
 def scan_ticker_income(ticker, regime_package, ohlcv_fn=None,
-                       chain_fn=None, expirations_fn=None):
+                       chain_fn=None, expirations_fn=None, flow_fn=None):
     """
     Fully automated scan. Zero manual inputs.
     chain_fn(ticker, expiry, side=) → MarketData columnar dict
@@ -978,11 +991,20 @@ def scan_ticker_income(ticker, regime_package, ohlcv_fn=None,
                                        regime_package, return_on_risk=roc,
                                        earnings_in_window=earnings_in_window)
 
+            # Institutional flow scoring
+            flow_data = None
+            if flow_fn:
+                try:
+                    flow_data = flow_fn(ticker, short_strike, "bull_put", expiry)
+                except Exception:
+                    pass
+
             itqs = compute_itqs(
                 "bull_put", short_strike, breakeven, spot, sup, failure,
                 regime_package, weekly, daily, rsi, vol, vwap_st,
                 fib_confluence=fib_match, return_on_risk=roc,
                 liquidity_score=liq, event_risk=event_risk, dte=dte,
+                flow_data=flow_data,
             )
 
             opportunities.append({
@@ -1037,11 +1059,20 @@ def scan_ticker_income(ticker, regime_package, ohlcv_fn=None,
                                        regime_package, return_on_risk=roc,
                                        earnings_in_window=earnings_in_window)
 
+            # Institutional flow scoring
+            flow_data = None
+            if flow_fn:
+                try:
+                    flow_data = flow_fn(ticker, short_strike, "bear_call", expiry)
+                except Exception:
+                    pass
+
             itqs = compute_itqs(
                 "bear_call", short_strike, breakeven, spot, res, failure,
                 regime_package, weekly, daily, rsi, vol, vwap_st,
                 fib_confluence=fib_match, return_on_risk=roc,
                 liquidity_score=liq, event_risk=event_risk, dte=dte,
+                flow_data=flow_data,
             )
 
             opportunities.append({
@@ -1077,7 +1108,8 @@ def scan_ticker_income(ticker, regime_package, ohlcv_fn=None,
 # ═══════════════════════════════════════════════════════════
 
 def score_trade(ticker, trade_type, short_strike, width, credit, regime_package,
-                ohlcv_fn=None, chain_fn=None, expirations_fn=None, expiry=None):
+                ohlcv_fn=None, chain_fn=None, expirations_fn=None, expiry=None,
+                flow_fn=None):
     """
     Score a specific trade. All context auto-computed.
     Pass expiry="2026-04-11" to score against a specific expiration.
@@ -1141,6 +1173,14 @@ def score_trade(ticker, trade_type, short_strike, width, credit, regime_package,
         liq = auto_liquidity(chain, short_strike, long_strike, trade_type)
         fib_match = any(abs(f - short_strike) / spot < 0.015 for f in fibs) if fibs else False
 
+        # Fetch institutional flow data if available
+        flow_data = None
+        if flow_fn:
+            try:
+                flow_data = flow_fn(ticker, short_strike, trade_type, expiry)
+            except Exception:
+                pass
+
         blocks = check_hard_blocks(trade_type, short_strike, breakeven, best, failure,
                                    regime_package, return_on_risk=roc,
                                    earnings_in_window=bool(earnings_in_window))
@@ -1150,6 +1190,7 @@ def score_trade(ticker, trade_type, short_strike, width, credit, regime_package,
             regime_package, weekly, daily, rsi, vol, vwap_st,
             fib_confluence=fib_match, return_on_risk=roc,
             liquidity_score=liq, event_risk=event_risk, dte=dte,
+            flow_data=flow_data,
         )
 
         return {
@@ -1267,11 +1308,15 @@ def format_scorecard(result):
         f"H. Liquidity:  {bd.get('H_liquidity',0):>3}/5   (auto: {'chain' if result.get('chain_available') else 'est'})",
         f"I. Event:      {bd.get('I_event_penalty',0):>3}   (auto: {result.get('event_risk',0)})",
         f"J. DTE:        {bd.get('J_dte',0):>+3}   ({result['dte']}d)",
+        f"K. Flow:       {bd.get('K_flow',0):>+3}   (institutional)",
         f"{'─'*28}",
         f"TOTAL:         {itqs['score']:>3}/100",
         f"GRADE:         {itqs['grade']}",
         f"DECISION:      {itqs['decision']}", "",
     ]
+    if itqs.get("recommended_expiry") and itqs.get("expiry_note"):
+        lines.append(f"🧭 {itqs['expiry_note']}")
+        lines.append("")
     if itqs["notes"]: [lines.append(f"  {n}") for n in itqs["notes"]]
     lines.append(div)
     return "\n".join(lines)
@@ -1282,7 +1327,7 @@ def format_scorecard(result):
 # ═══════════════════════════════════════════════════════════
 
 def run_income_scan(regime_package, ohlcv_fn=None, tickers=None, notify_fn=None,
-                    chain_fn=None, expirations_fn=None):
+                    chain_fn=None, expirations_fn=None, flow_fn=None):
     """Fully automated scan across all income tickers."""
     tickers = tickers or INCOME_TICKERS
     all_opps = []
@@ -1290,7 +1335,8 @@ def run_income_scan(regime_package, ohlcv_fn=None, tickers=None, notify_fn=None,
     for ticker in tickers:
         log.info(f"Income scan: {ticker}")
         opps = scan_ticker_income(ticker, regime_package, ohlcv_fn=ohlcv_fn,
-                                  chain_fn=chain_fn, expirations_fn=expirations_fn)
+                                  chain_fn=chain_fn, expirations_fn=expirations_fn,
+                                  flow_fn=flow_fn)
         all_opps.extend(opps)
         if notify_fn:
             for opp in opps:
