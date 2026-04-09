@@ -30,6 +30,7 @@ def create_income_handlers(
     ohlcv_fn: Callable,
     regime_fn: Callable,
     post_fn: Callable,
+    flow_fn: Callable = None,
 ):
     """
     Factory that creates the two Telegram command handlers.
@@ -40,6 +41,7 @@ def create_income_handlers(
     ohlcv_fn:       function(ticker, days=) → {open, high, low, close, volume}
     regime_fn:      function() → regime package dict
     post_fn:        post_to_telegram(text)
+    flow_fn:        function(ticker, strike, trade_type, expiry) → flow_data dict
     """
 
     def income_scan_fn(chat_id: str, ticker: Optional[str] = None):
@@ -66,6 +68,7 @@ def create_income_handlers(
                             ohlcv_fn=ohlcv_fn,
                             chain_fn=chain_fn,
                             expirations_fn=expirations_fn,
+                            flow_fn=flow_fn,
                         )
                         if not opps:
                             post_fn(f"📊 Income scan {ticker}: no qualifying opportunities found.",
@@ -87,6 +90,7 @@ def create_income_handlers(
                             ohlcv_fn=ohlcv_fn,
                             chain_fn=chain_fn,
                             expirations_fn=expirations_fn,
+                            flow_fn=flow_fn,
                             notify_fn=lambda msg: post_fn(msg, chat_id=chat_id),
                         )
 
@@ -131,6 +135,7 @@ def create_income_handlers(
                         chain_fn=chain_fn,
                         expirations_fn=expirations_fn,
                         expiry=expiry,
+                        flow_fn=flow_fn,
                     )
                     post_fn(format_scorecard(result), chat_id=chat_id)
 
