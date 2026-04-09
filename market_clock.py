@@ -16,8 +16,8 @@
 #   Equity market:  8:30 AM – 3:00 PM CT (regular session)
 #   0DTE options:   8:30 AM – 3:15 PM CT (SPY/QQQ/SPX trade 15 min longer)
 #   Pre-market:     7:00 AM – 8:30 AM CT (some data available)
-#   Power hour:     2:00 PM – 3:00 PM CT
-#   Close zone:     2:30 PM – 3:00 PM CT (urgency increases)
+#   Power hour:     2:30 PM – 3:00 PM CT (take profits, pin risk)
+#   Close zone:     2:30 PM – 3:00 PM CT (same as power hour)
 #
 # Usage:
 #   from market_clock import (
@@ -36,7 +36,7 @@ EQUITY_OPEN_MINS   = 510    # 8:30 AM CT
 EQUITY_CLOSE_MINS  = 900    # 3:00 PM CT
 OPTION_CLOSE_MINS  = 915    # 3:15 PM CT (0DTE SPY/QQQ/SPX)
 PRE_MARKET_MINS    = 420    # 7:00 AM CT
-POWER_HOUR_MINS    = 840    # 2:00 PM CT
+POWER_HOUR_MINS    = 870    # 2:30 PM CT (matches current_phase logic)
 CLOSE_ZONE_MINS    = 870    # 2:30 PM CT
 NO_NEW_ENTRY_MINS  = 885    # 2:45 PM CT — no new 0DTE entries after this
 
@@ -121,7 +121,7 @@ def current_phase(dt: datetime = None) -> dict:
         MORNING      — 9:00–11:30 AM CT (trend development)
         MIDDAY       — 11:30 AM–1:30 PM CT (often choppy)
         AFTERNOON    — 1:30–2:30 PM CT (trend resumption)
-        POWER_HOUR   — 2:30–3:00 PM CT (high urgency, take profits)
+        POWER_HOUR   — 2:30–3:00 PM CT (take profits, pin risk, no new 0DTE)
         OPTION_CLOSE — 3:00–3:15 PM CT (0DTE only, extreme urgency)
         CLOSED       — after close
     """
