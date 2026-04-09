@@ -150,6 +150,8 @@ from income_wiring import create_income_handlers, create_ohlcv_wrapper
 from portfolio_greeks import PortfolioGreeks
 from regime_detector import RegimeDetector
 from oi_tracker import OITracker
+from persistent_state import PersistentState
+from oi_flow import FlowDetector, FLOW_TICKERS
 
 # ── v4.3: Thesis Monitor ──
 from thesis_monitor import (
@@ -161,6 +163,8 @@ from thesis_monitor import (
 # OI cache will be initialized after store_get/store_set are defined
 _oi_cache = None
 _oi_tracker = None  # v5.1: daily OI change tracker
+_persistent_state = None  # v6.1: Redis-backed persistent state
+_flow_detector = None     # v6.1: unified institutional flow detection
 
 # ─────────────────────────────────────────────────────────
 # LOGGING
@@ -403,7 +407,7 @@ def _get_google_access_token() -> str | None:
 
 def _sheet_headers_exist(tab: str, token: str) -> bool:
     try:
-        url = f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEET_ID}/values/{requests.utils.quote(tab + '!1:1', safe='') }"
+        url = f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEET_ID}/values/{requests.utils.quote(tab + '!1:1', safe='!:')}"
         resp = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=10)
         resp.raise_for_status()
         values = resp.json().get("values", [])
@@ -415,7 +419,7 @@ def _sheet_headers_exist(tab: str, token: str) -> bool:
 
 def _append_google_sheet_values(tab: str, values: list, token: str) -> bool:
     try:
-        rng = requests.utils.quote(f"{tab}!A:A", safe="!")
+        rng = requests.utils.quote(f"{tab}!A:A", safe="!:")
         url = f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEET_ID}/values/{rng}:append"
         resp = requests.post(
             url,
@@ -427,7 +431,13 @@ def _append_google_sheet_values(tab: str, values: list, token: str) -> bool:
         resp.raise_for_status()
         return True
     except Exception as e:
-        log.warning(f"Google Sheets append failed for {tab}: {e}")
+        # Log response body for debugging 400 errors
+        resp_body = ""
+        try:
+            resp_body = f" | response: {resp.text[:300]}"
+        except Exception:
+            pass
+        log.warning(f"Google Sheets append failed for {tab}: {e}{resp_body}")
         return False
 
 
@@ -443,19 +453,19 @@ def _append_google_sheet_row(filename: str, fieldnames: list, row: dict):
 
     def _fetch_headers(tab_name: str, bearer: str):
         try:
-            rng = requests.utils.quote(f"{tab_name}!1:1", safe="!")
+            rng = requests.utils.quote(f"{tab_name}!1:1", safe="!:")
             url = f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEET_ID}/values/{rng}"
             resp = requests.get(url, headers={"Authorization": f"Bearer {bearer}"}, timeout=10)
             resp.raise_for_status()
             vals = resp.json().get("values", [])
-            return vals[0] if vals else []
+            return [str(v).strip() for v in vals[0]] if vals else []
         except Exception as e:
             log.warning(f"Google Sheets header fetch failed for {tab_name}: {e}")
             return []
 
     def _write_headers(tab_name: str, headers: list, bearer: str) -> bool:
         try:
-            rng = requests.utils.quote(f"{tab_name}!1:1", safe="!")
+            rng = requests.utils.quote(f"{tab_name}!1:1", safe="!:")
             url = f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEET_ID}/values/{rng}"
             resp = requests.put(
                 url,
@@ -470,7 +480,7 @@ def _append_google_sheet_row(filename: str, fieldnames: list, row: dict):
             log.warning(f"Google Sheets header write failed for {tab_name}: {e}")
             return False
 
-    values = [[row.get(k) for k in fieldnames]]
+    values = [[(row.get(k) if row.get(k) is not None else "") for k in fieldnames]]
     try:
         with _google_sheets_lock:
             current_headers = _fetch_headers(tab, token)
@@ -1365,6 +1375,24 @@ def store_exists(key: str) -> bool:
         try: return bool(r.exists(key))
         except Exception: pass
     return _mem_store.exists(key)
+
+
+def store_scan(pattern: str) -> list:
+    """Scan Redis for keys matching pattern. Returns list of key strings."""
+    r = _get_redis()
+    if r:
+        try:
+            keys = []
+            cursor = 0
+            while True:
+                cursor, batch = r.scan(cursor, match=pattern, count=100)
+                keys.extend([k.decode() if isinstance(k, bytes) else k for k in batch])
+                if cursor == 0:
+                    break
+            return keys
+        except Exception as e:
+            log.debug(f"Redis scan failed for {pattern}: {e}")
+    return []
 
 # ─────────────────────────────────────────────────────────
 # DEDUP
@@ -3517,6 +3545,30 @@ def _run_v4_prefilter(ticker: str, spot: float, chains: list, candle_closes: lis
         if _oi_tracker:
             _oi_tracker.record_chain(ticker, exp, chain_data, spot=spot)
 
+        # ── Intraday flow detection (volume/OI + direction approx) ──
+        try:
+            if _flow_detector:
+                _persistent_state.save_oi_baseline(ticker, exp,
+                    _oi_cache._parse_chain_oi(chain_data) if _oi_cache else {})
+                flow_alerts = _flow_detector.check_intraday_flow(ticker, exp, chain_data, spot)
+                for fa in flow_alerts:
+                    if fa.get("should_alert") and fa.get("flow_level") in ("significant", "extreme"):
+                        try:
+                            post_to_telegram(_flow_detector.format_intraday_alert(fa))
+                            log.info(f"Flow alert: {fa['ticker']} ${fa['strike']:.0f} "
+                                   f"{fa['side']} {fa['flow_level']} {fa['vol_oi_ratio']:.1f}x")
+                        except Exception:
+                            pass
+                # Generate trade ideas for extreme flow
+                ideas = _flow_detector.generate_flow_trade_ideas(flow_alerts)
+                for idea in ideas:
+                    try:
+                        post_to_telegram(_flow_detector.format_flow_trade_idea(idea))
+                    except Exception:
+                        pass
+        except Exception as _ofe:
+            log.debug(f"Flow check error for {ticker}: {_ofe}")
+
         if v4.get("error"):
             log.warning(f"v4 prefilter failed for {ticker}: {v4['error']}")
             return {}
@@ -4665,6 +4717,20 @@ def _get_0dte_iv(ticker: str, target_date_str: str = None) -> tuple:
         _oi_cache.save_snapshot(ticker, target, data)
         if _oi_tracker:
             _oi_tracker.record_chain(ticker, target, data, spot=spot)
+        # Intraday flow detection
+        try:
+            if _flow_detector:
+                _persistent_state.save_oi_baseline(ticker, target,
+                    _oi_cache._parse_chain_oi(data) if _oi_cache else {})
+                flow_alerts = _flow_detector.check_intraday_flow(ticker, target, data, spot)
+                for fa in flow_alerts:
+                    if fa.get("should_alert") and fa.get("flow_level") in ("significant", "extreme"):
+                        try:
+                            post_to_telegram(_flow_detector.format_intraday_alert(fa))
+                        except Exception:
+                            pass
+        except Exception:
+            pass
 
         iv_meta = {"iv": v4.get("iv"), "source": "institutional_snapshot", "inferred": False, "notes": []}
         if v4.get("iv") is None:
@@ -4838,6 +4904,20 @@ def _get_chain_iv_for_expiry(ticker: str, target_date_str: str, dte: float) -> t
         _oi_cache.save_snapshot(ticker, target, data)
         if _oi_tracker:
             _oi_tracker.record_chain(ticker, target, data, spot=spot)
+        # Intraday flow detection
+        try:
+            if _flow_detector:
+                _persistent_state.save_oi_baseline(ticker, target,
+                    _oi_cache._parse_chain_oi(data) if _oi_cache else {})
+                flow_alerts = _flow_detector.check_intraday_flow(ticker, target, data, spot)
+                for fa in flow_alerts:
+                    if fa.get("should_alert") and fa.get("flow_level") in ("significant", "extreme"):
+                        try:
+                            post_to_telegram(_flow_detector.format_intraday_alert(fa))
+                        except Exception:
+                            pass
+        except Exception:
+            pass
 
         iv_meta = {"iv": v4.get("iv"), "source": "institutional_snapshot", "inferred": False, "notes": []}
         if v4.get("iv") is None:
@@ -7848,14 +7928,15 @@ def _em_scheduler():
                         def _oi_forward_chain_fn(ticker: str, expiration: str):
                             """
                             Fetch a specific forward expiration chain for OI tracking.
-                            Uses strikeLimit=None for SPY/QQQ (need all strikes for wall detection),
-                            strikeLimit=20 for everything else (cost control).
+                            Uses feed=cached (1 credit total) + strikeLimit=None for
+                            SPY/QQQ, strikeLimit=20 for everything else.
                             """
                             try:
                                 full_chain_tickers = {"SPY", "QQQ"}
                                 t = ticker.strip().upper()
                                 limit = None if t in full_chain_tickers else 20
-                                data = _cached_md.get_chain(t, expiration, strike_limit=limit)
+                                data = _cached_md.get_chain(t, expiration,
+                                    strike_limit=limit, feed="cached")
                                 if isinstance(data, dict) and data.get("s") == "ok" and data.get("optionSymbol"):
                                     return data
                             except Exception as e:
@@ -7890,6 +7971,151 @@ def _em_scheduler():
                         _income_scan_fn(TELEGRAM_CHAT_ID)
                     except Exception as _ie:
                         log.debug(f"Income scan error: {_ie}")
+
+            # ── v6.1: Institutional Flow Detection ──
+            if _flow_detector and _persistent_state:
+
+                # 8:15 AM CT — Morning OI confirmation (yesterday's volume → today's OI)
+                _flow_confirm_key = (date_str, "flow_confirm")
+                if _flow_confirm_key not in fired_today:
+                    if now_ct.hour == 8 and 14 <= now_ct.minute <= 16:
+                        fired_today.add(_flow_confirm_key)
+                        def _run_morning_confirm():
+                            try:
+                                def _flow_chain_fn(ticker, expiration):
+                                    try:
+                                        data = _cached_md.get_chain(
+                                            ticker.upper(), expiration,
+                                            strike_limit=None,
+                                            feed="cached")  # 1 credit — OI only
+                                        if isinstance(data, dict) and data.get("s") == "ok":
+                                            return data
+                                    except Exception:
+                                        pass
+                                    return None
+
+                                confirmations = _flow_detector.run_morning_confirmation(
+                                    chain_fn=_flow_chain_fn,
+                                    spot_fn=get_spot,
+                                    expirations_fn=lambda t: get_expirations(t) or [],
+                                )
+                                if confirmations:
+                                    rolls = _flow_detector.detect_rolls(confirmations)
+                                    sector = _flow_detector.detect_sector_flow(confirmations)
+                                    msg = _flow_detector.format_confirmation_summary(
+                                        confirmations, rolls, sector)
+                                    if msg:
+                                        post_to_telegram(msg)
+
+                                    stalks = _flow_detector.generate_stalk_alerts(confirmations)
+                                    for stalk in stalks:
+                                        try:
+                                            post_to_telegram(_flow_detector.format_stalk_alert(stalk))
+                                        except Exception:
+                                            pass
+                            except Exception as _fe:
+                                log.warning(f"Morning flow confirmation error: {_fe}")
+                        threading.Thread(target=_run_morning_confirm, daemon=True,
+                                       name="flow-confirm").start()
+                        log.info("Flow morning confirmation triggered")
+
+                # Forward flow sweeps — 9:15, 11:00, 1:30, 2:45 CT
+                _flow_sweep_times = [(9, 15), (11, 0), (13, 30), (14, 45)]
+                for _fh, _fm in _flow_sweep_times:
+                    _flow_sweep_key = (date_str, f"flow_sweep_{_fh}_{_fm}")
+                    if _flow_sweep_key not in fired_today:
+                        if now_ct.hour == _fh and abs(now_ct.minute - _fm) <= 1:
+                            fired_today.add(_flow_sweep_key)
+                            def _run_flow_sweep(_hour=_fh, _minute=_fm):
+                                try:
+                                    from oi_flow import FLOW_TICKERS
+                                    sweep_alerts = []
+                                    for ticker in FLOW_TICKERS:
+                                        try:
+                                            spot = get_spot(ticker)
+                                            if not spot or spot <= 0:
+                                                continue
+                                            exps = get_expirations(ticker) or []
+                                            # Forward expirations: 7-60 DTE
+                                            from datetime import date as _d
+                                            today = _d.today()
+                                            fwd_exps = []
+                                            for exp in exps:
+                                                try:
+                                                    exp_dt = datetime.fromisoformat(exp).date()
+                                                    dte = (exp_dt - today).days
+                                                    if 7 <= dte <= 60:
+                                                        fwd_exps.append(exp)
+                                                except Exception:
+                                                    continue
+                                            fwd_exps = fwd_exps[:4]  # max 4 expirations
+
+                                            for exp in fwd_exps:
+                                                try:
+                                                    data = _cached_md.get_chain(
+                                                        ticker, exp, strike_limit=None,
+                                                        feed="cached")  # 1 credit total
+                                                    if not isinstance(data, dict) or data.get("s") != "ok":
+                                                        continue
+                                                    alerts = _flow_detector.check_intraday_flow(
+                                                        ticker, exp, data, spot)
+                                                    sweep_alerts.extend(alerts)
+                                                except Exception:
+                                                    continue
+                                        except Exception:
+                                            continue
+
+                                    # Post significant+ alerts
+                                    for fa in sweep_alerts:
+                                        if fa.get("should_alert") and fa.get("flow_level") in ("significant", "extreme"):
+                                            try:
+                                                post_to_telegram(_flow_detector.format_intraday_alert(fa))
+                                            except Exception:
+                                                pass
+
+                                    # Generate trade ideas for extreme
+                                    ideas = _flow_detector.generate_flow_trade_ideas(sweep_alerts)
+                                    for idea in ideas:
+                                        try:
+                                            post_to_telegram(_flow_detector.format_flow_trade_idea(idea))
+                                        except Exception:
+                                            pass
+
+                                    # Sector flow
+                                    sectors = _flow_detector.detect_sector_flow(sweep_alerts)
+                                    for sf in sectors:
+                                        try:
+                                            post_to_telegram(_flow_detector.format_sector_flow_alert(sf))
+                                        except Exception:
+                                            pass
+
+                                    # Expiry clustering
+                                    try:
+                                        from economic_calendar import get_events_in_window
+                                        econ = get_events_in_window(dte_days=30)
+                                    except Exception:
+                                        econ = []
+                                    clusters = _flow_detector.detect_expiry_clustering(sweep_alerts, econ)
+                                    for cl in clusters:
+                                        try:
+                                            post_to_telegram(_flow_detector.format_expiry_cluster_alert(cl))
+                                        except Exception:
+                                            pass
+
+                                    log.info(f"Flow sweep {_hour}:{_minute:02d} complete: "
+                                           f"{len(sweep_alerts)} alerts across {len(FLOW_TICKERS)} tickers")
+                                except Exception as _fe:
+                                    log.warning(f"Flow sweep error: {_fe}")
+                            threading.Thread(target=_run_flow_sweep, daemon=True,
+                                           name=f"flow-sweep-{_fh}{_fm}").start()
+                            log.info(f"Flow sweep triggered ({_fh}:{_fm:02d} CT)")
+
+                # 3:05 PM CT — End-of-day: save volume flags + OI baseline
+                _flow_eod_key = (date_str, "flow_eod")
+                if _flow_eod_key not in fired_today:
+                    if now_ct.hour == 15 and 4 <= now_ct.minute <= 6:
+                        fired_today.add(_flow_eod_key)
+                        log.info("Flow end-of-day save triggered (3:05 PM CT)")
 
             fired_today = {k for k in fired_today if k[0] == date_str}
         except Exception as e:
@@ -7952,6 +8178,10 @@ def _start_background_services_once():
         # v5.1: Wire portfolio Greeks into thesis monitor
         from thesis_monitor import set_portfolio_greeks
         set_portfolio_greeks(_portfolio_greeks)
+        # v6.1: Wire PersistentState for ORB/trade persistence
+        if _persistent_state:
+            from thesis_monitor import set_persistent_state as _thesis_set_ps
+            _thesis_set_ps(_persistent_state)
         # v5.0: Start active scanner
         global _scanner
         if ACTIVE_SCANNER_ENABLED:
@@ -7963,6 +8193,9 @@ def _start_background_services_once():
                 regime_fn=get_current_regime,
                 vol_regime_fn=get_canonical_vol_regime,
                 shadow_log_fn=_log_shadow_signal,
+                flow_boost_fn=(lambda ticker, direction, spot:
+                    _flow_detector.get_validator_boost(ticker, direction, spot)
+                    if _flow_detector else 0.0),
             )
             _scanner.start()
             log.info(f"Active scanner started: {_scanner.watchlist_size} tickers")
@@ -7982,6 +8215,14 @@ def _start_background_services_once():
                 earnings_fn=lambda t: enrich_ticker(t),
                 vix_fn=_get_vix_for_scanner,
             )
+            # Inject persistent state for Redis-backed signal cache
+            from swing_scanner import set_persistent_state as _swing_set_ps
+            from swing_scanner import set_flow_fn as _swing_set_flow
+            if _persistent_state:
+                _swing_set_ps(_persistent_state)
+            if _flow_detector:
+                _swing_set_flow(lambda ticker, fib_price, direction:
+                    _flow_detector.get_flow_score_for_swing(ticker, fib_price, direction))
             _swing_scanner.start()
             log.info(f"Swing scanner started: {_swing_scanner.status.get('watchlist_size', 0)} tickers "
                      f"({_swing_scanner.status.get('swing_only_tickers', 0)} swing-only)")
@@ -7993,14 +8234,23 @@ def _start_background_services_once():
         try:
             from market_regime import get_regime_package
             _income_ohlcv = create_ohlcv_wrapper(get_daily_candles, md_get_fn=md_get)
+
+            # Flow scoring callback for income scanner
+            def _income_flow_fn(ticker, strike, trade_type, expiry=None):
+                if _flow_detector:
+                    return _flow_detector.get_flow_score_for_income(
+                        ticker, strike, trade_type, expiry)
+                return None
+
             _income_scan_fn, _income_score_fn = create_income_handlers(
                 chain_fn=_cached_md.get_chain,
                 expirations_fn=get_expirations,
                 ohlcv_fn=_income_ohlcv,
                 regime_fn=get_regime_package,
                 post_fn=post_to_telegram,
+                flow_fn=_income_flow_fn,
             )
-            log.info("Income scanner wired: /income and /score commands active (3-layer regime)")
+            log.info("Income scanner wired: /income and /score commands active (3-layer regime + flow)")
         except Exception as e:
             log.error(f"Income scanner wiring failed: {e}")
             _income_scan_fn = None
@@ -8014,13 +8264,17 @@ def _start_background_services_once():
 def _initialize_app():
     global _oi_cache
     global _oi_tracker
+    global _persistent_state
+    global _flow_detector
     with app.app_context():
         portfolio.init_store(store_get, store_set)
         trade_journal.init_store(store_get, store_set)
         init_shared_state(store_get, store_set)
         _oi_cache = OICache(store_get, store_set)
         _oi_tracker = OITracker(store_get, store_set)
-        log.info(f"OI cache + tracker initialized (Redis: {_get_redis() is not None})")
+        _persistent_state = PersistentState(store_get, store_set, store_scan)
+        _flow_detector = FlowDetector(_persistent_state, post_fn=post_to_telegram)
+        log.info(f"OI cache + tracker + flow detector initialized (Redis: {_get_redis() is not None})")
         _tg_ws = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
         if _tg_ws and BOT_URL and _acquire_background_leader():
             register_webhook(BOT_URL, _tg_ws)
