@@ -193,6 +193,7 @@ def _analyze_ticker(
     intraday_fn: Callable,
     daily_candle_fn: Callable,
     regime: str = "BEAR",
+    flow_boost_fn: Callable = None,
 ) -> Optional[Dict]:
     """
     Run technical analysis on a ticker using intraday + daily data.
@@ -397,6 +398,26 @@ def _analyze_ticker(
         else:
             score_breakdown["rsi"] = 0
 
+        # ── Institutional flow boost ──
+        # Can lift borderline signals (50-54) over threshold (55)
+        # Cannot save structurally bad signals (< 45)
+        flow_boost = 0
+        if flow_boost_fn:
+            try:
+                raw_boost = flow_boost_fn(ticker, bias, spot)
+                # Translate 0-1.5 to 0-10 points
+                flow_boost = round(min(raw_boost * 7, 10))
+                if flow_boost > 0:
+                    score += flow_boost
+                    score_breakdown["flow"] = flow_boost
+                    log.info(f"Scanner {ticker}: flow boost +{flow_boost} (total {score})")
+                else:
+                    score_breakdown["flow"] = 0
+            except Exception:
+                score_breakdown["flow"] = 0
+        else:
+            score_breakdown["flow"] = 0
+
         if score < MIN_SIGNAL_SCORE:
             return _reject(f"below_threshold (score={score})")
 
@@ -466,6 +487,7 @@ class ActiveScanner:
         regime_fn: Callable = None,        # kept for backwards compat
         vol_regime_fn: Callable = None,    # kept for backwards compat
         shadow_log_fn: Callable = None,    # v6.1: shadow log for non-active tickers
+        flow_boost_fn: Callable = None,    # v6.1: institutional flow boost
     ):
         self._enqueue      = enqueue_fn
         self._spot         = spot_fn
@@ -473,6 +495,7 @@ class ActiveScanner:
         self._intraday     = intraday_fn
         self._vol_regime   = vol_regime_fn
         self._shadow_log_fn = shadow_log_fn  # v6.1
+        self._flow_boost_fn = flow_boost_fn  # v6.1
 
         # v6.0: regime detector (auto-detects BEAR/TRANSITION/BULL)
         self._regime_detector: Optional[MarketRegimeDetector] = regime_detector
@@ -565,6 +588,7 @@ class ActiveScanner:
             intraday_fn=self._intraday,
             daily_candle_fn=self._candles,
             regime=regime,
+            flow_boost_fn=self._flow_boost_fn,
         )
         if not signal:
             return
