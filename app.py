@@ -152,6 +152,7 @@ from regime_detector import RegimeDetector
 from oi_tracker import OITracker
 from persistent_state import PersistentState
 from oi_flow import FlowDetector, FLOW_TICKERS
+from potter_box import PotterBoxScanner
 
 # ── v4.3: Thesis Monitor ──
 from thesis_monitor import (
@@ -165,6 +166,7 @@ _oi_cache = None
 _oi_tracker = None  # v5.1: daily OI change tracker
 _persistent_state = None  # v6.1: Redis-backed persistent state
 _flow_detector = None     # v6.1: unified institutional flow detection
+_potter_scanner = None    # v6.1: Potter Box consolidation scanner
 
 # ─────────────────────────────────────────────────────────
 # LOGGING
@@ -7972,6 +7974,48 @@ def _em_scheduler():
                     except Exception as _ie:
                         log.debug(f"Income scan error: {_ie}")
 
+            # ── v6.1: Potter Box Scan — 8:15 AM CT + 3:05 PM CT ──
+            if _potter_scanner:
+                _pb_key = (date_str, "potter_box_scan")
+                if _pb_key not in fired_today:
+                    if (now_ct.hour == 8 and 14 <= now_ct.minute <= 16) or \
+                       (now_ct.hour == 15 and 4 <= now_ct.minute <= 6):
+                        fired_today.add(_pb_key)
+                        def _run_potter_scan():
+                            try:
+                                from oi_flow import FLOW_TICKERS
+                                from swing_scanner import fetch_daily_bars_yahoo
+
+                                def _pb_ohlcv(ticker):
+                                    bars = fetch_daily_bars_yahoo(ticker, days=120)
+                                    return bars if bars else None
+
+                                setups = _potter_scanner.scan_all(
+                                    tickers=FLOW_TICKERS,
+                                    ohlcv_fn=_pb_ohlcv,
+                                    chain_fn=lambda t, e: _cached_md.get_chain(
+                                        t, e, feed="cached"),
+                                    spot_fn=get_spot,
+                                    expirations_fn=lambda t: get_expirations(t) or [],
+                                )
+                                if setups:
+                                    # Post summary
+                                    summary = _potter_scanner.format_summary(setups)
+                                    if summary:
+                                        post_to_telegram(summary)
+                                    # Post individual alerts for setups with flow + trade structure
+                                    for s in setups:
+                                        if s.get("trade") and s.get("flow_direction"):
+                                            try:
+                                                post_to_telegram(_potter_scanner.format_alert(s))
+                                            except Exception:
+                                                pass
+                            except Exception as _pe:
+                                log.warning(f"Potter Box scan error: {_pe}")
+                        threading.Thread(target=_run_potter_scan, daemon=True,
+                                       name="potter-box").start()
+                        log.info("Potter Box scan triggered")
+
             # ── v6.1: Institutional Flow Detection ──
             if _flow_detector and _persistent_state:
 
@@ -8266,6 +8310,7 @@ def _initialize_app():
     global _oi_tracker
     global _persistent_state
     global _flow_detector
+    global _potter_scanner
     with app.app_context():
         portfolio.init_store(store_get, store_set)
         trade_journal.init_store(store_get, store_set)
@@ -8274,7 +8319,9 @@ def _initialize_app():
         _oi_tracker = OITracker(store_get, store_set)
         _persistent_state = PersistentState(store_get, store_set, store_scan)
         _flow_detector = FlowDetector(_persistent_state, post_fn=post_to_telegram)
-        log.info(f"OI cache + tracker + flow detector initialized (Redis: {_get_redis() is not None})")
+        _potter_scanner = PotterBoxScanner(_persistent_state, flow_detector=_flow_detector,
+                                           post_fn=post_to_telegram)
+        log.info(f"OI cache + tracker + flow detector + Potter Box initialized (Redis: {_get_redis() is not None})")
         _tg_ws = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
         if _tg_ws and BOT_URL and _acquire_background_leader():
             register_webhook(BOT_URL, _tg_ws)
