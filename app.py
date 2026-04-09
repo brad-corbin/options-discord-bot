@@ -482,7 +482,22 @@ def _append_google_sheet_row(filename: str, fieldnames: list, row: dict):
             log.warning(f"Google Sheets header write failed for {tab_name}: {e}")
             return False
 
-    values = [[(row.get(k) if row.get(k) is not None else "") for k in fieldnames]]
+    def _sanitize_cell(v):
+        """Convert any value to a Google Sheets safe string."""
+        if v is None:
+            return ""
+        if isinstance(v, float):
+            import math
+            if math.isnan(v) or math.isinf(v):
+                return ""
+            return v  # keep as number
+        if isinstance(v, (list, dict, set, tuple)):
+            return str(v)[:200]
+        if isinstance(v, bool):
+            return str(v)
+        return v
+
+    values = [[_sanitize_cell(row.get(k)) for k in fieldnames]]
     try:
         with _google_sheets_lock:
             current_headers = _fetch_headers(tab, token)
@@ -3553,19 +3568,24 @@ def _run_v4_prefilter(ticker: str, spot: float, chains: list, candle_closes: lis
                 _persistent_state.save_oi_baseline(ticker, exp,
                     _oi_cache._parse_chain_oi(chain_data) if _oi_cache else {})
                 flow_alerts = _flow_detector.check_intraday_flow(ticker, exp, chain_data, spot)
-                for fa in flow_alerts:
-                    if fa.get("should_alert") and fa.get("flow_level") in ("significant", "extreme"):
+                postable = [fa for fa in flow_alerts
+                           if fa.get("should_alert") and
+                           fa.get("flow_level") in ("significant", "extreme")]
+                if postable:
+                    grouped = _flow_detector.format_grouped_flow_alerts(postable)
+                    for msg in grouped:
                         try:
-                            post_to_telegram(_flow_detector.format_intraday_alert(fa))
-                            log.info(f"Flow alert: {fa['ticker']} ${fa['strike']:.0f} "
-                                   f"{fa['side']} {fa['flow_level']} {fa['vol_oi_ratio']:.1f}x")
+                            post_to_telegram(msg)
+                            log.info(f"Flow alert: {ticker} ({len(postable)} strikes)")
                         except Exception:
                             pass
                 # Generate trade ideas for extreme flow
                 ideas = _flow_detector.generate_flow_trade_ideas(flow_alerts)
-                for idea in ideas:
+                if ideas:
                     try:
-                        post_to_telegram(_flow_detector.format_flow_trade_idea(idea))
+                        digest = _flow_detector.format_flow_ideas_digest(ideas)
+                        if digest:
+                            post_to_telegram(digest)
                     except Exception:
                         pass
         except Exception as _ofe:
@@ -4725,10 +4745,13 @@ def _get_0dte_iv(ticker: str, target_date_str: str = None) -> tuple:
                 _persistent_state.save_oi_baseline(ticker, target,
                     _oi_cache._parse_chain_oi(data) if _oi_cache else {})
                 flow_alerts = _flow_detector.check_intraday_flow(ticker, target, data, spot)
-                for fa in flow_alerts:
-                    if fa.get("should_alert") and fa.get("flow_level") in ("significant", "extreme"):
+                postable = [fa for fa in flow_alerts
+                           if fa.get("should_alert") and
+                           fa.get("flow_level") in ("significant", "extreme")]
+                if postable:
+                    for msg in _flow_detector.format_grouped_flow_alerts(postable):
                         try:
-                            post_to_telegram(_flow_detector.format_intraday_alert(fa))
+                            post_to_telegram(msg)
                         except Exception:
                             pass
         except Exception:
@@ -4912,10 +4935,13 @@ def _get_chain_iv_for_expiry(ticker: str, target_date_str: str, dte: float) -> t
                 _persistent_state.save_oi_baseline(ticker, target,
                     _oi_cache._parse_chain_oi(data) if _oi_cache else {})
                 flow_alerts = _flow_detector.check_intraday_flow(ticker, target, data, spot)
-                for fa in flow_alerts:
-                    if fa.get("should_alert") and fa.get("flow_level") in ("significant", "extreme"):
+                postable = [fa for fa in flow_alerts
+                           if fa.get("should_alert") and
+                           fa.get("flow_level") in ("significant", "extreme")]
+                if postable:
+                    for msg in _flow_detector.format_grouped_flow_alerts(postable):
                         try:
-                            post_to_telegram(_flow_detector.format_intraday_alert(fa))
+                            post_to_telegram(msg)
                         except Exception:
                             pass
         except Exception:
@@ -8146,19 +8172,24 @@ def _em_scheduler():
                                         except Exception:
                                             continue
 
-                                    # Post significant+ alerts
-                                    for fa in sweep_alerts:
-                                        if fa.get("should_alert") and fa.get("flow_level") in ("significant", "extreme"):
-                                            try:
-                                                post_to_telegram(_flow_detector.format_intraday_alert(fa))
-                                            except Exception:
-                                                pass
-
-                                    # Generate trade ideas for extreme
-                                    ideas = _flow_detector.generate_flow_trade_ideas(sweep_alerts)
-                                    for idea in ideas:
+                                    # Post significant+ alerts — GROUPED BY TICKER
+                                    postable_alerts = [fa for fa in sweep_alerts
+                                                      if fa.get("should_alert") and
+                                                      fa.get("flow_level") in ("significant", "extreme")]
+                                    grouped_msgs = _flow_detector.format_grouped_flow_alerts(postable_alerts)
+                                    for msg in grouped_msgs:
                                         try:
-                                            post_to_telegram(_flow_detector.format_flow_trade_idea(idea))
+                                            post_to_telegram(msg)
+                                        except Exception:
+                                            pass
+
+                                    # Generate trade ideas — post as digest
+                                    ideas = _flow_detector.generate_flow_trade_ideas(sweep_alerts)
+                                    if ideas:
+                                        try:
+                                            digest = _flow_detector.format_flow_ideas_digest(ideas)
+                                            if digest:
+                                                post_to_telegram(digest)
                                         except Exception:
                                             pass
 
