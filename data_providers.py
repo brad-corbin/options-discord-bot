@@ -158,37 +158,46 @@ def get_earnings_warning(ticker: str, within_days: int = 5) -> Tuple[bool, Optio
     if cached is not None:
         return cached
 
-    # If Finnhub token not set, skip entirely
-    if not FINNHUB_TOKEN:
+    # Use FMP earnings calendar instead of Finnhub
+    FMP_TOKEN = os.getenv("FMP_TOKEN", "").strip()
+    if not FMP_TOKEN:
         return False, None
 
     today    = datetime.now(timezone.utc).date()
     end_date = today + timedelta(days=within_days)
 
-    # Fix: correct param name
-    data = _finnhub_get("calendar/earnings", {
-        "symbol": ticker,
-        "from":   today.strftime("%Y-%m-%d"),
-        "to":     end_date.strftime("%Y-%m-%d"),
-    })
+    try:
+        resp = requests.get(
+            "https://financialmodelingprep.com/stable/earning-calendar",
+            params={
+                "from": today.strftime("%Y-%m-%d"),
+                "to": end_date.strftime("%Y-%m-%d"),
+                "apikey": FMP_TOKEN,
+            },
+            timeout=8,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        err_str = str(e)
+        if FMP_TOKEN:
+            err_str = err_str.replace(FMP_TOKEN, "***")
+        log.warning(f"FMP earnings calendar error: {err_str}")
+        _cache_set(cache_key, (False, None))
+        return False, None
 
     has_earnings  = False
     warning_msg   = None
 
-    if data is None:
-        # Cache failure to avoid hammering Finnhub on every scan
-        _cache_set(cache_key, (False, None))
-        return False, None
-
-    if isinstance(data, dict):
-        earnings_list = data.get("earningsCalendar") or []
-        for event in earnings_list:
+    if isinstance(data, list):
+        for event in data:
             symbol = (event.get("symbol") or "").upper()
             if symbol != ticker.upper():
                 continue
 
             date_str = event.get("date") or ""
-            hour     = (event.get("hour") or "").lower()  # "bmo" = before open, "amc" = after close
+            # FMP uses "bmo"/"amc" in the "time" field
+            hour = (event.get("time") or "").lower()
 
             try:
                 earn_date = datetime.strptime(date_str, "%Y-%m-%d").date()
@@ -198,7 +207,7 @@ def get_earnings_warning(ticker: str, within_days: int = 5) -> Tuple[bool, Optio
                     has_earnings = True
                     timing = "BMO" if "bmo" in hour else "AMC" if "amc" in hour else ""
                     timing_str = f" ({timing})" if timing else ""
-                    eps_est = event.get("epsEstimate")
+                    eps_est = event.get("epsEstimated")
                     eps_str = f" | EPS est: ${eps_est:.2f}" if eps_est else ""
 
                     if days_away == 0:
