@@ -433,9 +433,37 @@ class PotterBoxScanner:
     def get_void_map(self, t): return self._load(self._void_key(t)) or []
     def get_zones(self, t): return self._load(self._zone_key(t)) or []
 
+    def _box_identity(self, box):
+        """Unique identity for a box to prevent re-counting."""
+        return f"{box.get('ticker','')}:{box.get('start_date','')}:{box.get('floor','')}:{box.get('roof','')}"
+
+    def _logged_key(self, ticker):
+        return f"potter_box:logged:{ticker.upper()}"
+
+    def _is_box_already_logged(self, ticker, box):
+        """Check if a completed box was already counted in history."""
+        logged = self._load(self._logged_key(ticker))
+        if not logged:
+            return False
+        return self._box_identity(box) in logged
+
+    def _mark_box_logged(self, ticker, box):
+        """Mark a completed box as logged so it won't be re-counted."""
+        logged = self._load(self._logged_key(ticker)) or []
+        bid = self._box_identity(box)
+        if bid not in logged:
+            logged.append(bid)
+            # Keep last 20 entries
+            logged = logged[-20:]
+            self._save(self._logged_key(ticker), logged, TTL_HISTORY_BOX)
+
     def _log_completed_box(self, ticker, box):
+        """Log a completed box — only if not already counted."""
+        if self._is_box_already_logged(ticker, box):
+            return  # already counted, skip
         self._save(self._history_key(ticker, date.today().isoformat()), box, TTL_HISTORY_BOX)
         self._update_avg(ticker, box["duration_bars"])
+        self._mark_box_logged(ticker, box)
 
     def _update_avg(self, ticker, new_dur):
         key = self._defaults_key(ticker); ex = self._load(key)
@@ -451,7 +479,16 @@ class PotterBoxScanner:
                     expirations_fn=None, iv_percentile_fn=None):
         ticker = ticker.upper()
         if not bars or len(bars) < 30: return None
+
+        # Use live spot if available, fall back to last daily close
         spot = bars[-1]["c"]
+        if spot_fn:
+            try:
+                live = spot_fn(ticker)
+                if live and live > 0:
+                    spot = live
+            except Exception:
+                pass  # keep daily close as fallback
         if spot <= 0: return None
 
         all_boxes = detect_boxes(bars, ticker)
@@ -541,7 +578,7 @@ class PotterBoxScanner:
                             trade = select_strikes(chain, spot, flow_dir, box, va, vb, tdte,
                                                    box_above=box_above, box_below=box_below)
                             if trade: setup["trade"] = trade; setup["expiry"] = be
-                except Exception as e: log.debug(f"Potter strike select failed {ticker}: {e}")
+                except Exception as e: log.warning(f"Potter strike select failed {ticker}: {e}")
         return setup
 
     def scan_all(self, tickers, ohlcv_fn, chain_fn=None, spot_fn=None,
@@ -562,7 +599,7 @@ class PotterBoxScanner:
                 s = self.scan_ticker(ticker, bars, chain_fn=chain_fn, spot_fn=spot_fn,
                                     expirations_fn=expirations_fn, iv_percentile_fn=iv_percentile_fn)
                 if s: setups.append(s)
-            except Exception as e: log.debug(f"Potter scan error {ticker}: {e}")
+            except Exception as e: log.warning(f"Potter scan error {ticker}: {e}")
         log.info(f"Potter Box scan: {len(setups)} setups from {len(tickers)} tickers")
         return setups
 
