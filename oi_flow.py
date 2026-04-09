@@ -28,15 +28,15 @@ log = logging.getLogger(__name__)
 # CONFIGURATION
 # ═══════════════════════════════════════════════════════════
 
-# Volume thresholds by liquidity tier
+# Volume thresholds by liquidity tier (3x from initial conservative values)
 VOLUME_TIERS = {
-    "index":    {"tickers": {"SPY", "QQQ", "IWM", "DIA"}, "min_volume": 5000},
+    "index":    {"tickers": {"SPY", "QQQ", "IWM", "DIA"}, "min_volume": 15000},
     "mega_cap": {"tickers": {"AAPL", "NVDA", "MSFT", "AMZN", "META", "TSLA", "GOOGL"},
-                 "min_volume": 2000},
+                 "min_volume": 6000},
     "large_cap": {"tickers": {"AMD", "AVGO", "NFLX", "CRM", "BA", "LLY", "UNH",
                                "JPM", "GS", "CAT", "ORCL", "ARM"},
-                  "min_volume": 1000},
-    "mid_cap":  {"tickers": set(), "min_volume": 500},  # everything else
+                  "min_volume": 3000},
+    "mid_cap":  {"tickers": set(), "min_volume": 1500},  # everything else
 }
 
 # Vol/OI ratio classification
@@ -1403,3 +1403,151 @@ class FlowDetector:
             f"{event_line}\n"
             f"Signal: Institutions positioning through this date"
         )
+
+    def format_eod_flow_summary(self, sweep_alerts: List[dict]) -> List[str]:
+        """
+        Single end-of-day summary of institutional flow.
+        Replaces per-sweep alert spam. Shows the day's picture in 1-2 messages.
+        """
+        if not sweep_alerts:
+            return []
+
+        # Group by ticker, count by level
+        by_ticker = {}
+        for a in sweep_alerts:
+            t = a["ticker"]
+            if t not in by_ticker:
+                by_ticker[t] = {"extreme": 0, "significant": 0, "notable": 0,
+                                "calls": 0, "puts": 0, "total_vol": 0,
+                                "max_vol_oi": 0, "top_strike": None}
+            level = a.get("flow_level", "notable")
+            if level in by_ticker[t]:
+                by_ticker[t][level] += 1
+            if a["side"] == "call":
+                by_ticker[t]["calls"] += a["volume"]
+            else:
+                by_ticker[t]["puts"] += a["volume"]
+            by_ticker[t]["total_vol"] += a["volume"]
+            if a["vol_oi_ratio"] > by_ticker[t]["max_vol_oi"]:
+                by_ticker[t]["max_vol_oi"] = a["vol_oi_ratio"]
+                by_ticker[t]["top_strike"] = a
+
+        # Sort by total volume
+        ranked = sorted(by_ticker.items(), key=lambda x: -x[1]["total_vol"])
+
+        # Build summary lines
+        lines = [
+            "🏛️ END-OF-DAY FLOW SUMMARY",
+            "━" * 28,
+            f"Scanned {len(by_ticker)} tickers | {len(sweep_alerts)} active strikes",
+            "",
+        ]
+
+        for ticker, data in ranked[:15]:  # top 15
+            if data["extreme"] == 0 and data["significant"] == 0:
+                continue  # skip notable-only tickers
+
+            # Determine net direction
+            if data["calls"] > data["puts"] * 1.5:
+                direction = "🟢 BULLISH"
+            elif data["puts"] > data["calls"] * 1.5:
+                direction = "🔴 BEARISH"
+            else:
+                direction = "⚪ MIXED"
+
+            level_tag = ""
+            if data["extreme"] > 0:
+                level_tag = f" 🚨×{data['extreme']}"
+            if data["significant"] > 0:
+                level_tag += f" 🔥×{data['significant']}"
+
+            top = data["top_strike"]
+            top_info = ""
+            if top:
+                top_info = (f" | Top: ${top['strike']:.0f} {top['side']} "
+                          f"({top['vol_oi_ratio']:.1f}x)")
+
+            lines.append(
+                f"{direction} {ticker}{level_tag} — "
+                f"C:{data['calls']:,} P:{data['puts']:,}{top_info}"
+            )
+
+        # Check campaigns
+        campaigns = []
+        for ticker in by_ticker:
+            try:
+                tc = self._state.get_all_flow_campaigns(ticker)
+                for c in tc:
+                    if c.get("consecutive_days", 0) >= CAMPAIGN_MIN_DAYS:
+                        campaigns.append(c)
+            except Exception:
+                pass
+
+        if campaigns:
+            lines.append("")
+            lines.append(f"📊 Active campaigns: {len(campaigns)}")
+            for c in sorted(campaigns, key=lambda x: -x.get("consecutive_days", 0))[:5]:
+                lines.append(
+                    f"  {c.get('ticker','?')} ${c.get('strike',0):.0f} {c.get('side','?')} "
+                    f"— {c.get('consecutive_days',0)}D, "
+                    f"{c.get('flow_type','?').replace('_',' ')}"
+                )
+
+        # Chunk to fit Telegram
+        messages = []
+        msg = "\n".join(lines)
+        if len(msg) <= 3800:
+            messages.append(msg)
+        else:
+            mid = len(lines) // 2
+            messages.append("\n".join(lines[:mid]))
+            messages.append("\n".join(lines[mid:]))
+
+        return messages
+
+    def check_flow_convergence(self, ticker: str, signal_type: str,
+                                signal_direction: str) -> Optional[dict]:
+        """
+        Check if institutional flow converges with another signal.
+
+        signal_type: 'shadow', 'swing', 'potter_box', 'income'
+        signal_direction: 'bullish' or 'bearish'
+
+        Returns convergence info if flow confirms the signal direction,
+        None if no convergence.
+        """
+        try:
+            campaigns = self._state.get_all_flow_campaigns(ticker)
+            if not campaigns:
+                return None
+
+            for c in campaigns:
+                side = c.get("side", "")
+                flow_type = c.get("flow_type", "")
+
+                # Determine flow direction
+                if side == "call" and "buildup" in flow_type:
+                    flow_dir = "bullish"
+                elif side == "put" and "buildup" in flow_type:
+                    flow_dir = "bearish"
+                elif side == "call" and "unwinding" in flow_type:
+                    flow_dir = "bearish"
+                elif side == "put" and "unwinding" in flow_type:
+                    flow_dir = "bullish"
+                else:
+                    continue
+
+                if flow_dir == signal_direction:
+                    return {
+                        "converged": True,
+                        "signal_type": signal_type,
+                        "flow_direction": flow_dir,
+                        "campaign": c,
+                        "days": c.get("consecutive_days", 0),
+                        "note": (f"Flow confirms {signal_type}: "
+                                f"{c.get('side','')} {c.get('flow_type','').replace('_',' ')} "
+                                f"at ${c.get('strike',0):.0f} ({c.get('consecutive_days',0)}D campaign)")
+                    }
+        except Exception:
+            pass
+        return None
