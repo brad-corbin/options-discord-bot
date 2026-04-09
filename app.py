@@ -3583,9 +3583,9 @@ def _run_v4_prefilter(ticker: str, spot: float, chains: list, candle_closes: lis
                 ideas = _flow_detector.generate_flow_trade_ideas(flow_alerts)
                 if ideas:
                     try:
-                        digest = _flow_detector.format_flow_ideas_digest(ideas)
-                        if digest:
-                            post_to_telegram(digest)
+                        digest_msgs = _flow_detector.format_flow_ideas_digest(ideas)
+                        for dm in digest_msgs:
+                            post_to_telegram(dm)
                     except Exception:
                         pass
         except Exception as _ofe:
@@ -8187,9 +8187,9 @@ def _em_scheduler():
                                     ideas = _flow_detector.generate_flow_trade_ideas(sweep_alerts)
                                     if ideas:
                                         try:
-                                            digest = _flow_detector.format_flow_ideas_digest(ideas)
-                                            if digest:
-                                                post_to_telegram(digest)
+                                            digest_msgs = _flow_detector.format_flow_ideas_digest(ideas)
+                                            for dm in digest_msgs:
+                                                post_to_telegram(dm)
                                         except Exception:
                                             pass
 
