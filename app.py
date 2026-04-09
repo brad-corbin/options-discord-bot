@@ -6920,8 +6920,8 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
                     atm_put_premium=_nt_atm["put_premium"],
                 )
                 get_thesis_engine().store_thesis(ticker, _nt_thesis)
-            except Exception:
-                pass
+            except Exception as _te:
+                log.warning(f"Thesis persistence failed for {ticker}: {_te}")
             post_to_telegram("\n".join(lines))
             log.info(f"Trade card blocked: {ticker} | {reason}")
 
