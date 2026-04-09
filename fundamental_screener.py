@@ -126,41 +126,77 @@ def _fetch_fmp_profile(ticker: str) -> Dict:
 
 
 def _fetch_fmp_ratios(ticker: str) -> Dict:
-    """Key financial ratios: PEG, P/E, debt/equity, ROE, FCF yield."""
+    """Key financial ratios from both ratios-ttm and key-metrics-ttm endpoints."""
+    # Stable endpoint splits data across two endpoints:
+    #   ratios-ttm:      PEG, P/E, P/S, P/B, debt ratios, margins
+    #   key-metrics-ttm: ROE, ROA, FCF yield, current ratio, EV multiples
+
+    def _first(d, *keys):
+        """Return first non-None value from dict for given keys."""
+        for k in keys:
+            v = d.get(k)
+            if v is not None:
+                return v
+        return None
+
+    merged = {}
+
+    # Pull ratios-ttm
     data = _fmp_get("ratios-ttm", {"symbol": ticker})
     if data:
         r = data[0] if isinstance(data, list) else data
         if isinstance(r, dict):
-            # Stable endpoint may use different field names than v3
-            # Try multiple variants: pegRatioTTM (v3), pegRatio (stable)
-            def _get(r, *keys):
-                for k in keys:
-                    v = r.get(k)
-                    if v is not None:
-                        return v
-                return None
+            merged.update(r)
 
-            result = {
-                "peg_ratio": _get(r, "pegRatioTTM", "pegRatio",
-                                   "forwardPegRatioTTM", "forwardPegRatio"),
-                "pe_ratio": _get(r, "peRatioTTM", "peRatio",
-                                  "priceEarningsRatioTTM", "priceEarningsRatio"),
-                "price_to_sales": _get(r, "priceToSalesRatioTTM", "priceToSalesRatio"),
-                "price_to_book": _get(r, "priceToBookRatioTTM", "priceToBookRatio"),
-                "debt_to_equity": _get(r, "debtEquityRatioTTM", "debtEquityRatio"),
-                "roe": _get(r, "returnOnEquityTTM", "returnOnEquity"),
-                "roa": _get(r, "returnOnAssetsTTM", "returnOnAssets"),
-                "current_ratio": _get(r, "currentRatioTTM", "currentRatio"),
-                "fcf_yield": _get(r, "freeCashFlowYieldTTM", "freeCashFlowYield"),
-                "dividend_yield_ttm": _get(r, "dividendYieldTTM", "dividendYield",
-                                            "dividendPerShareTTM"),
-            }
-            # Debug: log actual keys on first call to diagnose field name mismatches
-            if not _cache_get("_ratios_keys_logged"):
-                log.info(f"FMP ratios-ttm keys for {ticker}: {sorted(r.keys())}")
-                _cache_set("_ratios_keys_logged", True, ttl=86400)
-            return result
-    return {}
+    # Pull key-metrics-ttm (has ROE, ROA, FCF yield)
+    data2 = _fmp_get("key-metrics-ttm", {"symbol": ticker})
+    if data2:
+        km = data2[0] if isinstance(data2, list) else data2
+        if isinstance(km, dict):
+            # Don't overwrite ratios fields, just fill gaps
+            for k, v in km.items():
+                if k not in merged or merged[k] is None:
+                    merged[k] = v
+
+    if not merged:
+        return {}
+
+    # Debug: log actual keys on first call to confirm field mapping
+    if not _cache_get("_ratios_keys_logged"):
+        log.info(f"FMP ratios+metrics merged keys for {ticker}: {sorted(merged.keys())}")
+        _cache_set("_ratios_keys_logged", True, ttl=86400)
+
+    # FCF yield: stable key-metrics-ttm has it directly;
+    # ratios-ttm has priceToFreeCashFlowRatio (invert it)
+    fcf_yield = _first(merged, "freeCashFlowYieldTTM", "freeCashFlowYield")
+    if fcf_yield is None:
+        p_to_fcf = _first(merged, "priceToFreeCashFlowRatio",
+                            "priceToFreeCashFlowsRatioTTM")
+        if p_to_fcf and p_to_fcf > 0:
+            fcf_yield = 1.0 / p_to_fcf
+
+    return {
+        "peg_ratio": _first(merged, "priceToEarningsGrowthRatioTTM",
+                             "forwardPriceToEarningsGrowthRatioTTM",
+                             "priceToEarningsGrowthRatio",
+                             "pegRatioTTM"),
+        "pe_ratio": _first(merged, "priceToEarningsRatioTTM",
+                            "priceToEarningsRatio",
+                            "peRatioTTM"),
+        "price_to_sales": _first(merged, "priceToSalesRatioTTM",
+                                  "priceToSalesRatio"),
+        "price_to_book": _first(merged, "priceToBookRatioTTM",
+                                 "priceToBookRatio"),
+        "debt_to_equity": _first(merged, "debtToEquityRatioTTM",
+                                  "debtToEquityRatio",
+                                  "debtEquityRatioTTM"),
+        "roe": _first(merged, "returnOnEquityTTM", "returnOnEquity"),
+        "roa": _first(merged, "returnOnAssetsTTM", "returnOnAssets"),
+        "current_ratio": _first(merged, "currentRatioTTM", "currentRatio"),
+        "fcf_yield": fcf_yield,
+        "dividend_yield_ttm": _first(merged, "dividendYieldTTM",
+                                      "dividendYield"),
+    }
 
 
 def _fetch_fmp_growth(ticker: str) -> Dict:
