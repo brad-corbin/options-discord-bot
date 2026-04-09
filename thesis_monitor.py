@@ -940,6 +940,18 @@ class ThesisMonitorEngine:
             # Recover active trades from store
             if not state.active_trades:
                 self._load_trades_from_store(ticker, state)
+            # Recover ORB from Redis (survives redeploy)
+            if not state.orb_ready and _persistent_state:
+                try:
+                    orb = _persistent_state.get_orb(ticker)
+                    if orb and orb.get("high") and orb.get("low"):
+                        state.orb_high = orb["high"]
+                        state.orb_low = orb["low"]
+                        state.orb_ready = True
+                        log.info(f"ORB15 recovered from Redis: {ticker} "
+                                 f"high=${orb['high']:.2f} low=${orb['low']:.2f}")
+                except Exception:
+                    pass
         return t
 
     def get_state(self, ticker): return self._states.get(ticker)
@@ -1018,6 +1030,12 @@ class ThesisMonitorEngine:
                     log.info(f"ORB15 ready: {ticker} high=${state.orb_high:.2f} "
                              f"low=${state.orb_low:.2f} range=${orb_range:.2f} "
                              f"({len(state.orb_prices)} polls)")
+                    # Persist ORB to Redis (survives redeploy)
+                    if _persistent_state and state.orb_high and state.orb_low:
+                        try:
+                            _persistent_state.save_orb(ticker, state.orb_high, state.orb_low)
+                        except Exception:
+                            pass
                     # Feed ORB levels into intraday level tracker
                     if state.orb_high:
                         IntradayLevelTracker._upsert_level(
@@ -3925,6 +3943,7 @@ def build_thesis_from_em_card(ticker, spot, bias, eng, em, walls, cagf=None, vix
 _monitor_engine = ThesisMonitorEngine()
 _monitor_daemon: Optional[ThesisMonitorDaemon] = None
 _portfolio_greeks = None  # v5.1: set by app.py via set_portfolio_greeks()
+_persistent_state = None  # v6.1: set by app.py for ORB/trade persistence
 
 def get_engine(): return _monitor_engine
 def get_daemon(): return _monitor_daemon
@@ -3934,6 +3953,12 @@ def set_portfolio_greeks(pg):
     global _portfolio_greeks
     _portfolio_greeks = pg
     log.info("Portfolio Greeks aggregator connected to thesis monitor")
+
+def set_persistent_state(ps):
+    """Wire PersistentState from app.py for ORB/trade persistence."""
+    global _persistent_state
+    _persistent_state = ps
+    log.info("PersistentState connected to thesis monitor")
 
 def _pg_register(trade):
     """Register a new trade with the portfolio Greeks aggregator."""
