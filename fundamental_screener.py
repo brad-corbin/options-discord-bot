@@ -131,18 +131,35 @@ def _fetch_fmp_ratios(ticker: str) -> Dict:
     if data:
         r = data[0] if isinstance(data, list) else data
         if isinstance(r, dict):
-            return {
-                "peg_ratio": r.get("pegRatioTTM"),
-                "pe_ratio": r.get("peRatioTTM"),
-                "price_to_sales": r.get("priceToSalesRatioTTM"),
-                "price_to_book": r.get("priceToBookRatioTTM"),
-                "debt_to_equity": r.get("debtEquityRatioTTM"),
-                "roe": r.get("returnOnEquityTTM"),
-                "roa": r.get("returnOnAssetsTTM"),
-                "current_ratio": r.get("currentRatioTTM"),
-                "fcf_yield": r.get("freeCashFlowYieldTTM"),
-                "dividend_yield_ttm": r.get("dividendYieldTTM"),
+            # Stable endpoint may use different field names than v3
+            # Try multiple variants: pegRatioTTM (v3), pegRatio (stable)
+            def _get(r, *keys):
+                for k in keys:
+                    v = r.get(k)
+                    if v is not None:
+                        return v
+                return None
+
+            result = {
+                "peg_ratio": _get(r, "pegRatioTTM", "pegRatio",
+                                   "forwardPegRatioTTM", "forwardPegRatio"),
+                "pe_ratio": _get(r, "peRatioTTM", "peRatio",
+                                  "priceEarningsRatioTTM", "priceEarningsRatio"),
+                "price_to_sales": _get(r, "priceToSalesRatioTTM", "priceToSalesRatio"),
+                "price_to_book": _get(r, "priceToBookRatioTTM", "priceToBookRatio"),
+                "debt_to_equity": _get(r, "debtEquityRatioTTM", "debtEquityRatio"),
+                "roe": _get(r, "returnOnEquityTTM", "returnOnEquity"),
+                "roa": _get(r, "returnOnAssetsTTM", "returnOnAssets"),
+                "current_ratio": _get(r, "currentRatioTTM", "currentRatio"),
+                "fcf_yield": _get(r, "freeCashFlowYieldTTM", "freeCashFlowYield"),
+                "dividend_yield_ttm": _get(r, "dividendYieldTTM", "dividendYield",
+                                            "dividendPerShareTTM"),
             }
+            # Debug: log actual keys on first call to diagnose field name mismatches
+            if not _cache_get("_ratios_keys_logged"):
+                log.info(f"FMP ratios-ttm keys for {ticker}: {sorted(r.keys())}")
+                _cache_set("_ratios_keys_logged", True, ttl=86400)
+            return result
     return {}
 
 
