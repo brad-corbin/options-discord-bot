@@ -27,6 +27,15 @@ log = logging.getLogger(__name__)
 OI_CACHE_TTL = 50 * 3600  # 50 hours — survives overnight + one missed cycle
 OI_SAVE_COOLDOWN = 120     # minimum seconds between saves for same ticker+expiry
 
+# ── Intraday flow detection thresholds ──
+OI_FLOW_BUILDUP_PCT = 1.00     # 100%+ increase from morning baseline
+OI_FLOW_UNWIND_PCT = 0.50      # 50%+ decrease from morning baseline
+OI_FLOW_MIN_CONTRACTS = 500    # minimum contract change to be notable
+OI_FLOW_MIN_BASELINE = 1000    # minimum morning OI to avoid noise on tiny positions
+OI_FLOW_MAX_DIST_PCT = 0.10    # only alert strikes within 10% of spot
+OI_FLOW_ALERT_COOLDOWN = 1800  # 30 minutes between re-alerts for same strike
+OI_FLOW_FIRST_COOLDOWN = 300   # 5 minutes after baseline saved before checking (let OI settle)
+
 
 class OICache:
     """
@@ -211,3 +220,218 @@ class OICache:
         chain_data["oiChange"] = oi_change_list
         log.info(f"OI cache: injected {populated} oiChange values into {ticker}:{expiration} chain")
         return chain_data
+
+    # ═══════════════════════════════════════════════════════════
+    # INTRADAY FLOW DETECTION
+    # Compare current OI against morning baseline (not rolling snapshot).
+    # Detects institutional buildup (100%+) and unwinding (50%+).
+    # Alerts once on discovery, re-alerts every 30 min if trend continues.
+    # ═══════════════════════════════════════════════════════════
+
+    def _baseline_key(self, ticker: str, expiration: str, date_str: str) -> str:
+        return f"oi_baseline:{ticker.upper()}:{expiration}:{date_str}"
+
+    def save_morning_baseline(self, ticker: str, expiration: str, chain_data: dict) -> bool:
+        """
+        Save morning OI baseline. Called once per day per ticker/exp.
+        Returns True if baseline was saved (first call), False if already exists.
+        """
+        from datetime import date as _date
+        today = _date.today().isoformat()
+        key = self._baseline_key(ticker, expiration, today)
+
+        # Check if baseline already exists for today
+        existing = self._get(key)
+        if existing is not None:
+            return False  # already saved today
+
+        current = self._parse_chain_oi(chain_data)
+        if not current:
+            return False
+
+        try:
+            self._set(key, json.dumps(current), ttl=20 * 3600)  # 20h TTL — expires overnight
+            log.info(f"OI morning baseline saved: {ticker}:{expiration} — {len(current)} contracts")
+            return True
+        except Exception as e:
+            log.warning(f"OI baseline save failed for {ticker}:{expiration}: {e}")
+            return False
+
+    def _get_morning_baseline(self, ticker: str, expiration: str) -> Optional[Dict[str, int]]:
+        """Load today's morning baseline from store."""
+        from datetime import date as _date
+        today = _date.today().isoformat()
+        key = self._baseline_key(ticker, expiration, today)
+        try:
+            raw = self._get(key)
+            if raw is not None:
+                return json.loads(raw)
+            return None
+        except Exception:
+            return None
+
+    def check_intraday_flow(self, ticker: str, expiration: str,
+                            chain_data: dict, spot: float) -> list:
+        """
+        Compare current OI against morning baseline.
+        Returns list of flow alert dicts for significant buildup/unwinding.
+
+        Each alert dict:
+          {ticker, strike, side, morning_oi, current_oi, change, change_pct,
+           flow_type ('buildup'|'unwinding'), dist_from_spot, directional_bias}
+        """
+        baseline = self._get_morning_baseline(ticker, expiration)
+        if baseline is None:
+            return []
+
+        current = self._parse_chain_oi(chain_data)
+        if not current:
+            return []
+
+        now = time.monotonic()
+
+        # Initialize alert cooldown tracker if needed
+        if not hasattr(self, '_flow_alert_times'):
+            self._flow_alert_times = {}
+
+        alerts = []
+        for key, cur_oi in current.items():
+            base_oi = baseline.get(key, 0)
+            if base_oi < OI_FLOW_MIN_BASELINE:
+                continue
+
+            # Parse strike and side
+            try:
+                strike_str, side = key.split("|")
+                strike = float(strike_str)
+            except (ValueError, IndexError):
+                continue
+
+            # Distance filter — skip far OTM strikes
+            if spot > 0:
+                dist_pct = abs(strike - spot) / spot
+                if dist_pct > OI_FLOW_MAX_DIST_PCT:
+                    continue
+
+            change = cur_oi - base_oi
+            abs_change = abs(change)
+            if abs_change < OI_FLOW_MIN_CONTRACTS:
+                continue
+
+            change_pct = change / base_oi if base_oi > 0 else 0
+
+            flow_type = None
+            if change_pct >= OI_FLOW_BUILDUP_PCT:
+                flow_type = "buildup"
+            elif change_pct <= -OI_FLOW_UNWIND_PCT:
+                flow_type = "unwinding"
+
+            if not flow_type:
+                continue
+
+            # Cooldown check — alert once on discovery, then every 30 min
+            cooldown_key = f"{ticker}:{strike}:{side}:{flow_type}"
+            last_alert = self._flow_alert_times.get(cooldown_key, 0)
+            if now - last_alert < OI_FLOW_ALERT_COOLDOWN:
+                continue
+
+            self._flow_alert_times[cooldown_key] = now
+
+            # Directional context
+            if side == "call":
+                if flow_type == "buildup":
+                    directional = "BULLISH" if strike > spot else "BULLISH (ITM accumulation)"
+                else:
+                    directional = "BEARISH unwind" if strike > spot else "profit-taking"
+            else:  # put
+                if flow_type == "buildup":
+                    directional = "BEARISH" if strike < spot else "BEARISH (ITM accumulation)"
+                else:
+                    directional = "BULLISH unwind" if strike < spot else "profit-taking"
+
+            alerts.append({
+                "ticker": ticker,
+                "expiration": expiration,
+                "strike": strike,
+                "side": side,
+                "morning_oi": base_oi,
+                "current_oi": cur_oi,
+                "change": change,
+                "change_pct": round(change_pct * 100, 1),
+                "flow_type": flow_type,
+                "dist_from_spot": round((strike - spot) / spot * 100, 2),
+                "spot": spot,
+                "directional_bias": directional,
+            })
+
+        # Sort by absolute change descending — biggest flow first
+        alerts.sort(key=lambda a: abs(a["change"]), reverse=True)
+
+        # Cap at top 5 per ticker per check to avoid alert storms
+        return alerts[:5]
+
+    def format_flow_alert(self, alert: dict) -> str:
+        """Format a single intraday flow alert for Telegram."""
+        t = alert
+        if t["flow_type"] == "buildup":
+            emoji = "🔥" if abs(t["change_pct"]) >= 200 else "📈"
+            header = f"{emoji} OI BUILDUP — {t['ticker']}"
+        else:
+            emoji = "🧊" if abs(t["change_pct"]) >= 75 else "📉"
+            header = f"{emoji} OI UNWINDING — {t['ticker']}"
+
+        side_emoji = "📗" if t["side"] == "call" else "📕"
+        dist_dir = "above" if t["dist_from_spot"] > 0 else "below"
+
+        lines = [
+            header,
+            f"━━━━━━━━━━━━━━━━━━━━━━━━",
+            f"{side_emoji} ${t['strike']:.0f} {t['side'].upper()} ({abs(t['dist_from_spot']):.1f}% {dist_dir} spot ${t['spot']:.2f})",
+            f"Morning: {t['morning_oi']:,} → Now: {t['current_oi']:,} ({t['change']:+,})",
+            f"Change: {t['change_pct']:+.0f}%",
+            f"Exp: {t['expiration']}",
+            f"Signal: {t['directional_bias']}",
+        ]
+        return "\n".join(lines)
+
+    def format_flow_summary(self, alerts: list) -> str:
+        """Format multiple flow alerts into a single summary message."""
+        if not alerts:
+            return ""
+
+        buildups = [a for a in alerts if a["flow_type"] == "buildup"]
+        unwinds = [a for a in alerts if a["flow_type"] == "unwinding"]
+
+        lines = ["📊 INTRADAY OI FLOW DETECTED", "━" * 28]
+
+        if buildups:
+            lines.append("")
+            lines.append("🔥 BUILDUP (new positions opening):")
+            for a in buildups[:3]:
+                side_emoji = "📗" if a["side"] == "call" else "📕"
+                lines.append(
+                    f"  {side_emoji} {a['ticker']} ${a['strike']:.0f} {a['side'].upper()} "
+                    f"— {a['change']:+,} ({a['change_pct']:+.0f}%) → {a['directional_bias']}"
+                )
+
+        if unwinds:
+            lines.append("")
+            lines.append("🧊 UNWINDING (positions closing):")
+            for a in unwinds[:3]:
+                side_emoji = "📗" if a["side"] == "call" else "📕"
+                lines.append(
+                    f"  {side_emoji} {a['ticker']} ${a['strike']:.0f} {a['side'].upper()} "
+                    f"— {a['change']:+,} ({a['change_pct']:+.0f}%) → {a['directional_bias']}"
+                )
+
+        return "\n".join(lines)
+
+    def cleanup_flow_cooldowns(self):
+        """Purge stale cooldown entries. Call once per hour."""
+        if not hasattr(self, '_flow_alert_times'):
+            return
+        now = time.monotonic()
+        stale = [k for k, v in self._flow_alert_times.items()
+                 if now - v > OI_FLOW_ALERT_COOLDOWN * 4]
+        for k in stale:
+            del self._flow_alert_times[k]
