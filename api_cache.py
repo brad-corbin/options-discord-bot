@@ -337,18 +337,23 @@ class CachedMarketData:
 
     # ── Option Chain ──
     def get_chain(self, ticker: str, expiration: str,
-                  side: str = None, strike_limit: int = None) -> dict:
+                  side: str = None, strike_limit: int = None,
+                  feed: str = None) -> dict:
         """Cached option chain for a specific expiration.
 
         v5.1.1 API credit optimization:
         MarketData.app charges 1 credit PER OPTION SYMBOL in the response.
         SPY with 390 contracts = 390 credits per fetch!
 
+        v6.1: feed="cached" mode — 1 credit total regardless of chain size.
+        Use for OI/volume tracking where live quotes aren't needed.
+
         Args:
             side: "call" or "put" — halves credit cost by fetching one side only
             strike_limit: int — limits to N nearest-ATM strikes per side.
                           With strike_limit=20: SPY drops from 390 to ~40 contracts.
                           Combined with side: drops to ~20 contracts (95% savings).
+            feed: "cached" — 1 credit total. "live" or None — standard pricing.
         """
         # Cache key includes filters so filtered/unfiltered don't collide
         filter_tag = ""
@@ -356,6 +361,8 @@ class CachedMarketData:
             filter_tag += f":s={side}"
         if strike_limit:
             filter_tag += f":sl={strike_limit}"
+        if feed:
+            filter_tag += f":f={feed}"
         key = f"{ticker.upper()}:{expiration}{filter_tag}"
         cached = self._chain_cache.get(key)
         if cached is not None:
@@ -366,6 +373,8 @@ class CachedMarketData:
             params["side"] = side
         if strike_limit:
             params["strikeLimit"] = strike_limit
+        if feed:
+            params["feed"] = feed
 
         data = self._md_get(
             f"https://api.marketdata.app/v1/options/chain/{ticker.upper()}/",
