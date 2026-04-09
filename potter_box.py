@@ -109,8 +109,18 @@ def detect_boxes(bars, ticker):
         if box_bars >= MIN_BOX_BARS:
             roof = running_high; floor = running_low
             rz = roof * TOUCH_ZONE_PCT; fz = floor * TOUCH_ZONE_PCT
-            rt = sum(1 for k in range(box_start, box_end+1) if abs(_body_top(bars[k]) - roof) <= rz)
-            ft = sum(1 for k in range(box_start, box_end+1) if abs(_body_bot(bars[k]) - floor) <= fz)
+            # Count touches: body near boundary OR wick piercing through boundary
+            # Wick piercing = sellers/buyers testing the level (defensive touch)
+            # Both weaken the boundary per wave theory
+            rt = 0; ft = 0
+            for k in range(box_start, box_end+1):
+                bt = _body_top(bars[k]); bb = _body_bot(bars[k])
+                # Roof touch: body near roof OR wick pierced above roof
+                if abs(bt - roof) <= rz or bars[k]["h"] > roof * (1 + TOUCH_ZONE_PCT * 0.5):
+                    rt += 1
+                # Floor touch: body near floor OR wick pierced below floor
+                if abs(bb - floor) <= fz or bars[k]["l"] < floor * (1 - TOUCH_ZONE_PCT * 0.5):
+                    ft += 1
             if rt >= 2 and ft >= 2:
                 midpoint = (roof + floor) / 2
                 rp = (roof - floor) / midpoint * 100 if midpoint > 0 else 0
