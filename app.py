@@ -166,7 +166,7 @@ _oi_cache = None
 _oi_tracker = None  # v5.1: daily OI change tracker
 _persistent_state = None  # v6.1: Redis-backed persistent state
 _flow_detector = None     # v6.1: unified institutional flow detection
-_potter_scanner = None    # v6.1: Potter Box consolidation scanner
+_potter_box = None        # v6.2: Potter Box scanner
 
 # ─────────────────────────────────────────────────────────
 # LOGGING
@@ -8303,7 +8303,7 @@ def _em_scheduler():
 
             # ── v6.1: Potter Box Scan — 8:15 AM CT + 3:05 PM CT ──
             # MUST run AFTER flow confirmation so campaigns are fresh
-            if _potter_scanner:
+            if _potter_box:
                 # Morning scan (after flow confirmation has written campaigns)
                 _pb_am_key = (date_str, "potter_box_am")
                 if _pb_am_key not in fired_today:
@@ -8318,7 +8318,7 @@ def _em_scheduler():
                                     bars = fetch_daily_bars_yahoo(ticker, days=504)
                                     return bars if bars else None
 
-                                setups = _potter_scanner.scan_all(
+                                setups = _potter_box.scan_all(
                                     tickers=FLOW_TICKERS,
                                     ohlcv_fn=_pb_ohlcv,
                                     chain_fn=lambda t, e: _cached_md.get_chain(
@@ -8327,13 +8327,13 @@ def _em_scheduler():
                                     expirations_fn=lambda t: get_expirations(t) or [],
                                 )
                                 if setups:
-                                    summary = _potter_scanner.format_summary(setups)
+                                    summary = _potter_box.format_summary(setups)
                                     if summary:
                                         post_to_telegram(summary)
                                     for s in setups:
                                         if s.get("trade") and s.get("flow_direction"):
                                             try:
-                                                post_to_telegram(_potter_scanner.format_alert(s))
+                                                post_to_telegram(_potter_box.format_alert(s))
                                             except Exception:
                                                 pass
                             except Exception as _pe:
@@ -8356,7 +8356,7 @@ def _em_scheduler():
                                     bars = fetch_daily_bars_yahoo(ticker, days=504)
                                     return bars if bars else None
 
-                                setups = _potter_scanner.scan_all(
+                                setups = _potter_box.scan_all(
                                     tickers=FLOW_TICKERS,
                                     ohlcv_fn=_pb_ohlcv,
                                     chain_fn=lambda t, e: _cached_md.get_chain(
@@ -8365,13 +8365,13 @@ def _em_scheduler():
                                     expirations_fn=lambda t: get_expirations(t) or [],
                                 )
                                 if setups:
-                                    summary = _potter_scanner.format_summary(setups)
+                                    summary = _potter_box.format_summary(setups)
                                     if summary:
                                         post_to_telegram(summary)
                                     for s in setups:
                                         if s.get("trade") and s.get("flow_direction"):
                                             try:
-                                                post_to_telegram(_potter_scanner.format_alert(s))
+                                                post_to_telegram(_potter_box.format_alert(s))
                                             except Exception:
                                                 pass
                             except Exception as _pe:
@@ -8741,7 +8741,7 @@ def _initialize_app():
     global _oi_tracker
     global _persistent_state
     global _flow_detector
-    global _potter_scanner
+    global _potter_box
     with app.app_context():
         portfolio.init_store(store_get, store_set)
         trade_journal.init_store(store_get, store_set)
@@ -8750,7 +8750,7 @@ def _initialize_app():
         _oi_tracker = OITracker(store_get, store_set)
         _persistent_state = PersistentState(store_get, store_set, store_scan)
         _flow_detector = FlowDetector(_persistent_state, post_fn=post_to_telegram)
-        _potter_scanner = PotterBoxScanner(_persistent_state, flow_detector=_flow_detector,
+        _potter_box = PotterBoxScanner(_persistent_state, flow_detector=_flow_detector,
                                            post_fn=post_to_telegram)
         log.info(f"OI cache + tracker + flow detector + Potter Box initialized (Redis: {_get_redis() is not None})")
         _tg_ws = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
