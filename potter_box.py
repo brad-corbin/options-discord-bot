@@ -541,6 +541,7 @@ class PotterBoxScanner:
         flow_dir = None; flow_ctx = {}
         if self._flow:
             try:
+                # Source 1: Multi-day campaigns (strongest signal)
                 for c in self._state.get_all_flow_campaigns(ticker):
                     s = c.get("strike", 0)
                     if abs(s - box["roof"]) / spot < 0.03:
@@ -549,7 +550,31 @@ class PotterBoxScanner:
                     if abs(s - box["floor"]) / spot < 0.03:
                         if c.get("side") == "put" and "buildup" in c.get("flow_type",""): flow_dir = "bearish"; flow_ctx = c; break
                         elif c.get("side") == "call" and "unwinding" in c.get("flow_type",""): flow_dir = "bearish"; flow_ctx = c; break
+                # Source 2: Intraday flow direction (no campaign yet — day 1-3 fallback)
+                if not flow_dir:
+                    fd = self._state.get_flow_direction(ticker)
+                    if fd and fd.get("vol_oi", 0) >= 2.0:
+                        flow_dir = fd.get("direction")
+                        flow_ctx = {"source": "intraday_flow", "vol_oi": fd.get("vol_oi"),
+                                    "volume": fd.get("volume"), "side": fd.get("side"),
+                                    "strike": fd.get("strike"), "flow_level": fd.get("flow_level")}
             except: pass
+
+            # Source 2: Intraday flow direction (same-day, no campaign needed)
+            # A 10x+ vol/OI burst today at a box boundary = same-day direction
+            if flow_dir is None:
+                try:
+                    fd = self._state.get_flow_direction(ticker)
+                    if fd and fd.get("vol_oi", 0) >= 2.0:  # at least extreme
+                        fd_dir = fd.get("direction", "")
+                        fd_strike = fd.get("strike", 0)
+                        # Check if flow is near box boundaries
+                        near_roof = abs(fd_strike - box["roof"]) / spot < 0.05 if fd_strike else False
+                        near_floor = abs(fd_strike - box["floor"]) / spot < 0.05 if fd_strike else False
+                        if near_roof or near_floor or fd.get("vol_oi", 0) >= 5.0:
+                            flow_dir = fd_dir
+                            flow_ctx = {"source": "intraday_flow", **fd}
+                except Exception: pass
 
         iv_pct = None
         if iv_percentile_fn:
