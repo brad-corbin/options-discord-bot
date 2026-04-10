@@ -402,6 +402,177 @@ class PersistentState:
             return []
 
     # ═══════════════════════════════════════════════════════
+    # SHADOW SIGNAL STORAGE (intraday, 4hr TTL)
+    # ═══════════════════════════════════════════════════════
+
+    def save_shadow_signal(self, ticker: str, signal_data: dict):
+        """Store a shadow signal so flow conviction can find convergence."""
+        self._json_set(f"shadow:{ticker.upper()}", signal_data, ttl=14400)
+
+    def get_shadow_signal(self, ticker: str) -> dict:
+        """Get stored shadow signal for convergence checking."""
+        return self._json_get(f"shadow:{ticker.upper()}")
+
+    # ═══════════════════════════════════════════════════════
+    # FLOW DIRECTION CACHE (intraday, 2hr TTL)
+    # Updated on every significant+ flow detection so any
+    # subsystem can query "what is the latest flow bias?"
+    # ═══════════════════════════════════════════════════════
+
+    def save_flow_direction(self, ticker: str, data: dict):
+        """
+        Store latest significant+ flow direction for a ticker.
+        data: {direction, vol_oi, volume, flow_level, side, strike, timestamp}
+        """
+        self._json_set(f"flow_dir:{ticker.upper()}", data, ttl=7200)
+
+    def get_flow_direction(self, ticker: str) -> dict:
+        """Get latest flow direction. Returns None if no recent significant+ flow."""
+        return self._json_get(f"flow_dir:{ticker.upper()}")
+
+    # ── Intraday Re-hit Counter ──
+
+    def increment_flow_rehit(self, ticker: str, strike: float, side: str) -> int:
+        """
+        Increment and return the intraday hit count for a specific strike.
+        Resets daily via TTL (8hr). Returns the NEW count (1 = first hit, 2+ = re-hit).
+        """
+        key = f"flow_rehit:{ticker.upper()}:{strike:.0f}:{side}"
+        try:
+            if self._redis:
+                val = self._redis.incr(key)
+                self._redis.expire(key, 28800)  # 8hr TTL
+                return int(val)
+        except Exception:
+            pass
+        return 1
+
+    def get_flow_rehit_count(self, ticker: str, strike: float, side: str) -> int:
+        """Get current hit count for a strike (0 if never hit)."""
+        key = f"flow_rehit:{ticker.upper()}:{strike:.0f}:{side}"
+        try:
+            if self._redis:
+                val = self._redis.get(key)
+                return int(val) if val else 0
+        except Exception:
+            pass
+        return 0
+
+    # ── GEX Level Access ──
+
+    def get_gamma_flip_level(self, ticker: str) -> float:
+        """
+        Get gamma flip level for a ticker.
+        Sources (in priority order):
+          1. Thesis monitor (full institutional snapshot — SPY/QQQ)
+          2. Lightweight GEX from flow detector (all tickers with chain data)
+        """
+        # Source 1: Full thesis
+        try:
+            thesis = self.get_thesis(ticker)
+            if thesis:
+                levels = thesis.get("levels", {})
+                gf = levels.get("gamma_flip")
+                if gf and gf > 0:
+                    return float(gf)
+        except Exception:
+            pass
+        # Source 2: Lightweight GEX from flow sweep
+        try:
+            gex = self._json_get(f"gex:{ticker.upper()}")
+            if gex and gex.get("gamma_flip", 0) > 0:
+                return float(gex["gamma_flip"])
+        except Exception:
+            pass
+        return 0.0
+
+    def get_gex_sign(self, ticker: str) -> str:
+        """
+        Get GEX sign (positive/negative) for a ticker.
+        Sources: thesis monitor → lightweight GEX from flow detector.
+        """
+        # Source 1: Full thesis
+        try:
+            thesis = self.get_thesis(ticker)
+            if thesis and thesis.get("gex_sign"):
+                return thesis.get("gex_sign", "")
+        except Exception:
+            pass
+        # Source 2: Lightweight GEX
+        try:
+            gex = self._json_get(f"gex:{ticker.upper()}")
+            if gex and gex.get("gex_sign"):
+                return gex["gex_sign"]
+        except Exception:
+            pass
+        return ""
+
+    def get_gex_data(self, ticker: str) -> dict:
+        """Get full GEX data including call/put walls and max pain."""
+        try:
+            gex = self._json_get(f"gex:{ticker.upper()}")
+            if gex:
+                return gex
+        except Exception:
+            pass
+        return {}
+
+    def get_flow_conviction_boost(self, ticker: str, direction: str) -> float:
+        """
+        Calculate EntryValidator flow boost for a ticker/direction.
+        Returns 0-14 based on flow alignment and magnitude.
+
+        Used by thesis_monitor before calling EntryValidator.validate().
+        """
+        fd = self.get_flow_direction(ticker)
+        if not fd:
+            return 0.0
+        flow_dir = (fd.get("direction", "") or "").lower()
+        want_dir = direction.lower()
+
+        # Check alignment
+        aligned = (
+            ("bull" in flow_dir and want_dir == "long") or
+            ("bear" in flow_dir and want_dir == "short")
+        )
+        if not aligned:
+            return 0.0
+
+        vol_oi = fd.get("vol_oi", 0)
+        flow_level = fd.get("flow_level", "")
+
+        # Scale boost by magnitude
+        if vol_oi >= 10:     # conviction-level
+            return 14.0       # pushes score 2 → 4
+        elif vol_oi >= 5:    # very strong
+            return 10.0       # overrides critical-pair rejection
+        elif vol_oi >= 2:    # extreme
+            return 7.0        # pushes score 2 → 3
+        elif flow_level == "significant":
+            return 4.0        # meaningful but not decisive
+        return 0.0
+
+    def save_conviction_boost(self, ticker: str, boost: float, direction: str):
+        """Store a flow conviction boost for EntryValidator (30 min TTL)."""
+        self._json_set(f"conviction_boost:{ticker.upper()}", {
+            "boost": boost, "direction": direction,
+            "timestamp": datetime.now().isoformat(),
+        }, ttl=1800)
+
+    def get_conviction_boost(self, ticker: str, direction: str) -> float:
+        """Get active conviction boost for a ticker+direction."""
+        data = self._json_get(f"conviction_boost:{ticker.upper()}")
+        if not data:
+            return 0.0
+        # Only apply if direction matches
+        stored_dir = (data.get("direction", "") or "").lower()
+        if direction.lower() in ("long", "bull", "bullish") and "bull" in stored_dir:
+            return data.get("boost", 0.0)
+        if direction.lower() in ("short", "bear", "bearish") and "bear" in stored_dir:
+            return data.get("boost", 0.0)
+        return 0.0
+
+    # ═══════════════════════════════════════════════════════
     # DIAGNOSTICS
     # ═══════════════════════════════════════════════════════
 
