@@ -361,6 +361,7 @@ _signal_cache_lock = _threading.Lock()
 _SIGNAL_CACHE_MAX_AGE = 86400 * 7  # 7 days
 _persistent_state_ref = None  # set by app.py on startup
 _flow_fn_ref = None           # set by app.py for flow scoring
+_potter_box_ref = None        # set by app.py for Potter Box convergence
 
 
 def set_persistent_state(ps):
@@ -373,6 +374,12 @@ def set_flow_fn(fn):
     """Called by app.py to inject FlowDetector scoring function."""
     global _flow_fn_ref
     _flow_fn_ref = fn
+
+
+def set_potter_box(pb):
+    """Called by app.py to inject PotterBoxScanner for convergence scoring."""
+    global _potter_box_ref
+    _potter_box_ref = pb
 
 
 def _cache_signal(signal):
@@ -902,6 +909,36 @@ def analyze_swing_setup(
                 confidence += flow_adj
                 for fr in flow_result.get("reasons", []):
                     conf_reasons.append(fr)
+        except Exception:
+            pass
+
+    # ── Potter Box convergence ──
+    # A swing signal at a fib level that aligns with a Potter Box boundary
+    # is structurally stronger — two independent systems agree on the level.
+    if _potter_box_ref:
+        try:
+            pb = _potter_box_ref.get_active_box(ticker)
+            if pb and pb.get("floor") and pb.get("roof"):
+                floor = pb["floor"]
+                roof = pb["roof"]
+                cb = (floor + roof) / 2  # cost basis / 50% line
+                spot_price = last_close
+                tolerance = spot_price * 0.015  # 1.5% tolerance
+
+                # Check if fib level aligns with box boundaries
+                if abs(fib_price - floor) < tolerance:
+                    confidence += 8
+                    conf_reasons.append(f"Potter Box floor ${floor:.0f} aligns with fib {fib_level} (+8)")
+                elif abs(fib_price - roof) < tolerance:
+                    confidence += 8
+                    conf_reasons.append(f"Potter Box roof ${roof:.0f} aligns with fib {fib_level} (+8)")
+                elif abs(fib_price - cb) < tolerance:
+                    confidence += 5
+                    conf_reasons.append(f"Potter Box CB line ${cb:.0f} aligns with fib {fib_level} (+5)")
+                # Check if price is inside the box (consolidation context)
+                elif floor <= spot_price <= roof:
+                    confidence += 3
+                    conf_reasons.append(f"Inside Potter Box ${floor:.0f}–${roof:.0f} (+3)")
         except Exception:
             pass
 
