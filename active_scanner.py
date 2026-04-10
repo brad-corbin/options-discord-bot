@@ -599,29 +599,55 @@ class ActiveScanner:
 
         # ── Regime-aware rule filter ──────────────────────────
         # Only tickers in TICKER_RULES are allowed through.
-        # Everything else is suppressed — no ungated alerts.
+        # EXCEPTION: flow override — if significant+ institutional flow
+        # confirms the signal direction, bypass the regime gate.
+        flow_override = False
+        flow_override_boost = 0.0
+
         if ticker not in TICKER_RULES:
             log.debug(f"Scanner {ticker}: not in TICKER_RULES — suppressed")
-            # v6.1: shadow log — ticker has no rule in any regime
             if score >= MIN_SIGNAL_SCORE and self._shadow_log_fn:
                 try:
                     self._shadow_log_fn(ticker, regime, signal, "no_rule_in_regime")
                 except Exception:
                     pass
-            return
+            # Check flow override
+            if score >= MIN_SIGNAL_SCORE and self._flow_boost_fn:
+                try:
+                    fb = self._flow_boost_fn(ticker, bias, signal.get("close", 0))
+                    if fb >= 7:  # significant+ aligned flow
+                        flow_override = True
+                        flow_override_boost = fb
+                        log.info(f"🔗 FLOW OVERRIDE: {ticker} {bias} — no regime rule, "
+                               f"but flow boost={fb:.0f} confirms direction")
+                except Exception:
+                    pass
+            if not flow_override:
+                return
 
-        if not is_signal_valid(ticker, regime, signal):
+        if not flow_override and not is_signal_valid(ticker, regime, signal):
             log.debug(
                 f"Scanner {ticker}: {bias} score={score} htf={signal['htf_status']} "
                 f"phase={signal.get('phase')} — filtered (regime={regime})"
             )
-            # v6.1: shadow log — ticker has a rule but this signal didn't pass it
             if score >= MIN_SIGNAL_SCORE and self._shadow_log_fn:
                 try:
                     self._shadow_log_fn(ticker, regime, signal, "rule_exists_signal_filtered")
                 except Exception:
                     pass
-            return
+            # Check flow override
+            if score >= MIN_SIGNAL_SCORE and self._flow_boost_fn:
+                try:
+                    fb = self._flow_boost_fn(ticker, bias, signal.get("close", 0))
+                    if fb >= 7:
+                        flow_override = True
+                        flow_override_boost = fb
+                        log.info(f"🔗 FLOW OVERRIDE: {ticker} {bias} — signal filtered, "
+                               f"but flow boost={fb:.0f} confirms direction")
+                except Exception:
+                    pass
+            if not flow_override:
+                return
 
         # ── Dedup ────────────────────────────────────────────
         if self._is_deduped(ticker, signal):
@@ -633,7 +659,8 @@ class ActiveScanner:
         log.info(
             f"Scanner signal: {ticker} {bias.upper()} T{tier} "
             f"(score={score}, regime={regime}, htf={signal['htf_status']}, "
-            f"vol_ratio={signal['volume_ratio']:.1f}x)"
+            f"vol_ratio={signal['volume_ratio']:.1f}x"
+            f"{', FLOW_OVERRIDE' if flow_override else ''})"
         )
 
         # ── Build webhook data ────────────────────────────────
@@ -674,6 +701,8 @@ class ActiveScanner:
             "bar_count": signal.get("bar_count", 0),
             "score_breakdown": signal.get("score_breakdown", {}),
             "setup_hash": self._setup_hash(ticker, signal),
+            "flow_override": flow_override,
+            "flow_override_boost": flow_override_boost,
         }
 
         # ── Build alert message ───────────────────────────────
