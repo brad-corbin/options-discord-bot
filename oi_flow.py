@@ -62,6 +62,15 @@ CAMPAIGN_STRONG_DAYS = 3           # "Institutional campaign" label
 TRADE_GEN_MIN_VOL_OI = 2.0         # Extreme tier
 TRADE_GEN_MIN_VOLUME_MULTIPLIER = 2  # 2x the tier minimum
 
+# ── CONVICTION PLAY — tiered institutional flow signal ──
+# The ONLY flow that fires Telegram alerts (everything else silent).
+# Routes by DTE: immediate (0-2), income (3-7), swing (8-30), stalk (30-60)
+CONVICTION_MIN_VOL_OI = 10.0        # 10x turnover minimum
+CONVICTION_MIN_VOLUME_MULT = 5      # 5x tier minimum volume
+CONVICTION_MIN_BURST = 5000         # burst path: 5K+ contracts in one interval
+                                    # OR cumulative path: 15x+ vol/OI (no burst needed)
+CONVICTION_COOLDOWN = 3600          # 1 hour between conviction alerts per ticker per tier
+
 # Scoring impact
 SCORE_NOTABLE_ALIGNED = 3
 SCORE_NOTABLE_OPPOSING = -2
@@ -233,6 +242,257 @@ def parse_chain_volume_oi(chain_data: dict, spot: float) -> List[dict]:
 
 
 # ═══════════════════════════════════════════════════════════
+# LIGHTWEIGHT GEX CALCULATOR
+# Extracts gamma flip + GEX sign from raw chain OI data.
+# Zero additional API cost — uses chain data already in hand.
+# ═══════════════════════════════════════════════════════════
+
+def estimate_gex_from_chain(chain_data: dict, spot: float) -> dict:
+    """
+    Lightweight gamma exposure estimate from chain OI data.
+
+    Returns: {gamma_flip, gex_sign, call_wall, put_wall, max_pain}
+    - gamma_flip: strike where net dealer gamma changes sign
+    - gex_sign: 'positive' (spot above flip) or 'negative' (spot below flip)
+    - call_wall: highest call OI strike (resistance magnet)
+    - put_wall: highest put OI strike (support magnet)
+    - max_pain: strike where total OI (call+put) is highest
+
+    Proxy calculation — not exact greeks, but directionally correct
+    for determining whether dealers amplify or dampen moves.
+    """
+    sym_list = chain_data.get("optionSymbol") or []
+    n = len(sym_list)
+    if n == 0 or spot <= 0:
+        return {}
+
+    strikes = chain_data.get("strike", [])
+    sides = chain_data.get("side", [])
+    ois = chain_data.get("openInterest", [])
+    if not isinstance(strikes, list):
+        strikes = [strikes] * n
+    if not isinstance(sides, list):
+        sides = [sides] * n
+    if not isinstance(ois, list):
+        ois = [ois] * n
+
+    # Aggregate OI per strike per side
+    call_oi = {}  # strike → total call OI
+    put_oi = {}   # strike → total put OI
+    for i in range(n):
+        strike = strikes[i]
+        side = str(sides[i] or "").lower()
+        oi = int(ois[i] or 0)
+        if strike is None or oi <= 0:
+            continue
+        strike = float(strike)
+        if side == "call":
+            call_oi[strike] = call_oi.get(strike, 0) + oi
+        elif side == "put":
+            put_oi[strike] = put_oi.get(strike, 0) + oi
+
+    if not call_oi and not put_oi:
+        return {}
+
+    all_strikes = sorted(set(list(call_oi.keys()) + list(put_oi.keys())))
+
+    # Call wall: strike with highest call OI
+    call_wall = max(call_oi, key=call_oi.get) if call_oi else 0
+    # Put wall: strike with highest put OI
+    put_wall = max(put_oi, key=put_oi.get) if put_oi else 0
+    # Max pain: strike with highest total OI
+    total_oi = {s: call_oi.get(s, 0) + put_oi.get(s, 0) for s in all_strikes}
+    max_pain = max(total_oi, key=total_oi.get) if total_oi else 0
+
+    # Gamma flip estimate:
+    # Net gamma at each strike ≈ call_oi - put_oi (simplified)
+    # Flip point = where net gamma crosses zero
+    # Below flip = negative gamma (dealers short gamma, amplify moves)
+    # Above flip = positive gamma (dealers long gamma, dampen moves)
+    gamma_flip = 0
+    prev_net = None
+    for s in all_strikes:
+        net = call_oi.get(s, 0) - put_oi.get(s, 0)
+        if prev_net is not None and prev_net < 0 and net >= 0:
+            # Zero crossing — interpolate
+            gamma_flip = s
+            break
+        prev_net = net
+
+    # If no crossing found, use midpoint of call/put walls
+    if gamma_flip == 0 and call_wall > 0 and put_wall > 0:
+        gamma_flip = (call_wall + put_wall) / 2
+
+    # GEX sign: spot above flip = positive gamma
+    gex_sign = "positive" if spot >= gamma_flip else "negative"
+
+    return {
+        "gamma_flip": round(gamma_flip, 2),
+        "gex_sign": gex_sign,
+        "call_wall": call_wall,
+        "put_wall": put_wall,
+        "max_pain": max_pain,
+    }
+
+
+# ═══════════════════════════════════════════════════════════
+# IV SKEW CALCULATOR
+# Measures the shape of implied volatility across strikes.
+# Steepening put skew = institutions paying premium for protection.
+# Zero additional API cost — uses IV from chain data already in hand.
+# ═══════════════════════════════════════════════════════════
+
+def compute_iv_skew(chain_data: dict, spot: float) -> dict:
+    """
+    Compute IV skew from chain data.
+
+    Returns: {atm_iv, put_25d_iv, call_25d_iv, skew_ratio, skew_direction, skew_extreme}
+    - atm_iv: at-the-money implied volatility
+    - put_25d_iv: ~25 delta put IV (OTM put)
+    - call_25d_iv: ~25 delta call IV (OTM call)
+    - skew_ratio: put_25d_iv / call_25d_iv (>1.2 = steep put skew)
+    - skew_direction: 'put_heavy' | 'call_heavy' | 'neutral'
+    - skew_extreme: True if ratio > 1.5 (very steep, institutional fear signal)
+    """
+    sym_list = chain_data.get("optionSymbol") or []
+    n = len(sym_list)
+    if n == 0 or spot <= 0:
+        return {}
+
+    strikes = chain_data.get("strike", [])
+    sides = chain_data.get("side", [])
+    ivs = chain_data.get("iv", [])
+    deltas = chain_data.get("delta", [])
+    if not isinstance(strikes, list): strikes = [strikes] * n
+    if not isinstance(sides, list): sides = [sides] * n
+    if not isinstance(ivs, list): ivs = [ivs] * n
+    if not isinstance(deltas, list): deltas = [deltas] * n
+
+    # Collect IV by delta bucket
+    atm_call_iv = []
+    atm_put_iv = []
+    otm_put_iv = []   # ~25 delta puts
+    otm_call_iv = []  # ~25 delta calls
+
+    for i in range(n):
+        iv = ivs[i]
+        delta = deltas[i]
+        side = str(sides[i] or "").lower()
+        if iv is None or delta is None:
+            continue
+        iv = float(iv)
+        delta = float(delta)
+        if iv <= 0:
+            continue
+
+        abs_delta = abs(delta)
+
+        if side == "call":
+            if 0.40 <= abs_delta <= 0.60:
+                atm_call_iv.append(iv)
+            elif 0.20 <= abs_delta <= 0.30:
+                otm_call_iv.append(iv)
+        elif side == "put":
+            if 0.40 <= abs_delta <= 0.60:
+                atm_put_iv.append(iv)
+            elif 0.20 <= abs_delta <= 0.30:
+                otm_put_iv.append(iv)
+
+    if not atm_call_iv and not atm_put_iv:
+        return {}
+
+    atm_iv = sum(atm_call_iv + atm_put_iv) / len(atm_call_iv + atm_put_iv)
+    put_25d = sum(otm_put_iv) / len(otm_put_iv) if otm_put_iv else atm_iv
+    call_25d = sum(otm_call_iv) / len(otm_call_iv) if otm_call_iv else atm_iv
+
+    skew_ratio = put_25d / call_25d if call_25d > 0 else 1.0
+    skew_extreme = skew_ratio > 1.5
+
+    if skew_ratio > 1.2:
+        skew_direction = "put_heavy"
+    elif skew_ratio < 0.8:
+        skew_direction = "call_heavy"
+    else:
+        skew_direction = "neutral"
+
+    return {
+        "atm_iv": round(atm_iv, 4),
+        "put_25d_iv": round(put_25d, 4),
+        "call_25d_iv": round(call_25d, 4),
+        "skew_ratio": round(skew_ratio, 3),
+        "skew_direction": skew_direction,
+        "skew_extreme": skew_extreme,
+    }
+
+
+# ═══════════════════════════════════════════════════════════
+# VOLUME PROFILE / VPOC CALCULATOR
+# Computes Volume Point of Control from intraday bar data.
+# VPOC = price where most contracts traded today — gravitational center.
+# Zero additional cost — uses bar data already pulled by scanner.
+# ═══════════════════════════════════════════════════════════
+
+def compute_vpoc(bars: list) -> dict:
+    """
+    Compute Volume Point of Control from intraday bars.
+
+    bars: list of dicts with 'h', 'l', 'c', 'v' keys (high, low, close, volume)
+
+    Returns: {vpoc, value_area_high, value_area_low, total_volume}
+    - vpoc: price level with highest volume (gravitational center)
+    - value_area_high/low: 70% of volume traded within this range
+    """
+    if not bars or len(bars) < 5:
+        return {}
+
+    # Build volume-at-price profile using bar midpoints
+    # Use 50-cent buckets for price levels
+    price_volume = {}
+    total_vol = 0
+
+    for bar in bars:
+        h = bar.get("h", 0)
+        l = bar.get("l", 0)
+        v = bar.get("v", 0)
+        if not h or not l or not v:
+            continue
+
+        mid = (h + l) / 2
+        # Round to nearest 50 cents for bucketing
+        bucket = round(mid * 2) / 2
+        price_volume[bucket] = price_volume.get(bucket, 0) + v
+        total_vol += v
+
+    if not price_volume or total_vol == 0:
+        return {}
+
+    # VPOC = price with highest volume
+    vpoc = max(price_volume, key=price_volume.get)
+
+    # Value Area: 70% of total volume, expanding from VPOC
+    sorted_levels = sorted(price_volume.items(), key=lambda x: -x[1])
+    va_volume = 0
+    va_target = total_vol * 0.70
+    va_prices = []
+
+    for price, vol in sorted_levels:
+        va_prices.append(price)
+        va_volume += vol
+        if va_volume >= va_target:
+            break
+
+    va_high = max(va_prices) if va_prices else vpoc
+    va_low = min(va_prices) if va_prices else vpoc
+
+    return {
+        "vpoc": round(vpoc, 2),
+        "value_area_high": round(va_high, 2),
+        "value_area_low": round(va_low, 2),
+        "total_volume": total_vol,
+    }
+
+
+# ═══════════════════════════════════════════════════════════
 # CORE FLOW DETECTION
 # ═══════════════════════════════════════════════════════════
 
@@ -272,6 +532,23 @@ class FlowDetector:
         parsed = parse_chain_volume_oi(chain_data, spot)
         if not parsed:
             return []
+
+        # Compute and store lightweight GEX for this ticker
+        # Enables GEX convergence for conviction plays on ALL tickers
+        try:
+            gex = estimate_gex_from_chain(chain_data, spot)
+            if gex and gex.get("gamma_flip", 0) > 0:
+                self._state._json_set(f"gex:{ticker}", gex, ttl=7200)
+        except Exception:
+            pass
+
+        # Compute and store IV skew
+        try:
+            skew = compute_iv_skew(chain_data, spot)
+            if skew and skew.get("atm_iv", 0) > 0:
+                self._state._json_set(f"iv_skew:{ticker}", skew, ttl=7200)
+        except Exception:
+            pass
 
         # ── Volume burst detection ──
         prev_snapshot = self._state.get_volume_snapshot(ticker, expiry)
@@ -361,12 +638,26 @@ class FlowDetector:
                 "book_imbalance": p["book_imbalance"],
                 "dist_from_spot_pct": p["dist_from_spot_pct"],
                 "spot": spot,
+                "mid": p.get("mid", 0),
+                "bid": p.get("bid", 0),
+                "ask": p.get("ask", 0),
                 "burst": burst,
                 "is_burst": is_burst,
                 "is_new_strike": is_new_strike,
                 "should_alert": should_alert,
                 "timestamp": datetime.now().isoformat(),
+                "rehit_count": 0,
             }
+
+            # Track re-hits: same strike hit multiple times in one session
+            if flow_level in ("significant", "extreme"):
+                rehit = self._state.increment_flow_rehit(
+                    ticker, p["strike"], p["side"])
+                alert["rehit_count"] = rehit
+                if rehit >= 2:
+                    log.info(f"🔄 FLOW RE-HIT #{rehit}: {ticker} "
+                           f"${p['strike']:.0f} {p['side']} "
+                           f"({vol_oi:.1f}x, {vol:,} vol)")
 
             alerts.append(alert)
 
@@ -384,6 +675,21 @@ class FlowDetector:
                     "directional_bias": directional,
                     "spot": spot,
                     "date": today_str,
+                })
+
+                # Store flow direction for real-time queries by all subsystems
+                # (active scanner override, EntryValidator boost, Potter Box bias)
+                flow_dir_str = "bullish" if "BULLISH" in directional.upper() else "bearish"
+                self._state.save_flow_direction(ticker, {
+                    "direction": flow_dir_str,
+                    "vol_oi": round(vol_oi, 1),
+                    "volume": vol,
+                    "flow_level": flow_level,
+                    "side": p["side"],
+                    "strike": p["strike"],
+                    "spot": spot,
+                    "expiry": expiry,
+                    "timestamp": datetime.now().isoformat(),
                 })
 
         # Sort by vol_oi_ratio descending
@@ -963,16 +1269,32 @@ class FlowDetector:
                             spot: float) -> float:
         """
         Get flow-based boost for EntryValidator scoring.
-        Returns 0 to 1.5 — enough to lift 2→3 but not 1→3.
+        Three sources checked (best wins):
+        1. Conviction boost from 10x+ vol/OI bursts (0-14)
+        2. Intraday flow direction from latest significant+ hit (0-14)
+        3. Campaign boost from multi-day OI confirmation (0-1.5)
         """
         ticker = ticker.upper()
-        campaigns = self._state.get_all_flow_campaigns(ticker)
-        if not campaigns:
-            return 0.0
-
         best_boost = 0.0
-        for c in campaigns:
-            # Check proximity to spot
+
+        # Source 1: Conviction boost (stored when conviction play fires)
+        try:
+            conv_boost = self._state.get_conviction_boost(ticker, direction)
+            if conv_boost > 0:
+                best_boost = conv_boost
+        except Exception:
+            pass
+
+        # Source 2: Intraday flow direction (from latest significant+ detection)
+        try:
+            fb = self._state.get_flow_conviction_boost(ticker, direction)
+            best_boost = max(best_boost, fb)
+        except Exception:
+            pass
+
+        # Source 3: Campaign-based boost (multi-day OI confirmation)
+        campaigns = self._state.get_all_flow_campaigns(ticker)
+        for c in (campaigns or []):
             strike = c.get("strike", 0)
             if spot > 0 and abs(strike - spot) / spot > 0.05:
                 continue
@@ -1062,6 +1384,293 @@ class FlowDetector:
             })
 
         return ideas
+
+    # ─────────────────────────────────────────────────────
+    # CONVICTION PLAY — tiered by DTE
+    # ─────────────────────────────────────────────────────
+
+    def detect_conviction_plays(self, alerts: List[dict],
+                                 dte: int = None) -> List[dict]:
+        """
+        Detect overwhelming institutional flow and route by DTE:
+          0-2 DTE → "immediate" — LONG CALL/PUT, fire now
+          3-7 DTE → "income"   — auto-score income idea, post if ITQS > 60
+          8-30 DTE → "swing"   — boost swing signal or create stalk
+          30-60 DTE → "stalk"  — watchlist, track campaign
+
+        Triggers (all tiers):
+          - Vol/OI >= 10x
+          - Volume >= 5x tier minimum
+          - Burst >= 5K in one interval OR cumulative vol/OI >= 15x
+          - Clear directional bias
+        """
+        plays = []
+
+        for alert in alerts:
+            ticker = alert["ticker"]
+            vol_oi = alert.get("vol_oi_ratio", 0)
+            volume = alert.get("volume", 0)
+            burst = alert.get("burst", 0)
+            side = alert.get("side", "")
+            direction = alert.get("directional_bias", "")
+
+            # Get DTE
+            alert_dte = dte
+            if alert_dte is None:
+                try:
+                    exp_str = str(alert.get("expiry", ""))[:10]
+                    exp_date = datetime.strptime(exp_str, "%Y-%m-%d").date()
+                    alert_dte = (exp_date - date.today()).days
+                except Exception:
+                    alert_dte = 999
+
+            # Skip anything beyond 60 DTE
+            if alert_dte > 60:
+                continue
+
+            # Gate: Vol/OI ratio
+            if vol_oi < CONVICTION_MIN_VOL_OI:
+                continue
+
+            # Gate: Absolute volume
+            tier = _get_volume_tier(ticker)
+            if volume < tier["min_volume"] * CONVICTION_MIN_VOLUME_MULT:
+                continue
+
+            # Gate: Burst OR overwhelming cumulative ratio
+            has_burst = burst >= CONVICTION_MIN_BURST
+            has_overwhelming = vol_oi >= CONVICTION_MIN_VOL_OI * 1.5  # 15x+
+            if not has_burst and not has_overwhelming:
+                continue
+
+            # Gate: Clear direction
+            if "BULLISH" in direction.upper():
+                trade_direction = "bullish"
+                trade_side = "LONG CALL"
+                trade_emoji = "📗🚀"
+            elif "BEARISH" in direction.upper():
+                trade_direction = "bearish"
+                trade_side = "LONG PUT"
+                trade_emoji = "📕🚀"
+            else:
+                continue
+
+            # Route by DTE
+            if alert_dte <= 2:
+                route = "immediate"
+            elif alert_dte <= 7:
+                route = "income"
+            elif alert_dte <= 30:
+                route = "swing"
+            else:
+                route = "stalk"
+
+            # Cooldown per ticker per route
+            cooldown_key = f"conviction:{route}:{ticker}"
+            if not self._state.check_and_set_cooldown(
+                cooldown_key, CONVICTION_COOLDOWN
+            ):
+                continue
+
+            # Dollar estimate
+            mid = alert.get("mid", 0) or 0
+            if mid <= 0:
+                mid = (alert.get("bid", 0) + alert.get("ask", 0)) / 2
+            notional = volume * mid * 100
+
+            # Check for shadow signal convergence
+            shadow = self._get_shadow_signal(ticker)
+            has_shadow = shadow is not None
+            shadow_agrees = False
+            if has_shadow:
+                sb = (shadow.get("bias", "") or "").lower()
+                shadow_agrees = (
+                    (trade_direction == "bullish" and "bull" in sb) or
+                    (trade_direction == "bearish" and "bear" in sb)
+                )
+
+            # GEX convergence: is flow hitting a gamma level?
+            gex_amplified = False
+            gex_context = ""
+            try:
+                gamma_flip = self._state.get_gamma_flip_level(ticker)
+                gex_sign = self._state.get_gex_sign(ticker)
+                if gamma_flip > 0:
+                    strike_val = alert["strike"]
+                    spot_val = alert.get("spot", 0)
+                    dist_to_flip_pct = abs(strike_val - gamma_flip) / spot_val * 100 if spot_val > 0 else 999
+
+                    if dist_to_flip_pct < 1.5:  # strike within 1.5% of gamma flip
+                        if gex_sign == "negative":
+                            # Negative gamma + flow at flip = amplification
+                            gex_amplified = True
+                            gex_context = (f"GEX- amplified: flow at ${strike_val:.0f} "
+                                         f"near gamma flip ${gamma_flip:.0f} — "
+                                         f"dealer hedging will AMPLIFY move")
+                        else:
+                            gex_context = (f"GEX+ dampened: flow near gamma flip "
+                                         f"${gamma_flip:.0f} — dealer hedging may CAP move")
+            except Exception:
+                pass
+
+            # Re-hit data: has this strike been hit before today?
+            rehit_count = alert.get("rehit_count", 0)
+
+            # IV skew data: is the market pricing fear asymmetrically?
+            iv_skew = {}
+            try:
+                iv_skew = self._state._json_get(f"iv_skew:{ticker}") or {}
+            except Exception:
+                pass
+
+            # VPOC data: is flow hitting near the volume center of gravity?
+            vpoc_data = {}
+            vpoc_near = False
+            try:
+                vpoc_data = self._state._json_get(f"vpoc:{ticker}") or {}
+                if vpoc_data.get("vpoc") and alert.get("spot"):
+                    vpoc_dist = abs(alert["strike"] - vpoc_data["vpoc"]) / alert["spot"] * 100
+                    vpoc_near = vpoc_dist < 1.0  # within 1% of VPOC
+            except Exception:
+                pass
+
+            plays.append({
+                "ticker": ticker,
+                "strike": alert["strike"],
+                "side": side,
+                "trade_side": trade_side,
+                "trade_direction": trade_direction,
+                "trade_emoji": trade_emoji,
+                "volume": volume,
+                "oi": alert.get("oi", 0),
+                "vol_oi_ratio": vol_oi,
+                "burst": burst,
+                "dte": alert_dte,
+                "route": route,
+                "expiry": alert.get("expiry", ""),
+                "spot": alert.get("spot", 0),
+                "mid": mid,
+                "ask": alert.get("ask", 0),
+                "notional": notional,
+                "directional_bias": direction,
+                "has_shadow": has_shadow,
+                "shadow_agrees": shadow_agrees,
+                "shadow_signal": shadow,
+                "gex_amplified": gex_amplified,
+                "gex_context": gex_context,
+                "rehit_count": rehit_count,
+                "iv_skew": iv_skew,
+                "vpoc_data": vpoc_data,
+                "vpoc_near": vpoc_near,
+            })
+
+        return plays
+
+    def _get_shadow_signal(self, ticker: str) -> Optional[dict]:
+        """Get stored shadow signal for a ticker (intraday, 4hr TTL)."""
+        try:
+            return self._state._json_get(f"shadow:{ticker.upper()}")
+        except Exception:
+            return None
+
+    def format_conviction_play(self, play: dict) -> str:
+        """Format conviction play — adapts by route tier."""
+        ticker = play["ticker"]
+        strike = play["strike"]
+        side = play["side"]
+        trade_side = play["trade_side"]
+        emoji = play["trade_emoji"]
+        route = play["route"]
+        exp_str = str(play.get("expiry", ""))[:10]
+        dte = play.get("dte", 0)
+        dte_label = f"{dte}DTE" if dte > 0 else "0DTE"
+
+        notional = play.get("notional", 0)
+        if notional >= 1_000_000:
+            notional_str = f"${notional / 1_000_000:.1f}M"
+        elif notional >= 1_000:
+            notional_str = f"${notional / 1_000:.0f}K"
+        else:
+            notional_str = f"${notional:.0f}"
+
+        # Route-specific header and action
+        if route == "immediate":
+            header = f"💎🚨 CONVICTION PLAY — {ticker} {emoji}"
+            action = f"🎯 ACTION: {trade_side} ${strike:.0f} ({dte_label})"
+            urgency = f"⚠️ Institutions put {notional_str} on a {dte_label} {side}. They expect the move TODAY."
+        elif route == "income":
+            header = f"💎 FLOW CONVICTION — {ticker} (INCOME)"
+            action = f"🎯 Income setup: {dte_label} expiry — auto-scoring below"
+            urgency = f"📊 {notional_str} institutional flow at ${strike:.0f}. Short-term thesis."
+        elif route == "swing":
+            header = f"💎 FLOW CONVICTION — {ticker} (SWING)"
+            action = f"🎯 Swing setup: {dte}D expiry aligns with swing hold horizon"
+            urgency = f"📊 {notional_str} institutional positioning through {exp_str}."
+        else:  # stalk
+            header = f"💎 FLOW CONVICTION — {ticker} (CAMPAIGN)"
+            action = f"🎯 Watchlist: {dte}D institutional campaign building"
+            urgency = f"📊 {notional_str} positioned through {exp_str}. Track for entry."
+
+        lines = [
+            header,
+            "━" * 28,
+            f"⚡ {play['volume']:,} contracts at ${strike:.0f} {side.upper()} "
+            f"({play['vol_oi_ratio']:.0f}x vol/OI)",
+            f"💰 Notional: {notional_str}",
+        ]
+
+        burst = play.get("burst", 0)
+        if burst >= CONVICTION_MIN_BURST:
+            lines.append(f"Burst: +{burst:,} in last interval")
+        else:
+            lines.append(f"Buildup: {play['vol_oi_ratio']:.0f}x cumulative session vol/OI")
+
+        lines.append(f"Direction: {play['directional_bias']}")
+
+        # Shadow signal convergence
+        if play.get("shadow_agrees"):
+            shadow = play.get("shadow_signal", {})
+            lines.append(f"")
+            lines.append(f"🔗 CONFIRMED by shadow signal: {shadow.get('bias','')} "
+                        f"(score {shadow.get('score','?')}, HTF {shadow.get('htf','')})")
+
+        # GEX convergence
+        if play.get("gex_amplified"):
+            lines.append(f"⚡ {play['gex_context']}")
+        elif play.get("gex_context"):
+            lines.append(f"📐 {play['gex_context']}")
+
+        # Re-hit indicator
+        rehit = play.get("rehit_count", 0)
+        if rehit >= 3:
+            lines.append(f"🔄 MULTI-HIT #{rehit}: institutions returning to this strike repeatedly")
+        elif rehit >= 2:
+            lines.append(f"🔄 RE-HIT #{rehit}: same strike hit again — consensus building")
+
+        # IV skew context
+        skew = play.get("iv_skew", {})
+        if skew.get("skew_extreme"):
+            lines.append(f"📊 STEEP PUT SKEW: {skew['skew_ratio']:.2f}x "
+                        f"(25d put IV {skew['put_25d_iv']*100:.0f}% vs "
+                        f"call {skew['call_25d_iv']*100:.0f}%) — institutional fear signal")
+        elif skew.get("skew_direction") == "put_heavy":
+            lines.append(f"📊 Put skew {skew.get('skew_ratio',1):.2f}x — moderate protection buying")
+
+        # VPOC convergence
+        if play.get("vpoc_near"):
+            vpoc = play.get("vpoc_data", {})
+            lines.append(f"📍 Flow near VPOC ${vpoc.get('vpoc',0):.2f} — volume gravitational center")
+
+        # Earnings warning
+        if play.get("earnings_in_window"):
+            lines.append(f"")
+            lines.append(f"⚠️ EARNINGS WARNING: {play.get('earnings_note', 'earnings within expiry window')}")
+
+        lines += ["", action, f"📅 Expiry: {exp_str} ({dte_label})",
+                  f"💵 Ask: ${play.get('ask', 0):.2f} | Spot: ${play['spot']:.2f}",
+                  "", urgency]
+
+        return "\n".join(lines)
 
     # ─────────────────────────────────────────────────────
     # FORMATTING
@@ -1551,3 +2160,119 @@ class FlowDetector:
         except Exception:
             pass
         return None
+
+    # ─────────────────────────────────────────────────────
+    # CROSS-ASSET ROTATION DETECTION
+    # ─────────────────────────────────────────────────────
+
+    # Rotation patterns: when multiple asset classes move together,
+    # it signals a macro regime shift, not just a single-name trade.
+    ROTATION_PATTERNS = {
+        "risk_off": {
+            "description": "RISK-OFF ROTATION — institutions moving to safety",
+            "emoji": "🛡️",
+            "require_bearish": {"SPY", "QQQ", "IWM"},
+            "require_bullish": {"TLT", "GLD"},
+            "min_matches": 3,  # need at least 3 of the 5
+        },
+        "risk_on": {
+            "description": "RISK-ON ROTATION — institutions adding equity exposure",
+            "emoji": "🚀",
+            "require_bullish": {"SPY", "QQQ", "IWM", "XLF"},
+            "require_bearish": {"TLT", "GLD"},
+            "min_matches": 3,
+        },
+        "tech_rotation": {
+            "description": "TECH ROTATION — institutional tech accumulation",
+            "emoji": "💻",
+            "require_bullish": {"QQQ", "NVDA", "AMD", "SOXX"},
+            "require_bearish": set(),
+            "min_matches": 3,
+        },
+        "defensive": {
+            "description": "DEFENSIVE ROTATION — rotating into safe sectors",
+            "emoji": "🏥",
+            "require_bullish": {"XLV", "XLE", "GLD"},
+            "require_bearish": {"QQQ", "IWM"},
+            "min_matches": 3,
+        },
+    }
+
+    def detect_cross_asset_rotation(self, sweep_alerts: List[dict]) -> List[dict]:
+        """
+        Detect macro rotation by analyzing flow direction across asset classes.
+        Only considers significant+ flow to avoid noise.
+
+        Returns list of detected rotation patterns.
+        """
+        if not sweep_alerts:
+            return []
+
+        # Build per-ticker direction summary from significant+ alerts
+        ticker_direction = {}
+        for a in sweep_alerts:
+            if a.get("flow_level") not in ("significant", "extreme"):
+                continue
+            ticker = a["ticker"]
+            direction = (a.get("directional_bias", "") or "").upper()
+
+            # Accumulate call vs put volume per ticker
+            if ticker not in ticker_direction:
+                ticker_direction[ticker] = {"call_vol": 0, "put_vol": 0}
+            if a["side"] == "call":
+                ticker_direction[ticker]["call_vol"] += a["volume"]
+            else:
+                ticker_direction[ticker]["put_vol"] += a["volume"]
+
+        # Classify each ticker as bullish/bearish
+        bullish_tickers = set()
+        bearish_tickers = set()
+        for ticker, vols in ticker_direction.items():
+            if vols["call_vol"] > vols["put_vol"] * 1.5:
+                bullish_tickers.add(ticker)
+            elif vols["put_vol"] > vols["call_vol"] * 1.5:
+                bearish_tickers.add(ticker)
+
+        # Check each rotation pattern
+        detected = []
+        for pattern_name, pattern in self.ROTATION_PATTERNS.items():
+            bullish_matches = bullish_tickers & pattern.get("require_bullish", set())
+            bearish_matches = bearish_tickers & pattern.get("require_bearish", set())
+            total_matches = len(bullish_matches) + len(bearish_matches)
+
+            if total_matches >= pattern["min_matches"]:
+                detected.append({
+                    "pattern": pattern_name,
+                    "description": pattern["description"],
+                    "emoji": pattern["emoji"],
+                    "bullish_matches": sorted(bullish_matches),
+                    "bearish_matches": sorted(bearish_matches),
+                    "match_count": total_matches,
+                    "required": pattern["min_matches"],
+                    "all_bullish": sorted(bullish_tickers),
+                    "all_bearish": sorted(bearish_tickers),
+                })
+
+        return detected
+
+    def format_rotation_alert(self, rotation: dict) -> str:
+        """Format a cross-asset rotation detection for Telegram."""
+        lines = [
+            f"{rotation['emoji']} {rotation['description']}",
+            "━" * 28,
+        ]
+
+        if rotation["bullish_matches"]:
+            tickers = ", ".join(rotation["bullish_matches"])
+            lines.append(f"🟢 Bullish flow: {tickers}")
+        if rotation["bearish_matches"]:
+            tickers = ", ".join(rotation["bearish_matches"])
+            lines.append(f"🔴 Bearish flow: {tickers}")
+
+        lines.append(f"")
+        lines.append(f"Signal: {rotation['match_count']}/{rotation['required']}+ "
+                     f"asset classes confirm rotation pattern")
+        lines.append(f"⚠️ This is a MACRO signal — individual trades should "
+                     f"align with this direction.")
+
+        return "\n".join(lines)
