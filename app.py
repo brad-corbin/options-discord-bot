@@ -235,6 +235,7 @@ GOOGLE_SHEET_EM_TAB = os.getenv("GOOGLE_SHEET_EM_TAB", "em_predictions").strip()
 GOOGLE_SHEET_RECON_TAB = os.getenv("GOOGLE_SHEET_RECON_TAB", "em_reconciliation").strip() or "em_reconciliation"
 GOOGLE_SHEET_CRISIS_TAB = os.getenv("GOOGLE_SHEET_CRISIS_TAB", "crisis_put_signals").strip() or "crisis_put_signals"
 GOOGLE_SHEET_SHADOW_TAB = os.getenv("GOOGLE_SHEET_SHADOW_TAB", "shadow_signals").strip() or "shadow_signals"
+GOOGLE_SHEET_CONVICTION_TAB = os.getenv("GOOGLE_SHEET_CONVICTION_TAB", "conviction_plays").strip() or "conviction_plays"
 
 # ─────────────────────────────────────────────────────────
 # REDIS
@@ -334,6 +335,7 @@ def _tab_for_filename(filename: str) -> str:
         "em_reconciliation.csv": GOOGLE_SHEET_RECON_TAB,
         "crisis_put_signals.csv": GOOGLE_SHEET_CRISIS_TAB,
         "shadow_signals.csv": GOOGLE_SHEET_SHADOW_TAB,
+        "conviction_plays.csv": GOOGLE_SHEET_CONVICTION_TAB,
     }
     return mapping.get(filename, "")
 
@@ -532,14 +534,8 @@ _SHADOW_FIELDS = [
 
 def _log_shadow_signal(ticker: str, regime: str, signal: dict, why_blocked: str):
     """
-    Log a quality signal from a non-active ticker to shadow_signals.csv + Sheets.
-    Called by ActiveScanner when a signal passes technical thresholds but is
-    filtered by the regime-aware rule gate. No Telegram alert is sent.
-
-    why_blocked values:
-      'no_rule_in_regime'       — ticker not in TICKER_RULES for this regime at all
-      'rule_exists_signal_filtered' — ticker has a rule but signal didn't match
-                                      (wrong HTF, score out of range, wrong phase, etc.)
+    Log a quality signal from a non-active ticker to shadow_signals.csv + Sheets + Redis.
+    Redis storage enables flow conviction convergence checking.
     """
     try:
         from market_clock import CT
@@ -560,8 +556,217 @@ def _log_shadow_signal(ticker: str, regime: str, signal: dict, why_blocked: str)
             "why_blocked": why_blocked,
         }
         _append_csv_row("shadow_signals.csv", _SHADOW_FIELDS, row)
+
+        # Store in Redis for flow conviction convergence (4hr TTL)
+        if _persistent_state:
+            try:
+                _persistent_state.save_shadow_signal(ticker, row)
+            except Exception:
+                pass
     except Exception as e:
         log.debug(f"Shadow log failed for {ticker}: {e}")
+
+
+# ─────────────────────────────────────────────────────────
+# CONVICTION PLAY LOGGER (v6.2)
+# ─────────────────────────────────────────────────────────
+_CONVICTION_FIELDS = [
+    "date", "time_ct", "ticker", "route", "direction", "trade_side",
+    "strike", "side", "expiry", "dte",
+    "volume", "oi", "vol_oi_ratio", "burst", "notional_est",
+    "spot_at_entry", "ask_at_entry", "mid_at_entry",
+    "flow_level", "directional_bias",
+    "shadow_agrees", "shadow_bias", "shadow_score", "shadow_htf",
+    "gex_amplified", "gex_context", "rehit_count",
+    "iv_skew_ratio", "iv_skew_direction", "iv_atm",
+    "vpoc", "vpoc_near",
+    "earnings_in_window", "earnings_note",
+    "has_potter_box", "potter_box_floor", "potter_box_roof",
+    "regime", "vix",
+    "eod_spot", "pnl_pct", "outcome",  # filled by EOD reconciliation
+]
+
+def _log_conviction_play(play: dict, regime: str = "", vix: float = 0):
+    """
+    Log every conviction play with full data for threshold tuning.
+    Includes all decision inputs so we can backtest and adjust:
+    - vol/OI and burst thresholds
+    - DTE routing boundaries
+    - shadow convergence value
+    - notional thresholds
+    - win rate by route tier
+    """
+    try:
+        from market_clock import CT
+        now = datetime.now(CT)
+
+        # Check for active Potter Box
+        potter_floor = potter_roof = ""
+        has_pb = False
+        try:
+            if _potter_box:
+                pb = _potter_box.get_active_box(play["ticker"])
+                if pb:
+                    has_pb = True
+                    potter_floor = pb.get("floor", "")
+                    potter_roof = pb.get("roof", "")
+        except Exception:
+            pass
+
+        shadow = play.get("shadow_signal") or {}
+        notional = play.get("notional", 0)
+        if notional >= 1_000_000:
+            notional_str = f"${notional/1_000_000:.1f}M"
+        elif notional >= 1_000:
+            notional_str = f"${notional/1_000:.0f}K"
+        else:
+            notional_str = f"${notional:.0f}"
+
+        row = {
+            "date":             now.strftime("%Y-%m-%d"),
+            "time_ct":          now.strftime("%H:%M"),
+            "ticker":           play["ticker"],
+            "route":            play.get("route", ""),
+            "direction":        play.get("trade_direction", ""),
+            "trade_side":       play.get("trade_side", ""),
+            "strike":           play.get("strike", ""),
+            "side":             play.get("side", ""),
+            "expiry":           str(play.get("expiry", ""))[:10],
+            "dte":              play.get("dte", ""),
+            "volume":           play.get("volume", ""),
+            "oi":               play.get("oi", ""),
+            "vol_oi_ratio":     play.get("vol_oi_ratio", ""),
+            "burst":            play.get("burst", ""),
+            "notional_est":     notional_str,
+            "spot_at_entry":    play.get("spot", ""),
+            "ask_at_entry":     play.get("ask", ""),
+            "mid_at_entry":     play.get("mid", ""),
+            "flow_level":       "conviction",
+            "directional_bias": play.get("directional_bias", ""),
+            "shadow_agrees":    str(play.get("shadow_agrees", False)),
+            "shadow_bias":      shadow.get("bias", ""),
+            "shadow_score":     shadow.get("score", ""),
+            "shadow_htf":       shadow.get("htf", ""),
+            "gex_amplified":    str(play.get("gex_amplified", False)),
+            "gex_context":      play.get("gex_context", ""),
+            "rehit_count":      play.get("rehit_count", 0),
+            "iv_skew_ratio":    play.get("iv_skew", {}).get("skew_ratio", ""),
+            "iv_skew_direction": play.get("iv_skew", {}).get("skew_direction", ""),
+            "iv_atm":           play.get("iv_skew", {}).get("atm_iv", ""),
+            "vpoc":             play.get("vpoc_data", {}).get("vpoc", ""),
+            "vpoc_near":        str(play.get("vpoc_near", False)),
+            "earnings_in_window": str(play.get("earnings_in_window", False)),
+            "earnings_note":    play.get("earnings_note", ""),
+            "has_potter_box":   str(has_pb),
+            "potter_box_floor": potter_floor,
+            "potter_box_roof":  potter_roof,
+            "regime":           regime,
+            "vix":              round(vix, 1) if vix else "",
+            "eod_spot":         "",  # filled by reconciliation
+            "pnl_pct":          "",
+            "outcome":          "",
+        }
+        _append_csv_row("conviction_plays.csv", _CONVICTION_FIELDS, row)
+    except Exception as e:
+        log.debug(f"Conviction play log failed for {play.get('ticker','?')}: {e}")
+
+
+def _reconcile_conviction_plays(date_str: str):
+    """
+    At 4:15 PM CT, fetch EOD prices for today's conviction plays
+    and update the CSV/Sheets with outcome data for threshold tuning.
+    """
+    import csv, os
+    csv_path = os.path.join(
+        os.getenv("BOT_LOG_DIR", "/opt/render/project/src/bot_logs"),
+        "conviction_plays.csv")
+    if not os.path.exists(csv_path):
+        log.info("No conviction_plays.csv to reconcile")
+        return
+
+    rows = []
+    updated = 0
+    try:
+        with open(csv_path, "r") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                rows.append(dict(row))
+    except Exception as e:
+        log.warning(f"Failed to read conviction CSV: {e}")
+        return
+
+    for row in rows:
+        if row.get("date") != date_str:
+            continue
+        if row.get("eod_spot"):  # already reconciled
+            continue
+        ticker = row.get("ticker", "")
+        if not ticker:
+            continue
+
+        try:
+            spot = get_spot(ticker)
+            if not spot or spot <= 0:
+                continue
+            entry_spot = float(row.get("spot_at_entry", 0) or 0)
+            if entry_spot <= 0:
+                continue
+
+            direction = (row.get("direction", "") or "").lower()
+            if "bull" in direction:
+                pnl_pct = round((spot - entry_spot) / entry_spot * 100, 2)
+                outcome = "WIN" if spot > entry_spot else "LOSS"
+            elif "bear" in direction:
+                pnl_pct = round((entry_spot - spot) / entry_spot * 100, 2)
+                outcome = "WIN" if spot < entry_spot else "LOSS"
+            else:
+                pnl_pct = 0
+                outcome = "UNKNOWN"
+
+            row["eod_spot"] = round(spot, 2)
+            row["pnl_pct"] = pnl_pct
+            row["outcome"] = outcome
+            updated += 1
+        except Exception:
+            continue
+
+    if updated > 0:
+        try:
+            with open(csv_path, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=_CONVICTION_FIELDS)
+                writer.writeheader()
+                for row in rows:
+                    writer.writerow(row)
+            log.info(f"Conviction reconciliation: {updated} plays updated for {date_str}")
+
+            # Post summary to Telegram
+            wins = sum(1 for r in rows if r.get("date") == date_str and r.get("outcome") == "WIN")
+            losses = sum(1 for r in rows if r.get("date") == date_str and r.get("outcome") == "LOSS")
+            total = wins + losses
+            if total > 0:
+                avg_pnl = sum(float(r.get("pnl_pct", 0) or 0)
+                             for r in rows if r.get("date") == date_str and r.get("outcome") in ("WIN", "LOSS")) / total
+                summary = (
+                    f"📊 CONVICTION PLAY RESULTS — {date_str}\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"Plays: {total} | Wins: {wins} | Losses: {losses}\n"
+                    f"Win rate: {wins/total*100:.0f}% | Avg move: {avg_pnl:+.2f}%\n"
+                )
+                # Add per-play details
+                for r in rows:
+                    if r.get("date") != date_str or r.get("outcome") not in ("WIN", "LOSS"):
+                        continue
+                    emoji = "✅" if r["outcome"] == "WIN" else "❌"
+                    summary += (f"{emoji} {r['ticker']} {r.get('trade_side','')} "
+                              f"${r.get('strike','')} ({r.get('route','')}) "
+                              f"→ {float(r.get('pnl_pct',0)):+.1f}% "
+                              f"(vol/OI {r.get('vol_oi_ratio','')}x)\n")
+                try:
+                    post_to_telegram(summary)
+                except Exception:
+                    pass
+        except Exception as e:
+            log.warning(f"Conviction CSV write failed: {e}")
 
 
 # ─────────────────────────────────────────────────────────
@@ -3562,17 +3767,108 @@ def _run_v4_prefilter(ticker: str, spot: float, chains: list, candle_closes: lis
         if _oi_tracker:
             _oi_tracker.record_chain(ticker, exp, chain_data, spot=spot)
 
-        # ── Intraday flow detection (volume/OI + direction approx) ──
-        # Flow data is collected and stored for scoring (Component K, swing boost,
-        # EntryValidator, Potter Box) but NOT posted as standalone alerts.
-        # Standalone flow alerts were noise — flow only fires Telegram when it
-        # converges with another signal (shadow, swing, potter box).
+        # ── Intraday flow detection + conviction routing ──
+        # Flow data collected silently for scoring (Component K, swing, Potter Box).
+        # Conviction plays (10x+ vol/OI) are the ONLY flow that fires Telegram,
+        # routed by DTE to the appropriate engine.
         try:
             if _flow_detector:
                 _persistent_state.save_oi_baseline(ticker, exp,
                     _oi_cache._parse_chain_oi(chain_data) if _oi_cache else {})
-                _flow_detector.check_intraday_flow(ticker, exp, chain_data, spot)
-                # Flow data now stored in Redis for downstream scoring
+                flow_alerts = _flow_detector.check_intraday_flow(ticker, exp, chain_data, spot)
+
+                for cp in _flow_detector.detect_conviction_plays(flow_alerts, dte=max(dte, 0)):
+                    try:
+                        route = cp.get("route", "immediate")
+
+                        # Earnings gate: check if earnings fall within expiry window
+                        try:
+                            from data_providers import get_earnings_warning
+                            has_earn, earn_note = get_earnings_warning(
+                                cp["ticker"], within_days=max(cp.get("dte", 0) + 1, 5))
+                            if has_earn:
+                                cp["earnings_in_window"] = True
+                                cp["earnings_note"] = earn_note or "Earnings within expiry window"
+                                if route == "immediate":
+                                    route = "income"
+                                    cp["route"] = route
+                                    log.info(f"⚠️ Earnings gate: {cp['ticker']} downgraded "
+                                           f"from immediate to income ({earn_note})")
+                        except Exception:
+                            pass
+
+                        # Compute and store VPOC from bars
+                        try:
+                            from oi_flow import compute_vpoc
+                            _vpoc_bars = get_intraday_bars(cp["ticker"], count=80)
+                            if _vpoc_bars and len(_vpoc_bars) >= 10:
+                                _vpoc = compute_vpoc(_vpoc_bars)
+                                if _vpoc and _vpoc.get("vpoc"):
+                                    _persistent_state._json_set(
+                                        f"vpoc:{cp['ticker']}", _vpoc, ttl=7200)
+                        except Exception:
+                            pass
+
+                        msg = _flow_detector.format_conviction_play(cp)
+
+                        if route == "immediate":
+                            # 0-2 DTE: fire to BOTH channels immediately
+                            post_to_telegram(msg)
+                            if TELEGRAM_CHAT_INTRADAY and TELEGRAM_CHAT_INTRADAY != TELEGRAM_CHAT_ID:
+                                post_to_telegram(msg, chat_id=TELEGRAM_CHAT_INTRADAY)
+
+                        elif route == "income":
+                            # 3-7 DTE: post conviction + auto-score income idea
+                            post_to_telegram(msg)
+                            if _income_score_fn:
+                                try:
+                                    trade_type = "bull_put" if cp["trade_direction"] == "bullish" else "bear_call"
+                                    _income_score_fn(
+                                        TELEGRAM_CHAT_ID, cp["ticker"], trade_type,
+                                        cp["strike"], 2.0, 0.50,
+                                        expiry=str(cp.get("expiry",""))[:10])
+                                except Exception as _ise:
+                                    log.debug(f"Income auto-score failed for {cp['ticker']}: {_ise}")
+
+                        elif route == "swing":
+                            # 8-30 DTE: post to both channels
+                            post_to_telegram(msg)
+                            if TELEGRAM_CHAT_INTRADAY and TELEGRAM_CHAT_INTRADAY != TELEGRAM_CHAT_ID:
+                                post_to_telegram(msg, chat_id=TELEGRAM_CHAT_INTRADAY)
+
+                        elif route == "stalk":
+                            # 30-60 DTE: post campaign alert to main channel
+                            post_to_telegram(msg)
+
+                        log.info(f"💎 CONVICTION [{route.upper()}]: {cp['ticker']} "
+                               f"{cp['trade_side']} ${cp['strike']:.0f} "
+                               f"({cp['vol_oi_ratio']:.0f}x, {cp['dte']}DTE"
+                               f"{', SHADOW CONFIRMS' if cp.get('shadow_agrees') else ''})")
+
+                        # Log to conviction_plays.csv for outcome tracking
+                        try:
+                            _vix_val = 0
+                            try:
+                                vd = _get_vix_data()
+                                _vix_val = vd.get("vix", 0) if vd else 0
+                            except Exception:
+                                pass
+                            _log_conviction_play(cp,
+                                regime=get_current_regime() or "UNKNOWN",
+                                vix=_vix_val)
+                        except Exception:
+                            pass
+
+                        # Store conviction boost for EntryValidator
+                        try:
+                            if _persistent_state:
+                                boost = 14.0 if cp["vol_oi_ratio"] >= 10 else 7.0
+                                _persistent_state.save_conviction_boost(
+                                    cp["ticker"], boost, cp["trade_direction"])
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
         except Exception as _ofe:
             log.debug(f"Flow check error for {ticker}: {_ofe}")
 
@@ -4724,12 +5020,31 @@ def _get_0dte_iv(ticker: str, target_date_str: str = None) -> tuple:
         _oi_cache.save_snapshot(ticker, target, data)
         if _oi_tracker:
             _oi_tracker.record_chain(ticker, target, data, spot=spot)
-        # Intraday flow detection — silent collection for scoring
+        # Intraday flow detection — silent + tiered conviction routing
         try:
             if _flow_detector:
                 _persistent_state.save_oi_baseline(ticker, target,
                     _oi_cache._parse_chain_oi(data) if _oi_cache else {})
-                _flow_detector.check_intraday_flow(ticker, target, data, spot)
+                flow_alerts = _flow_detector.check_intraday_flow(ticker, target, data, spot)
+                for cp in _flow_detector.detect_conviction_plays(flow_alerts, dte=max(dte, 0)):
+                    try:
+                        route = cp.get("route", "immediate")
+                        msg = _flow_detector.format_conviction_play(cp)
+                        post_to_telegram(msg)
+                        if route in ("immediate", "swing") and TELEGRAM_CHAT_INTRADAY and TELEGRAM_CHAT_INTRADAY != TELEGRAM_CHAT_ID:
+                            post_to_telegram(msg, chat_id=TELEGRAM_CHAT_INTRADAY)
+                        log.info(f"💎 CONVICTION [{route.upper()}]: {cp['ticker']} "
+                               f"{cp['trade_side']} ${cp['strike']:.0f} ({cp['dte']}DTE)")
+                        # Store conviction boost for EntryValidator
+                        try:
+                            if _persistent_state:
+                                boost = 14.0 if cp["vol_oi_ratio"] >= 10 else 7.0
+                                _persistent_state.save_conviction_boost(
+                                    cp["ticker"], boost, cp.get("trade_direction", ""))
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -4905,12 +5220,31 @@ def _get_chain_iv_for_expiry(ticker: str, target_date_str: str, dte: float) -> t
         _oi_cache.save_snapshot(ticker, target, data)
         if _oi_tracker:
             _oi_tracker.record_chain(ticker, target, data, spot=spot)
-        # Intraday flow detection — silent collection for scoring
+        # Intraday flow detection — silent + tiered conviction routing
         try:
             if _flow_detector:
                 _persistent_state.save_oi_baseline(ticker, target,
                     _oi_cache._parse_chain_oi(data) if _oi_cache else {})
-                _flow_detector.check_intraday_flow(ticker, target, data, spot)
+                flow_alerts = _flow_detector.check_intraday_flow(ticker, target, data, spot)
+                for cp in _flow_detector.detect_conviction_plays(flow_alerts, dte=max(dte, 0)):
+                    try:
+                        route = cp.get("route", "immediate")
+                        msg = _flow_detector.format_conviction_play(cp)
+                        post_to_telegram(msg)
+                        if route in ("immediate", "swing") and TELEGRAM_CHAT_INTRADAY and TELEGRAM_CHAT_INTRADAY != TELEGRAM_CHAT_ID:
+                            post_to_telegram(msg, chat_id=TELEGRAM_CHAT_INTRADAY)
+                        log.info(f"💎 CONVICTION [{route.upper()}]: {cp['ticker']} "
+                               f"{cp['trade_side']} ${cp['strike']:.0f} ({cp['dte']}DTE)")
+                        # Store conviction boost for EntryValidator
+                        try:
+                            if _persistent_state:
+                                boost = 14.0 if cp["vol_oi_ratio"] >= 10 else 7.0
+                                _persistent_state.save_conviction_boost(
+                                    cp["ticker"], boost, cp.get("trade_direction", ""))
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -8114,15 +8448,45 @@ def _em_scheduler():
                                             from datetime import date as _d
                                             today = _d.today()
                                             fwd_exps = []
+                                            short_exps = []  # 0-2 DTE for conviction plays
                                             for exp in exps:
                                                 try:
                                                     exp_dt = datetime.fromisoformat(exp).date()
                                                     dte = (exp_dt - today).days
+                                                    if 0 <= dte <= 2:
+                                                        short_exps.append((exp, dte))
                                                     if 7 <= dte <= 60:
                                                         fwd_exps.append(exp)
                                                 except Exception:
                                                     continue
                                             fwd_exps = fwd_exps[:4]  # max 4 expirations
+
+                                            # Scan short-dated expirations for conviction plays
+                                            for s_exp, s_dte in short_exps[:2]:
+                                                try:
+                                                    s_data = _cached_md.get_chain(
+                                                        ticker, s_exp, strike_limit=None,
+                                                        feed="cached")
+                                                    if not isinstance(s_data, dict) or s_data.get("s") != "ok":
+                                                        continue
+                                                    s_alerts = _flow_detector.check_intraday_flow(
+                                                        ticker, s_exp, s_data, spot)
+                                                    sweep_alerts.extend(s_alerts)
+                                                    # Check for conviction plays
+                                                    for cp in _flow_detector.detect_conviction_plays(s_alerts, dte=s_dte):
+                                                        try:
+                                                            msg = _flow_detector.format_conviction_play(cp)
+                                                            post_to_telegram(msg)
+                                                            if TELEGRAM_CHAT_INTRADAY and TELEGRAM_CHAT_INTRADAY != TELEGRAM_CHAT_ID:
+                                                                post_to_telegram(msg, chat_id=TELEGRAM_CHAT_INTRADAY)
+                                                            log.info(f"💎 CONVICTION PLAY (sweep): {cp['ticker']} "
+                                                                   f"{cp['trade_side']} ${cp['strike']:.0f}")
+                                                            _log_conviction_play(cp,
+                                                                regime=get_current_regime() or "UNKNOWN")
+                                                        except Exception:
+                                                            pass
+                                                except Exception:
+                                                    continue
 
                                             for exp in fwd_exps:
                                                 try:
@@ -8134,6 +8498,27 @@ def _em_scheduler():
                                                     alerts = _flow_detector.check_intraday_flow(
                                                         ticker, exp, data, spot)
                                                     sweep_alerts.extend(alerts)
+                                                    # Conviction detection on forward expirations
+                                                    # (income 3-7, swing 8-30, stalk 30-60)
+                                                    for cp in _flow_detector.detect_conviction_plays(alerts):
+                                                        try:
+                                                            route = cp.get("route", "stalk")
+                                                            msg = _flow_detector.format_conviction_play(cp)
+                                                            post_to_telegram(msg)
+                                                            if route in ("immediate", "swing") and TELEGRAM_CHAT_INTRADAY and TELEGRAM_CHAT_INTRADAY != TELEGRAM_CHAT_ID:
+                                                                post_to_telegram(msg, chat_id=TELEGRAM_CHAT_INTRADAY)
+                                                            _log_conviction_play(cp,
+                                                                regime=get_current_regime() or "UNKNOWN")
+                                                            # Store boost for EntryValidator
+                                                            if _persistent_state:
+                                                                boost = 14.0 if cp["vol_oi_ratio"] >= 10 else 7.0
+                                                                _persistent_state.save_conviction_boost(
+                                                                    cp["ticker"], boost, cp["trade_direction"])
+                                                            log.info(f"💎 CONVICTION [{route.upper()}] (sweep): "
+                                                                   f"{cp['ticker']} {cp['trade_side']} "
+                                                                   f"${cp['strike']:.0f} ({cp['dte']}DTE)")
+                                                        except Exception:
+                                                            pass
                                                 except Exception:
                                                     continue
                                         except Exception:
@@ -8177,10 +8562,32 @@ def _em_scheduler():
                                         post_to_telegram(sm)
                                     except Exception:
                                         pass
-                                log.info(f"EOD flow summary posted ({len(eod_alerts)} alerts)")
+
+                                # Cross-asset rotation detection
+                                rotations = _flow_detector.detect_cross_asset_rotation(eod_alerts)
+                                for rot in rotations:
+                                    try:
+                                        post_to_telegram(_flow_detector.format_rotation_alert(rot))
+                                        log.info(f"🔄 Rotation detected: {rot['description']} "
+                                               f"({rot['match_count']} matches)")
+                                    except Exception:
+                                        pass
+
+                                log.info(f"EOD flow summary posted ({len(eod_alerts)} alerts, "
+                                       f"{len(rotations)} rotations)")
                                 _flow_detector._eod_sweep_alerts = []  # reset for next day
                         except Exception as _eod_e:
                             log.warning(f"EOD flow summary error: {_eod_e}")
+
+                # 4:15 PM CT — Reconcile conviction plays against EOD prices
+                _conv_recon_key = (date_str, "conviction_recon")
+                if _conv_recon_key not in fired_today:
+                    if now_ct.hour == 16 and 14 <= now_ct.minute <= 16:
+                        fired_today.add(_conv_recon_key)
+                        try:
+                            _reconcile_conviction_plays(date_str)
+                        except Exception as _cre:
+                            log.warning(f"Conviction reconciliation error: {_cre}")
 
             fired_today = {k for k in fired_today if k[0] == date_str}
         except Exception as e:
@@ -8283,11 +8690,14 @@ def _start_background_services_once():
             # Inject persistent state for Redis-backed signal cache
             from swing_scanner import set_persistent_state as _swing_set_ps
             from swing_scanner import set_flow_fn as _swing_set_flow
+            from swing_scanner import set_potter_box as _swing_set_pb
             if _persistent_state:
                 _swing_set_ps(_persistent_state)
             if _flow_detector:
                 _swing_set_flow(lambda ticker, fib_price, direction:
                     _flow_detector.get_flow_score_for_swing(ticker, fib_price, direction))
+            if _potter_box:
+                _swing_set_pb(_potter_box)
             _swing_scanner.start()
             log.info(f"Swing scanner started: {_swing_scanner.status.get('watchlist_size', 0)} tickers "
                      f"({_swing_scanner.status.get('swing_only_tickers', 0)} swing-only)")
