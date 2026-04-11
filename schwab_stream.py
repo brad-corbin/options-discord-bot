@@ -129,8 +129,15 @@ class SchwabStreamManager:
         log.info("Schwab streaming stop requested")
 
     def _run_loop(self):
-        """Outer loop with auto-reconnect."""
+        """Outer loop with auto-reconnect. Sleeps during off-hours."""
         while self._running:
+            # v7.0: Don't hammer WebSocket outside market hours
+            if not self._is_market_window():
+                with self._lock:
+                    self._connected = False
+                time.sleep(60)
+                continue
+
             try:
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
@@ -150,6 +157,18 @@ class SchwabStreamManager:
             log.info(f"Schwab stream reconnecting in {delay}s...")
             time.sleep(delay)
             self._reconnect_delay = min(self._reconnect_delay * 2, 60)
+
+    def _is_market_window(self) -> bool:
+        """True during extended market window (7 AM - 5 PM CT on weekdays).
+        Wider than regular hours to capture pre-market and after-hours quotes."""
+        try:
+            import pytz
+            ct = datetime.now(pytz.timezone("US/Central"))
+            if ct.weekday() >= 5:  # Saturday/Sunday
+                return False
+            return 7 <= ct.hour < 17
+        except Exception:
+            return True  # default to streaming if timezone check fails
 
     async def _stream(self):
         """Connect and stream Level 1 equity quotes."""
