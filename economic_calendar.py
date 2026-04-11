@@ -42,10 +42,9 @@ HIGH_IMPACT_KEYWORDS = [
     "GDP", "Gross Domestic Product",
     "PCE", "Personal Consumption",
     "PPI", "Producer Price Index",
-    "Unemployment Rate", "Jobless Claims",
+    "Unemployment Rate",
     "Retail Sales",
     "ISM Manufacturing", "ISM Services",
-    "Treasury", "Auction",
 ]
 
 MEDIUM_IMPACT_KEYWORDS = [
@@ -55,6 +54,17 @@ MEDIUM_IMPACT_KEYWORDS = [
     "Trade Balance", "Import",
     "Beige Book", "Fed Chair",
     "Existing Home Sales", "New Home Sales",
+    "Jobless Claims",
+    "10-Year", "30-Year", "20-Year",  # major bond auctions only
+]
+
+# Events that should NEVER be classified as high/medium impact
+# even if they contain partial keyword matches
+IGNORE_KEYWORDS = [
+    "Bill Auction", "Bill auction",
+    "TIPS", "FRN",  # Treasury Inflation Protected, Floating Rate Notes
+    "CMB",  # Cash Management Bills
+    "Coupon", "coupon",
 ]
 
 
@@ -76,8 +86,17 @@ def _cache_set(key, value):
 
 
 def _classify_impact(event_name: str) -> str:
-    """Classify event impact: high / medium / low."""
+    """Classify event impact: high / medium / low.
+
+    Explicit ignore list prevents bill auctions and minor treasury
+    events from being classified as high/medium impact. Only truly
+    market-moving events (CPI, FOMC, NFP, GDP) get through.
+    """
     name_upper = event_name.upper()
+    # Check ignore list first — bill auctions are never high impact
+    for kw in IGNORE_KEYWORDS:
+        if kw.upper() in name_upper:
+            return "low"
     for kw in HIGH_IMPACT_KEYWORDS:
         if kw.upper() in name_upper:
             return "high"
