@@ -55,7 +55,7 @@ log = logging.getLogger(__name__)
 
 # ── Watchlist tiers ──
 # Tier A: index ETFs — highest priority, scanned every 5 min
-TIER_A = ["QQQ", "IWM"]   # SPY removed — not in backtest ruleset
+TIER_A = ["SPY", "QQQ", "IWM"]   # SPY restored — primary trading instrument
 
 # Tier B: mega-cap stocks — every 10 min
 TIER_B = [
