@@ -2763,7 +2763,7 @@ def md_get(url, params=None, retries=2):
 
 # v4.1: Cached API layer — reduces duplicate API calls by 70-90%
 # v5.1.1: Counter wraps md_get inside CachedMarketData for per-endpoint tracking
-# Schwab Adapter 
+# v7.0: Schwab primary, MarketData fallback
 from schwab_adapter import build_data_router
 _cached_md = build_data_router(md_get)
 
@@ -8437,130 +8437,9 @@ def _em_scheduler():
                                        name="flow-confirm").start()
                         log.info("Flow morning confirmation triggered")
 
-                # Forward flow sweeps — 9:15, 11:00, 1:30, 2:45 CT
-                _flow_sweep_times = [(9, 15), (11, 0), (13, 30), (14, 45)]
-                for _fh, _fm in _flow_sweep_times:
-                    _flow_sweep_key = (date_str, f"flow_sweep_{_fh}_{_fm}")
-                    if _flow_sweep_key not in fired_today:
-                        if now_ct.hour == _fh and abs(now_ct.minute - _fm) <= 1:
-                            fired_today.add(_flow_sweep_key)
-                            def _run_flow_sweep(_hour=_fh, _minute=_fm):
-                                try:
-                                    from oi_flow import FLOW_TICKERS
-                                    sweep_alerts = []
-                                    for ticker in FLOW_TICKERS:
-                                        try:
-                                            spot = get_spot(ticker)
-                                            if not spot or spot <= 0:
-                                                continue
-                                            exps = get_expirations(ticker) or []
-                                            # Forward expirations: 7-60 DTE
-                                            from datetime import date as _d
-                                            today = _d.today()
-                                            fwd_exps = []
-                                            short_exps = []  # 0-2 DTE for conviction plays
-                                            for exp in exps:
-                                                try:
-                                                    exp_dt = datetime.fromisoformat(exp).date()
-                                                    dte = (exp_dt - today).days
-                                                    if 0 <= dte <= 2:
-                                                        short_exps.append((exp, dte))
-                                                    if 7 <= dte <= 60:
-                                                        fwd_exps.append(exp)
-                                                except Exception:
-                                                    continue
-                                            fwd_exps = fwd_exps[:4]  # max 4 expirations
-
-                                            # Scan short-dated expirations for conviction plays
-                                            for s_exp, s_dte in short_exps[:2]:
-                                                try:
-                                                    s_data = _cached_md.get_chain(
-                                                        ticker, s_exp, strike_limit=None,
-                                                        feed="cached")
-                                                    if not isinstance(s_data, dict) or s_data.get("s") != "ok":
-                                                        continue
-                                                    s_alerts = _flow_detector.check_intraday_flow(
-                                                        ticker, s_exp, s_data, spot)
-                                                    sweep_alerts.extend(s_alerts)
-                                                    # Check for conviction plays
-                                                    for cp in _flow_detector.detect_conviction_plays(s_alerts, dte=s_dte):
-                                                        try:
-                                                            msg = _flow_detector.format_conviction_play(cp)
-                                                            post_to_telegram(msg)
-                                                            if TELEGRAM_CHAT_INTRADAY and TELEGRAM_CHAT_INTRADAY != TELEGRAM_CHAT_ID:
-                                                                post_to_telegram(msg, chat_id=TELEGRAM_CHAT_INTRADAY)
-                                                            log.info(f"💎 CONVICTION PLAY (sweep): {cp['ticker']} "
-                                                                   f"{cp['trade_side']} ${cp['strike']:.0f}")
-                                                            _log_conviction_play(cp,
-                                                                regime=get_current_regime() or "UNKNOWN")
-                                                        except Exception:
-                                                            pass
-                                                except Exception:
-                                                    continue
-
-                                            for exp in fwd_exps:
-                                                try:
-                                                    data = _cached_md.get_chain(
-                                                        ticker, exp, strike_limit=None,
-                                                        feed="cached")  # 1 credit total
-                                                    if not isinstance(data, dict) or data.get("s") != "ok":
-                                                        continue
-                                                    alerts = _flow_detector.check_intraday_flow(
-                                                        ticker, exp, data, spot)
-                                                    sweep_alerts.extend(alerts)
-                                                    # Conviction detection on forward expirations
-                                                    # (income 3-7, swing 8-30, stalk 30-60)
-                                                    for cp in _flow_detector.detect_conviction_plays(alerts):
-                                                        try:
-                                                            route = cp.get("route", "stalk")
-                                                            msg = _flow_detector.format_conviction_play(cp)
-                                                            post_to_telegram(msg)
-                                                            if route in ("immediate", "swing") and TELEGRAM_CHAT_INTRADAY and TELEGRAM_CHAT_INTRADAY != TELEGRAM_CHAT_ID:
-                                                                post_to_telegram(msg, chat_id=TELEGRAM_CHAT_INTRADAY)
-                                                            # Income tier: run real ITQS scan
-                                                            if route == "income" and _income_scan_fn:
-                                                                try:
-                                                                    _income_scan_fn(TELEGRAM_CHAT_ID, cp["ticker"])
-                                                                except Exception:
-                                                                    pass
-                                                            _log_conviction_play(cp,
-                                                                regime=get_current_regime() or "UNKNOWN")
-                                                            # Store boost for EntryValidator
-                                                            if _persistent_state:
-                                                                boost = 14.0 if cp["vol_oi_ratio"] >= 10 else 7.0
-                                                                _persistent_state.save_conviction_boost(
-                                                                    cp["ticker"], boost, cp["trade_direction"])
-                                                            log.info(f"💎 CONVICTION [{route.upper()}] (sweep): "
-                                                                   f"{cp['ticker']} {cp['trade_side']} "
-                                                                   f"${cp['strike']:.0f} ({cp['dte']}DTE)")
-                                                        except Exception:
-                                                            pass
-                                                except Exception:
-                                                    continue
-                                        except Exception:
-                                            continue
-
-                                    # Flow data collected silently — NO standalone alerts.
-                                    # Data feeds into Component K, swing boost, Potter Box.
-                                    # EOD summary posted at 3:05 PM instead of per-sweep spam.
-                                    postable_count = sum(1 for fa in sweep_alerts
-                                                        if fa.get("should_alert") and
-                                                        fa.get("flow_level") in ("significant", "extreme"))
-
-                                    # Store sweep alerts for EOD summary
-                                    if not hasattr(_flow_detector, '_eod_sweep_alerts'):
-                                        _flow_detector._eod_sweep_alerts = []
-                                    _flow_detector._eod_sweep_alerts.extend(
-                                        [fa for fa in sweep_alerts if fa.get("should_alert")])
-
-                                    log.info(f"Flow sweep {_hour}:{_minute:02d} complete: "
-                                           f"{len(sweep_alerts)} alerts ({postable_count} significant+) "
-                                           f"across {len(FLOW_TICKERS)} tickers — stored for EOD summary")
-                                except Exception as _fe:
-                                    log.warning(f"Flow sweep error: {_fe}")
-                            threading.Thread(target=_run_flow_sweep, daemon=True,
-                                           name=f"flow-sweep-{_fh}{_fm}").start()
-                            log.info(f"Flow sweep triggered ({_fh}:{_fm:02d} CT)")
+                # v7.0: 4x daily flow sweeps REPLACED by continuous flow scanner
+                # (schwab_stream.ContinuousFlowScanner — scans 5 tickers every 60s)
+                # Kept EOD summary and morning confirmation above.
 
                 # 3:05 PM CT — End-of-day: save volume flags + post flow summary
                 _flow_eod_key = (date_str, "flow_eod")
@@ -8773,6 +8652,25 @@ def _initialize_app():
         if _tg_ws and BOT_URL and _acquire_background_leader():
             register_webhook(BOT_URL, _tg_ws)
         _start_background_services_once()
+
+        # Phase 2: Schwab streaming + continuous flow scanning
+        try:
+            from schwab_stream import start_streaming, start_continuous_flow
+            start_streaming(_cached_md)
+            start_continuous_flow(
+                cached_md=_cached_md,
+                flow_detector=_flow_detector,
+                get_spot_fn=get_spot,
+                get_expirations_fn=get_expirations,
+                post_fn=post_to_telegram,
+                log_conviction_fn=_log_conviction_play,
+                get_regime_fn=get_current_regime,
+                income_scan_fn=_income_scan_fn,
+                persistent_state=_persistent_state,
+                intraday_chat_id=TELEGRAM_CHAT_INTRADAY,
+            )
+        except Exception as _e:
+            log.warning(f"Phase 2 streaming init failed: {_e}")
 
 
 # ─────────────────────────────────────────────────────────
