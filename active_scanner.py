@@ -72,9 +72,9 @@ TIER_C = [
     "JPM", "GS", "BA", "CAT", "LLY", "UNH",
 ]
 
-SCAN_INTERVAL_A = 300    # 5 min
-SCAN_INTERVAL_B = 600    # 10 min
-SCAN_INTERVAL_C = 900    # 15 min
+SCAN_INTERVAL_A = 120    # v7.0: was 300 — streaming spots + Schwab bars are free
+SCAN_INTERVAL_B = 180    # v7.0: was 600
+SCAN_INTERVAL_C = 300    # v7.0: was 900
 
 # ── Technical signal thresholds ──
 EMA_FAST    = 5
@@ -194,10 +194,16 @@ def _analyze_ticker(
     daily_candle_fn: Callable,
     regime: str = "BEAR",
     flow_boost_fn: Callable = None,
+    spot_override: float = None,
 ) -> Optional[Dict]:
     """
     Run technical analysis on a ticker using intraday + daily data.
     Returns signal dict if a setup is detected, None otherwise.
+
+    v7.0: spot_override — when streaming spot is available, use it instead
+    of the (potentially stale) last 5-min bar close. Technical indicators
+    (EMAs, MACD, WaveTrend) still compute on bars, but scoring uses the
+    live spot for VWAP comparison and distance calculations.
     """
     def _reject(reason: str) -> None:
         log.debug(f"Scanner reject {ticker}: {reason}")
@@ -224,6 +230,10 @@ def _analyze_ticker(
             return _reject(f"insufficient_bars ({len(closes)} < 12)")
 
         spot = closes[-1]
+
+        # v7.0: Use streaming spot if available (sub-second vs 5-min bar close)
+        if spot_override and spot_override > 0:
+            spot = spot_override
 
         bar_count = len(closes)
         if bar_count >= 40:
@@ -583,12 +593,21 @@ class ActiveScanner:
 
         regime = self._get_regime()
 
+        # v7.0: Get streaming spot for fresher analysis
+        streaming_spot = None
+        try:
+            from schwab_stream import get_streaming_spot
+            streaming_spot = get_streaming_spot(ticker)
+        except ImportError:
+            pass
+
         signal = _analyze_ticker(
             ticker=ticker,
             intraday_fn=self._intraday,
             daily_candle_fn=self._candles,
             regime=regime,
             flow_boost_fn=self._flow_boost_fn,
+            spot_override=streaming_spot,
         )
         if not signal:
             return
