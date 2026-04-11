@@ -119,6 +119,12 @@ def _init_schwab_client():
       1. SCHWAB_TOKEN_JSON env var (base64-encoded token.json contents)
          → decoded and written to SCHWAB_TOKEN_PATH on startup
       2. Existing token file at SCHWAB_TOKEN_PATH
+
+    Token persistence:
+      A background thread watches the token file for changes.
+      When schwab-py refreshes the token, the updated file is
+      base64-encoded and pushed to Render's API so SCHWAB_TOKEN_JSON
+      always has the latest refresh token. Requires RENDER_API_KEY.
     """
     app_key = os.environ.get("SCHWAB_APP_KEY", "")
     app_secret = os.environ.get("SCHWAB_APP_SECRET", "")
@@ -147,6 +153,10 @@ def _init_schwab_client():
         client = client_from_token_file(token_path, app_key, app_secret,
                                         callback_url=callback_url)
         log.info("Schwab client initialised from token file")
+
+        # Start token sync thread
+        _start_token_sync(token_path)
+
         return client
     except FileNotFoundError:
         log.error(f"Schwab token file not found at {token_path}. "
@@ -155,6 +165,71 @@ def _init_schwab_client():
     except Exception as e:
         log.error(f"Schwab client init failed: {e}")
         return None
+
+
+def _start_token_sync(token_path: str):
+    """Background thread that watches token.json for changes and syncs
+    the updated token back to Render's SCHWAB_TOKEN_JSON env var.
+
+    Requires env vars:
+      RENDER_API_KEY     — Render API key (Account Settings → API Keys)
+      RENDER_SERVICE_ID  — auto-set by Render, or set manually
+    """
+    render_api_key = os.environ.get("RENDER_API_KEY", "")
+    service_id = os.environ.get("RENDER_SERVICE_ID", "")
+
+    if not render_api_key:
+        log.info("RENDER_API_KEY not set — token auto-sync disabled. "
+                 "Token will still work but won't survive redeploys after 7 days.")
+        return
+    if not service_id:
+        log.warning("RENDER_SERVICE_ID not set — token auto-sync disabled.")
+        return
+
+    def _sync_loop():
+        import base64
+        last_mtime = 0
+        try:
+            last_mtime = os.path.getmtime(token_path)
+        except OSError:
+            pass
+
+        while True:
+            try:
+                time.sleep(60)  # check every 60 seconds
+                try:
+                    current_mtime = os.path.getmtime(token_path)
+                except OSError:
+                    continue
+                if current_mtime <= last_mtime:
+                    continue
+
+                # Token file changed — read and push to Render
+                last_mtime = current_mtime
+                with open(token_path, "rb") as f:
+                    token_bytes = f.read()
+                new_b64 = base64.b64encode(token_bytes).decode("utf-8")
+
+                import requests as _req
+                resp = _req.put(
+                    f"https://api.render.com/v1/services/{service_id}/env-vars/SCHWAB_TOKEN_JSON",
+                    headers={
+                        "Authorization": f"Bearer {render_api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={"value": new_b64},
+                    timeout=15,
+                )
+                if resp.status_code == 200:
+                    log.info("Schwab token synced to Render env var (no redeploy triggered)")
+                else:
+                    log.warning(f"Schwab token sync failed: {resp.status_code} {resp.text[:200]}")
+            except Exception as e:
+                log.debug(f"Token sync error: {e}")
+
+    t = threading.Thread(target=_sync_loop, name="schwab-token-sync", daemon=True)
+    t.start()
+    log.info("Schwab token auto-sync thread started")
 
 
 # ─────────────────────────────────────────────────────────────
