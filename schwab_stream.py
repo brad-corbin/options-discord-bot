@@ -82,6 +82,263 @@ def get_streaming_spot(ticker: str) -> Optional[float]:
 
 
 # ─────────────────────────────────────────────────────────────
+# Option Quote Store — streaming Level 1 option quotes
+# ─────────────────────────────────────────────────────────────
+
+class OptionQuoteStore:
+    """Thread-safe store for streaming Level 1 option quotes.
+
+    Tracks live bid/ask/last/volume/OI/greeks per OCC symbol.
+    Maintains previous-volume snapshot for volume-delta (sweep) detection.
+    """
+
+    def __init__(self, stale_threshold: float = 60):
+        self._quotes = {}      # occ_symbol → {fields..., _ts}
+        self._prev_volume = {}  # occ_symbol → last-known total volume (for delta calc)
+        self._lock = threading.Lock()
+        self._stale_threshold = stale_threshold
+        self._stats = {"updates": 0, "sweeps_detected": 0}
+
+    def update(self, occ_symbol: str, fields: dict):
+        """Update a single option quote from streaming data.
+        Returns volume_delta if volume increased (potential sweep), else 0.
+        """
+        now = time.monotonic()
+        volume_delta = 0
+        with self._lock:
+            self._stats["updates"] += 1
+            new_vol = fields.get("volume", 0) or 0
+            prev_vol = self._prev_volume.get(occ_symbol, 0)
+            if new_vol > prev_vol > 0:
+                volume_delta = new_vol - prev_vol
+            self._prev_volume[occ_symbol] = new_vol
+            self._quotes[occ_symbol] = {**fields, "_ts": now}
+        return volume_delta
+
+    def get(self, occ_symbol: str) -> Optional[dict]:
+        """Get a fresh option quote, or None if stale/missing."""
+        with self._lock:
+            entry = self._quotes.get(occ_symbol)
+            if entry is None:
+                return None
+            if time.monotonic() - entry["_ts"] > self._stale_threshold:
+                return None
+            return {k: v for k, v in entry.items() if k != "_ts"}
+
+    def get_by_underlying(self, ticker: str) -> list:
+        """Get all fresh option quotes for an underlying ticker.
+        Parses the OCC symbol to match the underlying.
+        """
+        ticker_upper = ticker.upper().ljust(6)
+        now = time.monotonic()
+        results = []
+        with self._lock:
+            for sym, entry in self._quotes.items():
+                if sym[:6] == ticker_upper and now - entry["_ts"] <= self._stale_threshold:
+                    results.append({"symbol": sym, **{k: v for k, v in entry.items() if k != "_ts"}})
+        return results
+
+    def get_live_premium(self, occ_symbol: str) -> Optional[float]:
+        """Get live mid price for an option contract."""
+        q = self.get(occ_symbol)
+        if q is None:
+            return None
+        bid = q.get("bid", 0) or 0
+        ask = q.get("ask", 0) or 0
+        if bid > 0 and ask > 0:
+            return round((bid + ask) / 2, 4)
+        return q.get("mark") or q.get("last") or None
+
+    def get_live_greeks(self, occ_symbol: str) -> Optional[dict]:
+        """Get live Greeks for an option contract."""
+        q = self.get(occ_symbol)
+        if q is None:
+            return None
+        return {
+            "delta": q.get("delta", 0),
+            "gamma": q.get("gamma", 0),
+            "theta": q.get("theta", 0),
+            "vega": q.get("vega", 0),
+            "iv": q.get("iv", 0),
+        }
+
+    @property
+    def active_count(self) -> int:
+        now = time.monotonic()
+        with self._lock:
+            return sum(1 for e in self._quotes.values()
+                       if now - e["_ts"] <= self._stale_threshold)
+
+    @property
+    def stats(self) -> dict:
+        with self._lock:
+            return {**self._stats, "active_quotes": self.active_count,
+                    "total_symbols": len(self._quotes)}
+
+
+# Global instance
+_option_store = OptionQuoteStore()
+
+
+def get_option_store() -> OptionQuoteStore:
+    """Get the global OptionQuoteStore for consumers."""
+    return _option_store
+
+
+def get_streaming_option(occ_symbol: str) -> Optional[dict]:
+    """Get a streaming option quote if available and fresh."""
+    return _option_store.get(occ_symbol)
+
+
+def get_live_premium(occ_symbol: str) -> Optional[float]:
+    """Get live mid price for an option contract from streaming."""
+    return _option_store.get_live_premium(occ_symbol)
+
+
+def get_live_greeks(occ_symbol: str) -> Optional[dict]:
+    """Get live Greeks for an option contract from streaming."""
+    return _option_store.get_live_greeks(occ_symbol)
+
+
+# ─────────────────────────────────────────────────────────────
+# OCC Symbol Utilities
+# ─────────────────────────────────────────────────────────────
+
+def build_occ_symbol(ticker: str, expiry: str, side: str, strike: float) -> str:
+    """Build an OCC option symbol for Schwab streaming.
+
+    Format: TICKER (6 chars padded) + YYMMDD + C/P + strike*1000 (8 digits)
+    Example: 'AAPL  260417C00200000' for AAPL Apr 17 2026 200 Call
+    """
+    padded = ticker.upper().ljust(6)
+    # expiry is YYYY-MM-DD
+    dt = datetime.strptime(expiry, "%Y-%m-%d")
+    date_part = dt.strftime("%y%m%d")
+    cp = "C" if side.lower() == "call" else "P"
+    strike_int = int(round(strike * 1000))
+    strike_part = f"{strike_int:08d}"
+    return f"{padded}{date_part}{cp}{strike_part}"
+
+
+def parse_occ_symbol(occ: str) -> Optional[dict]:
+    """Parse an OCC option symbol into components."""
+    try:
+        ticker = occ[:6].strip()
+        date_str = occ[6:12]
+        cp = occ[12]
+        strike = int(occ[13:21]) / 1000
+        expiry = datetime.strptime(date_str, "%y%m%d").strftime("%Y-%m-%d")
+        return {"ticker": ticker, "expiry": expiry,
+                "side": "call" if cp == "C" else "put", "strike": strike}
+    except Exception:
+        return None
+
+
+# ─────────────────────────────────────────────────────────────
+# SweepDetector — real-time sweep detection from streaming volume deltas
+# ─────────────────────────────────────────────────────────────
+
+class SweepDetector:
+    """Detects option sweeps from streaming volume deltas.
+
+    A sweep is a large volume increment in a single streaming update,
+    especially when the trade occurs at the ask (buy sweep) or bid (sell sweep).
+
+    Fires callbacks when detected. Runs passively — called by the option handler.
+    """
+
+    # Minimum volume delta to consider a sweep
+    MIN_SWEEP_VOLUME = 50
+    # Minimum notional (volume × mid × 100) for significant sweep
+    MIN_SWEEP_NOTIONAL = 25_000
+    # Cooldown per symbol (seconds)
+    COOLDOWN = 120
+
+    def __init__(self, on_sweep: Optional[Callable] = None):
+        self._on_sweep = on_sweep
+        self._cooldowns = {}   # occ_symbol → last_fire_epoch
+        self._lock = threading.Lock()
+        self._stats = {"sweeps_detected": 0, "sweeps_fired": 0}
+
+    def check(self, occ_symbol: str, volume_delta: int, quote: dict):
+        """Called by the option handler on every volume delta > 0."""
+        if volume_delta < self.MIN_SWEEP_VOLUME:
+            return
+
+        mid = 0
+        bid = quote.get("bid", 0) or 0
+        ask = quote.get("ask", 0) or 0
+        last = quote.get("last", 0) or 0
+        if bid > 0 and ask > 0:
+            mid = (bid + ask) / 2
+        elif last > 0:
+            mid = last
+        if mid <= 0:
+            return
+
+        notional = volume_delta * mid * 100
+        if notional < self.MIN_SWEEP_NOTIONAL:
+            return
+
+        # Determine sweep direction from last vs bid/ask
+        sweep_side = "unknown"
+        if ask > bid > 0 and last > 0:
+            spread = ask - bid
+            if last >= ask - (spread * 0.15):
+                sweep_side = "buy"
+            elif last <= bid + (spread * 0.15):
+                sweep_side = "sell"
+
+        now = time.time()
+        with self._lock:
+            self._stats["sweeps_detected"] += 1
+            last_fire = self._cooldowns.get(occ_symbol, 0)
+            if now - last_fire < self.COOLDOWN:
+                return
+            self._cooldowns[occ_symbol] = now
+            self._stats["sweeps_fired"] += 1
+
+        parsed = parse_occ_symbol(occ_symbol)
+        sweep = {
+            "occ_symbol": occ_symbol,
+            "ticker": parsed["ticker"] if parsed else occ_symbol[:6].strip(),
+            "strike": parsed["strike"] if parsed else 0,
+            "side": parsed["side"] if parsed else "unknown",
+            "expiry": parsed["expiry"] if parsed else "",
+            "volume_delta": volume_delta,
+            "notional": round(notional),
+            "sweep_side": sweep_side,  # buy/sell/unknown
+            "last": last,
+            "bid": bid,
+            "ask": ask,
+            "delta": quote.get("delta", 0),
+            "iv": quote.get("iv", 0),
+            "timestamp": now,
+        }
+
+        log.info(f"SWEEP DETECTED: {sweep['ticker']} {sweep['strike']} {sweep['side']} "
+                 f"vol_delta={volume_delta} notional=${notional:,.0f} side={sweep_side}")
+
+        if self._on_sweep:
+            try:
+                self._on_sweep(sweep)
+            except Exception as e:
+                log.warning(f"Sweep callback error: {e}")
+
+    @property
+    def stats(self) -> dict:
+        with self._lock:
+            return dict(self._stats)
+
+
+_sweep_detector = None
+
+
+def get_sweep_detector() -> Optional[SweepDetector]:
+    return _sweep_detector
+
+
+# ─────────────────────────────────────────────────────────────
 # SchwabStreamManager — WebSocket Level 1 equity streaming
 # ─────────────────────────────────────────────────────────────
 
@@ -94,19 +351,26 @@ class SchwabStreamManager:
     Updates SpotPriceStore which the DataRouter checks before REST.
     """
 
-    def __init__(self, schwab_client, tickers: list):
+    def __init__(self, schwab_client, tickers: list,
+                 option_symbols: list = None):
         self._client = schwab_client
         self._tickers = tickers
+        self._option_symbols = list(option_symbols or [])
+        self._pending_option_adds = []   # symbols queued for dynamic add
+        self._pending_option_unsubs = [] # symbols queued for removal
+        self._stream_client = None       # set during _stream for dynamic ops
         self._thread = None
         self._running = False
         self._connected = False
         self._reconnect_delay = 5  # seconds, doubles on failure, max 60
         self._stats = {
             "updates_received": 0,
+            "option_updates_received": 0,
             "connects": 0,
             "disconnects": 0,
             "errors": 0,
             "last_update": None,
+            "option_symbols_subscribed": 0,
         }
         self._lock = threading.Lock()
 
@@ -122,7 +386,28 @@ class SchwabStreamManager:
             daemon=True,
         )
         self._thread.start()
-        log.info(f"Schwab streaming started for {len(self._tickers)} tickers")
+        log.info(f"Schwab streaming started for {len(self._tickers)} equity + "
+                 f"{len(self._option_symbols)} option symbols")
+
+    def add_option_symbols(self, symbols: list):
+        """Queue option symbols for dynamic subscription (thread-safe)."""
+        if not symbols:
+            return
+        with self._lock:
+            existing = set(self._option_symbols)
+            new_syms = [s for s in symbols if s not in existing]
+            if new_syms:
+                self._pending_option_adds.extend(new_syms)
+                self._option_symbols.extend(new_syms)
+                log.info(f"Queued {len(new_syms)} option symbols for streaming subscription")
+
+    def remove_option_symbols(self, symbols: list):
+        """Queue option symbols for removal."""
+        if not symbols:
+            return
+        with self._lock:
+            self._pending_option_unsubs.extend(symbols)
+            self._option_symbols = [s for s in self._option_symbols if s not in set(symbols)]
 
     def stop(self):
         self._running = False
@@ -171,7 +456,7 @@ class SchwabStreamManager:
             return True  # default to streaming if timezone check fails
 
     async def _stream(self):
-        """Connect and stream Level 1 equity quotes."""
+        """Connect and stream Level 1 equity + option quotes."""
         from schwab.streaming import StreamClient
 
         # Get account ID
@@ -186,6 +471,7 @@ class SchwabStreamManager:
 
         stream_client = StreamClient(self._client, account_id=account_id)
         await stream_client.login()
+        self._stream_client = stream_client
 
         with self._lock:
             self._stats["connects"] += 1
@@ -194,13 +480,12 @@ class SchwabStreamManager:
 
         log.info(f"Schwab WebSocket connected (account: ...{account_id[-4:]})")
 
-        # Register handler for equity quotes
+        # ── Equity handler ──
         def _equity_handler(msg):
             try:
                 content = msg.get("content", [])
                 for item in content:
                     ticker = item.get("key", "")
-                    # Try MARK first, then LAST_PRICE
                     price = item.get("MARK") or item.get("LAST_PRICE") or 0
                     if ticker and price and price > 0:
                         _spot_store.update(ticker, float(price))
@@ -212,8 +497,7 @@ class SchwabStreamManager:
 
         stream_client.add_level_one_equity_handler(_equity_handler)
 
-        # Subscribe to all tickers
-        fields = [
+        equity_fields = [
             StreamClient.LevelOneEquityFields.SYMBOL,
             StreamClient.LevelOneEquityFields.LAST_PRICE,
             StreamClient.LevelOneEquityFields.MARK,
@@ -221,12 +505,113 @@ class SchwabStreamManager:
             StreamClient.LevelOneEquityFields.ASK_PRICE,
             StreamClient.LevelOneEquityFields.TOTAL_VOLUME,
         ]
-        await stream_client.level_one_equity_subs(self._tickers, fields=fields)
+        await stream_client.level_one_equity_subs(self._tickers, fields=equity_fields)
         log.info(f"Subscribed to Level 1 equity quotes: {len(self._tickers)} symbols")
 
-        # Read messages until disconnected
+        # ── Option handler (Phase 3) ──
+        def _option_handler(msg):
+            try:
+                content = msg.get("content", [])
+                for item in content:
+                    occ_sym = item.get("key", "")
+                    if not occ_sym:
+                        continue
+                    fields = {
+                        "bid": item.get("BID_PRICE", 0) or 0,
+                        "ask": item.get("ASK_PRICE", 0) or 0,
+                        "last": item.get("LAST_PRICE", 0) or 0,
+                        "mark": item.get("MARK", 0) or 0,
+                        "volume": item.get("TOTAL_VOLUME", 0) or 0,
+                        "oi": item.get("OPEN_INTEREST", 0) or 0,
+                        "delta": item.get("DELTA", 0) or 0,
+                        "gamma": item.get("GAMMA", 0) or 0,
+                        "theta": item.get("THETA", 0) or 0,
+                        "vega": item.get("VEGA", 0) or 0,
+                        "iv": item.get("VOLATILITY", 0) or 0,
+                        "last_size": item.get("LAST_SIZE", 0) or 0,
+                        "bid_size": item.get("BID_SIZE", 0) or 0,
+                        "ask_size": item.get("ASK_SIZE", 0) or 0,
+                        "underlying_price": item.get("UNDERLYING_PRICE", 0) or 0,
+                    }
+                    vol_delta = _option_store.update(occ_sym, fields)
+                    with self._lock:
+                        self._stats["option_updates_received"] += 1
+
+                    # Feed sweep detector
+                    if vol_delta > 0 and _sweep_detector:
+                        _sweep_detector.check(occ_sym, vol_delta, fields)
+            except Exception as e:
+                log.debug(f"Option handler error: {e}")
+
+        stream_client.add_level_one_option_handler(_option_handler)
+
+        # Subscribe to initial option symbols if any
+        option_fields = [
+            StreamClient.LevelOneOptionFields.SYMBOL,
+            StreamClient.LevelOneOptionFields.BID_PRICE,
+            StreamClient.LevelOneOptionFields.ASK_PRICE,
+            StreamClient.LevelOneOptionFields.LAST_PRICE,
+            StreamClient.LevelOneOptionFields.MARK,
+            StreamClient.LevelOneOptionFields.TOTAL_VOLUME,
+            StreamClient.LevelOneOptionFields.OPEN_INTEREST,
+            StreamClient.LevelOneOptionFields.DELTA,
+            StreamClient.LevelOneOptionFields.GAMMA,
+            StreamClient.LevelOneOptionFields.THETA,
+            StreamClient.LevelOneOptionFields.VEGA,
+            StreamClient.LevelOneOptionFields.VOLATILITY,
+            StreamClient.LevelOneOptionFields.LAST_SIZE,
+            StreamClient.LevelOneOptionFields.BID_SIZE,
+            StreamClient.LevelOneOptionFields.ASK_SIZE,
+            StreamClient.LevelOneOptionFields.UNDERLYING_PRICE,
+        ]
+        self._option_fields = option_fields
+
+        with self._lock:
+            initial_opts = list(self._option_symbols)
+        if initial_opts:
+            await stream_client.level_one_option_subs(initial_opts, fields=option_fields)
+            with self._lock:
+                self._stats["option_symbols_subscribed"] = len(initial_opts)
+            log.info(f"Subscribed to Level 1 option quotes: {len(initial_opts)} symbols")
+
+        # Read messages + process pending subscription changes
+        _pending_check_interval = 5  # seconds
+        _last_pending_check = time.monotonic()
+
         while self._running:
             await stream_client.handle_message()
+
+            # Periodically process pending option symbol adds/unsubs
+            now_mono = time.monotonic()
+            if now_mono - _last_pending_check >= _pending_check_interval:
+                _last_pending_check = now_mono
+                await self._process_pending_subs(stream_client)
+
+    async def _process_pending_subs(self, stream_client):
+        """Add/remove option symbols dynamically without reconnecting."""
+        with self._lock:
+            adds = list(self._pending_option_adds)
+            self._pending_option_adds.clear()
+            unsubs = list(self._pending_option_unsubs)
+            self._pending_option_unsubs.clear()
+
+        if adds:
+            try:
+                await stream_client.level_one_option_add(adds, fields=self._option_fields)
+                with self._lock:
+                    self._stats["option_symbols_subscribed"] += len(adds)
+                log.info(f"Dynamically added {len(adds)} option symbols to stream")
+            except Exception as e:
+                log.warning(f"Failed to add option symbols: {e}")
+
+        if unsubs:
+            try:
+                await stream_client.level_one_option_unsubs(unsubs)
+                with self._lock:
+                    self._stats["option_symbols_subscribed"] -= len(unsubs)
+                log.info(f"Unsubscribed {len(unsubs)} option symbols from stream")
+            except Exception as e:
+                log.warning(f"Failed to unsub option symbols: {e}")
 
     @property
     def status(self) -> dict:
@@ -235,6 +620,7 @@ class SchwabStreamManager:
                 "connected": self._connected,
                 "tickers": len(self._tickers),
                 "active_spots": _spot_store.active_count,
+                "option_quotes_active": _option_store.active_count,
                 **self._stats,
             }
 
@@ -589,6 +975,9 @@ def get_stream_status() -> dict:
         status["continuous_flow"] = _flow_scanner.status
     if _fib_monitor:
         status["fib_monitor"] = _fib_monitor.status
+    if _sweep_detector:
+        status["sweep_detector"] = _sweep_detector.stats
+    status["option_store"] = _option_store.stats
     status["spot_store"] = _spot_store.get_all()
     return status
 
@@ -1065,4 +1454,266 @@ def start_box_break_monitor(potter_box_scanner, post_fn: Callable) -> Optional[P
         return _box_monitor
     except Exception as e:
         log.warning(f"Failed to start Potter Box break monitor: {e}")
+        return None
+
+
+# ─────────────────────────────────────────────────────────────
+# OptionSymbolManager — resolves & maintains near-ATM option
+# symbols for streaming subscription
+# ─────────────────────────────────────────────────────────────
+
+class OptionSymbolManager:
+    """Resolves near-ATM option symbols for flow tickers and keeps
+    streaming subscriptions current as spot prices move.
+
+    On startup: fetches expirations + spots for all tickers, builds
+    OCC symbols for the nearest 2 expirations × 3 strikes per side.
+    Every REFRESH_INTERVAL: checks if spot has moved enough to warrant
+    re-centering strikes, adds new symbols, unsubs stale ones.
+    """
+
+    STRIKES_PER_SIDE = 3        # ATM ± 3 strikes per side (call + put)
+    MAX_EXPIRATIONS = 2         # 0DTE/1DTE + nearest weekly
+    REFRESH_INTERVAL = 300      # re-center strikes every 5 min
+    SPOT_DRIFT_PCT = 0.5        # re-center if spot drifted > 0.5% from last center
+
+    def __init__(self, tickers: list, get_spot_fn: Callable,
+                 get_expirations_fn: Callable, get_chain_fn: Callable,
+                 stream_manager: SchwabStreamManager):
+        self._tickers = tickers
+        self._get_spot = get_spot_fn
+        self._get_exps = get_expirations_fn
+        self._get_chain = get_chain_fn
+        self._stream = stream_manager
+        self._subscribed = set()         # currently subscribed OCC symbols
+        self._center_spots = {}          # ticker → spot when last centered
+        self._thread = None
+        self._running = False
+        self._lock = threading.Lock()
+        self._stats = {"refreshes": 0, "symbols_added": 0, "symbols_removed": 0}
+
+    def start(self):
+        self._running = True
+        self._thread = threading.Thread(
+            target=self._run, name="option-sym-mgr", daemon=True)
+        self._thread.start()
+        log.info(f"OptionSymbolManager started for {len(self._tickers)} tickers")
+
+    def stop(self):
+        self._running = False
+
+    def _run(self):
+        """Initial resolution + periodic refresh loop."""
+        # Wait a few seconds for equity stream to stabilize
+        time.sleep(10)
+        self._full_refresh()
+        while self._running:
+            time.sleep(self.REFRESH_INTERVAL)
+            if not self._running:
+                break
+            self._check_drift()
+
+    def _full_refresh(self):
+        """Resolve near-ATM symbols for all tickers."""
+        today = date.today()
+        all_new = set()
+        for ticker in self._tickers:
+            try:
+                syms = self._resolve_symbols(ticker, today)
+                all_new.update(syms)
+            except Exception as e:
+                log.debug(f"OptionSymbolManager: {ticker} resolve failed: {e}")
+
+        with self._lock:
+            to_add = all_new - self._subscribed
+            to_remove = self._subscribed - all_new
+            self._subscribed = all_new
+            self._stats["refreshes"] += 1
+            self._stats["symbols_added"] += len(to_add)
+            self._stats["symbols_removed"] += len(to_remove)
+
+        if to_add:
+            self._stream.add_option_symbols(list(to_add))
+        if to_remove:
+            self._stream.remove_option_symbols(list(to_remove))
+
+        log.info(f"OptionSymbolManager: subscribed {len(all_new)} option symbols "
+                 f"(+{len(to_add)} -{len(to_remove)})")
+
+    def _check_drift(self):
+        """Re-center any tickers whose spot has drifted significantly."""
+        today = date.today()
+        drifted = []
+        for ticker in self._tickers:
+            spot = get_streaming_spot(ticker)
+            if not spot:
+                continue
+            prev = self._center_spots.get(ticker)
+            if prev and abs(spot - prev) / prev < self.SPOT_DRIFT_PCT / 100:
+                continue
+            drifted.append(ticker)
+
+        if not drifted:
+            return
+
+        new_syms = set()
+        for ticker in drifted:
+            try:
+                syms = self._resolve_symbols(ticker, today)
+                new_syms.update(syms)
+            except Exception:
+                pass
+
+        with self._lock:
+            to_add = new_syms - self._subscribed
+            # Only remove symbols for drifted tickers, keep others
+            drifted_set = set(drifted)
+            old_for_drifted = {s for s in self._subscribed
+                               if parse_occ_symbol(s) and parse_occ_symbol(s)["ticker"] in drifted_set}
+            to_remove = old_for_drifted - new_syms
+            self._subscribed = (self._subscribed - to_remove) | to_add
+            self._stats["refreshes"] += 1
+            self._stats["symbols_added"] += len(to_add)
+            self._stats["symbols_removed"] += len(to_remove)
+
+        if to_add:
+            self._stream.add_option_symbols(list(to_add))
+        if to_remove:
+            self._stream.remove_option_symbols(list(to_remove))
+
+        if to_add or to_remove:
+            log.info(f"OptionSymbolManager drift refresh: +{len(to_add)} -{len(to_remove)} "
+                     f"for {len(drifted)} tickers")
+
+    def _resolve_symbols(self, ticker: str, today: date) -> set:
+        """Get near-ATM OCC symbols for one ticker."""
+        spot = get_streaming_spot(ticker)
+        if not spot:
+            try:
+                spot = self._get_spot(ticker)
+            except Exception:
+                return set()
+        if not spot or spot <= 0:
+            return set()
+
+        self._center_spots[ticker] = spot
+
+        # Get expirations
+        exps = []
+        try:
+            raw_exps = self._get_exps(ticker) or []
+            for exp in raw_exps:
+                try:
+                    exp_dt = datetime.fromisoformat(exp).date()
+                    dte = (exp_dt - today).days
+                    if 0 <= dte <= 7:
+                        exps.append(exp)
+                    if len(exps) >= self.MAX_EXPIRATIONS:
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            return set()
+
+        if not exps:
+            return set()
+
+        # Resolve strikes: fetch chain for nearest expiry to get actual strike ladder
+        symbols = set()
+        for exp in exps:
+            try:
+                chain = self._get_chain(ticker, exp, strike_limit=self.STRIKES_PER_SIDE * 2 + 1)
+                if not isinstance(chain, dict) or chain.get("s") != "ok":
+                    continue
+                strikes = chain.get("strike", [])
+                sides = chain.get("side", [])
+                option_syms = chain.get("optionSymbol", [])
+
+                # Collect unique strikes near ATM
+                unique_strikes = sorted(set(s for s in strikes if s and abs(s - spot) / spot < 0.03))
+                # Find ATM index
+                if not unique_strikes:
+                    continue
+                atm_idx = min(range(len(unique_strikes)),
+                              key=lambda i: abs(unique_strikes[i] - spot))
+                start = max(0, atm_idx - self.STRIKES_PER_SIDE)
+                end = min(len(unique_strikes), atm_idx + self.STRIKES_PER_SIDE + 1)
+                selected_strikes = set(unique_strikes[start:end])
+
+                # Build OCC symbols for selected strikes × both sides
+                for i, sym in enumerate(option_syms):
+                    if i < len(strikes) and strikes[i] in selected_strikes:
+                        symbols.add(sym)
+
+            except Exception as e:
+                log.debug(f"OptionSymbolManager chain error {ticker}/{exp}: {e}")
+
+        return symbols
+
+    def subscribe_specific(self, occ_symbols: list):
+        """Manually subscribe to specific OCC symbols (e.g., for active trades)."""
+        with self._lock:
+            new = [s for s in occ_symbols if s not in self._subscribed]
+            self._subscribed.update(new)
+        if new:
+            self._stream.add_option_symbols(new)
+            log.info(f"OptionSymbolManager: manually subscribed {len(new)} symbols")
+
+    @property
+    def status(self) -> dict:
+        with self._lock:
+            return {"subscribed": len(self._subscribed), **self._stats}
+
+
+_option_sym_manager = None
+
+
+def get_option_symbol_manager() -> Optional[OptionSymbolManager]:
+    return _option_sym_manager
+
+
+def start_option_streaming(cached_md, get_spot_fn: Callable,
+                           get_expirations_fn: Callable,
+                           on_sweep_fn: Optional[Callable] = None
+                           ) -> Optional[OptionSymbolManager]:
+    """Start Phase 3 option streaming: symbol resolution + sweep detection.
+
+    Must be called AFTER start_streaming() so _stream_manager exists.
+
+    Usage in app.py:
+        from schwab_stream import start_option_streaming
+        start_option_streaming(
+            cached_md=_cached_md,
+            get_spot_fn=get_spot,
+            get_expirations_fn=get_expirations,
+            on_sweep_fn=_handle_sweep,
+        )
+    """
+    global _option_sym_manager, _sweep_detector
+
+    if not _stream_manager:
+        log.warning("Option streaming: equity stream not running, skipping")
+        return None
+
+    try:
+        # Initialize sweep detector
+        _sweep_detector = SweepDetector(on_sweep=on_sweep_fn)
+
+        # Initialize symbol manager
+        def _get_chain(ticker, exp, strike_limit=None):
+            return cached_md.get_chain(ticker, exp, strike_limit=strike_limit)
+
+        _option_sym_manager = OptionSymbolManager(
+            tickers=list(getattr(cached_md, '_tickers', None) or
+                         __import__('oi_flow', fromlist=['FLOW_TICKERS']).FLOW_TICKERS),
+            get_spot_fn=get_spot_fn,
+            get_expirations_fn=get_expirations_fn,
+            get_chain_fn=_get_chain,
+            stream_manager=_stream_manager,
+        )
+        _option_sym_manager.start()
+        log.info("Phase 3 option streaming started: symbol manager + sweep detector")
+        return _option_sym_manager
+    except Exception as e:
+        log.warning(f"Failed to start option streaming: {e}")
         return None
