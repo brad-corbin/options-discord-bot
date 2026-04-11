@@ -49,8 +49,15 @@ SHORT_LEG_MIN_DELTA_PUT  = -0.40    # Short put delta floor (absolute value)
 # For 0-3 DTE: allow ATM short leg (delta ~0.45-0.55) for cheaper spreads.
 # For 4+ DTE: prefer ITM short leg (delta >= 0.55) for higher probability.
 SHORT_LEG_DTE_ITM_THRESHOLD = 4     # DTE above this prefers ITM short leg
-WIDTH_PREFERENCE         = [1.0, 2.50, 5.0]
+WIDTH_PREFERENCE         = [1.0, 2.0, 2.50, 5.0]
 NO_HALF_DOLLAR_WIDTHS    = True
+
+# ─────────────────────────────────────────────────────────
+# SIGNAL VALIDATION — single source of truth for prechain + live
+# ─────────────────────────────────────────────────────────
+SIGNAL_STALE_AFTER_SEC       = 900    # 15 min — shared by prechain gate + app.py
+SCALP_SIGNAL_HARD_BLOCK_PCT  = 1.50   # max price drift for scalp/intraday
+SWING_SIGNAL_HARD_BLOCK_PCT  = 2.50   # max price drift for swing/daily
 
 # ─────────────────────────────────────────────────────────
 # COST / QUALITY FILTERS
