@@ -202,24 +202,86 @@ def parse_chain_volume_oi(chain_data: dict, spot: float) -> List[dict]:
         # Vol/OI ratio
         vol_oi = vol / oi if oi > 0 else (999.0 if vol > 0 else 0)
 
-        # Direction approximation
-        direction_approx = "unknown"
-        if mid > 0 and last > 0:
-            if last > mid * 1.01:
-                direction_approx = "buyer_initiated"
-            elif last < mid * 0.99:
-                direction_approx = "seller_initiated"
-            else:
-                direction_approx = "neutral"
+        # ── v7.0: Enhanced direction inference ──────────────────────
+        # With 60s continuous scanning (Schwab), these signals are now
+        # real-time instead of 15-min delayed. Each signal gets a
+        # confidence weight; the composite determines trade side.
+        #
+        # Signal 1: Last vs Ask/Bid (strongest — actual trade execution)
+        #   last >= ask  → aggressive BUY (someone paid the full ask)
+        #   last <= bid  → aggressive SELL (someone hit the bid)
+        #   This was unreliable with 15-min delay; now it's live.
+        #
+        # Signal 2: Last vs Mid (weaker confirmation)
+        #   last > mid   → buying pressure
+        #   last < mid   → selling pressure
+        #
+        # Signal 3: Book imbalance (bid_size vs ask_size)
+        #   bid_heavy    → demand (buyers stacking)
+        #   ask_heavy    → supply (sellers stacking)
+        #
+        # Combined: all signals agree = HIGH confidence direction.
+        # Signals conflict = LOW confidence (noise/market-maker activity).
+        # ────────────────────────────────────────────────────────────
 
-        # Book imbalance
+        direction_approx = "unknown"
+        direction_confidence = 0.0  # 0.0-1.0
+
+        buy_signals = 0
+        sell_signals = 0
+        total_signals = 0
+
+        # Signal 1: Last vs Bid/Ask (weight: 3)
+        if last > 0 and bid > 0 and ask > 0 and ask > bid:
+            spread = ask - bid
+            if spread > 0:
+                total_signals += 3
+                if last >= ask - (spread * 0.1):
+                    # Traded at or above ask — aggressive buyer
+                    buy_signals += 3
+                elif last <= bid + (spread * 0.1):
+                    # Traded at or below bid — aggressive seller
+                    sell_signals += 3
+                elif last > mid:
+                    buy_signals += 1
+                    total_signals -= 1  # weaker signal, adjust weight
+                elif last < mid:
+                    sell_signals += 1
+                    total_signals -= 1
+        elif mid > 0 and last > 0:
+            # Fallback when bid/ask unavailable — use mid comparison
+            total_signals += 2
+            if last > mid * 1.005:
+                buy_signals += 2
+            elif last < mid * 0.995:
+                sell_signals += 2
+
+        # Signal 2: Book imbalance (weight: 1)
         book_imbalance = "balanced"
         if bid_sz > 0 and ask_sz > 0:
             ratio = bid_sz / ask_sz
             if ratio > 2.0:
-                book_imbalance = "bid_heavy"  # demand
+                book_imbalance = "bid_heavy"
+                buy_signals += 1
+                total_signals += 1
             elif ratio < 0.5:
-                book_imbalance = "ask_heavy"  # supply
+                book_imbalance = "ask_heavy"
+                sell_signals += 1
+                total_signals += 1
+            else:
+                total_signals += 1  # neutral counts toward total
+
+        # Composite direction
+        if total_signals > 0:
+            if buy_signals > sell_signals:
+                direction_approx = "buyer_initiated"
+                direction_confidence = buy_signals / total_signals
+            elif sell_signals > buy_signals:
+                direction_approx = "seller_initiated"
+                direction_confidence = sell_signals / total_signals
+            else:
+                direction_approx = "neutral"
+                direction_confidence = 0.3
 
         results.append({
             "strike": float(strike),
@@ -234,6 +296,7 @@ def parse_chain_volume_oi(chain_data: dict, spot: float) -> List[dict]:
             "bidSize": bid_sz,
             "askSize": ask_sz,
             "direction_approx": direction_approx,
+            "direction_confidence": round(direction_confidence, 2),
             "book_imbalance": book_imbalance,
             "dist_from_spot_pct": round(dist_pct * 100, 2),
         })
@@ -513,6 +576,9 @@ class FlowDetector:
         self._state = persistent_state
         self._post = post_fn
         self._spot_history = {}  # {ticker: [(timestamp, spot), ...]} for pre-move detection
+        # v7.0: Volume velocity tracker — consecutive snapshots show flow direction
+        # Key: "ticker:strike:side" → list of (timestamp, volume, direction_approx, confidence)
+        self._flow_velocity = {}  # tracks last N snapshots per contract for sustained flow detection
 
     # ─────────────────────────────────────────────────────
     # PHASE 1: INTRADAY VOLUME DETECTION
@@ -607,21 +673,92 @@ class FlowDetector:
 
             is_burst = burst >= VOLUME_BURST_THRESHOLD
 
-            # Directional inference
+            # ── v7.0: Enhanced directional inference ──────────────────
+            # Uses composite direction_confidence from parse_chain_volume_oi.
+            # With 60s scanning, "buyer_initiated" now means the LAST TRADE
+            # hit the ask within the last minute — real signal, not noise.
+            dir_conf = p.get("direction_confidence", 0)
+            high_confidence = dir_conf >= 0.6
+
             if p["side"] == "call":
                 if p["direction_approx"] == "buyer_initiated":
-                    directional = "BULLISH (call buying)"
+                    if high_confidence:
+                        directional = "BULLISH (aggressive call buying)"
+                    else:
+                        directional = "BULLISH (call buying)"
                 elif p["direction_approx"] == "seller_initiated":
-                    directional = "BEARISH (call selling/writing)"
+                    if high_confidence:
+                        directional = "BEARISH (aggressive call selling)"
+                    else:
+                        directional = "BEARISH (call selling/writing)"
                 else:
                     directional = "BULLISH lean (call volume)"
             else:  # put
                 if p["direction_approx"] == "buyer_initiated":
-                    directional = "BEARISH (put buying)"
+                    if high_confidence:
+                        directional = "BEARISH (aggressive put buying)"
+                    else:
+                        directional = "BEARISH (put buying)"
                 elif p["direction_approx"] == "seller_initiated":
-                    directional = "BULLISH (put selling/writing)"
+                    if high_confidence:
+                        directional = "BULLISH (aggressive put selling)"
+                    else:
+                        directional = "BULLISH (put selling/writing)"
                 else:
                     directional = "BEARISH lean (put volume)"
+
+            # ── v7.0: Volume velocity tracking ────────────────────────
+            # Track consecutive snapshots for sustained flow detection.
+            # 3+ consecutive snapshots with same direction = SUSTAINED.
+            # Sustained flow with high confidence = institutional, not noise.
+            velocity_key = f"{ticker}:{p['strike']}:{p['side']}"
+            now_ts = time.time()
+            sustained_flow = False
+            velocity_count = 0
+            try:
+                if velocity_key not in self._flow_velocity:
+                    self._flow_velocity[velocity_key] = []
+
+                self._flow_velocity[velocity_key].append({
+                    "ts": now_ts,
+                    "vol": vol,
+                    "burst": burst,
+                    "dir": p["direction_approx"],
+                    "conf": dir_conf,
+                })
+                # Trim to last 10 snapshots (10 minutes at 60s interval)
+                self._flow_velocity[velocity_key] = [
+                    s for s in self._flow_velocity[velocity_key]
+                    if now_ts - s["ts"] < 600
+                ][-10:]
+
+                # Check for sustained flow: 3+ consecutive same-direction
+                recent = self._flow_velocity[velocity_key]
+                if len(recent) >= 3:
+                    last_3_dirs = [s["dir"] for s in recent[-3:]]
+                    if (all(d == "buyer_initiated" for d in last_3_dirs) or
+                        all(d == "seller_initiated" for d in last_3_dirs)):
+                        sustained_flow = True
+                        velocity_count = len(recent)
+                        # Boost direction label
+                        if "BULLISH" in directional and sustained_flow:
+                            directional = directional.replace("BULLISH", "BULLISH SUSTAINED")
+                        elif "BEARISH" in directional and sustained_flow:
+                            directional = directional.replace("BEARISH", "BEARISH SUSTAINED")
+            except Exception:
+                pass
+
+            # Volume velocity: contracts per minute in last 3 snapshots
+            vol_per_min = 0
+            try:
+                recent = self._flow_velocity.get(velocity_key, [])
+                if len(recent) >= 2:
+                    time_span = recent[-1]["ts"] - recent[0]["ts"]
+                    vol_delta = recent[-1]["vol"] - recent[0]["vol"]
+                    if time_span > 0 and vol_delta > 0:
+                        vol_per_min = int(vol_delta / (time_span / 60))
+            except Exception:
+                pass
 
             # New strike detection (OI=0 but volume > minimum)
             is_new_strike = oi == 0 and vol >= min_vol
@@ -650,6 +787,7 @@ class FlowDetector:
                 "vol_oi_ratio": vol_oi,
                 "flow_level": flow_level,
                 "direction_approx": p["direction_approx"],
+                "direction_confidence": dir_conf,
                 "directional_bias": directional,
                 "book_imbalance": p["book_imbalance"],
                 "dist_from_spot_pct": p["dist_from_spot_pct"],
@@ -660,6 +798,9 @@ class FlowDetector:
                 "burst": burst,
                 "is_burst": is_burst,
                 "is_new_strike": is_new_strike,
+                "sustained_flow": sustained_flow,
+                "velocity_count": velocity_count,
+                "vol_per_min": vol_per_min,
                 "should_alert": should_alert,
                 "timestamp": datetime.now().isoformat(),
                 "rehit_count": 0,
@@ -1501,10 +1642,18 @@ class FlowDetector:
             # Gate: Burst OR overwhelming cumulative ratio
             has_burst = burst >= CONVICTION_MIN_BURST
             has_overwhelming = vol_oi >= CONVICTION_MIN_VOL_OI * 1.5  # 15x+
-            if not has_burst and not has_overwhelming:
+            # v7.0: Sustained flow can substitute for burst — if the same
+            # direction has persisted for 3+ consecutive 60s snapshots,
+            # the flow is real even without a single massive burst.
+            has_sustained = alert.get("sustained_flow", False)
+            if not has_burst and not has_overwhelming and not has_sustained:
                 continue
 
             # Gate: Clear direction
+            # v7.0: Require minimum direction confidence for conviction plays.
+            # "lean" directions (unknown trade side) need burst OR sustained
+            # to qualify — they're ambiguous without trade-side data.
+            dir_conf = alert.get("direction_confidence", 0)
             if "BULLISH" in direction.upper():
                 trade_direction = "bullish"
                 trade_side = "LONG CALL"
@@ -1514,6 +1663,13 @@ class FlowDetector:
                 trade_side = "LONG PUT"
                 trade_emoji = "📕🚀"
             else:
+                continue
+
+            # v7.0: If direction is just a "lean" (no trade-side data),
+            # require either burst or sustained flow — leans alone aren't
+            # enough for a conviction play without confirmed trade side.
+            is_lean = "lean" in direction.lower()
+            if is_lean and not has_burst and not has_sustained:
                 continue
 
             # ── DIRECTION FLIP = EXIT SIGNAL ──
@@ -1782,6 +1938,11 @@ class FlowDetector:
                 "strike_guidance": strike_guidance,
                 "potter_box_gate": potter_box_gate,
                 "potter_context": potter_context,
+                # v7.0: Enhanced direction data
+                "direction_confidence": dir_conf,
+                "sustained_flow": alert.get("sustained_flow", False),
+                "velocity_count": alert.get("velocity_count", 0),
+                "vol_per_min": alert.get("vol_per_min", 0),
                 "potter_location": potter_location,
             })
 
@@ -1869,6 +2030,21 @@ class FlowDetector:
             lines.append(f"Buildup: {play['vol_oi_ratio']:.0f}x cumulative session vol/OI")
 
         lines.append(f"Direction: {play['directional_bias']}")
+
+        # v7.0: Direction confidence + velocity indicators
+        dir_conf = play.get("direction_confidence", 0)
+        if dir_conf >= 0.75:
+            lines.append(f"🎯 Direction confidence: HIGH ({dir_conf:.0%}) — trade side confirmed at bid/ask")
+        elif dir_conf >= 0.5:
+            lines.append(f"📊 Direction confidence: MODERATE ({dir_conf:.0%})")
+
+        if play.get("sustained_flow"):
+            vel_count = play.get("velocity_count", 0)
+            vol_pm = play.get("vol_per_min", 0)
+            lines.append(f"🔥 SUSTAINED FLOW: {vel_count} consecutive snapshots same direction"
+                        + (f" ({vol_pm:,}/min)" if vol_pm > 0 else ""))
+        elif play.get("vol_per_min", 0) > 500:
+            lines.append(f"⚡ Sweep velocity: {play['vol_per_min']:,} contracts/min")
 
         # ── PRE-MOVE WARNING ──
         if is_reactive:
