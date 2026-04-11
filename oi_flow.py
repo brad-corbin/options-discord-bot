@@ -512,6 +512,7 @@ class FlowDetector:
         """
         self._state = persistent_state
         self._post = post_fn
+        self._spot_history = {}  # {ticker: [(timestamp, spot), ...]} for pre-move detection
 
     # ─────────────────────────────────────────────────────
     # PHASE 1: INTRADAY VOLUME DETECTION
@@ -547,6 +548,21 @@ class FlowDetector:
             skew = compute_iv_skew(chain_data, spot)
             if skew and skew.get("atm_iv", 0) > 0:
                 self._state._json_set(f"iv_skew:{ticker}", skew, ttl=7200)
+        except Exception:
+            pass
+
+        # Track spot price history for pre-move detection
+        # Keeps last 60 min of spot data per ticker
+        try:
+            now_ts = time.time()
+            if ticker not in self._spot_history:
+                self._spot_history[ticker] = []
+            self._spot_history[ticker].append((now_ts, spot))
+            # Trim to last 60 minutes
+            cutoff = now_ts - 3600
+            self._spot_history[ticker] = [
+                (t, s) for t, s in self._spot_history[ticker] if t > cutoff
+            ]
         except Exception:
             pass
 
@@ -1385,6 +1401,41 @@ class FlowDetector:
 
         return ideas
 
+    def _get_recent_move_pct(self, ticker: str, lookback_min: int = 30) -> float:
+        """
+        Get the percentage price move in the last N minutes.
+        Used to detect reactive flow (hedging/profit-taking after a big move)
+        vs predictive flow (directional bet in calm conditions).
+        """
+        history = self._spot_history.get(ticker.upper(), [])
+        if len(history) < 2:
+            return 0.0
+        now_ts = time.time()
+        cutoff = now_ts - (lookback_min * 60)
+        # Find the oldest spot in the lookback window
+        old_spots = [(t, s) for t, s in history if t <= cutoff + 120]  # within 2 min of cutoff
+        if not old_spots:
+            # Use oldest available
+            old_spots = [history[0]]
+        oldest_spot = old_spots[0][1]
+        current_spot = history[-1][1]
+        if oldest_spot <= 0:
+            return 0.0
+        return abs(current_spot - oldest_spot) / oldest_spot * 100
+
+    @staticmethod
+    def _get_ct_time() -> Tuple[int, int]:
+        """Get current Central Time hour and minute."""
+        try:
+            from zoneinfo import ZoneInfo
+            ct = datetime.now(ZoneInfo("America/Chicago"))
+            return ct.hour, ct.minute
+        except Exception:
+            # Fallback: UTC - 5 for CDT
+            utc_now = datetime.now()
+            ct_hour = (utc_now.hour - 5) % 24
+            return ct_hour, utc_now.minute
+
     # ─────────────────────────────────────────────────────
     # CONVICTION PLAY — tiered by DTE
     # ─────────────────────────────────────────────────────
@@ -1393,18 +1444,22 @@ class FlowDetector:
                                  dte: int = None) -> List[dict]:
         """
         Detect overwhelming institutional flow and route by DTE:
-          0-2 DTE → "immediate" — LONG CALL/PUT, fire now
+          0-2 DTE → "immediate" — LONG CALL/PUT with 1DTE vehicle
           3-7 DTE → "income"   — auto-score income idea, post if ITQS > 60
           8-30 DTE → "swing"   — boost swing signal or create stalk
           30-60 DTE → "stalk"  — watchlist, track campaign
 
-        Triggers (all tiers):
-          - Vol/OI >= 10x
-          - Volume >= 5x tier minimum
-          - Burst >= 5K in one interval OR cumulative vol/OI >= 15x
-          - Clear directional bias
+        Rules:
+          - 0DTE after 10:30 CT → silenced (closing/hedging noise)
+          - 0DTE never boosts income tier
+          - Pre-move >2% in 30 min → flagged as reactive (hedging)
+          - Opposite direction on same ticker → exit signal, not new entry
+          - Recommends ATM/near-money strike, not just side
         """
         plays = []
+        ct_hour, ct_minute = self._get_ct_time()
+        ct_minutes_total = ct_hour * 60 + ct_minute
+        ZERO_DTE_CUTOFF = 10 * 60 + 30  # 10:30 CT
 
         for alert in alerts:
             ticker = alert["ticker"]
@@ -1426,6 +1481,12 @@ class FlowDetector:
 
             # Skip anything beyond 60 DTE
             if alert_dte > 60:
+                continue
+
+            # ── 0DTE TIME GATE ──
+            # After 10:30 CT, 0DTE flow is mostly closing/hedging/gamma noise.
+            # Not directional conviction. Silence completely.
+            if alert_dte == 0 and ct_minutes_total > ZERO_DTE_CUTOFF:
                 continue
 
             # Gate: Vol/OI ratio
@@ -1455,6 +1516,29 @@ class FlowDetector:
             else:
                 continue
 
+            # ── DIRECTION FLIP = EXIT SIGNAL ──
+            # If we already have a conviction play in the opposite direction
+            # for this ticker, this is an exit signal, not a new entry.
+            is_exit_signal = False
+            try:
+                existing = self._state._json_get(f"conviction_dir:{ticker}")
+                if existing:
+                    existing_dir = existing.get("direction", "")
+                    if existing_dir and existing_dir != trade_direction:
+                        is_exit_signal = True
+            except Exception:
+                pass
+
+            # Store current direction for future flip detection (4hr TTL)
+            try:
+                self._state._json_set(f"conviction_dir:{ticker}", {
+                    "direction": trade_direction,
+                    "strike": alert["strike"],
+                    "time": datetime.now().isoformat(),
+                }, ttl=14400)
+            except Exception:
+                pass
+
             # Route by DTE
             if alert_dte <= 2:
                 route = "immediate"
@@ -1465,6 +1549,12 @@ class FlowDetector:
             else:
                 route = "stalk"
 
+            # ── 0DTE NEVER ROUTES TO INCOME ──
+            # 0DTE flow expires before the income spread does.
+            # The flow signal and the trade vehicle are on different timelines.
+            if alert_dte == 0 and route == "income":
+                continue
+
             # Cooldown per ticker per route
             cooldown_key = f"conviction:{route}:{ticker}"
             if not self._state.check_and_set_cooldown(
@@ -1472,11 +1562,36 @@ class FlowDetector:
             ):
                 continue
 
+            # ── PRE-MOVE FILTER ──
+            # If stock moved >2% in last 30 min, flow is likely reactive
+            # (hedging, profit-taking, closing losers) not predictive.
+            recent_move_pct = self._get_recent_move_pct(ticker, lookback_min=30)
+            is_reactive = recent_move_pct >= 2.0
+
             # Dollar estimate
             mid = alert.get("mid", 0) or 0
             if mid <= 0:
                 mid = (alert.get("bid", 0) + alert.get("ask", 0)) / 2
             notional = volume * mid * 100
+
+            # ── ATM STRIKE GUIDANCE ──
+            # Recommend ATM or first ITM strike based on current spot
+            spot = alert.get("spot", 0)
+            if spot > 0:
+                if trade_direction == "bullish":
+                    # ATM call or first ITM (strike just below spot)
+                    atm_strike = round(spot)  # nearest dollar
+                    strike_guidance = f"Buy ATM CALL near ${atm_strike:.0f}"
+                else:
+                    atm_strike = round(spot)
+                    strike_guidance = f"Buy ATM PUT near ${atm_strike:.0f}"
+            else:
+                strike_guidance = trade_side
+
+            # ── 1DTE VEHICLE for 0DTE plays ──
+            # The institutional flow is the signal. Next expiry is the vehicle.
+            # Avoids theta death spiral on late-morning entries.
+            recommend_1dte = (alert_dte == 0)
 
             # Check for shadow signal convergence
             shadow = self._get_shadow_signal(ticker)
@@ -1502,7 +1617,6 @@ class FlowDetector:
 
                     if dist_to_flip_pct < 1.5:  # strike within 1.5% of gamma flip
                         if gex_sign == "negative":
-                            # Negative gamma + flow at flip = amplification
                             gex_amplified = True
                             gex_context = (f"GEX- amplified: flow at ${strike_val:.0f} "
                                          f"near gamma flip ${gamma_flip:.0f} — "
@@ -1513,24 +1627,24 @@ class FlowDetector:
             except Exception:
                 pass
 
-            # Re-hit data: has this strike been hit before today?
+            # Re-hit data
             rehit_count = alert.get("rehit_count", 0)
 
-            # IV skew data: is the market pricing fear asymmetrically?
+            # IV skew data
             iv_skew = {}
             try:
                 iv_skew = self._state._json_get(f"iv_skew:{ticker}") or {}
             except Exception:
                 pass
 
-            # VPOC data: is flow hitting near the volume center of gravity?
+            # VPOC data
             vpoc_data = {}
             vpoc_near = False
             try:
                 vpoc_data = self._state._json_get(f"vpoc:{ticker}") or {}
                 if vpoc_data.get("vpoc") and alert.get("spot"):
                     vpoc_dist = abs(alert["strike"] - vpoc_data["vpoc"]) / alert["spot"] * 100
-                    vpoc_near = vpoc_dist < 1.0  # within 1% of VPOC
+                    vpoc_near = vpoc_dist < 1.0
             except Exception:
                 pass
 
@@ -1562,6 +1676,12 @@ class FlowDetector:
                 "iv_skew": iv_skew,
                 "vpoc_data": vpoc_data,
                 "vpoc_near": vpoc_near,
+                # New fields
+                "is_exit_signal": is_exit_signal,
+                "is_reactive": is_reactive,
+                "recent_move_pct": round(recent_move_pct, 1),
+                "recommend_1dte": recommend_1dte,
+                "strike_guidance": strike_guidance,
             })
 
         return plays
@@ -1584,6 +1704,10 @@ class FlowDetector:
         exp_str = str(play.get("expiry", ""))[:10]
         dte = play.get("dte", 0)
         dte_label = f"{dte}DTE" if dte > 0 else "0DTE"
+        is_exit = play.get("is_exit_signal", False)
+        is_reactive = play.get("is_reactive", False)
+        recommend_1dte = play.get("recommend_1dte", False)
+        strike_guidance = play.get("strike_guidance", trade_side)
 
         notional = play.get("notional", 0)
         if notional >= 1_000_000:
@@ -1593,10 +1717,28 @@ class FlowDetector:
         else:
             notional_str = f"${notional:.0f}"
 
+        # ── EXIT SIGNAL: opposite direction on same ticker ──
+        if is_exit:
+            header = f"🔄 EXIT SIGNAL — {ticker}"
+            lines = [
+                header,
+                "━" * 28,
+                f"⚠️ Institutions REVERSED on {ticker}",
+                f"⚡ {play['volume']:,} contracts at ${strike:.0f} {side.upper()} "
+                f"({play['vol_oi_ratio']:.0f}x vol/OI)",
+                f"💰 Notional: {notional_str}",
+                f"Direction: {play['directional_bias']}",
+                "",
+                f"🎯 ACTION: Close existing {ticker} position",
+                f"Flow flipped — prior direction no longer supported by institutional money.",
+                f"💵 Spot: ${play['spot']:.2f}",
+            ]
+            return "\n".join(lines)
+
         # Route-specific header and action
         if route == "immediate":
             header = f"💎🚨 CONVICTION PLAY — {ticker} {emoji}"
-            action = f"🎯 ACTION: {trade_side} ${strike:.0f} ({dte_label})"
+            action = f"🎯 ACTION: {strike_guidance}"
             urgency = f"⚠️ Institutions put {notional_str} on a {dte_label} {side}. They expect the move TODAY."
         elif route == "income":
             header = f"💎 FLOW CONVICTION — {ticker} (INCOME)"
@@ -1626,6 +1768,13 @@ class FlowDetector:
             lines.append(f"Buildup: {play['vol_oi_ratio']:.0f}x cumulative session vol/OI")
 
         lines.append(f"Direction: {play['directional_bias']}")
+
+        # ── PRE-MOVE WARNING ──
+        if is_reactive:
+            move_pct = play.get("recent_move_pct", 0)
+            lines.append(f"")
+            lines.append(f"⚠️ REACTIVE FLOW: {ticker} moved {move_pct:.1f}% "
+                        f"in last 30 min — likely hedging/profit-taking, not new conviction")
 
         # Shadow signal convergence
         if play.get("shadow_agrees"):
@@ -1666,9 +1815,19 @@ class FlowDetector:
             lines.append(f"")
             lines.append(f"⚠️ EARNINGS WARNING: {play.get('earnings_note', 'earnings within expiry window')}")
 
-        lines += ["", action, f"📅 Expiry: {exp_str} ({dte_label})",
-                  f"💵 Ask: ${play.get('ask', 0):.2f} | Spot: ${play['spot']:.2f}",
-                  "", urgency]
+        # ── 1DTE VEHICLE RECOMMENDATION ──
+        if recommend_1dte and route == "immediate":
+            lines += [
+                "", action,
+                f"📅 Flow detected on: {exp_str} (0DTE)",
+                f"👉 Recommended: Trade 1DTE for theta protection",
+                f"💵 Ask (0DTE): ${play.get('ask', 0):.2f} | Spot: ${play['spot']:.2f}",
+            ]
+        else:
+            lines += ["", action, f"📅 Expiry: {exp_str} ({dte_label})",
+                      f"💵 Ask: ${play.get('ask', 0):.2f} | Spot: ${play['spot']:.2f}"]
+
+        lines += ["", urgency]
 
         return "\n".join(lines)
 
