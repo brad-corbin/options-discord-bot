@@ -168,12 +168,49 @@ def _aggregate_weekly(bars: List[dict]) -> List[dict]:
 
 
 # ═══════════════════════════════════════════════════════════
-# YAHOO FINANCE DATA FETCHER
+# DAILY BAR FETCHER — Schwab primary, Yahoo fallback
 # ═══════════════════════════════════════════════════════════
 
 _yf_cache: Dict[str, tuple] = {}
 _yf_cache_lock = threading.Lock()
 _YF_CACHE_TTL = 14400  # 4 hours
+
+# v7.0: Schwab daily bars callback — set by app.py at startup
+_schwab_daily_bars_fn = None   # callable(ticker, days) -> list[dict] or None
+
+
+def set_daily_bars_fn(fn):
+    """Wire Schwab daily bars from app.py. Called once at startup."""
+    global _schwab_daily_bars_fn
+    _schwab_daily_bars_fn = fn
+    log.info("Swing scanner: Schwab daily bars wired")
+
+
+def fetch_daily_bars(ticker: str, days: int = 120) -> List[dict]:
+    """
+    v7.0: Fetch daily OHLCV — Schwab primary, Yahoo fallback.
+    Returns list of dicts: [{date, o, h, l, c, v}, ...]
+    Cached for 4 hours.
+    """
+    cache_key = f"bars:{ticker}:{days}"
+    with _yf_cache_lock:
+        cached = _yf_cache.get(cache_key)
+        if cached and (time.time() - cached[1]) < _YF_CACHE_TTL:
+            return cached[0]
+
+    # Try Schwab first
+    if _schwab_daily_bars_fn:
+        try:
+            bars = _schwab_daily_bars_fn(ticker, days)
+            if bars and len(bars) >= 20:
+                with _yf_cache_lock:
+                    _yf_cache[cache_key] = (bars, time.time())
+                return bars
+        except Exception as e:
+            log.debug(f"Schwab daily bars failed for {ticker}, falling back to Yahoo: {e}")
+
+    # Fallback to Yahoo
+    return fetch_daily_bars_yahoo(ticker, days)
 
 
 def fetch_daily_bars_yahoo(ticker: str, days: int = 120) -> List[dict]:
@@ -1084,8 +1121,8 @@ class SwingScanner:
         if not SWING_SCANNER_ENABLED:
             log.info("Swing scanner disabled")
             return
-        if not _YF_AVAILABLE:
-            log.error("Swing scanner requires yfinance — pip install yfinance")
+        if not _schwab_daily_bars_fn and not _YF_AVAILABLE:
+            log.error("Swing scanner requires Schwab daily bars or yfinance fallback")
             return
         self._running = True
         self._thread = threading.Thread(target=self._loop, daemon=True, name="swing-scanner")
@@ -1100,7 +1137,7 @@ class SwingScanner:
         vix = self._vix_fn() if self._vix_fn else 20.0
 
         # Fetch SPY bars first (needed for relative strength)
-        spy_bars = fetch_daily_bars_yahoo("SPY", SWING_SCAN_LOOKBACK_DAYS)
+        spy_bars = fetch_daily_bars("SPY", SWING_SCAN_LOOKBACK_DAYS)
         if not spy_bars:
             log.warning("Swing scanner: failed to fetch SPY bars, RS disabled")
 
@@ -1110,7 +1147,7 @@ class SwingScanner:
 
         for ticker in sorted(SWING_WATCHLIST):
             try:
-                bars = fetch_daily_bars_yahoo(ticker, SWING_SCAN_LOOKBACK_DAYS)
+                bars = fetch_daily_bars(ticker, SWING_SCAN_LOOKBACK_DAYS)
                 if not bars or len(bars) < 60:
                     no_data += 1
                     continue
