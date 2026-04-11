@@ -583,6 +583,7 @@ _CONVICTION_FIELDS = [
     "earnings_in_window", "earnings_note",
     "is_exit_signal", "is_reactive", "recent_move_pct",
     "recommend_1dte", "strike_guidance",
+    "potter_box_gate", "potter_location",
     "has_potter_box", "potter_box_floor", "potter_box_roof",
     "regime", "vix",
     "eod_spot", "pnl_pct", "outcome",  # filled by EOD reconciliation
@@ -664,6 +665,8 @@ def _log_conviction_play(play: dict, regime: str = "", vix: float = 0):
             "recent_move_pct":  play.get("recent_move_pct", ""),
             "recommend_1dte":   str(play.get("recommend_1dte", False)),
             "strike_guidance":  play.get("strike_guidance", ""),
+            "potter_box_gate":  play.get("potter_box_gate", ""),
+            "potter_location":  play.get("potter_location", ""),
             "has_potter_box":   str(has_pb),
             "potter_box_floor": potter_floor,
             "potter_box_roof":  potter_roof,
