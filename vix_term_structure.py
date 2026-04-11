@@ -3,14 +3,13 @@
 # VIX Term Structure — Contango / Backwardation / VVIX
 # NOTE: Educational/demo code. Not financial advice. Use at your own risk.
 #
-# All data from Yahoo Finance (free). Cache: 120s TTL.
-# Zero MarketData API calls.
+# v7.0: Schwab quote primary, Yahoo Finance fallback. Cache: 120s TTL.
 # ═══════════════════════════════════════════════════════════════════
 
 import time
 import logging
 import threading
-from typing import Dict, Optional
+from typing import Dict, Optional, Callable
 
 import requests
 
@@ -29,6 +28,26 @@ VIX9D_SPIKE_RATIO    = 1.10
 VVIX_ELEVATED        = 110.0
 VVIX_EXTREME         = 130.0
 
+# v7.0: Schwab quote callback — set by app.py at startup
+_schwab_quote_fn: Optional[Callable] = None
+
+# Schwab uses $ prefix for indices
+_SCHWAB_SYMBOLS = {
+    "VIX": "$VIX",
+    "VIX9D": "$VIX9D",
+    "VIX3M": "$VIX3M",
+    "VVIX": "$VVIX",
+}
+
+
+def set_quote_fn(fn: Callable):
+    """Wire Schwab quote function from app.py. Called once at startup.
+    fn(symbol) -> float or None
+    """
+    global _schwab_quote_fn
+    _schwab_quote_fn = fn
+    log.info("VIX term structure: Schwab quotes wired")
+
 
 def _cache_get(key):
     with _cache_lock:
@@ -45,6 +64,24 @@ def _cache_get(key):
 def _cache_set(key, value):
     with _cache_lock:
         _cache[key] = (value, time.time())
+
+
+def _get_index_quote(symbol: str) -> Optional[float]:
+    """v7.0: Get index quote — Schwab primary, Yahoo fallback.
+    symbol: short name like 'VIX', 'VIX9D', 'VIX3M', 'VVIX'
+    """
+    # Try Schwab first
+    if _schwab_quote_fn:
+        schwab_sym = _SCHWAB_SYMBOLS.get(symbol, f"${symbol}")
+        try:
+            val = _schwab_quote_fn(schwab_sym)
+            if val and val > 0:
+                return val
+        except Exception as e:
+            log.debug(f"Schwab quote failed for {schwab_sym}: {e}")
+
+    # Fallback to Yahoo
+    return _yahoo_last(f"%5E{symbol}")
 
 
 def _yahoo_last(symbol: str) -> Optional[float]:
@@ -72,10 +109,10 @@ def get_vix_term_structure() -> Dict:
     if cached is not None:
         return cached
 
-    vix = _yahoo_last("%5EVIX")
-    vix9d = _yahoo_last("%5EVIX9D")
-    vix3m = _yahoo_last("%5EVIX3M")
-    vvix = _yahoo_last("%5EVVIX")
+    vix = _get_index_quote("VIX")
+    vix9d = _get_index_quote("VIX9D")
+    vix3m = _get_index_quote("VIX3M")
+    vvix = _get_index_quote("VVIX")
 
     if not vix or vix <= 0:
         r = {"vix": 0, "vix9d": None, "vix3m": None, "vvix": None,
