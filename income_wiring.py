@@ -153,16 +153,33 @@ def create_income_handlers(
     return income_scan_fn, income_score_fn
 
 
-def create_ohlcv_wrapper(daily_candle_fn: Callable, md_get_fn: Callable = None):
+def create_ohlcv_wrapper(daily_candle_fn: Callable, md_get_fn: Callable = None,
+                         schwab_bars_fn: Callable = None):
     """
     Creates an ohlcv_fn that returns full OHLCV dict.
-    Primary: MarketData daily candles (already paid for, never rate-limits)
-    Fallback: yfinance (rate-limits frequently)
+    v7.0: Schwab daily bars primary (free, reliable)
+    Fallback 1: MarketData daily candles
+    Fallback 2: yfinance
     Last resort: closes-only degraded mode
     """
 
     def ohlcv_fn(ticker, days=250):
-        # Strategy 1: MarketData daily candles (full OHLCV, reliable)
+        # Strategy 0 (v7.0): Schwab daily bars — free, most reliable
+        if schwab_bars_fn:
+            try:
+                bars = schwab_bars_fn(ticker, days)
+                if bars and len(bars) >= 30:
+                    return {
+                        "open": [b["o"] for b in bars],
+                        "high": [b["h"] for b in bars],
+                        "low": [b["l"] for b in bars],
+                        "close": [b["c"] for b in bars],
+                        "volume": [b.get("v", 0) for b in bars],
+                    }
+            except Exception as e:
+                log.debug(f"Schwab OHLCV failed for {ticker}: {e}")
+
+        # Strategy 1: MarketData daily candles (already paid for, never rate-limits)
         if md_get_fn:
             try:
                 from datetime import datetime, timezone, timedelta
