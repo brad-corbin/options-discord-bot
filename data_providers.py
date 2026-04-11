@@ -158,31 +158,39 @@ def get_earnings_warning(ticker: str, within_days: int = 5) -> Tuple[bool, Optio
     if cached is not None:
         return cached
 
-    # Use FMP earnings calendar instead of Finnhub
-    FMP_TOKEN = os.getenv("FMP_TOKEN", "").strip()
-    if not FMP_TOKEN:
-        return False, None
+    # FMP earnings calendar: try stable endpoint, fall back to v3
+    FMP_URLS = [
+        "https://financialmodelingprep.com/stable/earnings-calendar",
+        "https://financialmodelingprep.com/api/v3/earning_calendar",
+    ]
 
     today    = datetime.now(timezone.utc).date()
     end_date = today + timedelta(days=within_days)
+    data = None
 
-    try:
-        resp = requests.get(
-            "https://financialmodelingprep.com/stable/earning-calendar",
-            params={
-                "from": today.strftime("%Y-%m-%d"),
-                "to": end_date.strftime("%Y-%m-%d"),
-                "apikey": FMP_TOKEN,
-            },
-            timeout=8,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as e:
-        err_str = str(e)
-        if FMP_TOKEN:
-            err_str = err_str.replace(FMP_TOKEN, "***")
-        log.warning(f"FMP earnings calendar error: {err_str}")
+    for url in FMP_URLS:
+        try:
+            resp = requests.get(
+                url,
+                params={
+                    "from": today.strftime("%Y-%m-%d"),
+                    "to": end_date.strftime("%Y-%m-%d"),
+                    "apikey": FMP_TOKEN,
+                },
+                timeout=8,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            break  # success — stop trying
+        except Exception as e:
+            err_str = str(e)
+            if FMP_TOKEN:
+                err_str = err_str.replace(FMP_TOKEN, "***")
+            log.debug(f"FMP earnings calendar ({url.split('/')[-1]}): {err_str}")
+            continue
+
+    if data is None:
+        log.warning(f"FMP earnings calendar: all endpoints failed for {ticker}")
         _cache_set(cache_key, (False, None))
         return False, None
 
