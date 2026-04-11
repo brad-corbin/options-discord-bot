@@ -8641,7 +8641,19 @@ def _start_background_services_once():
         global _income_scan_fn, _income_score_fn
         try:
             from market_regime import get_regime_package
-            _income_ohlcv = create_ohlcv_wrapper(get_daily_candles, md_get_fn=md_get)
+            # v7.0: Use swing_scanner's unified fetch_daily_bars (Schwab→Yahoo)
+            # The Schwab bars fn gets wired later at startup, but by the time
+            # income scans run (8:15 AM CT), it's already available.
+            _income_schwab_bars = None
+            try:
+                from swing_scanner import fetch_daily_bars as _income_schwab_bars
+            except ImportError:
+                pass
+
+            _income_ohlcv = create_ohlcv_wrapper(
+                get_daily_candles, md_get_fn=md_get,
+                schwab_bars_fn=_income_schwab_bars,
+            )
 
             # Flow scoring callback for income scanner
             def _income_flow_fn(ticker, strike, trade_type, expiry=None):
