@@ -88,7 +88,7 @@ FIB_EXTENSIONS = {
 # Swing confidence thresholds — v1.1: raised from 45 → 65 (only strong Fib setups)
 SWING_MIN_CONFIDENCE      = 65
 SWING_MIN_WIN_PROBABILITY = 0.60   # B-S win prob gate — reject if below this
-SWING_WIDTH_PREFERENCE    = [1.0, 2.5, 5.0, 10.0]  # Allow wider spreads for swing
+SWING_WIDTH_PREFERENCE    = [1.0, 2.0, 2.5, 5.0, 10.0]  # Allow wider spreads for swing
 
 
 # ─────────────────────────────────────────────────────────
