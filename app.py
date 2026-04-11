@@ -8672,6 +8672,57 @@ def _initialize_app():
         except Exception as _e:
             log.warning(f"Phase 2 streaming init failed: {_e}")
 
+        # v7.0: Wire Schwab daily bars into swing scanner (replaces Yahoo dependency)
+        try:
+            def _schwab_daily_bars(ticker: str, days: int = 310) -> list:
+                """Fetch daily bars via Schwab for swing scanner."""
+                from schwab.client import Client as _SC
+                try:
+                    end = datetime.now(timezone.utc)
+                    start = end - timedelta(days=days + 10)
+                    if hasattr(_cached_md, '_schwab') and _cached_md._schwab.available:
+                        raw = _cached_md._schwab._schwab_get(
+                            "get_price_history", ticker.upper(),
+                            period_type=_SC.PriceHistory.PeriodType.YEAR,
+                            frequency_type=_SC.PriceHistory.FrequencyType.DAILY,
+                            frequency=_SC.PriceHistory.Frequency.EVERY_MINUTE,
+                            start_datetime=start, end_datetime=end,
+                            need_extended_hours_data=False,
+                        )
+                        candles = raw.get("candles", [])
+                        if candles and len(candles) >= 20:
+                            bars = []
+                            for c in candles:
+                                o, h, l, cl, v = c.get("open"), c.get("high"), c.get("low"), c.get("close"), c.get("volume", 0)
+                                dt_ms = c.get("datetime", 0)
+                                if all(x and x > 0 for x in [o, h, l, cl]):
+                                    bars.append({
+                                        "date": datetime.fromtimestamp(dt_ms / 1000, tz=timezone.utc),
+                                        "o": float(o), "h": float(h), "l": float(l),
+                                        "c": float(cl), "v": int(v or 0),
+                                    })
+                            if bars:
+                                return bars
+                except Exception as e:
+                    log.debug(f"Schwab daily bars failed for {ticker}: {e}")
+                return None
+
+            from swing_scanner import set_daily_bars_fn
+            set_daily_bars_fn(_schwab_daily_bars)
+        except Exception as _e:
+            log.warning(f"Schwab daily bars wiring failed: {_e}")
+
+        # v7.0: Intraday Fib zone monitor
+        try:
+            from schwab_stream import start_fib_monitor
+            from swing_scanner import fetch_daily_bars
+            start_fib_monitor(
+                daily_bars_fn=fetch_daily_bars,
+                post_fn=post_to_telegram,
+            )
+        except Exception as _e:
+            log.warning(f"Fib monitor init failed: {_e}")
+
 
 # ─────────────────────────────────────────────────────────
 # v5.0 ENDPOINTS
