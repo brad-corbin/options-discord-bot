@@ -579,6 +579,101 @@ class FlowDetector:
         # v7.0: Volume velocity tracker — consecutive snapshots show flow direction
         # Key: "ticker:strike:side" → list of (timestamp, volume, direction_approx, confidence)
         self._flow_velocity = {}  # tracks last N snapshots per contract for sustained flow detection
+        # Phase 3: streaming option store reference
+        self._option_store = None
+        self._sweep_alerts = []  # recent sweeps for conviction pipeline
+
+    def set_option_store(self, store):
+        """Wire the OptionQuoteStore for streaming option data overlay."""
+        self._option_store = store
+        log.info("FlowDetector: option streaming store connected")
+
+    def handle_sweep(self, sweep: dict):
+        """Handle a real-time sweep from SweepDetector.
+
+        Converts streaming sweep data into a flow alert compatible with
+        the conviction play pipeline, then fires through the normal alert path.
+        """
+        from schwab_stream import get_streaming_spot, parse_occ_symbol
+        ticker = sweep.get("ticker", "")
+        if not ticker:
+            return
+
+        # Build a flow alert from the sweep
+        side = sweep.get("side", "unknown")
+        sweep_side = sweep.get("sweep_side", "unknown")
+
+        # Direction: buy sweep on calls = bullish, buy sweep on puts = bearish
+        if sweep_side == "buy":
+            if side == "call":
+                directional = "BULLISH"
+                direction_approx = "buyer_initiated"
+            else:
+                directional = "BEARISH"
+                direction_approx = "buyer_initiated"
+        elif sweep_side == "sell":
+            if side == "call":
+                directional = "BEARISH"
+                direction_approx = "seller_initiated"
+            else:
+                directional = "BULLISH"
+                direction_approx = "seller_initiated"
+        else:
+            directional = f"LEAN {'BULLISH' if side == 'call' else 'BEARISH'}"
+            direction_approx = "unknown"
+
+        alert = {
+            "ticker": ticker,
+            "expiry": sweep.get("expiry", ""),
+            "strike": sweep.get("strike", 0),
+            "side": side,
+            "volume": sweep.get("volume_delta", 0),
+            "oi": 0,  # not available from sweep
+            "vol_oi_ratio": 999.0,  # sweep = extreme
+            "flow_level": "extreme",
+            "direction_approx": direction_approx,
+            "direction_confidence": 0.85 if sweep_side != "unknown" else 0.5,
+            "directional_bias": directional,
+            "book_imbalance": "balanced",
+            "dist_from_spot_pct": 0,
+            "spot": sweep.get("underlying_price", 0) or get_streaming_spot(ticker) or 0,
+            "mid": (sweep.get("bid", 0) + sweep.get("ask", 0)) / 2 if sweep.get("bid") else sweep.get("last", 0),
+            "bid": sweep.get("bid", 0),
+            "ask": sweep.get("ask", 0),
+            "burst": f"SWEEP ${sweep.get('notional', 0):,.0f}",
+            "is_burst": True,
+            "is_new_strike": False,
+            "sustained_flow": False,
+            "velocity_count": 1,
+            "vol_per_min": sweep.get("volume_delta", 0),  # all in one update
+            "should_alert": True,
+            "timestamp": datetime.now().isoformat(),
+            "rehit_count": 0,
+            "is_streaming_sweep": True,  # flag for formatting
+            "sweep_notional": sweep.get("notional", 0),
+            "sweep_delta": sweep.get("delta", 0),
+            "sweep_iv": sweep.get("iv", 0),
+        }
+
+        self._sweep_alerts.append(alert)
+        # Keep only last 50 sweep alerts
+        if len(self._sweep_alerts) > 50:
+            self._sweep_alerts = self._sweep_alerts[-50:]
+
+        return alert
+
+    def get_streaming_overlay(self, ticker: str, strike: float, side: str) -> Optional[dict]:
+        """Get live streaming data for a specific contract if available.
+        Used to enhance chain-polled data with sub-second bid/ask/volume."""
+        if not self._option_store:
+            return None
+        from schwab_stream import parse_occ_symbol
+        quotes = self._option_store.get_by_underlying(ticker)
+        for q in quotes:
+            parsed = parse_occ_symbol(q.get("symbol", ""))
+            if parsed and parsed["strike"] == strike and parsed["side"] == side:
+                return q
+        return None
 
     # ─────────────────────────────────────────────────────
     # PHASE 1: INTRADAY VOLUME DETECTION
@@ -599,6 +694,30 @@ class FlowDetector:
         parsed = parse_chain_volume_oi(chain_data, spot)
         if not parsed:
             return []
+
+        # Phase 3: Overlay streaming option data on chain-polled data
+        # Streaming bid/ask/volume is sub-second vs 30s chain cache
+        if self._option_store:
+            for p in parsed:
+                overlay = self.get_streaming_overlay(ticker, p["strike"], p["side"])
+                if overlay:
+                    # Use streaming bid/ask for better direction inference
+                    if overlay.get("bid", 0) > 0:
+                        p["bid"] = overlay["bid"]
+                    if overlay.get("ask", 0) > 0:
+                        p["ask"] = overlay["ask"]
+                    if overlay.get("last", 0) > 0:
+                        p["last"] = overlay["last"]
+                    # Recalculate mid from live bid/ask
+                    if p["bid"] > 0 and p["ask"] > 0:
+                        p["mid"] = round((p["bid"] + p["ask"]) / 2, 4)
+                    # Use streaming volume if higher (more current)
+                    stream_vol = overlay.get("volume", 0) or 0
+                    if stream_vol > p["volume"]:
+                        p["volume"] = stream_vol
+                    # Store live Greeks on parsed entry for downstream use
+                    p["live_delta"] = overlay.get("delta", 0)
+                    p["live_iv"] = overlay.get("iv", 0)
 
         # Compute and store lightweight GEX for this ticker
         # Enables GEX convergence for conviction plays on ALL tickers
@@ -2024,7 +2143,10 @@ class FlowDetector:
         ]
 
         burst = play.get("burst", 0)
-        if burst >= CONVICTION_MIN_BURST:
+        if play.get("is_streaming_sweep"):
+            sweep_notional = play.get("sweep_notional", 0)
+            lines.append(f"⚡ REAL-TIME SWEEP: ${sweep_notional:,.0f} notional detected via streaming")
+        elif burst >= CONVICTION_MIN_BURST:
             lines.append(f"Burst: +{burst:,} in last interval")
         else:
             lines.append(f"Buildup: {play['vol_oi_ratio']:.0f}x cumulative session vol/OI")
@@ -2151,6 +2273,42 @@ class FlowDetector:
 
         if alert.get("is_burst"):
             lines.append(f"Burst: +{alert['burst']:,} contracts in last interval")
+
+        return "\n".join(lines)
+
+    def format_sweep_alert(self, sweep: dict) -> str:
+        """Format a real-time streaming sweep alert for Telegram."""
+        side_emoji = "📗" if sweep.get("side") == "call" else "📕"
+        sweep_dir = sweep.get("sweep_side", "unknown")
+        if sweep_dir == "buy":
+            dir_emoji = "🟢"
+            dir_label = "BUY SWEEP"
+        elif sweep_dir == "sell":
+            dir_emoji = "🔴"
+            dir_label = "SELL SWEEP"
+        else:
+            dir_emoji = "⚪"
+            dir_label = "SWEEP"
+
+        notional = sweep.get("sweep_notional", 0) or sweep.get("notional", 0)
+        vol = sweep.get("volume", 0) or sweep.get("volume_delta", 0)
+        delta = sweep.get("sweep_delta", 0) or sweep.get("delta", 0)
+        iv = sweep.get("sweep_iv", 0) or sweep.get("iv", 0)
+
+        lines = [
+            f"⚡ {dir_emoji} {dir_label} — {sweep['ticker']}",
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            f"{side_emoji} {sweep.get('strike', 0)} {sweep.get('side', '').upper()} | "
+            f"Exp: {sweep.get('expiry', 'N/A')}",
+            f"📊 Volume: {vol:,} contracts | ${notional:,.0f} notional",
+        ]
+        if delta:
+            lines.append(f"Δ={delta:.2f} | IV={iv:.1f}%")
+        bid = sweep.get("bid", 0)
+        ask = sweep.get("ask", 0)
+        last = sweep.get("last", 0)
+        if bid and ask:
+            lines.append(f"Bid/Ask: ${bid:.2f}/${ask:.2f} | Last: ${last:.2f}")
 
         return "\n".join(lines)
 
