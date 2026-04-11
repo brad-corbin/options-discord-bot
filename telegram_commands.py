@@ -138,6 +138,22 @@ def send_reply(chat_id: str, text: str):
         log.warning(f"send_reply error: {e}")
 
 
+def send_document(chat_id: str, filepath: str, caption: str = ""):
+    """Send a file as a Telegram document."""
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    try:
+        with open(filepath, "rb") as f:
+            requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument",
+                data={"chat_id": chat_id, "caption": caption[:1024]},
+                files={"document": f},
+                timeout=30,
+            )
+    except Exception as e:
+        log.warning(f"send_document error: {e}")
+
+
 def register_webhook(bot_url: str, webhook_secret: str):
     if not TELEGRAM_BOT_TOKEN or not bot_url:
         log.warning("Cannot register webhook — BOT_URL or TOKEN missing")
@@ -961,6 +977,8 @@ def handle_command(
             "/watchlist — show tickers\n"
             "/confidence 60 — set min confidence\n"
             "/pause | /resume — control scheduled scans\n"
+            "/exportlogs — download full log file\n"
+            "/exportlogs SWEEP — filtered by keyword\n"
             "\n── Risk & Regime ──\n"
             "/risk — portfolio risk dashboard\n"
             "/regime — market regime (VIX + ADX)\n"
@@ -981,6 +999,37 @@ def handle_command(
             "🛡️ Risk limits auto-block trades that exceed exposure caps\n"
             "— Not financial advice —"
         )
+        return
+
+    if cmd in ("/exportlogs", "/exportlogs@omegabot", "/logs", "/logs@omegabot"):
+        try:
+            import os as _os
+            _diag_chat = _os.getenv("DIAGNOSTIC_CHAT_ID", "").strip() or chat_id
+            log_path = "/tmp/omega3000.log"
+            if not _os.path.exists(log_path):
+                reply("No log file found yet. Logs accumulate after deploy.")
+                return
+            size_mb = _os.path.getsize(log_path) / 1_000_000
+            # Optional: filter by keyword
+            if args:
+                keyword = " ".join(args).lower()
+                filtered_path = "/tmp/omega3000_filtered.log"
+                count = 0
+                with open(log_path, "r", encoding="utf-8", errors="replace") as src, \
+                     open(filtered_path, "w", encoding="utf-8") as dst:
+                    for line in src:
+                        if keyword in line.lower():
+                            dst.write(line)
+                            count += 1
+                send_document(_diag_chat, filtered_path,
+                              caption=f"Filtered logs: '{keyword}' ({count} lines)")
+                reply(f"📤 Sent filtered logs to diagnostics channel ({count} lines)")
+            else:
+                send_document(_diag_chat, log_path,
+                              caption=f"Full log ({size_mb:.1f} MB)")
+                reply(f"📤 Sent full log to diagnostics channel ({size_mb:.1f} MB)")
+        except Exception as e:
+            reply(f"Log export failed: {e}")
         return
 
     reply(f"❓ Unknown command: {cmd}\nType /help for available commands.")
