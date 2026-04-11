@@ -8722,6 +8722,54 @@ def _initialize_app():
         except Exception as _e:
             log.warning(f"Phase 2 streaming init failed: {_e}")
 
+        # Phase 3: WebSocket option streaming — live Greeks, sweep detection, live premium
+        try:
+            from schwab_stream import (start_option_streaming, get_option_store,
+                                        get_sweep_detector)
+
+            def _handle_sweep(sweep: dict):
+                """Sweep callback: create flow alert, post to Telegram, run conviction."""
+                try:
+                    alert = _flow_detector.handle_sweep(sweep)
+                    if not alert:
+                        return
+                    # Format and post sweep alert
+                    msg = _flow_detector.format_sweep_alert(alert)
+                    post_to_telegram(msg)
+                    if TELEGRAM_CHAT_INTRADAY:
+                        post_to_telegram(msg, chat_id=TELEGRAM_CHAT_INTRADAY)
+
+                    # Feed into conviction pipeline
+                    plays = _flow_detector.detect_conviction_plays([alert])
+                    for cp in plays:
+                        cp_msg = _flow_detector.format_conviction_play(cp)
+                        post_to_telegram(cp_msg)
+                        if cp.get("route") in ("immediate", "swing") and TELEGRAM_CHAT_INTRADAY:
+                            post_to_telegram(cp_msg, chat_id=TELEGRAM_CHAT_INTRADAY)
+                        if cp.get("route") == "income" and _income_scan_fn:
+                            try:
+                                _income_scan_fn(None, cp["ticker"])
+                            except Exception:
+                                pass
+                        if _log_conviction_play:
+                            regime = get_current_regime() if get_current_regime else "UNKNOWN"
+                            _log_conviction_play(cp, regime=regime)
+                except Exception as e:
+                    log.warning(f"Sweep handler error: {e}")
+
+            start_option_streaming(
+                cached_md=_cached_md,
+                get_spot_fn=get_spot,
+                get_expirations_fn=get_expirations,
+                on_sweep_fn=_handle_sweep,
+            )
+
+            # Wire option store into flow detector for streaming overlay
+            _flow_detector.set_option_store(get_option_store())
+            log.info("Phase 3 option streaming wired: sweeps → flow → conviction → Telegram")
+        except Exception as _e:
+            log.warning(f"Phase 3 option streaming init failed: {_e}")
+
         # v7.0: Wire Schwab daily bars into swing scanner (replaces Yahoo dependency)
         try:
             def _schwab_daily_bars(ticker: str, days: int = 310) -> list:
