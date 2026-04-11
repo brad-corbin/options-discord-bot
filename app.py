@@ -8322,10 +8322,10 @@ def _em_scheduler():
                         def _run_potter_scan():
                             try:
                                 from oi_flow import FLOW_TICKERS
-                                from swing_scanner import fetch_daily_bars_yahoo
+                                from swing_scanner import fetch_daily_bars
 
                                 def _pb_ohlcv(ticker):
-                                    bars = fetch_daily_bars_yahoo(ticker, days=504)
+                                    bars = fetch_daily_bars(ticker, days=504)
                                     return bars if bars else None
 
                                 setups = _potter_box.scan_all(
@@ -8360,10 +8360,10 @@ def _em_scheduler():
                         def _run_potter_scan_pm():
                             try:
                                 from oi_flow import FLOW_TICKERS
-                                from swing_scanner import fetch_daily_bars_yahoo
+                                from swing_scanner import fetch_daily_bars
 
                                 def _pb_ohlcv(ticker):
-                                    bars = fetch_daily_bars_yahoo(ticker, days=504)
+                                    bars = fetch_daily_bars(ticker, days=504)
                                     return bars if bars else None
 
                                 setups = _potter_box.scan_all(
@@ -8389,6 +8389,44 @@ def _em_scheduler():
                         threading.Thread(target=_run_potter_scan_pm, daemon=True,
                                        name="potter-box-pm").start()
                         log.info("Potter Box PM scan triggered (3:05 CT)")
+
+                # v7.0: Midday scan — catch morning box breaks with Schwab (free)
+                _pb_mid_key = (date_str, "potter_box_mid")
+                if _pb_mid_key not in fired_today:
+                    if now_ct.hour == 11 and 29 <= now_ct.minute <= 31:
+                        fired_today.add(_pb_mid_key)
+                        def _run_potter_scan_mid():
+                            try:
+                                from oi_flow import FLOW_TICKERS
+                                from swing_scanner import fetch_daily_bars
+
+                                def _pb_ohlcv(ticker):
+                                    bars = fetch_daily_bars(ticker, days=504)
+                                    return bars if bars else None
+
+                                setups = _potter_box.scan_all(
+                                    tickers=FLOW_TICKERS,
+                                    ohlcv_fn=_pb_ohlcv,
+                                    chain_fn=lambda t, e: _cached_md.get_chain(
+                                        t, e, feed="cached"),
+                                    spot_fn=get_spot,
+                                    expirations_fn=lambda t: get_expirations(t) or [],
+                                )
+                                if setups:
+                                    summary = _potter_box.format_summary(setups)
+                                    if summary:
+                                        post_to_telegram(summary)
+                                    for s in setups:
+                                        if s.get("trade") and s.get("flow_direction"):
+                                            try:
+                                                post_to_telegram(_potter_box.format_alert(s))
+                                            except Exception:
+                                                pass
+                            except Exception as _pe:
+                                log.warning(f"Potter Box midday scan error: {_pe}")
+                        threading.Thread(target=_run_potter_scan_mid, daemon=True,
+                                       name="potter-box-mid").start()
+                        log.info("Potter Box midday scan triggered (11:30 CT)")
 
             # ── v6.1: Institutional Flow Detection ──
             if _flow_detector and _persistent_state:
@@ -8722,6 +8760,14 @@ def _initialize_app():
             )
         except Exception as _e:
             log.warning(f"Fib monitor init failed: {_e}")
+
+        # v7.0: Real-time Potter Box break/reclaim monitor
+        try:
+            if _potter_box:
+                from schwab_stream import start_box_break_monitor
+                start_box_break_monitor(_potter_box, post_to_telegram)
+        except Exception as _e:
+            log.warning(f"Potter Box break monitor init failed: {_e}")
 
 
 # ─────────────────────────────────────────────────────────
