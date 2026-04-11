@@ -37,6 +37,11 @@
 import time
 import logging
 from typing import Dict, Optional, List
+from trading_rules import (
+    SIGNAL_STALE_AFTER_SEC,
+    SCALP_SIGNAL_HARD_BLOCK_PCT,
+    SWING_SIGNAL_HARD_BLOCK_PCT,
+)
 
 log = logging.getLogger(__name__)
 
@@ -126,8 +131,8 @@ def _check_signal_freshness(webhook_data: dict) -> Dict:
 
     age_sec = int(time.time() - received_at)
 
-    # Hard stale limit — no point pulling chains for ancient signals
-    STALE_LIMIT = 300  # 5 minutes — matches SIGNAL_STALE_AFTER_SEC default
+    # Hard stale limit — unified with app.py via trading_rules
+    STALE_LIMIT = SIGNAL_STALE_AFTER_SEC
     if age_sec > STALE_LIMIT:
         return {
             "ok": False,
@@ -151,9 +156,11 @@ def _check_price_drift(webhook_data: dict, live_spot: float) -> Dict:
         alert_close = float(alert_close)
         drift_pct = abs((live_spot - alert_close) / alert_close) * 100.0
 
-        # Hard block at 1.5% drift — same threshold as _validate_live_signal
-        # but checked BEFORE chains are pulled
-        HARD_DRIFT_PCT = 1.5
+        # Timeframe-aware drift: swing signals get wider tolerance
+        _tf = str((webhook_data or {}).get("timeframe") or "").lower()
+        _is_swing = (any(tag in _tf for tag in ("d", "w", "day", "week"))
+                     or bool((webhook_data or {}).get("is_swing")))
+        HARD_DRIFT_PCT = SWING_SIGNAL_HARD_BLOCK_PCT if _is_swing else SCALP_SIGNAL_HARD_BLOCK_PCT
         if drift_pct > HARD_DRIFT_PCT:
             return {
                 "ok": False,
