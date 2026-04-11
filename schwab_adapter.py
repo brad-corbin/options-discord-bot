@@ -128,7 +128,6 @@ def _init_schwab_client():
     """
     app_key = os.environ.get("SCHWAB_APP_KEY", "")
     app_secret = os.environ.get("SCHWAB_APP_SECRET", "")
-    callback_url = os.environ.get("SCHWAB_CALLBACK_URL", "https://127.0.0.1")
     token_path = os.environ.get("SCHWAB_TOKEN_PATH", "schwab_token.json")
 
     if not app_key or not app_secret:
@@ -150,8 +149,7 @@ def _init_schwab_client():
 
     try:
         from schwab.auth import client_from_token_file
-        client = client_from_token_file(token_path, app_key, app_secret,
-                                        callback_url=callback_url)
+        client = client_from_token_file(token_path, app_key, app_secret)
         log.info("Schwab client initialised from token file")
 
         # Start token sync thread
