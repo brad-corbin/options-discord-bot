@@ -8781,6 +8781,27 @@ def _initialize_app():
         except Exception as _e:
             log.warning(f"Potter Box break monitor init failed: {_e}")
 
+        # v7.0: Wire Schwab quotes into VIX term structure (replaces Yahoo dependency)
+        try:
+            from vix_term_structure import set_quote_fn as _vts_set_quote
+            def _schwab_index_quote(symbol: str):
+                """Get index quote via Schwab REST."""
+                try:
+                    if hasattr(_cached_md, '_schwab') and _cached_md._schwab.available:
+                        raw = _cached_md._schwab._schwab_get("get_quote", symbol)
+                        entry = raw.get(symbol, {})
+                        quote = entry.get("quote", {})
+                        for field in ("lastPrice", "mark", "closePrice"):
+                            v = quote.get(field)
+                            if v and float(v) > 0:
+                                return float(v)
+                except Exception as e:
+                    log.debug(f"Schwab index quote failed for {symbol}: {e}")
+                return None
+            _vts_set_quote(_schwab_index_quote)
+        except Exception as _e:
+            log.debug(f"VIX term structure Schwab wiring failed: {_e}")
+
 
 # ─────────────────────────────────────────────────────────
 # v5.0 ENDPOINTS
