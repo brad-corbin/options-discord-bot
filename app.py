@@ -8776,18 +8776,18 @@ def _initialize_app():
                                         get_sweep_detector)
 
             def _handle_sweep(sweep: dict):
-                """Sweep callback: create flow alert, post to Telegram, run conviction."""
+                """Sweep callback: log for analysis, only post actionable conviction plays."""
                 try:
                     alert = _flow_detector.handle_sweep(sweep)
                     if not alert:
                         return
-                    # Format and post sweep alert
-                    msg = _flow_detector.format_sweep_alert(alert)
-                    post_to_telegram(msg)
-                    if TELEGRAM_CHAT_INTRADAY:
-                        post_to_telegram(msg, chat_id=TELEGRAM_CHAT_INTRADAY)
 
-                    # Feed into conviction pipeline
+                    # Log sweep for analysis — no Telegram for raw sweeps
+                    log.info(f"SWEEP: {alert['ticker']} {alert.get('strike',0)} "
+                             f"{alert.get('side','')} {alert.get('directional_bias','')} "
+                             f"vol={alert.get('volume',0)} notional=${alert.get('sweep_notional',0):,.0f}")
+
+                    # Only post to Telegram if conviction pipeline promotes it to a trade
                     plays = _flow_detector.detect_conviction_plays([alert])
                     for cp in plays:
                         cp_msg = _flow_detector.format_conviction_play(cp)
