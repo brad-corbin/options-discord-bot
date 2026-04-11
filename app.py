@@ -581,6 +581,8 @@ _CONVICTION_FIELDS = [
     "iv_skew_ratio", "iv_skew_direction", "iv_atm",
     "vpoc", "vpoc_near",
     "earnings_in_window", "earnings_note",
+    "is_exit_signal", "is_reactive", "recent_move_pct",
+    "recommend_1dte", "strike_guidance",
     "has_potter_box", "potter_box_floor", "potter_box_roof",
     "regime", "vix",
     "eod_spot", "pnl_pct", "outcome",  # filled by EOD reconciliation
@@ -657,6 +659,11 @@ def _log_conviction_play(play: dict, regime: str = "", vix: float = 0):
             "vpoc_near":        str(play.get("vpoc_near", False)),
             "earnings_in_window": str(play.get("earnings_in_window", False)),
             "earnings_note":    play.get("earnings_note", ""),
+            "is_exit_signal":   str(play.get("is_exit_signal", False)),
+            "is_reactive":      str(play.get("is_reactive", False)),
+            "recent_move_pct":  play.get("recent_move_pct", ""),
+            "recommend_1dte":   str(play.get("recommend_1dte", False)),
+            "strike_guidance":  play.get("strike_guidance", ""),
             "has_potter_box":   str(has_pb),
             "potter_box_floor": potter_floor,
             "potter_box_roof":  potter_roof,
@@ -3818,17 +3825,15 @@ def _run_v4_prefilter(ticker: str, spot: float, chains: list, candle_closes: lis
                                 post_to_telegram(msg, chat_id=TELEGRAM_CHAT_INTRADAY)
 
                         elif route == "income":
-                            # 3-7 DTE: post conviction + auto-score income idea
+                            # 3-7 DTE: post conviction alert + run REAL income scan
                             post_to_telegram(msg)
-                            if _income_score_fn:
+                            # Run actual income scan for this ticker to find real spreads
+                            # and post proper ITQS scorecard (not fake hardcoded params)
+                            if _income_scan_fn:
                                 try:
-                                    trade_type = "bull_put" if cp["trade_direction"] == "bullish" else "bear_call"
-                                    _income_score_fn(
-                                        TELEGRAM_CHAT_ID, cp["ticker"], trade_type,
-                                        cp["strike"], 2.0, 0.50,
-                                        expiry=str(cp.get("expiry",""))[:10])
+                                    _income_scan_fn(TELEGRAM_CHAT_ID, cp["ticker"])
                                 except Exception as _ise:
-                                    log.debug(f"Income auto-score failed for {cp['ticker']}: {_ise}")
+                                    log.debug(f"Income auto-scan failed for {cp['ticker']}: {_ise}")
 
                         elif route == "swing":
                             # 8-30 DTE: post to both channels
@@ -8507,6 +8512,12 @@ def _em_scheduler():
                                                             post_to_telegram(msg)
                                                             if route in ("immediate", "swing") and TELEGRAM_CHAT_INTRADAY and TELEGRAM_CHAT_INTRADAY != TELEGRAM_CHAT_ID:
                                                                 post_to_telegram(msg, chat_id=TELEGRAM_CHAT_INTRADAY)
+                                                            # Income tier: run real ITQS scan
+                                                            if route == "income" and _income_scan_fn:
+                                                                try:
+                                                                    _income_scan_fn(TELEGRAM_CHAT_ID, cp["ticker"])
+                                                                except Exception:
+                                                                    pass
                                                             _log_conviction_play(cp,
                                                                 regime=get_current_regime() or "UNKNOWN")
                                                             # Store boost for EntryValidator
