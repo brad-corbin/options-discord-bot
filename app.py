@@ -205,6 +205,23 @@ SIGNAL_WARN_CONF_PENALTY        = int(os.getenv("SIGNAL_WARN_CONF_PENALTY",     
 SIGNAL_MODERATE_CONF_PENALTY    = int(os.getenv("SIGNAL_MODERATE_CONF_PENALTY",    "12")   or 12)
 SIGNAL_HARD_REJECT_CONF_PENALTY = int(os.getenv("SIGNAL_HARD_REJECT_CONF_PENALTY", "20")   or 20)
 SIGNAL_STALE_AFTER_SEC          = int(os.getenv("SIGNAL_STALE_AFTER_SEC",          "900")  or 900)
+
+# Sync hard-block + stale with trading_rules.py (single source of truth)
+try:
+    from trading_rules import (
+        SIGNAL_STALE_AFTER_SEC as _TR_STALE,
+        SCALP_SIGNAL_HARD_BLOCK_PCT as _TR_SCALP,
+        SWING_SIGNAL_HARD_BLOCK_PCT as _TR_SWING,
+    )
+    if not os.getenv("SIGNAL_STALE_AFTER_SEC"):
+        SIGNAL_STALE_AFTER_SEC = _TR_STALE
+    if not os.getenv("SCALP_SIGNAL_HARD_BLOCK_PCT"):
+        SCALP_SIGNAL_HARD_BLOCK_PCT = _TR_SCALP
+    if not os.getenv("SWING_SIGNAL_HARD_BLOCK_PCT"):
+        SWING_SIGNAL_HARD_BLOCK_PCT = _TR_SWING
+except ImportError:
+    pass
+
 PENDING_RECHECK_ENABLE         = os.getenv("PENDING_RECHECK_ENABLE",         "1").strip().lower() not in ("0", "false", "no", "off")
 PENDING_RECHECK_DELAYS_SEC     = os.getenv("PENDING_RECHECK_DELAYS_SEC",     "300,900,1800").strip() or "300,900,1800"
 PENDING_RECHECK_MAX_SIGNAL_AGE_SEC = int(os.getenv("PENDING_RECHECK_MAX_SIGNAL_AGE_SEC", "5400") or 5400)
@@ -1720,22 +1737,30 @@ def _prefetch_ticker(ticker: str):
         spot = get_spot(ticker)
 
         # 2. Enrichment: earnings (Finnhub, 0 MarketData calls)
-        enrichment = {"has_earnings": False, "earnings_warn": None}
+        enrichment = {"has_earnings": False, "earnings_warn": None, "degraded": False, "error": None}
         try:
             import threading as _threading
-            _enrich_result = {}
+            _enrich_result = {"degraded": False, "error": None}
             def _fetch_enrich():
                 try:
                     _enrich_result.update(enrich_ticker(ticker))
-                except Exception:
-                    pass
+                except Exception as _ee:
+                    _enrich_result["degraded"] = True
+                    _enrich_result["error"] = str(_ee)[:200]
             _et = _threading.Thread(target=_fetch_enrich, daemon=True)
             _et.start()
             _et.join(timeout=2.0)
-            if _enrich_result:
-                enrichment = _enrich_result
-        except Exception:
-            pass
+            if _et.is_alive():
+                enrichment["degraded"] = True
+                enrichment["error"] = "enrichment timeout > 2s"
+            else:
+                enrichment.update(_enrich_result)
+            if enrichment.get("degraded"):
+                log.warning(f"{ticker}: enrichment degraded: {enrichment.get('error')}")
+        except Exception as _ee:
+            enrichment["degraded"] = True
+            enrichment["error"] = str(_ee)[:200]
+            log.warning(f"{ticker}: enrichment failed: {_ee}")
 
         # 3. Daily candles (usually cached at 10 min TTL)
         candle_closes = get_daily_candles(ticker, days=RV_LOOKBACK_DAYS + 5)
@@ -4203,22 +4228,30 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
             # No cache — fetch live once, then store so the opposite side of /check can reuse it.
             spot = get_spot(ticker); chains = get_options_chain(ticker)
             # Non-blocking earnings check — same 2s cap as prefetch path.
-            enrichment = {"has_earnings": False, "earnings_warn": None}
+            enrichment = {"has_earnings": False, "earnings_warn": None, "degraded": False, "error": None}
             try:
                 import threading as _threading
-                _enrich_result = {}
+                _enrich_result = {"degraded": False, "error": None}
                 def _fetch_enrich_live():
                     try:
                         _enrich_result.update(enrich_ticker(ticker))
-                    except Exception:
-                        pass
+                    except Exception as _ee:
+                        _enrich_result["degraded"] = True
+                        _enrich_result["error"] = str(_ee)[:200]
                 _et = _threading.Thread(target=_fetch_enrich_live, daemon=True)
                 _et.start()
                 _et.join(timeout=2.0)
-                if _enrich_result:
-                    enrichment = _enrich_result
-            except Exception:
-                pass
+                if _et.is_alive():
+                    enrichment["degraded"] = True
+                    enrichment["error"] = "enrichment timeout > 2s"
+                else:
+                    enrichment.update(_enrich_result)
+                if enrichment.get("degraded"):
+                    log.warning(f"{ticker}: enrichment degraded (live): {enrichment.get('error')}")
+            except Exception as _ee:
+                enrichment["degraded"] = True
+                enrichment["error"] = str(_ee)[:200]
+                log.warning(f"{ticker}: enrichment failed (live): {_ee}")
             has_earnings = enrichment.get("has_earnings", False)
             earnings_warn = enrichment.get("earnings_warn")
             candle_closes = get_daily_candles(ticker, days=RV_LOOKBACK_DAYS + 5)
@@ -4480,6 +4513,21 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
         trade_journal.log_signal(ticker, webhook_data,
             outcome="trade_opened" if risk_result["allowed"] else "risk_blocked",
             confidence=best_rec.get("confidence"))
+
+        # Phase: Wire journal open for feedback loop
+        if risk_result["allowed"]:
+            try:
+                _spread_id = f"{ticker}:{best_rec.get('exp','')}:{best_rec.get('side','')}:{trade.get('long','')}:{trade.get('short','')}"
+                best_rec["spread_id"] = _spread_id
+                trade_journal.log_trade_open(
+                    spread_id=_spread_id,
+                    ticker=ticker,
+                    rec=best_rec,
+                    regime=regime,
+                    risk_check=risk_result,
+                )
+            except Exception as _je:
+                log.warning(f"Journal log_trade_open failed: {_je}")
         _log_signal_dataset_event(
             ticker, webhook_data,
             outcome="trade_opened" if risk_result["allowed"] else "risk_blocked",
