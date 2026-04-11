@@ -861,3 +861,189 @@ def start_fib_monitor(daily_bars_fn: Callable, post_fn: Callable,
     except Exception as e:
         log.warning(f"Failed to start Fib monitor: {e}")
         return None
+
+
+# ─────────────────────────────────────────────────────────────
+# PotterBoxBreakMonitor — real-time box break/reclaim detection
+# ─────────────────────────────────────────────────────────────
+
+class PotterBoxBreakMonitor:
+    """Monitors streaming spots against active Potter Box boundaries.
+
+    Potter Box detection runs 2-3x daily on daily bars (boxes are multi-day
+    patterns). But BREAKS happen intraday — and with the old 2x/day scan,
+    you wouldn't know until hours later.
+
+    This monitor checks streaming spots every 30s against stored active boxes
+    in Redis (written by the Potter Box scanner). When price breaks a floor
+    or ceiling, it fires an immediate alert.
+    """
+
+    CHECK_INTERVAL = 30
+    ALERT_COOLDOWN = 3600   # 1 hour between same break alerts
+    BREAK_CONFIRM_PCT = 0.15  # must break by 0.15% to confirm (not just touch)
+
+    def __init__(self, potter_box_scanner, post_fn: Callable, tickers: list):
+        self._potter = potter_box_scanner
+        self._post = post_fn
+        self._tickers = tickers
+        self._cooldowns = {}   # "ticker:break_type" → timestamp
+        self._thread = None
+        self._running = False
+        self._lock = threading.Lock()
+        self._stats = {"checks": 0, "breaks_detected": 0, "last_check": None}
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._running = True
+        self._thread = threading.Thread(
+            target=self._run, name="potter-break-monitor", daemon=True)
+        self._thread.start()
+        log.info(f"Potter Box break monitor started: {len(self._tickers)} tickers")
+
+    def stop(self):
+        self._running = False
+
+    def _run(self):
+        time.sleep(60)  # let Potter Box AM scan populate Redis first
+        while self._running:
+            try:
+                if not self._is_market_hours():
+                    time.sleep(60)
+                    continue
+                self._check_breaks()
+                with self._lock:
+                    self._stats["checks"] += 1
+                    self._stats["last_check"] = time.time()
+            except Exception as e:
+                log.debug(f"Potter break monitor error: {e}")
+            time.sleep(self.CHECK_INTERVAL)
+
+    def _is_market_hours(self) -> bool:
+        try:
+            import pytz
+            ct = datetime.now(pytz.timezone("US/Central"))
+            if ct.weekday() >= 5:
+                return False
+            return ct.replace(hour=8, minute=30) <= ct <= ct.replace(hour=15, minute=15)
+        except Exception:
+            return True
+
+    def _check_breaks(self):
+        now = time.time()
+        for ticker in self._tickers:
+            spot = get_streaming_spot(ticker)
+            if not spot or spot <= 0:
+                continue
+
+            # Get active box from Potter Box scanner's Redis cache
+            try:
+                box = self._potter.get_active_box(ticker)
+                if not box:
+                    continue
+            except Exception:
+                continue
+
+            floor = box.get("floor", 0)
+            roof = box.get("roof", 0)
+            if floor <= 0 or roof <= 0 or floor >= roof:
+                continue
+
+            break_margin = spot * (self.BREAK_CONFIRM_PCT / 100)
+
+            # Check ceiling break (breakout)
+            if spot > roof + break_margin:
+                self._fire_break(ticker, spot, "BREAKOUT", roof, floor, box, now)
+
+            # Check floor break (breakdown)
+            elif spot < floor - break_margin:
+                self._fire_break(ticker, spot, "BREAKDOWN", roof, floor, box, now)
+
+            # Check reclaim from outside
+            elif floor <= spot <= roof:
+                # If we previously alerted a break, reclaim is noteworthy
+                breakout_key = f"{ticker}:BREAKOUT"
+                breakdown_key = f"{ticker}:BREAKDOWN"
+                if (breakout_key in self._cooldowns or
+                        breakdown_key in self._cooldowns):
+                    self._fire_break(ticker, spot, "RECLAIM", roof, floor, box, now)
+
+    def _fire_break(self, ticker: str, spot: float, break_type: str,
+                    roof: float, floor: float, box: dict, now: float):
+        cooldown_key = f"{ticker}:{break_type}"
+        last_fired = self._cooldowns.get(cooldown_key, 0)
+        if now - last_fired < self.ALERT_COOLDOWN:
+            return
+
+        self._cooldowns[cooldown_key] = now
+        box_width = roof - floor
+        box_pct = (box_width / floor) * 100 if floor > 0 else 0
+        bars_in_box = box.get("duration_bars", "?")
+
+        if break_type == "BREAKOUT":
+            emoji = "🚀"
+            dist = ((spot - roof) / roof) * 100
+            action = f"Price ${spot:.2f} broke ABOVE ceiling ${roof:.2f} (+{dist:.2f}%)"
+            guidance = "Watch for continuation. Failed breakout = short opportunity."
+        elif break_type == "BREAKDOWN":
+            emoji = "💥"
+            dist = ((floor - spot) / floor) * 100
+            action = f"Price ${spot:.2f} broke BELOW floor ${floor:.2f} (-{dist:.2f}%)"
+            guidance = "Watch for continuation. Failed breakdown = long opportunity."
+        else:  # RECLAIM
+            emoji = "🔄"
+            action = f"Price ${spot:.2f} RECLAIMED inside box ${floor:.2f}-${roof:.2f}"
+            guidance = "Break failed — range trade logic applies. Fade the edges."
+
+        msg = (
+            f"{emoji} POTTER BOX {break_type} — {ticker}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{action}\n"
+            f"📦 Box: ${floor:.2f} - ${roof:.2f} ({box_pct:.1f}% wide, {bars_in_box} bars)\n"
+            f"\n"
+            f"💡 {guidance}"
+        )
+
+        try:
+            self._post(msg)
+            with self._lock:
+                self._stats["breaks_detected"] += 1
+            log.info(f"Potter Box {break_type}: {ticker} ${spot:.2f} "
+                     f"(box ${floor:.2f}-${roof:.2f})")
+        except Exception as e:
+            log.warning(f"Potter break alert failed for {ticker}: {e}")
+
+    @property
+    def status(self) -> dict:
+        with self._lock:
+            return dict(self._stats)
+
+
+# ─────────────────────────────────────────────────────────────
+# Potter Box Break Monitor Factory
+# ─────────────────────────────────────────────────────────────
+
+_box_monitor = None
+
+
+def start_box_break_monitor(potter_box_scanner, post_fn: Callable) -> Optional[PotterBoxBreakMonitor]:
+    """Start real-time Potter Box break monitoring.
+
+    Usage in app.py:
+        from schwab_stream import start_box_break_monitor
+        start_box_break_monitor(_potter_box, post_to_telegram)
+    """
+    global _box_monitor
+    try:
+        from oi_flow import FLOW_TICKERS
+        _box_monitor = PotterBoxBreakMonitor(
+            potter_box_scanner=potter_box_scanner,
+            post_fn=post_fn,
+            tickers=list(FLOW_TICKERS),
+        )
+        _box_monitor.start()
+        return _box_monitor
+    except Exception as e:
+        log.warning(f"Failed to start Potter Box break monitor: {e}")
+        return None
