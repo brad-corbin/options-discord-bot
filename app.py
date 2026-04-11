@@ -2763,7 +2763,9 @@ def md_get(url, params=None, retries=2):
 
 # v4.1: Cached API layer — reduces duplicate API calls by 70-90%
 # v5.1.1: Counter wraps md_get inside CachedMarketData for per-endpoint tracking
-_cached_md = CachedMarketData(md_get)
+# Schwab Adapter 
+from schwab_adapter import build_data_router
+_cached_md = build_data_router(md_get)
 
 def get_api_status() -> dict:
     """v5.1.1: Get API call counter status for /status endpoint.
