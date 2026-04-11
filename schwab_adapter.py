@@ -858,6 +858,14 @@ class DataRouter:
         return getattr(self._md, method_name)(*args, **kwargs)
 
     def get_spot(self, ticker: str, as_float_fn=None) -> float:
+        # Phase 2: Check streaming spot prices first (sub-second freshness)
+        try:
+            from schwab_stream import get_streaming_spot
+            streaming = get_streaming_spot(ticker)
+            if streaming is not None and streaming > 0:
+                return streaming
+        except ImportError:
+            pass
         return self._try_schwab_first("get_spot", ticker, as_float_fn=as_float_fn)
 
     def get_chain(self, ticker: str, expiration: str,
