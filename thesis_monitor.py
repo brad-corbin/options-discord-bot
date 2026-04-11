@@ -266,6 +266,10 @@ class ActiveTrade:
     # Used for 20% premium stop without live quote fetching.
     entry_premium: float = 0.0   # estimated option mid price at entry (dollars)
     entry_delta: float = 0.0     # option delta at entry (0–1 for calls, 0–1 for puts)
+    # Phase 3: live option tracking via streaming
+    option_symbol: str = ""      # OCC symbol for streaming subscription
+    option_strike: float = 0.0   # strike price
+    option_expiry: str = ""      # expiry date YYYY-MM-DD
     # ── v5.1 Change 8: CRISIS long option tracking ────────────────────────
     is_crisis_long_option: bool = False   # True = use CRISIS exit framework
     crisis_phase: str = "HOLD"           # HOLD → SCALE_1 → SCALE_2 → TRAIL
@@ -1680,6 +1684,42 @@ class ThesisMonitorEngine:
                 log.info(f"Premium stop not armed for {ticker} {direction} — no ATM data on thesis "
                          f"(delta={trade.entry_delta}, premium={trade.entry_premium})")
 
+        # Phase 3: Compute OCC symbol and request streaming subscription
+        try:
+            from schwab_stream import build_occ_symbol, get_option_symbol_manager, get_live_premium
+            _opt_side = "call" if direction == "LONG" else "put"
+            _atm = round(price)  # ATM strike
+            if _opt_side == "put":
+                _atm = round(price) + 1  # slightly ITM for puts per v5.1
+            # Find expiry — use today for 0DTE, tomorrow for 1DTE
+            _today = date.today()
+            if thesis.session_label and "1DTE" in thesis.session_label:
+                _exp = _today + timedelta(days=1)
+                while _exp.weekday() >= 5:
+                    _exp += timedelta(days=1)
+            else:
+                _exp = _today
+            trade.option_expiry = _exp.strftime("%Y-%m-%d")
+            trade.option_strike = float(_atm)
+            trade.option_symbol = build_occ_symbol(ticker, trade.option_expiry, _opt_side, _atm)
+            log.info(f"Phase 3: OCC symbol for trade: {trade.option_symbol}")
+
+            # Request streaming subscription for this symbol
+            osm = get_option_symbol_manager()
+            if osm:
+                osm.subscribe_specific([trade.option_symbol])
+
+            # Try to get live premium from streaming instead of estimate
+            live_prem = get_live_premium(trade.option_symbol)
+            if live_prem and live_prem > 0:
+                trade.entry_premium = live_prem
+                trade.est_premium = live_prem
+                trade.peak_premium = live_prem
+                log.info(f"Phase 3: Live entry premium ${live_prem:.2f} from streaming "
+                         f"(replaces estimate)")
+        except Exception as e:
+            log.debug(f"Phase 3 OCC symbol setup: {e}")
+
         state.active_trades.append(trade)
         state.last_entry_time = now   # stamp cooldown timer
         self._persist_trades(ticker, state)
@@ -1766,35 +1806,53 @@ class ThesisMonitorEngine:
                 continue  # CRISIS trades skip standard Layer 1b + Layer 2
 
             # ── LAYER 1b: Delta-based 20% premium stop ───────────────────────
-            # No live quote needed. Uses entry_delta (from em chain at session
-            # start) and min_favorable (worst spot excursion, tracked every poll)
-            # to estimate current option loss percentage.
-            # Formula: est_loss = adverse_spot_move × entry_delta / entry_premium
-            # Fires when estimated premium loss ≥ 20%.
-            # Approximation degrades for large moves (delta shifts) but is
-            # accurate enough for the tight intraday stops we run.
+            # Phase 3: Use live streaming premium when available.
+            # Fallback: uses entry_delta and min_favorable to estimate loss.
             if (trade.entry_premium > 0 and trade.entry_delta > 0
                     and trade.status in ("OPEN",)  # only before scaling
                     and trade.max_favorable <= 0):  # no MFE yet — still a pure loser
+
+                # Phase 3: Try live premium first
+                _live_loss_pct = None
+                if trade.option_symbol:
+                    try:
+                        from schwab_stream import get_live_premium
+                        _lp = get_live_premium(trade.option_symbol)
+                        if _lp and _lp > 0 and trade.entry_premium > 0:
+                            _live_loss_pct = (trade.entry_premium - _lp) / trade.entry_premium
+                    except Exception:
+                        pass
+
                 adverse_move = abs(trade.min_favorable)
-                if adverse_move > 0:
+                if _live_loss_pct is not None:
+                    est_loss_pct = _live_loss_pct
+                    est_loss_dollars = round(trade.entry_premium - (trade.entry_premium * (1 - est_loss_pct)), 2)
+                elif adverse_move > 0:
                     est_loss_pct = (adverse_move * trade.entry_delta) / trade.entry_premium
-                    if est_loss_pct >= 0.20:
+                    est_loss_dollars = round(adverse_move * trade.entry_delta, 2)
+                else:
+                    est_loss_pct = 0
+                    est_loss_dollars = 0
+
+                if est_loss_pct >= 0.20:
                         if self._exit_alert_ok(trade, "prem_stop", now):
                             pnl_pct = ((price - trade.entry_price) / trade.entry_price * 100) if trade.direction == "LONG" else ((trade.entry_price - price) / trade.entry_price * 100)
-                            est_loss_dollars = round(adverse_move * trade.entry_delta, 2)
                             trade.status = "INVALIDATED"; trade.close_price = price
                             trade.close_time = now; trade.close_epoch = time.time()
-                            trade.close_reason = (f"Premium stop: est. {est_loss_pct:.0%} loss "
+                            _src = "live" if _live_loss_pct is not None else "est"
+                            trade.close_reason = (f"Premium stop: {_src}. {est_loss_pct:.0%} loss "
                                                    f"(${adverse_move:.2f} adverse × δ{trade.entry_delta:.2f})")
                             # v5.1 Change 6: increment circuit breaker
                             self._update_circuit_breaker(state, trade.bias_direction, is_stop=True)
                             self._persist_trades(ticker, state)
+                            _detail = (f"Live option premium ${_lp:.2f} vs entry ${trade.entry_premium:.2f}"
+                                       if _live_loss_pct is not None else
+                                       f"Adverse move: ${adverse_move:.2f} × delta {trade.entry_delta:.2f} "
+                                       f"≈ ${est_loss_dollars:.2f} estimated loss.")
                             events.append({"msg": (
                                 f"🛑 PREMIUM STOP — {trade.direction}\n\n"
-                                f"Estimated option loss ~{est_loss_pct:.0%} of entry premium.\n"
-                                f"Adverse move: ${adverse_move:.2f} × delta {trade.entry_delta:.2f} "
-                                f"≈ ${est_loss_dollars:.2f} estimated loss.\n"
+                                f"Option loss ~{est_loss_pct:.0%} of entry premium.\n"
+                                f"{_detail}\n"
                                 f"Entry: ${trade.entry_price:.2f} → Now: ${price:.2f} ({pnl_pct:+.2f}%)\n"
                                 f"Cut it. Don't let a small loss compound."
                             ), "type": "exit", "priority": 5, "alert_key": f"exit_prem_{trade.trade_id}"})
@@ -1928,9 +1986,26 @@ class ThesisMonitorEngine:
         else:  # SHORT direction = put buyer
             spot_move = trade.entry_price - price
 
-        # Approximate premium: entry_premium + (spot_move × delta)
-        # Delta shifts as option moves ITM/OTM, but this is close enough for 0DTE
-        trade.est_premium = max(0.01, trade.entry_premium + spot_move * trade.entry_delta)
+        # Phase 3: Use live streaming premium if available, else delta approximation
+        _used_live = False
+        if trade.option_symbol:
+            try:
+                from schwab_stream import get_live_premium, get_live_greeks
+                live_prem = get_live_premium(trade.option_symbol)
+                if live_prem and live_prem > 0:
+                    trade.est_premium = live_prem
+                    _used_live = True
+                    # Also update delta from live Greeks for better accuracy
+                    live_g = get_live_greeks(trade.option_symbol)
+                    if live_g and live_g.get("delta"):
+                        trade.entry_delta = abs(live_g["delta"])
+            except Exception:
+                pass
+
+        if not _used_live:
+            # Fallback: Approximate premium: entry_premium + (spot_move × delta)
+            trade.est_premium = max(0.01, trade.entry_premium + spot_move * trade.entry_delta)
+
         trade.peak_premium = max(trade.peak_premium, trade.est_premium)
 
         pnl_pct = ((price - trade.entry_price) / trade.entry_price * 100) if trade.direction == "LONG" else ((trade.entry_price - price) / trade.entry_price * 100)
@@ -2348,6 +2423,9 @@ class ThesisMonitorEngine:
                     "close_reason": t.close_reason, "close_epoch": t.close_epoch,
                     "last_exit_bar_ts": t.last_exit_bar_ts,
                     "exit_alert_history_rel": eah_relative,
+                    "option_symbol": t.option_symbol,
+                    "option_strike": t.option_strike,
+                    "option_expiry": t.option_expiry,
                 })
             self._store_set(f"active_trades:{ticker}", json.dumps(trades_data), ttl=86400)
         except Exception as e:
@@ -2412,6 +2490,18 @@ class ThesisMonitorEngine:
                     close_epoch=close_epoch,
                     last_exit_bar_ts=td.get("last_exit_bar_ts", 0),
                 )
+                trade.option_symbol = td.get("option_symbol", "")
+                trade.option_strike = td.get("option_strike", 0.0)
+                trade.option_expiry = td.get("option_expiry", "")
+                # Phase 3: re-subscribe to streaming for restored trades
+                if trade.option_symbol and trade.status in ("OPEN", "SCALED", "TRAILED"):
+                    try:
+                        from schwab_stream import get_option_symbol_manager
+                        osm = get_option_symbol_manager()
+                        if osm:
+                            osm.subscribe_specific([trade.option_symbol])
+                    except Exception:
+                        pass
                 # Reconstruct exit_alert_history from relative offsets
                 eah_rel = td.get("exit_alert_history_rel", {})
                 for k, secs_ago in eah_rel.items():
@@ -3166,6 +3256,7 @@ _TRADE_LOG_FIELDS = [
     "entry_bar_time", "close_bar_time",
     "mfe_pts", "mae_pts",
     "entry_premium", "entry_delta",  # option tracking for premium stop analysis
+    "option_symbol",                 # Phase 3: OCC symbol for streaming
 ]
 
 def _log_trade_event(trade, event: str, close_price: float = None,
@@ -3210,6 +3301,7 @@ def _log_trade_event(trade, event: str, close_price: float = None,
             "mae_pts":          getattr(trade, "min_favorable",     ""),
             "entry_premium":    getattr(trade, "entry_premium",     ""),
             "entry_delta":      getattr(trade, "entry_delta",       ""),
+            "option_symbol":    getattr(trade, "option_symbol",     ""),
         }
 
         with open(path, "a", newline="", encoding="utf-8") as f:
