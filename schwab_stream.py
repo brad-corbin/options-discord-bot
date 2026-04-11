@@ -248,11 +248,11 @@ class SweepDetector:
     """
 
     # Minimum volume delta to consider a sweep
-    MIN_SWEEP_VOLUME = 50
+    MIN_SWEEP_VOLUME = 200
     # Minimum notional (volume × mid × 100) for significant sweep
-    MIN_SWEEP_NOTIONAL = 25_000
+    MIN_SWEEP_NOTIONAL = 100_000
     # Cooldown per symbol (seconds)
-    COOLDOWN = 120
+    COOLDOWN = 300
 
     def __init__(self, on_sweep: Optional[Callable] = None):
         self._on_sweep = on_sweep
