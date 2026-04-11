@@ -90,9 +90,24 @@ except ImportError:
     MULTI_TOUCH_RECENT_TOUCH_MIN = 60
     BREAK_CONFIRM_POLLS = 3
 
-MONITOR_POLL_INTERVAL_SEC = 300
-MONITOR_POLL_INTERVAL_FAST_SEC = 60
-MONITOR_FAST_POLL_TICKERS = ["SPY", "QQQ"]   # v5.1 Change 5: QQQ parity
+MONITOR_POLL_INTERVAL_SEC = 60             # v7.0: was 300 — streaming spots are free, evaluate all tickers every cycle
+MONITOR_POLL_INTERVAL_FAST_SEC = 30        # v7.0: was 60 — streaming spots are instant, catch breaks 2x faster
+MONITOR_FAST_POLL_TICKERS = [              # v7.0: was just SPY/QQQ — streaming covers all flow tickers for free
+    # Indexes
+    "SPY", "QQQ", "IWM", "DIA",
+    # Mega-cap tech (highest flow volume)
+    "AAPL", "MSFT", "NVDA", "AMD", "AMZN", "META", "TSLA", "GOOGL",
+    # Large-cap with heavy options flow
+    "NFLX", "COIN", "AVGO", "PLTR", "CRM", "ORCL", "ARM", "SMCI",
+    # Financials
+    "JPM", "GS",
+    # Industrials / Health
+    "BA", "CAT", "LLY", "UNH", "MRNA",
+    # ETFs
+    "GLD", "TLT", "XLF", "XLE", "XLV", "SOXX",
+    # Additional active
+    "MSTR", "SOFI",
+]
 MONITOR_ALERT_COOLDOWN_SEC = 300       # v4.3: was 600 (10 min) — 5 min is enough to prevent spam
 MONITOR_ZONE_CLUSTER_PCT   = 0.08   # break attempts / level alerts within 0.08% of each other are treated as the same zone
 MONITOR_MAX_BREAK_AGE_SEC = 900
@@ -770,7 +785,11 @@ class ThesisMonitorEngine:
 
     # Tickers that use 1-minute bars for lower latency.
     # All others use 5-minute bars.
-    _HIGH_RES_TICKERS = {"SPY", "QQQ"}   # v5.1 Change 5: QQQ parity
+    _HIGH_RES_TICKERS = {                    # v7.0: expanded from SPY/QQQ — streaming makes 1-min bars free
+        "SPY", "QQQ", "IWM",                # Indexes — highest priority
+        "NVDA", "TSLA", "AMD", "AAPL",      # Mega-cap with heaviest options flow
+        "META", "AMZN", "MSFT", "GOOGL",    # Big tech
+    }
 
     def _get_or_create_bar_manager(self, ticker: str) -> Optional[BarStateManager]:
         """Lazy-init bar manager for a ticker.
@@ -3478,7 +3497,9 @@ class ThesisMonitorDaemon:
     @property
     def is_running(self): return self._thread is not None and self._thread.is_alive()
     def _run(self):
-        log.info(f"Thesis monitor: fast={MONITOR_POLL_INTERVAL_FAST_SEC}s for {MONITOR_FAST_POLL_TICKERS}, normal={MONITOR_POLL_INTERVAL_SEC}s")
+        log.info(f"Thesis monitor: {MONITOR_POLL_INTERVAL_FAST_SEC}s for {len(MONITOR_FAST_POLL_TICKERS)} streaming tickers, "
+                 f"{MONITOR_POLL_INTERVAL_SEC}s for others, "
+                 f"{len(self._HIGH_RES_TICKERS)} high-res (1-min bars + ORB)")
         self._cycle_count = 0; self._slow_n = max(1, MONITOR_POLL_INTERVAL_SEC // MONITOR_POLL_INTERVAL_FAST_SEC)
         while not self._stop_event.is_set():
             try: self._poll_cycle()
