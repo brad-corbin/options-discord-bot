@@ -1151,6 +1151,20 @@ def _spread_close(args: list, send_fn, account: str = "brad"):
         send_fn(f"❌ {result['error']}")
         return
 
+    # Wire journal close for feedback loop
+    try:
+        from trade_journal import log_trade_close
+        log_trade_close(
+            spread_id=sp_id,
+            ticker=result.get("ticker", ""),
+            spread=result,
+            close_price=close_price,
+            exit_reason="manual",
+            account=account,
+        )
+    except Exception as _je:
+        log.warning(f"Journal log_trade_close failed: {_je}")
+
     pnl = result.get("pnl", 0)
     emoji = _pnl_emoji(pnl)
     total_risk = result["debit"] * result["contracts"] * 100
@@ -1178,6 +1192,13 @@ def _spread_stop(args: list, send_fn, account: str = "brad"):
     if "error" in result:
         send_fn(f"❌ {result['error']}")
         return
+
+    try:
+        from trade_journal import log_trade_close
+        log_trade_close(spread_id=sp_id, ticker=result.get("ticker", ""),
+                        spread=result, close_price=0.0, exit_reason="stop", account=account)
+    except Exception:
+        pass
 
     pnl = result.get("pnl", 0)
     total_risk = result["debit"] * result["contracts"] * 100
@@ -1208,6 +1229,16 @@ def _spread_expire(args: list, send_fn, account: str = "brad"):
     if "error" in result:
         send_fn(f"❌ {result['error']}")
         return
+
+    try:
+        from trade_journal import log_trade_close
+        _exit_reason = "expired_itm" if itm else "expired_otm"
+        _close_price = result.get("close_price", result.get("width", 0) if itm else 0)
+        log_trade_close(spread_id=sp_id, ticker=result.get("ticker", ""),
+                        spread=result, close_price=_close_price,
+                        exit_reason=_exit_reason, account=account)
+    except Exception:
+        pass
 
     pnl = result.get("pnl", 0)
     emoji = _pnl_emoji(pnl)
