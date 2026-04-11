@@ -15,6 +15,12 @@ FINNHUB_TOKEN = os.getenv("FINNHUB_TOKEN", "").strip()
 FINNHUB_BASE  = "https://finnhub.io/api/v1"
 MARKETDATA_TOKEN = os.getenv("MARKETDATA_TOKEN", "").strip()
 
+# FMP token — shared with fundamental_screener
+try:
+    from fundamental_screener import FMP_TOKEN
+except ImportError:
+    FMP_TOKEN = os.getenv("FMP_TOKEN", "").strip()
+
 # Cache to avoid hammering Finnhub on every scan
 # key: ticker → (value, timestamp)
 _cache: dict = {}
@@ -82,7 +88,7 @@ def get_iv_rank_from_candles(ticker: str, iv_current: float) -> Tuple[Optional[f
         return cached
 
     if not MARKETDATA_TOKEN:
-        return None, None
+        return None, None, None
 
     try:
         today     = datetime.now(timezone.utc).date()
@@ -100,7 +106,7 @@ def get_iv_rank_from_candles(ticker: str, iv_current: float) -> Tuple[Optional[f
 
         closes = data.get("c") or []
         if len(closes) < 30:
-            return None, None
+            return None, None, None
 
         # Compute 30-day rolling realized volatility (annualized)
         import math
@@ -120,14 +126,14 @@ def get_iv_rank_from_candles(ticker: str, iv_current: float) -> Tuple[Optional[f
             rv_series.append(rv)
 
         if len(rv_series) < 10:
-            return None, None
+            return None, None, None
 
         rv_min = min(rv_series)
         rv_max = max(rv_series)
         rng    = rv_max - rv_min
 
         if rng <= 0:
-            return None, None
+            return None, None, None
 
         # IV rank: where does current IV sit vs historical RV range
         iv_rank = round(min(max((iv_current - rv_min) / rng * 100, 0), 100), 1)
@@ -170,15 +176,13 @@ def get_earnings_warning(ticker: str, within_days: int = 5) -> Tuple[bool, Optio
 
     for url in FMP_URLS:
         try:
-            resp = requests.get(
-                url,
-                params={
-                    "from": today.strftime("%Y-%m-%d"),
-                    "to": end_date.strftime("%Y-%m-%d"),
-                    "apikey": FMP_TOKEN,
-                },
-                timeout=8,
-            )
+            params = {
+                "from": today.strftime("%Y-%m-%d"),
+                "to": end_date.strftime("%Y-%m-%d"),
+            }
+            if FMP_TOKEN:
+                params["apikey"] = FMP_TOKEN
+            resp = requests.get(url, params=params, timeout=8)
             resp.raise_for_status()
             data = resp.json()
             break  # success — stop trying
