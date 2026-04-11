@@ -1555,6 +1555,104 @@ class FlowDetector:
             if alert_dte == 0 and route == "income":
                 continue
 
+            # ── POTTER BOX STRUCTURAL GATE ──
+            # Flow must agree with box structure. Prevents fighting breakouts.
+            # Void above + put flow = reactive noise (broken support holders)
+            # Void above + call flow = confirms breakout (fire)
+            # Void below + call flow = bottom-fishing gamblers (block)
+            # Void below + put flow = confirms breakdown (fire)
+            # Failed breakout + opposing flow + 3+ DTE = fire with context
+            potter_box_gate = "pass"  # pass, block, context
+            potter_context = ""
+            potter_location = ""
+            try:
+                pb_data = self._state._json_get(f"potter_box:active:{ticker}")
+                if pb_data:
+                    box = pb_data.get("box") or pb_data  # handle both formats
+                    pb_floor = box.get("floor", 0)
+                    pb_roof = box.get("roof", 0)
+                    spot_val = alert.get("spot", 0)
+
+                    if pb_floor > 0 and pb_roof > 0 and spot_val > 0:
+                        # Determine price location
+                        if spot_val > pb_roof * 1.005:  # above roof (0.5% buffer)
+                            potter_location = "void_above"
+                            if trade_direction == "bearish":
+                                if alert_dte <= 2:
+                                    # 0-2DTE bearish in void above = reactive noise
+                                    potter_box_gate = "block"
+                                    potter_context = (
+                                        f"📦 BLOCKED: {ticker} in void above Potter Box "
+                                        f"(${pb_floor:.0f}-${pb_roof:.0f}). "
+                                        f"Bearish 0DTE flow is reactive — hedging/profit-taking, "
+                                        f"not directional conviction.")
+                                elif alert_dte >= 3:
+                                    # 3+ DTE bearish in void above = possible failed breakout
+                                    # Only fire if we can confirm the breakout is failing
+                                    potter_box_gate = "context"
+                                    potter_context = (
+                                        f"📦 CAUTION: {ticker} in void above box "
+                                        f"(${pb_floor:.0f}-${pb_roof:.0f}). "
+                                        f"Bearish {alert_dte}DTE flow may signal breakout failure. "
+                                        f"Confirm price drops below ${pb_roof:.0f} before entry.")
+                            else:
+                                # Bullish flow in void above = confirms breakout
+                                potter_context = (
+                                    f"📦 BREAKOUT CONFIRMED: {ticker} above box "
+                                    f"${pb_roof:.0f} with bullish flow — momentum aligned")
+
+                        elif spot_val < pb_floor * 0.995:  # below floor
+                            potter_location = "void_below"
+                            if trade_direction == "bullish":
+                                if alert_dte <= 2:
+                                    potter_box_gate = "block"
+                                    potter_context = (
+                                        f"📦 BLOCKED: {ticker} in void below Potter Box "
+                                        f"(${pb_floor:.0f}-${pb_roof:.0f}). "
+                                        f"Bullish 0DTE flow is bottom-fishing, "
+                                        f"not institutional conviction.")
+                                elif alert_dte >= 3:
+                                    potter_box_gate = "context"
+                                    potter_context = (
+                                        f"📦 CAUTION: {ticker} in void below box "
+                                        f"(${pb_floor:.0f}-${pb_roof:.0f}). "
+                                        f"Bullish {alert_dte}DTE flow may signal breakdown failure. "
+                                        f"Confirm price recovers above ${pb_floor:.0f} before entry.")
+                            else:
+                                potter_context = (
+                                    f"📦 BREAKDOWN CONFIRMED: {ticker} below box "
+                                    f"${pb_floor:.0f} with bearish flow — momentum aligned")
+
+                        else:  # Inside box
+                            potter_location = "inside"
+                            dist_to_floor = abs(spot_val - pb_floor) / spot_val * 100
+                            dist_to_roof = abs(spot_val - pb_roof) / spot_val * 100
+
+                            if dist_to_floor < 1.5 and trade_direction == "bullish":
+                                potter_context = (
+                                    f"📦 BOUNCE PLAY: {ticker} near box floor ${pb_floor:.0f} "
+                                    f"with bullish flow — structural support")
+                            elif dist_to_roof < 1.5 and trade_direction == "bearish":
+                                potter_context = (
+                                    f"📦 REJECTION PLAY: {ticker} near box ceiling ${pb_roof:.0f} "
+                                    f"with bearish flow — structural resistance")
+                            elif dist_to_floor < 1.5 and trade_direction == "bearish":
+                                potter_context = (
+                                    f"📦 ⚠️ Testing support: {ticker} near floor ${pb_floor:.0f} "
+                                    f"— bearish flow may break or bounce")
+                            elif dist_to_roof < 1.5 and trade_direction == "bullish":
+                                potter_context = (
+                                    f"📦 ⚠️ Testing resistance: {ticker} near ceiling ${pb_roof:.0f} "
+                                    f"— bullish flow may break or reject")
+            except Exception:
+                pass
+
+            # Apply Potter Box gate
+            if potter_box_gate == "block":
+                log.info(f"📦 Potter Box BLOCKED conviction: {ticker} {trade_side} "
+                       f"({potter_location}, {alert_dte}DTE)")
+                continue
+
             # Cooldown per ticker per route
             cooldown_key = f"conviction:{route}:{ticker}"
             if not self._state.check_and_set_cooldown(
@@ -1682,6 +1780,9 @@ class FlowDetector:
                 "recent_move_pct": round(recent_move_pct, 1),
                 "recommend_1dte": recommend_1dte,
                 "strike_guidance": strike_guidance,
+                "potter_box_gate": potter_box_gate,
+                "potter_context": potter_context,
+                "potter_location": potter_location,
             })
 
         return plays
@@ -1809,6 +1910,12 @@ class FlowDetector:
         if play.get("vpoc_near"):
             vpoc = play.get("vpoc_data", {})
             lines.append(f"📍 Flow near VPOC ${vpoc.get('vpoc',0):.2f} — volume gravitational center")
+
+        # Potter Box structural context
+        potter_ctx = play.get("potter_context", "")
+        if potter_ctx:
+            lines.append(f"")
+            lines.append(potter_ctx)
 
         # Earnings warning
         if play.get("earnings_in_window"):
@@ -2431,7 +2538,41 @@ class FlowDetector:
         lines.append(f"")
         lines.append(f"Signal: {rotation['match_count']}/{rotation['required']}+ "
                      f"asset classes confirm rotation pattern")
-        lines.append(f"⚠️ This is a MACRO signal — individual trades should "
-                     f"align with this direction.")
+
+        # Actionable guidance per rotation type
+        pattern = rotation.get("pattern", "")
+        if pattern == "risk_off":
+            lines += [
+                "",
+                "🎯 ACTION GUIDANCE:",
+                "  • Favor: Puts on SPY/QQQ/IWM",
+                "  • Favor: Calls on TLT/GLD",
+                "  • Reduce long equity exposure",
+                "  • Tighten stops on bullish swing trades",
+            ]
+        elif pattern == "risk_on":
+            lines += [
+                "",
+                "🎯 ACTION GUIDANCE:",
+                "  • Favor: Calls on SPY/QQQ/IWM",
+                "  • Reduce bond/gold long positions",
+                "  • Widen stops on bullish swings — trend is your friend",
+            ]
+        elif pattern == "tech_rotation":
+            lines += [
+                "",
+                "🎯 ACTION GUIDANCE:",
+                "  • Favor: Calls on QQQ/NVDA/AMD/SOXX",
+                "  • Tech leading — overweight semiconductor/AI names",
+                "  • Watch for QQQ breakout above resistance",
+            ]
+        elif pattern == "defensive":
+            lines += [
+                "",
+                "🎯 ACTION GUIDANCE:",
+                "  • Favor: Calls on XLV/XLE/GLD",
+                "  • Reduce tech/growth exposure",
+                "  • Institutions rotating into value/safety",
+            ]
 
         return "\n".join(lines)
