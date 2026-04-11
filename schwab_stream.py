@@ -568,5 +568,296 @@ def get_stream_status() -> dict:
         status["streaming"] = _stream_manager.status
     if _flow_scanner:
         status["continuous_flow"] = _flow_scanner.status
+    if _fib_monitor:
+        status["fib_monitor"] = _fib_monitor.status
     status["spot_store"] = _spot_store.get_all()
     return status
+
+
+# ─────────────────────────────────────────────────────────────
+# SwingFibMonitor — intraday Fib zone alerts from streaming
+# ─────────────────────────────────────────────────────────────
+
+class SwingFibMonitor:
+    """Monitors streaming spots against pre-computed Fib retracement zones.
+
+    Instead of waiting for the daily close to check Fib touches (3x/day
+    scan schedule), this catches the moment price enters a Fib zone
+    intraday and fires an early warning alert.
+
+    Architecture:
+      1. On startup + daily refresh: compute Fib zones for all swing tickers
+         using daily bars (swing highs/lows → retracement levels)
+      2. Every CHECK_INTERVAL seconds: check streaming spots against zones
+      3. When price enters a zone: fire an early alert with full context
+      4. Cooldown prevents spam (1 alert per ticker per zone per 4 hours)
+    """
+
+    CHECK_INTERVAL = 30      # seconds between spot checks
+    ZONE_TOUCH_PCT = 1.5     # % distance to count as "in the zone"
+    ALERT_COOLDOWN = 14400   # 4 hours between same zone alerts
+    REFRESH_HOUR_CT = 8      # refresh Fib zones at 8 AM CT daily
+
+    def __init__(self, daily_bars_fn: Callable, post_fn: Callable,
+                 tickers: list, enqueue_fn: Callable = None):
+        """
+        Args:
+            daily_bars_fn: callable(ticker, days) -> list[{date, o, h, l, c, v}]
+            post_fn: callable(message) — post to Telegram
+            tickers: list of tickers to monitor
+            enqueue_fn: optional — enqueue swing signal for full evaluation
+        """
+        self._bars_fn = daily_bars_fn
+        self._post = post_fn
+        self._enqueue = enqueue_fn
+        self._tickers = tickers
+        self._fib_zones = {}       # ticker → {fibs, swing_high, swing_low, weekly_bull, ...}
+        self._cooldowns = {}       # "ticker:level:direction" → timestamp
+        self._thread = None
+        self._running = False
+        self._lock = threading.Lock()
+        self._stats = {
+            "zones_computed": 0,
+            "alerts_fired": 0,
+            "checks": 0,
+            "last_check": None,
+            "last_refresh": None,
+        }
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._running = True
+        self._thread = threading.Thread(
+            target=self._run, name="fib-monitor", daemon=True)
+        self._thread.start()
+        log.info(f"Swing Fib monitor started: {len(self._tickers)} tickers")
+
+    def stop(self):
+        self._running = False
+
+    def _run(self):
+        # Initial zone computation
+        time.sleep(45)  # let streaming establish first
+        self._refresh_zones()
+
+        last_refresh_day = ""
+        while self._running:
+            try:
+                if not self._is_market_hours():
+                    time.sleep(60)
+                    continue
+
+                # Daily refresh at REFRESH_HOUR_CT
+                try:
+                    import pytz
+                    ct = datetime.now(pytz.timezone("US/Central"))
+                    today_str = ct.strftime("%Y-%m-%d")
+                    if (ct.hour == self.REFRESH_HOUR_CT and
+                            today_str != last_refresh_day):
+                        self._refresh_zones()
+                        last_refresh_day = today_str
+                except Exception:
+                    pass
+
+                self._check_spots()
+                with self._lock:
+                    self._stats["checks"] += 1
+                    self._stats["last_check"] = time.time()
+
+            except Exception as e:
+                log.debug(f"Fib monitor error: {e}")
+
+            time.sleep(self.CHECK_INTERVAL)
+
+    def _is_market_hours(self) -> bool:
+        try:
+            import pytz
+            ct = datetime.now(pytz.timezone("US/Central"))
+            if ct.weekday() >= 5:
+                return False
+            market_open = ct.replace(hour=8, minute=30, second=0, microsecond=0)
+            market_close = ct.replace(hour=15, minute=15, second=0, microsecond=0)
+            return market_open <= ct <= market_close
+        except Exception:
+            return True
+
+    def _refresh_zones(self):
+        """Compute Fib zones for all tickers from daily bars."""
+        from swing_scanner import (
+            _find_pivots, compute_fib_levels,
+            SWING_FIB_LOOKBACK, _ema,
+        )
+        from trading_rules import (
+            SWING_WEEKLY_EMA_FAST, SWING_WEEKLY_EMA_SLOW,
+            SWING_WEEKLY_MIN_SEP_PCT,
+        )
+
+        computed = 0
+        for ticker in self._tickers:
+            try:
+                bars = self._bars_fn(ticker, 310)
+                if not bars or len(bars) < 60:
+                    continue
+
+                highs = [b["h"] for b in bars]
+                lows = [b["l"] for b in bars]
+                closes = [b["c"] for b in bars]
+                spot = closes[-1]
+
+                # Find swing points
+                pivot_len = max(2, round(SWING_FIB_LOOKBACK / 5))
+                swing_highs, swing_lows = _find_pivots(highs, lows, pivot_len)
+                if not swing_highs or not swing_lows:
+                    continue
+
+                last_sh = swing_highs[-1][1]
+                last_sl = swing_lows[-1][1]
+                fibs = compute_fib_levels(last_sh, last_sl)
+
+                # Weekly trend context
+                from swing_scanner import _aggregate_weekly
+                weekly_bars = _aggregate_weekly(bars)
+                weekly_bull = False
+                weekly_bear = False
+                if len(weekly_bars) >= SWING_WEEKLY_EMA_SLOW + 2:
+                    w_closes = [w["c"] for w in weekly_bars]
+                    w_ema_f = _ema(w_closes, SWING_WEEKLY_EMA_FAST)
+                    w_ema_s = _ema(w_closes, SWING_WEEKLY_EMA_SLOW)
+                    wef, wes = w_ema_f[-1], w_ema_s[-1]
+                    w_gap = abs(wef - wes)
+                    w_min_sep = w_closes[-1] * (SWING_WEEKLY_MIN_SEP_PCT / 100)
+                    weekly_bull = wef > wes and w_gap >= w_min_sep
+                    weekly_bear = wef < wes and w_gap >= w_min_sep
+
+                self._fib_zones[ticker] = {
+                    "fibs": fibs,
+                    "swing_high": last_sh,
+                    "swing_low": last_sl,
+                    "weekly_bull": weekly_bull,
+                    "weekly_bear": weekly_bear,
+                    "spot_at_compute": spot,
+                }
+                computed += 1
+            except Exception as e:
+                log.debug(f"Fib zone computation failed for {ticker}: {e}")
+
+        with self._lock:
+            self._stats["zones_computed"] = computed
+            self._stats["last_refresh"] = time.time()
+        log.info(f"Fib zones refreshed: {computed}/{len(self._tickers)} tickers")
+
+    def _check_spots(self):
+        """Check streaming spots against Fib zones."""
+        touch_pct = self.ZONE_TOUCH_PCT / 100
+        now = time.time()
+
+        for ticker, zone in self._fib_zones.items():
+            spot = get_streaming_spot(ticker)
+            if not spot or spot <= 0:
+                continue
+
+            fibs = zone["fibs"]
+
+            # Check bull Fib levels (price pulling back to support)
+            if zone.get("weekly_bull"):
+                for name, key in [("50.0", "bull_500"), ("61.8", "bull_618"),
+                                  ("38.2", "bull_382"), ("78.6", "bull_786")]:
+                    level = fibs.get(key, 0)
+                    if level <= 0:
+                        continue
+                    dist_pct = abs(spot - level) / level
+                    if dist_pct <= touch_pct and spot >= level * 0.99:
+                        self._fire_fib_alert(ticker, spot, name, level,
+                                             "bull", dist_pct * 100, zone, now)
+                        break  # only fire closest level
+
+            # Check bear Fib levels (price rallying to resistance)
+            if zone.get("weekly_bear"):
+                for name, key in [("50.0", "bear_500"), ("61.8", "bear_618"),
+                                  ("38.2", "bear_382"), ("78.6", "bear_786")]:
+                    level = fibs.get(key, 0)
+                    if level <= 0:
+                        continue
+                    dist_pct = abs(spot - level) / level
+                    if dist_pct <= touch_pct and spot <= level * 1.01:
+                        self._fire_fib_alert(ticker, spot, name, level,
+                                             "bear", dist_pct * 100, zone, now)
+                        break
+
+    def _fire_fib_alert(self, ticker: str, spot: float, fib_name: str,
+                        fib_level: float, direction: str, dist_pct: float,
+                        zone: dict, now: float):
+        """Fire an early Fib zone alert if not in cooldown."""
+        cooldown_key = f"{ticker}:{fib_name}:{direction}"
+        last_fired = self._cooldowns.get(cooldown_key, 0)
+        if now - last_fired < self.ALERT_COOLDOWN:
+            return
+
+        self._cooldowns[cooldown_key] = now
+
+        dir_emoji = "🐂" if direction == "bull" else "🐻"
+        trend = "WEEKLY BULL ✅" if zone.get("weekly_bull") else "WEEKLY BEAR 🔴"
+        sh = zone.get("swing_high", 0)
+        sl = zone.get("swing_low", 0)
+
+        msg = (
+            f"🪜 SWING FIB ALERT — {ticker} {dir_emoji}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📍 Price ${spot:.2f} entering {fib_name}% zone (${fib_level:.2f})\n"
+            f"   Distance: {dist_pct:.1f}% from level\n"
+            f"📊 Trend: {trend}\n"
+            f"📐 Swing range: ${sl:.2f} → ${sh:.2f}\n"
+            f"\n"
+            f"⏰ EARLY WARNING — daily scanner will confirm at close.\n"
+            f"   Watch for wick rejection or hold at this level.\n"
+            f"   Use /checkswing {ticker} for full analysis."
+        )
+
+        try:
+            self._post(msg)
+            with self._lock:
+                self._stats["alerts_fired"] += 1
+            log.info(f"Fib alert: {ticker} {direction} at {fib_name}% "
+                     f"(${spot:.2f} near ${fib_level:.2f})")
+        except Exception as e:
+            log.warning(f"Fib alert failed for {ticker}: {e}")
+
+    @property
+    def status(self) -> dict:
+        with self._lock:
+            return dict(self._stats)
+
+
+# ─────────────────────────────────────────────────────────────
+# Fib Monitor Factory
+# ─────────────────────────────────────────────────────────────
+
+_fib_monitor = None
+
+
+def start_fib_monitor(daily_bars_fn: Callable, post_fn: Callable,
+                      enqueue_fn: Callable = None) -> Optional[SwingFibMonitor]:
+    """Start intraday Fib zone monitoring.
+
+    Usage in app.py:
+        from schwab_stream import start_fib_monitor
+        start_fib_monitor(
+            daily_bars_fn=lambda t, d: _schwab_daily_bars(t, d),
+            post_fn=post_to_telegram,
+        )
+    """
+    global _fib_monitor
+    try:
+        from trading_rules import SWING_WATCHLIST
+        _fib_monitor = SwingFibMonitor(
+            daily_bars_fn=daily_bars_fn,
+            post_fn=post_fn,
+            tickers=sorted(SWING_WATCHLIST),
+            enqueue_fn=enqueue_fn,
+        )
+        _fib_monitor.start()
+        return _fib_monitor
+    except Exception as e:
+        log.warning(f"Failed to start Fib monitor: {e}")
+        return None
