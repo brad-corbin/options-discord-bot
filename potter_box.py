@@ -56,6 +56,8 @@ TTL_HISTORY_BOX = 90 * 86400
 TTL_VOID_MAP = 7 * 86400
 TTL_DEFAULTS = 30 * 86400
 TTL_ZONE = 30 * 86400
+TTL_BOX_MAP = 7 * 86400          # full box map (all detected boxes)
+TTL_ADJACENT = 7 * 86400         # box_above / box_below
 
 TIER_MAP = {
     "index": {"SPY", "QQQ", "IWM", "DIA"},
@@ -452,11 +454,21 @@ class PotterBoxScanner:
     def _void_key(self, t): return f"potter_box:void:{t.upper()}"
     def _zone_key(self, t): return f"potter_box:zones:{t.upper()}"
     def _defaults_key(self, t): return f"potter_box:avg_duration:{t.upper()}"
+    def _boxmap_key(self, t): return f"potter_box:boxmap:{t.upper()}"
+    def _adjacent_key(self, t): return f"potter_box:adjacent:{t.upper()}"
     def _save(self, key, data, ttl): self._state._json_set(key, data, ttl)
     def _load(self, key): return self._state._json_get(key)
     def get_active_box(self, t): return self._load(self._active_key(t))
     def get_void_map(self, t): return self._load(self._void_key(t)) or []
     def get_zones(self, t): return self._load(self._zone_key(t)) or []
+    def get_box_map(self, t): return self._load(self._boxmap_key(t)) or []
+    def get_adjacent(self, t): return self._load(self._adjacent_key(t)) or {}
+    def get_box_above(self, t):
+        adj = self.get_adjacent(t)
+        return adj.get("box_above")
+    def get_box_below(self, t):
+        adj = self.get_adjacent(t)
+        return adj.get("box_below")
 
     def _box_identity(self, box):
         """Unique identity for a box to prevent re-counting."""
@@ -523,6 +535,9 @@ class PotterBoxScanner:
             try: self._log_completed_box(ticker, cb)
             except: pass
 
+        # ── Persist full box map (all detected boxes — backdated + current) ──
+        self._save(self._boxmap_key(ticker), all_boxes, TTL_BOX_MAP)
+
         zones = detect_supply_demand_zones(bars, ticker)
         if zones: self._save(self._zone_key(ticker), zones, TTL_ZONE)
         voids = detect_voids(bars, all_boxes, ticker)
@@ -545,6 +560,14 @@ class PotterBoxScanner:
             if ob["roof"] < box["floor"] * 1.02:
                 if box_below is None or ob["roof"] > box_below["roof"]:
                     box_below = ob
+
+        # ── Persist adjacent boxes (breakout targets) ──
+        self._save(self._adjacent_key(ticker), {
+            "box_above": box_above,
+            "box_below": box_below,
+            "active_roof": box["roof"],
+            "active_floor": box["floor"],
+        }, TTL_ADJACENT)
 
         avg_dur = self.get_avg_duration(ticker); mat = classify_maturity(box, avg_dur)
         if mat["maturity"] == "early": return None
