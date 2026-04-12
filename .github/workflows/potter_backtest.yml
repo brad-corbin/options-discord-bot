@@ -102,7 +102,7 @@ jobs:
           mkdir -p backtest/results
 
           echo "Ticker data: $TICKER_FILE"
-          python potter_backtest.py \
+          python backtest/potter_backtest.py \
             --ticker   ${{ github.event.inputs.ticker }} \
             --data     "$TICKER_FILE" \
             --signals  ${{ github.event.inputs.signals }} \
