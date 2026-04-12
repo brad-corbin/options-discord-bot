@@ -1,0 +1,174 @@
+# .github/workflows/potter_backtest.yml
+# ─────────────────────────────────────────────────────────────────────────────
+# Potter Box backtest runner.
+#
+# Downloads daily bars for the ticker, then runs the walk-forward
+# Potter Box backtest: box detection, floor bounces, roof rejections,
+# breakouts, punchbacks, and CB gap signals.
+#
+# How to run:
+#   GitHub → Actions → "Potter Box Backtest" → Run workflow
+#
+# Key inputs:
+#   ticker         — the stock to backtest
+#   download_from  — how far back to pull data (needs enough history for
+#                    box detection; 18+ months recommended)
+#   to_date        — last date (leave blank = today)
+#   signals        — which signal types to trade on
+#   max_hold_days  — max days to hold before force-exiting
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Potter Box Backtest
+
+on:
+  workflow_dispatch:
+    inputs:
+      ticker:
+        description: 'Ticker to backtest (e.g. AAPL)'
+        required: true
+        default: 'AAPL'
+      download_from:
+        description: 'Data download start YYYY-MM-DD (18+ months recommended)'
+        required: false
+        default: '2024-01-01'
+      to_date:
+        description: 'End date YYYY-MM-DD (leave blank = today)'
+        required: false
+        default: ''
+      signals:
+        description: 'Signal types to trade'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - bounce
+          - breakout
+          - punchback
+          - cb_gap
+      max_hold_days:
+        description: 'Max days to hold before force-exit (default: 15)'
+        required: false
+        default: '15'
+      cooldown_days:
+        description: 'Cooldown between same-direction re-entries (default: 3)'
+        required: false
+        default: '3'
+
+jobs:
+  potter_backtest:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install requests pandas pytz
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Download daily bars
+        env:
+          MARKETDATA_TOKEN: ${{ secrets.MARKETDATA_TOKEN }}
+        run: |
+          TO_ARG=""
+          if [ -n "${{ github.event.inputs.to_date }}" ]; then
+            TO_ARG="--to ${{ github.event.inputs.to_date }}"
+          fi
+          python backtest/download_daily_bars.py \
+            --ticker ${{ github.event.inputs.ticker }} \
+            --from ${{ github.event.inputs.download_from }} \
+            $TO_ARG
+
+      - name: Run Potter Box backtest
+        run: |
+          TICKER_UPPER=$(echo "${{ github.event.inputs.ticker }}" | tr '[:lower:]' '[:upper:]')
+          TICKER_FILE=$(ls backtest/data/${TICKER_UPPER}_daily_*.csv 2>/dev/null | head -1)
+
+          if [ -z "$TICKER_FILE" ]; then
+            echo "ERROR: No daily CSV found for ${TICKER_UPPER} in backtest/data/"
+            echo "Files present:"
+            ls backtest/data/ || echo "(directory empty)"
+            exit 1
+          fi
+
+          mkdir -p backtest/results
+
+          echo "Ticker data: $TICKER_FILE"
+          python potter_backtest.py \
+            --ticker   ${{ github.event.inputs.ticker }} \
+            --data     "$TICKER_FILE" \
+            --signals  ${{ github.event.inputs.signals }} \
+            --output   backtest/results/potter_backtest_results.json
+
+      - name: Print summary
+        run: |
+          echo ""
+          echo "══════════════════════════════════════════════════"
+          python -c "
+          import json
+          with open('backtest/results/potter_backtest_results.json') as f:
+              r = json.load(f)
+          s = r['stats']
+          print(f'  POTTER BOX BACKTEST — {r[\"ticker\"]}')
+          print('='*50)
+          print(f'  Trades: {s[\"total_trades\"]} ({s[\"winners\"]}W / {s[\"losers\"]}L)')
+          print(f'  Win Rate: {s[\"win_rate\"]}%')
+          print(f'  Avg Win: {s[\"avg_win_pct\"]}% ({s[\"avg_win_r\"]}R)')
+          print(f'  Avg Loss: {s[\"avg_loss_pct\"]}% ({s[\"avg_loss_r\"]}R)')
+          print(f'  Total Return: {s[\"total_return_pct\"]}%')
+          print(f'  Max Drawdown: {s[\"max_drawdown_pct\"]}%')
+          print(f'  Profit Factor: {s[\"profit_factor\"]}')
+          print(f'  Avg Hold: {s[\"avg_bars_held\"]} bars')
+          print(f'  Final Equity: \${s[\"final_equity\"]:,.2f} (from \${s[\"initial_equity\"]:,.2f})')
+          print()
+          print('  By Signal Type:')
+          for st, d in s.get('by_signal_type',{}).items():
+              print(f'    {st}: {d[\"count\"]} trades, {d[\"win_rate\"]}% WR, {d[\"avg_r\"]}R avg, \${d[\"total_pnl\"]:,.2f} P&L')
+          print()
+          print('  By Exit Reason:')
+          for er, d in s.get('by_exit_reason',{}).items():
+              print(f'    {er}: {d[\"count\"]} trades, \${d[\"total_pnl\"]:,.2f} P&L')
+          print()
+          print('  Boxes Detected:')
+          for i, b in enumerate(r.get('boxes',[])):
+              st = 'ACTIVE' if b['active'] else f'BROKEN {(b.get(\"break_direction\") or \"?\").upper()}'
+              print(f'    Box {i+1}: \${b[\"floor\"]:.2f}-\${b[\"roof\"]:.2f} | {b[\"roof_touches\"]}R/{b[\"floor_touches\"]}F | {b[\"wave_label\"]} | {st}')
+          "
+
+      - name: Generate trades CSV
+        if: always()
+        run: |
+          python -c "
+          import json, csv
+          with open('backtest/results/potter_backtest_results.json') as f:
+              r = json.load(f)
+          trades = r.get('trades', [])
+          if trades:
+              keys = trades[0].keys()
+              with open('backtest/results/potter_trades.csv', 'w', newline='') as f:
+                  w = csv.DictWriter(f, fieldnames=keys)
+                  w.writeheader()
+                  w.writerows(trades)
+              print(f'Wrote {len(trades)} trades to potter_trades.csv')
+          else:
+              print('No trades to write')
+          "
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: potter-backtest-${{ github.event.inputs.ticker }}-${{ github.run_number }}
+          path: |
+            backtest/results/potter_backtest_results.json
+            backtest/results/potter_trades.csv
+            backtest/data/
+          retention-days: 30
