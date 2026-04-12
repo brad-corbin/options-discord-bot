@@ -8873,7 +8873,11 @@ def _initialize_app():
         try:
             if _potter_box:
                 from schwab_stream import start_box_break_monitor
-                start_box_break_monitor(_potter_box, post_to_telegram)
+                start_box_break_monitor(
+                    _potter_box, post_to_telegram,
+                    cached_md=_cached_md,
+                    get_expirations_fn=get_expirations,
+                )
         except Exception as _e:
             log.warning(f"Potter Box break monitor init failed: {_e}")
 
