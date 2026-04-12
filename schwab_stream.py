@@ -1276,7 +1276,7 @@ def start_fib_monitor(daily_bars_fn: Callable, post_fn: Callable,
 # ─────────────────────────────────────────────────────────────
 
 class PotterBoxBreakMonitor:
-    """Monitors streaming spots against active Potter Box boundaries.
+    """Enhanced Potter Box break monitor with GEX exposure + conviction scoring.
 
     Potter Box detection runs 2-3x daily on daily bars (boxes are multi-day
     patterns). But BREAKS happen intraday — and with the old 2x/day scan,
@@ -1284,22 +1284,40 @@ class PotterBoxBreakMonitor:
 
     This monitor checks streaming spots every 30s against stored active boxes
     in Redis (written by the Potter Box scanner). When price breaks a floor
-    or ceiling, it fires an immediate alert.
+    or ceiling, it:
+      1. Pulls the full Schwab option chain (free, no ticker limits)
+      2. Runs ExposureEngine → GEX regime, gamma flip, OI walls, composite score
+      3. Loads void target + adjacent box from Redis
+      4. Computes conviction score: box maturity + wave stage + GEX regime + void size
+      5. Auto-fires select_strikes on high-conviction directional breaks
     """
 
     CHECK_INTERVAL = 30
     ALERT_COOLDOWN = 3600   # 1 hour between same break alerts
     BREAK_CONFIRM_PCT = 0.15  # must break by 0.15% to confirm (not just touch)
+    HIGH_CONVICTION_THRESHOLD = 70  # auto-fire select_strikes above this
 
-    def __init__(self, potter_box_scanner, post_fn: Callable, tickers: list):
+    # Conviction scoring weights (out of 100)
+    _MATURITY_SCORES = {"early": 5, "mid": 15, "late": 25, "overdue": 30}
+    _WAVE_SCORES = {"established": 5, "weakening": 12, "breakout_probable": 20, "breakout_imminent": 25}
+    _GEX_REGIME_SCORES = {
+        "STRONG TREND / EXPLOSIVE": 25, "MODERATE TREND": 18,
+        "NEUTRAL / TRANSITION": 10, "MODERATE PIN": 5, "STRONG PIN": 0,
+    }
+
+    def __init__(self, potter_box_scanner, post_fn: Callable, tickers: list,
+                 cached_md=None, get_expirations_fn: Callable = None):
         self._potter = potter_box_scanner
         self._post = post_fn
         self._tickers = tickers
+        self._cached_md = cached_md
+        self._get_exps = get_expirations_fn
         self._cooldowns = {}   # "ticker:break_type" → timestamp
         self._thread = None
         self._running = False
         self._lock = threading.Lock()
-        self._stats = {"checks": 0, "breaks_detected": 0, "last_check": None}
+        self._stats = {"checks": 0, "breaks_detected": 0, "high_conviction": 0,
+                       "auto_strikes": 0, "last_check": None}
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -1308,7 +1326,9 @@ class PotterBoxBreakMonitor:
         self._thread = threading.Thread(
             target=self._run, name="potter-break-monitor", daemon=True)
         self._thread.start()
-        log.info(f"Potter Box break monitor started: {len(self._tickers)} tickers")
+        enriched = "enriched" if self._cached_md else "basic"
+        log.info(f"Potter Box break monitor started ({enriched}): "
+                 f"{len(self._tickers)} tickers")
 
     def stop(self):
         self._running = False
@@ -1377,6 +1397,176 @@ class PotterBoxBreakMonitor:
                         breakdown_key in self._cooldowns):
                     self._fire_break(ticker, spot, "RECLAIM", roof, floor, box, now)
 
+    # ── Exposure engine integration ──────────────────────────
+
+    def _fetch_exposure(self, ticker: str, spot: float) -> Optional[dict]:
+        """Pull full Schwab chain and run ExposureEngine.
+
+        Schwab chains are free with no ticker limits — we pull the full
+        chain (all expirations near-term) to get accurate GEX, gamma
+        flip, OI walls, and composite regime score.
+
+        Returns dict with keys: net, walls, gamma_flip, regime, composite
+        or None if chain unavailable.
+        """
+        if not self._cached_md or not self._get_exps:
+            return None
+
+        try:
+            from engine_bridge import build_option_rows
+            from options_exposure import ExposureEngine, gex_regime, composite_regime
+
+            exps = self._get_exps(ticker) or []
+            if not exps:
+                return None
+
+            # Pick nearest 2 expirations (0DTE/1DTE + nearest weekly)
+            from datetime import date as _date
+            today = _date.today()
+            exp_dtes = []
+            for exp in exps:
+                try:
+                    dte = (datetime.strptime(str(exp)[:10], "%Y-%m-%d").date() - today).days
+                    if dte >= 0:
+                        exp_dtes.append((exp, dte))
+                except Exception:
+                    continue
+            exp_dtes.sort(key=lambda x: x[1])
+            target_exps = exp_dtes[:2]  # nearest 2 expirations
+            if not target_exps:
+                return None
+
+            all_rows = []
+            for exp, dte in target_exps:
+                try:
+                    chain = self._cached_md.get_chain(
+                        ticker, str(exp)[:10], strike_limit=None, feed="cached")
+                    if not isinstance(chain, dict) or chain.get("s") != "ok":
+                        continue
+                    rows = build_option_rows(chain, spot=spot,
+                                             days_to_exp=max(dte, 0.5))
+                    all_rows.extend(rows)
+                except Exception:
+                    continue
+
+            if len(all_rows) < 4:
+                return None
+
+            engine = ExposureEngine()
+            result = engine.compute(all_rows)
+            net = result.get("net", {})
+            walls = result.get("walls", {})
+            gf = engine.gamma_flip(all_rows)
+            regime = gex_regime(net.get("gex", 0))
+            comp = composite_regime(net)
+
+            return {
+                "net": net,
+                "walls": walls,
+                "gamma_flip": gf,
+                "regime": regime,
+                "composite": comp,
+                "row_count": len(all_rows),
+            }
+        except Exception as e:
+            log.debug(f"Potter break exposure fetch failed {ticker}: {e}")
+            return None
+
+    # ── Conviction scoring ───────────────────────────────────
+
+    def _compute_conviction(self, box: dict, break_type: str,
+                            exposure: Optional[dict],
+                            void: Optional[dict]) -> dict:
+        """Score break conviction from box maturity + wave stage + GEX regime + void size.
+
+        Returns dict with score (0-100), label, and component breakdown.
+        Components:
+          - maturity (0-30):  overdue boxes break more reliably
+          - wave (0-25):      more touches = weaker boundary = higher conviction
+          - gex_regime (0-25): negative gamma / trending regime supports continuation
+          - void_size (0-20):  larger void = more room to run = higher payoff
+        """
+        components = {}
+
+        # Maturity score (0-30)
+        mat_label = "mid"
+        avg_dur = self._potter.get_avg_duration(box.get("ticker", "SPY"))
+        dur = box.get("duration_bars", 0)
+        ratio = dur / avg_dur if avg_dur > 0 else 1.0
+        if ratio < 0.50:
+            mat_label = "early"
+        elif ratio < 0.75:
+            mat_label = "mid"
+        elif ratio < 1.00:
+            mat_label = "late"
+        else:
+            mat_label = "overdue"
+        components["maturity"] = self._MATURITY_SCORES.get(mat_label, 10)
+
+        # Wave score (0-25)
+        wave = box.get("wave_label", "established")
+        components["wave"] = self._WAVE_SCORES.get(wave, 5)
+
+        # GEX regime score (0-25) — only for directional breaks
+        if exposure and break_type in ("BREAKOUT", "BREAKDOWN"):
+            comp_regime = exposure.get("composite", {}).get("regime", "NEUTRAL / TRANSITION")
+            components["gex_regime"] = self._GEX_REGIME_SCORES.get(comp_regime, 10)
+
+            # Bonus: gamma flip alignment
+            gf = exposure.get("gamma_flip")
+            if gf:
+                if break_type == "BREAKOUT" and gf < box.get("roof", 0):
+                    components["gex_regime"] = min(components["gex_regime"] + 5, 25)
+                elif break_type == "BREAKDOWN" and gf > box.get("floor", 0):
+                    components["gex_regime"] = min(components["gex_regime"] + 5, 25)
+        else:
+            components["gex_regime"] = 10  # neutral default
+
+        # Void size score (0-20) — bigger void = bigger move potential
+        if void:
+            void_pct = void.get("height_pct", 0)
+            if void_pct >= 8.0:
+                components["void_size"] = 20
+            elif void_pct >= 5.0:
+                components["void_size"] = 15
+            elif void_pct >= 3.0:
+                components["void_size"] = 10
+            else:
+                components["void_size"] = 5
+        else:
+            components["void_size"] = 0
+
+        total = sum(components.values())
+        if total >= 80:
+            label = "VERY HIGH"
+        elif total >= 65:
+            label = "HIGH"
+        elif total >= 45:
+            label = "MODERATE"
+        else:
+            label = "LOW"
+
+        return {
+            "score": total,
+            "label": label,
+            "components": components,
+            "maturity": mat_label,
+            "wave": wave,
+        }
+
+    # ── Format touch label ───────────────────────────────────
+
+    @staticmethod
+    def _touch_label(box: dict) -> str:
+        """Format: 'Touches 3 Roof / 2 Floor · Break Out Imminent'"""
+        rt = box.get("roof_touches", 0)
+        ft = box.get("floor_touches", 0)
+        wave = box.get("wave_label", "established")
+        wave_display = wave.replace("_", " ").title()
+        return f"Touches {rt} Roof / {ft} Floor · {wave_display}"
+
+    # ── Enhanced fire break ──────────────────────────────────
+
     def _fire_break(self, ticker: str, spot: float, break_type: str,
                     roof: float, floor: float, box: dict, now: float):
         cooldown_key = f"{ticker}:{break_type}"
@@ -1389,6 +1579,29 @@ class PotterBoxBreakMonitor:
         box_pct = (box_width / floor) * 100 if floor > 0 else 0
         bars_in_box = box.get("duration_bars", "?")
 
+        # ── 1. Fetch GEX exposure (free Schwab chain) ────────
+        exposure = self._fetch_exposure(ticker, spot)
+
+        # ── 2. Load void + adjacent box from Redis ───────────
+        voids = self._potter.get_void_map(ticker)
+        adjacent = self._potter.get_adjacent(ticker)
+        box_above = adjacent.get("box_above") if adjacent else None
+        box_below = adjacent.get("box_below") if adjacent else None
+
+        # Pick the directional void
+        void = None
+        if break_type == "BREAKOUT":
+            void = next((v for v in voids if v.get("position") == "above"), None)
+        elif break_type == "BREAKDOWN":
+            void = next((v for v in voids if v.get("position") == "below"), None)
+
+        # ── 3. Compute conviction ────────────────────────────
+        conviction = self._compute_conviction(box, break_type, exposure, void)
+
+        # ── 4. Build touch label ─────────────────────────────
+        touch_label = self._touch_label(box)
+
+        # ── 5. Format the alert ──────────────────────────────
         if break_type == "BREAKOUT":
             emoji = "🚀"
             dist = ((spot - roof) / roof) * 100
@@ -1404,23 +1617,162 @@ class PotterBoxBreakMonitor:
             action = f"Price ${spot:.2f} RECLAIMED inside box ${floor:.2f}-${roof:.2f}"
             guidance = "Break failed — range trade logic applies. Fade the edges."
 
-        msg = (
-            f"{emoji} POTTER BOX {break_type} — {ticker}\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"{action}\n"
-            f"📦 Box: ${floor:.2f} - ${roof:.2f} ({box_pct:.1f}% wide, {bars_in_box} bars)\n"
-            f"\n"
-            f"💡 {guidance}"
-        )
+        lines = [
+            f"{emoji} POTTER BOX {break_type} — {ticker}",
+            "━" * 28,
+            f"{action}",
+            f"📦 Box: ${floor:.2f} – ${roof:.2f} ({box_pct:.1f}% wide, {bars_in_box} bars)",
+            f"🔢 {touch_label}",
+        ]
+
+        # Adjacent box targets
+        if break_type == "BREAKOUT" and box_above:
+            lines.append(f"🎯 Next Box Above: ${box_above['floor']:.2f}–${box_above['roof']:.2f} "
+                         f"(target: ${box_above['floor']:.2f})")
+        elif break_type == "BREAKDOWN" and box_below:
+            lines.append(f"🎯 Next Box Below: ${box_below['floor']:.2f}–${box_below['roof']:.2f} "
+                         f"(target: ${box_below['roof']:.2f})")
+
+        # Void target
+        if void:
+            arrow = "⬆️" if void.get("position") == "above" else "⬇️"
+            lines.append(f"{arrow} Void: ${void['low']:.2f} → ${void['high']:.2f} "
+                         f"({void['height_pct']:.1f}% gap)")
+
+        # GEX exposure block (when chain was available)
+        if exposure:
+            net = exposure.get("net", {})
+            walls = exposure.get("walls", {})
+            comp = exposure.get("composite", {})
+            gf = exposure.get("gamma_flip")
+
+            regime_str = comp.get("regime", "?")
+            comp_score = comp.get("composite_score", 0)
+            lines.append("")
+            lines.append(f"⚡ GEX Regime: {regime_str} (score {comp_score:+d})")
+            if gf:
+                gf_rel = "above" if gf > spot else "below"
+                lines.append(f"🔀 Gamma Flip: ${gf:.2f} ({gf_rel} spot)")
+            if walls.get("call_wall"):
+                lines.append(f"📈 Call Wall: ${walls['call_wall']:.2f}")
+            if walls.get("put_wall"):
+                lines.append(f"📉 Put Wall: ${walls['put_wall']:.2f}")
+            net_gex = net.get("gex", 0)
+            lines.append(f"📊 Net GEX: {net_gex:+,.0f} | "
+                         f"Vanna: {net.get('vanna', 0):+,.0f} | "
+                         f"Charm: {net.get('charm', 0):+,.0f}")
+
+        # Conviction block
+        conv_emoji = {"VERY HIGH": "🔥🔥", "HIGH": "🔥", "MODERATE": "⚡", "LOW": "💤"
+                      }.get(conviction["label"], "⚡")
+        lines.append("")
+        lines.append(f"{conv_emoji} Conviction: {conviction['label']} "
+                     f"({conviction['score']}/100)")
+        comp_parts = conviction["components"]
+        lines.append(f"   Maturity {comp_parts.get('maturity', 0)} + "
+                     f"Wave {comp_parts.get('wave', 0)} + "
+                     f"GEX {comp_parts.get('gex_regime', 0)} + "
+                     f"Void {comp_parts.get('void_size', 0)}")
+
+        lines.append("")
+        lines.append(f"💡 {guidance}")
+
+        # ── 6. Auto-fire select_strikes on high-conviction ───
+        trade = None
+        if (conviction["score"] >= self.HIGH_CONVICTION_THRESHOLD
+                and break_type in ("BREAKOUT", "BREAKDOWN")
+                and self._cached_md and self._get_exps):
+            trade = self._auto_select_strikes(
+                ticker, spot, break_type, box, void,
+                box_above, box_below)
+
+        if trade:
+            direction = "bullish" if break_type == "BREAKOUT" else "bearish"
+            p = trade["primary"]
+            h = trade["hedge"]
+            dir_emoji = "🟢" if direction == "bullish" else "🔴"
+            lines.append("")
+            lines.append(f"{dir_emoji} AUTO-STRIKE: {trade['structure']}")
+            lines.append(f"  📗 {p['qty']}x ${p['strike']:.0f} {p['side'].upper()} "
+                         f"@ ${p['ask']:.2f} (δ{p['delta']:.2f}, IV {p['iv']:.0f}%)")
+            lines.append(f"  📕 {h['qty']}x ${h['strike']:.0f} {h['side'].upper()} "
+                         f"@ ${h['ask']:.2f} (δ{h['delta']:.2f}, IV {h['iv']:.0f}%)")
+            lines.append(f"  Cost: ${trade['total_cost']:.2f} | "
+                         f"Target: ${trade['target_price']:.2f} | "
+                         f"R/R: {trade['reward_risk']:.1f}:1")
+            with self._lock:
+                self._stats["auto_strikes"] += 1
+
+        msg = "\n".join(lines)
 
         try:
             self._post(msg)
             with self._lock:
                 self._stats["breaks_detected"] += 1
+                if conviction["score"] >= self.HIGH_CONVICTION_THRESHOLD:
+                    self._stats["high_conviction"] += 1
             log.info(f"Potter Box {break_type}: {ticker} ${spot:.2f} "
-                     f"(box ${floor:.2f}-${roof:.2f})")
+                     f"(box ${floor:.2f}-${roof:.2f}) "
+                     f"conviction={conviction['score']}")
         except Exception as e:
             log.warning(f"Potter break alert failed for {ticker}: {e}")
+
+    # ── Auto strike selection ────────────────────────────────
+
+    def _auto_select_strikes(self, ticker: str, spot: float,
+                             break_type: str, box: dict,
+                             void: Optional[dict],
+                             box_above: Optional[dict],
+                             box_below: Optional[dict]) -> Optional[dict]:
+        """Auto-fire select_strikes on high-conviction breaks.
+
+        Uses the existing potter_box.select_strikes() with the break
+        direction, void targets, and adjacent boxes already loaded.
+        """
+        try:
+            from potter_box import select_strikes, classify_maturity
+
+            direction = "bullish" if break_type == "BREAKOUT" else "bearish"
+            avg_dur = self._potter.get_avg_duration(ticker)
+            mat = classify_maturity(box, avg_dur)
+            target_dte = mat.get("suggested_dte", 21) or 21
+
+            # Pick best expiration near target DTE
+            exps = self._get_exps(ticker) or []
+            from datetime import date as _date
+            today = _date.today()
+            best_exp = None
+            best_dist = 999
+            for exp in exps:
+                try:
+                    dte = (datetime.strptime(str(exp)[:10], "%Y-%m-%d").date() - today).days
+                    if dte < 7:
+                        continue
+                    if abs(dte - target_dte) < best_dist:
+                        best_dist = abs(dte - target_dte)
+                        best_exp = exp
+                except Exception:
+                    continue
+            if not best_exp:
+                return None
+
+            chain = self._cached_md.get_chain(
+                ticker, str(best_exp)[:10], strike_limit=None, feed="cached")
+            if not isinstance(chain, dict) or chain.get("s") != "ok":
+                return None
+
+            # Get void maps for both directions
+            voids = self._potter.get_void_map(ticker)
+            va = next((v for v in voids if v.get("position") == "above"), None)
+            vb = next((v for v in voids if v.get("position") == "below"), None)
+
+            trade = select_strikes(
+                chain, spot, direction, box, va, vb, target_dte,
+                box_above=box_above, box_below=box_below)
+            return trade
+        except Exception as e:
+            log.debug(f"Potter auto strike-select failed {ticker}: {e}")
+            return None
 
     @property
     def status(self) -> dict:
@@ -1435,12 +1787,19 @@ class PotterBoxBreakMonitor:
 _box_monitor = None
 
 
-def start_box_break_monitor(potter_box_scanner, post_fn: Callable) -> Optional[PotterBoxBreakMonitor]:
-    """Start real-time Potter Box break monitoring.
+def start_box_break_monitor(potter_box_scanner, post_fn: Callable,
+                            cached_md=None,
+                            get_expirations_fn: Callable = None,
+                            ) -> Optional[PotterBoxBreakMonitor]:
+    """Start real-time Potter Box break monitoring with GEX exposure enrichment.
 
     Usage in app.py:
         from schwab_stream import start_box_break_monitor
-        start_box_break_monitor(_potter_box, post_to_telegram)
+        start_box_break_monitor(
+            _potter_box, post_to_telegram,
+            cached_md=_cached_md,
+            get_expirations_fn=get_expirations,
+        )
     """
     global _box_monitor
     try:
@@ -1449,6 +1808,8 @@ def start_box_break_monitor(potter_box_scanner, post_fn: Callable) -> Optional[P
             potter_box_scanner=potter_box_scanner,
             post_fn=post_fn,
             tickers=list(FLOW_TICKERS),
+            cached_md=cached_md,
+            get_expirations_fn=get_expirations_fn,
         )
         _box_monitor.start()
         return _box_monitor
