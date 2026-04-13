@@ -603,8 +603,86 @@ _CONVICTION_FIELDS = [
     "potter_box_gate", "potter_location",
     "has_potter_box", "potter_box_floor", "potter_box_roof",
     "regime", "vix",
+    # EM alignment fields
+    "em_aligned", "em_conflict", "em_thesis_bias", "em_thesis_score",
+    "em_gex_sign", "em_regime", "is_shadow_only",
     "eod_spot", "pnl_pct", "outcome",  # filled by EOD reconciliation
 ]
+
+def _check_spread_fillability(ticker: str, long_strike: float, short_strike: float,
+                              side: str, expiry: str) -> dict:
+    """Issue 6: Validate spread fillability from streaming OptionQuoteStore.
+
+    Returns dict with:
+      fillable: bool — whether the spread appears executable
+      reason: str — why it failed (if not fillable)
+      live_mid: float — actual mid from live quotes (0 if unavailable)
+    """
+    try:
+        from schwab_stream import get_option_store, build_occ_symbol
+        store = get_option_store()
+        if not store:
+            return {"fillable": True, "reason": "no streaming store", "live_mid": 0}
+
+        long_sym = build_occ_symbol(ticker, expiry, side, long_strike)
+        short_sym = build_occ_symbol(ticker, expiry, side, short_strike)
+
+        long_q = store.get(long_sym)
+        short_q = store.get(short_sym)
+
+        # Fall back to get_by_underlying scan
+        if not long_q or not short_q:
+            from schwab_stream import parse_occ_symbol
+            quotes = store.get_by_underlying(ticker)
+            for q in quotes:
+                sym = q.get("symbol", "")
+                parsed = parse_occ_symbol(sym)
+                if not parsed:
+                    continue
+                if parsed["strike"] == long_strike and parsed["side"] == side:
+                    long_q = q
+                elif parsed["strike"] == short_strike and parsed["side"] == side:
+                    short_q = q
+
+        if not long_q or not short_q:
+            return {"fillable": True, "reason": "legs not in stream", "live_mid": 0}
+
+        long_bid = long_q.get("bid", 0) or 0
+        long_ask = long_q.get("ask", 0) or 0
+        short_bid = short_q.get("bid", 0) or 0
+        short_ask = short_q.get("ask", 0) or 0
+
+        # Check for crossed markets on either leg
+        if long_bid > 0 and long_ask > 0 and long_bid > long_ask:
+            return {"fillable": False, "reason": f"long leg crossed: bid ${long_bid:.2f} > ask ${long_ask:.2f}", "live_mid": 0}
+        if short_bid > 0 and short_ask > 0 and short_bid > short_ask:
+            return {"fillable": False, "reason": f"short leg crossed: bid ${short_bid:.2f} > ask ${short_ask:.2f}", "live_mid": 0}
+
+        # Check for extremely wide markets (>50% spread width on either leg)
+        for leg_label, bid, ask in [("long", long_bid, long_ask), ("short", short_bid, short_ask)]:
+            if bid > 0 and ask > 0:
+                spread_width_pct = (ask - bid) / ((bid + ask) / 2) * 100
+                if spread_width_pct > 50:
+                    return {"fillable": False,
+                            "reason": f"{leg_label} leg too wide: ${bid:.2f}-${ask:.2f} ({spread_width_pct:.0f}%)",
+                            "live_mid": 0}
+
+        # Compute actual spread mid (debit spread: buy long leg, sell short leg)
+        # For a debit spread: cost = long_mid - short_mid
+        long_mid = (long_bid + long_ask) / 2 if long_bid > 0 and long_ask > 0 else 0
+        short_mid = (short_bid + short_ask) / 2 if short_bid > 0 and short_ask > 0 else 0
+        live_mid = long_mid - short_mid if long_mid > 0 and short_mid > 0 else 0
+
+        # Check if natural mid is unreasonably negative (shouldn't pay us to buy a debit spread)
+        if live_mid < -0.05:
+            return {"fillable": False, "reason": f"inverted spread: live mid ${live_mid:.2f}", "live_mid": live_mid}
+
+        return {"fillable": True, "reason": "ok", "live_mid": round(live_mid, 2)}
+
+    except Exception as e:
+        log.debug(f"Fillability check error for {ticker}: {e}")
+        return {"fillable": True, "reason": f"check error: {e}", "live_mid": 0}
+
 
 def _log_conviction_play(play: dict, regime: str = "", vix: float = 0):
     """
@@ -689,6 +767,14 @@ def _log_conviction_play(play: dict, regime: str = "", vix: float = 0):
             "potter_box_roof":  potter_roof,
             "regime":           regime,
             "vix":              round(vix, 1) if vix else "",
+            # EM alignment fields
+            "em_aligned":       str(play.get("em_aligned", True)),
+            "em_conflict":      str(play.get("em_conflict", False)),
+            "em_thesis_bias":   play.get("em_thesis_bias", ""),
+            "em_thesis_score":  play.get("em_thesis_score", ""),
+            "em_gex_sign":      play.get("em_gex_sign", ""),
+            "em_regime":        play.get("em_regime", ""),
+            "is_shadow_only":   str(play.get("is_shadow_only", False)),
             "eod_spot":         "",  # filled by reconciliation
             "pnl_pct":          "",
             "outcome":          "",
@@ -3848,22 +3934,117 @@ def _run_v4_prefilter(ticker: str, spot: float, chains: list, candle_closes: lis
 
                         msg = _flow_detector.format_conviction_play(cp)
 
-                        if route == "immediate":
+                        # ── Issue 5: Spread routing for conviction plays ──
+                        # Run through options engine for defined-risk spread alternative
+                        spread_msg = ""
+                        if route in ("immediate", "swing") and chain_data:
+                            try:
+                                _cp_direction = "bullish" if cp.get("trade_direction") == "bullish" else "bearish"
+                                _cp_rec = recommend_trade(
+                                    chain_data, spot, max(cp.get("dte", 0), 0.5),
+                                    direction=_cp_direction,
+                                    trade_type="debit_spread",
+                                    account_size=25000,
+                                )
+                                if _cp_rec and _cp_rec.get("spread_type"):
+                                    # Issue 6: Validate fillability from streaming
+                                    _fill_ok = True
+                                    if _cp_rec.get("long_strike") and _cp_rec.get("short_strike"):
+                                        _fill = _check_spread_fillability(
+                                            cp["ticker"],
+                                            _cp_rec["long_strike"],
+                                            _cp_rec["short_strike"],
+                                            _cp_rec.get("option_type", "call"),
+                                            str(cp.get("expiry", ""))[:10],
+                                        )
+                                        if not _fill["fillable"]:
+                                            _fill_ok = False
+                                            log.info(f"Issue 6: Spread unfillable for {cp['ticker']}: {_fill['reason']}")
+                                            spread_msg = (f"\n📊 Spread alternative found but unfillable: "
+                                                         f"{_fill['reason']}")
+
+                                    if _fill_ok:
+                                        _card = format_trade_card(_cp_rec)
+                                        if _card:
+                                            spread_msg = f"\n\n📊 DEFINED-RISK ALTERNATIVE:\n{_card}"
+                            except Exception as _spr_err:
+                                log.debug(f"Spread routing for {cp['ticker']}: {_spr_err}")
+
+                        if spread_msg:
+                            msg += spread_msg
+
+                        # ── EM ALIGNMENT SHADOW GATE ──
+                        # Plays that fight a strong EM thesis are shadow-logged only
+                        # (written to CSV for analysis but not posted to Telegram).
+                        _is_shadow = cp.get("is_shadow_only", False)
+                        if _is_shadow:
+                            log.info(f"🔇 SHADOW: {cp['ticker']} {cp['trade_side']} ${cp['strike']:.0f} "
+                                     f"— flow fights EM card ({cp.get('em_detail','')})")
+                        elif route == "immediate":
                             # 0-2 DTE: fire to BOTH channels immediately
                             post_to_telegram(msg)
                             if TELEGRAM_CHAT_INTRADAY and TELEGRAM_CHAT_INTRADAY != TELEGRAM_CHAT_ID:
                                 post_to_telegram(msg, chat_id=TELEGRAM_CHAT_INTRADAY)
 
                         elif route == "income":
-                            # 3-7 DTE: post conviction alert + run REAL income scan
+                            # 3-7 DTE: unified conviction + income card
+                            # Instead of posting raw flow card + 3 separate ITQS cards,
+                            # run income scan inline and merge the best result into one card.
+                            _best_income = None
+                            try:
+                                from income_scanner import scan_ticker_income, format_income_alert
+                                from market_regime import get_regime_package
+                                _pkg = get_regime_package()
+                                _opps = scan_ticker_income(
+                                    cp["ticker"], _pkg,
+                                    chain_fn=_cached_md.get_chain if _cached_md else None,
+                                    expirations_fn=get_expirations,
+                                )
+                                if _opps:
+                                    # Prefer best grade without hard blocks
+                                    _clean = [o for o in _opps if not o.get("hard_blocks") and o["itqs"]["grade"] != "F"]
+                                    if _clean:
+                                        _best_income = max(_clean, key=lambda o: o["itqs"]["score"])
+                                    else:
+                                        # All have blocks — take highest score anyway
+                                        _non_f = [o for o in _opps if o["itqs"]["grade"] != "F"]
+                                        if _non_f:
+                                            _best_income = max(_non_f, key=lambda o: o["itqs"]["score"])
+                            except Exception as _isc_err:
+                                log.debug(f"Inline income scan for {cp['ticker']}: {_isc_err}")
+
+                            if _best_income:
+                                # Build unified card: conviction header + ITQS scorecard
+                                _itqs = _best_income["itqs"]
+                                _grade = _itqs["grade"]
+                                _score = _itqs["score"]
+                                _ge = {"A+": "🟢", "A": "🟢", "B": "🟡", "C": "🟠", "F": "🔴"}.get(_grade, "⚪")
+                                _bd = _itqs["breakdown"]
+                                _blocks = _best_income.get("hard_blocks", [])
+                                _chain_tag = "📡 live" if _best_income.get("chain_available") else "📊 est"
+                                _ll = "Support" if _best_income["trade_type"] == "bull_put" else "Resistance"
+
+                                income_section = [
+                                    "",
+                                    f"{_ge} INCOME SCORECARD — Grade {_grade} (ITQS: {_score}) | {_itqs['decision']}",
+                                    "━" * 28,
+                                ]
+                                if _blocks:
+                                    income_section.append("🚫 HARD BLOCKS: " + " | ".join(_blocks[:2]))
+                                income_section += [
+                                    f"{_ll}: ${_best_income['level']:.2f} ({_best_income['touches']}T)",
+                                    f"Strike: ${_best_income['short_strike']:.2f}/${_best_income.get('long_strike', 0):.2f}",
+                                    f"Credit: ${_best_income.get('credit',0):.2f} on ${_best_income.get('width',0):.2f} wide ({_best_income.get('roc_pct',0):.1f}% ROC) [{_chain_tag}]",
+                                    f"Cushion: {_best_income.get('cushion_pct',0):.1f}% | Exp: {_best_income.get('expiry','?')} ({_best_income.get('dte',0)}d)",
+                                    f"A:{_bd.get('A_regime',0)} B:{_bd.get('B_weekly',0)} C:{_bd.get('C_daily',0)} "
+                                    f"D:{_bd.get('D_support',0)} E:{_bd.get('E_breakeven',0)} F:{_bd.get('F_cushion',0)} "
+                                    f"G:{_bd.get('G_technical',0)} H:{_bd.get('H_liquidity',0)}",
+                                ]
+                                msg += "\n".join(income_section)
+                            else:
+                                msg += "\n\n📊 Income scan: no qualifying opportunities found"
+
                             post_to_telegram(msg)
-                            # Run actual income scan for this ticker to find real spreads
-                            # and post proper ITQS scorecard (not fake hardcoded params)
-                            if _income_scan_fn:
-                                try:
-                                    _income_scan_fn(TELEGRAM_CHAT_ID, cp["ticker"])
-                                except Exception as _ise:
-                                    log.debug(f"Income auto-scan failed for {cp['ticker']}: {_ise}")
 
                         elif route == "swing":
                             # 8-30 DTE: post to both channels
@@ -3875,9 +4056,10 @@ def _run_v4_prefilter(ticker: str, spot: float, chains: list, candle_closes: lis
                             # 30-60 DTE: post campaign alert to main channel
                             post_to_telegram(msg)
 
-                        log.info(f"💎 CONVICTION [{route.upper()}]: {cp['ticker']} "
-                               f"{cp['trade_side']} ${cp['strike']:.0f} "
+                        log.info(f"💎 CONVICTION [{route.upper()}]{' (SHADOW)' if _is_shadow else ''}: "
+                               f"{cp['ticker']} {cp['trade_side']} ${cp['strike']:.0f} "
                                f"({cp['vol_oi_ratio']:.0f}x, {cp['dte']}DTE"
+                               f"{', EM ALIGNED' if cp.get('em_aligned') else ', EM CONFLICT' if cp.get('em_conflict') else ''}"
                                f"{', SHADOW CONFIRMS' if cp.get('shadow_agrees') else ''})")
 
                         # Log to conviction_plays.csv for outcome tracking
@@ -6786,6 +6968,136 @@ def _post_em_card(ticker: str, session: str):
         log.error(f"EM card error for {ticker} ({session}): {e}", exc_info=True)
 
 
+def _generate_silent_thesis(ticker: str):
+    """Generate and store thesis from EM card data WITHOUT posting to Telegram.
+
+    Used for flow alignment gate: conviction plays check if flow direction
+    agrees with the morning thesis before firing. Runs for all 35 flow
+    tickers at market open so every conviction play has structural context.
+
+    Stores: ThesisContext with bias, gex_sign, regime, levels, vol regime.
+    Does NOT post: no EM card, no guidance, no action block to Telegram.
+    """
+    try:
+        import pytz
+        ct = pytz.timezone("America/Chicago")
+        now_ct = datetime.now(ct)
+        today_str = now_ct.strftime("%Y-%m-%d")
+
+        market_close_ct = now_ct.replace(hour=15, minute=0, second=0, microsecond=0)
+        hours_for_em = max((market_close_ct - now_ct).total_seconds() / 3600, 0.25)
+
+        result_tuple = _get_0dte_iv(ticker, today_str)
+        iv, spot, expiration = result_tuple[0], result_tuple[1], result_tuple[2]
+        eng = result_tuple[3]
+        walls = result_tuple[4]
+        skew = result_tuple[5]
+        pcr = result_tuple[6]
+        vix = result_tuple[7]
+        v4_result = result_tuple[8] if len(result_tuple) > 8 else {}
+
+        if iv is None or spot is None:
+            log.debug(f"Silent thesis skipped for {ticker}: IV unavailable")
+            return False
+
+        em = _calc_intraday_em(spot, iv, hours_for_em)
+        if not em:
+            return False
+
+        # VIX proxy fallback
+        if not vix or not vix.get("vix"):
+            if iv and iv > 0:
+                proxy_vix = round(iv * 100, 1)
+                vix = {"vix": proxy_vix, "vix9d": None, "term": "unknown", "source": "iv_proxy"}
+
+        vol_regime = get_canonical_vol_regime(ticker, get_daily_candles(ticker, days=30), vix_override=vix)
+        bias = _calc_bias(spot, em, walls or {}, skew or {}, eng or {}, pcr or {}, vix or {})
+
+        # Derive structural levels (same as full EM card)
+        _chain_struct = _derive_structure_levels_from_chain({}, spot, walls or {}, eng or {})
+        _price_struct = _compute_price_structure_levels(ticker, spot, days=90)
+        _local_walls = _merge_price_structure_with_walls(_price_struct, _chain_struct, spot, em)
+
+        # Composite regime
+        cagf = {}
+        try:
+            from options_exposure import composite_regime as _comp_regime
+            if eng:
+                cagf = _comp_regime(eng)
+        except Exception:
+            pass
+
+        # Prior day close
+        _prior_close = None
+        try:
+            candles = get_daily_candles(ticker, days=3)
+            if candles and len(candles) >= 2:
+                _prior_close = candles[-2].get("c") or candles[-2].get("close")
+        except Exception:
+            pass
+
+        # ATM option data for premium stop
+        _atm_data = {"call_delta": 0.0, "call_premium": 0.0,
+                     "put_delta": 0.0, "put_premium": 0.0}
+        try:
+            _atm_chain, _atm_spot, _ = _get_0dte_chain(ticker, today_str)
+            _atm_data = _extract_atm_option_data(_atm_chain or {}, _atm_spot or spot)
+        except Exception:
+            pass
+
+        _thesis = build_thesis_from_em_card(
+            ticker=ticker, spot=spot, bias=bias, eng=eng or {},
+            em=em, walls=walls or {}, cagf=cagf, vix=vix or {},
+            v4_result=v4_result, session_label="Silent (Flow Gate)",
+            local_walls=_local_walls, prior_day_close=_prior_close,
+            atm_call_delta=_atm_data["call_delta"],
+            atm_call_premium=_atm_data["call_premium"],
+            atm_put_delta=_atm_data["put_delta"],
+            atm_put_premium=_atm_data["put_premium"],
+        )
+        get_thesis_engine().store_thesis(ticker, _thesis)
+
+        # Log to em_predictions sheet so all 35 tickers are reviewable
+        try:
+            _log_em_prediction(ticker, "silent", spot, em, bias, v4_result,
+                               walls=walls, eng=eng, cagf=cagf, vol_regime=vol_regime)
+        except Exception:
+            pass
+
+        log.info(f"Silent thesis stored: {ticker} | bias={bias.get('direction','?')} "
+                 f"score={bias.get('score',0):+d}/14 | gex={_thesis.gex_sign} | "
+                 f"regime={_thesis.regime}")
+        return True
+
+    except Exception as e:
+        log.debug(f"Silent thesis generation failed for {ticker}: {e}")
+        return False
+
+
+def _generate_all_silent_theses():
+    """Generate silent theses for all flow tickers not already covered by EM cards.
+
+    Called at ~8:25 AM CT. SPY/QQQ get full EM cards at 8:20; this fills in
+    the other 33 tickers so conviction plays have structural context.
+    """
+    from oi_flow import FLOW_TICKERS
+    count = 0
+    skipped = 0
+    for ticker in FLOW_TICKERS:
+        # Skip tickers that already have a thesis from the full EM card
+        existing = get_thesis_engine().get_thesis(ticker)
+        if existing and existing.bias != "NEUTRAL":
+            skipped += 1
+            continue
+        try:
+            if _generate_silent_thesis(ticker):
+                count += 1
+            time.sleep(1.5)  # rate limit: ~23 tickers/min
+        except Exception:
+            pass
+    log.info(f"Silent thesis generation complete: {count} generated, {skipped} already had EM cards")
+
+
 # ─────────────────────────────────────────────────────────────────────
 # PLAIN ENGLISH ACTION BLOCK — appended to EM/no-trade cards
 # Tells the trader WHAT TO DO, not just what the levels are.
@@ -8231,6 +8543,17 @@ def _em_scheduler():
                     for ticker in EM_TICKERS:
                         threading.Thread(target=_post_em_card, args=(ticker, session), daemon=True).start()
 
+            # ── Silent thesis generation for all flow tickers (8:50 AM CT) ──
+            # Runs after first EM cards fire (8:45). Generates thesis for all 35
+            # flow tickers so conviction plays have EM alignment data.
+            _silent_key = (date_str, "silent_thesis")
+            if _silent_key not in fired_today:
+                if now_ct.hour == 8 and 49 <= now_ct.minute <= 51:
+                    fired_today.add(_silent_key)
+                    log.info("Silent thesis generation firing for all flow tickers")
+                    threading.Thread(target=_generate_all_silent_theses,
+                                     daemon=True, name="silent-thesis").start()
+
             # ── Auto-reconciler: 4:15 PM CT (after market close) ──
             recon_key = (date_str, 16, 15)
             if recon_key not in fired_today:
@@ -8557,6 +8880,8 @@ def _em_scheduler():
                                 log.info(f"EOD flow summary posted ({len(eod_alerts)} alerts, "
                                        f"{len(rotations)} rotations)")
                                 _flow_detector._eod_sweep_alerts = []  # reset for next day
+                                # Issue 2+4: Clear conviction session state for next day
+                                _flow_detector.clear_conviction_session()
                         except Exception as _eod_e:
                             log.warning(f"EOD flow summary error: {_eod_e}")
 
@@ -8791,14 +9116,13 @@ def _initialize_app():
                     plays = _flow_detector.detect_conviction_plays([alert])
                     for cp in plays:
                         cp_msg = _flow_detector.format_conviction_play(cp)
-                        post_to_telegram(cp_msg)
-                        if cp.get("route") in ("immediate", "swing") and TELEGRAM_CHAT_INTRADAY:
-                            post_to_telegram(cp_msg, chat_id=TELEGRAM_CHAT_INTRADAY)
-                        if cp.get("route") == "income" and _income_scan_fn:
-                            try:
-                                _income_scan_fn(None, cp["ticker"])
-                            except Exception:
-                                pass
+                        # Shadow gate: don't post EM-conflicting short-dated plays
+                        if not cp.get("is_shadow_only"):
+                            post_to_telegram(cp_msg)
+                            if cp.get("route") in ("immediate", "swing") and TELEGRAM_CHAT_INTRADAY:
+                                post_to_telegram(cp_msg, chat_id=TELEGRAM_CHAT_INTRADAY)
+                        else:
+                            log.info(f"🔇 SHADOW (sweep): {cp['ticker']} {cp.get('em_detail','')}")
                         if _log_conviction_play:
                             regime = get_current_regime() if get_current_regime else "UNKNOWN"
                             _log_conviction_play(cp, regime=regime)
@@ -8814,6 +9138,18 @@ def _initialize_app():
 
             # Wire option store into flow detector for streaming overlay
             _flow_detector.set_option_store(get_option_store())
+
+            # Issue 1: Wire conviction plays into thesis monitor for exit logic
+            try:
+                _te = get_thesis_engine()
+                if _te:
+                    _flow_detector.set_thesis_monitor_fn(_te.create_conviction_trade)
+                    _flow_detector.set_get_thesis_fn(_te.get_thesis)
+                    log.info("Issue 1: Conviction plays → thesis monitor exit logic wired")
+                    log.info("EM alignment gate wired: conviction plays check thesis bias")
+            except Exception as _wire_err:
+                log.debug(f"Conviction → thesis monitor wiring: {_wire_err}")
+
             log.info("Phase 3 option streaming wired: sweeps → flow → conviction → Telegram")
         except Exception as _e:
             log.warning(f"Phase 3 option streaming init failed: {_e}")
