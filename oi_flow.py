@@ -583,10 +583,149 @@ class FlowDetector:
         self._option_store = None
         self._sweep_alerts = []  # recent sweeps for conviction pipeline
 
+        # ── Issue 2+4: Session-level conviction position tracking ──
+        # Tracks active conviction positions to suppress duplicate alerts.
+        # {ticker: {"direction": "bullish"/"bearish", "entry_time": iso,
+        #           "strike": float, "route": str, "fire_count": int}}
+        self._conviction_positions = {}
+        # Reference to thesis monitor for wiring conviction → ActiveTrade (Issue 1)
+        self._thesis_monitor = None
+        self._thesis_monitor_fn = None  # callable(play) → creates ActiveTrade
+        # Reference to thesis engine for EM alignment gate
+        self._get_thesis_fn = None  # callable(ticker) → ThesisContext or None
+
     def set_option_store(self, store):
         """Wire the OptionQuoteStore for streaming option data overlay."""
         self._option_store = store
         log.info("FlowDetector: option streaming store connected")
+
+    def set_get_thesis_fn(self, fn):
+        """Wire thesis lookup for EM alignment gate on conviction plays."""
+        self._get_thesis_fn = fn
+        log.info("FlowDetector: thesis lookup wired for EM alignment gate")
+
+    def _check_em_alignment(self, ticker: str, trade_direction: str) -> dict:
+        """Check if conviction play direction aligns with the morning EM card thesis.
+
+        Returns dict with:
+          aligned: bool — True if flow agrees with thesis (or thesis unavailable)
+          thesis_bias: str — "BULLISH", "BEARISH", "NEUTRAL", etc.
+          thesis_score: int — bias score from EM card (-14 to +14)
+          conflict: bool — True if flow directly opposes a strong thesis
+          detail: str — human-readable alignment note
+        """
+        result = {"aligned": True, "thesis_bias": "", "thesis_score": 0,
+                  "conflict": False, "detail": "no thesis available",
+                  "gex_sign": "", "regime": ""}
+
+        if not self._get_thesis_fn:
+            return result
+
+        try:
+            thesis = self._get_thesis_fn(ticker)
+            if not thesis:
+                return result
+
+            bias = getattr(thesis, "bias", "NEUTRAL") or "NEUTRAL"
+            score = getattr(thesis, "bias_score", 0) or 0
+            gex_sign = getattr(thesis, "gex_sign", "positive") or "positive"
+            regime = getattr(thesis, "regime", "UNKNOWN") or "UNKNOWN"
+
+            result["thesis_bias"] = bias
+            result["thesis_score"] = score
+            result["gex_sign"] = gex_sign
+            result["regime"] = regime
+
+            bias_upper = bias.upper()
+
+            # Determine if thesis is bullish, bearish, or neutral
+            thesis_bullish = "BULLISH" in bias_upper
+            thesis_bearish = "BEARISH" in bias_upper
+            thesis_strong = "STRONG" in bias_upper or abs(score) >= 7
+
+            flow_bullish = trade_direction == "bullish"
+            flow_bearish = trade_direction == "bearish"
+
+            if thesis_bullish and flow_bullish:
+                result["aligned"] = True
+                result["detail"] = f"✅ ALIGNED: flow {trade_direction} agrees with EM card {bias} ({score:+d}/14)"
+            elif thesis_bearish and flow_bearish:
+                result["aligned"] = True
+                result["detail"] = f"✅ ALIGNED: flow {trade_direction} agrees with EM card {bias} ({score:+d}/14)"
+            elif thesis_bullish and flow_bearish:
+                result["aligned"] = False
+                result["conflict"] = thesis_strong
+                result["detail"] = (f"⚠️ CONFLICT: flow bearish vs EM card {bias} ({score:+d}/14)"
+                                    + (" — STRONG thesis, shadow only" if thesis_strong else ""))
+            elif thesis_bearish and flow_bullish:
+                result["aligned"] = False
+                result["conflict"] = thesis_strong
+                result["detail"] = (f"⚠️ CONFLICT: flow bullish vs EM card {bias} ({score:+d}/14)"
+                                    + (" — STRONG thesis, shadow only" if thesis_strong else ""))
+            else:
+                # Neutral thesis — flow can go either way
+                result["aligned"] = True
+                result["detail"] = f"📊 NEUTRAL thesis ({score:+d}/14) — flow direction not opposed"
+
+        except Exception as e:
+            result["detail"] = f"alignment check error: {e}"
+
+        return result
+
+    def set_thesis_monitor_fn(self, fn):
+        """Wire a callback to create ActiveTrade from conviction plays (Issue 1)."""
+        self._thesis_monitor_fn = fn
+        log.info("FlowDetector: thesis monitor conviction entry wired")
+
+    def _check_conviction_session_state(self, ticker: str, trade_direction: str,
+                                         strike: float, route: str) -> str:
+        """Check session state for conviction dedup (Issues 2+4).
+
+        Returns:
+          "new"         — first fire, full alert
+          "hold"        — same direction re-fire, suppress
+          "exit"        — direction flipped, post exit signal
+          "new_strike"  — same direction but significantly different strike
+        """
+        existing = self._conviction_positions.get(ticker)
+        if not existing:
+            return "new"
+
+        existing_dir = existing.get("direction", "")
+        existing_strike = existing.get("strike", 0)
+
+        # Direction flip → exit signal
+        if existing_dir and existing_dir != trade_direction:
+            return "exit"
+
+        # Same direction — check if strike is significantly different (>3% from prior)
+        if existing_strike > 0 and strike > 0:
+            strike_diff_pct = abs(strike - existing_strike) / existing_strike * 100
+            if strike_diff_pct > 3.0:
+                return "new_strike"
+
+        # Same direction, similar strike → suppress (HOLD)
+        return "hold"
+
+    def _update_conviction_session(self, ticker: str, trade_direction: str,
+                                    strike: float, route: str):
+        """Update session state after firing a conviction alert."""
+        existing = self._conviction_positions.get(ticker, {})
+        fire_count = existing.get("fire_count", 0) + 1
+        self._conviction_positions[ticker] = {
+            "direction": trade_direction,
+            "strike": strike,
+            "route": route,
+            "entry_time": datetime.now().isoformat(),
+            "fire_count": fire_count,
+        }
+
+    def clear_conviction_session(self, ticker: str = None):
+        """Clear conviction session state. Called on direction flip or EOD reset."""
+        if ticker:
+            self._conviction_positions.pop(ticker, None)
+        else:
+            self._conviction_positions.clear()
 
     def handle_sweep(self, sweep: dict):
         """Handle a real-time sweep from SweepDetector.
@@ -1935,6 +2074,24 @@ class FlowDetector:
             ):
                 continue
 
+            # ── SESSION-LEVEL DEDUP (Issues 2+4) ──
+            # Check if we already have an active conviction position for this ticker.
+            # Same direction re-fires → suppress (HOLD).
+            # Direction flip → exit signal (handled above via is_exit_signal).
+            # Significantly different strike → allow as new setup.
+            session_action = self._check_conviction_session_state(
+                ticker, trade_direction, alert["strike"], route)
+            if session_action == "hold":
+                existing_pos = self._conviction_positions.get(ticker, {})
+                fire_ct = existing_pos.get("fire_count", 0)
+                log.info(f"💎 DEDUP: {ticker} {trade_side} suppressed — "
+                         f"same direction fire #{fire_ct + 1}, holding position")
+                # Still count it for fire_count tracking
+                self._update_conviction_session(ticker, trade_direction, alert["strike"], route)
+                continue
+            # "exit" is already handled by is_exit_signal logic above
+            # "new" and "new_strike" proceed to full alert
+
             # ── PRE-MOVE FILTER ──
             # If stock moved >2% in last 30 min, flow is likely reactive
             # (hedging, profit-taking, closing losers) not predictive.
@@ -1946,6 +2103,13 @@ class FlowDetector:
             if mid <= 0:
                 mid = (alert.get("bid", 0) + alert.get("ask", 0)) / 2
             notional = volume * mid * 100
+
+            # ── EM ALIGNMENT GATE ──
+            # Check if flow direction agrees with the morning thesis.
+            # Misaligned plays (flow fights EM card) are shadow-logged, not fired.
+            em_alignment = self._check_em_alignment(ticker, trade_direction)
+            is_em_aligned = em_alignment.get("aligned", True)
+            is_em_conflict = em_alignment.get("conflict", False)
 
             # ── ATM STRIKE GUIDANCE ──
             # Recommend ATM or first ITM strike based on current spot
@@ -1960,6 +2124,7 @@ class FlowDetector:
                     strike_guidance = f"Buy ATM PUT near ${atm_strike:.0f}"
             else:
                 strike_guidance = trade_side
+                atm_strike = alert.get("strike", 0)
 
             # ── 1DTE VEHICLE for 0DTE plays ──
             # The institutional flow is the signal. Next expiry is the vehicle.
@@ -2063,7 +2228,80 @@ class FlowDetector:
                 "velocity_count": alert.get("velocity_count", 0),
                 "vol_per_min": alert.get("vol_per_min", 0),
                 "potter_location": potter_location,
+                # Issue 2+4: session dedup state
+                "session_action": session_action,  # "new" or "new_strike"
+                # streaming sweep flag
+                "is_streaming_sweep": alert.get("is_streaming_sweep", False),
+                "sweep_notional": alert.get("sweep_notional", 0),
+                # EM alignment gate
+                "em_aligned": is_em_aligned,
+                "em_conflict": is_em_conflict,
+                "em_thesis_bias": em_alignment.get("thesis_bias", ""),
+                "em_thesis_score": em_alignment.get("thesis_score", 0),
+                "em_detail": em_alignment.get("detail", ""),
+                "em_gex_sign": em_alignment.get("gex_sign", ""),
+                "em_regime": em_alignment.get("regime", ""),
+                # Shadow-only flag: misaligned plays are logged but not posted.
+                # Only applies to DTE < 5 — EM card is intraday context.
+                # Longer-dated institutional positioning (swing/stalk) operates
+                # on a different timeframe and should not be gated by intraday structure.
+                "is_shadow_only": is_em_conflict and alert_dte < 5,
             })
+
+            # ── Issue 3: Resolve recommended contract details ──
+            # When flow side differs from trade side (e.g. put flow → LONG CALL),
+            # look up the actual recommended contract's bid/ask/mid from streaming.
+            play = plays[-1]
+            rec_side = "call" if trade_direction == "bullish" else "put"
+            if rec_side != side and self._option_store:
+                rec_quote = self.get_streaming_overlay(ticker, atm_strike, rec_side)
+                if rec_quote:
+                    play["rec_bid"] = rec_quote.get("bid", 0)
+                    play["rec_ask"] = rec_quote.get("ask", 0)
+                    play["rec_mid"] = (rec_quote.get("bid", 0) + rec_quote.get("ask", 0)) / 2
+                    play["rec_strike"] = atm_strike
+                    play["rec_side"] = rec_side
+                    play["has_rec_contract"] = True
+
+            # ── 1DTE contract price lookup ──
+            # When we recommend 1DTE for theta protection, look up the actual
+            # 1DTE contract's bid/ask so the card shows the right price.
+            if recommend_1dte and self._option_store:
+                try:
+                    from schwab_stream import build_occ_symbol, parse_occ_symbol
+                    _1dte_date = date.today() + timedelta(days=1)
+                    # Skip weekends
+                    while _1dte_date.weekday() >= 5:
+                        _1dte_date += timedelta(days=1)
+                    _1dte_exp = _1dte_date.strftime("%Y-%m-%d")
+                    _1dte_side = rec_side  # same side as recommended
+                    _1dte_sym = build_occ_symbol(ticker, _1dte_exp, _1dte_side, atm_strike)
+                    _1dte_q = self._option_store.get(_1dte_sym)
+                    if _1dte_q:
+                        _1b = _1dte_q.get("bid", 0) or 0
+                        _1a = _1dte_q.get("ask", 0) or 0
+                        if _1a > 0:
+                            play["dte1_bid"] = _1b
+                            play["dte1_ask"] = _1a
+                            play["dte1_mid"] = round((_1b + _1a) / 2, 2)
+                            play["dte1_expiry"] = _1dte_exp
+                            play["dte1_strike"] = atm_strike
+                            play["dte1_side"] = _1dte_side
+                            play["has_1dte_quote"] = True
+                            log.info(f"1DTE quote for {ticker}: {_1dte_sym} "
+                                     f"bid=${_1b:.2f} ask=${_1a:.2f}")
+                except Exception as _1e:
+                    log.debug(f"1DTE lookup for {ticker}: {_1e}")
+
+            # ── Issue 2+4: Update session state after successful fire ──
+            self._update_conviction_session(ticker, trade_direction, alert["strike"], route)
+
+            # ── Issue 1: Wire conviction into thesis monitor ──
+            if self._thesis_monitor_fn and route in ("immediate", "swing"):
+                try:
+                    self._thesis_monitor_fn(play)
+                except Exception as _tm_err:
+                    log.debug(f"Conviction → thesis monitor failed: {_tm_err}")
 
         return plays
 
@@ -2209,6 +2447,21 @@ class FlowDetector:
             vpoc = play.get("vpoc_data", {})
             lines.append(f"📍 Flow near VPOC ${vpoc.get('vpoc',0):.2f} — volume gravitational center")
 
+        # EM card alignment context
+        em_detail = play.get("em_detail", "")
+        if em_detail:
+            lines.append(f"")
+            if play.get("is_shadow_only"):
+                lines.append(f"📋 EM Card: {em_detail}")
+                lines.append(f"🔇 SHADOW ONLY — flow fights strong EM thesis on short-dated play")
+            elif play.get("em_conflict") and play.get("dte", 0) >= 5:
+                # Long-dated flow fighting intraday EM = strategic institutional positioning
+                lines.append(f"📋 EM Card: {em_detail}")
+                lines.append(f"🏗️ STRATEGIC: Institutions positioning against intraday structure — "
+                             f"multi-day thesis, consider building throughout session")
+            else:
+                lines.append(f"📋 EM Card: {em_detail}")
+
         # Potter Box structural context
         potter_ctx = play.get("potter_context", "")
         if potter_ctx:
@@ -2221,16 +2474,49 @@ class FlowDetector:
             lines.append(f"⚠️ EARNINGS WARNING: {play.get('earnings_note', 'earnings within expiry window')}")
 
         # ── 1DTE VEHICLE RECOMMENDATION ──
+        # Issue 3: When we have resolved recommended contract details, show those
+        has_rec = play.get("has_rec_contract", False)
+        rec_ask = play.get("rec_ask", 0)
+        rec_mid = play.get("rec_mid", 0)
+        rec_strike_val = play.get("rec_strike", 0)
+        rec_side_label = play.get("rec_side", "").upper()
+
         if recommend_1dte and route == "immediate":
             lines += [
                 "", action,
                 f"📅 Flow detected on: {exp_str} (0DTE)",
                 f"👉 Recommended: Trade 1DTE for theta protection",
-                f"💵 Ask (0DTE): ${play.get('ask', 0):.2f} | Spot: ${play['spot']:.2f}",
             ]
+            # Show 1DTE contract price if available from streaming
+            has_1dte = play.get("has_1dte_quote", False)
+            if has_1dte:
+                _1side = play.get("dte1_side", "").upper()
+                _1strike = play.get("dte1_strike", 0)
+                _1ask = play.get("dte1_ask", 0)
+                _1mid = play.get("dte1_mid", 0)
+                _1exp = play.get("dte1_expiry", "")
+                lines.append(f"💵 1DTE {_1side} ${_1strike:.0f} ({_1exp}): "
+                             f"Ask ${_1ask:.2f} (Mid ${_1mid:.2f}) | Spot: ${play['spot']:.2f}")
+                # Also show 0DTE for comparison
+                lines.append(f"   (0DTE reference: Ask ${play.get('ask', 0):.2f})")
+            elif has_rec and rec_ask > 0:
+                lines.append(f"💵 Rec {rec_side_label} ${rec_strike_val:.0f}: "
+                             f"Ask ${rec_ask:.2f} (Mid ${rec_mid:.2f}) | Spot: ${play['spot']:.2f}")
+                lines.append(f"   ⚠️ 1DTE quote unavailable — price shown is 0DTE")
+            else:
+                lines.append(f"💵 Ask (0DTE): ${play.get('ask', 0):.2f} | Spot: ${play['spot']:.2f}")
+                lines.append(f"   ⚠️ 1DTE quote unavailable — price shown is 0DTE")
         else:
-            lines += ["", action, f"📅 Expiry: {exp_str} ({dte_label})",
-                      f"💵 Ask: ${play.get('ask', 0):.2f} | Spot: ${play['spot']:.2f}"]
+            lines += ["", action, f"📅 Expiry: {exp_str} ({dte_label})"]
+            if has_rec and rec_ask > 0:
+                lines.append(f"💵 Rec {rec_side_label} ${rec_strike_val:.0f}: "
+                             f"Ask ${rec_ask:.2f} (Mid ${rec_mid:.2f}) | Spot: ${play['spot']:.2f}")
+            else:
+                lines.append(f"💵 Ask: ${play.get('ask', 0):.2f} | Spot: ${play['spot']:.2f}")
+
+        # Issue 5: Suggest spread alternative for defined-risk
+        if route in ("immediate", "swing") and play.get("spot", 0) > 0:
+            lines.append(f"📊 For defined risk: run spread engine on {trade_side.split()[-1].lower()} debit spread")
 
         lines += ["", urgency]
 
