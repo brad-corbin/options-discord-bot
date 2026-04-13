@@ -1306,12 +1306,14 @@ class PotterBoxBreakMonitor:
     }
 
     def __init__(self, potter_box_scanner, post_fn: Callable, tickers: list,
-                 cached_md=None, get_expirations_fn: Callable = None):
+                 cached_md=None, get_expirations_fn: Callable = None,
+                 persistent_state=None):
         self._potter = potter_box_scanner
         self._post = post_fn
         self._tickers = tickers
         self._cached_md = cached_md
         self._get_exps = get_expirations_fn
+        self._state = persistent_state
         self._cooldowns = {}   # "ticker:break_type" → timestamp
         self._thread = None
         self._running = False
@@ -1705,6 +1707,34 @@ class PotterBoxBreakMonitor:
 
         msg = "\n".join(lines)
 
+        # ── 7. Persist break event to Redis ──────────────────
+        if self._state:
+            try:
+                event = {
+                    "ticker": ticker,
+                    "spot": spot,
+                    "break_type": break_type,
+                    "roof": roof,
+                    "floor": floor,
+                    "box": box,
+                    "conviction": conviction,
+                    "trade": trade,
+                    "exposure": {
+                        "regime": exposure.get("composite", {}).get("regime") if exposure else None,
+                        "composite_score": exposure.get("composite", {}).get("composite_score") if exposure else None,
+                        "gamma_flip": exposure.get("gamma_flip") if exposure else None,
+                        "walls": exposure.get("walls") if exposure else None,
+                        "net_gex": exposure.get("net", {}).get("gex") if exposure else None,
+                    } if exposure else None,
+                    "void": void,
+                    "box_above": box_above,
+                    "box_below": box_below,
+                    "timestamp": datetime.now().isoformat(),
+                }
+                self._state.save_break_event(ticker, event)
+            except Exception as e:
+                log.debug(f"Failed to persist break event {ticker}: {e}")
+
         try:
             self._post(msg)
             with self._lock:
@@ -1790,6 +1820,7 @@ _box_monitor = None
 def start_box_break_monitor(potter_box_scanner, post_fn: Callable,
                             cached_md=None,
                             get_expirations_fn: Callable = None,
+                            persistent_state=None,
                             ) -> Optional[PotterBoxBreakMonitor]:
     """Start real-time Potter Box break monitoring with GEX exposure enrichment.
 
@@ -1799,6 +1830,7 @@ def start_box_break_monitor(potter_box_scanner, post_fn: Callable,
             _potter_box, post_to_telegram,
             cached_md=_cached_md,
             get_expirations_fn=get_expirations,
+            persistent_state=_persistent_state,
         )
     """
     global _box_monitor
@@ -1810,6 +1842,7 @@ def start_box_break_monitor(potter_box_scanner, post_fn: Callable,
             tickers=list(FLOW_TICKERS),
             cached_md=cached_md,
             get_expirations_fn=get_expirations_fn,
+            persistent_state=persistent_state,
         )
         _box_monitor.start()
         return _box_monitor
