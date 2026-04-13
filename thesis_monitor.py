@@ -994,6 +994,10 @@ class ThesisMonitorEngine:
                 log.warning(f"Ticker list load failed: {e}")
         for d in MONITOR_DEFAULT_TICKERS:
             if d not in tickers and self.get_thesis(d): tickers.add(d)
+        # Issue 1: Include tickers with active conviction trades (may not have thesis)
+        for t, st in self._states.items():
+            if any(tr.status in ("OPEN", "SCALED", "TRAILED") for tr in st.active_trades):
+                tickers.add(t)
         return sorted(tickers)
 
     def _recent_net_move(self, state, lookback=3, bm=None):
@@ -1006,7 +1010,15 @@ class ThesisMonitorEngine:
     def evaluate(self, ticker, price):
         with self._lock:
             thesis = self._theses.get(ticker); state = self._states.get(ticker)
-            if not thesis or not state: return []
+            if not state: return []
+            # Allow exit monitoring even without thesis if we have active trades
+            # (conviction trades may not have a thesis context)
+            has_active_trades = any(t.status in ("OPEN", "SCALED", "TRAILED")
+                                   for t in state.active_trades)
+            if not thesis and not has_active_trades: return []
+            if not thesis:
+                # Minimal thesis for exit monitoring only — no entry logic runs
+                thesis = ThesisContext(ticker=ticker)
             events = []; now = time.monotonic()
             try:
                 from zoneinfo import ZoneInfo; ts = datetime.now(ZoneInfo("America/Chicago")).strftime("%I:%M %p")
@@ -1731,6 +1743,143 @@ class ThesisMonitorEngine:
                  f"policy={policy.name} | scale={validation.scale_advice} | "
                  f"stop=${stop:.2f} | targets={[f'${t:.2f}' for t in targets]} | "
                  f"gates=[{validation.gate_summary}]")
+        return True
+
+    # ── Issue 1: Conviction Play → ActiveTrade ──
+    def create_conviction_trade(self, play: dict) -> bool:
+        """Create an ActiveTrade from a conviction play, wiring it into
+        the existing exit framework (premium stop, scale-out, trailing).
+
+        This gives conviction plays the same exit logic as thesis-monitor
+        generated trades: 20% premium stop, 1/3→2/3→full scale-in,
+        and trailing exits.
+        """
+        ticker = play.get("ticker", "")
+        if not ticker:
+            return False
+
+        direction = "LONG" if play.get("trade_direction") == "bullish" else "SHORT"
+        spot = play.get("spot", 0)
+        if spot <= 0:
+            return False
+
+        # Check for duplicate — don't create if already tracking this ticker+direction
+        state = self._states.setdefault(ticker, MonitorState())
+        for t in state.active_trades:
+            if t.status in ("OPEN", "SCALED", "TRAILED") and t.direction == direction:
+                log.info(f"Conviction trade skipped — already tracking {ticker} {direction}")
+                return False
+
+        route = play.get("route", "immediate")
+        dte = play.get("dte", 0)
+        strike = play.get("strike", round(spot))
+        rec_strike = play.get("rec_strike", strike)
+
+        # Compute stop: 20% of premium (handled by premium stop), but also set
+        # a spot-based backstop. Use 1.5% for immediate, 3% for swing.
+        if route == "immediate":
+            stop_pct = 0.015
+        else:
+            stop_pct = 0.03
+        if direction == "LONG":
+            stop = spot * (1 - stop_pct)
+        else:
+            stop = spot * (1 + stop_pct)
+
+        # Targets: use Potter Box levels if available, else ±1% / ±2%
+        targets = []
+        try:
+            pb_data = _persistent_state._json_get(f"potter_box:active:{ticker}") if _persistent_state else None
+            if pb_data:
+                box = pb_data.get("box") or pb_data
+                if direction == "LONG" and box.get("roof", 0) > spot:
+                    targets.append(box["roof"])
+                elif direction == "SHORT" and box.get("floor", 0) > 0 and box["floor"] < spot:
+                    targets.append(box["floor"])
+        except Exception:
+            pass
+        if not targets:
+            mult = 1 if direction == "LONG" else -1
+            targets = [round(spot * (1 + mult * 0.01), 2),
+                       round(spot * (1 + mult * 0.02), 2)]
+
+        now = time.monotonic()
+        trade = ActiveTrade(
+            ticker=ticker,
+            direction=direction,
+            entry_type="CONVICTION",
+            entry_price=spot,
+            stop_level=stop,
+            targets=targets,
+            status="OPEN",
+            entry_time=now,
+            entry_epoch=time.time(),
+            entry_time_str=datetime.now().strftime("%H:%M:%S CT"),
+            level_name=f"conviction_flow_{play.get('route', 'imm')}",
+            regime=play.get("regime", ""),
+            trade_type_label=play.get("trade_side", "LONG CALL"),
+            setup_score=4 if play.get("shadow_agrees") else 3,
+            setup_label="CONVICTION FLOW",
+            exit_policy_name="CONVICTION_MOMENTUM",
+            scale_advice="1/3 at entry, scale on confirmation",
+            bias_direction=play.get("trade_direction", "bullish"),
+            initial_contracts=7,
+            scale_in_stage=1,
+        )
+
+        # Wire OCC symbol for live premium tracking
+        opt_side = "call" if direction == "LONG" else "put"
+        opt_strike = rec_strike if rec_strike > 0 else round(spot)
+        try:
+            from schwab_stream import build_occ_symbol, get_option_symbol_manager, get_live_premium
+            exp_str = str(play.get("expiry", ""))[:10]
+            if not exp_str or dte == 0:
+                exp_date = date.today()
+                # Use 1DTE vehicle for 0DTE
+                if play.get("recommend_1dte"):
+                    exp_date = date.today() + timedelta(days=1)
+                    while exp_date.weekday() >= 5:
+                        exp_date += timedelta(days=1)
+                exp_str = exp_date.strftime("%Y-%m-%d")
+
+            trade.option_expiry = exp_str
+            trade.option_strike = float(opt_strike)
+            trade.option_symbol = build_occ_symbol(ticker, exp_str, opt_side, opt_strike)
+            log.info(f"Conviction trade OCC: {trade.option_symbol}")
+
+            osm = get_option_symbol_manager()
+            if osm:
+                osm.subscribe_specific([trade.option_symbol])
+
+            live_prem = get_live_premium(trade.option_symbol)
+            if live_prem and live_prem > 0:
+                trade.entry_premium = live_prem
+                trade.est_premium = live_prem
+                trade.peak_premium = live_prem
+                trade.entry_delta = 0.50  # approximate ATM
+                log.info(f"Conviction trade live premium: ${live_prem:.2f}")
+            else:
+                # Fallback: estimate from play mid/ask
+                est = play.get("rec_mid") or play.get("mid") or play.get("ask", 0)
+                if est and est > 0:
+                    trade.entry_premium = est
+                    trade.est_premium = est
+                    trade.peak_premium = est
+                    trade.entry_delta = 0.50
+        except Exception as e:
+            log.debug(f"Conviction trade OCC setup: {e}")
+
+        state.active_trades.append(trade)
+        self._persist_trades(ticker, state)
+        _log_trade_event(trade, event="OPEN")
+        try:
+            _pg_register(trade)
+        except Exception:
+            pass
+
+        log.info(f"🎯 Conviction ActiveTrade created: {ticker} {direction} "
+                 f"@ ${spot:.2f} | stop=${stop:.2f} | OCC={trade.option_symbol} | "
+                 f"premium=${trade.entry_premium:.2f}")
         return True
 
     # ── Exit Monitor: Core Loop ──
@@ -3622,7 +3771,15 @@ class ThesisMonitorDaemon:
             fast = ticker.upper() in MONITOR_FAST_POLL_TICKERS
             if not fast and not slow: continue
             thesis = self.engine.get_thesis(ticker)
-            if not thesis: continue
+            # Issue 1: Don't skip tickers without thesis if they have active trades
+            # (conviction trades create state but may not have thesis)
+            if not thesis:
+                state = self.engine.get_state(ticker)
+                has_active = state and any(
+                    t.status in ("OPEN", "SCALED", "TRAILED")
+                    for t in state.active_trades)
+                if not has_active:
+                    continue
             try:
                 price = self.get_spot(ticker)
                 if not price or price <= 0: continue
