@@ -8877,6 +8877,7 @@ def _initialize_app():
                     _potter_box, post_to_telegram,
                     cached_md=_cached_md,
                     get_expirations_fn=get_expirations,
+                    persistent_state=_persistent_state,
                 )
         except Exception as _e:
             log.warning(f"Potter Box break monitor init failed: {_e}")
