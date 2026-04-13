@@ -573,6 +573,42 @@ class PersistentState:
         return 0.0
 
     # ═══════════════════════════════════════════════════════
+    # POTTER BOX BREAK EVENTS — enriched break/reclaim data
+    # ═══════════════════════════════════════════════════════
+
+    _BREAK_TTL = 4 * 3600  # 4 hours — intraday shelf life
+
+    def _break_event_key(self, ticker: str) -> str:
+        return f"potter_break:{ticker.upper()}"
+
+    def save_break_event(self, ticker: str, event: dict):
+        """Persist an enriched break event (conviction, exposure, trade).
+
+        Keyed by ticker — latest break overwrites previous.
+        4-hour TTL: break events are intraday-actionable only.
+        """
+        self._json_set(self._break_event_key(ticker), event, self._BREAK_TTL)
+
+    def get_break_event(self, ticker: str) -> Optional[dict]:
+        """Retrieve the most recent break event for a ticker."""
+        return self._json_get(self._break_event_key(ticker))
+
+    def get_all_break_events(self) -> List[dict]:
+        """Retrieve all active break events (scan potter_break:* keys)."""
+        if not self._scan:
+            return []
+        try:
+            keys = self._scan("potter_break:*")
+            events = []
+            for key in keys:
+                ev = self._json_get(key)
+                if ev:
+                    events.append(ev)
+            return events
+        except Exception:
+            return []
+
+    # ═══════════════════════════════════════════════════════
     # DIAGNOSTICS
     # ═══════════════════════════════════════════════════════
 
@@ -588,6 +624,7 @@ class PersistentState:
                 result["stalk_alerts"] = len(self._scan("stalk:*"))
                 result["volume_flags"] = len(self._scan("vol_flags:*"))
                 result["oi_baselines"] = len(self._scan("oi_baseline:*"))
+                result["break_events"] = len(self._scan("potter_break:*"))
             except Exception:
                 result["scan_error"] = True
         return result
