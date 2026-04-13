@@ -1293,8 +1293,9 @@ class PotterBoxBreakMonitor:
     """
 
     CHECK_INTERVAL = 30
-    ALERT_COOLDOWN = 3600   # 1 hour between same break alerts
+    ALERT_COOLDOWN = 14400   # 4 hours between same break alerts (was 1hr)
     BREAK_CONFIRM_PCT = 0.15  # must break by 0.15% to confirm (not just touch)
+    BREAK_CONFIRM_CHECKS = 2  # must hold outside box for 2 consecutive checks (Issue 7)
     HIGH_CONVICTION_THRESHOLD = 70  # auto-fire select_strikes above this
 
     # Conviction scoring weights (out of 100)
@@ -1315,6 +1316,7 @@ class PotterBoxBreakMonitor:
         self._get_exps = get_expirations_fn
         self._state = persistent_state
         self._cooldowns = {}   # "ticker:break_type" → timestamp
+        self._break_confirm = {}  # "ticker:break_type" → consecutive count (Issue 7)
         self._thread = None
         self._running = False
         self._lock = threading.Lock()
@@ -1384,14 +1386,29 @@ class PotterBoxBreakMonitor:
 
             # Check ceiling break (breakout)
             if spot > roof + break_margin:
-                self._fire_break(ticker, spot, "BREAKOUT", roof, floor, box, now)
+                confirm_key = f"{ticker}:BREAKOUT"
+                self._break_confirm[confirm_key] = self._break_confirm.get(confirm_key, 0) + 1
+                # Reset opposite direction
+                self._break_confirm.pop(f"{ticker}:BREAKDOWN", None)
+                if self._break_confirm[confirm_key] >= self.BREAK_CONFIRM_CHECKS:
+                    self._fire_break(ticker, spot, "BREAKOUT", roof, floor, box, now)
+                    self._break_confirm.pop(confirm_key, None)
 
             # Check floor break (breakdown)
             elif spot < floor - break_margin:
-                self._fire_break(ticker, spot, "BREAKDOWN", roof, floor, box, now)
+                confirm_key = f"{ticker}:BREAKDOWN"
+                self._break_confirm[confirm_key] = self._break_confirm.get(confirm_key, 0) + 1
+                # Reset opposite direction
+                self._break_confirm.pop(f"{ticker}:BREAKOUT", None)
+                if self._break_confirm[confirm_key] >= self.BREAK_CONFIRM_CHECKS:
+                    self._fire_break(ticker, spot, "BREAKDOWN", roof, floor, box, now)
+                    self._break_confirm.pop(confirm_key, None)
 
             # Check reclaim from outside
             elif floor <= spot <= roof:
+                # Price back inside box — reset all confirmation counters
+                self._break_confirm.pop(f"{ticker}:BREAKOUT", None)
+                self._break_confirm.pop(f"{ticker}:BREAKDOWN", None)
                 # If we previously alerted a break, reclaim is noteworthy
                 breakout_key = f"{ticker}:BREAKOUT"
                 breakdown_key = f"{ticker}:BREAKDOWN"
