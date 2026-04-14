@@ -974,6 +974,14 @@ def scan_ticker_income(ticker, regime_package, ohlcv_fn=None,
             cushion_pct = ((spot - short_strike) / spot) * 100
             failure = find_support_failure_level(supports, sup["level"])
 
+            # v7 filter: minimum cushion — below 6% is a coin flip
+            try:
+                from trading_rules import INCOME_MIN_CUSHION_PCT
+            except ImportError:
+                INCOME_MIN_CUSHION_PCT = 6.0
+            if cushion_pct < INCOME_MIN_CUSHION_PCT:
+                continue
+
             # Auto liquidity
             liq = auto_liquidity(chain, short_strike, long_strike, "bull_put")
 
@@ -1035,7 +1043,15 @@ def scan_ticker_income(ticker, regime_package, ohlcv_fn=None,
             })
 
         # ── Bear call candidates ──
-        for res in resistances:
+        # v7 filter: skip bear calls on tickers where they consistently lose
+        try:
+            from trading_rules import INCOME_SKIP_BEAR_CALLS
+        except ImportError:
+            INCOME_SKIP_BEAR_CALLS = set()
+        if ticker.upper() in INCOME_SKIP_BEAR_CALLS:
+            pass  # skip entire bear call loop for this ticker
+        else:
+          for res in resistances:
             short_strike = _strike_above_resistance(res, spot, chain=chain)
             if short_strike <= spot:
                 continue
@@ -1052,6 +1068,15 @@ def scan_ticker_income(ticker, regime_package, ohlcv_fn=None,
             roc = (credit / width) * 100 if width > 0 else 0
             cushion_pct = ((short_strike - spot) / spot) * 100
             failure = find_resistance_failure_level(resistances, res["level"])
+
+            # v7 filter: minimum cushion for bear calls too
+            try:
+                from trading_rules import INCOME_MIN_CUSHION_PCT as _min_c
+            except ImportError:
+                _min_c = 6.0
+            if cushion_pct < _min_c:
+                continue
+
             liq = auto_liquidity(chain, short_strike, long_strike, "bear_call")
             fib_match = any(abs(f - short_strike) / spot < 0.015 for f in fibs) if fibs else False
 
