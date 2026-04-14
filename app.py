@@ -204,6 +204,7 @@ app = Flask(__name__)
 TELEGRAM_BOT_TOKEN      = os.getenv("TELEGRAM_BOT_TOKEN",      "").strip()
 TELEGRAM_CHAT_ID        = os.getenv("TELEGRAM_CHAT_ID",        "").strip()
 TELEGRAM_CHAT_INTRADAY  = os.getenv("TELEGRAM_CHAT_INTRADAY",  "").strip()  # intraday monitor alerts
+TELEGRAM_CHAT_DIAGNOSIS = os.getenv("DIAGNOSTIC_CHAT_ID", "").strip()  # v7.1: noise/diagnostic alerts
 TV_WEBHOOK_SECRET   = os.getenv("TV_WEBHOOK_SECRET",   "").strip()
 MARKETDATA_TOKEN    = os.getenv("MARKETDATA_TOKEN",    "").strip()
 WATCHLIST           = os.getenv("WATCHLIST",           "").strip()
@@ -475,6 +476,18 @@ def _append_google_sheet_values(tab: str, values: list, token: str) -> bool:
             json={"values": values},
             timeout=15,
         )
+        # v7.1: Auto-create tab if it doesn't exist (400 error)
+        if resp.status_code == 400 and "Unable to parse range" in resp.text:
+            log.info(f"Google Sheets tab '{tab}' not found — auto-creating")
+            if _create_google_sheet_tab(tab, token):
+                # Retry the append
+                resp = requests.post(
+                    url,
+                    params={"valueInputOption": "USER_ENTERED", "insertDataOption": "INSERT_ROWS"},
+                    headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                    json={"values": values},
+                    timeout=15,
+                )
         resp.raise_for_status()
         return True
     except Exception as e:
@@ -485,6 +498,34 @@ def _append_google_sheet_values(tab: str, values: list, token: str) -> bool:
         except Exception:
             pass
         log.warning(f"Google Sheets append failed for {tab}: {e}{resp_body}")
+        return False
+
+
+def _create_google_sheet_tab(tab_name: str, token: str) -> bool:
+    """Auto-create a new tab/sheet in the Google Spreadsheet."""
+    try:
+        url = f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEET_ID}:batchUpdate"
+        body = {
+            "requests": [{
+                "addSheet": {
+                    "properties": {"title": tab_name}
+                }
+            }]
+        }
+        resp = requests.post(
+            url,
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json=body,
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            log.info(f"Google Sheets tab '{tab_name}' created successfully")
+            return True
+        else:
+            log.warning(f"Google Sheets tab creation failed for '{tab_name}': {resp.status_code} {resp.text[:200]}")
+            return False
+    except Exception as e:
+        log.warning(f"Google Sheets tab creation error for '{tab_name}': {e}")
         return False
 
 
@@ -839,13 +880,28 @@ def _log_conviction_play(play: dict, regime: str = "", vix: float = 0):
             if expiry and track_strike > 0:
                 occ = build_occ_symbol(ticker, expiry, track_side, track_strike)
                 row["occ_symbol"] = occ
-                row["opt_entry_mid"] = round(track_mid, 4) if track_mid else ""
+
+                # v7.1: Fetch LIVE option price for entry tracking
+                # The flow detection mid (track_mid) is from when flow was first
+                # detected, which can be minutes/hours old and from a different
+                # contract. Use the actual live price of the recommended contract.
+                _live_entry_mid = track_mid  # fallback to flow mid
+                try:
+                    from schwab_stream import get_live_premium as _glp
+                    _live = _glp(occ)
+                    if _live and _live > 0:
+                        _live_entry_mid = _live
+                        log.info(f"Conviction entry mid: live ${_live:.2f} "
+                                 f"(flow was ${track_mid:.2f}) for {occ}")
+                except Exception:
+                    pass
+                row["opt_entry_mid"] = round(_live_entry_mid, 4) if _live_entry_mid else ""
 
                 # Register for watermark tracking (single-leg: immediate/swing)
                 route = play.get("route", "")
-                if track_mid > 0 and route != "income":
+                if _live_entry_mid > 0 and route != "income":
                     store = get_option_store()
-                    store.track_conviction(occ, track_mid)
+                    store.track_conviction(occ, _live_entry_mid)
 
                     # Ensure this contract is in the streaming subscription
                     try:
@@ -3391,6 +3447,18 @@ def post_to_intraday(text: str):
     cid = TELEGRAM_CHAT_INTRADAY or TELEGRAM_CHAT_ID
     if not cid:
         log.error("post_to_intraday: no chat ID configured")
+        return
+    post_to_telegram(text, chat_id=cid)
+
+
+def post_to_diagnosis(text: str):
+    """Post to the diagnosis/noise channel (TELEGRAM_CHAT_DIAGNOSIS).
+    v7.1: All non-actionable noise routes here — swing fibs, Potter Box,
+    OI confirmations, stalk alerts, income scans, level breaks.
+    Falls back to intraday, then main channel if not configured."""
+    cid = TELEGRAM_CHAT_DIAGNOSIS or TELEGRAM_CHAT_INTRADAY or TELEGRAM_CHAT_ID
+    if not cid:
+        log.error("post_to_diagnosis: no chat ID configured")
         return
     post_to_telegram(text, chat_id=cid)
 
@@ -9336,7 +9404,8 @@ def _em_scheduler():
                     fired_today.add(_income_key)
                     log.info("Income scanner firing (8:15 AM CT)")
                     try:
-                        _income_scan_fn(TELEGRAM_CHAT_ID)
+                        _inc_cid = TELEGRAM_CHAT_DIAGNOSIS or TELEGRAM_CHAT_INTRADAY or TELEGRAM_CHAT_ID  # v7.1: route to diagnosis
+                        _income_scan_fn(_inc_cid)
                     except Exception as _ie:
                         log.debug(f"Income scan error: {_ie}")
 
@@ -9368,11 +9437,11 @@ def _em_scheduler():
                                 if setups:
                                     summary = _potter_box.format_summary(setups)
                                     if summary:
-                                        post_to_telegram(summary)
+                                        post_to_diagnosis(summary)
                                     for s in setups:
                                         if s.get("trade") and s.get("flow_direction"):
                                             try:
-                                                post_to_telegram(_potter_box.format_alert(s))
+                                                post_to_diagnosis(_potter_box.format_alert(s))
                                             except Exception:
                                                 pass
                             except Exception as _pe:
@@ -9406,11 +9475,11 @@ def _em_scheduler():
                                 if setups:
                                     summary = _potter_box.format_summary(setups)
                                     if summary:
-                                        post_to_telegram(summary)
+                                        post_to_diagnosis(summary)
                                     for s in setups:
                                         if s.get("trade") and s.get("flow_direction"):
                                             try:
-                                                post_to_telegram(_potter_box.format_alert(s))
+                                                post_to_diagnosis(_potter_box.format_alert(s))
                                             except Exception:
                                                 pass
                             except Exception as _pe:
@@ -9444,11 +9513,11 @@ def _em_scheduler():
                                 if setups:
                                     summary = _potter_box.format_summary(setups)
                                     if summary:
-                                        post_to_telegram(summary)
+                                        post_to_diagnosis(summary)
                                     for s in setups:
                                         if s.get("trade") and s.get("flow_direction"):
                                             try:
-                                                post_to_telegram(_potter_box.format_alert(s))
+                                                post_to_diagnosis(_potter_box.format_alert(s))
                                             except Exception:
                                                 pass
                             except Exception as _pe:
@@ -9490,12 +9559,12 @@ def _em_scheduler():
                                     msg = _flow_detector.format_confirmation_summary(
                                         confirmations, rolls, sector)
                                     if msg:
-                                        post_to_telegram(msg)
+                                        post_to_diagnosis(msg)  # v7.1: route to diagnosis
 
                                     stalks = _flow_detector.generate_stalk_alerts(confirmations)
                                     for stalk in stalks:
                                         try:
-                                            post_to_telegram(_flow_detector.format_stalk_alert(stalk))
+                                            post_to_diagnosis(_flow_detector.format_stalk_alert(stalk))  # v7.1
                                         except Exception:
                                             pass
                             except Exception as _fe:
@@ -9640,11 +9709,21 @@ def _start_background_services_once():
         # v5.0: Start active scanner
         global _scanner
         if ACTIVE_SCANNER_ENABLED:
+            # v7.1: Initialize regime detector (was never called — defaulted to BEAR)
+            from market_regime import init_regime_detector
+            _regime_det = init_regime_detector(notify_fn=post_to_telegram)
+            try:
+                _regime_det.refresh(daily_candle_fn=lambda t, days=60: get_daily_candles(t, days=days))
+                log.info(f"Regime detector initialized: {_regime_det.get_regime()}")
+            except Exception as _rd_err:
+                log.warning(f"Regime detector initial refresh failed: {_rd_err}")
+
             _scanner = ActiveScanner(
                 enqueue_fn=_enqueue_signal,
                 spot_fn=get_spot,
                 candle_fn=get_daily_candles,
                 intraday_fn=get_intraday_bars,
+                regime_detector=_regime_det,  # v7.1: pass actual detector, not just fn
                 regime_fn=get_current_regime,
                 vol_regime_fn=get_canonical_vol_regime,
                 shadow_log_fn=_log_shadow_signal,
@@ -9895,7 +9974,7 @@ def _initialize_app():
             from swing_scanner import fetch_daily_bars
             start_fib_monitor(
                 daily_bars_fn=fetch_daily_bars,
-                post_fn=post_to_telegram,
+                post_fn=post_to_diagnosis,  # v7.1: route fibs to diagnosis, not main
             )
         except Exception as _e:
             log.warning(f"Fib monitor init failed: {_e}")
@@ -9905,7 +9984,7 @@ def _initialize_app():
             if _potter_box:
                 from schwab_stream import start_box_break_monitor
                 start_box_break_monitor(
-                    _potter_box, post_to_telegram,
+                    _potter_box, post_to_diagnosis,  # v7.1: route to diagnosis, not main
                     cached_md=_cached_md,
                     get_expirations_fn=get_expirations,
                     persistent_state=_persistent_state,
