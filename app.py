@@ -4651,6 +4651,38 @@ def _run_v4_prefilter(ticker: str, spot: float, chains: list, candle_closes: lis
                         except Exception:
                             pass
 
+                        # v7: register conviction trade for live option P&L tracking
+                        try:
+                            if _position_monitor and cp.get("strike") and cp.get("expiry"):
+                                from schwab_stream import build_occ_symbol, get_live_premium
+                                _cv_side_str = (cp.get("trade_side", "") or "").upper()
+                                _cv_side = "C" if "CALL" in _cv_side_str else "P"
+                                _cv_strike = float(cp.get("rec_strike", cp.get("strike", 0)))
+                                _cv_exp = str(cp.get("expiry", ""))[:10]
+                                _cv_occ = build_occ_symbol(cp["ticker"], _cv_exp, _cv_side, _cv_strike)
+                                _cv_mid = float(cp.get("rec_mid", cp.get("mid", 0)) or 0)
+                                if _cv_mid <= 0:
+                                    _cv_mid = get_live_premium(_cv_occ) or 0
+                                if _cv_mid > 0:
+                                    _cv_dir = cp.get("trade_direction", "bull")
+                                    _position_monitor.register_position(
+                                        ticker=cp["ticker"],
+                                        direction=_cv_dir,
+                                        trade_type="conviction",
+                                        occ_symbol=_cv_occ,
+                                        entry_mid=_cv_mid,
+                                        expiry=_cv_exp,
+                                        strike=_cv_strike,
+                                        option_type="call" if _cv_side == "C" else "put",
+                                        entry_spot=float(cp.get("spot", cp.get("close", 0)) or 0),
+                                        metadata={"vol_oi_ratio": cp.get("vol_oi_ratio", 0),
+                                                  "dte": cp.get("dte", 0),
+                                                  "route": cp.get("route", ""),
+                                                  "em_aligned": cp.get("em_aligned", False)},
+                                    )
+                        except Exception as _cv_pm_err:
+                            log.debug(f"Conviction position register failed: {_cv_pm_err}")
+
                         # Store conviction boost for EntryValidator
                         try:
                             if _persistent_state:
