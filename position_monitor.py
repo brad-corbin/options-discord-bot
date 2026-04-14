@@ -276,6 +276,7 @@ class PositionMonitor:
         self._subscribe(occ_symbol)
 
         self._save()
+        self._log_open_to_sheets(pos)  # v7.1: log to sheets immediately on open
         log.info(f"PositionMonitor: registered {trade_type} {ticker} {direction} "
                  f"OCC={occ_symbol} entry=${entry_mid:.2f} exp={expiry}")
 
@@ -412,6 +413,7 @@ class PositionMonitor:
 
         tab = self.SHEET_TABS.get(pos.trade_type, "position_tracking_other")
         row = pos.to_sheet_row()
+        row["log_type"] = "CLOSE"
         # Add metadata fields
         for k, v in (pos.metadata or {}).items():
             row[f"meta_{k}"] = v
@@ -419,8 +421,40 @@ class PositionMonitor:
         try:
             fieldnames = list(row.keys())
             self._sheet_fn(tab, fieldnames, row)
+            log.info(f"PositionMonitor sheets CLOSE logged: {pos.pos_id}")
         except Exception as e:
             log.debug(f"PositionMonitor sheets log failed: {e}")
+
+    def _log_open_to_sheets(self, pos: MonitoredPosition):
+        """Log position OPEN to Google Sheets immediately on registration."""
+        if not self._sheet_fn:
+            return
+
+        tab = self.SHEET_TABS.get(pos.trade_type, "position_tracking_other")
+        row = {
+            "log_type": "OPEN",
+            "pos_id": pos.pos_id,
+            "ticker": pos.ticker,
+            "direction": pos.direction,
+            "trade_type": pos.trade_type,
+            "option_type": pos.option_type,
+            "strike": pos.strike,
+            "expiry": pos.expiry,
+            "occ_symbol": pos.occ_symbol,
+            "entry_date": pos.entry_date,
+            "entry_time": pos.entry_time,
+            "entry_mid": pos.entry_mid,
+            "entry_spot": pos.entry_spot,
+        }
+        for k, v in (pos.metadata or {}).items():
+            row[f"meta_{k}"] = v
+
+        try:
+            fieldnames = list(row.keys())
+            self._sheet_fn(tab, fieldnames, row)
+            log.info(f"PositionMonitor sheets OPEN logged: {pos.pos_id} {pos.ticker} {pos.trade_type}")
+        except Exception as e:
+            log.debug(f"PositionMonitor sheets open log failed: {e}")
 
     def get_open_positions(self, trade_type: str = None) -> List[MonitoredPosition]:
         """Get all open (non-expired, non-closed) positions."""
