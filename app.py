@@ -607,6 +607,9 @@ _CONVICTION_FIELDS = [
     "em_aligned", "em_conflict", "em_thesis_bias", "em_thesis_score",
     "em_gex_sign", "em_regime", "is_shadow_only",
     "eod_spot", "pnl_pct", "outcome",  # filled by EOD reconciliation
+    # Option premium tracking (filled by EOD reconciliation from streaming watermarks)
+    "occ_symbol", "opt_entry_mid", "opt_peak_mid", "opt_peak_time_ct",
+    "opt_eod_mid", "opt_pnl_peak_pct", "opt_pnl_eod_pct",
 ]
 
 def _check_spread_fillability(ticker: str, long_strike: float, short_strike: float,
@@ -778,18 +781,147 @@ def _log_conviction_play(play: dict, regime: str = "", vix: float = 0):
             "eod_spot":         "",  # filled by reconciliation
             "pnl_pct":          "",
             "outcome":          "",
+            # Option premium tracking (filled by reconciliation)
+            "occ_symbol":       "",
+            "opt_entry_mid":    "",
+            "opt_peak_mid":     "",
+            "opt_peak_time_ct": "",
+            "opt_eod_mid":      "",
+            "opt_pnl_peak_pct": "",
+            "opt_pnl_eod_pct":  "",
         }
+
+        # Build OCC symbol and register for streaming watermark tracking
+        try:
+            from schwab_stream import build_occ_symbol, get_option_store
+
+            ticker = play["ticker"]
+            expiry = str(play.get("expiry", ""))[:10]
+            trade_side_str = (play.get("trade_side", "") or "").upper()
+
+            # Determine actual contract: use recommended contract if Issue 3 swap happened
+            if play.get("has_rec_contract"):
+                track_strike = float(play.get("rec_strike", play.get("strike", 0)))
+                track_side = play.get("rec_side", "call" if "CALL" in trade_side_str else "put")
+                track_mid = float(play.get("rec_mid", play.get("mid", 0)) or 0)
+            else:
+                track_strike = float(play.get("strike", 0))
+                # Derive option side from trade_side: LONG CALL → call, LONG PUT → put
+                track_side = "call" if "CALL" in trade_side_str else "put"
+                track_mid = float(play.get("mid", 0) or 0)
+
+            if expiry and track_strike > 0:
+                occ = build_occ_symbol(ticker, expiry, track_side, track_strike)
+                row["occ_symbol"] = occ
+                row["opt_entry_mid"] = round(track_mid, 4) if track_mid else ""
+
+                # Register for watermark tracking
+                if track_mid > 0:
+                    store = get_option_store()
+                    store.track_conviction(occ, track_mid)
+
+                    # Ensure this contract is in the streaming subscription
+                    try:
+                        from schwab_stream import _stream_manager
+                        if _stream_manager:
+                            _stream_manager.add_option_symbols([occ])
+                    except Exception:
+                        pass  # non-critical — may already be subscribed
+        except Exception as _occ_err:
+            log.debug(f"Conviction OCC tracking setup failed: {_occ_err}")
+
         _append_csv_row("conviction_plays.csv", _CONVICTION_FIELDS, row)
     except Exception as e:
         log.debug(f"Conviction play log failed for {play.get('ticker','?')}: {e}")
 
 
+def _handle_exit_alert(alert: dict):
+    """Handle exit management alerts from streaming option premium tracking.
+
+    Phases:
+      profit_50         → 50% gain, set 15% trailing stop
+      stop_15           → 15% trailing stop triggered
+      profit_100_exit_half → 100% gain, exit half, set 30% trailing on remainder
+      stop_30           → 30% trailing stop triggered on remainder
+    """
+    try:
+        from schwab_stream import parse_occ_symbol
+        alert_type = alert.get("type", "")
+        occ = alert.get("occ_symbol", "")
+        entry = alert.get("entry_mid", 0)
+        current = alert.get("current_mid", 0)
+        peak = alert.get("peak_mid", 0)
+        pnl = alert.get("pnl_pct", 0)
+        peak_pnl = alert.get("peak_pnl_pct", 0)
+
+        # Parse OCC for human-readable display
+        parsed = parse_occ_symbol(occ) or {}
+        ticker = parsed.get("ticker", occ[:6].strip())
+        strike = parsed.get("strike", "?")
+        side = (parsed.get("side", "") or "").upper()
+        expiry = parsed.get("expiry", "")
+
+        contract_label = f"{ticker} ${strike} {side}"
+        if expiry:
+            contract_label += f" {expiry}"
+
+        if alert_type == "profit_50":
+            msg = (
+                f"🎯 50% PROFIT — SET 15% TRAILING STOP\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"Contract: {contract_label}\n"
+                f"Entry: ${entry:.2f} → Now: ${current:.2f} (+{pnl:.0f}%)\n"
+                f"⚡ Set 15% trailing stop from peak\n"
+                f"Stop level: ${peak * 0.85:.2f} (from peak ${peak:.2f})"
+            )
+
+        elif alert_type == "stop_15":
+            msg = (
+                f"⚠️ 15% TRAILING STOP HIT — EXIT\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"Contract: {contract_label}\n"
+                f"Entry: ${entry:.2f} | Peak: ${peak:.2f} (+{peak_pnl:.0f}%)\n"
+                f"Stopped at: ${current:.2f} ({pnl:+.0f}%)\n"
+                f"🛑 Close full position"
+            )
+
+        elif alert_type == "profit_100_exit_half":
+            msg = (
+                f"💰 100% PROFIT — EXIT HALF + 30% TRAILING\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"Contract: {contract_label}\n"
+                f"Entry: ${entry:.2f} → Now: ${current:.2f} (+{pnl:.0f}%)\n"
+                f"✅ Exit HALF to recover all capital\n"
+                f"⚡ Set 30% trailing stop on remainder\n"
+                f"Stop level: ${peak * 0.70:.2f} (from peak ${peak:.2f})"
+            )
+
+        elif alert_type == "stop_30":
+            msg = (
+                f"⚠️ 30% TRAILING STOP HIT — EXIT REMAINDER\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"Contract: {contract_label}\n"
+                f"Entry: ${entry:.2f} | Peak: ${peak:.2f} (+{peak_pnl:.0f}%)\n"
+                f"Stopped at: ${current:.2f} ({pnl:+.0f}%)\n"
+                f"🛑 Close remaining position"
+            )
+        else:
+            return
+
+        post_to_telegram(msg)
+        log.info(f"Exit alert sent: {alert_type} for {contract_label} at ${current:.2f} ({pnl:+.0f}%)")
+
+    except Exception as e:
+        log.warning(f"Exit alert handler failed: {e}")
+
+
 def _reconcile_conviction_plays(date_str: str):
     """
-    At 4:15 PM CT, fetch EOD prices for today's conviction plays
+    At 4:05–4:30 PM CT, fetch EOD prices for today's conviction plays
     and update the CSV/Sheets with outcome data for threshold tuning.
     """
     import csv, os
+    log.info(f"Conviction reconciliation starting for {date_str}")
     csv_path = os.path.join(
         os.getenv("BOT_LOG_DIR", "/opt/render/project/src/bot_logs"),
         "conviction_plays.csv")
@@ -799,6 +931,7 @@ def _reconcile_conviction_plays(date_str: str):
 
     rows = []
     updated = 0
+    today_count = 0
     try:
         with open(csv_path, "r") as f:
             reader = csv.DictReader(f)
@@ -808,9 +941,13 @@ def _reconcile_conviction_plays(date_str: str):
         log.warning(f"Failed to read conviction CSV: {e}")
         return
 
+    # Cache spot prices per ticker to avoid redundant API calls
+    _spot_cache_local = {}
+
     for row in rows:
         if row.get("date") != date_str:
             continue
+        today_count += 1
         if row.get("eod_spot"):  # already reconciled
             continue
         ticker = row.get("ticker", "")
@@ -818,8 +955,14 @@ def _reconcile_conviction_plays(date_str: str):
             continue
 
         try:
-            spot = get_spot(ticker)
+            if ticker in _spot_cache_local:
+                spot = _spot_cache_local[ticker]
+            else:
+                spot = get_spot(ticker)
+                if spot and spot > 0:
+                    _spot_cache_local[ticker] = spot
             if not spot or spot <= 0:
+                log.warning(f"Conviction recon: get_spot returned {spot} for {ticker}")
                 continue
             entry_spot = float(row.get("spot_at_entry", 0) or 0)
             if entry_spot <= 0:
@@ -840,8 +983,60 @@ def _reconcile_conviction_plays(date_str: str):
             row["pnl_pct"] = pnl_pct
             row["outcome"] = outcome
             updated += 1
-        except Exception:
+        except Exception as _spot_err:
+            log.warning(f"Conviction recon: get_spot failed for {ticker}: {_spot_err}")
             continue
+
+    log.info(f"Conviction recon: {today_count} plays found for {date_str}, {updated} updated")
+
+    # Fill in option premium watermark data from streaming tracker
+    opt_updated = 0
+    try:
+        from schwab_stream import get_option_store
+        import pytz
+        ct_tz = pytz.timezone("America/Chicago")
+        all_tracks = get_option_store().get_all_conviction_tracks()
+        if all_tracks:
+            for row in rows:
+                if row.get("date") != date_str:
+                    continue
+                occ = row.get("occ_symbol", "")
+                if not occ or occ not in all_tracks:
+                    continue
+                if row.get("opt_peak_mid"):  # already filled
+                    continue
+                track = all_tracks[occ]
+                entry_mid = float(track.get("entry_mid", 0) or 0)
+                peak_mid = float(track.get("peak_mid", 0) or 0)
+                last_mid = float(track.get("last_mid", 0) or 0)
+                peak_epoch = track.get("peak_time", 0)
+
+                row["opt_peak_mid"] = round(peak_mid, 4) if peak_mid else ""
+                row["opt_eod_mid"] = round(last_mid, 4) if last_mid else ""
+
+                # Convert peak time epoch to CT string
+                if peak_epoch:
+                    try:
+                        from datetime import datetime as _dt
+                        peak_dt = _dt.fromtimestamp(peak_epoch, tz=pytz.utc).astimezone(ct_tz)
+                        row["opt_peak_time_ct"] = peak_dt.strftime("%H:%M")
+                    except Exception:
+                        row["opt_peak_time_ct"] = ""
+
+                # Compute option P&L percentages
+                if entry_mid > 0:
+                    if peak_mid > 0:
+                        row["opt_pnl_peak_pct"] = round((peak_mid - entry_mid) / entry_mid * 100, 1)
+                    if last_mid > 0:
+                        row["opt_pnl_eod_pct"] = round((last_mid - entry_mid) / entry_mid * 100, 1)
+
+                opt_updated += 1
+
+            if opt_updated:
+                log.info(f"Conviction recon: {opt_updated} plays got option watermark data")
+                updated = max(updated, 1)  # ensure CSV write triggers
+    except Exception as _wm_err:
+        log.warning(f"Conviction recon: watermark fill failed: {_wm_err}")
 
     if updated > 0:
         try:
@@ -872,14 +1067,167 @@ def _reconcile_conviction_plays(date_str: str):
                     emoji = "✅" if r["outcome"] == "WIN" else "❌"
                     summary += (f"{emoji} {r['ticker']} {r.get('trade_side','')} "
                               f"${r.get('strike','')} ({r.get('route','')}) "
-                              f"→ {float(r.get('pnl_pct',0)):+.1f}% "
-                              f"(vol/OI {r.get('vol_oi_ratio','')}x)\n")
+                              f"→ {float(r.get('pnl_pct',0)):+.1f}%")
+                    # Add option premium peak if available
+                    opt_peak = r.get("opt_pnl_peak_pct", "")
+                    if opt_peak not in ("", None):
+                        summary += f" | opt peak {float(opt_peak):+.0f}%"
+                    summary += f" (vol/OI {r.get('vol_oi_ratio','')}x)\n"
                 try:
                     post_to_telegram(summary)
                 except Exception:
                     pass
         except Exception as e:
             log.warning(f"Conviction CSV write failed: {e}")
+
+    # Sync reconciled rows to Google Sheets
+    if updated > 0:
+        try:
+            _sync_conviction_recon_to_sheets(date_str, rows)
+        except Exception as _sheets_err:
+            log.warning(f"Conviction Sheets sync failed: {_sheets_err}")
+
+    # Clear conviction tracks after reconciliation
+    try:
+        from schwab_stream import get_option_store
+        get_option_store().clear_conviction_tracks()
+    except Exception:
+        pass
+
+
+def _col_letter(idx: int) -> str:
+    """Convert 0-based column index to spreadsheet column letter (A, B, ..., Z, AA, AB, ...)."""
+    result = ""
+    while True:
+        result = chr(65 + idx % 26) + result
+        idx = idx // 26 - 1
+        if idx < 0:
+            break
+    return result
+
+
+def _sync_conviction_recon_to_sheets(date_str: str, reconciled_rows: list):
+    """Sync eod_spot/pnl_pct/outcome back to Google Sheets for today's reconciled rows."""
+    tab = GOOGLE_SHEET_CONVICTION_TAB
+    if not (GOOGLE_SHEETS_ENABLE and tab and GOOGLE_SHEET_ID):
+        return
+    token = _get_google_access_token()
+    if not token:
+        log.warning("Conviction recon Sheets sync: no Google token")
+        return
+
+    # 1. Read all sheet data
+    try:
+        rng = requests.utils.quote(f"{tab}", safe="!:")
+        url = f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEET_ID}/values/{rng}"
+        resp = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=20)
+        resp.raise_for_status()
+        sheet_data = resp.json().get("values", [])
+    except Exception as e:
+        log.warning(f"Conviction recon: failed to read sheet: {e}")
+        return
+
+    if len(sheet_data) < 2:
+        log.info("Conviction recon: sheet has no data rows")
+        return
+
+    # 2. Find column indices from header
+    headers = [str(h).strip() for h in sheet_data[0]]
+    try:
+        eod_col = headers.index("eod_spot")
+        pnl_col = headers.index("pnl_pct")
+        out_col = headers.index("outcome")
+    except ValueError:
+        log.warning(f"Conviction recon: missing eod_spot/pnl_pct/outcome columns in sheet headers")
+        return
+
+    # Find option premium columns (may not exist yet in old sheets)
+    recon_fields = ["eod_spot", "pnl_pct", "outcome",
+                    "occ_symbol", "opt_entry_mid", "opt_peak_mid",
+                    "opt_peak_time_ct", "opt_eod_mid", "opt_pnl_peak_pct", "opt_pnl_eod_pct"]
+    # Find the last column that exists in headers
+    last_col = out_col
+    for f in recon_fields[3:]:  # skip eod_spot/pnl_pct/outcome which we already found
+        if f in headers:
+            last_col = max(last_col, headers.index(f))
+
+    date_col = headers.index("date") if "date" in headers else 0
+    time_col = headers.index("time_ct") if "time_ct" in headers else 1
+    ticker_col = headers.index("ticker") if "ticker" in headers else 2
+    strike_col = headers.index("strike") if "strike" in headers else 6
+
+    # 3. Build lookup of reconciled rows: (date, time, ticker, strike) -> row data
+    recon_map = {}
+    for r in reconciled_rows:
+        if r.get("date") == date_str and r.get("eod_spot"):
+            key = (r.get("date", ""), r.get("time_ct", ""), r.get("ticker", ""), str(r.get("strike", "")))
+            recon_map[key] = r
+
+    if not recon_map:
+        return
+
+    # 4. Find matching sheet rows and build batch update
+    batch_data = []
+    for row_idx, sheet_row in enumerate(sheet_data[1:], start=2):  # row 2 = first data row
+        # Pad short rows
+        while len(sheet_row) <= max(date_col, time_col, ticker_col, strike_col, eod_col):
+            sheet_row.append("")
+
+        # Skip rows not matching today or already reconciled
+        if str(sheet_row[date_col]).strip() != date_str:
+            continue
+        if str(sheet_row[eod_col]).strip():  # already has eod_spot
+            continue
+
+        key = (
+            str(sheet_row[date_col]).strip(),
+            str(sheet_row[time_col]).strip(),
+            str(sheet_row[ticker_col]).strip(),
+            str(sheet_row[strike_col]).strip(),
+        )
+
+        if key in recon_map:
+            r = recon_map[key]
+            # Build cell range: eod_spot through last option premium column
+            start_col_letter = _col_letter(eod_col)
+            end_col_letter = _col_letter(last_col)
+            cell_range = f"{tab}!{start_col_letter}{row_idx}:{end_col_letter}{row_idx}"
+            # Build values for all columns from eod_spot to last_col
+            values = []
+            for ci in range(eod_col, last_col + 1):
+                col_name = headers[ci] if ci < len(headers) else ""
+                values.append(str(r.get(col_name, "") or ""))
+            batch_data.append({
+                "range": cell_range,
+                "values": [values]
+            })
+
+    if not batch_data:
+        log.info("Conviction recon: no matching sheet rows to update")
+        return
+
+    # 5. Execute batch update
+    try:
+        url = f"https://sheets.googleapis.com/v4/spreadsheets/{GOOGLE_SHEET_ID}/values:batchUpdate"
+        payload = {
+            "valueInputOption": "USER_ENTERED",
+            "data": batch_data,
+        }
+        resp = requests.post(
+            url,
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json=payload,
+            timeout=20,
+        )
+        resp.raise_for_status()
+        log.info(f"Conviction recon: synced {len(batch_data)} rows to Google Sheets for {date_str}")
+    except Exception as e:
+        resp_body = ""
+        try:
+            resp_body = f" | response: {resp.text[:300]}"
+        except Exception:
+            pass
+        log.warning(f"Conviction recon Sheets batch update failed: {e}{resp_body}")
 
 
 # ─────────────────────────────────────────────────────────
@@ -8885,10 +9233,10 @@ def _em_scheduler():
                         except Exception as _eod_e:
                             log.warning(f"EOD flow summary error: {_eod_e}")
 
-                # 4:15 PM CT — Reconcile conviction plays against EOD prices
+                # 4:05–4:30 PM CT — Reconcile conviction plays against EOD prices
                 _conv_recon_key = (date_str, "conviction_recon")
                 if _conv_recon_key not in fired_today:
-                    if now_ct.hour == 16 and 14 <= now_ct.minute <= 16:
+                    if now_ct.hour == 16 and 5 <= now_ct.minute <= 30:
                         fired_today.add(_conv_recon_key)
                         try:
                             _reconcile_conviction_plays(date_str)
@@ -9138,6 +9486,10 @@ def _initialize_app():
 
             # Wire option store into flow detector for streaming overlay
             _flow_detector.set_option_store(get_option_store())
+
+            # Wire exit management alerts for conviction play premium tracking
+            get_option_store().set_exit_alert_callback(_handle_exit_alert)
+            log.info("Exit management: conviction play trailing stop alerts wired")
 
             # Issue 1: Wire conviction plays into thesis monitor for exit logic
             try:
