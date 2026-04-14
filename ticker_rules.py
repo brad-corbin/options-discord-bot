@@ -264,7 +264,7 @@ TICKER_RULES = {
     # ────────────────────────────────────────────────────────
     "META": {
         BEAR: {
-            "active": True,
+            "active": False,
             "htf": "CONFIRMED", "bias": "bear",
             "score_min": 75, "score_max": 99,
             "phase": None, "rsi_max": None, "rsi_min": None,
@@ -284,7 +284,7 @@ TICKER_RULES = {
             ],
         },
         TRANSITION: {
-            "active": True,
+            "active": False,
             "htf": "CONFIRMED", "bias": "bull",
             "score_min": 60, "score_max": 99,
             "phase": "AFTERNOON", "rsi_max": 75, "rsi_min": 50,
@@ -307,7 +307,7 @@ TICKER_RULES = {
             ],
         },
         BULL: {
-            "active": True,
+            "active": False,
             "htf": "CONFIRMED", "bias": "bear",
             "score_min": 75, "score_max": 99,
             "phase": None, "rsi_max": None, "rsi_min": None,
@@ -548,7 +548,7 @@ TICKER_RULES = {
             ],
         },
         BULL: {
-            "active": True,
+            "active": False,
             "htf": "OPPOSING", "bias": "both",
             "score_min": 0, "score_max": 99,
             "phase": None, "rsi_max": None, "rsi_min": None,
@@ -774,7 +774,7 @@ TICKER_RULES = {
             ],
         },
         BULL: {
-            "active": True,
+            "active": False,
             "htf": "OPPOSING", "bias": "both",
             "score_min": 0, "score_max": 99,
             "phase": None, "rsi_max": None, "rsi_min": None,
@@ -927,12 +927,208 @@ TICKER_RULES = {
         },
     },
 
+    # ────────────────────────────────────────────────────────
+    # NFLX — REMOVED by v7 backtest. 41.3% WR, -1.03%, PF 0.45.
+    # No filter combination produces edge. Shadow-track only.
+    # ────────────────────────────────────────────────────────
+    "NFLX": {
+        BEAR: {
+            "active": False,
+            "htf": None, "bias": None,
+            "score_min": 0, "score_max": 99,
+            "phase": None, "rsi_max": None, "rsi_min": None,
+            "exit_days": 5, "spread": None,
+            "premium_flag": None, "premium_wr": None,
+            "wr_3d": 36.2, "wr_5d": 41.3, "n": 92, "period": "Jul 25 – Apr 26 (v7)",
+            "notes": ["REMOVED — v7 backtest: 41.3% WR, -1.03% EV, PF 0.45"],
+            "never": ["Trade NFLX on the active scanner — no edge in any condition"],
+        },
+        TRANSITION: {
+            "active": False,
+            "htf": None, "bias": None,
+            "score_min": 0, "score_max": 99,
+            "phase": None, "rsi_max": None, "rsi_min": None,
+            "exit_days": 5, "spread": None,
+            "premium_flag": None, "premium_wr": None,
+            "wr_3d": 36.2, "wr_5d": 41.3, "n": 92, "period": "Jul 25 – Apr 26 (v7)",
+            "notes": ["REMOVED — v7 backtest"],
+            "never": ["Trade NFLX"],
+        },
+        BULL: {
+            "active": False,
+            "htf": None, "bias": None,
+            "score_min": 0, "score_max": 99,
+            "phase": None, "rsi_max": None, "rsi_min": None,
+            "exit_days": 5, "spread": None,
+            "premium_flag": None, "premium_wr": None,
+            "wr_3d": 36.2, "wr_5d": 41.3, "n": 92, "period": "Jul 25 – Apr 26 (v7)",
+            "notes": ["REMOVED — v7 backtest"],
+            "never": ["Trade NFLX"],
+        },
+    },
+
+    # ────────────────────────────────────────────────────────
+    # COIN — Bear-only. Bull side is -1.31% at 5d.
+    # Bear edge peaks at 1d (+6.03%) — short hold.
+    # Conviction: 76.5% WR, +4.35% — second-best conviction ticker.
+    # ────────────────────────────────────────────────────────
+    "COIN": {
+        BEAR: {
+            "active": True,
+            "htf": "CONFIRMED", "bias": "bear",
+            "score_min": 60, "score_max": 99,
+            "phase": None, "rsi_max": None, "rsi_min": None,
+            "exit_days": 3, "spread": "bear_put",
+            "premium_flag": None, "premium_wr": None,
+            "wr_3d": 62.9, "wr_5d": 60.7, "n": 177, "period": "Jul 25 – Apr 26 (v7)",
+            "notes": [
+                "Bear-only — bull 5d: -1.31%, PF 0.70",
+                "Bear edge peaks at 1d (+6.03%) — consider short hold",
+                "Conviction: 76.5% WR, +4.35% — hold 3-5d on conviction",
+            ],
+            "never": [
+                "Take bull signals on COIN — negative EV at all horizons",
+                "Hold bear past 3d without conviction confirmation",
+            ],
+        },
+        TRANSITION: {
+            "active": True,
+            "htf": "CONFIRMED", "bias": "bear",
+            "score_min": 60, "score_max": 99,
+            "phase": None, "rsi_max": None, "rsi_min": None,
+            "exit_days": 1, "spread": "bear_put",
+            "premium_flag": None, "premium_wr": None,
+            "wr_3d": 43.0, "wr_5d": 54.5, "n": 100, "period": "Jul 25 – Apr 26 (v7)",
+            "notes": [
+                "Bear-only, 1d hold in TRANSITION",
+                "TRANSITION COIN is weaker — reduce size",
+            ],
+            "never": ["Bull signals", "Hold past 1d in TRANSITION"],
+        },
+        BULL: {
+            "active": True,
+            "htf": "CONFIRMED", "bias": "bear",
+            "score_min": 60, "score_max": 99,
+            "phase": None, "rsi_max": None, "rsi_min": None,
+            "exit_days": 3, "spread": "bear_put",
+            "premium_flag": None, "premium_wr": None,
+            "wr_3d": 56.5, "wr_5d": 56.5, "n": 265, "period": "Jul 25 – Apr 26 (v7)",
+            "notes": ["Bear-only, hold 3d in BULL regime"],
+            "never": ["Bull signals on COIN"],
+        },
+    },
+
+    # ────────────────────────────────────────────────────────
+    # PLTR — TRANSITION CONVERGING only. BULL regime is flat.
+    # CONVERGING 3d: 82.4% WR, PF 6.24 — elite signal.
+    # Midday: 71.1% WR at 1d. Afternoon drops to 45%.
+    # ────────────────────────────────────────────────────────
+    "PLTR": {
+        BEAR: {
+            "active": False,
+            "htf": None, "bias": None,
+            "score_min": 0, "score_max": 99,
+            "phase": None, "rsi_max": None, "rsi_min": None,
+            "exit_days": 3, "spread": None,
+            "premium_flag": None, "premium_wr": None,
+            "wr_3d": 0.0, "wr_5d": 0.0, "n": 0, "period": "Jul 25 – Apr 26 (v7)",
+            "notes": ["SUSPENDED in BEAR"],
+            "never": ["Trade PLTR in BEAR regime"],
+        },
+        TRANSITION: {
+            "active": True,
+            "htf": "CONVERGING", "bias": "bull",
+            "score_min": 60, "score_max": 99,
+            "phase": "MIDDAY", "rsi_max": None, "rsi_min": None,
+            "exit_days": 3, "spread": "bull_call",
+            "premium_flag": None, "premium_wr": None,
+            "wr_3d": 82.4, "wr_5d": 54.5, "n": 34, "period": "Jul 25 – Apr 26 (v7)",
+            "notes": [
+                "CONVERGING only — CONFIRMED 3d: -0.47% (loses)",
+                "Hold 3 days — edge fades by 5d",
+                "Midday: 71.1% WR, PF 4.59 — afternoon drops to 45%",
+                "TRANSITION CONVERGING 3d: 82.4% WR, PF 6.24 — elite signal",
+            ],
+            "never": [
+                "CONFIRMED signals in TRANSITION — use CONVERGING only",
+                "Afternoon signals — midday only",
+                "Hold past 3d — edge fades",
+                "Conviction/volume-burst on PLTR — anti-signal",
+            ],
+        },
+        BULL: {
+            "active": False,
+            "htf": None, "bias": None,
+            "score_min": 0, "score_max": 99,
+            "phase": None, "rsi_max": None, "rsi_min": None,
+            "exit_days": 3, "spread": None,
+            "premium_flag": None, "premium_wr": None,
+            "wr_3d": 53.2, "wr_5d": 47.5, "n": 300, "period": "Jul 25 – Apr 26 (v7)",
+            "notes": [
+                "SUSPENDED in BULL — v7 backtest: 47.5% WR, -0.24% at 5d",
+                "Edge exists only in TRANSITION with CONVERGING HTF",
+            ],
+            "never": ["Trade PLTR in BULL regime — near flat"],
+        },
+    },
+
+    # ────────────────────────────────────────────────────────
+    # SPY — Bull-only at 3-5d. Bear decays past EOD.
+    # CONVERGING 3d: PF 2.06. Midday EOD: 73% WR.
+    # TRANSITION regime 1d: 59.9% WR, PF 1.70.
+    # ────────────────────────────────────────────────────────
+    "SPY": {
+        BEAR: {
+            "active": True,
+            "htf": "CONFIRMED", "bias": "bear",
+            "score_min": 60, "score_max": 99,
+            "phase": None, "rsi_max": None, "rsi_min": None,
+            "exit_days": 1, "spread": "bear_put",
+            "premium_flag": None, "premium_wr": None,
+            "wr_3d": 37.9, "wr_5d": 45.1, "n": 103, "period": "Jul 25 – Apr 26 (v7)",
+            "notes": [
+                "Bear SPY is EOD/1d-only — decays hard by 3d",
+                "1d: 48.5% WR — marginal but tradeable for scalps",
+            ],
+            "never": [
+                "Hold bear SPY past 1d — WR drops to 37.9% at 3d",
+            ],
+        },
+        TRANSITION: {
+            "active": True,
+            "htf": None, "bias": "any",
+            "score_min": 60, "score_max": 99,
+            "phase": None, "rsi_max": None, "rsi_min": None,
+            "exit_days": 5, "spread": "bull_call",
+            "premium_flag": None, "premium_wr": None,
+            "wr_3d": 55.3, "wr_5d": 56.5, "n": 197, "period": "Jul 25 – Apr 26 (v7)",
+            "notes": [
+                "TRANSITION SPY 1d: 59.9% WR, PF 1.70 — decent short hold",
+                "Both bull and bear work in TRANSITION",
+                "CONVERGING: PF 2.06 — premium signal",
+            ],
+            "never": [],
+        },
+        BULL: {
+            "active": True,
+            "htf": None, "bias": "bull",
+            "score_min": 60, "score_max": 99,
+            "phase": None, "rsi_max": None, "rsi_min": None,
+            "exit_days": 5, "spread": "bull_call",
+            "premium_flag": None, "premium_wr": None,
+            "wr_3d": 58.8, "wr_5d": 61.5, "n": 207, "period": "Jul 25 – Apr 26 (v7)",
+            "notes": [
+                "Bull-only at 3-5d: 61.5% WR, PF 1.93",
+                "Midday EOD: 73% WR — strongest phase",
+                "CONVERGING: 57.1% WR at 3d, PF 2.06",
+            ],
+            "never": [
+                "Hold bear signals past EOD in BULL regime — WR drops to 38%",
+            ],
+        },
+    },
+
 }
-
-
-# ═══════════════════════════════════════════════════════════
-# HELPER FUNCTIONS
-# ═══════════════════════════════════════════════════════════
 
 def get_ticker_rule(ticker: str, regime: str) -> Optional[dict]:
     """
@@ -1169,6 +1365,15 @@ def build_alert_message(ticker: str, regime: str, signal: dict) -> str:
         lines.append("🚫 DO NOT:")
         for n in rule["never"]:
             lines.append(f"  ✗ {n}")
+
+    # v7 backtest guidance
+    try:
+        from backtest_guidance import format_active_guidance_block
+        guidance = format_active_guidance_block(ticker, bias, regime)
+        if guidance:
+            lines.append(guidance)
+    except ImportError:
+        pass
 
     lines.append(divider)
 
