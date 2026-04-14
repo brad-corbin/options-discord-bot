@@ -2743,6 +2743,16 @@ def format_trade_card(rec: Dict) -> str:
     if rec.get("conf_reasons"):
         lines.append("💭 Why confidence: " + " | ".join(rec["conf_reasons"][:3]))
 
+    # v7 backtest guidance
+    try:
+        from backtest_guidance import format_active_guidance_block
+        _regime_label = rec.get("regime", {}).get("label", "") if isinstance(rec.get("regime"), dict) else str(rec.get("regime", ""))
+        _guidance = format_active_guidance_block(ticker, direction, _regime_label)
+        if _guidance:
+            lines.append(_guidance)
+    except ImportError:
+        pass
+
     lines += ["", f"Size: {rec['sizing_note']}", "", "— Not financial advice —"]
     return "\n".join(lines)
 
