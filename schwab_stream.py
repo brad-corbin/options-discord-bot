@@ -90,7 +90,14 @@ class OptionQuoteStore:
 
     Tracks live bid/ask/last/volume/OI/greeks per OCC symbol.
     Maintains previous-volume snapshot for volume-delta (sweep) detection.
+    Also tracks premium high watermarks and exit management for conviction plays.
     """
+
+    # Exit management thresholds
+    PROFIT_ALERT_1 = 0.50     # 50% profit → 15% trailing stop
+    TRAILING_STOP_1 = 0.15    # 15% trailing stop from peak
+    PROFIT_ALERT_2 = 1.00     # 100% profit → exit half, 30% trailing
+    TRAILING_STOP_2 = 0.30    # 30% trailing stop from peak on remainder
 
     def __init__(self, stale_threshold: float = 60):
         self._quotes = {}      # occ_symbol → {fields..., _ts}
@@ -98,13 +105,23 @@ class OptionQuoteStore:
         self._lock = threading.Lock()
         self._stale_threshold = stale_threshold
         self._stats = {"updates": 0, "sweeps_detected": 0}
+        # Conviction play premium tracking + exit management
+        self._conviction_tracks = {}  # occ_symbol → {entry_mid, peak_mid, ..., phase, ...}
+        self._exit_alert_callback = None  # callable(alert_dict) — set by app.py
+
+    def set_exit_alert_callback(self, callback: Callable):
+        """Register callback for exit management alerts. Called outside lock."""
+        self._exit_alert_callback = callback
 
     def update(self, occ_symbol: str, fields: dict):
         """Update a single option quote from streaming data.
         Returns volume_delta if volume increased (potential sweep), else 0.
+        Also updates conviction play watermarks and checks exit thresholds.
         """
         now = time.monotonic()
         volume_delta = 0
+        exit_alerts = []  # collect alerts inside lock, fire outside
+
         with self._lock:
             self._stats["updates"] += 1
             new_vol = fields.get("volume", 0) or 0
@@ -113,7 +130,99 @@ class OptionQuoteStore:
                 volume_delta = new_vol - prev_vol
             self._prev_volume[occ_symbol] = new_vol
             self._quotes[occ_symbol] = {**fields, "_ts": now}
+
+            # Update conviction watermark + exit management if tracked
+            if occ_symbol in self._conviction_tracks:
+                bid = fields.get("bid", 0) or 0
+                ask = fields.get("ask", 0) or 0
+                if bid > 0 and ask > 0:
+                    mid = round((bid + ask) / 2, 4)
+                    track = self._conviction_tracks[occ_symbol]
+                    track["last_mid"] = mid
+                    track["last_time"] = time.time()
+                    if mid > track.get("peak_mid", 0):
+                        track["peak_mid"] = mid
+                        track["peak_time"] = time.time()
+
+                    # Exit management phase checks
+                    entry_mid = track["entry_mid"]
+                    peak_mid = track["peak_mid"]
+                    phase = track.get("phase", "watching")
+                    pnl_pct = (mid - entry_mid) / entry_mid if entry_mid > 0 else 0
+                    peak_pnl_pct = (peak_mid - entry_mid) / entry_mid if entry_mid > 0 else 0
+
+                    alert_base = {
+                        "occ_symbol": occ_symbol,
+                        "entry_mid": entry_mid,
+                        "current_mid": mid,
+                        "peak_mid": peak_mid,
+                        "pnl_pct": round(pnl_pct * 100, 1),
+                        "peak_pnl_pct": round(peak_pnl_pct * 100, 1),
+                    }
+
+                    if phase == "watching":
+                        if pnl_pct >= self.PROFIT_ALERT_1:
+                            track["phase"] = "trailing_15"
+                            exit_alerts.append({**alert_base, "type": "profit_50"})
+
+                    elif phase == "trailing_15":
+                        # Check for 100% profit first (promotion)
+                        if pnl_pct >= self.PROFIT_ALERT_2:
+                            track["phase"] = "half_exit"
+                            exit_alerts.append({**alert_base, "type": "profit_100_exit_half"})
+                        # Then check 15% trailing stop
+                        elif peak_mid > 0 and mid <= peak_mid * (1 - self.TRAILING_STOP_1):
+                            track["phase"] = "done"
+                            exit_alerts.append({**alert_base, "type": "stop_15"})
+
+                    elif phase == "half_exit":
+                        # 30% trailing stop on remainder
+                        if peak_mid > 0 and mid <= peak_mid * (1 - self.TRAILING_STOP_2):
+                            track["phase"] = "done"
+                            exit_alerts.append({**alert_base, "type": "stop_30"})
+
+        # Fire exit alerts outside lock
+        if exit_alerts and self._exit_alert_callback:
+            for alert in exit_alerts:
+                try:
+                    self._exit_alert_callback(alert)
+                except Exception as e:
+                    log.warning(f"Exit alert callback error: {e}")
+
         return volume_delta
+
+    def track_conviction(self, occ_symbol: str, entry_mid: float):
+        """Register an OCC symbol for conviction play watermark + exit tracking."""
+        with self._lock:
+            if occ_symbol not in self._conviction_tracks:
+                now = time.time()
+                self._conviction_tracks[occ_symbol] = {
+                    "entry_mid": entry_mid,
+                    "peak_mid": entry_mid,  # starts at entry
+                    "peak_time": now,
+                    "last_mid": entry_mid,
+                    "last_time": now,
+                    "phase": "watching",  # watching → trailing_15 → half_exit → done
+                }
+                log.info(f"Conviction track started: {occ_symbol} entry_mid={entry_mid}")
+
+    def get_conviction_track(self, occ_symbol: str) -> Optional[dict]:
+        """Get conviction tracking data for an OCC symbol."""
+        with self._lock:
+            return dict(self._conviction_tracks.get(occ_symbol, {})) or None
+
+    def get_all_conviction_tracks(self) -> dict:
+        """Get all conviction tracking data (for reconciliation)."""
+        with self._lock:
+            return {k: dict(v) for k, v in self._conviction_tracks.items()}
+
+    def clear_conviction_tracks(self):
+        """Clear all conviction tracks (call at EOD)."""
+        with self._lock:
+            count = len(self._conviction_tracks)
+            self._conviction_tracks.clear()
+        if count:
+            log.info(f"Conviction tracks cleared: {count} contracts")
 
     def get(self, occ_symbol: str) -> Optional[dict]:
         """Get a fresh option quote, or None if stale/missing."""
