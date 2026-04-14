@@ -25,7 +25,7 @@ BEAR_TRANSITION = "BEAR_TRANSITION"
 BEAR_CRISIS     = "BEAR_CRISIS"
 
 REGIME_SCORE_THRESHOLDS = {BULL_BASE: 6, BULL_TRANSITION: 2, CHOP: -1, BEAR_TRANSITION: -5, BEAR_CRISIS: -99}
-REGIME_HYSTERESIS_DAYS = 2
+REGIME_HYSTERESIS_DAYS = 1  # v7.1: reduced from 2 — faster regime switching
 V2_TO_V1 = {BULL_BASE: "BULL", BULL_TRANSITION: "TRANSITION", CHOP: "TRANSITION", BEAR_TRANSITION: "BEAR", BEAR_CRISIS: "BEAR"}
 
 EVENT_NONE = "NONE"
@@ -37,6 +37,10 @@ VIX_SHOCK_THRESHOLD = 25.0
 VIX_SPIKE_PCT = 25.0
 VIX_CRISIS_THRESHOLD = 35.0
 VIX_CRISIS_DAYS = 2
+
+# v7.1: Emergency VIX override — skip hysteresis entirely
+VIX_EMERGENCY_ABS_JUMP = 5.0    # VIX jumps 5+ points in a day → force BEAR immediately
+VIX_EMERGENCY_LEVEL = 30.0      # VIX crosses 30 → force BEAR immediately
 
 SECTOR_AI_STRONG = "AI_STRONG"
 SECTOR_AI_WEAK = "AI_WEAK"
@@ -239,12 +243,42 @@ class MarketRegimeDetector:
             new_event = self._compute_event(data)
             new_sectors = self._compute_sectors(data, sector_data)
 
+            # v7.1: Emergency VIX override — skip hysteresis entirely
+            # If VIX jumps 5+ points or crosses 30, force BEAR immediately.
+            # In a tariff war / macro shock, waiting 1-2 days costs real money.
+            _vix_emergency = False
+            vix_data = data.get(VIX_TICKER, [])
+            if vix_data and len(vix_data) >= 2:
+                _vix_now = vix_data[-1]
+                _vix_prev = vix_data[-2]
+                _vix_jump = _vix_now - _vix_prev
+                if _vix_now >= VIX_EMERGENCY_LEVEL:
+                    _vix_emergency = True
+                    log.warning(f"🚨 VIX EMERGENCY: VIX {_vix_now:.1f} >= {VIX_EMERGENCY_LEVEL} "
+                                f"— forcing BEAR, skipping hysteresis")
+                elif _vix_jump >= VIX_EMERGENCY_ABS_JUMP:
+                    _vix_emergency = True
+                    log.warning(f"🚨 VIX EMERGENCY: VIX jumped +{_vix_jump:.1f} points "
+                                f"({_vix_prev:.1f} → {_vix_now:.1f}) — forcing BEAR, skipping hysteresis")
+
             with self._lock:
                 old_v1 = self._v1_regime
                 old_core = self._core_regime
 
-                # Hysteresis
-                if new_core != self._core_regime:
+                if _vix_emergency:
+                    # Skip hysteresis — force to at least BEAR_TRANSITION
+                    if new_core in (BEAR_TRANSITION, BEAR_CRISIS):
+                        self._core_regime = new_core
+                    else:
+                        # Score says BULL but VIX screaming — force BEAR_TRANSITION
+                        self._core_regime = BEAR_TRANSITION
+                    self._candidate_regime = None
+                    self._candidate_days = 0
+                    self._regime_since = date.today()
+                    self._days_in_regime = 0
+
+                # Normal hysteresis (1 day)
+                elif new_core != self._core_regime:
                     if new_core == self._candidate_regime:
                         self._candidate_days += 1
                     else:
