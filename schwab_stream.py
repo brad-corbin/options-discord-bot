@@ -93,11 +93,15 @@ class OptionQuoteStore:
     Also tracks premium high watermarks and exit management for conviction plays.
     """
 
-    # Exit management thresholds
+    # Exit management thresholds — single-leg options
     PROFIT_ALERT_1 = 0.50     # 50% profit → 15% trailing stop
     TRAILING_STOP_1 = 0.15    # 15% trailing stop from peak
     PROFIT_ALERT_2 = 1.00     # 100% profit → exit half, 30% trailing
     TRAILING_STOP_2 = 0.30    # 30% trailing stop from peak on remainder
+
+    # Exit management thresholds — credit spreads
+    SPREAD_TAKE_PROFIT = 0.50  # take profit when spread value = 50% of entry credit
+    SPREAD_STOP_LOSS = 2.00    # stop loss when spread value = 2x entry credit
 
     def __init__(self, stale_threshold: float = 60):
         self._quotes = {}      # occ_symbol → {fields..., _ts}
@@ -105,8 +109,11 @@ class OptionQuoteStore:
         self._lock = threading.Lock()
         self._stale_threshold = stale_threshold
         self._stats = {"updates": 0, "sweeps_detected": 0}
-        # Conviction play premium tracking + exit management
+        # Conviction play premium tracking + exit management (single-leg)
         self._conviction_tracks = {}  # occ_symbol → {entry_mid, peak_mid, ..., phase, ...}
+        # Credit spread tracking + exit management
+        self._spread_tracks = {}      # spread_key → {short_occ, long_occ, entry_credit, ...}
+        self._occ_to_spread = {}      # occ_symbol → spread_key (reverse lookup for both legs)
         self._exit_alert_callback = None  # callable(alert_dict) — set by app.py
 
     def set_exit_alert_callback(self, callback: Callable):
@@ -181,6 +188,60 @@ class OptionQuoteStore:
                             track["phase"] = "done"
                             exit_alerts.append({**alert_base, "type": "stop_30"})
 
+            # Update spread tracking if this OCC is part of a tracked spread
+            if occ_symbol in self._occ_to_spread:
+                spread_key = self._occ_to_spread[occ_symbol]
+                spread = self._spread_tracks.get(spread_key)
+                if spread and spread.get("phase") != "done":
+                    short_q = self._quotes.get(spread["short_occ"])
+                    long_q = self._quotes.get(spread["long_occ"])
+                    if short_q and long_q:
+                        s_bid = short_q.get("bid", 0) or 0
+                        s_ask = short_q.get("ask", 0) or 0
+                        l_bid = long_q.get("bid", 0) or 0
+                        l_ask = long_q.get("ask", 0) or 0
+                        if s_bid > 0 and s_ask > 0 and l_bid > 0 and l_ask > 0:
+                            short_mid = (s_bid + s_ask) / 2
+                            long_mid = (l_bid + l_ask) / 2
+                            current_value = round(short_mid - long_mid, 4)
+                            spread["current_value"] = current_value
+                            spread["last_time"] = time.time()
+
+                            # Set initial credit from first valid quote if not yet set
+                            if not spread.get("entry_credit"):
+                                spread["entry_credit"] = current_value
+                                spread["min_value"] = current_value
+                                log.info(f"Spread {spread_key}: entry credit set to ${current_value:.2f}")
+
+                            if current_value < spread.get("min_value", 999):
+                                spread["min_value"] = current_value
+
+                            entry_credit = spread.get("entry_credit", 0)
+                            if entry_credit > 0:
+                                phase = spread["phase"]
+                                pnl_pct = round((entry_credit - current_value) / entry_credit * 100, 1)
+                                alert_base = {
+                                    "spread_key": spread_key,
+                                    "short_occ": spread["short_occ"],
+                                    "long_occ": spread["long_occ"],
+                                    "ticker": spread.get("ticker", ""),
+                                    "trade_type": spread.get("trade_type", ""),
+                                    "entry_credit": entry_credit,
+                                    "current_value": current_value,
+                                    "min_value": spread.get("min_value", current_value),
+                                    "pnl_pct": pnl_pct,
+                                }
+
+                                if phase == "watching":
+                                    # Take profit: spread narrowed to 50% of initial credit
+                                    if current_value <= entry_credit * self.SPREAD_TAKE_PROFIT:
+                                        spread["phase"] = "done"
+                                        exit_alerts.append({**alert_base, "type": "spread_take_profit"})
+                                    # Stop loss: spread widened to 2x initial credit
+                                    elif current_value >= entry_credit * self.SPREAD_STOP_LOSS:
+                                        spread["phase"] = "done"
+                                        exit_alerts.append({**alert_base, "type": "spread_stop_loss"})
+
         # Fire exit alerts outside lock
         if exit_alerts and self._exit_alert_callback:
             for alert in exit_alerts:
@@ -223,6 +284,56 @@ class OptionQuoteStore:
             self._conviction_tracks.clear()
         if count:
             log.info(f"Conviction tracks cleared: {count} contracts")
+
+    def track_spread(self, short_occ: str, long_occ: str, ticker: str,
+                     trade_type: str, entry_credit: float = 0):
+        """Register a credit spread for exit management tracking.
+
+        Args:
+            short_occ: OCC symbol for the short (sold) leg
+            long_occ: OCC symbol for the long (bought) leg
+            ticker: underlying ticker
+            trade_type: 'bull_put' or 'bear_call'
+            entry_credit: initial credit received (0 = auto-detect from first streaming quote)
+        """
+        spread_key = short_occ  # use short leg OCC as unique key
+        with self._lock:
+            if spread_key not in self._spread_tracks:
+                self._spread_tracks[spread_key] = {
+                    "short_occ": short_occ,
+                    "long_occ": long_occ,
+                    "ticker": ticker,
+                    "trade_type": trade_type,
+                    "entry_credit": entry_credit,
+                    "current_value": entry_credit,
+                    "min_value": entry_credit if entry_credit > 0 else 999,
+                    "phase": "watching",
+                    "last_time": time.time(),
+                }
+                self._occ_to_spread[short_occ] = spread_key
+                self._occ_to_spread[long_occ] = spread_key
+                credit_str = f"${entry_credit:.2f}" if entry_credit else "auto-detect"
+                log.info(f"Spread track started: {ticker} {trade_type} "
+                         f"short={short_occ} long={long_occ} credit={credit_str}")
+
+    def get_spread_track(self, spread_key: str) -> Optional[dict]:
+        """Get spread tracking data."""
+        with self._lock:
+            return dict(self._spread_tracks.get(spread_key, {})) or None
+
+    def get_all_spread_tracks(self) -> dict:
+        """Get all spread tracking data (for reconciliation)."""
+        with self._lock:
+            return {k: dict(v) for k, v in self._spread_tracks.items()}
+
+    def clear_spread_tracks(self):
+        """Clear all spread tracks (call at EOD)."""
+        with self._lock:
+            count = len(self._spread_tracks)
+            self._spread_tracks.clear()
+            self._occ_to_spread.clear()
+        if count:
+            log.info(f"Spread tracks cleared: {count} spreads")
 
     def get(self, occ_symbol: str) -> Optional[dict]:
         """Get a fresh option quote, or None if stale/missing."""
