@@ -1263,5 +1263,15 @@ def format_swing_card(rec: Dict) -> str:
         lines.append("🧠 " + " | ".join(rec["conf_reasons"][:5]))
         lines.append("")
 
+    # v7 swing guidance
+    try:
+        from backtest_guidance import format_swing_guidance_block
+        _swing_guidance = format_swing_guidance_block(ticker, direction, str(fib_level))
+        if _swing_guidance:
+            lines.append(_swing_guidance)
+            lines.append("")
+    except ImportError:
+        pass
+
     lines.append("— Not financial advice —")
     return "\n".join(lines)
