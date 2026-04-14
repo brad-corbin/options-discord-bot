@@ -995,3 +995,21 @@ CRISIS_PUT_BLACKLIST = {
     "GLD", "SLV", "NEM", "IAU", "BWXT", "TLT", "NOC", "RTX",
     "PEP", "KO", "JNJ", "PG", "VZ", "T",  # defensive consumer/telecom
 }
+
+# ═══════════════════════════════════════════════════════════════════
+# v7 BACKTEST-DERIVED RULES (April 2026 corrected rerun)
+# ═══════════════════════════════════════════════════════════════════
+
+# ── Swing trail stop (alert-only, no auto-execution) ──────────────
+SWING_TRAIL_MIN_PROFIT_PCT   = 0.005   # 0.5% underlying move activates trail
+SWING_TRAIL_GIVEBACK_PCT     = 0.40    # keep 60% of peak MFE
+SWING_TRAIL_ALERT_COOLDOWN   = 300     # 5 min between same trail alert type
+SWING_TRAIL_NEW_PEAK_PCT     = 0.002   # alert on new peak if 0.2%+ higher
+SWING_TRAIL_GIVEBACK_WARN    = 0.27    # warn at 27% giveback (before 40% trigger)
+
+# ── Income scanner v7 gates ───────────────────────────────────────
+INCOME_MIN_CUSHION_PCT       = 6.0     # hard minimum — below this is a coin flip
+INCOME_SKIP_BEAR_CALLS       = {"IWM", "NVDA", "AVGO", "SPY", "AMD", "GOOGL"}
+
+# ── Active scanner v7 phase filter ────────────────────────────────
+ACTIVE_MIDDAY_ONLY_TICKERS   = {"PLTR", "GLD"}  # skip afternoon on these tickers
