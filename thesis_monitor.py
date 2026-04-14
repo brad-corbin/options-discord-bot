@@ -289,6 +289,15 @@ class ActiveTrade:
     # ── v5.1: Scale-in entry framework ────────────────────────────────
     scale_in_stage: int = 1              # 1=initial 1/3, 2=added on confirm, 3=full
     initial_contracts: int = 7           # 1/3 of 20 — initial position size
+    # ── v7: Swing trail monitor (alert-only, no auto-execution) ───
+    is_swing_trade: bool = False
+    swing_trail_active: bool = False
+    swing_mfe_peak_pct: float = 0.0       # highest % move from entry
+    swing_trail_level: float = 0.0        # current trail stop price
+    swing_giveback_pct: float = 0.40      # 40% giveback default
+    swing_min_profit_pct: float = 0.005   # 0.5% activation threshold
+    swing_last_alert: str = ""            # last alert type sent
+    swing_last_alert_time: float = 0.0    # cooldown tracking
 
 @dataclass
 class MonitorState:
@@ -1906,6 +1915,10 @@ class ThesisMonitorEngine:
                 trade.max_favorable = max(trade.max_favorable, fav)
                 trade.min_favorable = min(trade.min_favorable, fav)
 
+            # v7: Swing trail monitor (alert-only, no auto-execution)
+            if getattr(trade, 'is_swing_trade', False):
+                self._swing_trail_monitor(trade, ticker, price, now, events)
+
             # ── Auto-migrate legacy trades without policy_config ──
             if not trade.policy_config:
                 from exit_policy import select_exit_policy as _sel
@@ -2089,6 +2102,146 @@ class ThesisMonitorEngine:
                     events.append({"msg": f"\U0001f6d1 TRADE INVALIDATED — {trade.direction}\n\n{signal.reason}\nEntry: ${trade.entry_price:.2f} → Now: ${price:.2f} ({pnl_pct:+.2f}%)\nDon't hope. Close it.", "type": "exit", "priority": 5, "alert_key": f"exit_inv_{trade.trade_id}"})
             # HOLD = do nothing
         return events
+
+    def _swing_trail_monitor(self, trade, ticker, price, now, events):
+        """Monitor swing trade MFE and send trail alerts.
+        Alert-only — does NOT auto-execute. Human decides."""
+        if trade.status in ("CLOSED", "INVALIDATED"):
+            return
+
+        try:
+            from trading_rules import (
+                SWING_TRAIL_MIN_PROFIT_PCT, SWING_TRAIL_GIVEBACK_PCT,
+                SWING_TRAIL_ALERT_COOLDOWN, SWING_TRAIL_NEW_PEAK_PCT,
+                SWING_TRAIL_GIVEBACK_WARN,
+            )
+        except ImportError:
+            SWING_TRAIL_MIN_PROFIT_PCT = 0.005
+            SWING_TRAIL_GIVEBACK_PCT = 0.40
+            SWING_TRAIL_ALERT_COOLDOWN = 300
+            SWING_TRAIL_NEW_PEAK_PCT = 0.002
+            SWING_TRAIL_GIVEBACK_WARN = 0.27
+
+        entry = trade.entry_price
+        if entry <= 0:
+            return
+
+        # Current move %
+        if trade.direction == "LONG":
+            move_pct = (price - entry) / entry
+        else:
+            move_pct = (entry - price) / entry
+
+        # Cooldown check
+        def _trail_alert_ok(alert_type):
+            if trade.swing_last_alert == alert_type:
+                if now - trade.swing_last_alert_time < SWING_TRAIL_ALERT_COOLDOWN:
+                    return False
+            return True
+
+        def _mark_trail_alert(alert_type):
+            trade.swing_last_alert = alert_type
+            trade.swing_last_alert_time = now
+
+        # ── Check if trail should activate ──
+        if not trade.swing_trail_active:
+            if move_pct >= SWING_TRAIL_MIN_PROFIT_PCT:
+                trade.swing_trail_active = True
+                trade.swing_mfe_peak_pct = move_pct
+                giveback = move_pct * SWING_TRAIL_GIVEBACK_PCT
+                if trade.direction == "LONG":
+                    trade.swing_trail_level = entry * (1 + move_pct - giveback)
+                else:
+                    trade.swing_trail_level = entry * (1 - move_pct + giveback)
+
+                if _trail_alert_ok("activated"):
+                    _mark_trail_alert("activated")
+                    events.append({
+                        "msg": (
+                            f"\U0001f7e2 SWING TRAIL ACTIVATED — {ticker} {trade.direction}\n\n"
+                            f"Entry: ${entry:.2f} → Now: ${price:.2f} ({move_pct*100:+.2f}%)\n"
+                            f"Trail stop: ${trade.swing_trail_level:.2f}\n"
+                            f"MFE tracking started. Will alert at giveback threshold.\n"
+                            f"\n\U0001f4a1 No action needed yet — let it run."
+                        ),
+                        "type": "swing_trail", "priority": 3,
+                        "alert_key": f"swing_trail_act_{trade.trade_id}",
+                    })
+                    self._persist_trades(ticker, None)
+            return
+
+        # ── Trail is active — check for new peak ──
+        if move_pct > trade.swing_mfe_peak_pct:
+            old_peak = trade.swing_mfe_peak_pct
+            trade.swing_mfe_peak_pct = move_pct
+            giveback = move_pct * SWING_TRAIL_GIVEBACK_PCT
+            if trade.direction == "LONG":
+                trade.swing_trail_level = entry * (1 + move_pct - giveback)
+            else:
+                trade.swing_trail_level = entry * (1 - move_pct + giveback)
+
+            if move_pct - old_peak >= SWING_TRAIL_NEW_PEAK_PCT:
+                if _trail_alert_ok("new_peak"):
+                    _mark_trail_alert("new_peak")
+                    events.append({
+                        "msg": (
+                            f"\U0001f4c8 SWING NEW PEAK — {ticker} {trade.direction}\n\n"
+                            f"Peak: ${price:.2f} ({move_pct*100:+.2f}% from ${entry:.2f})\n"
+                            f"Trail stop: ${trade.swing_trail_level:.2f} "
+                            f"({SWING_TRAIL_GIVEBACK_PCT*100:.0f}% giveback)\n"
+                            f"Keep holding — trail protects gains."
+                        ),
+                        "type": "swing_trail", "priority": 2,
+                        "alert_key": f"swing_trail_peak_{trade.trade_id}",
+                    })
+                    self._persist_trades(ticker, None)
+            return
+
+        # ── Check giveback from peak ──
+        if trade.swing_mfe_peak_pct > 0:
+            giveback_current = (trade.swing_mfe_peak_pct - move_pct) / trade.swing_mfe_peak_pct
+
+            peak_price = (entry * (1 + trade.swing_mfe_peak_pct)
+                          if trade.direction == "LONG"
+                          else entry * (1 - trade.swing_mfe_peak_pct))
+
+            # Warning at partial giveback
+            if (giveback_current >= SWING_TRAIL_GIVEBACK_WARN
+                    and giveback_current < SWING_TRAIL_GIVEBACK_PCT):
+                if _trail_alert_ok("giveback_warn"):
+                    _mark_trail_alert("giveback_warn")
+                    events.append({
+                        "msg": (
+                            f"\u26a0\ufe0f SWING GIVEBACK — {ticker} {trade.direction}\n\n"
+                            f"Peak: ${peak_price:.2f} ({trade.swing_mfe_peak_pct*100:+.1f}%)\n"
+                            f"Now: ${price:.2f} ({move_pct*100:+.1f}%)\n"
+                            f"Giveback: {giveback_current*100:.0f}% of move "
+                            f"(trigger at {SWING_TRAIL_GIVEBACK_PCT*100:.0f}%)\n"
+                            f"Trail stop: ${trade.swing_trail_level:.2f}\n"
+                            f"\n\U0001f914 Watch closely. Not at trigger yet."
+                        ),
+                        "type": "swing_trail", "priority": 3,
+                        "alert_key": f"swing_trail_warn_{trade.trade_id}",
+                    })
+
+            # Close signal at full giveback
+            if giveback_current >= SWING_TRAIL_GIVEBACK_PCT:
+                if _trail_alert_ok("close_signal"):
+                    _mark_trail_alert("close_signal")
+                    events.append({
+                        "msg": (
+                            f"\U0001f534 SWING EXIT SIGNAL — {ticker} {trade.direction}\n\n"
+                            f"Hit {SWING_TRAIL_GIVEBACK_PCT*100:.0f}% giveback threshold.\n"
+                            f"Peak: ${peak_price:.2f} ({trade.swing_mfe_peak_pct*100:+.1f}%)\n"
+                            f"Now: ${price:.2f} ({move_pct*100:+.1f}%)\n"
+                            f"Trail level: ${trade.swing_trail_level:.2f}\n"
+                            f"Keeping: {move_pct*100:.1f}% of entry\n"
+                            f"\n\U0001f3af Manual close recommended.\n"
+                            f"Check spread bid before executing."
+                        ),
+                        "type": "swing_trail", "priority": 5,
+                        "alert_key": f"swing_trail_exit_{trade.trade_id}",
+                    })
 
     def _exit_alert_ok(self, trade, key, now):
         """Check and set cooldown for exit alerts."""
