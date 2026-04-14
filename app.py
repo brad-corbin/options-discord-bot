@@ -140,6 +140,11 @@ from em_reconciler import (
 import risk_manager
 import trade_journal
 
+# ── v7 imports ──
+from backtest_guidance import should_filter_signal, ACTIVE_GUIDANCE
+from shadow_filter import ShadowFilterLogger
+from position_monitor import PositionMonitor
+
 # ── v5.0 imports ──
 from prechain_gate import should_pull_chains
 from vix_term_structure import get_vix_term_structure, format_term_structure_line
@@ -177,6 +182,8 @@ from thesis_monitor import (
 _oi_cache = None
 _oi_tracker = None  # v5.1: daily OI change tracker
 _persistent_state = None  # v6.1: Redis-backed persistent state
+_shadow_logger = None     # v7: shadow filter logger
+_position_monitor = None  # v7: unified position monitor
 _flow_detector = None     # v6.1: unified institutional flow detection
 _potter_box = None        # v6.2: Potter Box scanner
 
@@ -365,6 +372,13 @@ def _tab_for_filename(filename: str) -> str:
         "crisis_put_signals.csv": GOOGLE_SHEET_CRISIS_TAB,
         "shadow_signals.csv": GOOGLE_SHEET_SHADOW_TAB,
         "conviction_plays.csv": GOOGLE_SHEET_CONVICTION_TAB,
+        # v7 position tracking tabs — name IS the tab
+        "position_tracking_active": "position_tracking_active",
+        "position_tracking_swing": "position_tracking_swing",
+        "position_tracking_income": "position_tracking_income",
+        "position_tracking_conviction": "position_tracking_conviction",
+        "position_tracking_shadow": "position_tracking_shadow",
+        "shadow_filtered_signals": "shadow_filtered_signals",
     }
     return mapping.get(filename, "")
 
@@ -2783,6 +2797,71 @@ def _process_job(worker_id: int, job: dict):
             _record_wave_result(base)
             return
 
+        # ── v7: Backtest filter gate ──────────────────────────────
+        # Check if this signal should be blocked by v7 rules BEFORE
+        # any chain fetches. Blocked signals get shadow-tracked with
+        # live option P&L monitoring.
+        try:
+            _v7_regime = (webhook_data or {}).get("market_regime", "")
+            _v7_should_block, _v7_reason, _v7_category = should_filter_signal(ticker, bias, _v7_regime)
+            if _v7_should_block:
+                log.info(f"[worker-{worker_id}] v7 FILTER: {ticker} {bias} blocked — {_v7_reason}")
+
+                # Shadow log
+                if _shadow_logger:
+                    _shadow_logger.log_filtered_signal(
+                        ticker=ticker, bias=bias, signal_data=webhook_data or {},
+                        filter_reason=_v7_reason, filter_category=_v7_category,
+                        spot=float((webhook_data or {}).get("close", 0)),
+                    )
+
+                # Register shadow position for live option P&L tracking
+                try:
+                    if _position_monitor:
+                        from schwab_stream import build_occ_symbol, get_live_premium
+                        _v7_spot = float((webhook_data or {}).get("close", 0)) or get_spot(ticker)
+                        _v7_side = "C" if bias == "bull" else "P"
+                        _v7_strike = round(_v7_spot)  # ATM
+                        # Find nearest weekly expiry
+                        _v7_exps = get_expirations(ticker) if 'get_expirations' in dir() else []
+                        _v7_exp = ""
+                        if _v7_exps:
+                            from datetime import date as _d, timedelta as _td
+                            _today = _d.today()
+                            for exp_str in sorted(_v7_exps):
+                                try:
+                                    _exp_d = datetime.strptime(exp_str, "%Y-%m-%d").date()
+                                    if _exp_d >= _today and (_exp_d - _today).days <= 7:
+                                        _v7_exp = exp_str
+                                        break
+                                except ValueError:
+                                    continue
+                        if _v7_exp and _v7_strike > 0:
+                            _v7_occ = build_occ_symbol(ticker, _v7_exp, _v7_side, _v7_strike)
+                            _v7_mid = get_live_premium(_v7_occ) or 0
+                            if _v7_mid > 0:
+                                _position_monitor.register_position(
+                                    ticker=ticker, direction=bias, trade_type="shadow",
+                                    occ_symbol=_v7_occ, entry_mid=_v7_mid,
+                                    expiry=_v7_exp, strike=_v7_strike,
+                                    option_type="call" if _v7_side == "C" else "put",
+                                    entry_spot=_v7_spot,
+                                    metadata={"filter_category": _v7_category,
+                                              "filter_reason": _v7_reason,
+                                              "score": (webhook_data or {}).get("score"),
+                                              "regime": _v7_regime},
+                                )
+                                log.info(f"v7 shadow position registered: {_v7_occ} @ ${_v7_mid:.2f}")
+                except Exception as _v7_pm_err:
+                    log.debug(f"v7 shadow position register failed: {_v7_pm_err}")
+
+                base["reason"] = f"v7 filter: {_v7_reason}"
+                base["outcome"] = "v7_filtered"
+                _record_wave_result(base)
+                return
+        except Exception as _v7_err:
+            log.debug(f"v7 filter check failed: {_v7_err}")
+
         # ── v4.1: CAGF regime gate for liquid index tickers ──
         # Pine = timing trigger, Python CAGF = regime context
         # Only gate SPY/QQQ/SPX — other tickers skip this check
@@ -3124,6 +3203,29 @@ def _process_job(worker_id: int, job: dict):
             base["card"]    = _swing_card
             _record_wave_result(base)
             log.info(f"Swing winner queued for digest: {ticker} {bias} conf={rec.get('confidence')}/100")
+
+            # v7: register swing trade for live option P&L tracking
+            try:
+                if _position_monitor and rec.get("trade"):
+                    from schwab_stream import build_occ_symbol
+                    _sw_side = "C" if rec.get("direction", "bull") == "bull" else "P"
+                    _sw_occ = build_occ_symbol(ticker, rec.get("exp", ""), _sw_side, rec["trade"].get("long", 0))
+                    _position_monitor.register_position(
+                        ticker=ticker,
+                        direction=rec.get("direction", "bull"),
+                        trade_type="swing",
+                        occ_symbol=_sw_occ,
+                        entry_mid=rec["trade"].get("debit", 0),
+                        expiry=rec.get("exp", ""),
+                        strike=rec["trade"].get("long", 0),
+                        option_type="call" if _sw_side == "C" else "put",
+                        entry_spot=rec.get("spot", 0),
+                        metadata={"fib": str(rec.get("fib_level", "")),
+                                  "confidence": rec.get("confidence", 0),
+                                  "tier": rec.get("tier", "?")},
+                    )
+            except Exception as _sw_pm_err:
+                log.debug(f"Swing position register failed: {_sw_pm_err}")
 
 
 def _signal_queue_worker_redis(worker_id: int):
@@ -4488,6 +4590,32 @@ def _run_v4_prefilter(ticker: str, spot: float, chains: list, candle_closes: lis
                                     f"G:{_bd.get('G_technical',0)} H:{_bd.get('H_liquidity',0)}",
                                 ]
                                 msg += "\n".join(income_section)
+
+                                # v7: register income trade for live option P&L tracking
+                                try:
+                                    if _position_monitor:
+                                        from schwab_stream import build_occ_symbol
+                                        _inc_side = "P" if _best_income["trade_type"] == "bull_put" else "C"
+                                        _inc_occ = build_occ_symbol(
+                                            cp["ticker"], _best_income.get("expiry", ""),
+                                            _inc_side, _best_income["short_strike"],
+                                        )
+                                        _position_monitor.register_position(
+                                            ticker=cp["ticker"],
+                                            direction="bull" if _best_income["trade_type"] == "bull_put" else "bear",
+                                            trade_type="income",
+                                            occ_symbol=_inc_occ,
+                                            entry_mid=_best_income.get("credit", 0),
+                                            expiry=_best_income.get("expiry", ""),
+                                            strike=_best_income["short_strike"],
+                                            option_type="put" if _inc_side == "P" else "call",
+                                            entry_spot=spot if 'spot' in dir() else 0,
+                                            metadata={"itqs_score": _score, "grade": _grade,
+                                                      "cushion": _best_income.get("cushion_pct", 0),
+                                                      "trade_type": _best_income["trade_type"]},
+                                        )
+                                except Exception as _inc_pm_err:
+                                    log.debug(f"Income position register failed: {_inc_pm_err}")
                             else:
                                 msg += "\n\n📊 Income scan: no qualifying opportunities found"
 
@@ -5157,6 +5285,30 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
                 )
             except Exception as _je:
                 log.warning(f"Journal log_trade_open failed: {_je}")
+
+            # v7: register active scanner trade for live option P&L tracking
+            try:
+                if _position_monitor and trade:
+                    from schwab_stream import build_occ_symbol
+                    _act_side = "C" if direction == "bull" else "P"
+                    _act_occ = build_occ_symbol(ticker, best_rec.get("exp", ""), _act_side, trade.get("long", 0))
+                    _position_monitor.register_position(
+                        ticker=ticker,
+                        direction=direction,
+                        trade_type="active",
+                        occ_symbol=_act_occ,
+                        entry_mid=trade.get("debit", 0),
+                        expiry=best_rec.get("exp", ""),
+                        strike=trade.get("long", 0),
+                        option_type="call" if _act_side == "C" else "put",
+                        entry_spot=spot,
+                        metadata={"score": best_rec.get("score"),
+                                  "tier": best_rec.get("tier"),
+                                  "confidence": best_rec.get("confidence"),
+                                  "regime": regime},
+                    )
+            except Exception as _act_pm_err:
+                log.debug(f"Active position register failed: {_act_pm_err}")
         _log_signal_dataset_event(
             ticker, webhook_data,
             outcome="trade_opened" if risk_result["allowed"] else "risk_blocked",
@@ -9009,6 +9161,33 @@ def _em_scheduler():
                     log.info("EM reconciler firing (4:15 PM CT)")
                     threading.Thread(target=_run_reconciler_auto, daemon=True, name="reconciler").start()
 
+            # ── v7: Position monitor cleanup + shadow reports (4:20 PM CT) ──
+            _pm_key = (date_str, 16, 20)
+            if _pm_key not in fired_today:
+                if now_ct.hour == 16 and abs(now_ct.minute - 20) <= 1:
+                    fired_today.add(_pm_key)
+                    try:
+                        if _position_monitor:
+                            _position_monitor.cleanup_expired()
+                            log.info("v7: position monitor cleanup complete")
+                        if _shadow_logger:
+                            _shadow_logger.reconcile_outcomes(
+                                spot_fn=lambda t: get_spot(t),
+                            )
+                            alerts = _shadow_logger.check_alert_thresholds()
+                            for a in alerts:
+                                post_to_telegram(a)
+                            # Monthly report on 1st of month
+                            if now_ct.day == 1:
+                                report = _shadow_logger.format_monthly_report()
+                                post_to_telegram(report)
+                                if _position_monitor:
+                                    shadow_sc = _position_monitor.format_shadow_scorecard()
+                                    post_to_telegram(shadow_sc)
+                                log.info("v7: monthly shadow reports posted")
+                    except Exception as _pm_eod_err:
+                        log.warning(f"v7 EOD processing error: {_pm_eod_err}")
+
             # ── v5.1: Regime transition detector (every 30 min during market hours) ──
             if 8 <= now_ct.hour < 16:
                 _regime_key = (date_str, now_ct.hour, now_ct.minute // 30)
@@ -9400,6 +9579,25 @@ def _start_background_services_once():
             store_get_fn=store_get, store_set_fn=store_set,
             get_bars_fn=lambda ticker, res, count: get_intraday_bars(ticker, res, count),
         )
+
+        # v7: start position monitor polling thread
+        def _position_monitor_loop():
+            """Poll live option prices every 60s for all tracked positions."""
+            import time as _t
+            while True:
+                try:
+                    if _position_monitor:
+                        alerts = _position_monitor.poll_all()
+                        for a in alerts:
+                            try:
+                                post_to_telegram(a.get("msg", ""))
+                            except Exception:
+                                pass
+                except Exception as _pm_err:
+                    log.debug(f"Position monitor poll error: {_pm_err}")
+                _t.sleep(60)
+        threading.Thread(target=_position_monitor_loop, daemon=True, name="position-monitor").start()
+        log.info("v7: position monitor polling thread started")
         # v5.1: Wire portfolio Greeks into thesis monitor
         from thesis_monitor import set_portfolio_greeks
         set_portfolio_greeks(_portfolio_greeks)
@@ -9518,6 +9716,20 @@ def _initialize_app():
         _potter_box = PotterBoxScanner(_persistent_state, flow_detector=_flow_detector,
                                            post_fn=post_to_telegram)
         log.info(f"OI cache + tracker + flow detector + Potter Box initialized (Redis: {_get_redis() is not None})")
+
+        # v7: position monitor + shadow logger
+        global _shadow_logger, _position_monitor
+        _shadow_logger = ShadowFilterLogger(
+            persistent_state=_persistent_state,
+            post_fn=post_to_telegram,
+            sheet_append_fn=_append_google_sheet_row,
+        )
+        _position_monitor = PositionMonitor(
+            persistent_state=_persistent_state,
+            sheet_fn=_append_google_sheet_row,
+            spot_fn=lambda t: get_spot(t),
+        )
+        log.info("v7: shadow logger + position monitor initialized")
         _tg_ws = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
         if _tg_ws and BOT_URL and _acquire_background_leader():
             register_webhook(BOT_URL, _tg_ws)
