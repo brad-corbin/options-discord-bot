@@ -96,6 +96,14 @@ class MonitoredPosition:
     # Metadata (flexible per engine)
     metadata: dict = field(default_factory=dict)
 
+    # v7.2: Silent Thesis Layer fields — structural alignment data at entry
+    thesis_direction: str = ""           # thesis bias at entry (BULLISH/BEARISH/NEUTRAL)
+    thesis_aligned: str = ""             # YES/NO/NEUTRAL — flow aligned with thesis?
+    thesis_gex_sign: str = ""            # GEX sign from morning thesis
+    thesis_gamma_flip_vs_spot: str = ""  # "above" or "below" — spot vs gamma flip
+    thesis_put_wall: float = 0.0         # put wall level from thesis
+    thesis_call_wall: float = 0.0        # call wall level from thesis
+
     # Snapshot history (optional — last N mid prices for charting)
     mid_snapshots: list = field(default_factory=list)  # [{"ts": "...", "mid": 1.23, "spot": 200.5}]
     MAX_SNAPSHOTS: int = 100
@@ -169,6 +177,13 @@ class MonitoredPosition:
             "close_reason": self.close_reason,
             "is_expired": self.is_expired,
             "num_snapshots": len(self.mid_snapshots),
+            # v7.2: Silent Thesis Layer — structural alignment at entry
+            "thesis_direction": self.thesis_direction,
+            "thesis_aligned": self.thesis_aligned,
+            "thesis_gex_sign": self.thesis_gex_sign,
+            "thesis_gamma_flip_vs_spot": self.thesis_gamma_flip_vs_spot,
+            "thesis_put_wall": self.thesis_put_wall,
+            "thesis_call_wall": self.thesis_call_wall,
         }
 
 
@@ -275,6 +290,9 @@ class PositionMonitor:
         # Subscribe to streaming
         self._subscribe(occ_symbol)
 
+        # v7.2: Populate thesis alignment fields at entry
+        self._populate_thesis_fields(pos)
+
         self._save()
         self._log_open_to_sheets(pos)  # v7.1: log to sheets immediately on open
         log.info(f"PositionMonitor: registered {trade_type} {ticker} {direction} "
@@ -295,6 +313,80 @@ class PositionMonitor:
                 log.info(f"PositionMonitor: subscribed {occ_symbol}")
         except Exception as e:
             log.debug(f"PositionMonitor subscribe failed for {occ_symbol}: {e}")
+
+    def _populate_thesis_fields(self, pos: MonitoredPosition):
+        """v7.2: Populate thesis alignment fields at position entry time.
+
+        Looks up the morning thesis for this ticker and records structural
+        alignment data. This is OBSERVATIONAL — it does not gate or block.
+        The data enables filtering in Google Sheets to measure whether
+        thesis alignment improves win rate.
+        """
+        try:
+            from thesis_monitor import get_engine
+            thesis = get_engine().get_thesis(pos.ticker)
+            if not thesis:
+                return
+
+            pos.thesis_direction = thesis.bias or ""
+            pos.thesis_gex_sign = thesis.gex_sign or ""
+
+            # Determine alignment
+            thesis_bullish = thesis.bias in ("BULLISH", "LEAN_BULLISH") or thesis.bias_score > 2
+            thesis_bearish = thesis.bias in ("BEARISH", "LEAN_BEARISH") or thesis.bias_score < -2
+            flow_bullish = (pos.direction or "").lower() in ("bull", "bullish", "long")
+
+            if (flow_bullish and thesis_bullish) or (not flow_bullish and thesis_bearish):
+                pos.thesis_aligned = "YES"
+            elif (flow_bullish and thesis_bearish) or (not flow_bullish and thesis_bullish):
+                pos.thesis_aligned = "NO"
+            else:
+                pos.thesis_aligned = "NEUTRAL"
+
+            # Gamma flip vs spot
+            lvl = thesis.levels
+            if lvl.gamma_flip and pos.entry_spot > 0:
+                pos.thesis_gamma_flip_vs_spot = (
+                    "above" if pos.entry_spot > lvl.gamma_flip else "below")
+
+            if lvl.put_wall:
+                pos.thesis_put_wall = round(lvl.put_wall, 2)
+            if lvl.call_wall:
+                pos.thesis_call_wall = round(lvl.call_wall, 2)
+
+            log.debug(f"Thesis fields populated: {pos.ticker} aligned={pos.thesis_aligned} "
+                      f"dir={pos.thesis_direction} gex={pos.thesis_gex_sign}")
+
+        except Exception as e:
+            log.debug(f"Thesis field population failed for {pos.ticker}: {e}")
+
+    def _get_thesis_proximity(self, ticker: str, spot: float) -> str:
+        """v7.2: Check if spot is near any thesis levels for exit alert context.
+
+        Returns a string like '📍 price approaching put wall at $358.00' or ''.
+        """
+        try:
+            from thesis_monitor import get_engine
+            thesis = get_engine().get_thesis(ticker)
+            if not thesis or spot <= 0:
+                return ""
+
+            lvl = thesis.levels
+            near = []
+            for name, val in [("put wall", lvl.put_wall), ("call wall", lvl.call_wall),
+                              ("γ-flip", lvl.gamma_flip), ("EM low", lvl.em_low),
+                              ("EM high", lvl.em_high)]:
+                if val and val > 0:
+                    dist_pct = abs(spot - val) / spot * 100
+                    if dist_pct < 0.5:  # within 0.5% of spot
+                        direction = ("at" if dist_pct < 0.1 else
+                                     "approaching" if spot < val else "testing")
+                        near.append(f"📍 price {direction} {name} at ${val:.2f}")
+            return "\n".join(near) if near else ""
+
+        except Exception as e:
+            log.debug(f"Thesis proximity check failed for {ticker}: {e}")
+            return ""
 
     def poll_all(self) -> List[dict]:
         """Poll live prices for all open positions.
@@ -357,6 +449,9 @@ class PositionMonitor:
                 if pos.entry_mid > 0:
                     pnl_pct = (mid - pos.entry_mid) / pos.entry_mid * 100
                     if pnl_pct >= 20:  # only alert on meaningful peaks (20%+)
+                        # v7.2: Thesis level proximity for exit context
+                        _prox = self._get_thesis_proximity(pos.ticker, spot) if spot > 0 else ""
+                        _prox_line = f"\n{_prox}" if _prox else ""
                         alerts.append({
                             "msg": (
                                 f"📈 OPTION PEAK — {pos.ticker} {pos.trade_type} {pos.direction}\n\n"
@@ -364,6 +459,7 @@ class PositionMonitor:
                                 f"Entry: ${pos.entry_mid:.2f} → Peak: ${mid:.2f} ({pnl_pct:+.1f}%)\n"
                                 f"Spot: ${spot:.2f}\n"
                                 f"Consider taking profit."
+                                f"{_prox_line}"
                             ),
                             "type": "position_peak",
                             "priority": 3,
@@ -445,6 +541,13 @@ class PositionMonitor:
             "entry_time": pos.entry_time,
             "entry_mid": pos.entry_mid,
             "entry_spot": pos.entry_spot,
+            # v7.2: Silent Thesis Layer — structural alignment at entry
+            "thesis_direction": pos.thesis_direction,
+            "thesis_aligned": pos.thesis_aligned,
+            "thesis_gex_sign": pos.thesis_gex_sign,
+            "thesis_gamma_flip_vs_spot": pos.thesis_gamma_flip_vs_spot,
+            "thesis_put_wall": pos.thesis_put_wall,
+            "thesis_call_wall": pos.thesis_call_wall,
         }
         for k, v in (pos.metadata or {}).items():
             row[f"meta_{k}"] = v
