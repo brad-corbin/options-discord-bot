@@ -2375,10 +2375,27 @@ class FlowDetector:
         lines = [
             header,
             "━" * 28,
-            f"⚡ {play['volume']:,} contracts at ${strike:.0f} {side.upper()} "
-            f"({play['vol_oi_ratio']:.0f}x vol/OI)",
-            f"💰 Notional: {notional_str}",
         ]
+
+        # v7.1: YOUR TRADE line — prominently shows what YOU should trade
+        # This prevents confusion when flow shows "PUT" but direction is bullish
+        # (institutions selling puts = bullish, but user sees "PUT" and thinks bearish)
+        _your_side = "CALL" if trade_direction == "bullish" else "PUT"
+        _your_verb = "BULLISH" if trade_direction == "bullish" else "BEARISH"
+        _your_strike = play.get("rec_strike", strike)
+        lines.append(f"🎯 YOUR TRADE: Buy {_your_side} — Institutions are {_your_verb}")
+        if play.get("rec_strike") and play.get("rec_strike") != strike:
+            lines.append(f"   Recommended: ${play['rec_strike']:.0f} {_your_side} | Flow strike: ${strike:.0f}")
+        else:
+            lines.append(f"   Strike: ${_your_strike:.0f} {_your_side}")
+        lines.append("━" * 28)
+
+        # Flow data (what institutions did — NOT what you trade)
+        lines.append(
+            f"⚡ Flow: {play['volume']:,} contracts at ${strike:.0f} {side.upper()} "
+            f"({play['vol_oi_ratio']:.0f}x vol/OI)"
+        )
+        lines.append(f"💰 Notional: {notional_str}")
 
         burst = play.get("burst", 0)
         if play.get("is_streaming_sweep"):
