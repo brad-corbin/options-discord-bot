@@ -677,6 +677,9 @@ _CONVICTION_FIELDS = [
     # Option premium tracking (filled by EOD reconciliation from streaming watermarks)
     "occ_symbol", "opt_entry_mid", "opt_peak_mid", "opt_peak_time_ct",
     "opt_eod_mid", "opt_pnl_peak_pct", "opt_pnl_eod_pct",
+    # v7.2: Silent Thesis Layer — structural alignment data for edge measurement
+    "thesis_direction", "thesis_aligned", "gex_sign",
+    "gamma_flip_vs_spot", "put_wall", "call_wall",
 ]
 
 def _check_spread_fillability(ticker: str, long_strike: float, short_strike: float,
@@ -752,6 +755,140 @@ def _check_spread_fillability(ticker: str, long_strike: float, short_strike: flo
     except Exception as e:
         log.debug(f"Fillability check error for {ticker}: {e}")
         return {"fillable": True, "reason": f"check error: {e}", "live_mid": 0}
+
+
+# ─────────────────────────────────────────────────────────────────────
+# SILENT THESIS LAYER — v7.2
+# Observational enrichment: adds thesis alignment info to conviction
+# cards and exit alerts WITHOUT gating or blocking any signals.
+# ─────────────────────────────────────────────────────────────────────
+
+def _get_thesis_enrichment(ticker: str, trade_direction: str) -> str:
+    """Build thesis alignment block for conviction card enrichment.
+
+    Returns a multi-line string appended AFTER the conviction card body.
+    Does NOT gate or block — purely informational until we prove edge.
+    """
+    try:
+        thesis = get_thesis_engine().get_thesis(ticker)
+        if not thesis:
+            return ""
+
+        # Determine alignment
+        thesis_bullish = thesis.bias in ("BULLISH", "LEAN_BULLISH") or thesis.bias_score > 2
+        thesis_bearish = thesis.bias in ("BEARISH", "LEAN_BEARISH") or thesis.bias_score < -2
+        flow_bullish = (trade_direction or "").lower() == "bullish"
+
+        aligned = (flow_bullish and thesis_bullish) or (not flow_bullish and thesis_bearish)
+        conflicts = (flow_bullish and thesis_bearish) or (not flow_bullish and thesis_bullish)
+
+        lines = [""]  # leading blank line separator
+        if aligned:
+            lines.append(f"✅ THESIS CONFIRMS — flow agrees with morning structure "
+                         f"({thesis.bias} {thesis.bias_score:+d}/14)")
+        elif conflicts:
+            lines.append(f"⚠️ CONFLICTS WITH THESIS — morning structure is "
+                         f"{thesis.bias} ({thesis.bias_score:+d}/14)")
+        else:
+            lines.append(f"📋 THESIS NEUTRAL — morning structure is "
+                         f"{thesis.bias} ({thesis.bias_score:+d}/14)")
+
+        # Key levels summary
+        lvl = thesis.levels
+        level_parts = []
+        if lvl.put_wall:
+            level_parts.append(f"Put wall ${lvl.put_wall:.2f}")
+        if lvl.call_wall:
+            level_parts.append(f"Call wall ${lvl.call_wall:.2f}")
+        if lvl.gamma_flip:
+            level_parts.append(f"γ-flip ${lvl.gamma_flip:.2f}")
+        if level_parts:
+            lines.append(f"📐 Levels: {' | '.join(level_parts)}")
+
+        lines.append(f"GEX: {thesis.gex_sign} | Regime: {thesis.regime}")
+        return "\n".join(lines)
+
+    except Exception as e:
+        log.debug(f"Thesis enrichment failed for {ticker}: {e}")
+        return ""
+
+
+def _get_thesis_alignment_data(ticker: str, trade_direction: str) -> dict:
+    """Extract thesis alignment data for Google Sheets logging.
+
+    Returns dict with the 6 thesis columns for conviction play rows.
+    """
+    result = {
+        "thesis_direction": "",
+        "thesis_aligned": "",
+        "gex_sign": "",
+        "gamma_flip_vs_spot": "",
+        "put_wall": "",
+        "call_wall": "",
+    }
+    try:
+        thesis = get_thesis_engine().get_thesis(ticker)
+        if not thesis:
+            return result
+
+        result["thesis_direction"] = thesis.bias
+        result["gex_sign"] = thesis.gex_sign
+
+        # Alignment
+        thesis_bullish = thesis.bias in ("BULLISH", "LEAN_BULLISH") or thesis.bias_score > 2
+        thesis_bearish = thesis.bias in ("BEARISH", "LEAN_BEARISH") or thesis.bias_score < -2
+        flow_bullish = (trade_direction or "").lower() == "bullish"
+
+        if (flow_bullish and thesis_bullish) or (not flow_bullish and thesis_bearish):
+            result["thesis_aligned"] = "YES"
+        elif (flow_bullish and thesis_bearish) or (not flow_bullish and thesis_bullish):
+            result["thesis_aligned"] = "NO"
+        else:
+            result["thesis_aligned"] = "NEUTRAL"
+
+        # Gamma flip vs spot
+        lvl = thesis.levels
+        if lvl.gamma_flip and thesis.spot_at_creation > 0:
+            if thesis.spot_at_creation > lvl.gamma_flip:
+                result["gamma_flip_vs_spot"] = "above"
+            else:
+                result["gamma_flip_vs_spot"] = "below"
+
+        if lvl.put_wall:
+            result["put_wall"] = round(lvl.put_wall, 2)
+        if lvl.call_wall:
+            result["call_wall"] = round(lvl.call_wall, 2)
+
+    except Exception as e:
+        log.debug(f"Thesis alignment data failed for {ticker}: {e}")
+    return result
+
+
+def _get_thesis_proximity(ticker: str, spot: float) -> str:
+    """Check if spot is near any thesis levels. Used in exit alerts.
+
+    Returns a string like 'price approaching put wall at $358.00' or ''.
+    """
+    try:
+        thesis = get_thesis_engine().get_thesis(ticker)
+        if not thesis or spot <= 0:
+            return ""
+
+        lvl = thesis.levels
+        near = []
+        for name, val in [("put wall", lvl.put_wall), ("call wall", lvl.call_wall),
+                          ("γ-flip", lvl.gamma_flip), ("EM low", lvl.em_low),
+                          ("EM high", lvl.em_high)]:
+            if val and val > 0:
+                dist_pct = abs(spot - val) / spot * 100
+                if dist_pct < 0.5:  # within 0.5% of spot
+                    direction = "at" if dist_pct < 0.1 else ("approaching" if spot < val else "testing")
+                    near.append(f"📍 price {direction} {name} at ${val:.2f}")
+        return "\n".join(near) if near else ""
+
+    except Exception as e:
+        log.debug(f"Thesis proximity check failed for {ticker}: {e}")
+        return ""
 
 
 def _log_conviction_play(play: dict, regime: str = "", vix: float = 0):
@@ -857,6 +994,10 @@ def _log_conviction_play(play: dict, regime: str = "", vix: float = 0):
             "opt_pnl_peak_pct": "",
             "opt_pnl_eod_pct":  "",
         }
+
+        # v7.2: Silent Thesis Layer — alignment data for edge measurement
+        _thesis_data = _get_thesis_alignment_data(play["ticker"], play.get("trade_direction", ""))
+        row.update(_thesis_data)
 
         # Build OCC symbol and register for streaming watermark tracking
         try:
@@ -1075,6 +1216,17 @@ def _handle_exit_alert(alert: dict):
 
         else:
             return
+
+        # v7.2: Silent Thesis Layer — level proximity context in exit alerts
+        _prox_ticker = parsed.get("ticker", "")
+        if _prox_ticker:
+            try:
+                _prox_spot = get_spot(_prox_ticker)
+                _prox = _get_thesis_proximity(_prox_ticker, _prox_spot)
+                if _prox:
+                    msg += f"\n{_prox}"
+            except Exception:
+                pass
 
         post_to_telegram(msg)
         log.info(f"Exit alert sent: {alert_type} for {alert.get('ticker', contract_label)}")
@@ -4551,6 +4703,11 @@ def _run_v4_prefilter(ticker: str, spot: float, chains: list, candle_closes: lis
 
                         msg = _flow_detector.format_conviction_play(cp)
 
+                        # v7.2: Silent Thesis Layer — informational enrichment (no gating)
+                        _thesis_block = _get_thesis_enrichment(cp["ticker"], cp.get("trade_direction", ""))
+                        if _thesis_block:
+                            msg += _thesis_block
+
                         # ── Issue 5: Spread routing for conviction plays ──
                         # Run through options engine for defined-risk spread alternative
                         spread_msg = ""
@@ -5969,6 +6126,10 @@ def _get_0dte_iv(ticker: str, target_date_str: str = None) -> tuple:
                     try:
                         route = cp.get("route", "immediate")
                         msg = _flow_detector.format_conviction_play(cp)
+                        # v7.2: Silent Thesis Layer — informational enrichment (no gating)
+                        _thesis_block = _get_thesis_enrichment(cp["ticker"], cp.get("trade_direction", ""))
+                        if _thesis_block:
+                            msg += _thesis_block
                         post_to_telegram(msg)
                         if route in ("immediate", "swing") and TELEGRAM_CHAT_INTRADAY and TELEGRAM_CHAT_INTRADAY != TELEGRAM_CHAT_ID:
                             post_to_telegram(msg, chat_id=TELEGRAM_CHAT_INTRADAY)
@@ -6169,6 +6330,10 @@ def _get_chain_iv_for_expiry(ticker: str, target_date_str: str, dte: float) -> t
                     try:
                         route = cp.get("route", "immediate")
                         msg = _flow_detector.format_conviction_play(cp)
+                        # v7.2: Silent Thesis Layer — informational enrichment (no gating)
+                        _thesis_block = _get_thesis_enrichment(cp["ticker"], cp.get("trade_direction", ""))
+                        if _thesis_block:
+                            msg += _thesis_block
                         post_to_telegram(msg)
                         if route in ("immediate", "swing") and TELEGRAM_CHAT_INTRADAY and TELEGRAM_CHAT_INTRADAY != TELEGRAM_CHAT_ID:
                             post_to_telegram(msg, chat_id=TELEGRAM_CHAT_INTRADAY)
@@ -9242,14 +9407,16 @@ def _em_scheduler():
                     for ticker in EM_TICKERS:
                         threading.Thread(target=_post_em_card, args=(ticker, session), daemon=True).start()
 
-            # ── Silent thesis generation for all flow tickers (8:50 AM CT) ──
-            # Runs after first EM cards fire (8:45). Generates thesis for all 35
-            # flow tickers so conviction plays have EM alignment data.
+            # ── Silent thesis generation for all flow tickers (8:30 AM CT) ──
+            # v7.2: Moved from 8:50→8:30 CT. Generates thesis for all ~30 flow
+            # tickers BEFORE market open so conviction plays have structural
+            # context (put wall, call wall, GEX sign, gamma flip, EM boundaries,
+            # dealer regime, key S/R). Stored in Redis, NOT posted to Telegram.
             _silent_key = (date_str, "silent_thesis")
             if _silent_key not in fired_today:
-                if now_ct.hour == 8 and 49 <= now_ct.minute <= 51:
+                if now_ct.hour == 8 and 29 <= now_ct.minute <= 31:
                     fired_today.add(_silent_key)
-                    log.info("Silent thesis generation firing for all flow tickers")
+                    log.info("Silent thesis generation firing for all flow tickers (8:30 CT)")
                     threading.Thread(target=_generate_all_silent_theses,
                                      daemon=True, name="silent-thesis").start()
 
@@ -9886,6 +10053,10 @@ def _initialize_app():
                     plays = _flow_detector.detect_conviction_plays([alert])
                     for cp in plays:
                         cp_msg = _flow_detector.format_conviction_play(cp)
+                        # v7.2: Silent Thesis Layer — informational enrichment (no gating)
+                        _thesis_block = _get_thesis_enrichment(cp["ticker"], cp.get("trade_direction", ""))
+                        if _thesis_block:
+                            cp_msg += _thesis_block
                         # Shadow gate: don't post EM-conflicting short-dated plays
                         if not cp.get("is_shadow_only"):
                             post_to_telegram(cp_msg)
@@ -10305,4 +10476,3 @@ _initialize_app()
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
-
