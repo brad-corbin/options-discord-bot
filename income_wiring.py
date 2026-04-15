@@ -76,12 +76,15 @@ def create_income_handlers(
                             return
 
                         # Post top 3 opportunities
+                        # v7.2.1: Skip cards with hard blocks (e.g., $0 credit, break-even past failure).
+                        # Previously only checked grade != F, so grade C cards with hard blocks
+                        # still posted showing $0.00 credit / 0% ROC.
                         for opp in opps[:3]:
-                            if opp["itqs"]["grade"] != "F":
+                            if opp["itqs"]["grade"] != "F" and not opp.get("hard_blocks"):
                                 post_fn(format_income_alert(opp), chat_id=chat_id)
 
-                        if not any(o["itqs"]["grade"] != "F" for o in opps):
-                            post_fn(f"📊 Income scan {ticker}: all opportunities below threshold (grade F).",
+                        if not any(o["itqs"]["grade"] != "F" and not o.get("hard_blocks") for o in opps):
+                            post_fn(f"📊 Income scan {ticker}: no qualifying opportunities (all blocked or below threshold).",
                                     chat_id=chat_id)
                     else:
                         # Full universe scan
