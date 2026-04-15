@@ -860,11 +860,14 @@ class ContinuousFlowScanner:
       - Divides FLOW_TICKERS into batches of BATCH_SIZE
       - Each cycle scans one batch
       - Full rotation through all tickers every ~SCAN_INTERVAL * num_batches seconds
-      - e.g., 35 tickers / 5 per batch = 7 batches × 60s = 7 min full rotation
+      - e.g., 35 tickers / 12 per batch = 3 batches × 60s = 3 min full rotation
     """
 
     SCAN_INTERVAL = 60    # seconds between batch scans
-    BATCH_SIZE = 5        # tickers per scan cycle
+    BATCH_SIZE = 12       # tickers per scan cycle (v7.2.1: was 5, now 12)
+                          # 35 tickers / 12 per batch = 3 batches × 60s = ~3 min full rotation
+                          # API budget: 12 × ~7 calls = ~84/min, leaves ~36/min headroom
+                          # for EM cards, trade cards, exposure engine, etc.
 
     def __init__(self, tickers: list, cached_md, flow_detector,
                  get_spot_fn: Callable,
