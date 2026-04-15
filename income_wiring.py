@@ -179,8 +179,13 @@ def create_ohlcv_wrapper(daily_candle_fn: Callable, md_get_fn: Callable = None,
                         "close": [b["c"] for b in bars],
                         "volume": [b.get("v", 0) for b in bars],
                     }
+                elif bars is not None:
+                    log.warning(f"Schwab OHLCV for {ticker}: only {len(bars)} bars "
+                                 f"(need ≥30), trying MarketData fallback")
+                else:
+                    log.warning(f"Schwab OHLCV returned None for {ticker}, trying MarketData fallback")
             except Exception as e:
-                log.debug(f"Schwab OHLCV failed for {ticker}: {e}")
+                log.warning(f"Schwab OHLCV failed for {ticker}: {e}, trying MarketData fallback")
 
         # Strategy 1: MarketData daily candles (already paid for, never rate-limits)
         if md_get_fn:
@@ -207,23 +212,13 @@ def create_ohlcv_wrapper(daily_candle_fn: Callable, md_get_fn: Callable = None,
                             "volume": [float(x) for x in (volumes[:n] if len(volumes) >= n else [0]*n)],
                         }
             except Exception as e:
-                log.debug(f"MarketData OHLCV failed for {ticker}: {e}")
+                log.warning(f"MarketData OHLCV failed for {ticker}: {e}")
 
-        # Strategy 2: yfinance (can rate-limit and hang)
-        try:
-            import yfinance as yf
-            data = yf.download(ticker, period="1y", interval="1d",
-                               progress=False, multi_level_index=False, timeout=15)
-            if data is not None and len(data) >= 30:
-                return {
-                    "open": data["Open"].tolist(),
-                    "high": data["High"].tolist(),
-                    "low": data["Low"].tolist(),
-                    "close": data["Close"].tolist(),
-                    "volume": data["Volume"].tolist(),
-                }
-        except Exception as e:
-            log.debug(f"yfinance OHLCV failed for {ticker}: {e}")
+        # v7.2.1: Yahoo fallback removed — Schwab + MarketData cover all tickers.
+        # Log clearly so we know if both providers fail for a ticker.
+        if schwab_bars_fn or md_get_fn:
+            log.warning(f"All OHLCV providers failed for {ticker} — "
+                         "falling through to closes-only degraded mode")
 
         # Strategy 3: closes-only degraded mode
         try:
