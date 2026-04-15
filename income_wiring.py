@@ -31,6 +31,7 @@ def create_income_handlers(
     regime_fn: Callable,
     post_fn: Callable,
     flow_fn: Callable = None,
+    position_monitor=None,
 ):
     """
     Factory that creates the two Telegram command handlers.
@@ -42,7 +43,39 @@ def create_income_handlers(
     regime_fn:      function() → regime package dict
     post_fn:        post_to_telegram(text)
     flow_fn:        function(ticker, strike, trade_type, expiry) → flow_data dict
+    position_monitor: PositionMonitor instance for live P&L tracking
     """
+
+    def _register_income_position(opp):
+        """Register an income opportunity with the position monitor for sheet tracking."""
+        if not position_monitor:
+            return
+        try:
+            from schwab_stream import build_occ_symbol
+            ticker = opp["ticker"]
+            _side = "P" if opp["trade_type"] == "bull_put" else "C"
+            _occ = build_occ_symbol(
+                ticker, opp.get("expiry", ""),
+                _side, opp["short_strike"],
+            )
+            position_monitor.register_position(
+                ticker=ticker,
+                direction="bull" if opp["trade_type"] == "bull_put" else "bear",
+                trade_type="income",
+                occ_symbol=_occ,
+                entry_mid=opp.get("credit", 0),
+                expiry=opp.get("expiry", ""),
+                strike=opp["short_strike"],
+                option_type="put" if _side == "P" else "call",
+                entry_spot=opp.get("spot", 0),
+                metadata={"itqs_score": opp["itqs"]["score"],
+                          "grade": opp["itqs"]["grade"],
+                          "cushion": opp.get("cushion_pct", 0),
+                          "trade_type": opp["trade_type"],
+                          "source": "scheduled_scan"},
+            )
+        except Exception as e:
+            log.warning(f"Income position register failed for {opp.get('ticker','?')}: {e}")
 
     def income_scan_fn(chat_id: str, ticker: Optional[str] = None):
         """
@@ -82,12 +115,20 @@ def create_income_handlers(
                         for opp in opps[:3]:
                             if opp["itqs"]["grade"] != "F" and not opp.get("hard_blocks"):
                                 post_fn(format_income_alert(opp), chat_id=chat_id)
+                                # v7.2.1: Register A+/A grade income positions for sheet tracking
+                                if opp["itqs"]["grade"] in ("A+", "A"):
+                                    _register_income_position(opp)
 
                         if not any(o["itqs"]["grade"] != "F" and not o.get("hard_blocks") for o in opps):
                             post_fn(f"📊 Income scan {ticker}: no qualifying opportunities (all blocked or below threshold).",
                                     chat_id=chat_id)
                     else:
-                        # Full universe scan
+                        # Full universe scan — capture results for position registration
+                        _scan_results = []
+
+                        def _notify_and_capture(msg, **kwargs):
+                            post_fn(msg, **kwargs)
+
                         run_income_scan(
                             regime_package=pkg,
                             ohlcv_fn=ohlcv_fn,
@@ -96,6 +137,29 @@ def create_income_handlers(
                             flow_fn=flow_fn,
                             notify_fn=lambda msg: post_fn(msg, chat_id=chat_id),
                         )
+
+                        # v7.2.1: Run a second pass to register A+/A positions for sheet tracking.
+                        # run_income_scan already posted alerts — we re-scan to get the result objects.
+                        # This is lightweight because the data is cached from the first pass.
+                        try:
+                            from income_scanner import scan_ticker_income, INCOME_TICKERS
+                            for _t in INCOME_TICKERS:
+                                try:
+                                    _opps = scan_ticker_income(
+                                        _t, pkg,
+                                        ohlcv_fn=ohlcv_fn,
+                                        chain_fn=chain_fn,
+                                        expirations_fn=expirations_fn,
+                                        flow_fn=flow_fn,
+                                    )
+                                    for _o in (_opps or []):
+                                        if (_o["itqs"]["grade"] in ("A+", "A")
+                                                and not _o.get("hard_blocks")):
+                                            _register_income_position(_o)
+                                except Exception:
+                                    pass
+                        except Exception as _reg_err:
+                            log.warning(f"Income position registration pass failed: {_reg_err}")
 
                 except Exception as e:
                     log.error(f"Income scan error: {e}", exc_info=True)
