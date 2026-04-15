@@ -377,6 +377,28 @@ class PersistentState:
         self._set(key, "1", ttl=cooldown_seconds)
         return True
 
+    def flush_conviction_cooldowns(self) -> int:
+        """Flush all conviction cooldown keys from Redis.
+
+        Called on startup/deploy so that pre-restart cooldowns
+        don't silently block new conviction plays.
+        Returns the number of keys flushed.
+        """
+        if not self._scan:
+            return 0
+        try:
+            keys = self._scan("flow_cd:conviction:*")
+            for k in keys:
+                # Expire immediately — no delete primitive, so set TTL=1
+                self._set(k, "0", ttl=1)
+            if keys:
+                log.info(f"Flushed {len(keys)} conviction cooldown keys on startup: "
+                         f"{[k.replace('flow_cd:conviction:', '') for k in keys[:10]]}")
+            return len(keys)
+        except Exception as e:
+            log.warning(f"Failed to flush conviction cooldowns: {e}")
+            return 0
+
     # ═══════════════════════════════════════════════════════
     # STALK ALERTS — persistent watchlist from confirmed flow
     # ═══════════════════════════════════════════════════════
