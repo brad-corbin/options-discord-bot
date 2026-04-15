@@ -4751,9 +4751,19 @@ def _run_v4_prefilter(ticker: str, spot: float, chains: list, candle_closes: lis
                         # Plays that fight a strong EM thesis are shadow-logged only
                         # (written to CSV for analysis but not posted to Telegram).
                         _is_shadow = cp.get("is_shadow_only", False)
+
+                        # v7.2: Exit signals for positions never posted to user → log only.
+                        # The direction flip is still tracked internally and logged to CSV,
+                        # but the user shouldn't be told to "close" a position they never entered.
+                        _is_phantom_exit = (cp.get("is_exit_signal") and
+                                           not cp.get("exit_prior_was_posted", True))
+
                         if _is_shadow:
                             log.info(f"🔇 SHADOW: {cp['ticker']} {cp['trade_side']} ${cp['strike']:.0f} "
                                      f"— flow fights EM card ({cp.get('em_detail','')})")
+                        elif _is_phantom_exit:
+                            log.info(f"🔇 EXIT SIGNAL SUPPRESSED: {cp['ticker']} "
+                                     f"— prior entry was never posted to user")
                         elif route == "immediate":
                             # 0-2 DTE: fire to BOTH channels immediately
                             post_to_telegram(msg)
@@ -4861,6 +4871,13 @@ def _run_v4_prefilter(ticker: str, spot: float, chains: list, candle_closes: lis
                                f"({cp['vol_oi_ratio']:.0f}x, {cp['dte']}DTE"
                                f"{', EM ALIGNED' if cp.get('em_aligned') else ', EM CONFLICT' if cp.get('em_conflict') else ''}"
                                f"{', SHADOW CONFIRMS' if cp.get('shadow_agrees') else ''})")
+
+                        # v7.2 fix: Confirm direction ONLY after actual Telegram post.
+                        # Prevents exit signals for positions never shown to user.
+                        if not _is_shadow and not _is_phantom_exit:
+                            _flow_detector.confirm_conviction_posted(
+                                cp["ticker"], cp.get("trade_direction", ""),
+                                cp.get("strike", 0))
 
                         # Log to conviction_plays.csv for outcome tracking
                         try:
@@ -6130,9 +6147,19 @@ def _get_0dte_iv(ticker: str, target_date_str: str = None) -> tuple:
                         _thesis_block = _get_thesis_enrichment(cp["ticker"], cp.get("trade_direction", ""))
                         if _thesis_block:
                             msg += _thesis_block
-                        post_to_telegram(msg)
-                        if route in ("immediate", "swing") and TELEGRAM_CHAT_INTRADAY and TELEGRAM_CHAT_INTRADAY != TELEGRAM_CHAT_ID:
-                            post_to_telegram(msg, chat_id=TELEGRAM_CHAT_INTRADAY)
+                        # v7.2: Suppress exit signals for positions never shown to user
+                        _is_phantom_exit = (cp.get("is_exit_signal") and
+                                           not cp.get("exit_prior_was_posted", True))
+                        if _is_phantom_exit:
+                            log.info(f"🔇 EXIT SIGNAL SUPPRESSED: {cp['ticker']} "
+                                     f"— prior entry was never posted to user")
+                        else:
+                            post_to_telegram(msg)
+                            if route in ("immediate", "swing") and TELEGRAM_CHAT_INTRADAY and TELEGRAM_CHAT_INTRADAY != TELEGRAM_CHAT_ID:
+                                post_to_telegram(msg, chat_id=TELEGRAM_CHAT_INTRADAY)
+                            # v7.2 fix: Confirm direction posted for exit signal tracking
+                            _flow_detector.confirm_conviction_posted(
+                                cp["ticker"], cp.get("trade_direction", ""), cp.get("strike", 0))
                         log.info(f"💎 CONVICTION [{route.upper()}]: {cp['ticker']} "
                                f"{cp['trade_side']} ${cp['strike']:.0f} ({cp['dte']}DTE)")
                         # Store conviction boost for EntryValidator
@@ -6334,9 +6361,19 @@ def _get_chain_iv_for_expiry(ticker: str, target_date_str: str, dte: float) -> t
                         _thesis_block = _get_thesis_enrichment(cp["ticker"], cp.get("trade_direction", ""))
                         if _thesis_block:
                             msg += _thesis_block
-                        post_to_telegram(msg)
-                        if route in ("immediate", "swing") and TELEGRAM_CHAT_INTRADAY and TELEGRAM_CHAT_INTRADAY != TELEGRAM_CHAT_ID:
-                            post_to_telegram(msg, chat_id=TELEGRAM_CHAT_INTRADAY)
+                        # v7.2: Suppress exit signals for positions never shown to user
+                        _is_phantom_exit = (cp.get("is_exit_signal") and
+                                           not cp.get("exit_prior_was_posted", True))
+                        if _is_phantom_exit:
+                            log.info(f"🔇 EXIT SIGNAL SUPPRESSED: {cp['ticker']} "
+                                     f"— prior entry was never posted to user")
+                        else:
+                            post_to_telegram(msg)
+                            if route in ("immediate", "swing") and TELEGRAM_CHAT_INTRADAY and TELEGRAM_CHAT_INTRADAY != TELEGRAM_CHAT_ID:
+                                post_to_telegram(msg, chat_id=TELEGRAM_CHAT_INTRADAY)
+                            # v7.2 fix: Confirm direction posted for exit signal tracking
+                            _flow_detector.confirm_conviction_posted(
+                                cp["ticker"], cp.get("trade_direction", ""), cp.get("strike", 0))
                         log.info(f"💎 CONVICTION [{route.upper()}]: {cp['ticker']} "
                                f"{cp['trade_side']} ${cp['strike']:.0f} ({cp['dte']}DTE)")
                         # Store conviction boost for EntryValidator
@@ -10057,11 +10094,19 @@ def _initialize_app():
                         _thesis_block = _get_thesis_enrichment(cp["ticker"], cp.get("trade_direction", ""))
                         if _thesis_block:
                             cp_msg += _thesis_block
-                        # Shadow gate: don't post EM-conflicting short-dated plays
-                        if not cp.get("is_shadow_only"):
+                        # Shadow gate + phantom exit gate
+                        _is_phantom_exit = (cp.get("is_exit_signal") and
+                                           not cp.get("exit_prior_was_posted", True))
+                        if _is_phantom_exit:
+                            log.info(f"🔇 EXIT SIGNAL SUPPRESSED (sweep): {cp['ticker']} "
+                                     f"— prior entry was never posted to user")
+                        elif not cp.get("is_shadow_only"):
                             post_to_telegram(cp_msg)
                             if cp.get("route") in ("immediate", "swing") and TELEGRAM_CHAT_INTRADAY:
                                 post_to_telegram(cp_msg, chat_id=TELEGRAM_CHAT_INTRADAY)
+                            # v7.2 fix: Confirm direction posted for exit signal tracking
+                            _flow_detector.confirm_conviction_posted(
+                                cp["ticker"], cp.get("trade_direction", ""), cp.get("strike", 0))
                         else:
                             log.info(f"🔇 SHADOW (sweep): {cp['ticker']} {cp.get('em_detail','')}")
                         if _log_conviction_play:
