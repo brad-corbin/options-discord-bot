@@ -2443,6 +2443,7 @@ class FlowDetector:
         # v7.1: YOUR TRADE line — prominently shows what YOU should trade
         # This prevents confusion when flow shows "PUT" but direction is bullish
         # (institutions selling puts = bullish, but user sees "PUT" and thinks bearish)
+        trade_direction = play.get("trade_direction", "")
         _your_side = "CALL" if trade_direction == "bullish" else "PUT"
         _your_verb = "BULLISH" if trade_direction == "bullish" else "BEARISH"
         _your_strike = play.get("rec_strike", strike)
