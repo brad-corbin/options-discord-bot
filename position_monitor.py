@@ -519,7 +519,7 @@ class PositionMonitor:
             self._sheet_fn(tab, fieldnames, row)
             log.info(f"PositionMonitor sheets CLOSE logged: {pos.pos_id}")
         except Exception as e:
-            log.debug(f"PositionMonitor sheets log failed: {e}")
+            log.warning(f"PositionMonitor sheets CLOSE log failed for {pos.pos_id} {pos.ticker}: {e}")
 
     def _log_open_to_sheets(self, pos: MonitoredPosition):
         """Log position OPEN to Google Sheets immediately on registration."""
@@ -557,7 +557,7 @@ class PositionMonitor:
             self._sheet_fn(tab, fieldnames, row)
             log.info(f"PositionMonitor sheets OPEN logged: {pos.pos_id} {pos.ticker} {pos.trade_type}")
         except Exception as e:
-            log.debug(f"PositionMonitor sheets open log failed: {e}")
+            log.warning(f"PositionMonitor sheets OPEN log failed for {pos.pos_id} {pos.ticker}: {e}")
 
     def get_open_positions(self, trade_type: str = None) -> List[MonitoredPosition]:
         """Get all open (non-expired, non-closed) positions."""
