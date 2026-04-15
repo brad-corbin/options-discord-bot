@@ -10060,102 +10060,109 @@ def _initialize_app():
             register_webhook(BOT_URL, _tg_ws)
         _start_background_services_once()
 
-        # Phase 2: Schwab streaming + continuous flow scanning
-        try:
-            from schwab_stream import start_streaming, start_continuous_flow
-            start_streaming(_cached_md)
-            start_continuous_flow(
-                cached_md=_cached_md,
-                flow_detector=_flow_detector,
-                get_spot_fn=get_spot,
-                get_expirations_fn=get_expirations,
-                post_fn=post_to_telegram,
-                log_conviction_fn=_log_conviction_play,
-                get_regime_fn=get_current_regime,
-                income_scan_fn=_income_scan_fn,
-                persistent_state=_persistent_state,
-                intraday_chat_id=TELEGRAM_CHAT_INTRADAY,
-            )
-        except Exception as _e:
-            log.warning(f"Phase 2 streaming init failed: {_e}")
-
-        # Phase 3: WebSocket option streaming — live Greeks, sweep detection, live premium
-        try:
-            from schwab_stream import (start_option_streaming, get_option_store,
-                                        get_sweep_detector)
-
-            def _handle_sweep(sweep: dict):
-                """Sweep callback: log for analysis, only post actionable conviction plays."""
-                try:
-                    alert = _flow_detector.handle_sweep(sweep)
-                    if not alert:
-                        return
-
-                    # Log sweep for analysis — no Telegram for raw sweeps
-                    log.info(f"SWEEP: {alert['ticker']} {alert.get('strike',0)} "
-                             f"{alert.get('side','')} {alert.get('directional_bias','')} "
-                             f"vol={alert.get('volume',0)} notional=${alert.get('sweep_notional',0):,.0f}")
-
-                    # Only post to Telegram if conviction pipeline promotes it to a trade
-                    plays = _flow_detector.detect_conviction_plays([alert])
-                    for cp in plays:
-                        cp_msg = _flow_detector.format_conviction_play(cp)
-                        # v7.2: Silent Thesis Layer — informational enrichment (no gating)
-                        try:
-                            _thesis_block = _get_thesis_enrichment(cp["ticker"], cp.get("trade_direction", ""))
-                            if _thesis_block:
-                                cp_msg += _thesis_block
-                        except Exception as _te:
-                            log.debug(f"Thesis enrichment failed (sweep) for {cp['ticker']}: {_te}")
-                        # Shadow gate + phantom exit gate
-                        _is_phantom_exit = (cp.get("is_exit_signal") and
-                                           not cp.get("exit_prior_was_posted", True))
-                        if _is_phantom_exit:
-                            log.info(f"🔇 EXIT SIGNAL SUPPRESSED (sweep): {cp['ticker']} "
-                                     f"— prior entry was never posted to user")
-                        elif not cp.get("is_shadow_only"):
-                            post_to_telegram(cp_msg)
-                            if cp.get("route") in ("immediate", "swing") and TELEGRAM_CHAT_INTRADAY:
-                                post_to_telegram(cp_msg, chat_id=TELEGRAM_CHAT_INTRADAY)
-                            # v7.2 fix: Confirm direction posted for exit signal tracking
-                            _flow_detector.confirm_conviction_posted(
-                                cp["ticker"], cp.get("trade_direction", ""), cp.get("strike", 0))
-                        else:
-                            log.info(f"🔇 SHADOW (sweep): {cp['ticker']} {cp.get('em_detail','')}")
-                        if _log_conviction_play:
-                            regime = get_current_regime() if get_current_regime else "UNKNOWN"
-                            _log_conviction_play(cp, regime=regime)
-                except Exception as e:
-                    log.warning(f"Sweep handler error: {e}")
-
-            start_option_streaming(
-                cached_md=_cached_md,
-                get_spot_fn=get_spot,
-                get_expirations_fn=get_expirations,
-                on_sweep_fn=_handle_sweep,
-            )
-
-            # Wire option store into flow detector for streaming overlay
-            _flow_detector.set_option_store(get_option_store())
-
-            # Wire exit management alerts for conviction play premium tracking
-            get_option_store().set_exit_alert_callback(_handle_exit_alert)
-            log.info("Exit management: conviction play trailing stop alerts wired")
-
-            # Issue 1: Wire conviction plays into thesis monitor for exit logic
+        # v7.2.1: Only the leader worker opens WebSocket connections.
+        # Schwab allows ONE concurrent WebSocket per account — multiple workers
+        # fighting for the connection causes a ~55s connect/disconnect cycle on
+        # every deploy. Non-leader workers read from the shared OptionQuoteStore.
+        if _acquire_background_leader():
+            # Phase 2: Schwab streaming + continuous flow scanning
             try:
-                _te = get_thesis_engine()
-                if _te:
-                    _flow_detector.set_thesis_monitor_fn(_te.create_conviction_trade)
-                    _flow_detector.set_get_thesis_fn(_te.get_thesis)
-                    log.info("Issue 1: Conviction plays → thesis monitor exit logic wired")
-                    log.info("EM alignment gate wired: conviction plays check thesis bias")
-            except Exception as _wire_err:
-                log.debug(f"Conviction → thesis monitor wiring: {_wire_err}")
+                from schwab_stream import start_streaming, start_continuous_flow
+                start_streaming(_cached_md)
+                start_continuous_flow(
+                    cached_md=_cached_md,
+                    flow_detector=_flow_detector,
+                    get_spot_fn=get_spot,
+                    get_expirations_fn=get_expirations,
+                    post_fn=post_to_telegram,
+                    log_conviction_fn=_log_conviction_play,
+                    get_regime_fn=get_current_regime,
+                    income_scan_fn=_income_scan_fn,
+                    persistent_state=_persistent_state,
+                    intraday_chat_id=TELEGRAM_CHAT_INTRADAY,
+                )
+            except Exception as _e:
+                log.warning(f"Phase 2 streaming init failed: {_e}")
 
-            log.info("Phase 3 option streaming wired: sweeps → flow → conviction → Telegram")
-        except Exception as _e:
-            log.warning(f"Phase 3 option streaming init failed: {_e}")
+            # Phase 3: WebSocket option streaming — live Greeks, sweep detection, live premium
+            try:
+                from schwab_stream import (start_option_streaming, get_option_store,
+                                            get_sweep_detector)
+
+                def _handle_sweep(sweep: dict):
+                    """Sweep callback: log for analysis, only post actionable conviction plays."""
+                    try:
+                        alert = _flow_detector.handle_sweep(sweep)
+                        if not alert:
+                            return
+
+                        # Log sweep for analysis — no Telegram for raw sweeps
+                        log.info(f"SWEEP: {alert['ticker']} {alert.get('strike',0)} "
+                                 f"{alert.get('side','')} {alert.get('directional_bias','')} "
+                                 f"vol={alert.get('volume',0)} notional=${alert.get('sweep_notional',0):,.0f}")
+
+                        # Only post to Telegram if conviction pipeline promotes it to a trade
+                        plays = _flow_detector.detect_conviction_plays([alert])
+                        for cp in plays:
+                            cp_msg = _flow_detector.format_conviction_play(cp)
+                            # v7.2: Silent Thesis Layer — informational enrichment (no gating)
+                            try:
+                                _thesis_block = _get_thesis_enrichment(cp["ticker"], cp.get("trade_direction", ""))
+                                if _thesis_block:
+                                    cp_msg += _thesis_block
+                            except Exception as _te:
+                                log.debug(f"Thesis enrichment failed (sweep) for {cp['ticker']}: {_te}")
+                            # Shadow gate + phantom exit gate
+                            _is_phantom_exit = (cp.get("is_exit_signal") and
+                                               not cp.get("exit_prior_was_posted", True))
+                            if _is_phantom_exit:
+                                log.info(f"🔇 EXIT SIGNAL SUPPRESSED (sweep): {cp['ticker']} "
+                                         f"— prior entry was never posted to user")
+                            elif not cp.get("is_shadow_only"):
+                                post_to_telegram(cp_msg)
+                                if cp.get("route") in ("immediate", "swing") and TELEGRAM_CHAT_INTRADAY:
+                                    post_to_telegram(cp_msg, chat_id=TELEGRAM_CHAT_INTRADAY)
+                                # v7.2 fix: Confirm direction posted for exit signal tracking
+                                _flow_detector.confirm_conviction_posted(
+                                    cp["ticker"], cp.get("trade_direction", ""), cp.get("strike", 0))
+                            else:
+                                log.info(f"🔇 SHADOW (sweep): {cp['ticker']} {cp.get('em_detail','')}")
+                            if _log_conviction_play:
+                                regime = get_current_regime() if get_current_regime else "UNKNOWN"
+                                _log_conviction_play(cp, regime=regime)
+                    except Exception as e:
+                        log.warning(f"Sweep handler error: {e}")
+
+                start_option_streaming(
+                    cached_md=_cached_md,
+                    get_spot_fn=get_spot,
+                    get_expirations_fn=get_expirations,
+                    on_sweep_fn=_handle_sweep,
+                )
+
+                # Wire option store into flow detector for streaming overlay
+                _flow_detector.set_option_store(get_option_store())
+
+                # Wire exit management alerts for conviction play premium tracking
+                get_option_store().set_exit_alert_callback(_handle_exit_alert)
+                log.info("Exit management: conviction play trailing stop alerts wired")
+
+                # Issue 1: Wire conviction plays into thesis monitor for exit logic
+                try:
+                    _te = get_thesis_engine()
+                    if _te:
+                        _flow_detector.set_thesis_monitor_fn(_te.create_conviction_trade)
+                        _flow_detector.set_get_thesis_fn(_te.get_thesis)
+                        log.info("Issue 1: Conviction plays → thesis monitor exit logic wired")
+                        log.info("EM alignment gate wired: conviction plays check thesis bias")
+                except Exception as _wire_err:
+                    log.debug(f"Conviction → thesis monitor wiring: {_wire_err}")
+
+                log.info("Phase 3 option streaming wired: sweeps → flow → conviction → Telegram")
+            except Exception as _e:
+                log.warning(f"Phase 3 option streaming init failed: {_e}")
+        else:
+            log.info("Non-leader worker: skipping WebSocket streaming (leader worker owns Schwab connection)")
 
         # v7.0: Wire Schwab daily bars into swing scanner (replaces Yahoo dependency)
         try:
