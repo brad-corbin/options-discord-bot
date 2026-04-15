@@ -1080,10 +1080,11 @@ class ContinuousFlowScanner:
                     log.info(f"💎 CONVICTION [{route.upper()}] (continuous): "
                              f"{ticker} {cp['trade_side']} "
                              f"${cp['strike']:.0f} ({cp['dte']}DTE)")
-                except Exception:
-                    pass
-        except Exception:
-            pass
+                except Exception as _cp_err:
+                    log.warning(f"❌ Conviction play CRASHED (continuous) for {cp.get('ticker', '?')}: {_cp_err}")
+                    import traceback; log.debug(traceback.format_exc())
+        except Exception as _scan_err:
+            log.warning(f"❌ Flow scan CRASHED for {ticker}: {_scan_err}")
 
     @property
     def status(self) -> dict:
