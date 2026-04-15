@@ -3047,21 +3047,23 @@ def _process_job(worker_id: int, job: dict):
                         if _v7_exp and _v7_strike > 0:
                             _v7_occ = build_occ_symbol(ticker, _v7_exp, _v7_side, _v7_strike)
                             _v7_mid = get_live_premium(_v7_occ) or 0
-                            if _v7_mid > 0:
-                                _position_monitor.register_position(
-                                    ticker=ticker, direction=bias, trade_type="shadow",
-                                    occ_symbol=_v7_occ, entry_mid=_v7_mid,
-                                    expiry=_v7_exp, strike=_v7_strike,
-                                    option_type="call" if _v7_side == "C" else "put",
-                                    entry_spot=_v7_spot,
-                                    metadata={"filter_category": _v7_category,
-                                              "filter_reason": _v7_reason,
-                                              "score": (webhook_data or {}).get("score"),
-                                              "regime": _v7_regime},
-                                )
-                                log.info(f"v7 shadow position registered: {_v7_occ} @ ${_v7_mid:.2f}")
+                            if _v7_mid <= 0:
+                                log.warning(f"Shadow position {ticker}: no streaming price for "
+                                             f"{_v7_occ} — registering with mid=0 for sheet tracking")
+                            _position_monitor.register_position(
+                                ticker=ticker, direction=bias, trade_type="shadow",
+                                occ_symbol=_v7_occ, entry_mid=_v7_mid,
+                                expiry=_v7_exp, strike=_v7_strike,
+                                option_type="call" if _v7_side == "C" else "put",
+                                entry_spot=_v7_spot,
+                                metadata={"filter_category": _v7_category,
+                                          "filter_reason": _v7_reason,
+                                          "score": (webhook_data or {}).get("score"),
+                                          "regime": _v7_regime},
+                            )
+                            log.info(f"v7 shadow position registered: {_v7_occ} @ ${_v7_mid:.2f}")
                 except Exception as _v7_pm_err:
-                    log.debug(f"v7 shadow position register failed: {_v7_pm_err}")
+                    log.warning(f"v7 shadow position register failed for {ticker}: {_v7_pm_err}")
 
                 base["reason"] = f"v7 filter: {_v7_reason}"
                 base["outcome"] = "v7_filtered"
@@ -3433,7 +3435,7 @@ def _process_job(worker_id: int, job: dict):
                                   "tier": rec.get("tier", "?")},
                     )
             except Exception as _sw_pm_err:
-                log.debug(f"Swing position register failed: {_sw_pm_err}")
+                log.warning(f"Swing position register failed for {ticker}: {_sw_pm_err}")
 
 
 def _signal_queue_worker_redis(worker_id: int):
@@ -4853,7 +4855,7 @@ def _run_v4_prefilter(ticker: str, spot: float, chains: list, candle_closes: lis
                                                       "trade_type": _best_income["trade_type"]},
                                         )
                                 except Exception as _inc_pm_err:
-                                    log.debug(f"Income position register failed: {_inc_pm_err}")
+                                    log.warning(f"Income position register failed for {cp.get('ticker','?')}: {_inc_pm_err}")
                             else:
                                 msg += "\n\n📊 Income scan: no qualifying opportunities found"
 
@@ -4905,28 +4907,36 @@ def _run_v4_prefilter(ticker: str, spot: float, chains: list, candle_closes: lis
                                 _cv_strike = float(cp.get("rec_strike", cp.get("strike", 0)))
                                 _cv_exp = str(cp.get("expiry", ""))[:10]
                                 _cv_occ = build_occ_symbol(cp["ticker"], _cv_exp, _cv_side, _cv_strike)
-                                _cv_mid = float(cp.get("rec_mid", cp.get("mid", 0)) or 0)
+                                # v7.2.1: Try multiple price sources — rec_mid, mid, ask, then streaming
+                                _cv_mid = float(cp.get("rec_mid", 0) or 0)
+                                if _cv_mid <= 0:
+                                    _cv_mid = float(cp.get("mid", 0) or 0)
+                                if _cv_mid <= 0:
+                                    _cv_mid = float(cp.get("rec_ask", cp.get("ask", 0)) or 0)
                                 if _cv_mid <= 0:
                                     _cv_mid = get_live_premium(_cv_occ) or 0
-                                if _cv_mid > 0:
-                                    _cv_dir = cp.get("trade_direction", "bull")
-                                    _position_monitor.register_position(
-                                        ticker=cp["ticker"],
-                                        direction=_cv_dir,
-                                        trade_type="conviction",
-                                        occ_symbol=_cv_occ,
-                                        entry_mid=_cv_mid,
-                                        expiry=_cv_exp,
-                                        strike=_cv_strike,
-                                        option_type="call" if _cv_side == "C" else "put",
-                                        entry_spot=float(cp.get("spot", cp.get("close", 0)) or 0),
-                                        metadata={"vol_oi_ratio": cp.get("vol_oi_ratio", 0),
-                                                  "dte": cp.get("dte", 0),
-                                                  "route": cp.get("route", ""),
-                                                  "em_aligned": cp.get("em_aligned", False)},
-                                    )
+                                if _cv_mid <= 0:
+                                    log.warning(f"Conviction position {cp['ticker']}: no price found "
+                                                 f"(rec_mid/mid/ask/streaming all 0) — registering with mid=0 "
+                                                 f"for sheet tracking. OCC={_cv_occ}")
+                                _cv_dir = cp.get("trade_direction", "bull")
+                                _position_monitor.register_position(
+                                    ticker=cp["ticker"],
+                                    direction=_cv_dir,
+                                    trade_type="conviction",
+                                    occ_symbol=_cv_occ,
+                                    entry_mid=_cv_mid,
+                                    expiry=_cv_exp,
+                                    strike=_cv_strike,
+                                    option_type="call" if _cv_side == "C" else "put",
+                                    entry_spot=float(cp.get("spot", cp.get("close", 0)) or 0),
+                                    metadata={"vol_oi_ratio": cp.get("vol_oi_ratio", 0),
+                                              "dte": cp.get("dte", 0),
+                                              "route": cp.get("route", ""),
+                                              "em_aligned": cp.get("em_aligned", False)},
+                                )
                         except Exception as _cv_pm_err:
-                            log.debug(f"Conviction position register failed: {_cv_pm_err}")
+                            log.warning(f"Conviction position register failed for {cp.get('ticker','?')}: {_cv_pm_err}")
 
                         # Store conviction boost for EntryValidator
                         try:
@@ -5569,24 +5579,35 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
                 if _position_monitor and trade:
                     from schwab_stream import build_occ_symbol
                     _act_side = "C" if direction == "bull" else "P"
-                    _act_occ = build_occ_symbol(ticker, best_rec.get("exp", ""), _act_side, trade.get("long", 0))
-                    _position_monitor.register_position(
-                        ticker=ticker,
-                        direction=direction,
-                        trade_type="active",
-                        occ_symbol=_act_occ,
-                        entry_mid=trade.get("debit", 0),
-                        expiry=best_rec.get("exp", ""),
-                        strike=trade.get("long", 0),
-                        option_type="call" if _act_side == "C" else "put",
-                        entry_spot=spot,
-                        metadata={"score": best_rec.get("score"),
-                                  "tier": best_rec.get("tier"),
-                                  "confidence": best_rec.get("confidence"),
-                                  "regime": regime},
-                    )
+                    _act_exp = best_rec.get("exp", "")
+                    _act_strike = trade.get("long", 0)
+                    if not _act_exp or _act_strike <= 0:
+                        log.warning(f"Active position skipped for {ticker}: "
+                                     f"exp='{_act_exp}' strike={_act_strike} — "
+                                     f"missing data from trade recommendation")
+                    else:
+                        _act_occ = build_occ_symbol(ticker, _act_exp, _act_side, _act_strike)
+                        _position_monitor.register_position(
+                            ticker=ticker,
+                            direction=direction,
+                            trade_type="active",
+                            occ_symbol=_act_occ,
+                            entry_mid=trade.get("debit", 0),
+                            expiry=_act_exp,
+                            strike=_act_strike,
+                            option_type="call" if _act_side == "C" else "put",
+                            entry_spot=spot,
+                            metadata={"score": best_rec.get("score"),
+                                      "tier": best_rec.get("tier"),
+                                      "confidence": best_rec.get("confidence"),
+                                      "regime": regime},
+                        )
+                elif not _position_monitor:
+                    log.warning(f"Active position skipped for {ticker}: _position_monitor is None")
+                elif not trade:
+                    log.warning(f"Active position skipped for {ticker}: trade dict is empty")
             except Exception as _act_pm_err:
-                log.debug(f"Active position register failed: {_act_pm_err}")
+                log.warning(f"Active position register failed for {ticker}: {_act_pm_err}")
         _log_signal_dataset_event(
             ticker, webhook_data,
             outcome="trade_opened" if risk_result["allowed"] else "risk_blocked",
@@ -10012,8 +10033,9 @@ def _start_background_services_once():
                 regime_fn=get_regime_package,
                 post_fn=post_to_telegram,
                 flow_fn=_income_flow_fn,
+                position_monitor=_position_monitor,
             )
-            log.info("Income scanner wired: /income and /score commands active (3-layer regime + flow)")
+            log.info("Income scanner wired: /income and /score commands active (3-layer regime + flow + position tracking)")
         except Exception as e:
             log.error(f"Income scanner wiring failed: {e}")
             _income_scan_fn = None
