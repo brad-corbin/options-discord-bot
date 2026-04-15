@@ -188,9 +188,10 @@ def set_daily_bars_fn(fn):
 
 def fetch_daily_bars(ticker: str, days: int = 120) -> List[dict]:
     """
-    v7.0: Fetch daily OHLCV — Schwab primary, Yahoo fallback.
+    v7.2.1: Fetch daily OHLCV via Schwab (sole provider).
     Returns list of dicts: [{date, o, h, l, c, v}, ...]
-    Cached for 4 hours.
+    Cached for 4 hours. Yahoo fallback removed — Schwab WebSocket
+    handles all price data without rate limits.
     """
     cache_key = f"bars:{ticker}:{days}"
     with _yf_cache_lock:
@@ -198,19 +199,29 @@ def fetch_daily_bars(ticker: str, days: int = 120) -> List[dict]:
         if cached and (time.time() - cached[1]) < _YF_CACHE_TTL:
             return cached[0]
 
-    # Try Schwab first
-    if _schwab_daily_bars_fn:
-        try:
-            bars = _schwab_daily_bars_fn(ticker, days)
-            if bars and len(bars) >= 20:
-                with _yf_cache_lock:
-                    _yf_cache[cache_key] = (bars, time.time())
-                return bars
-        except Exception as e:
-            log.debug(f"Schwab daily bars failed for {ticker}, falling back to Yahoo: {e}")
+    if not _schwab_daily_bars_fn:
+        log.warning(f"Daily bars requested for {ticker} but Schwab daily bars fn not wired — "
+                     "call set_daily_bars_fn() at startup")
+        return []
 
-    # Fallback to Yahoo
-    return fetch_daily_bars_yahoo(ticker, days)
+    try:
+        bars = _schwab_daily_bars_fn(ticker, days)
+        if bars and len(bars) >= 20:
+            with _yf_cache_lock:
+                _yf_cache[cache_key] = (bars, time.time())
+            return bars
+        elif bars is not None:
+            log.warning(f"Schwab daily bars for {ticker}: only {len(bars)} bars returned "
+                         f"(need ≥20, requested {days} days) — fib zones will be incomplete")
+            return bars or []
+        else:
+            log.warning(f"Schwab daily bars returned None for {ticker} — "
+                         "no price history available for fib/swing analysis")
+            return []
+    except Exception as e:
+        log.warning(f"Schwab daily bars failed for {ticker}: {e} — "
+                     "no fallback, fib zones unavailable for this ticker")
+        return []
 
 
 def fetch_daily_bars_yahoo(ticker: str, days: int = 120) -> List[dict]:
