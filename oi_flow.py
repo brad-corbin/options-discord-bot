@@ -594,6 +594,15 @@ class FlowDetector:
         # Reference to thesis engine for EM alignment gate
         self._get_thesis_fn = None  # callable(ticker) → ThesisContext or None
 
+        # v7.2 fix: Flush conviction cooldowns from prior process.
+        # Prevents pre-deploy cooldown keys from silently blocking post-deploy plays.
+        try:
+            flushed = self._state.flush_conviction_cooldowns()
+            if flushed:
+                log.info(f"FlowDetector: cleared {flushed} stale conviction cooldowns from prior session")
+        except Exception as e:
+            log.debug(f"Cooldown flush on startup: {e}")
+
     def set_option_store(self, store):
         """Wire the OptionQuoteStore for streaming option data overlay."""
         self._option_store = store
@@ -2122,6 +2131,8 @@ class FlowDetector:
             if not self._state.check_and_set_cooldown(
                 cooldown_key, CONVICTION_COOLDOWN
             ):
+                log.info(f"⏳ COOLDOWN blocked conviction: {ticker} {trade_side} "
+                         f"${alert['strike']:.0f} ({route}, {CONVICTION_COOLDOWN}s)")
                 continue
 
             # ── SESSION-LEVEL DEDUP (Issues 2+4) ──
