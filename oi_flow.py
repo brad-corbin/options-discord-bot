@@ -684,7 +684,7 @@ class FlowDetector:
         Returns:
           "new"         — first fire, full alert
           "hold"        — same direction re-fire, suppress
-          "exit"        — direction flipped, post exit signal
+          "exit"        — direction flipped (app.py decides whether to post based on posted flag)
           "new_strike"  — same direction but significantly different strike
         """
         existing = self._conviction_positions.get(ticker)
@@ -692,11 +692,14 @@ class FlowDetector:
             return "new"
 
         existing_dir = existing.get("direction", "")
-        existing_strike = existing.get("strike", 0)
 
-        # Direction flip → exit signal
+        # Direction flip → always return "exit" for internal tracking.
+        # v7.2: Whether to POST the exit signal to Telegram depends on the
+        # 'posted' flag, which app.py checks via exit_prior_was_posted.
         if existing_dir and existing_dir != trade_direction:
             return "exit"
+
+        existing_strike = existing.get("strike", 0)
 
         # Same direction — check if strike is significantly different (>3% from prior)
         if existing_strike > 0 and strike > 0:
@@ -709,7 +712,8 @@ class FlowDetector:
 
     def _update_conviction_session(self, ticker: str, trade_direction: str,
                                     strike: float, route: str):
-        """Update session state after firing a conviction alert."""
+        """Update session state after firing a conviction alert.
+        Note: posted flag defaults False until confirm_conviction_posted() is called."""
         existing = self._conviction_positions.get(ticker, {})
         fire_count = existing.get("fire_count", 0) + 1
         self._conviction_positions[ticker] = {
@@ -718,7 +722,38 @@ class FlowDetector:
             "route": route,
             "entry_time": datetime.now().isoformat(),
             "fire_count": fire_count,
+            "posted": existing.get("posted", False),  # v7.2: preserve posted flag
         }
+
+    def confirm_conviction_posted(self, ticker: str, trade_direction: str,
+                                   strike: float = 0):
+        """v7.2 fix: Called by app.py AFTER a conviction play is actually posted
+        to Telegram. Only after this call will exit signals fire for this ticker.
+
+        Prevents exit signals for positions that were detected but blocked by
+        Potter Box, dedup, shadow gate, etc.
+        """
+        # Update in-memory session state
+        existing = self._conviction_positions.get(ticker, {})
+        existing["posted"] = True
+        existing["direction"] = trade_direction
+        if strike > 0:
+            existing["strike"] = strike
+        self._conviction_positions[ticker] = existing
+
+        # Update Redis for cross-restart persistence
+        try:
+            self._state._json_set(f"conviction_dir:{ticker}", {
+                "direction": trade_direction,
+                "strike": strike,
+                "time": datetime.now().isoformat(),
+                "posted": True,
+            }, ttl=14400)
+        except Exception:
+            pass
+
+        log.info(f"Conviction direction CONFIRMED posted: {ticker} {trade_direction} "
+                 f"${strike:.0f}")
 
     def clear_conviction_session(self, ticker: str = None):
         """Clear conviction session state. Called on direction flip or EOD reset."""
@@ -1933,22 +1968,32 @@ class FlowDetector:
             # ── DIRECTION FLIP = EXIT SIGNAL ──
             # If we already have a conviction play in the opposite direction
             # for this ticker, this is an exit signal, not a new entry.
+            # v7.2: Always detect exit signals internally (for logging/CSV),
+            # but mark whether the prior entry was actually posted to Telegram.
+            # app.py uses this flag to suppress exit notifications for positions
+            # the user was never told to enter.
             is_exit_signal = False
+            _exit_prior_was_posted = False
             try:
                 existing = self._state._json_get(f"conviction_dir:{ticker}")
                 if existing:
                     existing_dir = existing.get("direction", "")
                     if existing_dir and existing_dir != trade_direction:
                         is_exit_signal = True
+                        _exit_prior_was_posted = existing.get("posted", False)
             except Exception:
                 pass
 
             # Store current direction for future flip detection (4hr TTL)
+            # v7.2: Always store eagerly for internal tracking. The 'posted'
+            # flag is set False here and upgraded to True by
+            # confirm_conviction_posted() in app.py after actual Telegram post.
             try:
                 self._state._json_set(f"conviction_dir:{ticker}", {
                     "direction": trade_direction,
                     "strike": alert["strike"],
                     "time": datetime.now().isoformat(),
+                    "posted": False,  # upgraded to True by app.py after posting
                 }, ttl=14400)
             except Exception:
                 pass
@@ -2216,6 +2261,7 @@ class FlowDetector:
                 "vpoc_near": vpoc_near,
                 # New fields
                 "is_exit_signal": is_exit_signal,
+                "exit_prior_was_posted": _exit_prior_was_posted,  # v7.2: was prior entry shown to user?
                 "is_reactive": is_reactive,
                 "recent_move_pct": round(recent_move_pct, 1),
                 "recommend_1dte": recommend_1dte,
