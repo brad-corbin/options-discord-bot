@@ -69,7 +69,8 @@ CONVICTION_MIN_VOL_OI = 10.0        # 10x turnover minimum
 CONVICTION_MIN_VOLUME_MULT = 5      # 5x tier minimum volume
 CONVICTION_MIN_BURST = 5000         # burst path: 5K+ contracts in one interval
                                     # OR cumulative path: 15x+ vol/OI (no burst needed)
-CONVICTION_COOLDOWN = 3600          # 1 hour between conviction alerts per ticker per tier
+CONVICTION_COOLDOWN = 300           # 5 min between conviction alerts per ticker per tier
+                                    # (was 3600 — 1 hour blocked everything after deploy)
 
 # Scoring impact
 SCORE_NOTABLE_ALIGNED = 3
@@ -598,10 +599,10 @@ class FlowDetector:
         # Prevents pre-deploy cooldown keys from silently blocking post-deploy plays.
         try:
             flushed = self._state.flush_conviction_cooldowns()
-            if flushed:
-                log.info(f"FlowDetector: cleared {flushed} stale conviction cooldowns from prior session")
+            log.info(f"FlowDetector: conviction cooldown flush — cleared {flushed} keys "
+                     f"(CONVICTION_COOLDOWN={CONVICTION_COOLDOWN}s)")
         except Exception as e:
-            log.debug(f"Cooldown flush on startup: {e}")
+            log.warning(f"Cooldown flush on startup failed: {e}")
 
     def set_option_store(self, store):
         """Wire the OptionQuoteStore for streaming option data overlay."""
