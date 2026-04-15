@@ -1999,19 +1999,10 @@ class FlowDetector:
             except Exception:
                 pass
 
-            # Store current direction for future flip detection (4hr TTL)
-            # v7.2: Always store eagerly for internal tracking. The 'posted'
-            # flag is set False here and upgraded to True by
-            # confirm_conviction_posted() in app.py after actual Telegram post.
-            try:
-                self._state._json_set(f"conviction_dir:{ticker}", {
-                    "direction": trade_direction,
-                    "strike": alert["strike"],
-                    "time": datetime.now().isoformat(),
-                    "posted": False,  # upgraded to True by app.py after posting
-                }, ttl=14400)
-            except Exception:
-                pass
+            # v7.2.1: conviction_dir write moved to AFTER all gates pass.
+            # Previously stored eagerly here, causing direction to oscillate
+            # as different expirations for the same ticker were scanned.
+            # Now only written when a play is accepted and about to be returned.
 
             # Route by DTE
             if alert_dte <= 2:
@@ -2248,7 +2239,7 @@ class FlowDetector:
             except Exception:
                 pass
 
-            plays.append({
+            play = {
                 "ticker": ticker,
                 "strike": alert["strike"],
                 "side": side,
@@ -2309,12 +2300,11 @@ class FlowDetector:
                 # Longer-dated institutional positioning (swing/stalk) operates
                 # on a different timeframe and should not be gated by intraday structure.
                 "is_shadow_only": is_em_conflict and alert_dte < 5,
-            })
+            }
 
             # ── Issue 3: Resolve recommended contract details ──
             # When flow side differs from trade side (e.g. put flow → LONG CALL),
             # look up the actual recommended contract's bid/ask/mid from streaming.
-            play = plays[-1]
             rec_side = "call" if trade_direction == "bullish" else "put"
             if rec_side != side and self._option_store:
                 rec_quote = self.get_streaming_overlay(ticker, atm_strike, rec_side)
@@ -2356,15 +2346,38 @@ class FlowDetector:
                 except Exception as _1e:
                     log.debug(f"1DTE lookup for {ticker}: {_1e}")
 
+            # ── Issue 1: Wire conviction into thesis monitor ──
+            # v7.2.1: Check return value BEFORE appending to plays[].
+            # If thesis_monitor says "already tracking this ticker+direction",
+            # the play must NOT be returned — otherwise it gets posted to Telegram again.
+            if self._thesis_monitor_fn and route in ("immediate", "swing"):
+                try:
+                    _tm_accepted = self._thesis_monitor_fn(play)
+                    if _tm_accepted is False:
+                        # Already tracking — update fire count but don't return play
+                        self._update_conviction_session(ticker, trade_direction, alert["strike"], route)
+                        continue
+                except Exception as _tm_err:
+                    log.debug(f"Conviction → thesis monitor failed: {_tm_err}")
+
+            # ── v7.2.1: Store direction ONLY after all gates passed ──
+            # Previously stored eagerly before routing/dedup/cooldown checks,
+            # which caused direction oscillation across expirations.
+            try:
+                self._state._json_set(f"conviction_dir:{ticker}", {
+                    "direction": trade_direction,
+                    "strike": alert["strike"],
+                    "time": datetime.now().isoformat(),
+                    "posted": False,  # upgraded to True by confirm_conviction_posted()
+                }, ttl=14400)
+            except Exception:
+                pass
+
             # ── Issue 2+4: Update session state after successful fire ──
             self._update_conviction_session(ticker, trade_direction, alert["strike"], route)
 
-            # ── Issue 1: Wire conviction into thesis monitor ──
-            if self._thesis_monitor_fn and route in ("immediate", "swing"):
-                try:
-                    self._thesis_monitor_fn(play)
-                except Exception as _tm_err:
-                    log.debug(f"Conviction → thesis monitor failed: {_tm_err}")
+            # All gates passed — add to return list
+            plays.append(play)
 
         return plays
 
@@ -2399,6 +2412,10 @@ class FlowDetector:
         else:
             notional_str = f"${notional:.0f}"
 
+        # v7.2.1: Show .50 strikes accurately (e.g., $207.50 not $208)
+        # Defined here so it's available in both exit and normal paths.
+        _fmt_strike = lambda v: f"${v:.2f}" if v % 1 != 0 else f"${v:.0f}"
+
         # ── EXIT SIGNAL: opposite direction on same ticker ──
         if is_exit:
             header = f"🔄 EXIT SIGNAL — {ticker}"
@@ -2406,7 +2423,7 @@ class FlowDetector:
                 header,
                 "━" * 28,
                 f"⚠️ Institutions REVERSED on {ticker}",
-                f"⚡ {play['volume']:,} contracts at ${strike:.0f} {side.upper()} "
+                f"⚡ {play['volume']:,} contracts at {_fmt_strike(strike)} {side.upper()} "
                 f"({play['vol_oi_ratio']:.0f}x vol/OI)",
                 f"💰 Notional: {notional_str}",
                 f"Direction: {play['directional_bias']}",
@@ -2425,7 +2442,7 @@ class FlowDetector:
         elif route == "income":
             header = f"💎 FLOW CONVICTION — {ticker} (INCOME)"
             action = f"🎯 Income setup: {dte_label} expiry — auto-scoring below"
-            urgency = f"📊 {notional_str} institutional flow at ${strike:.0f}. Short-term thesis."
+            urgency = f"📊 {notional_str} institutional flow at {_fmt_strike(strike)}. Short-term thesis."
         elif route == "swing":
             header = f"💎 FLOW CONVICTION — {ticker} (SWING)"
             action = f"🎯 Swing setup: {dte}D expiry aligns with swing hold horizon"
@@ -2449,14 +2466,14 @@ class FlowDetector:
         _your_strike = play.get("rec_strike", strike)
         lines.append(f"🎯 YOUR TRADE: Buy {_your_side} — Institutions are {_your_verb}")
         if play.get("rec_strike") and play.get("rec_strike") != strike:
-            lines.append(f"   Recommended: ${play['rec_strike']:.0f} {_your_side} | Flow strike: ${strike:.0f}")
+            lines.append(f"   Recommended: {_fmt_strike(play['rec_strike'])} {_your_side} | Flow strike: {_fmt_strike(strike)}")
         else:
-            lines.append(f"   Strike: ${_your_strike:.0f} {_your_side}")
+            lines.append(f"   Strike: {_fmt_strike(_your_strike)} {_your_side}")
         lines.append("━" * 28)
 
         # Flow data (what institutions did — NOT what you trade)
         lines.append(
-            f"⚡ Flow: {play['volume']:,} contracts at ${strike:.0f} {side.upper()} "
+            f"⚡ Flow: {play['volume']:,} contracts at {_fmt_strike(strike)} {side.upper()} "
             f"({play['vol_oi_ratio']:.0f}x vol/OI)"
         )
         lines.append(f"💰 Notional: {notional_str}")
@@ -2576,12 +2593,12 @@ class FlowDetector:
                 _1ask = play.get("dte1_ask", 0)
                 _1mid = play.get("dte1_mid", 0)
                 _1exp = play.get("dte1_expiry", "")
-                lines.append(f"💵 1DTE {_1side} ${_1strike:.0f} ({_1exp}): "
+                lines.append(f"💵 1DTE {_1side} {_fmt_strike(_1strike)} ({_1exp}): "
                              f"Ask ${_1ask:.2f} (Mid ${_1mid:.2f}) | Spot: ${play['spot']:.2f}")
                 # Also show 0DTE for comparison
                 lines.append(f"   (0DTE reference: Ask ${play.get('ask', 0):.2f})")
             elif has_rec and rec_ask > 0:
-                lines.append(f"💵 Rec {rec_side_label} ${rec_strike_val:.0f}: "
+                lines.append(f"💵 Rec {rec_side_label} {_fmt_strike(rec_strike_val)}: "
                              f"Ask ${rec_ask:.2f} (Mid ${rec_mid:.2f}) | Spot: ${play['spot']:.2f}")
                 lines.append(f"   ⚠️ 1DTE quote unavailable — price shown is 0DTE")
             else:
@@ -2590,10 +2607,38 @@ class FlowDetector:
         else:
             lines += ["", action, f"📅 Expiry: {exp_str} ({dte_label})"]
             if has_rec and rec_ask > 0:
-                lines.append(f"💵 Rec {rec_side_label} ${rec_strike_val:.0f}: "
+                lines.append(f"💵 Rec {rec_side_label} {_fmt_strike(rec_strike_val)}: "
                              f"Ask ${rec_ask:.2f} (Mid ${rec_mid:.2f}) | Spot: ${play['spot']:.2f}")
             else:
                 lines.append(f"💵 Ask: ${play.get('ask', 0):.2f} | Spot: ${play['spot']:.2f}")
+
+        # v7.2.1: Consolidated contract summary — strike, expiry, cost in plain text
+        _contract_side = "CALL" if trade_direction == "bullish" else "PUT"
+        if play.get("has_1dte_quote"):
+            _c_strike = play.get("dte1_strike", 0)
+            _c_exp = play.get("dte1_expiry", "")
+            _c_ask = play.get("dte1_ask", 0)
+            _c_mid = play.get("dte1_mid", 0)
+        elif play.get("has_rec_contract"):
+            _c_strike = play.get("rec_strike", 0)
+            _c_exp = exp_str
+            _c_ask = play.get("rec_ask", 0)
+            _c_mid = play.get("rec_mid", 0)
+        else:
+            _c_strike = _your_strike
+            _c_exp = exp_str
+            _c_ask = play.get("ask", 0)
+            _c_mid = play.get("mid", 0)
+
+        if _c_strike > 0 and _c_exp:
+            _cost_part = ""
+            if _c_ask > 0 and _c_mid > 0:
+                _cost_part = f" — Ask ${_c_ask:.2f} (Mid ${_c_mid:.2f})"
+            elif _c_ask > 0:
+                _cost_part = f" — Ask ${_c_ask:.2f}"
+            elif _c_mid > 0:
+                _cost_part = f" — Est ${_c_mid:.2f}"
+            lines.append(f"📋 Contract: {_fmt_strike(_c_strike)} {_contract_side} — Exp {_c_exp}{_cost_part}")
 
         # Issue 5: Suggest spread alternative for defined-risk
         if route in ("immediate", "swing") and play.get("spot", 0) > 0:
