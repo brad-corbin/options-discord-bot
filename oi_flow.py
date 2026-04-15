@@ -1968,10 +1968,10 @@ class FlowDetector:
             # ── DIRECTION FLIP = EXIT SIGNAL ──
             # If we already have a conviction play in the opposite direction
             # for this ticker, this is an exit signal, not a new entry.
-            # v7.2: Always detect exit signals internally (for logging/CSV),
-            # but mark whether the prior entry was actually posted to Telegram.
-            # app.py uses this flag to suppress exit notifications for positions
-            # the user was never told to enter.
+            # v7.2: Only fire exit signal if the prior entry was actually posted
+            # to Telegram. If prior was never posted (blocked by Potter Box,
+            # dedup, shadow gate), treat this as a NEW entry instead.
+            # Direction is still tracked eagerly in Redis for internal state.
             is_exit_signal = False
             _exit_prior_was_posted = False
             try:
@@ -1979,8 +1979,13 @@ class FlowDetector:
                 if existing:
                     existing_dir = existing.get("direction", "")
                     if existing_dir and existing_dir != trade_direction:
-                        is_exit_signal = True
                         _exit_prior_was_posted = existing.get("posted", False)
+                        if _exit_prior_was_posted:
+                            is_exit_signal = True
+                        else:
+                            # Prior was never posted to user → new entry, not exit
+                            log.info(f"Direction flip {ticker}: {existing_dir}→{trade_direction} "
+                                     f"but prior was never posted — treating as new entry")
             except Exception:
                 pass
 
