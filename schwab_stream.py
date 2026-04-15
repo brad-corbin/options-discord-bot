@@ -1048,6 +1048,13 @@ class ContinuousFlowScanner:
             for cp in self._flow.detect_conviction_plays(alerts, dte=max(dte, 0)):
                 try:
                     route = cp.get("route", "stalk")
+
+                    # Shadow-only plays are logged but not posted to user
+                    if cp.get("is_shadow_only"):
+                        log.info(f"🔇 SHADOW conviction (not posted): {ticker} "
+                                 f"{cp.get('trade_side','')} — EM conflict on short-dated")
+                        continue
+
                     msg = self._flow.format_conviction_play(cp)
                     self._post(msg)
 
@@ -1055,6 +1062,15 @@ class ContinuousFlowScanner:
                     if (route in ("immediate", "swing") and
                             self._intraday_chat_id):
                         self._post(msg, chat_id=self._intraday_chat_id)
+
+                    # v7.2.1: Confirm direction posted — enables exit signals
+                    # and prevents duplicate posts on subsequent scan cycles.
+                    # Previously only called in app.py, never here, causing
+                    # every ContinuousFlowScanner conviction to re-post.
+                    self._flow.confirm_conviction_posted(
+                        cp["ticker"],
+                        cp.get("trade_direction", ""),
+                        cp.get("strike", 0))
 
                     # Income route → trigger ITQS scan
                     if route == "income" and self._income_scan:
@@ -1077,9 +1093,11 @@ class ContinuousFlowScanner:
                     with self._lock:
                         self._stats["convictions"] += 1
 
+                    _cp_strike = cp['strike']
+                    _cp_sfmt = f"${_cp_strike:.2f}" if _cp_strike % 1 != 0 else f"${_cp_strike:.0f}"
                     log.info(f"💎 CONVICTION [{route.upper()}] (continuous): "
                              f"{ticker} {cp['trade_side']} "
-                             f"${cp['strike']:.0f} ({cp['dte']}DTE)")
+                             f"{_cp_sfmt} ({cp['dte']}DTE)")
                 except Exception as _cp_err:
                     log.warning(f"❌ Conviction play CRASHED (continuous) for {cp.get('ticker', '?')}: {_cp_err}")
                     import traceback; log.debug(traceback.format_exc())
