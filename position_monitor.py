@@ -258,9 +258,44 @@ class PositionMonitor:
         """Register a new position for live tracking.
         
         Call this from ANY engine when a trade fires or a shadow signal is logged.
-        Returns the position ID.
+        Returns the position ID, or None if registration was rejected.
+
+        FIX BUG #14: refuse to register a position with entry_mid <= MIN_VALID_ENTRY.
+        Previously, when streaming had no quote at entry time, callers passed
+        entry_mid=0 and the position got stored with a near-zero entry. Once
+        streaming warmed up and fed a real mid, pnl_pct = (mid - 0) / 0 produced
+        absurd percentages (+250%, +2,286%, +33,967% observed in production)
+        which triggered profit_50 and profit_100_exit_half alerts immediately
+        — user saw fake "SET TRAILING STOP" cards on positions that never had
+        a real entry price.
+
+        After this fix: if the caller can't get a valid entry_mid, we log ERROR
+        and return None. The position is NOT tracked and NO profit/loss alerts
+        will fire until a caller retries with a real price. Callers can check
+        the return value (currently none do — safe default) or watch logs.
         """
         import uuid
+
+        # FIX BUG #14: refuse garbage entries. A real option trading at tick
+        # minimum is $0.01 for penny-wide options, so $0.05 is a conservative
+        # threshold that rejects clearly-broken values without false-rejecting
+        # real low-premium trades.
+        MIN_VALID_ENTRY = 0.05
+        try:
+            _em = float(entry_mid or 0)
+        except (TypeError, ValueError):
+            _em = 0.0
+        if _em < MIN_VALID_ENTRY:
+            log.error(
+                f"PositionMonitor: REFUSING to register {trade_type} {ticker} "
+                f"{direction} OCC={occ_symbol} — entry_mid=${_em:.4f} is "
+                f"below MIN_VALID_ENTRY (${MIN_VALID_ENTRY:.2f}). "
+                f"Caller must provide a real entry price. This is the "
+                f"Bug #14 path that used to produce fake +250%+ profit "
+                f"cards on cold-start / missing-stream positions."
+            )
+            return None
+
         now = datetime.now(timezone.utc)
         pos_id = f"{trade_type[:3]}_{ticker}_{str(uuid.uuid4())[:6]}"
 
@@ -273,12 +308,12 @@ class PositionMonitor:
             option_type=option_type,
             strike=strike,
             expiry=expiry,
-            entry_mid=entry_mid,
+            entry_mid=_em,
             entry_spot=entry_spot,
             entry_time=now.isoformat(),
             entry_date=now.strftime("%Y-%m-%d"),
-            current_mid=entry_mid,
-            peak_mid=entry_mid,
+            current_mid=_em,
+            peak_mid=_em,
             peak_date=now.strftime("%Y-%m-%d"),
             peak_spot=entry_spot,
             metadata=metadata or {},
@@ -296,7 +331,7 @@ class PositionMonitor:
         self._save()
         self._log_open_to_sheets(pos)  # v7.1: log to sheets immediately on open
         log.info(f"PositionMonitor: registered {trade_type} {ticker} {direction} "
-                 f"OCC={occ_symbol} entry=${entry_mid:.2f} exp={expiry}")
+                 f"OCC={occ_symbol} entry=${_em:.2f} exp={expiry}")
 
         return pos_id
 
