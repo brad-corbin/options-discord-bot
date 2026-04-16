@@ -139,6 +139,10 @@ from em_reconciler import (
 
 import risk_manager
 import trade_journal
+import fill_reconciler as _fill_reconciler_mod
+from fill_reconciler import FillRecordStore
+import recommendation_tracker as _rt_mod
+from recommendation_tracker import RecommendationStore
 
 # ── v7 imports ──
 from backtest_guidance import should_filter_signal, ACTIVE_GUIDANCE
@@ -186,6 +190,8 @@ _shadow_logger = None     # v7: shadow filter logger
 _position_monitor = None  # v7: unified position monitor
 _flow_detector = None     # v6.1: unified institutional flow detection
 _potter_box = None        # v6.2: Potter Box scanner
+_fill_store = None        # Phase 1: fill reconciliation store
+_rec_tracker = None       # Phase 1b: recommendation effectiveness tracker
 
 # ─────────────────────────────────────────────────────────
 # LOGGING
@@ -5530,6 +5536,11 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
             contracts=best_rec.get("contracts", 1), regime=regime, direction=direction,
         )
 
+        _spread_id = f"{ticker}:{best_rec.get('exp','')}:{best_rec.get('side','')}:{trade.get('long','')}:{trade.get('short','')}"
+        _trade_id = f"{ticker}:{best_rec.get('exp','')}:{best_rec.get('side','')}:{trade.get('long','')}:{trade.get('short','')}:{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+        best_rec["spread_id"] = _spread_id
+        best_rec["trade_id"] = _trade_id
+
         card = format_trade_card(best_rec)
         shared_lines = _um_format_shared_snapshot_lines(best_rec.get("shared_model_snapshot"))
         if shared_lines:
@@ -5562,8 +5573,6 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
         # Phase: Wire journal open for feedback loop
         if risk_result["allowed"]:
             try:
-                _spread_id = f"{ticker}:{best_rec.get('exp','')}:{best_rec.get('side','')}:{trade.get('long','')}:{trade.get('short','')}"
-                best_rec["spread_id"] = _spread_id
                 trade_journal.log_trade_open(
                     spread_id=_spread_id,
                     ticker=ticker,
@@ -5573,6 +5582,105 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
                 )
             except Exception as _je:
                 log.warning(f"Journal log_trade_open failed: {_je}")
+
+            try:
+                if _fill_store is not None:
+                    _fill_store.record_recommendation(
+                        trade_id=_trade_id,
+                        ticker=ticker,
+                        direction=direction,
+                        trade_type=best_rec.get("spread_type", "debit_spread"),
+                        recommended_debit=trade.get("debit", 0),
+                        est_slippage=trade.get("est_slippage", 0),
+                        display_debit=trade.get("display_debit", trade.get("debit", 0)),
+                        long_strike=trade.get("long", 0),
+                        short_strike=trade.get("short"),
+                        width=trade.get("width", 0),
+                        expiration=best_rec.get("exp", ""),
+                        contracts=best_rec.get("contracts", 1),
+                        confidence=best_rec.get("confidence", 0),
+                    )
+            except Exception as _fre:
+                log.warning(f"Fill reconciliation record failed: {_fre}")
+
+            # ── Phase 1b: Recommendation Tracker + Shadow Signals ──
+            # Auto-records every recommendation for effectiveness tracking.
+            # Shadow signals computed at post time but NOT applied to confidence.
+            try:
+                if _rec_tracker is not None:
+                    from recommendation_tracker import record_recommendation as _rr
+
+                    _rec_dte = int(best_rec.get("dte") or 0)
+                    _rec_tt = "immediate" if _rec_dte <= 2 else "swing"
+                    _rec_right = "call" if direction == "bull" else "put"
+                    _rec_legs = [{
+                        "right": _rec_right,
+                        "strike": trade.get("long"),
+                        "expiry": best_rec.get("exp"),
+                        "action": "buy",
+                    }]
+                    _rec_structure = f"long_{_rec_right}"
+                    if trade.get("short"):
+                        _rec_legs.append({
+                            "right": _rec_right,
+                            "strike": trade.get("short"),
+                            "expiry": best_rec.get("exp"),
+                            "action": "sell",
+                        })
+                        _rec_structure = ("bull_call_spread" if direction == "bull"
+                                          else "bear_put_spread")
+
+                    # Compute shadow signals (observational — does NOT modify confidence)
+                    _shadow = None
+                    try:
+                        import shadow_signals as _ss_mod
+                        _chain = best_rec.get("chain_contracts") or []
+                        _intraday = best_rec.get("intraday_bars_5m") or []
+                        _prior = best_rec.get("prior_day_ohlc")
+                        _first_bars = best_rec.get("first_5m_bars_of_session")
+
+                        _skew_r = _ss_mod._safe_compute_skew(_chain, spot, ticker, direction)
+                        _vwap_r = _ss_mod._safe_compute_vwap_bands(_intraday, direction)
+                        _gap_r = _ss_mod._safe_compute_gap(
+                            _prior, spot, direction, _first_bars, None,
+                        )
+                        _shadow = {
+                            "skew": _skew_r,
+                            "vwap": _vwap_r,
+                            "gap": _gap_r,
+                            "total_delta": (
+                                (_skew_r.get("delta", 0) or 0)
+                                + (_vwap_r.get("delta", 0) or 0)
+                                + (_gap_r.get("delta", 0) or 0)
+                            ),
+                        }
+                        log.info(
+                            f"Shadow signals: {ticker} {direction} "
+                            f"skew={_skew_r.get('delta', 0):+d} "
+                            f"vwap={_vwap_r.get('delta', 0):+d} "
+                            f"gap={_gap_r.get('delta', 0):+d} "
+                            f"total={_shadow['total_delta']:+d} (NOT applied)"
+                        )
+                    except Exception as _sse:
+                        log.warning(f"Shadow signals compute failed: {_sse}")
+
+                    _rr(
+                        store=_rec_tracker,
+                        source="check_ticker",
+                        ticker=ticker,
+                        direction=direction,
+                        trade_type=_rec_tt,
+                        structure=_rec_structure,
+                        legs=_rec_legs,
+                        entry_option_mark=float(trade.get("debit") or 0),
+                        entry_underlying=float(spot),
+                        confidence=int(best_rec.get("confidence") or 0),
+                        regime=(regime.get("label") if isinstance(regime, dict)
+                                else str(regime)),
+                        shadow_signals=_shadow,
+                    )
+            except Exception as _rre:
+                log.warning(f"Rec tracker record failed: {_rre}")
 
             # v7: register active scanner trade for live option P&L tracking
             try:
@@ -9561,6 +9669,19 @@ def _em_scheduler():
                     except Exception as _cpe:
                         log.debug(f"Crisis put monitor error: {_cpe}")
 
+            # ── Phase 1: Morning portfolio Greeks summary (once per day) ──
+            _book_greeks_key = (date_str, "book_greeks")
+            if _book_greeks_key not in fired_today:
+                if now_ct.hour == 8 and 40 <= now_ct.minute <= 50:
+                    fired_today.add(_book_greeks_key)
+                    try:
+                        _greeks_msg = _portfolio_greeks.format_summary()
+                        if _greeks_msg:
+                            post_to_telegram(_greeks_msg)
+                            log.info("Portfolio Greeks: morning summary posted")
+                    except Exception as _pge:
+                        log.debug(f"Portfolio Greeks summary error: {_pge}")
+
             # ── v5.1: OI Tracker — morning summary + end-of-day flush ──
             if _oi_tracker:
                 # Morning unusual flow post at 9:00 AM CT (before sweep runs)
@@ -10046,12 +10167,218 @@ def _start_background_services_once():
         return True
 
 
+# ═══════════════════════════════════════════════════════════════════
+# Phase 1b: Recommendation Tracker polling + scheduled reports
+# ═══════════════════════════════════════════════════════════════════
+
+def _rec_tracker_opt_mark_fn(ticker, expiry, right, strike, structure, legs):
+    """Option mid-price lookup for the recommendation tracker's polling loop.
+
+    Reuses the cached chain fetched by the rest of the bot — no new API
+    calls unless the chain hasn't been pulled yet.
+    """
+    try:
+        if structure in ("long_call", "long_put"):
+            side = "call" if "call" in structure else "put"
+            chain = _cached_md.get_chain(ticker, expiry, side=side)
+            for c in chain or []:
+                if abs(float(c.get("strike", 0)) - float(strike)) < 0.01:
+                    bid = float(c.get("bid") or 0)
+                    ask = float(c.get("ask") or 0)
+                    if ask > 0:
+                        return (bid + ask) / 2
+            return None
+
+        # Spreads: fetch both legs and compute net
+        mids = {}
+        for leg in legs:
+            side = leg["right"]
+            chain = _cached_md.get_chain(ticker, leg["expiry"], side=side)
+            for c in chain or []:
+                if abs(float(c.get("strike", 0)) - float(leg["strike"])) < 0.01:
+                    bid = float(c.get("bid") or 0)
+                    ask = float(c.get("ask") or 0)
+                    mids[leg["strike"]] = (bid + ask) / 2 if ask > 0 else None
+                    break
+        buy_leg = next((l for l in legs if l["action"] == "buy"), None)
+        sell_leg = next((l for l in legs if l["action"] == "sell"), None)
+        if not buy_leg or not sell_leg:
+            return None
+        buy_mid = mids.get(buy_leg["strike"])
+        sell_mid = mids.get(sell_leg["strike"])
+        if buy_mid is None or sell_mid is None:
+            return None
+        return buy_mid - sell_mid
+    except Exception as e:
+        log.warning(f"_rec_tracker_opt_mark_fn failed for {ticker}: {e}")
+        return None
+
+
+def _rec_tracker_poll_once():
+    """Single polling pass — skips off-hours automatically."""
+    global _rec_tracker
+    if _rec_tracker is None:
+        return
+    try:
+        from recommendation_tracker import poll_and_update_if_market_open
+        summary = poll_and_update_if_market_open(
+            store=_rec_tracker,
+            price_fn=_rec_tracker_opt_mark_fn,
+            spot_fn=lambda t: get_spot(t),
+        )
+        if summary.get("polled", 0) > 0 or summary.get("graded", 0) > 0:
+            log.info(f"Rec tracker poll: {summary}")
+    except Exception as e:
+        log.warning(f"Rec tracker poll failed: {e}")
+
+
+def _rec_tracker_scheduler():
+    """Kick off the 90-second polling loop as a background daemon thread."""
+    import threading
+    def _loop():
+        while True:
+            try:
+                _rec_tracker_poll_once()
+            except Exception as e:
+                log.warning(f"Rec tracker loop error: {e}")
+            threading.Event().wait(90)   # 90-second interval
+
+    t = threading.Thread(target=_loop, daemon=True, name="rec_tracker_poll")
+    t.start()
+    log.info("Phase 1b: rec tracker polling loop started (90s interval)")
+
+
+# ── Scheduled report posting ──
+
+def _rec_tracker_post_morning_briefing():
+    """8:00 AM CT weekday briefing."""
+    if _rec_tracker is None:
+        return
+    now_ct = datetime.now(timezone.utc) - timedelta(hours=5)
+    if now_ct.weekday() >= 5:
+        return
+    try:
+        from scheduled_reports import post_morning_briefing
+        # Book Greeks + regime are optional — wire them if available
+        greeks_fn = None
+        regime_fn = None
+        try:
+            from omega_small_fixes import summarize_book_greeks, format_book_greeks_report
+            greeks_fn = lambda: format_book_greeks_report(
+                summarize_book_greeks(portfolio.list_open_positions())
+            )
+        except Exception:
+            pass
+        try:
+            regime_fn = lambda: regime_detector.get_regime_package()
+        except Exception:
+            pass
+        post_morning_briefing(
+            post_fn=post_to_telegram,
+            rec_tracker_store=_rec_tracker,
+            greeks_summary_fn=greeks_fn,
+            regime_fn=regime_fn,
+        )
+    except Exception as e:
+        log.warning(f"Morning briefing post failed: {e}")
+
+
+def _rec_tracker_post_eod():
+    """3:15 PM CT weekday end-of-day report."""
+    if _rec_tracker is None:
+        return
+    now_ct = datetime.now(timezone.utc) - timedelta(hours=5)
+    if now_ct.weekday() >= 5:
+        return
+    try:
+        from scheduled_reports import post_eod_report
+        post_eod_report(post_to_telegram, _rec_tracker)
+    except Exception as e:
+        log.warning(f"EOD report post failed: {e}")
+
+
+def _rec_tracker_post_weekly():
+    """Friday 3:30 PM CT weekly digest."""
+    if _rec_tracker is None:
+        return
+    now_ct = datetime.now(timezone.utc) - timedelta(hours=5)
+    if now_ct.weekday() != 4:   # Friday only
+        return
+    try:
+        from scheduled_reports import post_weekly_digest
+        post_weekly_digest(post_to_telegram, _rec_tracker)
+    except Exception as e:
+        log.warning(f"Weekly digest post failed: {e}")
+
+
+def _rec_tracker_post_monthly():
+    """1st of month 9:00 AM CT monthly attribution."""
+    if _rec_tracker is None:
+        return
+    now_ct = datetime.now(timezone.utc) - timedelta(hours=5)
+    if now_ct.day != 1:
+        return
+    try:
+        from scheduled_reports import post_monthly_attribution
+        post_monthly_attribution(post_to_telegram, _rec_tracker)
+    except Exception as e:
+        log.warning(f"Monthly attribution post failed: {e}")
+
+
+def _rec_tracker_daily_report_scheduler():
+    """Schedule the four daily/weekly/monthly report posts.
+
+    Uses a single 60-second heartbeat thread that checks whether any
+    scheduled post is due. This avoids needing apscheduler or the
+    external 'schedule' library.
+    """
+    import threading
+    _last_post_keys = set()   # avoid double-posts within the same minute
+
+    def _should_post_now(hour_ct, minute_ct):
+        now_ct = datetime.now(timezone.utc) - timedelta(hours=5)
+        if now_ct.hour != hour_ct or now_ct.minute != minute_ct:
+            return False
+        key = now_ct.strftime(f"%Y-%m-%d-{hour_ct:02d}:{minute_ct:02d}")
+        if key in _last_post_keys:
+            return False
+        _last_post_keys.add(key)
+        # Prune old keys (keep only last 48hrs)
+        cutoff = (now_ct - timedelta(hours=48)).strftime("%Y-%m-%d")
+        for k in list(_last_post_keys):
+            if k < cutoff:
+                _last_post_keys.discard(k)
+        return True
+
+    def _loop():
+        while True:
+            try:
+                if _should_post_now(8, 0):
+                    _rec_tracker_post_morning_briefing()
+                if _should_post_now(15, 15):
+                    _rec_tracker_post_eod()
+                if _should_post_now(15, 30):
+                    _rec_tracker_post_weekly()
+                if _should_post_now(9, 0):
+                    _rec_tracker_post_monthly()
+            except Exception as e:
+                log.warning(f"Rec report scheduler error: {e}")
+            threading.Event().wait(60)
+
+    t = threading.Thread(target=_loop, daemon=True, name="rec_tracker_reports")
+    t.start()
+    log.info("Phase 1b: scheduled reports thread started "
+             "(morning 08:00 / EOD 15:15 / Fri weekly 15:30 / 1st monthly 09:00)")
+
+
 def _initialize_app():
     global _oi_cache
     global _oi_tracker
     global _persistent_state
     global _flow_detector
     global _potter_box
+    global _fill_store
+    global _rec_tracker
     with app.app_context():
         portfolio.init_store(store_get, store_set)
         trade_journal.init_store(store_get, store_set)
@@ -10059,10 +10386,17 @@ def _initialize_app():
         _oi_cache = OICache(store_get, store_set)
         _oi_tracker = OITracker(store_get, store_set)
         _persistent_state = PersistentState(store_get, store_set, store_scan)
+        _fill_store = FillRecordStore(get_fn=store_get, set_fn=store_set)
+        _fill_reconciler_mod.default_store = _fill_store
+        _rec_tracker = RecommendationStore(
+            get_fn=store_get, set_fn=store_set, scan_fn=store_scan,
+        )
         _flow_detector = FlowDetector(_persistent_state, post_fn=post_to_telegram)
         _potter_box = PotterBoxScanner(_persistent_state, flow_detector=_flow_detector,
                                            post_fn=post_to_telegram)
         log.info(f"OI cache + tracker + flow detector + Potter Box initialized (Redis: {_get_redis() is not None})")
+        log.info("Phase 1: fill reconciler store initialized")
+        log.info("Phase 1b: recommendation tracker initialized")
 
         # v7: position monitor + shadow logger
         global _shadow_logger, _position_monitor
@@ -10077,6 +10411,13 @@ def _initialize_app():
             spot_fn=lambda t: get_spot(t),
         )
         log.info("v7: shadow logger + position monitor initialized")
+
+        # ── Phase 1b: start rec tracker polling + scheduled report threads ──
+        try:
+            _rec_tracker_scheduler()
+            _rec_tracker_daily_report_scheduler()
+        except Exception as _rte:
+            log.warning(f"Rec tracker thread startup failed: {_rte}")
         _tg_ws = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
         if _tg_ws and BOT_URL and _acquire_background_leader():
             register_webhook(BOT_URL, _tg_ws)
