@@ -142,7 +142,6 @@ def create_income_handlers(
                         # run_income_scan already posted alerts — we re-scan to get the result objects.
                         # This is lightweight because the data is cached from the first pass.
                         try:
-                            from income_scanner import scan_ticker_income, INCOME_TICKERS
                             for _t in INCOME_TICKERS:
                                 try:
                                     _opps = scan_ticker_income(
