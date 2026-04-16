@@ -2433,6 +2433,66 @@ def _find_chain_rows_for_expiration(chains, expiration: str) -> list:
     return []
 
 
+def _chain_rows_from_response(chain_resp) -> list:
+    """Normalize a get_chain() response into a list of row-dicts.
+
+    FIX BUG #1 (price_fn normalization): _cached_md.get_chain() returns the raw
+    MarketData.app payload which is a DICT OF PARALLEL ARRAYS
+    (e.g. {"s": "ok", "strike": [...], "bid": [...], "ask": [...], ...}),
+    NOT a list of row-dicts. Naively doing `list(chain_resp or [])` on a dict
+    yields the dict *keys* as strings — then downstream code that calls
+    c.get("strike") explodes with 'str' object has no attribute 'get'.
+
+    This helper accepts any of:
+      - the raw dict-of-arrays response from get_chain()
+      - an already-normalized list of row-dicts (e.g. from ticker scans)
+      - None / empty / malformed input (returns [])
+
+    and always returns a list of row-dicts with the keys the rest of the
+    codebase expects: strike, bid, ask, mid, last, volume, openInterest,
+    delta, gamma, theta, vega, iv, side, optionSymbol, expiration.
+    """
+    if chain_resp is None:
+        return []
+    # Already a list of row-dicts — pass through, but filter out stray strings
+    if isinstance(chain_resp, list):
+        return [r for r in chain_resp if isinstance(r, dict)]
+    # Not a dict at this point = unusable
+    if not isinstance(chain_resp, dict):
+        return []
+    # Dict-of-arrays: unzip parallel arrays into row-dicts
+    strikes = chain_resp.get("strike") or []
+    if not strikes:
+        return []
+    # Fields we care about — all optional, safely default to None per row
+    FIELDS = (
+        "strike", "bid", "ask", "mid", "last",
+        "volume", "openInterest",
+        "delta", "gamma", "theta", "vega", "rho",
+        "iv", "impliedVolatility",
+        "side", "optionSymbol", "expiration", "dte",
+        "bidSize", "askSize", "underlyingPrice",
+    )
+    n = len(strikes)
+    cols = {}
+    for k in FIELDS:
+        v = chain_resp.get(k)
+        if isinstance(v, list) and len(v) == n:
+            cols[k] = v
+    rows = []
+    for i in range(n):
+        row = {}
+        for k, arr in cols.items():
+            val = arr[i]
+            if val is not None:
+                row[k] = val
+        # Normalize iv field name (MarketData uses 'iv', some callers expect 'impliedVolatility')
+        if "iv" in row and "impliedVolatility" not in row:
+            row["impliedVolatility"] = row["iv"]
+        rows.append(row)
+    return rows
+
+
 def _build_prior_day_gap_context(ticker: str, intraday_rows: list = None) -> dict:
     rows = _get_daily_ohlcv_rows(ticker, days=3)
     if not rows:
@@ -2587,7 +2647,8 @@ def _record_income_opportunity(opp: dict, source: str = "income_scanner"):
     intraday_rows = _raw_intraday_to_rows(get_intraday_bars(ticker, resolution=5, countback=60))
     prior_ctx = _build_prior_day_gap_context(ticker, intraday_rows)
     try:
-        chain_rows = list((_cached_md.get_chain(ticker, exp, side=right) or [])) if _cached_md else []
+        # FIX BUG #1: normalize dict-of-arrays response to row-dicts
+        chain_rows = _chain_rows_from_response(_cached_md.get_chain(ticker, exp, side=right)) if _cached_md else []
     except Exception:
         chain_rows = []
     return _record_recommendation_campaign(
@@ -2618,7 +2679,8 @@ def _record_conviction_recommendation(cp: dict, spot: float, chain_data=None, be
         return None
     intraday_rows = _raw_intraday_to_rows(get_intraday_bars(cp["ticker"], resolution=5, countback=60))
     prior_ctx = _build_prior_day_gap_context(cp["ticker"], intraday_rows)
-    chain_rows = list(chain_data or [])
+    # FIX BUG #1: normalize — chain_data may be the raw dict-of-arrays response
+    chain_rows = _chain_rows_from_response(chain_data)
     return _record_recommendation_campaign(
         source=source, ticker=cp["ticker"], direction=direction, trade_type=route,
         structure=f"long_{right}", legs=[{"right": right, "strike": strike, "expiry": exp, "action": "buy"}],
@@ -2636,7 +2698,11 @@ def _rec_tracker_price_fn(ticker, expiry, right, strike, structure, legs):
     try:
         if structure in ("long_call", "long_put"):
             side = "call" if "call" in structure else "put"
-            chain = _cached_md.get_chain(ticker, expiry, side=side) or []
+            # FIX BUG #1/#13: normalize dict-of-arrays response into row-dicts.
+            # Previously did `get_chain(...) or []` and iterated, which on a dict
+            # yielded the dict KEYS as strings → c.get(...) blew up and the
+            # tracker logged "failed", stranding recs at +0.0% / [MFE +0.0%].
+            chain = _chain_rows_from_response(_cached_md.get_chain(ticker, expiry, side=side))
             for c in chain:
                 if abs(float(c.get("strike", 0)) - float(strike or 0)) < 0.01:
                     bid = as_float(c.get("bid"), 0.0)
@@ -2653,7 +2719,8 @@ def _rec_tracker_price_fn(ticker, expiry, right, strike, structure, legs):
             mids = {}
             for leg in (legs or []):
                 side = leg.get("right")
-                chain = _cached_md.get_chain(ticker, leg.get("expiry"), side=side) or []
+                # FIX BUG #1/#13: normalize here too
+                chain = _chain_rows_from_response(_cached_md.get_chain(ticker, leg.get("expiry"), side=side))
                 for c in chain:
                     if abs(float(c.get("strike", 0)) - float(leg.get("strike", 0))) < 0.01:
                         bid = as_float(c.get("bid"), 0.0)
@@ -5147,9 +5214,12 @@ def _run_v4_prefilter(ticker: str, spot: float, chains: list, candle_closes: lis
                                      f"— prior entry was never posted to user")
                         elif route == "immediate":
                             # 0-2 DTE: fire to BOTH channels immediately
-                            post_to_telegram(msg)
+                            # FIX BUG #2: route through _tg_rate_limited_post so
+                            # rapid-fire conviction alerts share the global TG gap
+                            # lock and don't each individually hit the 429 wall.
+                            _tg_rate_limited_post(msg)
                             if TELEGRAM_CHAT_INTRADAY and TELEGRAM_CHAT_INTRADAY != TELEGRAM_CHAT_ID:
-                                post_to_telegram(msg, chat_id=TELEGRAM_CHAT_INTRADAY)
+                                _tg_rate_limited_post(msg, chat_id=TELEGRAM_CHAT_INTRADAY)
                             try:
                                 _record_conviction_recommendation(cp, spot, chain_data=chain_data, source="conviction_flow")
                             except Exception as _rce:
@@ -5247,9 +5317,10 @@ def _run_v4_prefilter(ticker: str, spot: float, chains: list, candle_closes: lis
 
                         elif route == "swing":
                             # 8-30 DTE: post to both channels
-                            post_to_telegram(msg)
+                            # FIX BUG #2: route through rate limiter
+                            _tg_rate_limited_post(msg)
                             if TELEGRAM_CHAT_INTRADAY and TELEGRAM_CHAT_INTRADAY != TELEGRAM_CHAT_ID:
-                                post_to_telegram(msg, chat_id=TELEGRAM_CHAT_INTRADAY)
+                                _tg_rate_limited_post(msg, chat_id=TELEGRAM_CHAT_INTRADAY)
                             try:
                                 _record_conviction_recommendation(cp, spot, chain_data=chain_data, source="conviction_flow")
                             except Exception as _rce:
@@ -6575,9 +6646,10 @@ def _get_0dte_iv(ticker: str, target_date_str: str = None) -> tuple:
                             log.info(f"🔇 EXIT SIGNAL SUPPRESSED: {cp['ticker']} "
                                      f"— prior entry was never posted to user")
                         else:
-                            post_to_telegram(msg)
+                            # FIX BUG #2: route through rate limiter to share global TG gap lock
+                            _tg_rate_limited_post(msg)
                             if route in ("immediate", "swing") and TELEGRAM_CHAT_INTRADAY and TELEGRAM_CHAT_INTRADAY != TELEGRAM_CHAT_ID:
-                                post_to_telegram(msg, chat_id=TELEGRAM_CHAT_INTRADAY)
+                                _tg_rate_limited_post(msg, chat_id=TELEGRAM_CHAT_INTRADAY)
                             try:
                                 _record_conviction_recommendation(cp, spot, chain_data=rows if "rows" in locals() else None, source="conviction_flow")
                             except Exception as _rce:
@@ -6796,9 +6868,10 @@ def _get_chain_iv_for_expiry(ticker: str, target_date_str: str, dte: float) -> t
                             log.info(f"🔇 EXIT SIGNAL SUPPRESSED: {cp['ticker']} "
                                      f"— prior entry was never posted to user")
                         else:
-                            post_to_telegram(msg)
+                            # FIX BUG #2: route through rate limiter to share global TG gap lock
+                            _tg_rate_limited_post(msg)
                             if route in ("immediate", "swing") and TELEGRAM_CHAT_INTRADAY and TELEGRAM_CHAT_INTRADAY != TELEGRAM_CHAT_ID:
-                                post_to_telegram(msg, chat_id=TELEGRAM_CHAT_INTRADAY)
+                                _tg_rate_limited_post(msg, chat_id=TELEGRAM_CHAT_INTRADAY)
                             try:
                                 _record_conviction_recommendation(cp, spot, chain_data=rows if "rows" in locals() else None, source="conviction_flow")
                             except Exception as _rce:
@@ -10253,8 +10326,15 @@ def _em_scheduler():
                             log.warning(f"EOD flow summary error: {_eod_e}")
 
                 # 4:05–4:30 PM CT — Reconcile conviction plays against EOD prices
+                # FIX BUG #12: legacy conviction reconciliation runs alongside the
+                # new recommendation_tracker and causes confusion when both emit
+                # results. Gated behind env flag (default OFF). Set
+                # LEGACY_CONVICTION_RECON=1 to temporarily re-enable while
+                # validating the new tracker. Remove this block entirely once
+                # you're fully confident in the new system.
                 _conv_recon_key = (date_str, "conviction_recon")
-                if _conv_recon_key not in fired_today:
+                _legacy_recon_enabled = os.getenv("LEGACY_CONVICTION_RECON", "0") == "1"
+                if _legacy_recon_enabled and _conv_recon_key not in fired_today:
                     if now_ct.hour == 16 and 5 <= now_ct.minute <= 30:
                         fired_today.add(_conv_recon_key)
                         try:
@@ -10553,9 +10633,10 @@ def _initialize_app():
                                 log.info(f"🔇 EXIT SIGNAL SUPPRESSED (sweep): {cp['ticker']} "
                                          f"— prior entry was never posted to user")
                             elif not cp.get("is_shadow_only"):
-                                post_to_telegram(cp_msg)
+                                # FIX BUG #2: route through rate limiter
+                                _tg_rate_limited_post(cp_msg)
                                 if cp.get("route") in ("immediate", "swing") and TELEGRAM_CHAT_INTRADAY:
-                                    post_to_telegram(cp_msg, chat_id=TELEGRAM_CHAT_INTRADAY)
+                                    _tg_rate_limited_post(cp_msg, chat_id=TELEGRAM_CHAT_INTRADAY)
                                 try:
                                     _record_conviction_recommendation(cp, get_spot(cp.get("ticker")) or 0, source="conviction_sweep")
                                 except Exception as _rce:
