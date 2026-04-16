@@ -270,6 +270,42 @@ def _safe_compute_gap(
         return {"available": False, "reason": f"error: {e}", "delta": 0, "reasons": []}
 
 
+def compute_shadow_bundle(
+    ticker: str,
+    direction: str,
+    contracts: Optional[List[Dict]] = None,
+    spot: Optional[float] = None,
+    intraday_bars: Optional[List[Dict]] = None,
+    prior_day_data: Optional[Dict] = None,
+    first_bars_of_session: Optional[List[Dict]] = None,
+    minutes_since_open: Optional[int] = None,
+) -> Dict:
+    """Compute shadow signals without persisting.
+
+    Safe default for Phase 1b when you want signals attached directly to the
+    recommendation campaign record instead of stored separately.
+    """
+    skew_result = _safe_compute_skew(contracts, spot, ticker, direction)
+    vwap_result = _safe_compute_vwap_bands(intraday_bars, direction)
+    gap_result = _safe_compute_gap(
+        prior_day_data, spot, direction, first_bars_of_session, minutes_since_open
+    )
+    return {
+        "ticker": ticker.upper(),
+        "direction": direction,
+        "skew": skew_result,
+        "vwap": vwap_result,
+        "gap": gap_result,
+        "total_delta": (
+            skew_result.get("delta", 0)
+            + vwap_result.get("delta", 0)
+            + gap_result.get("delta", 0)
+        ),
+    }
+
+
+
+
 # ─────────────────────────────────────────────────────────
 # SHADOW READER
 # ─────────────────────────────────────────────────────────
