@@ -1881,6 +1881,102 @@ class FlowDetector:
             return ct_hour, utc_now.minute
 
     # ─────────────────────────────────────────────────────
+    # Phase 1b: Recommendation Tracker integration
+    # ─────────────────────────────────────────────────────
+    def record_play_to_tracker(self, play: dict, spot_val: float,
+                                chain_data: Optional[list],
+                                rec_tracker_store) -> bool:
+        """Record a conviction play to the recommendation tracker.
+
+        Call this once per play right after format_conviction_play() +
+        post_to_telegram(). Returns True on successful record.
+
+        Args:
+            play:              the conviction play dict (from detect_conviction_plays)
+            spot_val:          current underlying spot price
+            chain_data:        current option chain for the ticker (used to get option mark)
+            rec_tracker_store: the RecommendationStore instance
+
+        The rec_tracker handles deduplication automatically — 8 re-fires
+        of the same NVDA idea within 4 hours = 1 campaign with
+        duplicate_count=8.
+        """
+        if rec_tracker_store is None:
+            return False
+        try:
+            # Map play data to recommendation shape
+            direction = "bull" if play.get("trade_direction") == "bullish" else "bear"
+            route = (play.get("route") or "immediate").lower()
+            # "stalk" campaigns graded on swing horizon
+            trade_type = "swing" if route == "stalk" else route
+
+            right = "call" if direction == "bull" else "put"
+            strike = play.get("rec_strike") or play.get("strike")
+            expiry = str(play.get("expiry") or "")[:10]
+            if not strike or not expiry:
+                return False
+
+            # Try to find the current option mark from the chain
+            option_mark = None
+            if chain_data:
+                for c in chain_data:
+                    c_right = (c.get("right") or c.get("option_type") or "").lower()
+                    c_strike = c.get("strike")
+                    if c_strike is None:
+                        continue
+                    try:
+                        if c_right == right and abs(float(c_strike) - float(strike)) < 0.01:
+                            bid = float(c.get("bid") or 0)
+                            ask = float(c.get("ask") or 0)
+                            if ask > 0:
+                                option_mark = (bid + ask) / 2
+                            break
+                    except (ValueError, TypeError):
+                        continue
+
+            # Fall back to play's own mark/mid if chain lookup failed
+            if not option_mark:
+                option_mark = play.get("current_mark") or play.get("mid") or play.get("option_mark")
+
+            if not option_mark or float(option_mark) <= 0:
+                log.debug(f"Conviction tracker: no option mark for {play.get('ticker')} "
+                          f"{right} {strike}, skipping record")
+                return False
+
+            from recommendation_tracker import record_recommendation as _rr
+            _rr(
+                store=rec_tracker_store,
+                source="conviction_flow",
+                ticker=play["ticker"],
+                direction=direction,
+                trade_type=trade_type,
+                structure=f"long_{right}",
+                legs=[{
+                    "right": right,
+                    "strike": float(strike),
+                    "expiry": expiry,
+                    "action": "buy",
+                }],
+                entry_option_mark=float(option_mark),
+                entry_underlying=float(spot_val),
+                confidence=70,   # conviction plays don't have explicit confidence
+                regime=None,
+                extra_metadata={
+                    "vol_oi_ratio": play.get("vol_oi_ratio"),
+                    "burst": play.get("burst"),
+                    "rehit_count": play.get("rehit_count"),
+                    "directional_bias": play.get("directional_bias"),
+                    "route": route,
+                    "dte": play.get("dte"),
+                },
+            )
+            return True
+        except Exception as e:
+            log.warning(f"Conviction tracker record failed for "
+                        f"{play.get('ticker', '?')}: {e}")
+            return False
+
+    # ─────────────────────────────────────────────────────
     # CONVICTION PLAY — tiered by DTE
     # ─────────────────────────────────────────────────────
 
