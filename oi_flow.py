@@ -72,6 +72,14 @@ CONVICTION_MIN_BURST = 5000         # burst path: 5K+ contracts in one interval
 CONVICTION_COOLDOWN = 300           # 5 min between conviction alerts per ticker per tier
                                     # (was 3600 — 1 hour blocked everything after deploy)
 
+# FIX BUG #11-lite: minimum time a posted conviction must be held before a
+# direction-flip can fire as an EXIT signal. Prevents "you're on the wrong side"
+# alerts from hitting within minutes of the original entry — observed live as
+# 5-9 min flip-to-exit which is faster than a user can act on the entry.
+# Set from handoff discussion: today's reversal fired at 9 min, user estimates
+# 5-7 min from entry → 15 min gives comfortable buffer for trade execution.
+CONVICTION_EXIT_MIN_HOLD_SEC = 15 * 60  # 15 minutes
+
 # Scoring impact
 SCORE_NOTABLE_ALIGNED = 3
 SCORE_NOTABLE_OPPOSING = -2
@@ -696,6 +704,13 @@ class FlowDetector:
           "hold"        — same direction re-fire, suppress
           "exit"        — direction flipped (app.py decides whether to post based on posted flag)
           "new_strike"  — same direction but significantly different strike
+                          AND enough time has passed since prior fire
+
+        FIX BUG #3: tightened from 3% strike-diff to 5% AND added a
+        10-minute min gap even for different-strike entries. Previously
+        a 3% drift on SPY ($15) during a trending move produced repeated
+        "new_strike" alerts every few minutes. Now requires both a
+        meaningful strike change AND real elapsed time.
         """
         existing = self._conviction_positions.get(ticker)
         if not existing:
@@ -711,13 +726,29 @@ class FlowDetector:
 
         existing_strike = existing.get("strike", 0)
 
-        # Same direction — check if strike is significantly different (>3% from prior)
+        # FIX BUG #3: Same direction — check BOTH strike change AND time elapsed.
+        # Previously: strike_diff > 3.0% → "new_strike" (too loose, fired on drift).
+        # Now: strike_diff > 5.0% AND elapsed > 10 min → "new_strike".
         if existing_strike > 0 and strike > 0:
             strike_diff_pct = abs(strike - existing_strike) / existing_strike * 100
-            if strike_diff_pct > 3.0:
-                return "new_strike"
+            if strike_diff_pct > 5.0:
+                # Additionally require 10+ minutes since prior entry
+                _entry_time_iso = existing.get("entry_time")
+                if _entry_time_iso:
+                    try:
+                        from datetime import datetime as _dt
+                        _prior_dt = _dt.fromisoformat(_entry_time_iso)
+                        _age_sec = (_dt.now() - _prior_dt).total_seconds()
+                        if _age_sec >= 600:  # 10 minutes
+                            return "new_strike"
+                        # Too soon — treat as hold even though strike moved
+                    except Exception:
+                        # Can't parse time → conservative: allow new_strike
+                        return "new_strike"
+                else:
+                    return "new_strike"
 
-        # Same direction, similar strike → suppress (HOLD)
+        # Same direction, similar strike (or too-recent) → suppress (HOLD)
         return "hold"
 
     def _update_conviction_session(self, ticker: str, trade_direction: str,
@@ -1341,8 +1372,17 @@ class FlowDetector:
         Three types: DO NOT CHASE / WATCH FOR TRIGGER / ROOM LEFT
 
         support_fn: function(ticker) → list of support/resistance dicts
+
+        FIX BUG #3: dedup per-ticker-per-day. Previously, if a ticker had
+        multiple confirmed strikes (very common for SPY/QQQ), we'd emit one
+        stalk per strike → 4-6 identical-looking STALK ALERTs in a row
+        for the same name. Now we keep only the highest-conviction stalk
+        per ticker per day (ranked by campaign days then total OI change).
         """
         stalks = []
+        # FIX BUG #3: per-ticker best-stalk tracker — we emit only one
+        # stalk per ticker per call, picking the strongest by campaign depth.
+        best_by_ticker = {}
 
         for conf in confirmations:
             if conf["flow_type"] == "churn":
@@ -1416,8 +1456,25 @@ class FlowDetector:
                 "date": date.today().isoformat(),
             }
 
+            # FIX BUG #3: per-ticker dedup — only keep the strongest stalk per
+            # ticker. Rank by (campaign_days desc, |total_oi| desc, then
+            # conviction of stalk_type). Previously appended every strike's
+            # stalk, flooding the diagnosis channel with 4-6 near-identical
+            # STALK ALERTs for the same ticker (observed on SPY/QQQ).
+            _type_priority = {"do_not_chase": 3, "watch_for_trigger": 2, "room_left": 1}
+            _rank_key = (
+                consecutive,
+                abs(total_oi or 0),
+                _type_priority.get(stalk_type, 0),
+            )
+            prev = best_by_ticker.get(ticker)
+            if prev is None or _rank_key > prev[0]:
+                best_by_ticker[ticker] = (_rank_key, stalk)
+
+        # Emit deduped best-per-ticker stalks
+        for _rank, stalk in best_by_ticker.values():
             stalks.append(stalk)
-            self._state.save_stalk_alert(ticker, stalk)
+            self._state.save_stalk_alert(stalk["ticker"], stalk)
 
         return stalks
 
@@ -2029,6 +2086,29 @@ class FlowDetector:
             if alert_dte == 0 and ct_minutes_total > ZERO_DTE_CUTOFF:
                 continue
 
+            # ── LOW CONFIDENCE — Flagging for Future Removal with Data Back Up ──
+            # FIX BUG #10 (INSTRUMENT-ONLY, DO NOT BLOCK):
+            # Handoff concern: ~2:45 PM CT onward, 3-30 DTE flow can look like
+            # conviction but is actually forced EOD retail-close / de-risking
+            # that just resembles institutional positioning. We DO NOT have
+            # empirical data to justify a hard cutoff yet. Instead, log every
+            # late-day 3-30 DTE conviction play at WARN level with a tag so
+            # you can grep 'LATE_DAY_HEURISTIC' and build a dataset.
+            # Once you have ≥2 weeks of tagged plays graded by the tracker,
+            # revisit this block and decide whether to add a real gate.
+            # --- To remove: delete this entire block. ---
+            LATE_DAY_CUTOFF_MIN = 14 * 60 + 45  # 2:45 PM CT
+            if (ct_minutes_total >= LATE_DAY_CUTOFF_MIN
+                    and 3 <= alert_dte <= 30):
+                log.warning(
+                    f"LATE_DAY_HEURISTIC [LOW_CONFIDENCE]: {ticker} "
+                    f"{alert_dte}DTE conviction fired at "
+                    f"{ct_hour:02d}:{ct_minute:02d} CT — may be EOD "
+                    f"de-risking rather than institutional positioning. "
+                    f"Tag for later review; not blocking."
+                )
+            # ── end Fix #10 ──
+
             # Gate: Vol/OI ratio
             if vol_oi < CONVICTION_MIN_VOL_OI:
                 continue
@@ -2087,7 +2167,39 @@ class FlowDetector:
                     if existing_dir and existing_dir != trade_direction:
                         _exit_prior_was_posted = existing.get("posted", False)
                         if _exit_prior_was_posted:
-                            is_exit_signal = True
+                            # FIX BUG #11-lite: don't fire an exit signal if the
+                            # original entry was posted less than
+                            # CONVICTION_EXIT_MIN_HOLD_SEC ago. Observed live:
+                            # exit firing 9 min after entry, before user could
+                            # complete the trade, making the bot tell the user
+                            # they're "on the wrong side" of their own fill.
+                            _prior_time_iso = existing.get("time")
+                            _minutes_since_entry = None
+                            if _prior_time_iso:
+                                try:
+                                    from datetime import datetime as _dt
+                                    _prior_dt = _dt.fromisoformat(_prior_time_iso)
+                                    _age_sec = (_dt.now() - _prior_dt).total_seconds()
+                                    _minutes_since_entry = _age_sec / 60.0
+                                    if _age_sec < CONVICTION_EXIT_MIN_HOLD_SEC:
+                                        log.info(
+                                            f"🔇 EXIT GATED: {ticker} flip "
+                                            f"{existing_dir}→{trade_direction} only "
+                                            f"{_minutes_since_entry:.1f} min after entry "
+                                            f"(need ≥{CONVICTION_EXIT_MIN_HOLD_SEC/60:.0f} min) — "
+                                            f"treating as new entry, not exit"
+                                        )
+                                        # Treat as new entry: don't flag exit
+                                        is_exit_signal = False
+                                    else:
+                                        is_exit_signal = True
+                                except Exception:
+                                    # Couldn't parse time — be conservative and
+                                    # allow exit (old behavior)
+                                    is_exit_signal = True
+                            else:
+                                # No time field — legacy record, allow exit
+                                is_exit_signal = True
                         else:
                             # Prior was never posted to user → new entry, not exit
                             log.info(f"Direction flip {ticker}: {existing_dir}→{trade_direction} "
@@ -2405,9 +2517,20 @@ class FlowDetector:
             if rec_side != side and self._option_store:
                 rec_quote = self.get_streaming_overlay(ticker, atm_strike, rec_side)
                 if rec_quote:
-                    play["rec_bid"] = rec_quote.get("bid", 0)
-                    play["rec_ask"] = rec_quote.get("ask", 0)
-                    play["rec_mid"] = (rec_quote.get("bid", 0) + rec_quote.get("ask", 0)) / 2
+                    _rb = rec_quote.get("bid", 0) or 0
+                    _ra = rec_quote.get("ask", 0) or 0
+                    play["rec_bid"] = _rb
+                    play["rec_ask"] = _ra
+                    # FIX BUG #9: only compute a two-sided mid when both bid>0 and ask>0.
+                    # Previously (bid + ask) / 2 with bid=0 produced a fake midpoint
+                    # like Ask=1.16, Mid=0.58. When only ask is available, use ask as
+                    # the best-available mark (shows a conservative execution price).
+                    if _rb > 0 and _ra > 0:
+                        play["rec_mid"] = round((_rb + _ra) / 2, 2)
+                    elif _ra > 0:
+                        play["rec_mid"] = _ra  # one-sided: don't fabricate a midpoint
+                    else:
+                        play["rec_mid"] = 0
                     play["rec_strike"] = atm_strike
                     play["rec_side"] = rec_side
                     play["has_rec_contract"] = True
@@ -2432,13 +2555,20 @@ class FlowDetector:
                         if _1a > 0:
                             play["dte1_bid"] = _1b
                             play["dte1_ask"] = _1a
-                            play["dte1_mid"] = round((_1b + _1a) / 2, 2)
+                            # FIX BUG #9: only compute mid when both sides valid.
+                            # Pre-fix: Ask=1.16, Bid=0 produced Mid=0.58 (fake midpoint).
+                            # Post-fix: one-sided quote → mid = ask (conservative mark).
+                            if _1b > 0 and _1a > 0:
+                                play["dte1_mid"] = round((_1b + _1a) / 2, 2)
+                            else:
+                                play["dte1_mid"] = _1a  # one-sided, use ask as mark
                             play["dte1_expiry"] = _1dte_exp
                             play["dte1_strike"] = atm_strike
                             play["dte1_side"] = _1dte_side
                             play["has_1dte_quote"] = True
                             log.info(f"1DTE quote for {ticker}: {_1dte_sym} "
-                                     f"bid=${_1b:.2f} ask=${_1a:.2f}")
+                                     f"bid=${_1b:.2f} ask=${_1a:.2f}"
+                                     + (" (one-sided: mid=ask)" if _1b <= 0 else ""))
                 except Exception as _1e:
                     log.debug(f"1DTE lookup for {ticker}: {_1e}")
 
@@ -2705,7 +2835,18 @@ class FlowDetector:
             if has_rec and rec_ask > 0:
                 lines.append(f"💵 Rec {rec_side_label} {_fmt_strike(rec_strike_val)}: "
                              f"Ask ${rec_ask:.2f} (Mid ${rec_mid:.2f}) | Spot: ${play['spot']:.2f}")
+            elif has_rec:
+                # FIX BUG #8: we have a recommended contract on a different side
+                # from the flow trigger, but the rec contract's live quote is
+                # unavailable. Do NOT fall through to play["ask"] — that's the
+                # wrong-side flow-trigger price (e.g. put ask when recommending
+                # a call). Show a clear unavailable marker instead.
+                lines.append(f"💵 Rec {rec_side_label} {_fmt_strike(rec_strike_val)}: "
+                             f"price unavailable (stream miss) | Spot: ${play['spot']:.2f}")
+                lines.append(f"   ⚠️ Quote contract live; price will populate on next tick")
             else:
+                # No rec contract resolved — flow side matches trade side, so
+                # play["ask"] IS the right contract. Safe to use.
                 lines.append(f"💵 Ask: ${play.get('ask', 0):.2f} | Spot: ${play['spot']:.2f}")
 
         # v7.2.1: Consolidated contract summary — strike, expiry, cost in plain text
