@@ -688,145 +688,6 @@ def handle_command(
         )
         return
 
-
-    # ─────────────────────────────────────
-    # /filled TRADE_ID PRICE  or /filled TICKER PRICE
-    # ─────────────────────────────────────
-    if cmd in ("/filled", "/filled@omegabot"):
-        if len(args) < 2:
-            reply("Usage: /filled TRADE_ID PRICE  or  /filled TICKER PRICE")
-            return
-        try:
-            import fill_reconciler as _fr
-            result = _fr.default_store.resolve_fill(args[0], float(args[1]))
-            if result.get("status") == "RECONCILED":
-                msg = f"✅ Fill recorded — slippage ${result.get('realized_slippage', 0):+.2f}"
-                if result.get("warning"):
-                    msg += f"\n⚠️ {result['warning']}"
-                reply(msg)
-            else:
-                reply(f"❌ {result.get('reason', 'Not reconciled')}")
-        except ValueError:
-            reply("⚠️ Usage: /filled TRADE_ID PRICE  or  /filled TICKER PRICE")
-        except Exception as e:
-            reply(f"⚠️ Fill reconciliation error: {e}")
-        return
-
-    # ─────────────────────────────────────
-    # /slippage [days]
-    # ─────────────────────────────────────
-    if cmd in ("/slippage", "/slippage@omegabot"):
-        try:
-            import fill_reconciler as _fr
-            lookback = int(args[0]) if args else 30
-            reply(_fr.generate_slippage_report(_fr.default_store, lookback_days=lookback))
-        except Exception as e:
-            reply(f"⚠️ Slippage report error: {e}")
-        return
-
-    # ─────────────────────────────────────
-    # /fillquality [days]
-    # ─────────────────────────────────────
-    if cmd in ("/fillquality", "/fillquality@omegabot"):
-        try:
-            import fill_reconciler as _fr
-            lookback = int(args[0]) if args else 7
-            reply(_fr.generate_fill_quality_report(_fr.default_store, lookback_days=lookback))
-        except Exception as e:
-            reply(f"⚠️ Fill quality report error: {e}")
-        return
-
-    # ─────────────────────────────────────
-    # /report [YYYY-MM-DD]
-    # ─────────────────────────────────────
-    if cmd in ("/report", "/report@omegabot"):
-        try:
-            import trade_journal as _tj
-            from performance_attribution import generate_daily_report
-            reply(generate_daily_report(_tj, date_str=args[0] if args else None))
-        except Exception as e:
-            reply(f"⚠️ Daily report error: {e}")
-        return
-
-    # ─────────────────────────────────────
-    # /weekly
-    # ─────────────────────────────────────
-    if cmd in ("/weekly", "/weekly@omegabot"):
-        try:
-            import trade_journal as _tj
-            from performance_attribution import generate_weekly_report
-            reply(generate_weekly_report(_tj))
-        except Exception as e:
-            reply(f"⚠️ Weekly report error: {e}")
-        return
-
-    # ─────────────────────────────────────
-    # Phase 1b: Recommendation Tracker commands
-    # ─────────────────────────────────────
-
-    # /recresults [YYYY-MM-DD]
-    if cmd in ("/recresults", "/recresults@omegabot"):
-        try:
-            from recommendation_tracker import generate_daily_report, reply_long
-            from app import _rec_tracker
-            if _rec_tracker is None:
-                reply("⚠️ Recommendation tracker not initialized")
-                return
-            date_arg = args[0] if args else None
-            report = generate_daily_report(_rec_tracker, date_str=date_arg)
-            reply_long(reply, report)
-        except Exception as e:
-            reply(f"⚠️ Rec results error: {e}")
-        return
-
-    # /recopen — all currently-tracking positions
-    if cmd in ("/recopen", "/recopen@omegabot"):
-        try:
-            from recommendation_tracker import generate_open_positions_report, reply_long
-            from app import _rec_tracker
-            if _rec_tracker is None:
-                reply("⚠️ Recommendation tracker not initialized")
-                return
-            reply_long(reply, generate_open_positions_report(_rec_tracker))
-        except Exception as e:
-            reply(f"⚠️ Rec open error: {e}")
-        return
-
-    # /recweek  |  /recmonth
-    if cmd in ("/recweek", "/recweek@omegabot", "/recmonth", "/recmonth@omegabot"):
-        try:
-            from recommendation_tracker import generate_weekly_summary, reply_long
-            from app import _rec_tracker
-            if _rec_tracker is None:
-                reply("⚠️ Recommendation tracker not initialized")
-                return
-            days = 7 if "week" in cmd else 30
-            reply_long(reply, generate_weekly_summary(_rec_tracker, days=days))
-        except Exception as e:
-            reply(f"⚠️ Rec summary error: {e}")
-        return
-
-    # /shadowedge [days] — Phase 1b shadow signal analysis
-    if cmd in ("/shadowedge", "/shadowedge@omegabot"):
-        try:
-            from recommendation_tracker import (
-                analyze_shadow_edge_from_campaigns,
-                format_shadow_edge_report,
-                reply_long,
-            )
-            from app import _rec_tracker
-            if _rec_tracker is None:
-                reply("⚠️ Recommendation tracker not initialized")
-                return
-            lookback = int(args[0]) if args else 30
-            analysis = analyze_shadow_edge_from_campaigns(
-                _rec_tracker, lookback_days=lookback,
-            )
-            reply_long(reply, format_shadow_edge_report(analysis))
-        except Exception as e:
-            reply(f"⚠️ Shadow edge error: {e}")
-        return
-
     # ─────────────────────────────────────
     # /watchlist
     # ─────────────────────────────────────
@@ -1035,6 +896,70 @@ def handle_command(
             post_income_score_fn(chat_id, ticker, trade_type, short_strike, width, credit, expiry)
         except (ValueError, IndexError) as e:
             reply(f"⚠️ Parse error: {e}\nUsage: /score MRNA put 47 2 0.45")
+        return
+
+
+    # ─────────────────────────────────────
+    # /recresults [YYYY-MM-DD] | /recweek | /recmonth | /recopen | /shadowedge
+    # Uses reply_long() to auto-split messages over 4096 chars.
+    # ─────────────────────────────────────
+    if cmd in ("/recresults", "/recresults@omegabot"):
+        try:
+            from app import _rec_tracker
+            from recommendation_tracker import generate_daily_report, reply_long
+            if _rec_tracker is None:
+                reply("⚠️ Recommendation tracker not initialized.")
+                return
+            date_arg = args[0] if args else None
+            report = generate_daily_report(_rec_tracker, date_str=date_arg)
+            reply_long(reply, report)
+        except Exception as e:
+            reply(f"⚠️ Recommendation results error: {e}")
+        return
+
+    if cmd in ("/recweek", "/recweek@omegabot", "/recmonth", "/recmonth@omegabot"):
+        try:
+            from app import _rec_tracker
+            from recommendation_tracker import generate_weekly_summary, reply_long
+            if _rec_tracker is None:
+                reply("⚠️ Recommendation tracker not initialized.")
+                return
+            days = 7 if "week" in cmd else 30
+            reply_long(reply, generate_weekly_summary(_rec_tracker, days=days))
+        except Exception as e:
+            reply(f"⚠️ Recommendation summary error: {e}")
+        return
+
+    if cmd in ("/recopen", "/recopen@omegabot"):
+        try:
+            from app import _rec_tracker
+            from recommendation_tracker import generate_open_positions_report, reply_long
+            if _rec_tracker is None:
+                reply("⚠️ Recommendation tracker not initialized.")
+                return
+            reply_long(reply, generate_open_positions_report(_rec_tracker))
+        except Exception as e:
+            reply(f"⚠️ Open recommendation report error: {e}")
+        return
+
+    if cmd in ("/shadowedge", "/shadowedge@omegabot"):
+        try:
+            from app import _rec_tracker
+            from recommendation_tracker import (
+                analyze_shadow_edge_from_campaigns,
+                format_shadow_edge_report,
+                reply_long,
+            )
+            if _rec_tracker is None:
+                reply("⚠️ Recommendation tracker not initialized.")
+                return
+            lookback = int(args[0]) if args else 30
+            analysis = analyze_shadow_edge_from_campaigns(
+                _rec_tracker, lookback_days=lookback,
+            )
+            reply_long(reply, format_shadow_edge_report(analysis))
+        except Exception as e:
+            reply(f"⚠️ Shadow edge error: {e}")
         return
 
     if cmd in ("/help", "/help@omegabot", "/start"):
