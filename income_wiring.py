@@ -115,51 +115,14 @@ def create_income_handlers(
                         for opp in opps[:3]:
                             if opp["itqs"]["grade"] != "F" and not opp.get("hard_blocks"):
                                 post_fn(format_income_alert(opp), chat_id=chat_id)
+                                try:
+                                    from app import _record_income_opportunity
+                                    _record_income_opportunity(opp, source="income_scanner")
+                                except Exception as _rec_err:
+                                    log.warning(f"Rec tracker income record failed for {opp.get('ticker','?')}: {_rec_err}")
                                 # v7.2.1: Register A+/A grade income positions for sheet tracking
                                 if opp["itqs"]["grade"] in ("A+", "A"):
                                     _register_income_position(opp)
-
-                                # Phase 1b: Record to recommendation tracker
-                                try:
-                                    from app import _rec_tracker as _rt
-                                    if _rt is not None:
-                                        from recommendation_tracker import record_recommendation as _inrr
-                                        _in_tt = opp.get("trade_type", "")   # "bull_put" / "bear_call"
-                                        _in_right = "put" if _in_tt == "bull_put" else "call"
-                                        _in_dir = "bull" if _in_tt == "bull_put" else "bear"
-                                        _in_structure = _in_tt + "_spread"
-                                        _in_expiry = str(opp.get("expiry", ""))[:10]
-                                        _inrr(
-                                            store=_rt,
-                                            source="income_scanner",
-                                            ticker=opp["ticker"],
-                                            direction=_in_dir,
-                                            trade_type="income",
-                                            structure=_in_structure,
-                                            legs=[
-                                                {"right": _in_right,
-                                                 "strike": float(opp["short_strike"]),
-                                                 "expiry": _in_expiry,
-                                                 "action": "sell"},
-                                                {"right": _in_right,
-                                                 "strike": float(opp.get("long_strike", 0)),
-                                                 "expiry": _in_expiry,
-                                                 "action": "buy"},
-                                            ],
-                                            entry_option_mark=float(opp.get("credit") or 0),
-                                            entry_underlying=float(opp.get("spot", 0)),
-                                            confidence=int(opp["itqs"]["score"]),
-                                            extra_metadata={
-                                                "grade": opp["itqs"]["grade"],
-                                                "roc_pct": opp.get("roc_pct"),
-                                                "cushion_pct": opp.get("cushion_pct"),
-                                                "dte": opp.get("dte"),
-                                            },
-                                        )
-                                except Exception as _intre:
-                                    import logging
-                                    logging.getLogger(__name__).warning(
-                                        f"Income rec tracker record failed: {_intre}")
 
                         if not any(o["itqs"]["grade"] != "F" and not o.get("hard_blocks") for o in opps):
                             post_fn(f"📊 Income scan {ticker}: no qualifying opportunities (all blocked or below threshold).",
@@ -183,6 +146,10 @@ def create_income_handlers(
                         # v7.2.1: Run a second pass to register A+/A positions for sheet tracking.
                         # run_income_scan already posted alerts — we re-scan to get the result objects.
                         # This is lightweight because the data is cached from the first pass.
+                        # NOTE: Do NOT re-import scan_ticker_income here — the outer import at the
+                        # top of _run() already brought it in, and a nested import rebinds the name
+                        # as local for the whole closure, causing UnboundLocalError on the single-
+                        # ticker path above.
                         try:
                             for _t in INCOME_TICKERS:
                                 try:
@@ -194,6 +161,13 @@ def create_income_handlers(
                                         flow_fn=flow_fn,
                                     )
                                     for _o in (_opps or []):
+                                        if (_o["itqs"]["grade"] in ("A+", "A", "B", "C")
+                                                and not _o.get("hard_blocks")):
+                                            try:
+                                                from app import _record_income_opportunity
+                                                _record_income_opportunity(_o, source="income_scanner")
+                                            except Exception as _rec_err:
+                                                log.warning(f"Rec tracker income record failed for {_o.get('ticker','?')}: {_rec_err}")
                                         if (_o["itqs"]["grade"] in ("A+", "A")
                                                 and not _o.get("hard_blocks")):
                                             _register_income_position(_o)
