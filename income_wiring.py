@@ -119,6 +119,48 @@ def create_income_handlers(
                                 if opp["itqs"]["grade"] in ("A+", "A"):
                                     _register_income_position(opp)
 
+                                # Phase 1b: Record to recommendation tracker
+                                try:
+                                    from app import _rec_tracker as _rt
+                                    if _rt is not None:
+                                        from recommendation_tracker import record_recommendation as _inrr
+                                        _in_tt = opp.get("trade_type", "")   # "bull_put" / "bear_call"
+                                        _in_right = "put" if _in_tt == "bull_put" else "call"
+                                        _in_dir = "bull" if _in_tt == "bull_put" else "bear"
+                                        _in_structure = _in_tt + "_spread"
+                                        _in_expiry = str(opp.get("expiry", ""))[:10]
+                                        _inrr(
+                                            store=_rt,
+                                            source="income_scanner",
+                                            ticker=opp["ticker"],
+                                            direction=_in_dir,
+                                            trade_type="income",
+                                            structure=_in_structure,
+                                            legs=[
+                                                {"right": _in_right,
+                                                 "strike": float(opp["short_strike"]),
+                                                 "expiry": _in_expiry,
+                                                 "action": "sell"},
+                                                {"right": _in_right,
+                                                 "strike": float(opp.get("long_strike", 0)),
+                                                 "expiry": _in_expiry,
+                                                 "action": "buy"},
+                                            ],
+                                            entry_option_mark=float(opp.get("credit") or 0),
+                                            entry_underlying=float(opp.get("spot", 0)),
+                                            confidence=int(opp["itqs"]["score"]),
+                                            extra_metadata={
+                                                "grade": opp["itqs"]["grade"],
+                                                "roc_pct": opp.get("roc_pct"),
+                                                "cushion_pct": opp.get("cushion_pct"),
+                                                "dte": opp.get("dte"),
+                                            },
+                                        )
+                                except Exception as _intre:
+                                    import logging
+                                    logging.getLogger(__name__).warning(
+                                        f"Income rec tracker record failed: {_intre}")
+
                         if not any(o["itqs"]["grade"] != "F" and not o.get("hard_blocks") for o in opps):
                             post_fn(f"📊 Income scan {ticker}: no qualifying opportunities (all blocked or below threshold).",
                                     chat_id=chat_id)
