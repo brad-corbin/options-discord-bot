@@ -3443,6 +3443,48 @@ def _process_job(worker_id: int, job: dict):
             except Exception as _sw_pm_err:
                 log.warning(f"Swing position register failed for {ticker}: {_sw_pm_err}")
 
+            # Phase 1b: Record to recommendation tracker
+            try:
+                if _rec_tracker is not None and rec.get("trade"):
+                    from recommendation_tracker import record_recommendation as _swrr
+                    _sw_dir = rec.get("direction", "bull")
+                    _sw_right = "call" if _sw_dir == "bull" else "put"
+                    _sw_trade = rec["trade"]
+                    _sw_legs = [{
+                        "right": _sw_right,
+                        "strike": _sw_trade.get("long"),
+                        "expiry": rec.get("exp"),
+                        "action": "buy",
+                    }]
+                    _sw_structure = f"long_{_sw_right}"
+                    if _sw_trade.get("short"):
+                        _sw_legs.append({
+                            "right": _sw_right,
+                            "strike": _sw_trade.get("short"),
+                            "expiry": rec.get("exp"),
+                            "action": "sell",
+                        })
+                        _sw_structure = ("bull_call_spread" if _sw_dir == "bull"
+                                         else "bear_put_spread")
+                    _swrr(
+                        store=_rec_tracker,
+                        source="swing_engine",
+                        ticker=ticker,
+                        direction=_sw_dir,
+                        trade_type="swing",
+                        structure=_sw_structure,
+                        legs=_sw_legs,
+                        entry_option_mark=float(_sw_trade.get("debit") or 0),
+                        entry_underlying=float(rec.get("spot", 0)),
+                        confidence=int(rec.get("confidence") or 0),
+                        extra_metadata={
+                            "tier": rec.get("tier"),
+                            "fib_level": rec.get("fib_level"),
+                        },
+                    )
+            except Exception as _swtre:
+                log.warning(f"Swing rec tracker record failed: {_swtre}")
+
 
 def _signal_queue_worker_redis(worker_id: int):
     log.info(f"Redis signal worker-{worker_id} started")
@@ -4890,6 +4932,14 @@ def _run_v4_prefilter(ticker: str, spot: float, chains: list, candle_closes: lis
                                 cp["ticker"], cp.get("trade_direction", ""),
                                 cp.get("strike", 0))
 
+                            # Phase 1b: Record to recommendation tracker
+                            try:
+                                if _rec_tracker is not None:
+                                    _flow_detector.record_play_to_tracker(
+                                        cp, spot, chain_data, _rec_tracker)
+                            except Exception as _cprte:
+                                log.warning(f"Conviction tracker record failed: {_cprte}")
+
                         # Log to conviction_plays.csv for outcome tracking
                         try:
                             _vix_val = 0
@@ -6296,6 +6346,14 @@ def _get_0dte_iv(ticker: str, target_date_str: str = None) -> tuple:
                             # v7.2 fix: Confirm direction posted for exit signal tracking
                             _flow_detector.confirm_conviction_posted(
                                 cp["ticker"], cp.get("trade_direction", ""), cp.get("strike", 0))
+
+                            # Phase 1b: Record to recommendation tracker
+                            try:
+                                if _rec_tracker is not None:
+                                    _flow_detector.record_play_to_tracker(
+                                        cp, spot, data, _rec_tracker)
+                            except Exception as _cprte:
+                                log.warning(f"Conviction tracker record failed: {_cprte}")
                         log.info(f"💎 CONVICTION [{route.upper()}]: {cp['ticker']} "
                                f"{cp['trade_side']} ${cp['strike']:.0f} ({cp['dte']}DTE)")
                         # Store conviction boost for EntryValidator
@@ -6513,6 +6571,14 @@ def _get_chain_iv_for_expiry(ticker: str, target_date_str: str, dte: float) -> t
                             # v7.2 fix: Confirm direction posted for exit signal tracking
                             _flow_detector.confirm_conviction_posted(
                                 cp["ticker"], cp.get("trade_direction", ""), cp.get("strike", 0))
+
+                            # Phase 1b: Record to recommendation tracker
+                            try:
+                                if _rec_tracker is not None:
+                                    _flow_detector.record_play_to_tracker(
+                                        cp, spot, data, _rec_tracker)
+                            except Exception as _cprte:
+                                log.warning(f"Conviction tracker record failed: {_cprte}")
                         log.info(f"💎 CONVICTION [{route.upper()}]: {cp['ticker']} "
                                f"{cp['trade_side']} ${cp['strike']:.0f} ({cp['dte']}DTE)")
                         # Store conviction boost for EntryValidator
@@ -9317,6 +9383,50 @@ def _post_checkswing_card(ticker: str, forced_direction: str = None):
         _append_shared_regime_lines(extras, canonical_vol, unified_regime, structure_ctx=structure_ctx, rec=rec, eng=eng, walls=walls, mode="swing")
         final_card = card + ("\n\n" + "\n".join(extras) if extras else "")
         post_to_telegram(final_card)
+
+        # Phase 1b: Record to recommendation tracker
+        try:
+            if _rec_tracker is not None and rec.get("trade"):
+                from recommendation_tracker import record_recommendation as _swrr2
+                _sw_dir2 = rec.get("direction", "bull")
+                _sw_right2 = "call" if _sw_dir2 == "bull" else "put"
+                _sw_trade2 = rec["trade"]
+                _sw_legs2 = [{
+                    "right": _sw_right2,
+                    "strike": _sw_trade2.get("long"),
+                    "expiry": rec.get("exp"),
+                    "action": "buy",
+                }]
+                _sw_structure2 = f"long_{_sw_right2}"
+                if _sw_trade2.get("short"):
+                    _sw_legs2.append({
+                        "right": _sw_right2,
+                        "strike": _sw_trade2.get("short"),
+                        "expiry": rec.get("exp"),
+                        "action": "sell",
+                    })
+                    _sw_structure2 = ("bull_call_spread" if _sw_dir2 == "bull"
+                                      else "bear_put_spread")
+                _swrr2(
+                    store=_rec_tracker,
+                    source="swing_engine_manual",
+                    ticker=ticker,
+                    direction=_sw_dir2,
+                    trade_type="swing",
+                    structure=_sw_structure2,
+                    legs=_sw_legs2,
+                    entry_option_mark=float(_sw_trade2.get("debit") or 0),
+                    entry_underlying=float(spot),
+                    confidence=int(rec.get("confidence") or 0),
+                    extra_metadata={
+                        "tier": rec.get("tier"),
+                        "fib_level": rec.get("fib_level"),
+                        "forced_direction": forced_direction,
+                    },
+                )
+        except Exception as _swtre2:
+            log.warning(f"Swing (manual) rec tracker record failed: {_swtre2}")
+
         try:
             _log_signal_dataset_event(
                 ticker=ticker,
