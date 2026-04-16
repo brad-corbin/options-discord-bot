@@ -37,6 +37,7 @@ import logging
 from typing import Dict, List, Optional, Any, Tuple, Callable
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
 log = logging.getLogger(__name__)
 
@@ -45,8 +46,20 @@ log = logging.getLogger(__name__)
 # CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════
 
-# Window within which identical recommendations collapse into one campaign
-CAMPAIGN_WINDOW_HOURS = 4
+# Campaign windows by trade type. Tune here instead of one hardcoded global.
+CAMPAIGN_WINDOW_HOURS_BY_TYPE = {
+    "immediate": 1.5,
+    "conviction": 2.0,
+    "swing": 24.0,
+    "income": 24.0,
+}
+
+# Optional per-source exit overrides. Kept empty by default, but this makes
+# grading policy configurable without changing tracker logic later.
+SOURCE_EXIT_OVERRIDES = {
+    # Example:
+    # ("check_ticker", "immediate"): {"target_pct": 0.40, "scratch_band": 0.08},
+}
 
 # Default exit logic per trade type. Source modules can override when recording.
 # All percentages are of the option's entry premium (or spread's entry debit).
@@ -123,12 +136,40 @@ def canonical_fingerprint(
     return hashlib.sha1(payload.encode()).hexdigest()[:12]
 
 
-def _window_bucket(ts: float, window_hours: int = CAMPAIGN_WINDOW_HOURS) -> int:
-    return int(ts // (window_hours * 3600))
+def _campaign_window_hours(trade_type: str, source: Optional[str] = None) -> float:
+    trade_type = (trade_type or "").lower()
+    return float(CAMPAIGN_WINDOW_HOURS_BY_TYPE.get(trade_type, 4.0))
 
 
-def campaign_id_from_parts(fingerprint: str, ts: float) -> str:
-    return f"{fingerprint}:b{_window_bucket(ts)}"
+def _window_bucket(ts: float, window_hours: float) -> int:
+    return int(ts // max(window_hours * 3600.0, 1.0))
+
+
+def campaign_id_from_parts(fingerprint: str, ts: float, trade_type: str, source: Optional[str] = None) -> str:
+    hours = _campaign_window_hours(trade_type, source)
+    return f"{fingerprint}:b{_window_bucket(ts, hours)}"
+
+
+def _effective_exit_logic(trade_type: str, source: Optional[str] = None, exit_logic: Optional[Dict] = None) -> Dict:
+    base = dict(DEFAULT_EXIT_LOGIC.get((trade_type or "").lower(), DEFAULT_EXIT_LOGIC["conviction"]))
+    if source:
+        base.update(SOURCE_EXIT_OVERRIDES.get((source, (trade_type or "").lower()), {}))
+    if exit_logic:
+        base.update(exit_logic)
+    return base
+
+
+def _derive_pricing_mode(structure: str, explicit: Optional[str] = None) -> str:
+    if explicit:
+        return explicit
+    s = (structure or "").lower()
+    if s in ("long_call", "long_put"):
+        return "long_mark"
+    if s in ("bull_call_spread", "bear_put_spread"):
+        return "debit_spread_net"
+    if s in ("bull_put_spread", "bear_call_spread"):
+        return "credit_spread_debit_to_close"
+    return "long_mark"
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -264,7 +305,7 @@ class RecommendationStore:
                 seen.add(cid)
                 rec = self.load_campaign(cid)
                 if rec and rec.get("status") == STATUS_GRADED:
-                    if rec.get("entry_ts", 0) >= since_ts:
+                    if rec.get("exit_ts", rec.get("entry_ts", 0)) >= since_ts:
                         out.append(rec)
         return out
 
@@ -288,6 +329,7 @@ def record_recommendation(
     exit_logic: Optional[Dict] = None,
     extra_metadata: Optional[Dict] = None,
     shadow_signals: Optional[Dict] = None,   # Phase 1b: {skew, vwap, gap, total_delta}
+    pricing_mode: Optional[str] = None,      # long_mark / debit_spread_net / credit_spread_debit_to_close
     ts: Optional[float] = None,
 ) -> Dict:
     """Record a recommendation. Returns dict describing what happened.
@@ -308,7 +350,7 @@ def record_recommendation(
     fingerprint = canonical_fingerprint(
         ticker, direction, structure, legs, trade_type
     )
-    cid = campaign_id_from_parts(fingerprint, ts)
+    cid = campaign_id_from_parts(fingerprint, ts, trade_type, source)
 
     existing = store.load_campaign(cid)
     if existing is not None:
@@ -329,9 +371,7 @@ def record_recommendation(
         }
 
     # New campaign
-    effective_exit_logic = dict(DEFAULT_EXIT_LOGIC.get(trade_type, DEFAULT_EXIT_LOGIC["conviction"]))
-    if exit_logic:
-        effective_exit_logic.update(exit_logic)
+    effective_exit_logic = _effective_exit_logic(trade_type, source, exit_logic)
 
     # Absolute deadline for grading — used by max-hold check
     deadline_ts = ts + effective_exit_logic["max_hold_hours"] * 3600
@@ -348,6 +388,8 @@ def record_recommendation(
         "trade_type":         trade_type,
         "structure":          structure,
         "legs":               legs,
+        "pricing_mode":       _derive_pricing_mode(structure, pricing_mode),
+        "campaign_window_hours": _campaign_window_hours(trade_type, source),
 
         # Posting metadata
         "first_source":       source,
@@ -433,6 +475,15 @@ def _compute_credit_pnl_pct(credit_received: float, current_debit_to_close: floa
     return (credit_received - current_debit_to_close) / credit_received
 
 
+def _current_pnl_from_record(rec: Dict) -> float:
+    entry = float(rec.get("entry_option_mark") or 0)
+    current = float(rec.get("last_option_mark", entry) or 0)
+    pricing_mode = rec.get("pricing_mode") or _derive_pricing_mode(rec.get("structure"))
+    if pricing_mode == "credit_spread_debit_to_close":
+        return _compute_credit_pnl_pct(entry, current)
+    return _compute_pnl_pct(entry, current)
+
+
 def update_tracking(
     store: RecommendationStore,
     campaign_id: str,
@@ -450,8 +501,9 @@ def update_tracking(
     entry_mark = float(rec["entry_option_mark"])
     trade_type = rec["trade_type"]
 
-    # Compute P&L based on structure
-    is_credit = rec["structure"] in ("bull_put_spread", "bear_call_spread")
+    # Compute P&L based on stored pricing convention
+    pricing_mode = rec.get("pricing_mode") or _derive_pricing_mode(rec.get("structure"))
+    is_credit = pricing_mode == "credit_spread_debit_to_close"
     if is_credit:
         pnl_pct = _compute_credit_pnl_pct(entry_mark, current_option_mark)
     else:
@@ -938,10 +990,7 @@ def generate_daily_report(
         for r in sorted(posted_today_active, key=lambda x: -(x.get("mfe_pct") or 0)):
             dup_note = (f" (×{r['duplicate_count']})"
                         if r.get("duplicate_count", 1) > 1 else "")
-            current_pnl = _compute_pnl_pct(
-                r["entry_option_mark"],
-                r.get("last_option_mark", r["entry_option_mark"]),
-            )
+            current_pnl = _current_pnl_from_record(r)
             lines.append(
                 f"  ⏳ {r['ticker']} {_fmt_structure(r)} ({r['trade_type']})"
                 f"{dup_note} → {current_pnl:+.1%} "
@@ -955,10 +1004,7 @@ def generate_daily_report(
         for r in sorted(open_from_prior_days, key=lambda x: -(x.get("mfe_pct") or 0)):
             dup_note = (f" (×{r['duplicate_count']})"
                         if r.get("duplicate_count", 1) > 1 else "")
-            current_pnl = _compute_pnl_pct(
-                r["entry_option_mark"],
-                r.get("last_option_mark", r["entry_option_mark"]),
-            )
+            current_pnl = _current_pnl_from_record(r)
             days_held = (time.time() - r.get("entry_ts", time.time())) / 86400
             max_hold_days = r.get("exit_logic", {}).get("max_hold_hours", 24) / 24
             days_remaining = max_hold_days - days_held
@@ -1318,10 +1364,7 @@ def generate_open_positions_report(store: RecommendationStore) -> str:
             days_held = (now - r.get("entry_ts", now)) / 86400
             max_hold_days = r.get("exit_logic", {}).get("max_hold_hours", 24) / 24
             days_remaining = max_hold_days - days_held
-            current_pnl = _compute_pnl_pct(
-                r["entry_option_mark"],
-                r.get("last_option_mark", r["entry_option_mark"]),
-            )
+            current_pnl = _current_pnl_from_record(r)
             entry_date = r.get("entry_date", "?")
             peak_date = (
                 datetime.fromtimestamp(
@@ -1370,10 +1413,7 @@ def is_market_hours(now_ts: Optional[float] = None) -> bool:
     the tracker handles by leaving MFE/MAE unchanged).
     """
     now_ts = now_ts or time.time()
-    utc = datetime.fromtimestamp(now_ts, tz=timezone.utc)
-    # Convert to approximate CT (UTC-5 standard, UTC-6 DST — close enough
-    # for session gating)
-    ct = utc - timedelta(hours=5)
+    ct = datetime.fromtimestamp(now_ts, tz=ZoneInfo("America/Chicago"))
 
     # Monday=0 .. Sunday=6
     if ct.weekday() >= 5:   # Sat/Sun
