@@ -139,10 +139,6 @@ from em_reconciler import (
 
 import risk_manager
 import trade_journal
-import fill_reconciler as _fill_reconciler_mod
-from fill_reconciler import FillRecordStore
-import recommendation_tracker as _rt_mod
-from recommendation_tracker import RecommendationStore
 
 # ── v7 imports ──
 from backtest_guidance import should_filter_signal, ACTIVE_GUIDANCE
@@ -174,6 +170,7 @@ from oi_tracker import OITracker
 from persistent_state import PersistentState
 from oi_flow import FlowDetector, FLOW_TICKERS
 from potter_box import PotterBoxScanner
+import recommendation_tracker as _rt_mod
 
 # ── v4.3: Thesis Monitor ──
 from thesis_monitor import (
@@ -190,8 +187,7 @@ _shadow_logger = None     # v7: shadow filter logger
 _position_monitor = None  # v7: unified position monitor
 _flow_detector = None     # v6.1: unified institutional flow detection
 _potter_box = None        # v6.2: Potter Box scanner
-_fill_store = None        # Phase 1: fill reconciliation store
-_rec_tracker = None       # Phase 1b: recommendation effectiveness tracker
+_rec_tracker = None       # Real Phase 1: recommendation effectiveness tracker
 
 # ─────────────────────────────────────────────────────────
 # LOGGING
@@ -2388,25 +2384,399 @@ def store_exists(key: str) -> bool:
 
 
 def store_scan(pattern: str) -> list:
-    """Scan Redis for keys matching pattern. Returns list of key strings."""
     r = _get_redis()
-    if r:
-        try:
-            keys = []
-            cursor = 0
-            while True:
-                cursor, batch = r.scan(cursor, match=pattern, count=100)
-                keys.extend([k.decode() if isinstance(k, bytes) else k for k in batch])
-                if cursor == 0:
-                    break
-            return keys
-        except Exception as e:
-            log.debug(f"Redis scan failed for {pattern}: {e}")
-    return []
+    if not r:
+        return []
+    try:
+        return list(r.scan_iter(match=pattern))
+    except Exception as e:
+        log.warning(f"Redis SCAN failed for pattern={pattern}: {e}")
+        return []
+
 
 # ─────────────────────────────────────────────────────────
-# DEDUP
+# RECOMMENDATION EFFECTIVENESS TRACKER (REAL PHASE 1 + 1B)
 # ─────────────────────────────────────────────────────────
+
+def _raw_intraday_to_rows(raw_bars) -> list:
+    if not raw_bars:
+        return []
+    if isinstance(raw_bars, list):
+        return list(raw_bars)
+    try:
+        opens = raw_bars.get("o") or []
+        highs = raw_bars.get("h") or []
+        lows = raw_bars.get("l") or []
+        closes = raw_bars.get("c") or []
+        vols = raw_bars.get("v") or []
+        ts = raw_bars.get("t") or []
+        n = min(len(opens), len(highs), len(lows), len(closes), len(vols), len(ts))
+        rows = []
+        for i in range(n):
+            rows.append({
+                "open": as_float(opens[i], 0.0),
+                "high": as_float(highs[i], 0.0),
+                "low": as_float(lows[i], 0.0),
+                "close": as_float(closes[i], 0.0),
+                "volume": as_float(vols[i], 0.0),
+                "t": ts[i],
+            })
+        return rows
+    except Exception:
+        return []
+
+
+def _find_chain_rows_for_expiration(chains, expiration: str) -> list:
+    for exp, _dte, contracts in (chains or []):
+        if str(exp) == str(expiration):
+            return list(contracts or [])
+    return []
+
+
+def _build_prior_day_gap_context(ticker: str, intraday_rows: list = None) -> dict:
+    rows = _get_daily_ohlcv_rows(ticker, days=3)
+    if not rows:
+        return None
+    prev = rows[-1]
+    session_open = None
+    if intraday_rows:
+        try:
+            session_open = as_float(intraday_rows[0].get("open"), None)
+        except Exception:
+            session_open = None
+    return {
+        "high": prev.get("high"),
+        "low": prev.get("low"),
+        "close": prev.get("close"),
+        "session_open": session_open,
+        "avg_opening_volume": None,
+    }
+
+
+def _minutes_since_open_ct(now_ts: float = None) -> int:
+    now_ts = now_ts or time.time()
+    ct = datetime.fromtimestamp(now_ts, tz=ZoneInfo("America/Chicago"))
+    return ct.hour * 60 + ct.minute - 510
+
+
+def _compute_shadow_bundle_for_post(ticker: str, direction: str, chain_rows: list, spot: float, intraday_rows: list = None, prior_day_ctx: dict = None):
+    try:
+        from shadow_signals import compute_shadow_bundle
+        return compute_shadow_bundle(
+            ticker=ticker,
+            direction=direction,
+            contracts=chain_rows,
+            spot=spot,
+            intraday_bars=intraday_rows,
+            prior_day_data=prior_day_ctx,
+            first_bars_of_session=(intraday_rows[:3] if intraday_rows else None),
+            minutes_since_open=_minutes_since_open_ct(),
+        )
+    except Exception as e:
+        log.warning(f"Shadow bundle compute failed for {ticker}: {e}")
+        return None
+
+
+def _record_recommendation_campaign(*, source: str, ticker: str, direction: str, trade_type: str, structure: str, legs: list, entry_option_mark: float, entry_underlying: float, confidence: int = None, regime=None, extra_metadata: dict = None, exit_logic: dict = None, pricing_mode: str = None, chain_rows: list = None, intraday_rows: list = None, prior_day_ctx: dict = None):
+    global _rec_tracker
+    if _rec_tracker is None:
+        return None
+    try:
+        shadow_bundle = _compute_shadow_bundle_for_post(
+            ticker=ticker, direction=direction, chain_rows=chain_rows or [],
+            spot=entry_underlying, intraday_rows=intraday_rows or [],
+            prior_day_ctx=prior_day_ctx,
+        )
+        return _rt_mod.record_recommendation(
+            store=_rec_tracker,
+            source=source,
+            ticker=ticker,
+            direction=direction,
+            trade_type=trade_type,
+            structure=structure,
+            legs=legs,
+            entry_option_mark=float(entry_option_mark or 0),
+            entry_underlying=float(entry_underlying or 0),
+            confidence=int(confidence) if confidence is not None else None,
+            regime=(regime.get("label") if isinstance(regime, dict) else regime),
+            exit_logic=exit_logic,
+            extra_metadata=extra_metadata or {},
+            shadow_signals=shadow_bundle,
+            pricing_mode=pricing_mode,
+        )
+    except Exception as e:
+        log.warning(f"Rec tracker record failed for {ticker} ({source}): {e}")
+        return None
+
+
+def _record_check_ticker_recommendation(ticker: str, direction: str, best_rec: dict, spot: float, regime, chains):
+    trade = (best_rec or {}).get("trade") or {}
+    if not trade:
+        return None
+    exp = best_rec.get("exp")
+    dte = int(best_rec.get("dte") or 0)
+    right = "call" if direction == "bull" else "put"
+    long_strike = trade.get("long")
+    short_strike = trade.get("short")
+    if not exp or not long_strike:
+        return None
+    legs = [{"right": right, "strike": long_strike, "expiry": exp, "action": "buy"}]
+    structure = f"long_{right}"
+    pricing_mode = "long_mark"
+    if short_strike:
+        legs.append({"right": right, "strike": short_strike, "expiry": exp, "action": "sell"})
+        structure = "bull_call_spread" if direction == "bull" else "bear_put_spread"
+        pricing_mode = "debit_spread_net"
+    intraday_rows = _raw_intraday_to_rows(get_intraday_bars(ticker, resolution=5, countback=60))
+    prior_ctx = _build_prior_day_gap_context(ticker, intraday_rows)
+    chain_rows = _find_chain_rows_for_expiration(chains, exp)
+    return _record_recommendation_campaign(
+        source="check_ticker", ticker=ticker, direction=direction,
+        trade_type=("immediate" if dte <= 2 else "swing"),
+        structure=structure, legs=legs, entry_option_mark=trade.get("debit") or 0,
+        entry_underlying=spot, confidence=best_rec.get("confidence"), regime=regime,
+        extra_metadata={"spread_id": best_rec.get("spread_id"), "tier": best_rec.get("tier")},
+        pricing_mode=pricing_mode, chain_rows=chain_rows, intraday_rows=intraday_rows, prior_day_ctx=prior_ctx,
+    )
+
+
+def _record_swing_recommendation(ticker: str, rec: dict, spot: float, chains=None, source: str = "swing_engine"):
+    trade = (rec or {}).get("trade") or {}
+    direction = (rec or {}).get("direction")
+    exp = rec.get("exp")
+    right = "call" if direction == "bull" else "put"
+    long_strike = trade.get("long")
+    short_strike = trade.get("short")
+    if not exp or not long_strike or direction not in ("bull", "bear"):
+        return None
+    legs = [{"right": right, "strike": long_strike, "expiry": exp, "action": "buy"}]
+    structure = f"long_{right}"
+    pricing_mode = "long_mark"
+    if short_strike:
+        legs.append({"right": right, "strike": short_strike, "expiry": exp, "action": "sell"})
+        structure = "bull_call_spread" if direction == "bull" else "bear_put_spread"
+        pricing_mode = "debit_spread_net"
+    intraday_rows = _raw_intraday_to_rows(get_intraday_bars(ticker, resolution=5, countback=60))
+    prior_ctx = _build_prior_day_gap_context(ticker, intraday_rows)
+    chain_rows = _find_chain_rows_for_expiration(chains, exp) if chains else []
+    return _record_recommendation_campaign(
+        source=source, ticker=ticker, direction=direction, trade_type="swing",
+        structure=structure, legs=legs, entry_option_mark=trade.get("debit") or 0,
+        entry_underlying=spot, confidence=rec.get("confidence"), regime=rec.get("regime"),
+        extra_metadata={"tier": rec.get("tier")}, pricing_mode=pricing_mode,
+        chain_rows=chain_rows, intraday_rows=intraday_rows, prior_day_ctx=prior_ctx,
+    )
+
+
+def _record_income_opportunity(opp: dict, source: str = "income_scanner"):
+    ticker = (opp or {}).get("ticker")
+    trade_type = (opp or {}).get("trade_type")
+    if not ticker or trade_type not in ("bull_put", "bear_call"):
+        return None
+    right = "put" if trade_type == "bull_put" else "call"
+    exp = str(opp.get("expiry") or "")[:10]
+    short_strike = opp.get("short_strike")
+    long_strike = opp.get("long_strike")
+    if not exp or short_strike is None or long_strike is None:
+        return None
+    structure = trade_type + "_spread"
+    legs = [
+        {"right": right, "strike": short_strike, "expiry": exp, "action": "sell"},
+        {"right": right, "strike": long_strike, "expiry": exp, "action": "buy"},
+    ]
+    intraday_rows = _raw_intraday_to_rows(get_intraday_bars(ticker, resolution=5, countback=60))
+    prior_ctx = _build_prior_day_gap_context(ticker, intraday_rows)
+    try:
+        chain_rows = list((_cached_md.get_chain(ticker, exp, side=right) or [])) if _cached_md else []
+    except Exception:
+        chain_rows = []
+    return _record_recommendation_campaign(
+        source=source, ticker=ticker, direction=("bull" if trade_type == "bull_put" else "bear"),
+        trade_type="income", structure=structure, legs=legs,
+        entry_option_mark=opp.get("credit") or 0, entry_underlying=opp.get("spot") or 0,
+        confidence=((opp.get("itqs") or {}).get("score")), regime=None,
+        extra_metadata={"grade": (opp.get("itqs") or {}).get("grade")},
+        pricing_mode="credit_spread_debit_to_close", chain_rows=chain_rows, intraday_rows=intraday_rows, prior_day_ctx=prior_ctx,
+    )
+
+
+def _record_conviction_recommendation(cp: dict, spot: float, chain_data=None, best_income: dict = None, source: str = "conviction_flow"):
+    if not cp or cp.get("is_shadow_only") or cp.get("is_exit_signal"):
+        return None
+    route = (cp.get("route") or "").lower()
+    if route in ("stalk", "campaign", "watchlist"):
+        return None
+    if route == "income" and best_income:
+        return _record_income_opportunity(best_income, source=source + "_income")
+    if route not in ("immediate", "swing"):
+        return None
+    direction = "bull" if cp.get("trade_direction") == "bullish" else "bear"
+    right = "call" if direction == "bull" else "put"
+    strike = cp.get("rec_strike") or cp.get("strike")
+    exp = str(cp.get("expiry") or "")[:10]
+    if not strike or not exp:
+        return None
+    intraday_rows = _raw_intraday_to_rows(get_intraday_bars(cp["ticker"], resolution=5, countback=60))
+    prior_ctx = _build_prior_day_gap_context(cp["ticker"], intraday_rows)
+    chain_rows = list(chain_data or [])
+    return _record_recommendation_campaign(
+        source=source, ticker=cp["ticker"], direction=direction, trade_type=route,
+        structure=f"long_{right}", legs=[{"right": right, "strike": strike, "expiry": exp, "action": "buy"}],
+        entry_option_mark=(cp.get("current_mark") or cp.get("mid") or cp.get("premium") or 0),
+        entry_underlying=spot, confidence=cp.get("confidence") or 70, regime=None,
+        extra_metadata={"vol_oi_ratio": cp.get("vol_oi_ratio"), "burst": cp.get("burst")},
+        pricing_mode="long_mark", chain_rows=chain_rows, intraday_rows=intraday_rows, prior_day_ctx=prior_ctx,
+    )
+
+
+def _rec_tracker_price_fn(ticker, expiry, right, strike, structure, legs):
+    global _cached_md
+    if _cached_md is None:
+        return None
+    try:
+        if structure in ("long_call", "long_put"):
+            side = "call" if "call" in structure else "put"
+            chain = _cached_md.get_chain(ticker, expiry, side=side) or []
+            for c in chain:
+                if abs(float(c.get("strike", 0)) - float(strike or 0)) < 0.01:
+                    bid = as_float(c.get("bid"), 0.0)
+                    ask = as_float(c.get("ask"), 0.0)
+                    last = as_float(c.get("last"), 0.0)
+                    if bid > 0 and ask > 0:
+                        return (bid + ask) / 2.0
+                    if last > 0:
+                        return last
+                    return None
+            return None
+
+        if structure in ("bull_call_spread", "bear_put_spread", "bull_put_spread", "bear_call_spread"):
+            mids = {}
+            for leg in (legs or []):
+                side = leg.get("right")
+                chain = _cached_md.get_chain(ticker, leg.get("expiry"), side=side) or []
+                for c in chain:
+                    if abs(float(c.get("strike", 0)) - float(leg.get("strike", 0))) < 0.01:
+                        bid = as_float(c.get("bid"), 0.0)
+                        ask = as_float(c.get("ask"), 0.0)
+                        last = as_float(c.get("last"), 0.0)
+                        mids[(leg.get("action"), leg.get("strike"), leg.get("expiry"), leg.get("right"))] = ((bid + ask) / 2.0 if bid > 0 and ask > 0 else (last if last > 0 else None))
+                        break
+            buy_leg = next((l for l in (legs or []) if l.get("action") == "buy"), None)
+            sell_leg = next((l for l in (legs or []) if l.get("action") == "sell"), None)
+            if not buy_leg or not sell_leg:
+                return None
+            buy_mid = mids.get((buy_leg.get("action"), buy_leg.get("strike"), buy_leg.get("expiry"), buy_leg.get("right")))
+            sell_mid = mids.get((sell_leg.get("action"), sell_leg.get("strike"), sell_leg.get("expiry"), sell_leg.get("right")))
+            if buy_mid is None or sell_mid is None:
+                return None
+            return max(buy_mid - sell_mid, 0.0)
+        return None
+    except Exception as e:
+        log.warning(f"Rec tracker price_fn failed for {ticker}: {e}")
+        return None
+
+
+def _rec_tracker_poll_loop():
+    global _rec_tracker
+    while True:
+        try:
+            if _rec_tracker is not None:
+                summary = _rt_mod.poll_and_update_if_market_open(
+                    store=_rec_tracker,
+                    price_fn=_rec_tracker_price_fn,
+                    spot_fn=get_spot,
+                )
+                if summary.get("polled") or summary.get("graded") or summary.get("updated"):
+                    log.info(f"Rec tracker poll: {summary}")
+        except Exception as e:
+            log.warning(f"Rec tracker poll loop error: {e}")
+        time.sleep(90)
+
+
+# ─────────────────────────────────────────────────────────
+# Phase 1b: Scheduled report posting
+# Posts to Telegram automatically at:
+#   08:00 AM CT weekdays  →  Morning briefing
+#   03:15 PM CT weekdays  →  End-of-day /recresults
+#   03:30 PM CT Fridays   →  Weekly digest + /shadowedge
+#   09:00 AM CT 1st of month  →  Monthly attribution
+# ─────────────────────────────────────────────────────────
+
+def _rec_tracker_report_scheduler():
+    """60s heartbeat that posts scheduled reports at CT time targets.
+
+    Uses a dedup-keys-per-minute scheme so that running the check twice
+    within the same minute does not double-post.
+    """
+    from zoneinfo import ZoneInfo
+    _CT = ZoneInfo("America/Chicago")
+    _last_posted = set()
+
+    def _is_time(hour_ct: int, minute_ct: int) -> bool:
+        now_ct = datetime.now(_CT)
+        if now_ct.hour != hour_ct or now_ct.minute != minute_ct:
+            return False
+        key = now_ct.strftime(f"%Y-%m-%d-{hour_ct:02d}:{minute_ct:02d}")
+        if key in _last_posted:
+            return False
+        _last_posted.add(key)
+        # Prune older than 48hrs
+        cutoff = (now_ct - timedelta(hours=48)).strftime("%Y-%m-%d")
+        for k in list(_last_posted):
+            if k < cutoff:
+                _last_posted.discard(k)
+        return True
+
+    def _weekday_only():
+        return datetime.now(_CT).weekday() < 5
+
+    while True:
+        try:
+            if _rec_tracker is None:
+                time.sleep(60)
+                continue
+
+            import scheduled_reports as _sr
+
+            # 08:00 CT — morning briefing (weekdays)
+            if _is_time(8, 0) and _weekday_only():
+                try:
+                    _sr.post_morning_briefing(
+                        post_fn=post_to_telegram,
+                        rec_tracker_store=_rec_tracker,
+                    )
+                    log.info("Scheduled: morning briefing posted")
+                except Exception as e:
+                    log.warning(f"Morning briefing failed: {e}")
+
+            # 15:15 CT — end-of-day recresults (weekdays)
+            if _is_time(15, 15) and _weekday_only():
+                try:
+                    _sr.post_eod_report(post_to_telegram, _rec_tracker)
+                    log.info("Scheduled: EOD recresults posted")
+                except Exception as e:
+                    log.warning(f"EOD recresults failed: {e}")
+
+            # 15:30 CT Fridays — weekly digest + shadow edge
+            if _is_time(15, 30) and datetime.now(_CT).weekday() == 4:
+                try:
+                    _sr.post_weekly_digest(post_to_telegram, _rec_tracker)
+                    log.info("Scheduled: weekly digest posted")
+                except Exception as e:
+                    log.warning(f"Weekly digest failed: {e}")
+
+            # 09:00 CT on 1st of month — monthly attribution
+            if _is_time(9, 0) and datetime.now(_CT).day == 1:
+                try:
+                    _sr.post_monthly_attribution(post_to_telegram, _rec_tracker)
+                    log.info("Scheduled: monthly attribution posted")
+                except Exception as e:
+                    log.warning(f"Monthly attribution failed: {e}")
+
+        except Exception as e:
+            log.warning(f"Rec tracker report scheduler error: {e}")
+        time.sleep(60)
+
 
 def trade_dedup_key(ticker, direction, short_k, long_k) -> str:
     raw = f"{ticker}:{direction}:{short_k}:{long_k}"
@@ -3442,48 +3812,6 @@ def _process_job(worker_id: int, job: dict):
                     )
             except Exception as _sw_pm_err:
                 log.warning(f"Swing position register failed for {ticker}: {_sw_pm_err}")
-
-            # Phase 1b: Record to recommendation tracker
-            try:
-                if _rec_tracker is not None and rec.get("trade"):
-                    from recommendation_tracker import record_recommendation as _swrr
-                    _sw_dir = rec.get("direction", "bull")
-                    _sw_right = "call" if _sw_dir == "bull" else "put"
-                    _sw_trade = rec["trade"]
-                    _sw_legs = [{
-                        "right": _sw_right,
-                        "strike": _sw_trade.get("long"),
-                        "expiry": rec.get("exp"),
-                        "action": "buy",
-                    }]
-                    _sw_structure = f"long_{_sw_right}"
-                    if _sw_trade.get("short"):
-                        _sw_legs.append({
-                            "right": _sw_right,
-                            "strike": _sw_trade.get("short"),
-                            "expiry": rec.get("exp"),
-                            "action": "sell",
-                        })
-                        _sw_structure = ("bull_call_spread" if _sw_dir == "bull"
-                                         else "bear_put_spread")
-                    _swrr(
-                        store=_rec_tracker,
-                        source="swing_engine",
-                        ticker=ticker,
-                        direction=_sw_dir,
-                        trade_type="swing",
-                        structure=_sw_structure,
-                        legs=_sw_legs,
-                        entry_option_mark=float(_sw_trade.get("debit") or 0),
-                        entry_underlying=float(rec.get("spot", 0)),
-                        confidence=int(rec.get("confidence") or 0),
-                        extra_metadata={
-                            "tier": rec.get("tier"),
-                            "fib_level": rec.get("fib_level"),
-                        },
-                    )
-            except Exception as _swtre:
-                log.warning(f"Swing rec tracker record failed: {_swtre}")
 
 
 def _signal_queue_worker_redis(worker_id: int):
@@ -4822,6 +5150,10 @@ def _run_v4_prefilter(ticker: str, spot: float, chains: list, candle_closes: lis
                             post_to_telegram(msg)
                             if TELEGRAM_CHAT_INTRADAY and TELEGRAM_CHAT_INTRADAY != TELEGRAM_CHAT_ID:
                                 post_to_telegram(msg, chat_id=TELEGRAM_CHAT_INTRADAY)
+                            try:
+                                _record_conviction_recommendation(cp, spot, chain_data=chain_data, source="conviction_flow")
+                            except Exception as _rce:
+                                log.warning(f"Rec tracker conviction failed for {cp.get('ticker','?')}: {_rce}")
 
                         elif route == "income":
                             # 3-7 DTE: unified conviction + income card
@@ -4908,12 +5240,20 @@ def _run_v4_prefilter(ticker: str, spot: float, chains: list, candle_closes: lis
                                 msg += "\n\n📊 Income scan: no qualifying opportunities found"
 
                             post_to_telegram(msg)
+                            try:
+                                _record_conviction_recommendation(cp, spot, chain_data=chain_data, best_income=_best_income, source="conviction_flow")
+                            except Exception as _rce:
+                                log.warning(f"Rec tracker conviction failed for {cp.get('ticker','?')}: {_rce}")
 
                         elif route == "swing":
                             # 8-30 DTE: post to both channels
                             post_to_telegram(msg)
                             if TELEGRAM_CHAT_INTRADAY and TELEGRAM_CHAT_INTRADAY != TELEGRAM_CHAT_ID:
                                 post_to_telegram(msg, chat_id=TELEGRAM_CHAT_INTRADAY)
+                            try:
+                                _record_conviction_recommendation(cp, spot, chain_data=chain_data, source="conviction_flow")
+                            except Exception as _rce:
+                                log.warning(f"Rec tracker conviction failed for {cp.get('ticker','?')}: {_rce}")
 
                         elif route == "stalk":
                             # 30-60 DTE: post campaign alert to main channel
@@ -4931,14 +5271,6 @@ def _run_v4_prefilter(ticker: str, spot: float, chains: list, candle_closes: lis
                             _flow_detector.confirm_conviction_posted(
                                 cp["ticker"], cp.get("trade_direction", ""),
                                 cp.get("strike", 0))
-
-                            # Phase 1b: Record to recommendation tracker
-                            try:
-                                if _rec_tracker is not None:
-                                    _flow_detector.record_play_to_tracker(
-                                        cp, spot, chain_data, _rec_tracker)
-                            except Exception as _cprte:
-                                log.warning(f"Conviction tracker record failed: {_cprte}")
 
                         # Log to conviction_plays.csv for outcome tracking
                         try:
@@ -5586,11 +5918,6 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
             contracts=best_rec.get("contracts", 1), regime=regime, direction=direction,
         )
 
-        _spread_id = f"{ticker}:{best_rec.get('exp','')}:{best_rec.get('side','')}:{trade.get('long','')}:{trade.get('short','')}"
-        _trade_id = f"{ticker}:{best_rec.get('exp','')}:{best_rec.get('side','')}:{trade.get('long','')}:{trade.get('short','')}:{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
-        best_rec["spread_id"] = _spread_id
-        best_rec["trade_id"] = _trade_id
-
         card = format_trade_card(best_rec)
         shared_lines = _um_format_shared_snapshot_lines(best_rec.get("shared_model_snapshot"))
         if shared_lines:
@@ -5623,6 +5950,8 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
         # Phase: Wire journal open for feedback loop
         if risk_result["allowed"]:
             try:
+                _spread_id = f"{ticker}:{best_rec.get('exp','')}:{best_rec.get('side','')}:{trade.get('long','')}:{trade.get('short','')}"
+                best_rec["spread_id"] = _spread_id
                 trade_journal.log_trade_open(
                     spread_id=_spread_id,
                     ticker=ticker,
@@ -5634,103 +5963,9 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
                 log.warning(f"Journal log_trade_open failed: {_je}")
 
             try:
-                if _fill_store is not None:
-                    _fill_store.record_recommendation(
-                        trade_id=_trade_id,
-                        ticker=ticker,
-                        direction=direction,
-                        trade_type=best_rec.get("spread_type", "debit_spread"),
-                        recommended_debit=trade.get("debit", 0),
-                        est_slippage=trade.get("est_slippage", 0),
-                        display_debit=trade.get("display_debit", trade.get("debit", 0)),
-                        long_strike=trade.get("long", 0),
-                        short_strike=trade.get("short"),
-                        width=trade.get("width", 0),
-                        expiration=best_rec.get("exp", ""),
-                        contracts=best_rec.get("contracts", 1),
-                        confidence=best_rec.get("confidence", 0),
-                    )
-            except Exception as _fre:
-                log.warning(f"Fill reconciliation record failed: {_fre}")
-
-            # ── Phase 1b: Recommendation Tracker + Shadow Signals ──
-            # Auto-records every recommendation for effectiveness tracking.
-            # Shadow signals computed at post time but NOT applied to confidence.
-            try:
-                if _rec_tracker is not None:
-                    from recommendation_tracker import record_recommendation as _rr
-
-                    _rec_dte = int(best_rec.get("dte") or 0)
-                    _rec_tt = "immediate" if _rec_dte <= 2 else "swing"
-                    _rec_right = "call" if direction == "bull" else "put"
-                    _rec_legs = [{
-                        "right": _rec_right,
-                        "strike": trade.get("long"),
-                        "expiry": best_rec.get("exp"),
-                        "action": "buy",
-                    }]
-                    _rec_structure = f"long_{_rec_right}"
-                    if trade.get("short"):
-                        _rec_legs.append({
-                            "right": _rec_right,
-                            "strike": trade.get("short"),
-                            "expiry": best_rec.get("exp"),
-                            "action": "sell",
-                        })
-                        _rec_structure = ("bull_call_spread" if direction == "bull"
-                                          else "bear_put_spread")
-
-                    # Compute shadow signals (observational — does NOT modify confidence)
-                    _shadow = None
-                    try:
-                        import shadow_signals as _ss_mod
-                        _chain = best_rec.get("chain_contracts") or []
-                        _intraday = best_rec.get("intraday_bars_5m") or []
-                        _prior = best_rec.get("prior_day_ohlc")
-                        _first_bars = best_rec.get("first_5m_bars_of_session")
-
-                        _skew_r = _ss_mod._safe_compute_skew(_chain, spot, ticker, direction)
-                        _vwap_r = _ss_mod._safe_compute_vwap_bands(_intraday, direction)
-                        _gap_r = _ss_mod._safe_compute_gap(
-                            _prior, spot, direction, _first_bars, None,
-                        )
-                        _shadow = {
-                            "skew": _skew_r,
-                            "vwap": _vwap_r,
-                            "gap": _gap_r,
-                            "total_delta": (
-                                (_skew_r.get("delta", 0) or 0)
-                                + (_vwap_r.get("delta", 0) or 0)
-                                + (_gap_r.get("delta", 0) or 0)
-                            ),
-                        }
-                        log.info(
-                            f"Shadow signals: {ticker} {direction} "
-                            f"skew={_skew_r.get('delta', 0):+d} "
-                            f"vwap={_vwap_r.get('delta', 0):+d} "
-                            f"gap={_gap_r.get('delta', 0):+d} "
-                            f"total={_shadow['total_delta']:+d} (NOT applied)"
-                        )
-                    except Exception as _sse:
-                        log.warning(f"Shadow signals compute failed: {_sse}")
-
-                    _rr(
-                        store=_rec_tracker,
-                        source="check_ticker",
-                        ticker=ticker,
-                        direction=direction,
-                        trade_type=_rec_tt,
-                        structure=_rec_structure,
-                        legs=_rec_legs,
-                        entry_option_mark=float(trade.get("debit") or 0),
-                        entry_underlying=float(spot),
-                        confidence=int(best_rec.get("confidence") or 0),
-                        regime=(regime.get("label") if isinstance(regime, dict)
-                                else str(regime)),
-                        shadow_signals=_shadow,
-                    )
-            except Exception as _rre:
-                log.warning(f"Rec tracker record failed: {_rre}")
+                _record_check_ticker_recommendation(ticker, direction, best_rec, spot, regime, chains)
+            except Exception as _rte:
+                log.warning(f"Rec tracker check_ticker failed for {ticker}: {_rte}")
 
             # v7: register active scanner trade for live option P&L tracking
             try:
@@ -6343,17 +6578,13 @@ def _get_0dte_iv(ticker: str, target_date_str: str = None) -> tuple:
                             post_to_telegram(msg)
                             if route in ("immediate", "swing") and TELEGRAM_CHAT_INTRADAY and TELEGRAM_CHAT_INTRADAY != TELEGRAM_CHAT_ID:
                                 post_to_telegram(msg, chat_id=TELEGRAM_CHAT_INTRADAY)
+                            try:
+                                _record_conviction_recommendation(cp, spot, chain_data=rows if "rows" in locals() else None, source="conviction_flow")
+                            except Exception as _rce:
+                                log.warning(f"Rec tracker conviction failed for {cp.get('ticker','?')}: {_rce}")
                             # v7.2 fix: Confirm direction posted for exit signal tracking
                             _flow_detector.confirm_conviction_posted(
                                 cp["ticker"], cp.get("trade_direction", ""), cp.get("strike", 0))
-
-                            # Phase 1b: Record to recommendation tracker
-                            try:
-                                if _rec_tracker is not None:
-                                    _flow_detector.record_play_to_tracker(
-                                        cp, spot, data, _rec_tracker)
-                            except Exception as _cprte:
-                                log.warning(f"Conviction tracker record failed: {_cprte}")
                         log.info(f"💎 CONVICTION [{route.upper()}]: {cp['ticker']} "
                                f"{cp['trade_side']} ${cp['strike']:.0f} ({cp['dte']}DTE)")
                         # Store conviction boost for EntryValidator
@@ -6568,17 +6799,13 @@ def _get_chain_iv_for_expiry(ticker: str, target_date_str: str, dte: float) -> t
                             post_to_telegram(msg)
                             if route in ("immediate", "swing") and TELEGRAM_CHAT_INTRADAY and TELEGRAM_CHAT_INTRADAY != TELEGRAM_CHAT_ID:
                                 post_to_telegram(msg, chat_id=TELEGRAM_CHAT_INTRADAY)
+                            try:
+                                _record_conviction_recommendation(cp, spot, chain_data=rows if "rows" in locals() else None, source="conviction_flow")
+                            except Exception as _rce:
+                                log.warning(f"Rec tracker conviction failed for {cp.get('ticker','?')}: {_rce}")
                             # v7.2 fix: Confirm direction posted for exit signal tracking
                             _flow_detector.confirm_conviction_posted(
                                 cp["ticker"], cp.get("trade_direction", ""), cp.get("strike", 0))
-
-                            # Phase 1b: Record to recommendation tracker
-                            try:
-                                if _rec_tracker is not None:
-                                    _flow_detector.record_play_to_tracker(
-                                        cp, spot, data, _rec_tracker)
-                            except Exception as _cprte:
-                                log.warning(f"Conviction tracker record failed: {_cprte}")
                         log.info(f"💎 CONVICTION [{route.upper()}]: {cp['ticker']} "
                                f"{cp['trade_side']} ${cp['strike']:.0f} ({cp['dte']}DTE)")
                         # Store conviction boost for EntryValidator
@@ -9383,50 +9610,10 @@ def _post_checkswing_card(ticker: str, forced_direction: str = None):
         _append_shared_regime_lines(extras, canonical_vol, unified_regime, structure_ctx=structure_ctx, rec=rec, eng=eng, walls=walls, mode="swing")
         final_card = card + ("\n\n" + "\n".join(extras) if extras else "")
         post_to_telegram(final_card)
-
-        # Phase 1b: Record to recommendation tracker
         try:
-            if _rec_tracker is not None and rec.get("trade"):
-                from recommendation_tracker import record_recommendation as _swrr2
-                _sw_dir2 = rec.get("direction", "bull")
-                _sw_right2 = "call" if _sw_dir2 == "bull" else "put"
-                _sw_trade2 = rec["trade"]
-                _sw_legs2 = [{
-                    "right": _sw_right2,
-                    "strike": _sw_trade2.get("long"),
-                    "expiry": rec.get("exp"),
-                    "action": "buy",
-                }]
-                _sw_structure2 = f"long_{_sw_right2}"
-                if _sw_trade2.get("short"):
-                    _sw_legs2.append({
-                        "right": _sw_right2,
-                        "strike": _sw_trade2.get("short"),
-                        "expiry": rec.get("exp"),
-                        "action": "sell",
-                    })
-                    _sw_structure2 = ("bull_call_spread" if _sw_dir2 == "bull"
-                                      else "bear_put_spread")
-                _swrr2(
-                    store=_rec_tracker,
-                    source="swing_engine_manual",
-                    ticker=ticker,
-                    direction=_sw_dir2,
-                    trade_type="swing",
-                    structure=_sw_structure2,
-                    legs=_sw_legs2,
-                    entry_option_mark=float(_sw_trade2.get("debit") or 0),
-                    entry_underlying=float(spot),
-                    confidence=int(rec.get("confidence") or 0),
-                    extra_metadata={
-                        "tier": rec.get("tier"),
-                        "fib_level": rec.get("fib_level"),
-                        "forced_direction": forced_direction,
-                    },
-                )
-        except Exception as _swtre2:
-            log.warning(f"Swing (manual) rec tracker record failed: {_swtre2}")
-
+            _record_swing_recommendation(ticker, rec, spot, chains=chains, source="swing_engine")
+        except Exception as _rse:
+            log.warning(f"Rec tracker swing failed for {ticker}: {_rse}")
         try:
             _log_signal_dataset_event(
                 ticker=ticker,
@@ -9778,19 +9965,6 @@ def _em_scheduler():
                         threading.Thread(target=_crisis_put_monitor, daemon=True, name="crisis-put-mon").start()
                     except Exception as _cpe:
                         log.debug(f"Crisis put monitor error: {_cpe}")
-
-            # ── Phase 1: Morning portfolio Greeks summary (once per day) ──
-            _book_greeks_key = (date_str, "book_greeks")
-            if _book_greeks_key not in fired_today:
-                if now_ct.hour == 8 and 40 <= now_ct.minute <= 50:
-                    fired_today.add(_book_greeks_key)
-                    try:
-                        _greeks_msg = _portfolio_greeks.format_summary()
-                        if _greeks_msg:
-                            post_to_telegram(_greeks_msg)
-                            log.info("Portfolio Greeks: morning summary posted")
-                    except Exception as _pge:
-                        log.debug(f"Portfolio Greeks summary error: {_pge}")
 
             # ── v5.1: OI Tracker — morning summary + end-of-day flush ──
             if _oi_tracker:
@@ -10165,6 +10339,10 @@ def _start_background_services_once():
                 _t.sleep(60)
         threading.Thread(target=_position_monitor_loop, daemon=True, name="position-monitor").start()
         log.info("v7: position monitor polling thread started")
+        threading.Thread(target=_rec_tracker_poll_loop, daemon=True, name="rec-tracker").start()
+        log.info("Real Phase 1: recommendation tracker polling thread started (90s)")
+        threading.Thread(target=_rec_tracker_report_scheduler, daemon=True, name="rec-reports").start()
+        log.info("Phase 1b: scheduled reports thread started (08:00 briefing / 15:15 EOD / Fri 15:30 weekly / 1st 09:00 monthly)")
         # v5.1: Wire portfolio Greeks into thesis monitor
         from thesis_monitor import set_portfolio_greeks
         set_portfolio_greeks(_portfolio_greeks)
@@ -10277,217 +10455,12 @@ def _start_background_services_once():
         return True
 
 
-# ═══════════════════════════════════════════════════════════════════
-# Phase 1b: Recommendation Tracker polling + scheduled reports
-# ═══════════════════════════════════════════════════════════════════
-
-def _rec_tracker_opt_mark_fn(ticker, expiry, right, strike, structure, legs):
-    """Option mid-price lookup for the recommendation tracker's polling loop.
-
-    Reuses the cached chain fetched by the rest of the bot — no new API
-    calls unless the chain hasn't been pulled yet.
-    """
-    try:
-        if structure in ("long_call", "long_put"):
-            side = "call" if "call" in structure else "put"
-            chain = _cached_md.get_chain(ticker, expiry, side=side)
-            for c in chain or []:
-                if abs(float(c.get("strike", 0)) - float(strike)) < 0.01:
-                    bid = float(c.get("bid") or 0)
-                    ask = float(c.get("ask") or 0)
-                    if ask > 0:
-                        return (bid + ask) / 2
-            return None
-
-        # Spreads: fetch both legs and compute net
-        mids = {}
-        for leg in legs:
-            side = leg["right"]
-            chain = _cached_md.get_chain(ticker, leg["expiry"], side=side)
-            for c in chain or []:
-                if abs(float(c.get("strike", 0)) - float(leg["strike"])) < 0.01:
-                    bid = float(c.get("bid") or 0)
-                    ask = float(c.get("ask") or 0)
-                    mids[leg["strike"]] = (bid + ask) / 2 if ask > 0 else None
-                    break
-        buy_leg = next((l for l in legs if l["action"] == "buy"), None)
-        sell_leg = next((l for l in legs if l["action"] == "sell"), None)
-        if not buy_leg or not sell_leg:
-            return None
-        buy_mid = mids.get(buy_leg["strike"])
-        sell_mid = mids.get(sell_leg["strike"])
-        if buy_mid is None or sell_mid is None:
-            return None
-        return buy_mid - sell_mid
-    except Exception as e:
-        log.warning(f"_rec_tracker_opt_mark_fn failed for {ticker}: {e}")
-        return None
-
-
-def _rec_tracker_poll_once():
-    """Single polling pass — skips off-hours automatically."""
-    global _rec_tracker
-    if _rec_tracker is None:
-        return
-    try:
-        from recommendation_tracker import poll_and_update_if_market_open
-        summary = poll_and_update_if_market_open(
-            store=_rec_tracker,
-            price_fn=_rec_tracker_opt_mark_fn,
-            spot_fn=lambda t: get_spot(t),
-        )
-        if summary.get("polled", 0) > 0 or summary.get("graded", 0) > 0:
-            log.info(f"Rec tracker poll: {summary}")
-    except Exception as e:
-        log.warning(f"Rec tracker poll failed: {e}")
-
-
-def _rec_tracker_scheduler():
-    """Kick off the 90-second polling loop as a background daemon thread."""
-    import threading
-    def _loop():
-        while True:
-            try:
-                _rec_tracker_poll_once()
-            except Exception as e:
-                log.warning(f"Rec tracker loop error: {e}")
-            threading.Event().wait(90)   # 90-second interval
-
-    t = threading.Thread(target=_loop, daemon=True, name="rec_tracker_poll")
-    t.start()
-    log.info("Phase 1b: rec tracker polling loop started (90s interval)")
-
-
-# ── Scheduled report posting ──
-
-def _rec_tracker_post_morning_briefing():
-    """8:00 AM CT weekday briefing."""
-    if _rec_tracker is None:
-        return
-    now_ct = datetime.now(timezone.utc) - timedelta(hours=5)
-    if now_ct.weekday() >= 5:
-        return
-    try:
-        from scheduled_reports import post_morning_briefing
-        # Book Greeks + regime are optional — wire them if available
-        greeks_fn = None
-        regime_fn = None
-        try:
-            from omega_small_fixes import summarize_book_greeks, format_book_greeks_report
-            greeks_fn = lambda: format_book_greeks_report(
-                summarize_book_greeks(portfolio.list_open_positions())
-            )
-        except Exception:
-            pass
-        try:
-            regime_fn = lambda: regime_detector.get_regime_package()
-        except Exception:
-            pass
-        post_morning_briefing(
-            post_fn=post_to_telegram,
-            rec_tracker_store=_rec_tracker,
-            greeks_summary_fn=greeks_fn,
-            regime_fn=regime_fn,
-        )
-    except Exception as e:
-        log.warning(f"Morning briefing post failed: {e}")
-
-
-def _rec_tracker_post_eod():
-    """3:15 PM CT weekday end-of-day report."""
-    if _rec_tracker is None:
-        return
-    now_ct = datetime.now(timezone.utc) - timedelta(hours=5)
-    if now_ct.weekday() >= 5:
-        return
-    try:
-        from scheduled_reports import post_eod_report
-        post_eod_report(post_to_telegram, _rec_tracker)
-    except Exception as e:
-        log.warning(f"EOD report post failed: {e}")
-
-
-def _rec_tracker_post_weekly():
-    """Friday 3:30 PM CT weekly digest."""
-    if _rec_tracker is None:
-        return
-    now_ct = datetime.now(timezone.utc) - timedelta(hours=5)
-    if now_ct.weekday() != 4:   # Friday only
-        return
-    try:
-        from scheduled_reports import post_weekly_digest
-        post_weekly_digest(post_to_telegram, _rec_tracker)
-    except Exception as e:
-        log.warning(f"Weekly digest post failed: {e}")
-
-
-def _rec_tracker_post_monthly():
-    """1st of month 9:00 AM CT monthly attribution."""
-    if _rec_tracker is None:
-        return
-    now_ct = datetime.now(timezone.utc) - timedelta(hours=5)
-    if now_ct.day != 1:
-        return
-    try:
-        from scheduled_reports import post_monthly_attribution
-        post_monthly_attribution(post_to_telegram, _rec_tracker)
-    except Exception as e:
-        log.warning(f"Monthly attribution post failed: {e}")
-
-
-def _rec_tracker_daily_report_scheduler():
-    """Schedule the four daily/weekly/monthly report posts.
-
-    Uses a single 60-second heartbeat thread that checks whether any
-    scheduled post is due. This avoids needing apscheduler or the
-    external 'schedule' library.
-    """
-    import threading
-    _last_post_keys = set()   # avoid double-posts within the same minute
-
-    def _should_post_now(hour_ct, minute_ct):
-        now_ct = datetime.now(timezone.utc) - timedelta(hours=5)
-        if now_ct.hour != hour_ct or now_ct.minute != minute_ct:
-            return False
-        key = now_ct.strftime(f"%Y-%m-%d-{hour_ct:02d}:{minute_ct:02d}")
-        if key in _last_post_keys:
-            return False
-        _last_post_keys.add(key)
-        # Prune old keys (keep only last 48hrs)
-        cutoff = (now_ct - timedelta(hours=48)).strftime("%Y-%m-%d")
-        for k in list(_last_post_keys):
-            if k < cutoff:
-                _last_post_keys.discard(k)
-        return True
-
-    def _loop():
-        while True:
-            try:
-                if _should_post_now(8, 0):
-                    _rec_tracker_post_morning_briefing()
-                if _should_post_now(15, 15):
-                    _rec_tracker_post_eod()
-                if _should_post_now(15, 30):
-                    _rec_tracker_post_weekly()
-                if _should_post_now(9, 0):
-                    _rec_tracker_post_monthly()
-            except Exception as e:
-                log.warning(f"Rec report scheduler error: {e}")
-            threading.Event().wait(60)
-
-    t = threading.Thread(target=_loop, daemon=True, name="rec_tracker_reports")
-    t.start()
-    log.info("Phase 1b: scheduled reports thread started "
-             "(morning 08:00 / EOD 15:15 / Fri weekly 15:30 / 1st monthly 09:00)")
-
-
 def _initialize_app():
     global _oi_cache
     global _oi_tracker
     global _persistent_state
     global _flow_detector
     global _potter_box
-    global _fill_store
     global _rec_tracker
     with app.app_context():
         portfolio.init_store(store_get, store_set)
@@ -10496,17 +10469,12 @@ def _initialize_app():
         _oi_cache = OICache(store_get, store_set)
         _oi_tracker = OITracker(store_get, store_set)
         _persistent_state = PersistentState(store_get, store_set, store_scan)
-        _fill_store = FillRecordStore(get_fn=store_get, set_fn=store_set)
-        _fill_reconciler_mod.default_store = _fill_store
-        _rec_tracker = RecommendationStore(
-            get_fn=store_get, set_fn=store_set, scan_fn=store_scan,
-        )
+        _rec_tracker = _rt_mod.RecommendationStore(get_fn=store_get, set_fn=store_set, scan_fn=store_scan)
+        log.info("Real Phase 1: recommendation tracker initialized")
         _flow_detector = FlowDetector(_persistent_state, post_fn=post_to_telegram)
         _potter_box = PotterBoxScanner(_persistent_state, flow_detector=_flow_detector,
                                            post_fn=post_to_telegram)
         log.info(f"OI cache + tracker + flow detector + Potter Box initialized (Redis: {_get_redis() is not None})")
-        log.info("Phase 1: fill reconciler store initialized")
-        log.info("Phase 1b: recommendation tracker initialized")
 
         # v7: position monitor + shadow logger
         global _shadow_logger, _position_monitor
@@ -10521,13 +10489,6 @@ def _initialize_app():
             spot_fn=lambda t: get_spot(t),
         )
         log.info("v7: shadow logger + position monitor initialized")
-
-        # ── Phase 1b: start rec tracker polling + scheduled report threads ──
-        try:
-            _rec_tracker_scheduler()
-            _rec_tracker_daily_report_scheduler()
-        except Exception as _rte:
-            log.warning(f"Rec tracker thread startup failed: {_rte}")
         _tg_ws = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
         if _tg_ws and BOT_URL and _acquire_background_leader():
             register_webhook(BOT_URL, _tg_ws)
@@ -10595,6 +10556,10 @@ def _initialize_app():
                                 post_to_telegram(cp_msg)
                                 if cp.get("route") in ("immediate", "swing") and TELEGRAM_CHAT_INTRADAY:
                                     post_to_telegram(cp_msg, chat_id=TELEGRAM_CHAT_INTRADAY)
+                                try:
+                                    _record_conviction_recommendation(cp, get_spot(cp.get("ticker")) or 0, source="conviction_sweep")
+                                except Exception as _rce:
+                                    log.warning(f"Rec tracker conviction failed for {cp.get('ticker','?')}: {_rce}")
                                 # v7.2 fix: Confirm direction posted for exit signal tracking
                                 _flow_detector.confirm_conviction_posted(
                                     cp["ticker"], cp.get("trade_direction", ""), cp.get("strike", 0))
