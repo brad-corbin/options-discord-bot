@@ -2743,6 +2743,91 @@ def _rec_tracker_price_fn(ticker, expiry, right, strike, structure, legs):
         return None
 
 
+def _rec_tracker_smoke_test() -> bool:
+    """Startup smoke test for the recommendation tracker price path.
+
+    Runs ONE synchronous end-to-end call of _rec_tracker_price_fn against a
+    real open rec from the store. Exists because bug #1 (chain response
+    shape mismatch causing 'str' object has no attribute 'get') ran silently
+    for an entire session — the poll loop catches exceptions and just
+    increments 'failed', so a broken price_fn looks identical to 'market
+    closed' in the logs.
+
+    Returns True if safe to start the poll thread, False if a real error
+    was raised (caller decides whether to fail-startup or just log).
+
+    Empty-store and None-return are both treated as PASS — the first means
+    nothing to test, the second means price_fn handled an unavailable quote
+    cleanly (which is what it's supposed to do).
+    """
+    global _rec_tracker, _cached_md
+    if _rec_tracker is None:
+        log.error("SMOKE TEST SKIPPED: _rec_tracker is None at smoke-test time")
+        return False
+    if _cached_md is None:
+        # Not a failure — price_fn short-circuits on None md. Just note it.
+        log.info("SMOKE TEST SKIPPED: _cached_md not yet initialized "
+                 "(will exercise on first real poll)")
+        return True
+    try:
+        active = _rec_tracker.list_all_active()
+    except Exception as e:
+        log.error("=" * 70)
+        log.error(f"SMOKE TEST FAILED: _rec_tracker.list_all_active() raised: {e}")
+        log.error("Tracker store may be corrupted or Redis unreachable.")
+        log.error("=" * 70, exc_info=True)
+        return False
+
+    if not active:
+        log.info("SMOKE TEST: recommendation tracker has 0 open recs — "
+                 "nothing to exercise. price_fn path will be tested on "
+                 "first real recommendation.")
+        return True
+
+    rec = active[0]
+    legs = rec.get("legs") or []
+    if not legs:
+        log.warning(f"SMOKE TEST: rec {rec.get('campaign_id')} has no legs, "
+                    f"skipping — check recording path")
+        return True
+
+    primary = legs[0]
+    try:
+        price = _rec_tracker_price_fn(
+            rec.get("ticker"),
+            primary.get("expiry"),
+            primary.get("right"),
+            primary.get("strike"),
+            rec.get("structure"),
+            legs,
+        )
+    except Exception as e:
+        # THIS is the failure mode bug #1 had. Surface it immediately.
+        log.error("=" * 70)
+        log.error("SMOKE TEST FAILED: _rec_tracker_price_fn raised an exception.")
+        log.error(f"  rec:       {rec.get('campaign_id')} "
+                  f"({rec.get('ticker')} {rec.get('structure')})")
+        log.error(f"  exception: {type(e).__name__}: {e}")
+        log.error("This is the exact failure mode of bug #1 "
+                  "('str' object has no attribute 'get'). Investigate "
+                  "before trusting tracker output.")
+        log.error("=" * 70, exc_info=True)
+        return False
+
+    if price is not None and (not isinstance(price, (int, float)) or price < 0):
+        log.error("=" * 70)
+        log.error(f"SMOKE TEST FAILED: price_fn returned unexpected value: "
+                  f"{price!r} (type={type(price).__name__})")
+        log.error("Expected: positive float or None.")
+        log.error("=" * 70)
+        return False
+
+    log.info(f"SMOKE TEST PASSED: price_fn returned {price!r} for "
+             f"{rec.get('ticker')} {rec.get('structure')} "
+             f"(campaign {rec.get('campaign_id')})")
+    return True
+
+
 def _rec_tracker_poll_loop():
     global _rec_tracker
     while True:
@@ -10551,6 +10636,15 @@ def _initialize_app():
         _persistent_state = PersistentState(store_get, store_set, store_scan)
         _rec_tracker = _rt_mod.RecommendationStore(get_fn=store_get, set_fn=store_set, scan_fn=store_scan)
         log.info("Real Phase 1: recommendation tracker initialized")
+        # Startup smoke test — would have caught bug #1 in staging instead of
+        # production. Does not fail startup on its own; logs at ERROR level
+        # with a visible banner so a broken price path is obvious before the
+        # poll thread starts quietly incrementing 'failed' in the background.
+        try:
+            _rec_tracker_smoke_test()
+        except Exception as _ste:
+            log.error(f"SMOKE TEST HARNESS itself raised — bug in the harness: {_ste}",
+                      exc_info=True)
         _flow_detector = FlowDetector(_persistent_state, post_fn=post_to_telegram)
         _potter_box = PotterBoxScanner(_persistent_state, flow_detector=_flow_detector,
                                            post_fn=post_to_telegram)
