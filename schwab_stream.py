@@ -429,12 +429,23 @@ def build_occ_symbol(ticker: str, expiry: str, side: str, strike: float) -> str:
 
     Format: TICKER (6 chars padded) + YYMMDD + C/P + strike*1000 (8 digits)
     Example: 'AAPL  260417C00200000' for AAPL Apr 17 2026 200 Call
+
+    v7.3 (Patch 1): accepts either long-form ('call'/'put') or short-form
+    ('C'/'P') side arguments. Previously only long-form was handled correctly;
+    short-form silently defaulted to 'P' for all calls and all puts. Raises
+    on any other input rather than silently mis-writing the contract side.
     """
     padded = ticker.upper().ljust(6)
     # expiry is YYYY-MM-DD
     dt = datetime.strptime(expiry, "%Y-%m-%d")
     date_part = dt.strftime("%y%m%d")
-    cp = "C" if side.lower() == "call" else "P"
+    s = (side or "").lower().strip()
+    if s in ("c", "call"):
+        cp = "C"
+    elif s in ("p", "put"):
+        cp = "P"
+    else:
+        raise ValueError(f"build_occ_symbol: invalid side {side!r} (expected 'call'/'put' or 'C'/'P')")
     strike_int = int(round(strike * 1000))
     strike_part = f"{strike_int:08d}"
     return f"{padded}{date_part}{cp}{strike_part}"
