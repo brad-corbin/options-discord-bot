@@ -1006,7 +1006,9 @@ def _pnl_pct_lifetime(rec: Dict[str, Any]) -> Optional[float]:
     """Peak option PnL% over the position's whole tracked life, as a fraction.
 
     Uses mfe_pct if populated; otherwise derives from peak/entry marks. The
-    tracker stores mfe_pct as a fraction (e.g. 0.35 = 35%).
+    tracker stores mfe_pct as a fraction (e.g. 0.35 = 35%). Returns None
+    when neither source is usable — missing peak data reads as missing,
+    not as '-100%'.
     """
     mfe = rec.get("mfe_pct")
     try:
@@ -1016,9 +1018,11 @@ def _pnl_pct_lifetime(rec: Dict[str, Any]) -> Optional[float]:
         pass
     entry = rec.get("entry_option_mark")
     peak = rec.get("peak_option_mark")
+    if entry is None or peak is None:
+        return None
     try:
-        e = float(entry) if entry is not None else 0.0
-        p = float(peak) if peak is not None else 0.0
+        e = float(entry)
+        p = float(peak)
         if e > 0:
             return (p - e) / e
     except (TypeError, ValueError):
@@ -1027,15 +1031,22 @@ def _pnl_pct_lifetime(rec: Dict[str, Any]) -> Optional[float]:
 
 
 def _pnl_pct_current(rec: Dict[str, Any]) -> Optional[float]:
-    """Current (or final, if closed) option PnL% as a fraction."""
+    """Current (or final, if closed) option PnL% as a fraction.
+
+    Returns None when the relevant mark is missing — a graded record without
+    exit_option_mark, or an active record without last_option_mark, is a
+    data-integrity case and shouldn't silently render as '-100%'.
+    """
     entry = rec.get("entry_option_mark")
     if rec.get("status") == "graded":
         current = rec.get("exit_option_mark")
     else:
         current = rec.get("last_option_mark")
+    if entry is None or current is None:
+        return None
     try:
-        e = float(entry) if entry is not None else 0.0
-        c = float(current) if current is not None else 0.0
+        e = float(entry)
+        c = float(current)
         if e > 0:
             return (c - e) / e
     except (TypeError, ValueError):
