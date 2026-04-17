@@ -1876,7 +1876,15 @@ class ThesisMonitorEngine:
                     trade.peak_premium = est
                     trade.entry_delta = 0.50
         except Exception as e:
-            log.debug(f"Conviction trade OCC setup: {e}")
+            # v7.3 fix (Patch 3): was log.debug which swallowed early SPY/QQQ
+            # conviction trades registering with empty OCC / $0.00 premium.
+            # WARN with play context + traceback so we can diagnose next time.
+            log.warning(
+                f"Conviction OCC build failed for {ticker} "
+                f"(direction={direction}, rec_strike={rec_strike}, "
+                f"play_expiry={play.get('expiry','')}): {e}",
+                exc_info=True
+            )
 
         state.active_trades.append(trade)
         self._persist_trades(ticker, state)
@@ -3891,9 +3899,13 @@ class ThesisMonitorDaemon:
     @property
     def is_running(self): return self._thread is not None and self._thread.is_alive()
     def _run(self):
+        # v7.3 fix (Patch 2): _HIGH_RES_TICKERS is defined on ThesisMonitorEngine
+        # (class at line ~788), not on ThesisMonitorDaemon. Access via self.engine,
+        # which is stored in __init__. Previously AttributeError on every thread
+        # start, silently killing the monitor daemon after logging "started".
         log.info(f"Thesis monitor: {MONITOR_POLL_INTERVAL_FAST_SEC}s for {len(MONITOR_FAST_POLL_TICKERS)} streaming tickers, "
                  f"{MONITOR_POLL_INTERVAL_SEC}s for others, "
-                 f"{len(self._HIGH_RES_TICKERS)} high-res (1-min bars + ORB)")
+                 f"{len(self.engine._HIGH_RES_TICKERS)} high-res (1-min bars + ORB)")
         self._cycle_count = 0; self._slow_n = max(1, MONITOR_POLL_INTERVAL_SEC // MONITOR_POLL_INTERVAL_FAST_SEC)
         while not self._stop_event.is_set():
             try: self._poll_cycle()
