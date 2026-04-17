@@ -1,6 +1,24 @@
 # app.py
 # NOTE: Educational/demo code. Not financial advice. Use at your own risk.
 #
+# v8.2 (2026-04-17) — FEATURE RELEASE
+#   Fixes (all 11 from FIX_BUNDLE_v7_3.md, deploy order):
+#     Patch 1  — schwab_stream.py     OCC letter bug (accept C/P and call/put)
+#     Patch 2  — thesis_monitor.py    _HIGH_RES_TICKERS via self.engine
+#     Patch 3  — thesis_monitor.py    Conviction OCC failure: debug → warn
+#     Patch 4  — schwab_adapter.py    Rate limiter wiring (rate_limiter.py)
+#     Patch 5  — schwab_adapter.py    Expected 400/404s demoted to DEBUG
+#     Patch 6  — app.py               Silent EM prediction log: surface fails at WARN
+#     Patch 7  — app.py               Silent thesis outer catch: debug → warn
+#     Patch 8  — app.py               Silent thesis wrapper counts + lists failures
+#     Patch 9  — app.py               Silent EM fallback to nearest listed expiry
+#     Patch 10 — app.py               Wire /confidence Telegram gate (post suppression)
+#     Patch 11 — app.py               BOT_STARTUP_QUIET env + post_to_telegram gate
+#   New modules:
+#     rate_limiter.py                 Global Schwab token bucket (110/min default)
+#     dashboard.py                    Phase-1 observability + Position PnL tracking
+#   See FIX_BUNDLE_v7_3.md and v8_2_HANDOFF.md for per-patch rationale.
+#
 # v4.2 UPGRADE (2026-03-17):
 #   - CHECK_TICKER_TIMEOUT_SEC imported from trading_rules (45s, was hardcoded 75s)
 #   - PREFETCH_WORKER_WAIT_SEC used consistently (was hardcoded 60s in one path)
@@ -139,6 +157,7 @@ from em_reconciler import (
 
 import risk_manager
 import trade_journal
+import dashboard  # Phase 1 dashboard aggregator (read-only Sheets writer)
 
 # ── v7 imports ──
 from backtest_guidance import should_filter_signal, ACTIVE_GUIDANCE
@@ -262,6 +281,16 @@ ACCOUNT_CHAT_IDS = {
 # DATASET / DIAGNOSTICS AUT0-LOGGING
 # ─────────────────────────────────────────────────────────
 DIAGNOSTIC_CHAT_ID = os.getenv("DIAGNOSTIC_CHAT_ID", "").strip()
+
+# v7.3 (Patch 11): Startup-quiet window. During rapid deploy iteration
+# (multiple restarts within a few minutes), each boot emits Telegram
+# status messages and can hit rate-limit warnings. Set BOT_STARTUP_QUIET=1
+# to suppress sends for the first N seconds after boot (default 300s = 5m).
+# Does not affect trading logic — trade cards posted during the quiet
+# window still log/track/cache; only the Telegram send is skipped.
+BOT_STARTUP_QUIET = os.getenv("BOT_STARTUP_QUIET", "0").strip().lower() in ("1", "true", "yes", "on")
+BOT_STARTUP_QUIET_SEC = int(os.getenv("BOT_STARTUP_QUIET_SEC", "300") or 300)
+_BOT_BOOT_TS = time.time()
 AUTO_LOG_DIR = os.getenv("AUTO_LOG_DIR", "/mnt/data/bot_logs").strip() or "/mnt/data/bot_logs"
 AUTO_LOG_ENABLE = os.getenv("AUTO_LOG_ENABLE", "1").strip().lower() not in ("0", "false", "no", "off")
 AUTO_LOG_DIAGNOSTICS = os.getenv("AUTO_LOG_DIAGNOSTICS", "0").strip().lower() in ("1", "true", "yes", "on")
@@ -3217,9 +3246,17 @@ def _flush_wave_digest():
                 (tier in IMMEDIATE_POST_TIER and conf is not None and conf >= IMMEDIATE_POST_MIN_CONF)
             )
 
-            if is_immediate:
+            # v7.3 (Patch 10): honor the confidence-gate suppression flag set
+            # in check_ticker. Card still appears in the digest listing and
+            # stays retrievable via /tradecard TICKER — only the immediate
+            # Telegram post is skipped.
+            _suppressed = bool(r.get("_suppress_telegram_post"))
+
+            if is_immediate and not _suppressed:
                 immediate_cards.append(card)
                 digest_lines.append(f"  ✅ {ticker} T{tier} {dir_emoji} {conf_str} — POSTED ⬆️")
+            elif is_immediate and _suppressed:
+                digest_lines.append(f"  🔇 {ticker} T{tier} {dir_emoji} {conf_str} — gated (/tradecard {ticker})")
             else:
                 digest_lines.append(f"  📋 {ticker} T{tier} {dir_emoji} {conf_str} — /tradecard {ticker}")
         elif r.get("outcome") == "pending":
@@ -3788,6 +3825,10 @@ def _process_job(worker_id: int, job: dict):
         card_text = rec.get("card")
         base["outcome"] = "trade"
         base["card"]    = card_text
+        # v7.3 (Patch 10): forward suppression flag into the wave result so
+        # _flush_wave_digest can skip the Telegram post without skipping
+        # caching, digest line, or /tradecard retrieval.
+        base["_suppress_telegram_post"] = bool(rec.get("_suppress_telegram_post"))
         _record_wave_result(base)
         log.info(f"TV winner queued for digest: {ticker} {bias} T{tier_label} conf={rec.get('confidence')}/100")
 
@@ -4085,6 +4126,20 @@ def check_ticker_with_timeout(ticker, direction="bull", webhook_data=None, timeo
 # ─────────────────────────────────────────────────────────
 
 def post_to_telegram(text: str, max_retries: int = 4, chat_id: str = None):
+    # v7.3 (Patch 11): startup-quiet suppression — prevents rate-limit spam
+    # during rapid-deploy iteration. Trading logic is unaffected; cards are
+    # still built/logged/tracked, they just don't hit Telegram during the
+    # quiet window. Unset BOT_STARTUP_QUIET (or wait out the window) for
+    # normal posting to resume.
+    if BOT_STARTUP_QUIET:
+        _since_boot = time.time() - _BOT_BOOT_TS
+        if _since_boot < BOT_STARTUP_QUIET_SEC:
+            preview = text[:60].replace("\n", " ")
+            log.info(
+                f"Telegram SUPPRESSED (startup-quiet, "
+                f"{int(BOT_STARTUP_QUIET_SEC - _since_boot)}s remain): {preview}..."
+            )
+            return 200, "suppressed during startup-quiet window"
     cid = chat_id or TELEGRAM_CHAT_ID
     if not TELEGRAM_BOT_TOKEN or not cid:
         log.error("post_to_telegram: TELEGRAM_BOT_TOKEN or CHAT_ID not set")
@@ -6098,6 +6153,23 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
 
         conf = best_rec.get("confidence", 0)
         log.info(f"Trade card built: {ticker} {direction} conf={conf}/100")
+
+        # v7.3 (Patch 10): Telegram post gate. Check user's /confidence
+        # threshold — if the trade's confidence is below, mark the card
+        # for suppression at the post site (wave digest). Build, log,
+        # cache, journal, track, and register position as normal — only
+        # the Telegram send gets suppressed. The card is still retrievable
+        # via /tradecard TICKER.
+        try:
+            _tg_gate = get_confidence_gate()
+            if int(conf or 0) < int(_tg_gate or 0):
+                best_rec["_suppress_telegram_post"] = True
+                log.info(
+                    f"Trade card posted suppressed: {ticker} conf={conf} "
+                    f"< telegram gate {_tg_gate} (logged/tracked but not sent)"
+                )
+        except Exception as _gate_e:
+            log.warning(f"Confidence gate check failed (not suppressing): {_gate_e}")
         mark_trade_sent(ticker, direction, trade.get("short"), trade.get("long"))
         trade_journal.log_signal(ticker, webhook_data,
             outcome="trade_opened" if risk_result["allowed"] else "risk_blocked",
@@ -6178,6 +6250,9 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
             "confidence": best_rec.get("confidence"), "trade": trade,
             "expirations_checked": len(chains),
             "signal_validation": signal_validation,
+            # v7.3 (Patch 10): forward the suppression flag to the wave-digest
+            # poster, which is the actual Telegram post site for trade cards.
+            "_suppress_telegram_post": bool(best_rec.get("_suppress_telegram_post")),
         }
     except Exception as e:
         log.error(f"check_ticker({ticker}): {type(e).__name__}: {e}")
@@ -8487,8 +8562,40 @@ def _generate_silent_thesis(ticker: str):
         vix = result_tuple[7]
         v4_result = result_tuple[8] if len(result_tuple) > 8 else {}
 
+        # v7.3 fix (Patch 9): many flow tickers (AMD, ARM, COIN, ORCL, MRNA,
+        # PLTR, SMCI, XLE/XLF/XLV, etc.) don't have 0DTE/daily options —
+        # asking MarketData for today's expiry will 404. Fall back to the
+        # nearest listed future expiry (typically Friday weekly).
         if iv is None or spot is None:
-            log.debug(f"Silent thesis skipped for {ticker}: IV unavailable")
+            try:
+                exps = get_expirations(ticker) or []
+                from datetime import date as _date, datetime as _dt
+                today_d = _date.fromisoformat(today_str) if today_str else _date.today()
+                nearest = None
+                for exp_str in sorted(exps):
+                    try:
+                        exp_d = _dt.strptime(exp_str, "%Y-%m-%d").date()
+                        if exp_d > today_d:  # strictly future (today already failed)
+                            nearest = exp_str
+                            break
+                    except Exception:
+                        continue
+                if nearest:
+                    result_tuple = _get_0dte_iv(ticker, nearest)
+                    iv, spot, expiration = result_tuple[0], result_tuple[1], result_tuple[2]
+                    eng = result_tuple[3]
+                    walls = result_tuple[4]
+                    skew = result_tuple[5]
+                    pcr = result_tuple[6]
+                    vix = result_tuple[7]
+                    v4_result = result_tuple[8] if len(result_tuple) > 8 else {}
+                    if iv is not None and spot is not None:
+                        log.info(f"Silent thesis using fallback expiry {nearest} for {ticker} (no 0DTE chain)")
+            except Exception as _fb_e:
+                log.debug(f"Silent thesis fallback-expiry lookup failed for {ticker}: {_fb_e}")
+
+        if iv is None or spot is None:
+            log.warning(f"Silent thesis skipped for {ticker}: IV unavailable even with fallback expiry")
             return False
 
         em = _calc_intraday_em(spot, iv, hours_for_em)
@@ -8552,8 +8659,11 @@ def _generate_silent_thesis(ticker: str):
         try:
             _log_em_prediction(ticker, "silent", spot, em, bias, v4_result,
                                walls=walls, eng=eng, cagf=cagf, vol_regime=vol_regime)
-        except Exception:
-            pass
+        except Exception as e:
+            # v7.3 fix (Patch 6): previously swallowed silently. Surface the
+            # failure so we can see which tickers are failing sheet writes
+            # without aborting the in-memory thesis store.
+            log.warning(f"Silent EM prediction log failed for {ticker}: {e}")
 
         log.info(f"Silent thesis stored: {ticker} | bias={bias.get('direction','?')} "
                  f"score={bias.get('score',0):+d}/14 | gex={_thesis.gex_sign} | "
@@ -8561,7 +8671,9 @@ def _generate_silent_thesis(ticker: str):
         return True
 
     except Exception as e:
-        log.debug(f"Silent thesis generation failed for {ticker}: {e}")
+        # v7.3 fix (Patch 7): was log.debug, hiding the 22-of-35 silent-EM
+        # failures. WARN surfaces them so we can see which tickers die and why.
+        log.warning(f"Silent thesis generation failed for {ticker}: {e}")
         return False
 
 
@@ -8574,6 +8686,10 @@ def _generate_all_silent_theses():
     from oi_flow import FLOW_TICKERS
     count = 0
     skipped = 0
+    # v7.3 (Patch 8): track failures and which tickers failed, so the summary
+    # line shows the gap by name instead of hiding it.
+    failed = 0
+    failed_tickers = []
     for ticker in FLOW_TICKERS:
         # Skip tickers that already have a thesis from the full EM card
         existing = get_thesis_engine().get_thesis(ticker)
@@ -8583,10 +8699,22 @@ def _generate_all_silent_theses():
         try:
             if _generate_silent_thesis(ticker):
                 count += 1
+            else:
+                failed += 1
+                failed_tickers.append(ticker)
             time.sleep(1.5)  # rate limit: ~23 tickers/min
-        except Exception:
-            pass
-    log.info(f"Silent thesis generation complete: {count} generated, {skipped} already had EM cards")
+        except Exception as e:
+            failed += 1
+            failed_tickers.append(ticker)
+            log.warning(f"Silent thesis wrapper error for {ticker}: {e}")
+    msg = (
+        f"Silent thesis generation complete: {count} generated, "
+        f"{skipped} already had EM cards, {failed} failed"
+    )
+    if failed_tickers:
+        # Truncate so a complete-failure day doesn't produce a 4KB log line
+        msg += f" ({', '.join(failed_tickers[:10])}{'...' if len(failed_tickers) > 10 else ''})"
+    log.info(msg)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -10508,6 +10636,10 @@ def _start_background_services_once():
         log.info("Real Phase 1: recommendation tracker polling thread started (90s)")
         threading.Thread(target=_rec_tracker_report_scheduler, daemon=True, name="rec-reports").start()
         log.info("Phase 1b: scheduled reports thread started (08:00 briefing / 15:15 EOD / Fri 15:30 weekly / 1st 09:00 monthly)")
+
+        # Dashboard 3000 writer thread is started later, inside the leader-worker
+        # block where init_dashboard() is first called. start_dashboard_thread()
+        # is a no-op until init_dashboard() has set up the module state.
         # v5.1: Wire portfolio Greeks into thesis monitor
         from thesis_monitor import set_portfolio_greeks
         set_portfolio_greeks(_portfolio_greeks)
@@ -10645,6 +10777,46 @@ def _initialize_app():
         except Exception as _ste:
             log.error(f"SMOKE TEST HARNESS itself raised — bug in the harness: {_ste}",
                       exc_info=True)
+
+        # ═══════════════════════════════════════════════════════════
+        # DASHBOARD 3000 — Phase 1
+        # Wires the read-only per-ticker aggregator. Thread starts in
+        # _start_background_services_once() below. Safe even if
+        # DASHBOARD_ENABLED=0 — init_dashboard() no-ops and returns False.
+        # All dashboard writes go to the separate DASHBOARD_SHEET_ID;
+        # this does not touch any existing Sheets tabs, Telegram output,
+        # or the trading pipeline.
+        # ═══════════════════════════════════════════════════════════
+        try:
+            from oi_flow import FLOW_TICKERS as _dash_flow_tickers_ref
+            _dash_vix_fn = None
+            try:
+                import vix_term_structure as _vix_mod
+                _dash_vix_fn = _vix_mod.get_vix_term_structure
+            except Exception as _ve:
+                log.debug(f"dashboard: vix module unavailable: {_ve}")
+            _dash_regime_fn = None
+            try:
+                _dash_regime_fn = get_regime_package
+            except NameError:
+                try:
+                    from market_regime import get_regime_package as _mrg
+                    _dash_regime_fn = _mrg
+                except Exception as _re:
+                    log.debug(f"dashboard: regime function unavailable: {_re}")
+
+            dashboard.init_dashboard(
+                persistent_state=_persistent_state,
+                rec_tracker=_rec_tracker,
+                get_spot_fn=get_spot,
+                get_token_fn=_get_google_access_token,
+                get_flow_tickers_fn=lambda: list(_dash_flow_tickers_ref),
+                get_market_regime_pkg_fn=_dash_regime_fn,
+                get_vix_ts_fn=_dash_vix_fn,
+            )
+        except Exception as _dash_init_err:
+            log.warning(f"dashboard: init failed (non-fatal, dashboard will be disabled): {_dash_init_err}")
+
         _flow_detector = FlowDetector(_persistent_state, post_fn=post_to_telegram)
         _potter_box = PotterBoxScanner(_persistent_state, flow_detector=_flow_detector,
                                            post_fn=post_to_telegram)
@@ -10774,6 +10946,24 @@ def _initialize_app():
                 log.info("Phase 3 option streaming wired: sweeps → flow → conviction → Telegram")
             except Exception as _e:
                 log.warning(f"Phase 3 option streaming init failed: {_e}")
+
+            # Phase 1 Dashboard 3000: start the writer thread. Only leader
+            # workers start the thread to avoid duplicate writes (init was
+            # already done earlier in _start_background_services_once()).
+            # This is idempotent and fails silently if init was skipped
+            # (e.g. DASHBOARD_ENABLED=0), so it never affects trading.
+            try:
+                if dashboard.start_dashboard_thread():
+                    log.info("Dashboard 3000: writer thread started on leader worker")
+                else:
+                    log.info("Dashboard 3000: thread not started (disabled, SHEET_ID unset, or init skipped)")
+            except Exception as _dashe:
+                log.error(
+                    f"Dashboard 3000: thread start failed — {_dashe}. "
+                    f"This does NOT affect trading; dashboard is purely additive. "
+                    f"Grep logs for 'dashboard:' to investigate.",
+                    exc_info=True,
+                )
         else:
             log.info("Non-leader worker: skipping WebSocket streaming (leader worker owns Schwab connection)")
 
