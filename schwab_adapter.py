@@ -417,12 +417,26 @@ class SchwabDataProvider:
             self._call_counts[endpoint] = self._call_counts.get(endpoint, 0) + 1
             self._total_calls += 1
 
+    @staticmethod
+    def _rate_limited_schwab_call(method, *args, **kwargs):
+        """Wrapper that enforces the global Schwab token bucket before calling.
+
+        v7.3 (Patch 4): Every Schwab SDK call now passes through the
+        process-wide rate_limiter bucket (default 110/min, env-tunable
+        via SCHWAB_RATE_PER_MIN). When loops or scanners burst, they
+        queue here instead of racing past Schwab's 120/min ceiling.
+        Waits >5s get logged at WARN so contention is visible.
+        """
+        from rate_limiter import rate_limit
+        with rate_limit(cost=1, label=f"schwab.{getattr(method, '__name__', 'call')}"):
+            return method(*args, **kwargs)
+
     def _schwab_get(self, method_name: str, *args, **kwargs):
         """Call a schwab-py client method and return parsed JSON."""
         if not self._client:
             raise RuntimeError("Schwab client not initialised")
         method = getattr(self._client, method_name)
-        resp = method(*args, **kwargs)
+        resp = self._rate_limited_schwab_call(method, *args, **kwargs)
         resp.raise_for_status()
         return resp.json()
 
@@ -837,7 +851,14 @@ class DataRouter:
         self._schwab_errors = 0
 
     def _try_schwab_first(self, method_name: str, *args, **kwargs):
-        """Try Schwab, fall back to MarketData on any error."""
+        """Try Schwab, fall back to MarketData on any error.
+
+        Error-log policy (v7.3 Patch 5):
+          - Warn only for unexpected Schwab failures (auth, 500s, timeouts).
+          - Debug-log historical-chain 400s and "no contracts found" — those
+            are expected for past-dated queries or tickers without that
+            expiry, and the fallback path handles them cleanly.
+        """
         if self._schwab.available:
             try:
                 result = getattr(self._schwab, method_name)(*args, **kwargs)
@@ -850,7 +871,16 @@ class DataRouter:
             except Exception as e:
                 with self._lock:
                     self._schwab_errors += 1
-                log.warning(f"Schwab {method_name} failed, falling back to MarketData: {e}")
+                _emsg = str(e)
+                _is_expected = (
+                    "400 Bad Request" in _emsg
+                    or "no contracts found" in _emsg.lower()
+                    or "404 Not Found" in _emsg
+                )
+                if _is_expected:
+                    log.debug(f"Schwab {method_name} returned {_emsg[:80]} — using MarketData fallback")
+                else:
+                    log.warning(f"Schwab {method_name} failed, falling back to MarketData: {e}")
 
         # Fallback to MarketData
         with self._lock:
