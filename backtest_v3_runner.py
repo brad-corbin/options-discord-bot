@@ -85,6 +85,35 @@ log = logging.getLogger("backtest")
 NY = timezone(timedelta(hours=-5))
 
 
+def _to_unix_ts(t):
+    """Normalize any timestamp MarketData might return into unix integer.
+    MD sometimes ignores dateformat=timestamp and returns ISO strings for daily
+    candles. Handle int, float, and ISO date/datetime strings."""
+    if isinstance(t, (int, float)):
+        return int(t)
+    if isinstance(t, str):
+        s = t.strip()
+        # Try ISO datetime first (e.g. "2023-08-01T00:00:00-04:00" or "2023-08-01T13:45:00Z")
+        for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%SZ",
+                    "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+            try:
+                dt = datetime.strptime(s.replace("Z", "+0000") if fmt.endswith("Z") else s, fmt)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return int(dt.timestamp())
+            except ValueError:
+                continue
+        # datetime.fromisoformat handles lots of edge cases
+        try:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return int(dt.timestamp())
+        except Exception:
+            pass
+    raise ValueError(f"Cannot parse timestamp: {t!r}")
+
+
 def fetch_candles(ticker, resolution, start, end):
     if not MD_TOKEN:
         raise RuntimeError("MARKETDATA_TOKEN not set")
@@ -101,6 +130,13 @@ def fetch_candles(ticker, resolution, start, end):
         if data.get("s") != "ok":
             log.warning(f"MD {ticker} {resolution}: status={data.get('s')}")
             return None
+        # Normalize timestamps — MD sometimes returns strings despite dateformat=timestamp
+        if "t" in data:
+            try:
+                data["t"] = [_to_unix_ts(t) for t in data["t"]]
+            except ValueError as e:
+                log.warning(f"MD {ticker} {resolution}: timestamp parse error: {e}")
+                return None
         return data
     except Exception as e:
         log.warning(f"MD fetch failed {ticker} {resolution}: {e}")
@@ -852,6 +888,13 @@ def build_regime_map(start, end):
         if r.status_code in (200, 203):
             d = r.json()
             if d.get("s") == "ok":
+                # Normalize VIX timestamps to unix ints
+                if "t" in d:
+                    try:
+                        d["t"] = [_to_unix_ts(t) for t in d["t"]]
+                    except ValueError as e:
+                        log.warning(f"VIX timestamp parse error: {e}")
+                        d = None
                 vix = d
     except Exception as e:
         log.warning(f"VIX fetch failed: {e}")
@@ -1175,7 +1218,7 @@ def main():
     log.info(f"Output: {OUT_DIR}")
 
     start_str = os.environ.get("BACKTEST_START", "2023-08-01")
-    end_str = os.environ.get("BACKTEST_END", datetime.utcnow().strftime("%Y-%m-%d"))
+    end_str = os.environ.get("BACKTEST_END", datetime.now(timezone.utc).strftime("%Y-%m-%d"))
     start = datetime.strptime(start_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     end = datetime.strptime(end_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     log.info(f"Range: {start.date()} → {end.date()}")
