@@ -84,6 +84,26 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("backtest")
 NY = timezone(timedelta(hours=-5))
 
+# ─────────────────────────────────────────────────────────────
+# LIVE POTTER BOX ENGINE INTEGRATION
+# ─────────────────────────────────────────────────────────────
+# Use the actual bot's detect_boxes() from potter_box.py so backtest numbers
+# match what the live engine would have computed on each date. We import
+# from the repo's potter_box.py (expected on sys.path when run from the
+# Render project root).
+BOT_REPO_PATH = os.environ.get("BOT_REPO_PATH", "/opt/render/project/src")
+if BOT_REPO_PATH not in sys.path:
+    sys.path.insert(0, BOT_REPO_PATH)
+
+_detect_boxes_live = None
+try:
+    from potter_box import detect_boxes as _detect_boxes_live  # type: ignore
+    log.info(f"Loaded LIVE Potter Box engine from {BOT_REPO_PATH}/potter_box.py")
+except Exception as e:
+    log.warning(f"Could not import live potter_box.py ({e}). Set BOT_REPO_PATH "
+                f"env var to the directory containing potter_box.py, or run from the "
+                f"Render project root. Falling back to approximation.")
+
 
 def _to_unix_ts(t):
     """Normalize any timestamp MarketData might return into unix integer.
@@ -348,43 +368,113 @@ def resample_to_daily(bars_15m):
 
 @dataclass
 class PBState:
-    state: str
-    floor: float
-    roof: float
-    range_pct: float
-    box_age_days: int
+    state: str              # "in_box" / "above_roof" / "below_floor" / "no_box" / "post_box"
+    floor: float            # Actual price from detected box (0 if no_box)
+    roof: float             # Actual price from detected box (0 if no_box)
+    range_pct: float        # Live engine range_pct field
+    box_age_days: int       # duration_bars from live engine
+    midpoint: float = 0.0   # (roof + floor) / 2 — the CB line
+    max_touches: int = 0    # max(roof_touches, floor_touches)
+    wave_label: str = "none"  # established / weakening / breakout_probable / breakout_imminent / none
+    break_confirmed: bool = False
 
 
-def compute_potter_box(daily_bars, idx):
-    if idx < POTTER_LOOKBACK_DAYS:
+# Cache of detect_boxes results per ticker (key: ticker, value: list of box dicts)
+_pb_box_cache: dict = {}
+
+
+def _reset_pb_cache():
+    """Call between tickers if memory becomes a concern."""
+    global _pb_box_cache
+    _pb_box_cache = {}
+
+
+def _get_boxes_for_ticker(daily_bars, ticker):
+    """Run detect_boxes ONCE per ticker against full daily bars, cache the result.
+    Returns list of box dicts from the live engine."""
+    cache_key = (ticker, len(daily_bars))
+    if cache_key in _pb_box_cache:
+        return _pb_box_cache[cache_key]
+
+    if _detect_boxes_live is None:
+        _pb_box_cache[cache_key] = []
+        return []
+
+    try:
+        # Live engine expects bars with o/h/l/c/date fields — our daily_bars have all of these
+        boxes = _detect_boxes_live(daily_bars, ticker)
+    except Exception as e:
+        log.warning(f"detect_boxes failed for {ticker}: {e}")
+        boxes = []
+    _pb_box_cache[cache_key] = boxes
+    return boxes
+
+
+def compute_potter_box(daily_bars, idx, ticker="UNKNOWN"):
+    """Potter Box state at daily bar idx, using the LIVE bot engine.
+
+    Behavior: at signal date (idx), find the most recent detected box whose
+    start_idx <= idx. Classify:
+      - in_box:      signal fires during active consolidation (start_idx ≤ idx ≤ end_idx)
+      - above_roof:  box broke upward, signal fires after confirmed up break
+      - below_floor: box broke downward, signal fires after confirmed down break
+      - post_box:    box ended but no confirmed break yet (limbo)
+      - no_box:      no box has ever started at or before this date
+    """
+    if idx < 0 or idx >= len(daily_bars):
         return PBState("no_box", 0, 0, 0.0, 0)
-    w = daily_bars[idx - POTTER_LOOKBACK_DAYS + 1: idx + 1]
-    floor = min(b["l"] for b in w)
-    roof = max(b["h"] for b in w)
-    spot = daily_bars[idx]["c"]
-    if spot <= 0:
+
+    boxes = _get_boxes_for_ticker(daily_bars, ticker)
+    if not boxes:
+        # No live engine, or no boxes detected in this ticker's history
         return PBState("no_box", 0, 0, 0.0, 0)
-    rng = (roof - floor) / spot * 100.0
-    if rng > POTTER_MAX_RANGE_PCT:
-        return PBState("no_box", floor, roof, rng, 0)
-    age = 1
-    for j in range(idx - 1, max(idx - 60, POTTER_LOOKBACK_DAYS - 1), -1):
-        w2 = daily_bars[j - POTTER_LOOKBACK_DAYS + 1: j + 1]
-        if len(w2) < POTTER_LOOKBACK_DAYS:
-            break
-        f = min(b["l"] for b in w2); r = max(b["h"] for b in w2); s = daily_bars[j]["c"]
-        if s > 0 and (r - f) / s * 100.0 <= POTTER_MAX_RANGE_PCT:
-            age += 1
-        else:
-            break
-    buf = POTTER_BREAKOUT_BUFFER / 100.0
-    if spot > roof * (1 + buf):
-        state = "above_roof"
-    elif spot < floor * (1 - buf):
-        state = "below_floor"
-    else:
+
+    # Find the most recent box that starts before or at signal date
+    # Boxes are returned in chronological order by detect_boxes (increasing start_idx)
+    relevant = [b for b in boxes if b.get("start_idx", -1) <= idx]
+    if not relevant:
+        return PBState("no_box", 0, 0, 0.0, 0)
+
+    box = relevant[-1]  # most recent relevant box
+    start_idx = box.get("start_idx", -1)
+    end_idx = box.get("end_idx", -1)
+    floor = float(box.get("floor", 0))
+    roof = float(box.get("roof", 0))
+    midpoint = float(box.get("midpoint", (roof + floor) / 2 if roof and floor else 0))
+    range_pct = float(box.get("range_pct", 0))
+    duration = int(box.get("duration_bars", 0))
+    max_touches = int(box.get("max_touches", 0))
+    wave_label = str(box.get("wave_label", "none"))
+    broken = bool(box.get("broken", False))
+    break_confirmed = bool(box.get("break_confirmed", False))
+    break_direction = box.get("break_direction", None)
+
+    # Classify state at signal date
+    if start_idx <= idx <= end_idx:
+        # Signal fired during active consolidation
         state = "in_box"
-    return PBState(state, floor, roof, rng, age)
+    elif broken and break_confirmed:
+        # Box broke with ≥5% confirmed move. Signal fires post-breakout.
+        if break_direction == "up":
+            state = "above_roof"
+        elif break_direction == "down":
+            state = "below_floor"
+        else:
+            state = "post_box"
+    else:
+        # Box ended but no confirmed break. If signal is very close to end of box,
+        # treat as "in_box" still (consolidation could still be resolving).
+        bars_since_end = idx - end_idx
+        if bars_since_end <= 5:
+            state = "in_box"
+        else:
+            state = "post_box"
+
+    return PBState(
+        state=state, floor=floor, roof=roof, range_pct=range_pct,
+        box_age_days=duration, midpoint=midpoint, max_touches=max_touches,
+        wave_label=wave_label, break_confirmed=break_confirmed,
+    )
 
 
 @dataclass
@@ -478,6 +568,18 @@ class SignalBar:
     htf_bear_confirmed: bool = False
     daily_bull: bool = False
     daily_bear: bool = False
+    # Indicator values at signal bar (for quintile analysis)
+    ind_ema_diff_pct: float = 0.0    # (ema_fast - ema_slow) / close * 100
+    ind_macd_hist_pct: float = 0.0   # macd_hist / close * 100
+    ind_rsi_mfi: float = 50.0        # RSI+MFI avg (0-100)
+    ind_stoch_k: float = 50.0        # StochRSI K (0-100)
+    ind_stoch_d: float = 50.0        # StochRSI D (0-100)
+    ind_wt2: float = 0.0             # Wave Trend 2
+    ind_rsi: float = 50.0            # plain RSI
+    ind_adx: float = 0.0             # ADX reading
+    # Candle strength at signal bar
+    candle_body_pct: float = 0.0     # |close - open| / range * 100
+    candle_close_pos_pct: float = 50.0  # close position in range (0=at low, 100=at high)
 
 
 def compute_v3_signals(bars_15m):
@@ -494,6 +596,8 @@ def compute_v3_signals(bars_15m):
     wt1, wt2 = wave_trend(h, l, c, WT_CHANNEL, WT_AVG)
     rm = mfi_rsi_avg(h, l, c, v, RSI_MFI_LEN)
     sk, sd = stoch_rsi(c, STOCH_RSI_LEN, STOCH_LEN, STOCH_K, STOCH_D)
+    # Plain RSI-14 for per-signal reporting (separate from the 72-period RSI+MFI)
+    rsi14 = rsi(c, 14)
 
     # Session VWAP
     vwap_vals = [0.0] * n; cum_pv = 0.0; cum_v = 0.0; prev_day = None
@@ -635,12 +739,37 @@ def compute_v3_signals(bars_15m):
         t2s = ds[i] and hbrok[i] and sok and adx_ok[i] and bec and not t1s
 
         dt_ny = datetime.fromtimestamp(bars_15m[i]["t"], tz=NY)
+
+        # Candle strength at signal bar
+        rng_i = max(h[i] - l[i], 1e-9)
+        body = abs(c[i] - o[i])
+        body_pct = body / rng_i * 100.0
+        # Close position in range — for bulls we want close near high (high position
+        # value). For bears we want close near low. Store the raw position; summary
+        # code can interpret per-direction.
+        close_pos_pct = (c[i] - l[i]) / rng_i * 100.0
+
+        # Indicator values at signal bar
+        close_safe = max(c[i], 1e-9)
+        ema_diff_pct = (ef[i] - es[i]) / close_safe * 100.0
+        macd_hist_pct = hs[i] / close_safe * 100.0
+
         results.append(SignalBar(
             idx=i, ts=bars_15m[i]["t"], dt_ny=dt_ny,
             open=o[i], high=h[i], low=l[i], close=c[i],
             tier1_buy=t1b, tier2_buy=t2b, tier1_sell=t1s, tier2_sell=t2s,
             htf_bull_confirmed=hbc[i], htf_bear_confirmed=hbrc[i],
             daily_bull=db_d[i], daily_bear=dbr_d[i],
+            ind_ema_diff_pct=ema_diff_pct,
+            ind_macd_hist_pct=macd_hist_pct,
+            ind_rsi_mfi=rm[i],
+            ind_stoch_k=sk[i],
+            ind_stoch_d=sd[i],
+            ind_wt2=wt2[i],
+            ind_rsi=rsi14[i],
+            ind_adx=adx_v[i],
+            candle_body_pct=body_pct,
+            candle_close_pos_pct=close_pos_pct,
         ))
     return results
 
@@ -684,12 +813,49 @@ class Trade:
     pb_state: str
     pb_range_pct: float
     pb_box_age: int
-    fib_level: str
-    fib_distance_pct: float
-    fib_spot_above: str
-    swing_dist_above_pct: float
-    swing_dist_below_pct: float
-    confluence_bucket: str
+    # Live-engine Potter Box extras
+    pb_floor: float = 0.0
+    pb_roof: float = 0.0
+    pb_midpoint: float = 0.0          # CB line
+    pb_wave_label: str = "none"
+    pb_max_touches: int = 0
+    pb_break_confirmed: bool = False
+    # CB line analysis at signal (only meaningful when in_box)
+    cb_side: str = "n/a"              # "above_cb" / "below_cb" / "at_cb" / "n/a"
+    cb_distance_pct: float = 0.0      # abs(spot - midpoint) / spot * 100
+    # Candle strength at signal bar (15m)
+    candle_body_pct: float = 0.0
+    candle_close_pos_pct: float = 50.0
+    # Indicator values at signal bar
+    ind_ema_diff_pct: float = 0.0
+    ind_macd_hist_pct: float = 0.0
+    ind_rsi_mfi: float = 50.0
+    ind_stoch_k: float = 50.0
+    ind_stoch_d: float = 50.0
+    ind_wt2: float = 0.0
+    ind_rsi: float = 50.0
+    ind_adx: float = 0.0
+    fib_level: str = "none"
+    fib_distance_pct: float = 0.0
+    fib_spot_above: str = "unknown"
+    swing_dist_above_pct: float = 0.0
+    swing_dist_below_pct: float = 0.0
+    confluence_bucket: str = "none"
+    # Credit spread outcomes (only populated when in_box; otherwise 'n/a')
+    # Bull signal -> bull put credit at floor. Bear signal -> bear call credit at roof.
+    credit_short_strike: float = 0.0
+    credit_25_long_strike: float = 0.0     # $2.50 width
+    credit_50_long_strike: float = 0.0     # $5.00 width
+    # Primary Friday exit
+    credit_25_bucket: str = "n/a"
+    credit_25_win: bool = False
+    credit_50_bucket: str = "n/a"
+    credit_50_win: bool = False
+    # 2-week Friday exit
+    credit_25_2w_bucket: str = "n/a"
+    credit_25_2w_win: bool = False
+    credit_50_2w_bucket: str = "n/a"
+    credit_50_2w_win: bool = False
 
 
 def find_exit_bar(bars, entry_idx, min_trading_days=MIN_HOLD_DAYS):
@@ -752,6 +918,37 @@ def grade(signed):
         return "partial", False
     else:
         return "full_loss", False
+
+
+def grade_credit(direction: str, short_strike: float, long_strike: float, exit_price: float):
+    """Grade a credit spread at exit.
+
+    direction='bull' -> bull put credit: short_strike > long_strike.
+      Full win: exit >= short (OTM) — premium retained.
+      Partial: long < exit < short — between strikes, partial loss.
+      Full loss: exit <= long — max loss (width - premium).
+
+    direction='bear' -> bear call credit: short_strike < long_strike.
+      Full win: exit <= short.
+      Partial: short < exit < long.
+      Full loss: exit >= long.
+    """
+    if short_strike <= 0 or long_strike <= 0:
+        return "n/a", False
+    if direction == "bull":
+        if exit_price >= short_strike:
+            return "full_win", True
+        elif exit_price > long_strike:
+            return "partial", False
+        else:
+            return "full_loss", False
+    else:  # bear
+        if exit_price <= short_strike:
+            return "full_win", True
+        elif exit_price < long_strike:
+            return "partial", False
+        else:
+            return "full_loss", False
 
 
 def simulate_trades(ticker, bars, daily_bars, regime_map):
@@ -829,9 +1026,46 @@ def simulate_trades(ticker, bars, daily_bars, regime_map):
         sdk = sb.dt_ny.strftime("%Y-%m-%d")
         tidx = day_map.get(sdk, 0)
         pidx = max(0, tidx - 1)
-        pb = compute_potter_box(daily_bars, pidx)
+        pb = compute_potter_box(daily_bars, pidx, ticker=ticker)
         fb = compute_fib_state(daily_bars, pidx)
         sw = compute_swing_state(daily_bars, pidx, highs, lows)
+
+        # CB line analysis (the cost-basis midpoint of the Potter Box)
+        cb_side = "n/a"
+        cb_dist_pct = 0.0
+        if pb.state == "in_box" and pb.midpoint > 0:
+            spot_at_signal = sb.close
+            if spot_at_signal > pb.midpoint:
+                cb_side = "above_cb"
+            elif spot_at_signal < pb.midpoint:
+                cb_side = "below_cb"
+            else:
+                cb_side = "at_cb"
+            if spot_at_signal > 0:
+                cb_dist_pct = abs(spot_at_signal - pb.midpoint) / spot_at_signal * 100.0
+
+        # Credit spread simulation — only when in_box (we need a boundary to sell at)
+        cs_short = 0.0; cs_long_25 = 0.0; cs_long_50 = 0.0
+        cs_25_b = "n/a"; cs_25_w = False; cs_50_b = "n/a"; cs_50_w = False
+        cs_25_b_2w = "n/a"; cs_25_w_2w = False; cs_50_b_2w = "n/a"; cs_50_w_2w = False
+        if pb.state == "in_box" and pb.floor > 0 and pb.roof > 0:
+            if direction == "bull":
+                # Bull put credit: sell put at floor, buy put $W below
+                cs_short = pb.floor
+                cs_long_25 = pb.floor - 2.50
+                cs_long_50 = pb.floor - 5.00
+            else:
+                # Bear call credit: sell call at roof, buy call $W above
+                cs_short = pb.roof
+                cs_long_25 = pb.roof + 2.50
+                cs_long_50 = pb.roof + 5.00
+            # Primary Friday exit
+            cs_25_b, cs_25_w = grade_credit(direction, cs_short, cs_long_25, exit_price)
+            cs_50_b, cs_50_w = grade_credit(direction, cs_short, cs_long_50, exit_price)
+            # 2-week Friday exit
+            if exit_2w_idx is not None:
+                cs_25_b_2w, cs_25_w_2w = grade_credit(direction, cs_short, cs_long_25, e2p)
+                cs_50_b_2w, cs_50_w_2w = grade_credit(direction, cs_short, cs_long_50, e2p)
 
         conf = "none"
         if direction == "bull" and pb.state == "above_roof":
@@ -865,9 +1099,29 @@ def simulate_trades(ticker, bars, daily_bars, regime_map):
             regime_trend=rt, regime_vol=rv,
             signal_hour_et=shr, signal_dow=dow, days_to_friday=d2f,
             pb_state=pb.state, pb_range_pct=pb.range_pct, pb_box_age=pb.box_age_days,
+            pb_floor=pb.floor, pb_roof=pb.roof, pb_midpoint=pb.midpoint,
+            pb_wave_label=pb.wave_label, pb_max_touches=pb.max_touches,
+            pb_break_confirmed=pb.break_confirmed,
+            cb_side=cb_side, cb_distance_pct=cb_dist_pct,
+            candle_body_pct=sb.candle_body_pct,
+            candle_close_pos_pct=sb.candle_close_pos_pct,
+            ind_ema_diff_pct=sb.ind_ema_diff_pct,
+            ind_macd_hist_pct=sb.ind_macd_hist_pct,
+            ind_rsi_mfi=sb.ind_rsi_mfi,
+            ind_stoch_k=sb.ind_stoch_k,
+            ind_stoch_d=sb.ind_stoch_d,
+            ind_wt2=sb.ind_wt2,
+            ind_rsi=sb.ind_rsi,
+            ind_adx=sb.ind_adx,
             fib_level=fb.nearest_level, fib_distance_pct=fb.distance_pct, fib_spot_above=fb.above_or_below,
             swing_dist_above_pct=sw.distance_above_pct, swing_dist_below_pct=sw.distance_below_pct,
             confluence_bucket=conf,
+            credit_short_strike=cs_short,
+            credit_25_long_strike=cs_long_25, credit_50_long_strike=cs_long_50,
+            credit_25_bucket=cs_25_b, credit_25_win=cs_25_w,
+            credit_50_bucket=cs_50_b, credit_50_win=cs_50_w,
+            credit_25_2w_bucket=cs_25_b_2w, credit_25_2w_win=cs_25_w_2w,
+            credit_50_2w_bucket=cs_50_b_2w, credit_50_2w_win=cs_50_w_2w,
         ))
     return trades
 
@@ -1123,6 +1377,294 @@ def write_summary_by_confluence(trades, path):
                         w.writerow([name, str(val), tier, direction, n, fw, fp, fl,
                                     f"{wr:.1f}", f"{100*(fw+fp)/n:.1f}", f"{dlt:+.1f}"])
 
+        # CB line side (only meaningful for in_box trades)
+        for tier in (1, 2):
+            for direction in ("bull", "bear"):
+                by_cb = defaultdict(list)
+                for t in trades:
+                    if t.tier == tier and t.direction == direction and t.pb_state == "in_box":
+                        by_cb[t.cb_side].append(t)
+                for side in ("above_cb", "below_cb", "at_cb"):
+                    ts = by_cb.get(side, [])
+                    n, fw, fp, fl, _, _, _, _, _ = _stats(ts)
+                    if n == 0:
+                        continue
+                    wr = 100 * fw / n
+                    dlt = wr - baselines[(tier, direction)]
+                    w.writerow(["cb_side_in_box", side, tier, direction, n, fw, fp, fl,
+                                f"{wr:.1f}", f"{100*(fw+fp)/n:.1f}", f"{dlt:+.1f}"])
+
+        # Wave label at signal (only meaningful when in_box)
+        for tier in (1, 2):
+            for direction in ("bull", "bear"):
+                by_wl = defaultdict(list)
+                for t in trades:
+                    if t.tier == tier and t.direction == direction and t.pb_state == "in_box":
+                        by_wl[t.pb_wave_label].append(t)
+                for wl in ("established", "weakening", "breakout_probable", "breakout_imminent"):
+                    ts = by_wl.get(wl, [])
+                    n, fw, fp, fl, _, _, _, _, _ = _stats(ts)
+                    if n == 0:
+                        continue
+                    wr = 100 * fw / n
+                    dlt = wr - baselines[(tier, direction)]
+                    w.writerow(["wave_label_in_box", wl, tier, direction, n, fw, fp, fl,
+                                f"{wr:.1f}", f"{100*(fw+fp)/n:.1f}", f"{dlt:+.1f}"])
+
+
+def _credit_stats(trades, which="25"):
+    """Credit spread stats.
+    which='25' uses credit_25_*, '50' uses credit_50_*.
+    Returns (n_total, n_with_credit, full_win, partial, full_loss, wr_pct, wr_2w_pct)."""
+    with_credit = [t for t in trades if getattr(t, f"credit_{which}_bucket") != "n/a"]
+    n_total = len(trades)
+    n_wc = len(with_credit)
+    if n_wc == 0:
+        return (n_total, 0, 0, 0, 0, 0.0, 0.0)
+    fw = sum(1 for t in with_credit if getattr(t, f"credit_{which}_bucket") == "full_win")
+    fp = sum(1 for t in with_credit if getattr(t, f"credit_{which}_bucket") == "partial")
+    fl = sum(1 for t in with_credit if getattr(t, f"credit_{which}_bucket") == "full_loss")
+    fw2 = sum(1 for t in with_credit if getattr(t, f"credit_{which}_2w_bucket") == "full_win")
+    return (n_total, n_wc, fw, fp, fl, 100 * fw / n_wc, 100 * fw2 / n_wc)
+
+
+def write_summary_by_credit(trades, path):
+    """Per-ticker credit spread WR at $2.50 and $5.00 widths (in_box signals only).
+
+    For bull signals, this is a bull put credit at the Potter Box floor.
+    For bear signals, this is a bear call credit at the Potter Box roof.
+    Debit WR is also included for side-by-side comparison.
+    """
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow([
+            "ticker", "tier", "direction",
+            "n_total_signals", "n_in_box",
+            "debit_wr_pct",
+            "credit_25_wr_pct", "credit_25_partial_pct", "credit_25_2w_wr_pct",
+            "credit_50_wr_pct", "credit_50_partial_pct", "credit_50_2w_wr_pct",
+            "better_strategy",
+        ])
+        by_key = defaultdict(list)
+        for t in trades:
+            by_key[(t.ticker, t.tier, t.direction)].append(t)
+        for (tk, ti, di), ts in sorted(by_key.items()):
+            n_total = len(ts)
+            if n_total == 0:
+                continue
+            # Debit WR (all signals, not in_box-restricted)
+            debit_fw = sum(1 for t in ts if t.bucket == "full_win")
+            debit_wr = 100 * debit_fw / n_total if n_total > 0 else 0.0
+            # Credit WR (only in_box signals, because we need a boundary)
+            _, n_wc_25, fw_25, fp_25, _, wr_25, wr2_25 = _credit_stats(ts, "25")
+            _, n_wc_50, fw_50, fp_50, _, wr_50, wr2_50 = _credit_stats(ts, "50")
+            partial_pct_25 = (100 * fp_25 / n_wc_25) if n_wc_25 > 0 else 0.0
+            partial_pct_50 = (100 * fp_50 / n_wc_50) if n_wc_50 > 0 else 0.0
+            # Tag which strategy performed best (requires ≥ 20 trades for credit to be meaningful)
+            if n_wc_25 < 20 and n_wc_50 < 20:
+                best = "insufficient_credit_data"
+            else:
+                best_credit_wr = max(wr_25 if n_wc_25 >= 20 else 0.0, wr_50 if n_wc_50 >= 20 else 0.0)
+                if debit_wr >= best_credit_wr + 3:
+                    best = "debit"
+                elif best_credit_wr >= debit_wr + 3:
+                    best = f"credit_{'25' if wr_25 >= wr_50 else '50'}"
+                else:
+                    best = "tie"
+            w.writerow([
+                tk, ti, di, n_total, max(n_wc_25, n_wc_50),
+                f"{debit_wr:.1f}",
+                f"{wr_25:.1f}" if n_wc_25 > 0 else "n/a",
+                f"{partial_pct_25:.1f}" if n_wc_25 > 0 else "n/a",
+                f"{wr2_25:.1f}" if n_wc_25 > 0 else "n/a",
+                f"{wr_50:.1f}" if n_wc_50 > 0 else "n/a",
+                f"{partial_pct_50:.1f}" if n_wc_50 > 0 else "n/a",
+                f"{wr2_50:.1f}" if n_wc_50 > 0 else "n/a",
+                best,
+            ])
+
+
+def _quintile_bins(values):
+    """Compute 5 equal-count quintile bin edges from a list of floats.
+    Returns (edges, labels) where edges is 6 boundary values and labels is 5 bin names."""
+    if not values:
+        return [], []
+    s = sorted(values)
+    n = len(s)
+    edges = [s[0]]
+    for q in (0.2, 0.4, 0.6, 0.8):
+        idx = int(n * q)
+        edges.append(s[min(idx, n - 1)])
+    edges.append(s[-1])
+    labels = [f"Q{i+1}_[{edges[i]:.2f},{edges[i+1]:.2f}]" for i in range(5)]
+    return edges, labels
+
+
+def _which_quintile(value, edges):
+    """Return 0-4 bin index for value given 6 edge boundaries."""
+    if not edges or len(edges) < 6:
+        return 0
+    for i in range(5):
+        if value <= edges[i + 1]:
+            return i
+    return 4  # clamp
+
+
+def write_summary_by_indicator(trades, path):
+    """WR by quintile of each indicator, per tier + direction.
+
+    For each (tier, direction, indicator), split that subset into 5 equal-count
+    quintile bins by indicator value, then compute WR per bin. This shows which
+    indicator levels produce stronger signals.
+    """
+    indicators = [
+        ("ema_diff_pct", lambda t: t.ind_ema_diff_pct),
+        ("macd_hist_pct", lambda t: t.ind_macd_hist_pct),
+        ("rsi_mfi", lambda t: t.ind_rsi_mfi),
+        ("stoch_k", lambda t: t.ind_stoch_k),
+        ("stoch_d", lambda t: t.ind_stoch_d),
+        ("wt2", lambda t: t.ind_wt2),
+        ("rsi", lambda t: t.ind_rsi),
+        ("adx", lambda t: t.ind_adx),
+        ("candle_body_pct", lambda t: t.candle_body_pct),
+        ("candle_close_pos_pct", lambda t: t.candle_close_pos_pct),
+    ]
+
+    # Precompute baseline WR per (tier, direction)
+    baselines = {}
+    for tier in (1, 2):
+        for direction in ("bull", "bear"):
+            s = [t for t in trades if t.tier == tier and t.direction == direction]
+            n, fw, _, _, _, _, _, _, _ = _stats(s)
+            baselines[(tier, direction)] = (100 * fw / n) if n > 0 else 0.0
+
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow([
+            "indicator", "quintile", "tier", "direction",
+            "value_range_low", "value_range_high",
+            "n_trades", "full_win", "partial", "full_loss",
+            "headline_wr_pct", "win_or_partial_pct", "vs_baseline_wr_pct",
+        ])
+        for ind_name, accessor in indicators:
+            for tier in (1, 2):
+                for direction in ("bull", "bear"):
+                    subset = [t for t in trades if t.tier == tier and t.direction == direction]
+                    if len(subset) < 50:  # need enough data for meaningful quintiles
+                        continue
+                    values = [accessor(t) for t in subset]
+                    edges, _ = _quintile_bins(values)
+                    if not edges:
+                        continue
+                    bins = defaultdict(list)
+                    for t in subset:
+                        v = accessor(t)
+                        q = _which_quintile(v, edges)
+                        bins[q].append(t)
+                    baseline = baselines[(tier, direction)]
+                    for q_idx in range(5):
+                        ts = bins.get(q_idx, [])
+                        n, fw, fp, fl, _, _, _, _, _ = _stats(ts)
+                        if n == 0:
+                            continue
+                        wr = 100 * fw / n
+                        dlt = wr - baseline
+                        w.writerow([
+                            ind_name, f"Q{q_idx+1}", tier, direction,
+                            f"{edges[q_idx]:.3f}", f"{edges[q_idx+1]:.3f}",
+                            n, fw, fp, fl,
+                            f"{wr:.1f}", f"{100*(fw+fp)/n:.1f}", f"{dlt:+.1f}",
+                        ])
+
+
+def write_summary_by_refires(trades, path):
+    """WR stratified by how many times the signal fired in the same ISO week.
+
+    Three analyses:
+    - fires_in_week: WR of trades in weeks with N total fires (1, 2, 3, 4+)
+    - fire_position_in_week: WR by position of the trade within the week (1st, 2nd, 3rd, 4+)
+    - first_fire_given_total_fires: WR of the FIRST fire, split by total fires that week.
+      This answers: "if I enter the first signal and more keep firing, does my first trade
+      win more often than if it had been a lone signal?"
+    """
+    # Group by (ticker, iso_year, iso_week, tier, direction)
+    week_groups = defaultdict(list)
+    for idx, t in enumerate(trades):
+        dt = datetime.fromisoformat(t.signal_dt_ny)
+        iso_y, iso_w, _ = dt.isocalendar()
+        key = (t.ticker, iso_y, iso_w, t.tier, t.direction)
+        week_groups[key].append((idx, t))
+
+    # Tag each trade with (fires_count_this_week, fire_position)
+    fires_info = {}  # idx -> (count, position)
+    for key, group in week_groups.items():
+        group.sort(key=lambda x: x[1].signal_ts)
+        n = len(group)
+        for pos, (idx, _) in enumerate(group, 1):
+            fires_info[idx] = (n, pos)
+
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["dimension", "value", "tier", "direction", "n_trades",
+                    "full_win", "partial", "full_loss",
+                    "headline_wr_pct", "win_or_partial_pct"])
+
+        # 1. Distribution & WR by total fires in week
+        for tier in (1, 2):
+            for direction in ("bull", "bear"):
+                buckets = defaultdict(list)
+                for idx, t in enumerate(trades):
+                    if t.tier == tier and t.direction == direction:
+                        fires, _ = fires_info.get(idx, (1, 1))
+                        bucket = str(fires) if fires <= 3 else "4+"
+                        buckets[bucket].append(t)
+                for bucket in ("1", "2", "3", "4+"):
+                    ts = buckets.get(bucket, [])
+                    n, fw, fp, fl, _, _, _, _, _ = _stats(ts)
+                    if n == 0:
+                        continue
+                    wr = 100 * fw / n
+                    w.writerow(["fires_in_week", bucket, tier, direction, n, fw, fp, fl,
+                                f"{wr:.1f}", f"{100*(fw+fp)/n:.1f}"])
+
+        # 2. WR by fire position within the week
+        for tier in (1, 2):
+            for direction in ("bull", "bear"):
+                buckets = defaultdict(list)
+                for idx, t in enumerate(trades):
+                    if t.tier == tier and t.direction == direction:
+                        _, pos = fires_info.get(idx, (1, 1))
+                        bucket = str(pos) if pos <= 3 else "4+"
+                        buckets[bucket].append(t)
+                for bucket in ("1", "2", "3", "4+"):
+                    ts = buckets.get(bucket, [])
+                    n, fw, fp, fl, _, _, _, _, _ = _stats(ts)
+                    if n == 0:
+                        continue
+                    wr = 100 * fw / n
+                    w.writerow(["fire_position_in_week", bucket, tier, direction, n, fw, fp, fl,
+                                f"{wr:.1f}", f"{100*(fw+fp)/n:.1f}"])
+
+        # 3. WR of FIRST fire, split by how many total fires that week
+        #    This is the money question for the roll decision.
+        for tier in (1, 2):
+            for direction in ("bull", "bear"):
+                buckets = defaultdict(list)
+                for idx, t in enumerate(trades):
+                    if t.tier == tier and t.direction == direction:
+                        fires, pos = fires_info.get(idx, (1, 1))
+                        if pos == 1:  # First fire only
+                            bucket = str(fires) if fires <= 3 else "4+"
+                            buckets[bucket].append(t)
+                for bucket in ("1", "2", "3", "4+"):
+                    ts = buckets.get(bucket, [])
+                    n, fw, fp, fl, _, _, _, _, _ = _stats(ts)
+                    if n == 0:
+                        continue
+                    wr = 100 * fw / n
+                    w.writerow(["first_fire_given_total_fires", bucket, tier, direction, n, fw, fp, fl,
+                                f"{wr:.1f}", f"{100*(fw+fp)/n:.1f}"])
+
 
 def write_report(trades, start, end, path):
     n_total = len(trades)
@@ -1301,6 +1843,9 @@ def main():
     write_summary_by_regime(all_trades, os.path.join(OUT_DIR, "summary_by_regime.csv"))
     write_summary_by_timing(all_trades, os.path.join(OUT_DIR, "summary_by_timing.csv"))
     write_summary_by_confluence(all_trades, os.path.join(OUT_DIR, "summary_by_confluence.csv"))
+    write_summary_by_credit(all_trades, os.path.join(OUT_DIR, "summary_by_credit.csv"))
+    write_summary_by_indicator(all_trades, os.path.join(OUT_DIR, "summary_by_indicator.csv"))
+    write_summary_by_refires(all_trades, os.path.join(OUT_DIR, "summary_by_refires.csv"))
     write_report(all_trades, start, end, os.path.join(OUT_DIR, "report.md"))
 
     log.info(f"DONE. Outputs in {OUT_DIR}:")
