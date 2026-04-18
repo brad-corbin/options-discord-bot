@@ -1819,20 +1819,41 @@ def main():
     trades_path = os.path.join(OUT_DIR, "trades.csv")
     if done and os.path.exists(trades_path):
         try:
+            from dataclasses import fields as _dc_fields
+            # Build a (name, type) map for Trade so we cast each CSV cell to the
+            # right type. Field.type is the actual type object here (no
+            # `from __future__ import annotations` in this module).
+            _type_map = {}
+            for f in _dc_fields(Trade):
+                t = f.type
+                # Handle both type objects and string type annotations
+                if t is int or t == "int":
+                    _type_map[f.name] = "int"
+                elif t is float or t == "float":
+                    _type_map[f.name] = "float"
+                elif t is bool or t == "bool":
+                    _type_map[f.name] = "bool"
+                else:
+                    _type_map[f.name] = "str"
+
             with open(trades_path) as f:
                 rdr = csv.DictReader(f)
                 for row in rdr:
-                    for k in ("tier", "signal_ts", "entry_ts", "exit_ts", "exit_2w_ts",
-                              "signal_hour_et", "days_to_friday", "pb_box_age"):
-                        row[k] = int(row[k])
-                    for k in ("entry_price", "short_strike", "long_strike", "exit_price",
-                              "move_pct", "move_signed_pct", "mae_pct", "mfe_pct", "hold_days",
-                              "exit_2w_price", "move_2w_signed_pct",
-                              "pb_range_pct", "fib_distance_pct",
-                              "swing_dist_above_pct", "swing_dist_below_pct"):
-                        row[k] = float(row[k])
-                    for k in ("win_headline", "win_2w_headline", "htf_aligned", "daily_aligned"):
-                        row[k] = str(row[k]).lower() in ("true", "1")
+                    for name, kind in _type_map.items():
+                        if name not in row or row[name] is None:
+                            continue
+                        v = row[name]
+                        try:
+                            if kind == "int":
+                                row[name] = int(float(v))  # handle "1.0" → 1
+                            elif kind == "float":
+                                row[name] = float(v)
+                            elif kind == "bool":
+                                row[name] = str(v).lower() in ("true", "1")
+                            # kind == "str" leaves it alone
+                        except (ValueError, TypeError):
+                            # Leave untouched if cast fails — probably empty or n/a
+                            pass
                     all_trades.append(Trade(**row))
             log.info(f"Resumed {len(all_trades)} trades from {len(done)} tickers")
         except Exception as e:
