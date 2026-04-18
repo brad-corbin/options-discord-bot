@@ -78,7 +78,6 @@ FIB_LEVELS = [23.6, 38.2, 50.0, 61.8, 78.6]
 SWING_FRACTAL_ORDER = 3
 
 OUT_DIR = "/tmp/backtest_v3"
-RATE_LIMIT_SECONDS = 0.3
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("backtest")
@@ -134,33 +133,68 @@ def _to_unix_ts(t):
     raise ValueError(f"Cannot parse timestamp: {t!r}")
 
 
+RATE_LIMIT_SECONDS = float(os.environ.get("BACKTEST_RATE_LIMIT_SEC", "1.5"))
+MD_LOCKOUT_WAIT_SEC = 360   # 6 minutes — MD says "wait 5" but be safe
+MD_LOCKOUT_MAX_RETRIES = 3   # each fetch can endure up to 3 lockout waits
+
+
+def _is_md_one_device_error(status_code, response_text):
+    """Detect MarketData's 'one device permitted' block specifically."""
+    if status_code != 403:
+        return False
+    text = (response_text or "").lower()
+    return "one device" in text or "ip address has changed" in text or "temporarily blocked" in text
+
+
 def fetch_candles(ticker, resolution, start, end):
     if not MD_TOKEN:
         raise RuntimeError("MARKETDATA_TOKEN not set")
     url = f"https://api.marketdata.app/v1/stocks/candles/{resolution}/{ticker.upper()}/"
     params = {"from": int(start.timestamp()), "to": int(end.timestamp()), "dateformat": "timestamp"}
     headers = {"Authorization": f"Bearer {MD_TOKEN}"}
-    try:
-        time.sleep(RATE_LIMIT_SECONDS)
-        r = requests.get(url, params=params, headers=headers, timeout=60)
-        if r.status_code not in (200, 203):
-            log.warning(f"MD {ticker} {resolution}: HTTP {r.status_code}: {r.text[:200]}")
-            return None
-        data = r.json()
-        if data.get("s") != "ok":
-            log.warning(f"MD {ticker} {resolution}: status={data.get('s')}")
-            return None
-        # Normalize timestamps — MD sometimes returns strings despite dateformat=timestamp
-        if "t" in data:
-            try:
-                data["t"] = [_to_unix_ts(t) for t in data["t"]]
-            except ValueError as e:
-                log.warning(f"MD {ticker} {resolution}: timestamp parse error: {e}")
+
+    lockout_retries = 0
+    while True:
+        try:
+            time.sleep(RATE_LIMIT_SECONDS)
+            r = requests.get(url, params=params, headers=headers, timeout=60)
+            # Detect the one-device lockout specifically. This affects EVERY in-flight
+            # request — waiting and retrying this specific fetch is the only fix.
+            if _is_md_one_device_error(r.status_code, r.text):
+                if lockout_retries >= MD_LOCKOUT_MAX_RETRIES:
+                    log.error(
+                        f"MD {ticker} {resolution}: one-device lockout persisted through "
+                        f"{MD_LOCKOUT_MAX_RETRIES} retries. Bailing out on this fetch. "
+                        f"Another process (your live bot?) is hitting MD with the same token. "
+                        f"Either pause the bot or get a second MARKETDATA_TOKEN."
+                    )
+                    return None
+                lockout_retries += 1
+                wait = MD_LOCKOUT_WAIT_SEC
+                log.warning(
+                    f"MD one-device lockout on {ticker} {resolution}. "
+                    f"Waiting {wait}s (retry {lockout_retries}/{MD_LOCKOUT_MAX_RETRIES})..."
+                )
+                time.sleep(wait)
+                continue
+            if r.status_code not in (200, 203):
+                log.warning(f"MD {ticker} {resolution}: HTTP {r.status_code}: {r.text[:200]}")
                 return None
-        return data
-    except Exception as e:
-        log.warning(f"MD fetch failed {ticker} {resolution}: {e}")
-        return None
+            data = r.json()
+            if data.get("s") != "ok":
+                log.warning(f"MD {ticker} {resolution}: status={data.get('s')}")
+                return None
+            # Normalize timestamps — MD sometimes returns strings despite dateformat=timestamp
+            if "t" in data:
+                try:
+                    data["t"] = [_to_unix_ts(t) for t in data["t"]]
+                except ValueError as e:
+                    log.warning(f"MD {ticker} {resolution}: timestamp parse error: {e}")
+                    return None
+            return data
+        except Exception as e:
+            log.warning(f"MD fetch failed {ticker} {resolution}: {e}")
+            return None
 
 
 def fetch_15m_chunked(ticker, start, end):
