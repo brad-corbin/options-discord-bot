@@ -359,10 +359,14 @@ def detect_active_scanner(window_bars, daily_closes, regime, ticker):
     htf_confirmed = False
     htf_converging = False
     htf_status = "UNKNOWN"
-    if daily_closes and len(daily_closes) >= 21:
+    # v2 fix (2026-04-19): require BOTH EMAs have len>=2, not just d8.
+    # Live scanner only checks d8 but that works in production because
+    # it always pulls 30 days of daily data — the backtest at early
+    # dates may only have ~21 days, causing d21 to have length 1.
+    if daily_closes and len(daily_closes) >= 22:
         d8 = _compute_ema(daily_closes, 8)
         d21 = _compute_ema(daily_closes, 21)
-        if d8 and d21 and len(d8) >= 2:
+        if d8 and d21 and len(d8) >= 2 and len(d21) >= 2:
             daily_bull = d8[-1] > d21[-1]
             htf_confirmed = (daily_bull == ema_bull)
             if htf_confirmed:
@@ -718,9 +722,11 @@ def active_scanner_signals(bars, daily_bars, ticker, regime_map, countback=80):
         elif rr.get("trend") == "BEAR":
             regime = "BEAR"
 
-        # Daily closes up to (but not including) signal date — avoids lookahead
+        # Daily closes up to (but not including) signal date — avoids lookahead.
+        # v2 fix: require 22+ bars so d21 EMA has at least 2 values
+        # (_compute_ema returns len-period+1 outputs, so 22 in → 2 out for d21).
         dc = [daily_closes_by_date[d] for d in sorted_daily_dates if d < signal_date]
-        if len(dc) < 21:
+        if len(dc) < 22:
             continue
 
         sig = detect_active_scanner(window, dc[-30:], regime, ticker)
