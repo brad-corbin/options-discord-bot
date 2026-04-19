@@ -1613,6 +1613,25 @@ def write_trades_csv(trades, path):
             w.writerow(asdict(t))
 
 
+def _init_trades_csv(path):
+    """Initialize trades CSV with header only. Returns the field list."""
+    fields = list(Trade.__dataclass_fields__.keys())
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+    return fields
+
+
+def _append_trades_csv(trades, path, fields):
+    """Append a batch of trades to an existing CSV (header already written)."""
+    if not trades:
+        return
+    with open(path, "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        for t in trades:
+            w.writerow(asdict(t))
+
+
 def write_summary_by_resolution_scoring(trades, path):
     g = defaultdict(list)
     for t in trades:
@@ -1842,46 +1861,35 @@ def main():
     log.info(f"Regime map: {len(regime_map)} entries")
 
     # ── Resume checkpoint ──
+    # v3 STREAMING MODE: trades are written per-ticker to trades.csv directly.
+    # No all_trades[] list held in memory (fixed OOM kill that hit v3 first run).
     progress_path = OUT_DIR / ".progress.json"
     trades_path = OUT_DIR / "trades.csv"
-    all_trades: list[Trade] = []
     done: set = set()
+    trades_written = 0
 
+    # Resume: if progress file + trades.csv exist, rebuild done set and count
     if progress_path.exists() and trades_path.exists():
         try:
             with open(progress_path) as f:
                 done = set(json.load(f).get("done", []))
-            # Load trades
-            type_map = {}
-            for fld in _dc_fields(Trade):
-                t_ = fld.type
-                if t_ is int or t_ == "int":     type_map[fld.name] = "int"
-                elif t_ is float or t_ == "float": type_map[fld.name] = "float"
-                elif t_ is bool or t_ == "bool":   type_map[fld.name] = "bool"
-                else:                               type_map[fld.name] = "str"
+            # Count existing rows without loading them
             with open(trades_path) as f:
-                rdr = csv.DictReader(f)
-                for row in rdr:
-                    for name, kind in type_map.items():
-                        if name not in row or row[name] == "":
-                            continue
-                        try:
-                            if kind == "int":
-                                row[name] = int(float(row[name]))
-                            elif kind == "float":
-                                row[name] = float(row[name])
-                            elif kind == "bool":
-                                row[name] = str(row[name]).lower() in ("true", "1")
-                        except (ValueError, TypeError):
-                            pass
-                    try:
-                        all_trades.append(Trade(**row))
-                    except TypeError:
-                        pass
-            log.info(f"Resumed {len(all_trades)} trades from {len(done)} tickers")
+                next(f, None)  # skip header
+                for _ in f:
+                    trades_written += 1
+            log.info(f"Resumed with {trades_written} trades from {len(done)} tickers")
+            # Prepare CSV fields for append
+            csv_fields = list(Trade.__dataclass_fields__.keys())
         except Exception as e:
             log.warning(f"Resume failed ({e}); starting fresh")
-            all_trades = []; done = set()
+            done = set()
+            trades_written = 0
+            csv_fields = _init_trades_csv(trades_path)
+    else:
+        # Fresh start: write header
+        csv_fields = _init_trades_csv(trades_path)
+        log.info(f"Initialized fresh trades.csv with {len(csv_fields)} columns")
 
     # ── Per-ticker loop ──
     for idx, ticker in enumerate(tickers, 1):
@@ -1974,34 +1982,32 @@ def main():
             except Exception as e:
                 log.error(f"{ticker} {resolution}m active_scanner failed: {e}")
 
-        all_trades.extend(ticker_trades)
+        # ── Annotate confluence WITHIN this ticker only ──
+        # Confluence is ticker-local: a signal on AAPL can only be confluent with
+        # other AAPL signals. Annotating per-ticker keeps RAM bounded to one
+        # ticker's worth of trades (typically 15-20K max), not 572K.
+        annotate_confluence(ticker_trades)
+
+        # ── Stream trades for this ticker to CSV (append mode) ──
+        _append_trades_csv(ticker_trades, trades_path, csv_fields)
+        trades_written += len(ticker_trades)
+
         done.add(ticker)
 
-        # Checkpoint
-        write_trades_csv(all_trades, trades_path)
+        # Checkpoint progress file (no trades.csv rewrite — it's being appended)
         with open(progress_path, "w") as f:
             json.dump({"done": sorted(done)}, f)
 
-    # ── Annotate confluence after all trades generated ──
-    log.info(f"Annotating cross-resolution confluence on {len(all_trades)} trades...")
-    annotate_confluence(all_trades)
-    write_trades_csv(all_trades, trades_path)
+        log.info(f"  → {len(ticker_trades)} trades written (total: {trades_written:,})")
 
-    # ── Write summaries ──
-    log.info("Writing summaries...")
-    write_summary_by_resolution_scoring(all_trades, OUT_DIR / "summary_by_resolution_scoring.csv")
-    write_summary_by_tier_direction(all_trades, OUT_DIR / "summary_by_tier_direction.csv")
-    write_summary_by_confluence(all_trades, OUT_DIR / "summary_by_confluence.csv")
-    write_summary_by_regime(all_trades, OUT_DIR / "summary_by_regime.csv")
-    write_report(all_trades, start.date(), end.date(), OUT_DIR / "report.md")
+        # Free ticker_trades memory before next ticker
+        del ticker_trades
 
-    log.info(f"DONE. {len(all_trades)} total trades across {len(tickers)} tickers")
-    log.info(f"Outputs in {OUT_DIR}:")
-    for fn in sorted(os.listdir(OUT_DIR)):
-        if fn.startswith("."):
-            continue
-        fp = OUT_DIR / fn
-        log.info(f"  {fn}  ({fp.stat().st_size} bytes)")
+    log.info(f"DONE. {trades_written:,} total trades across {len(tickers)} tickers")
+    log.info(f"trades.csv: {trades_path}")
+    log.info("")
+    log.info("Run analyze_combined_v1.py to generate summary CSVs:")
+    log.info(f"  python backtest/analyze_combined_v1.py")
 
 
 if __name__ == "__main__":
