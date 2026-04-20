@@ -92,21 +92,14 @@ except ImportError:
 
 MONITOR_POLL_INTERVAL_SEC = 60             # v7.0: was 300 — streaming spots are free, evaluate all tickers every cycle
 MONITOR_POLL_INTERVAL_FAST_SEC = 30        # v7.0: was 60 — streaming spots are instant, catch breaks 2x faster
-MONITOR_FAST_POLL_TICKERS = [              # v7.0: was just SPY/QQQ — streaming covers all flow tickers for free
-    # Indexes
-    "SPY", "QQQ", "IWM", "DIA",
-    # Mega-cap tech (highest flow volume)
-    "AAPL", "MSFT", "NVDA", "AMD", "AMZN", "META", "TSLA", "GOOGL",
-    # Large-cap with heavy options flow
-    "NFLX", "COIN", "AVGO", "PLTR", "CRM", "ORCL", "ARM", "SMCI",
-    # Financials
-    "JPM", "GS",
-    # Industrials / Health
-    "BA", "CAT", "LLY", "UNH", "MRNA",
-    # ETFs
-    "GLD", "TLT", "XLF", "XLE", "XLV", "SOXX",
-    # Additional active
-    "MSTR", "SOFI",
+MONITOR_FAST_POLL_TICKERS = [              # v8.3.1: reverted to SPY/QQQ only.
+    # v7.0 expanded this to 35 tickers with "streaming makes it free" justification.
+    # That was an API-cost argument. On the signal-noise side, the expansion
+    # flooded the Alpha SPY Omega channel with thesis alerts for every ticker
+    # (Friday April 18 2026). For Alpha SPY Omega the only tickers that matter
+    # are SPY and QQQ. Other tickers' monitoring still happens via the main
+    # channel's trade cards; they just don't fire thesis-daemon pings.
+    "SPY", "QQQ",
 ]
 MONITOR_ALERT_COOLDOWN_SEC = 300       # v4.3: was 600 (10 min) — 5 min is enough to prevent spam
 MONITOR_ZONE_CLUSTER_PCT   = 0.08   # break attempts / level alerts within 0.08% of each other are treated as the same zone
