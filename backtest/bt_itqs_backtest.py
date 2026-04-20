@@ -141,6 +141,38 @@ GRADE_THRESHOLDS = [("A+", 90), ("A", 85), ("B", 75), ("C", 65), ("F", 0)]
 # DAILY BAR FETCH + CACHE
 # ═══════════════════════════════════════════════════════════
 
+def _to_unix_ts(t):
+    """Normalize any timestamp MarketData might return into a unix int.
+
+    Copied from backtest_v3_runner._to_unix_ts — MD often ignores
+    dateformat=timestamp for daily candles and returns ISO strings like
+    '2023-08-01T00:00:00-04:00'. Must handle int, float, and ISO string.
+
+    Without this normalizer the cache writer silently drops every bar.
+    """
+    if isinstance(t, (int, float)):
+        return int(t)
+    if isinstance(t, str):
+        s = t.strip()
+        for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%SZ",
+                    "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+            try:
+                dt = datetime.strptime(s.replace("Z", "+0000") if fmt.endswith("Z") else s, fmt)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return int(dt.timestamp())
+            except ValueError:
+                continue
+        try:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return int(dt.timestamp())
+        except Exception:
+            pass
+    raise ValueError(f"Cannot parse timestamp: {t!r}")
+
+
 def _cache_path(ticker: str) -> Path:
     return CACHE_DIR / f"{ticker}_{FETCH_START}_{FETCH_END}.csv"
 
@@ -180,22 +212,32 @@ def _fetch_daily_md(ticker: str, from_date: str, to_date: str,
     return None
 
 
-def _write_cache(ticker: str, data: dict) -> None:
+def _write_cache(ticker: str, data: dict) -> int:
+    """Write cache file. Returns number of bars written (0 = bad fetch)."""
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     path = _cache_path(ticker)
     t = data.get("t", [])
     o = data.get("o", []); h = data.get("h", [])
     l = data.get("l", []); c = data.get("c", []); v = data.get("v", [])
+    n_written = 0
+    n_parse_fail = 0
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["ts", "date", "o", "h", "l", "c", "v"])
         for i in range(len(t)):
             try:
-                ts = int(t[i])
+                ts = _to_unix_ts(t[i])
                 date_str = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
                 w.writerow([ts, date_str, o[i], h[i], l[i], c[i], v[i]])
-            except (IndexError, ValueError, TypeError):
+                n_written += 1
+            except (IndexError, ValueError, TypeError) as e:
+                n_parse_fail += 1
+                if n_parse_fail <= 3:
+                    log.warning(f"  {ticker}: timestamp parse failed at i={i}: {t[i]!r} ({e})")
                 continue
+    if n_parse_fail > 3:
+        log.warning(f"  {ticker}: {n_parse_fail} total timestamp parse failures (only first 3 shown)")
+    return n_written
 
 
 def _load_cache(ticker: str) -> Optional[list[dict]]:
@@ -220,7 +262,13 @@ def _load_cache(ticker: str) -> Optional[list[dict]]:
 
 
 def ensure_daily_cache(tickers: list[str]) -> dict[str, list[dict]]:
-    """Fetch + cache daily bars for every ticker. Returns {ticker: [bars]}."""
+    """Fetch + cache daily bars for every ticker. Returns {ticker: [bars]}.
+
+    Only tickers with NON-EMPTY bar lists are included in the returned dict.
+    Empty caches (parse failures, missing data) are logged and skipped so
+    the main loop's "ticker in daily_bars" check correctly routes them to
+    the no_daily_bars skip bucket.
+    """
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     out: dict[str, list[dict]] = {}
     need_fetch = []
@@ -240,10 +288,20 @@ def ensure_daily_cache(tickers: list[str]) -> dict[str, list[dict]]:
         log.info(f"  ({i}/{len(need_fetch)}) {t}...")
         data = _fetch_daily_md(t, FETCH_START, FETCH_END)
         if not data:
-            log.warning(f"  {t}: fetch failed, skipping ticker entirely")
+            log.warning(f"  {t}: fetch failed (MD error)")
             continue
-        _write_cache(t, data)
-        out[t] = _load_cache(t) or []
+        n_written = _write_cache(t, data)
+        if n_written == 0:
+            log.warning(f"  {t}: cache write produced 0 bars — MD response may be malformed; skipping ticker")
+            # Remove the empty file so a rerun will re-fetch
+            try:
+                _cache_path(t).unlink()
+            except OSError:
+                pass
+            continue
+        bars = _load_cache(t)
+        if bars:
+            out[t] = bars
         time.sleep(0.5)   # gentle rate limit; MarketData is fine with 2/s
     return out
 
@@ -513,7 +571,18 @@ def main():
     log.info("")
     log.info("Step 1: ensure daily bar cache...")
     daily_bars = ensure_daily_cache(ALL_TICKERS)
-    log.info(f"Daily bars loaded for {len(daily_bars)}/{len(ALL_TICKERS)} tickers")
+    loaded_count = len([t for t, bars in daily_bars.items() if bars])
+    log.info(f"Daily bars loaded for {loaded_count}/{len(ALL_TICKERS)} tickers")
+    if loaded_count < 30:
+        log.error(
+            f"FATAL: only {loaded_count}/{len(ALL_TICKERS)} tickers have daily bars. "
+            "The verdict would not be trustworthy. Common causes:\n"
+            "  1. MARKETDATA_TOKEN one-device lockout (live bot using same token)\n"
+            "  2. MD returning malformed daily candle payloads\n"
+            "  3. Network timeouts\n"
+            "Fix and rerun. Bad cache files at /tmp/itqs_daily_cache/ have been cleaned."
+        )
+        sys.exit(1)
 
     # 2. Stream Phase 1 CSV and compute ITQS per row
     log.info("")
