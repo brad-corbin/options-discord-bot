@@ -3333,7 +3333,7 @@ _CONVICTION_RULE_LABELS = {
     # Hard gates (discarding)
     "G1":  "HARD GATE: CB-side misaligned with bias",
     "G2":  "HARD GATE: Bear with no Potter Box",
-    "G3":  "HARD GATE: Other pre-filter",
+    "G3":  "HARD GATE: Bear with resistance too far above (≥3%)",
 }
 
 
@@ -10640,7 +10640,8 @@ def _em_scheduler():
                                 if setups:
                                     summary = _potter_box.format_summary(setups)
                                     if summary:
-                                        post_to_diagnosis(summary)
+                                        # v8.3.1 Fix B: summary digest goes to main
+                                        post_to_telegram(summary)
                                     for s in setups:
                                         if s.get("trade") and s.get("flow_direction"):
                                             try:
@@ -10678,7 +10679,8 @@ def _em_scheduler():
                                 if setups:
                                     summary = _potter_box.format_summary(setups)
                                     if summary:
-                                        post_to_diagnosis(summary)
+                                        # v8.3.1 Fix B: summary digest goes to main
+                                        post_to_telegram(summary)
                                     for s in setups:
                                         if s.get("trade") and s.get("flow_direction"):
                                             try:
@@ -10716,7 +10718,8 @@ def _em_scheduler():
                                 if setups:
                                     summary = _potter_box.format_summary(setups)
                                     if summary:
-                                        post_to_diagnosis(summary)
+                                        # v8.3.1 Fix B: summary digest goes to main
+                                        post_to_telegram(summary)
                                     for s in setups:
                                         if s.get("trade") and s.get("flow_direction"):
                                             try:
@@ -10892,6 +10895,14 @@ def _start_background_services_once():
         )
 
         # v7: start position monitor polling thread
+        # v8.3.1 Fix C: Dedup position monitor alerts by alert_key.
+        # Prior bug: caller ignored alert_key so every new intraday high within
+        # the same 20% band re-fired. Result: TSLA got 8 exits on 4/13.
+        # Now: alert_key persists in memory, same key never posts twice.
+        # Keys reset when process restarts — acceptable for intraday monitoring.
+        # Built: {pos_id}_{band} so PT1/PT2/PT3 each fire exactly once per position.
+        _posted_alert_keys = set()
+
         def _position_monitor_loop():
             """Poll live option prices every 60s for all tracked positions."""
             import time as _t
@@ -10900,8 +10911,14 @@ def _start_background_services_once():
                     if _position_monitor:
                         alerts = _position_monitor.poll_all()
                         for a in alerts:
+                            _alert_key = a.get("alert_key")
+                            # Skip duplicate bands — only post PT1/PT2/PT3 once each
+                            if _alert_key and _alert_key in _posted_alert_keys:
+                                continue
                             try:
                                 post_to_telegram(a.get("msg", ""))
+                                if _alert_key:
+                                    _posted_alert_keys.add(_alert_key)
                             except Exception:
                                 pass
                 except Exception as _pm_err:
