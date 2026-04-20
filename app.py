@@ -3434,10 +3434,19 @@ def _should_suppress_flow_post(ticker: str, direction: str) -> tuple[bool, str]:
     """Decide whether to suppress a flow post at a conviction play site.
 
     Returns (suppress, reason):
+      (False, "no_state")          → fail-open: persistent_state unavailable,
+                                     proceed with pre-v8.3.2 behavior (post full card)
       (True,  "already_confirmed") → silent skip, something already posted today
       (True,  "stash_pending")     → silent skip, pending flow stashed for scorer
       (False, "standalone_confirm") → caller should post ONE FLOW CONFIRMS card
     """
+    # v8.3.2 post-audit fix: honor fail-open intent. If persistent_state is
+    # None or otherwise unusable, dedup keys can't work → fall back to
+    # pre-v8.3.2 behavior (always post the full conviction play card).
+    # Without this, Redis outage silently suppresses ALL flow posts via the
+    # stash_pending default path, which is a regression.
+    if not _persistent_state:
+        return (False, "no_state")
     if _check_flow_confirmed(ticker, direction):
         return (True, "already_confirmed")
     if _check_scorer_posted(ticker, direction):
