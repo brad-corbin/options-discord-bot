@@ -517,7 +517,11 @@ class SchwabDataProvider:
         from schwab.client import Client
         try:
             end = datetime.now(timezone.utc)
-            start = end - timedelta(days=days + 10)
+            # v8.4.1 (hotfix pt 2): days here is *trading* days, not calendar days.
+            # Weekends + holidays eat ~30% — need ~1.5x calendar buffer + cushion
+            # or we return one bar short of the caller's intended count (which
+            # breaks market_regime's MA50+5 floor of 55 bars when days=70).
+            start = end - timedelta(days=int(days * 1.5) + 20)
             raw = self._schwab_get(
                 "get_price_history", ticker.upper(),
                 # v8.4.1 (hotfix): YEAR not MONTH — MONTH caps at ~22 daily bars
