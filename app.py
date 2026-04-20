@@ -6942,7 +6942,9 @@ def _post_v84_credit_card(ticker: str, direction: str, spot: float,
     # Register spread tracking for 50% TP / 2x credit SL alerts — reuses the
     # existing track_spread infrastructure that powers debit trade exits.
     try:
-        from schwab_stream import build_occ_symbol, _stream_manager
+        # v8.4.5 (Patch 2C): get_option_store also lives in schwab_stream,
+        # not at app.py module scope — import alongside the other symbols.
+        from schwab_stream import build_occ_symbol, get_option_store, _stream_manager
         store = get_option_store()
         spread_side = "put" if spread["trade_type"] == "bull_put" else "call"
         short_occ = build_occ_symbol(ticker, expiry, spread_side, spread["short_strike"])
