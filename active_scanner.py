@@ -185,6 +185,82 @@ def _compute_wavetrend(hlc3: list) -> Dict:
 
 
 # ═══════════════════════════════════════════════════════════
+# ADX (v8.3 Phase 2 — ported from backtest_v3_runner.py:346-364)
+# Same Wilder's-method ADX the backtest used for ind_adx quintile
+# analysis. Keeping algorithm identical so live ADX quintile lookups
+# against FALLBACK_BOUNDS reflect measured edge once the Phase 3
+# re-backtest populates ind_adx for active_scanner signals.
+# ═══════════════════════════════════════════════════════════
+
+def _rma(values: list, length: int) -> list:
+    """Wilder's smoothing (RMA). Recursive moving average.
+
+    Ported from backtest_v3_runner.py. Used internally by _compute_adx.
+    """
+    if not values or length <= 0:
+        return []
+    out = []
+    s = 0.0
+    for i, v in enumerate(values):
+        if i == 0:
+            s = float(v)
+        else:
+            s = s + (float(v) - s) / length
+        out.append(s)
+    return out
+
+
+def _compute_adx(highs: list, lows: list, closes: list, length: int = 14) -> float:
+    """Compute the current ADX value from OHLC arrays.
+
+    Returns the most recent ADX reading as a float. Returns 0.0 on any
+    failure — the scorer's ADX quintile rules check for missing data
+    and skip, so a silent zero is safe.
+
+    Matches backtest_v3_runner.py:346-364 exactly for alignment.
+    """
+    try:
+        n = len(closes)
+        if n < 2 or len(highs) != n or len(lows) != n:
+            return 0.0
+        if n < length + 1:
+            # Not enough bars for Wilder's smoothing to stabilize
+            return 0.0
+
+        dmp = [0.0]
+        dmn = [0.0]
+        tr = [highs[0] - lows[0]]
+        for i in range(1, n):
+            up = highs[i] - highs[i - 1]
+            dn = lows[i - 1] - lows[i]
+            dmp.append(up if up > dn and up > 0 else 0.0)
+            dmn.append(dn if dn > up and dn > 0 else 0.0)
+            tr.append(max(
+                highs[i] - lows[i],
+                abs(highs[i] - closes[i - 1]),
+                abs(lows[i] - closes[i - 1]),
+            ))
+
+        stt = _rma(tr, length)
+        sp = _rma(dmp, length)
+        sn = _rma(dmn, length)
+
+        dip = [100 * sp[i] / stt[i] if stt[i] != 0 else 0.0 for i in range(n)]
+        din = [100 * sn[i] / stt[i] if stt[i] != 0 else 0.0 for i in range(n)]
+
+        dx = []
+        for i in range(n):
+            s = dip[i] + din[i]
+            dx.append(100 * abs(dip[i] - din[i]) / s if s != 0 else 0.0)
+
+        adx_series = _rma(dx, length)
+        return float(adx_series[-1]) if adx_series else 0.0
+    except Exception:
+        # Defensive — never let ADX computation break signal analysis
+        return 0.0
+
+
+# ═══════════════════════════════════════════════════════════
 # TICKER ANALYSIS (unchanged from v5.x)
 # ═══════════════════════════════════════════════════════════
 
@@ -270,6 +346,10 @@ def _analyze_ticker(
                  for i in range(min(len(highs), len(lows), len(closes)))]
         wt    = _compute_wavetrend(hlc3)
         rsi   = _compute_rsi(closes, RSI_PERIOD)
+
+        # v8.3 Phase 2: Native ADX computation for FALLBACK_BOUNDS lookup.
+        # Replaces the TV-forwarded ADX field that's going away with TV deprecation.
+        adx_current = _compute_adx(highs, lows, closes, length=14)
 
         avg_vol      = sum(volumes[-20:]) / min(20, len(volumes)) if volumes else 0
         current_vol  = volumes[-1] if volumes else 0
@@ -457,6 +537,8 @@ def _analyze_ticker(
             "wt_cross_bear": wt.get("wt_cross_bear", False),
             "rsi_mfi": rsi,
             "rsi_mfi_bull": rsi > 50 if rsi else False,
+            # v8.3 Phase 2: native ADX for scorer quintile lookup (P11)
+            "adx": round(adx_current, 2),
             "vwap": vwap,
             "above_vwap": spot > vwap if vwap else False,
             "htf_confirmed": htf_confirmed,
@@ -616,57 +698,29 @@ class ActiveScanner:
         bias   = signal["bias"]
         tier   = signal["tier"]
 
-        # ── Regime-aware rule filter ──────────────────────────
-        # Only tickers in TICKER_RULES are allowed through.
-        # EXCEPTION: flow override — if significant+ institutional flow
-        # confirms the signal direction, bypass the regime gate.
+        # ── v8.3: TICKER_RULES gate REMOVED ──────────────────
+        # The conviction scorer (validated at +8.92 WR in Phase 4) is the
+        # authoritative smart-layer filter for v8.3. Per-ticker TICKER_RULES
+        # pre-filtering was a v7.x heuristic that gated signals by ticker
+        # before scoring could happen. It was silently rejecting ~96% of
+        # active_scanner signals including 21 tickers with no rules at all.
+        # v8.3 replaces that with: every MIN_SIGNAL_SCORE-passing signal
+        # goes to the scorer. Scorer returns POST or LOG_ONLY based on
+        # backtest-validated rules. No per-ticker pre-gating.
+        #
+        # flow_override still tracked for shadow logging but no longer
+        # gates dispatch. Kept as field for backward-compat; see shadow log
+        # consumers.
         flow_override = False
         flow_override_boost = 0.0
-
-        if ticker not in TICKER_RULES:
-            log.debug(f"Scanner {ticker}: not in TICKER_RULES — suppressed")
-            if score >= MIN_SIGNAL_SCORE and self._shadow_log_fn:
-                try:
-                    self._shadow_log_fn(ticker, regime, signal, "no_rule_in_regime")
-                except Exception:
-                    pass
-            # Check flow override
-            if score >= MIN_SIGNAL_SCORE and self._flow_boost_fn:
-                try:
-                    fb = self._flow_boost_fn(ticker, bias, signal.get("close", 0))
-                    if fb >= 7:  # significant+ aligned flow
-                        flow_override = True
-                        flow_override_boost = fb
-                        log.info(f"🔗 FLOW OVERRIDE: {ticker} {bias} — no regime rule, "
-                               f"but flow boost={fb:.0f} confirms direction")
-                except Exception:
-                    pass
-            if not flow_override:
-                return
-
-        if not flow_override and not is_signal_valid(ticker, regime, signal):
-            log.debug(
-                f"Scanner {ticker}: {bias} score={score} htf={signal['htf_status']} "
-                f"phase={signal.get('phase')} — filtered (regime={regime})"
-            )
-            if score >= MIN_SIGNAL_SCORE and self._shadow_log_fn:
-                try:
-                    self._shadow_log_fn(ticker, regime, signal, "rule_exists_signal_filtered")
-                except Exception:
-                    pass
-            # Check flow override
-            if score >= MIN_SIGNAL_SCORE and self._flow_boost_fn:
-                try:
-                    fb = self._flow_boost_fn(ticker, bias, signal.get("close", 0))
-                    if fb >= 7:
-                        flow_override = True
-                        flow_override_boost = fb
-                        log.info(f"🔗 FLOW OVERRIDE: {ticker} {bias} — signal filtered, "
-                               f"but flow boost={fb:.0f} confirms direction")
-                except Exception:
-                    pass
-            if not flow_override:
-                return
+        if score >= MIN_SIGNAL_SCORE and self._flow_boost_fn:
+            try:
+                fb = self._flow_boost_fn(ticker, bias, signal.get("close", 0))
+                if fb >= 7:
+                    flow_override = True
+                    flow_override_boost = fb
+            except Exception:
+                pass
 
         # ── Dedup ────────────────────────────────────────────
         if self._is_deduped(ticker, signal):
