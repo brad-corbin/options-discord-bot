@@ -3216,15 +3216,13 @@ def _flush_wave_digest():
             store_set(cache_key, card, ttl=DIGEST_CARD_CACHE_TTL_SEC)
 
         if won and card:
-            is_immediate = (
-                (tier in IMMEDIATE_POST_TIER and conf is not None and conf >= IMMEDIATE_POST_MIN_CONF)
-            )
-
-            if is_immediate:
-                immediate_cards.append(card)
-                digest_lines.append(f"  ✅ {ticker} T{tier} {dir_emoji} {conf_str} — POSTED ⬆️")
-            else:
-                digest_lines.append(f"  📋 {ticker} T{tier} {dir_emoji} {conf_str} — /tradecard {ticker}")
+            # v8.4.4 (Patch 2B): scorer is the authoritative gate — any signal
+            # that reached `won=True` already passed CONVICTION_POST_THRESHOLD
+            # (default 70). Don't double-filter on tier+conf here; post the
+            # full card. The old is_immediate check suppressed Tier 2 cards
+            # and any Tier 1 under 75, hiding them behind /tradecard.
+            immediate_cards.append(card)
+            digest_lines.append(f"  ✅ {ticker} T{tier} {dir_emoji} {conf_str} — POSTED ⬆️")
         elif r.get("outcome") == "pending":
             reason = r.get("reason", "waiting on recheck")[:50]
             pending_lines.append(f"  ⏳ {ticker} T{tier} {dir_emoji} {conf_str} — {reason}")
