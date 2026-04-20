@@ -2743,6 +2743,18 @@ def format_trade_card(rec: Dict) -> str:
     if rec.get("conf_reasons"):
         lines.append("💭 Why confidence: " + " | ".join(rec["conf_reasons"][:3]))
 
+    # v8.3.1 Fix #4: Conviction scorer block (on top of v4 institutional confidence).
+    # Conviction is the backtest-validated layer (+8.75 WR lift on 572K trades @ score≥70).
+    # v4 confidence above is the institutional dealer-flow confidence.
+    # Both are shown — they measure different things and can diverge.
+    _cs = rec.get("conviction_score")
+    if _cs is not None:
+        lines.append(f"💪 Conviction: {int(_cs)}/100 (v4 conf: {int(rec.get('confidence', 0))}/100)")
+        _cs_reasons = rec.get("conviction_reasons") or []
+        if _cs_reasons:
+            # Top 3 biggest-impact rules, comma-separated
+            lines.append("🧩 Why fired: " + " | ".join(_cs_reasons[:3]))
+
     # v7 backtest guidance
     try:
         from backtest_guidance import format_active_guidance_block
