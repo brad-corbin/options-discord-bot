@@ -4107,6 +4107,22 @@ def _process_job(worker_id: int, job: dict):
                 except Exception as _fsc_err:
                     log.debug(f"Flow+scorer merge failed for {ticker}: {_fsc_err}")
 
+                # v8.4.3 (Patch 1F): Scorer-path credit hook.
+                # Fires INDEPENDENTLY of whether check_ticker later builds a
+                # valid debit spread. Credit gate (in_box + CB aligned + wave
+                # != established) is the authoritative filter per Phase 1
+                # backtest, not debit spread viability. Env-gated by
+                # V84_CREDIT_DUAL_POST — no-op when disabled.
+                try:
+                    _post_v84_credit_from_scorer(
+                        ticker=ticker, bias=bias,
+                        webhook_data=webhook_data or {},
+                        worker_id=worker_id,
+                    )
+                except Exception as _v84_sp_err:
+                    log.warning(f"[worker-{worker_id}] v8.4 scorer-path hook outer "
+                                f"failed for {ticker} {bias}: {_v84_sp_err}")
+
             except Exception as _sc_err:
                 # v8.3.1 Fix #7: Surface scorer exceptions clearly + write audit row.
                 # Prior: log.warning with no traceback, no audit row → silent audit gap.
@@ -6819,21 +6835,10 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
         except Exception:
             pass  # non-critical
 
-        # v8.4 (Patch 1C): dual-post credit card if V84_CREDIT_DUAL_POST=true
-        # AND the credit gate passes (in_box + CB aligned + non-established wave).
-        # Env-gated — defaults off — zero behavior change when unset.
-        try:
-            # v8.4.2 (probe): prove Patch 1C site is reached. Remove after diagnosis.
-            log.info(f"v8.4 Patch 1C REACHED: ticker={ticker} direction={direction}")
-            _post_v84_credit_card(
-                ticker=ticker, direction=direction, spot=spot,
-                expiry=best_rec.get("exp", ""),
-                regime_trend=(webhook_data or {}).get("market_regime", ""),
-                webhook_data=webhook_data or {},
-                chains=chains,
-            )
-        except Exception as _v84_err:
-            log.warning(f"v8.4 credit hook failed for {ticker}: {_v84_err}")
+        # v8.4 (Patch 1C) — SUPERSEDED BY Patch 1F (v8.4.3).
+        # Credit dual-post now fires from the scorer-path independently of
+        # whether check_ticker builds a valid debit spread. Leaving this
+        # comment for history; no hook call happens here.
 
         return {
             "ticker": ticker, "ok": True, "posted": True, "card": card,
@@ -6869,8 +6874,6 @@ def _post_v84_credit_card(ticker: str, direction: str, spot: float,
     are authoritative per Phase 1 backtest validation (83% credit WR, +32%
     EV on 15,700 trades).
     """
-    # v8.4.2 (probe): prove entry. Remove after diagnosis.
-    log.info(f"v8.4 hook ENTERED: ticker={ticker} dir={direction} spot={spot}")
     try:
         from credit_card_builder import (
             is_v84_dual_post_enabled,
@@ -6878,13 +6881,10 @@ def _post_v84_credit_card(ticker: str, direction: str, spot: float,
             format_credit_card,
         )
     except ImportError as _imp_err:
-        log.warning(f"v8.4 hook IMPORT FAILED: {_imp_err}")  # v8.4.2 (probe): was log.debug
+        log.debug(f"v8.4 credit hook: credit_card_builder not available: {_imp_err}")
         return
 
-    # v8.4.2 (probe): log env gate decision
-    _enabled = is_v84_dual_post_enabled()
-    log.info(f"v8.4 hook env check: enabled={_enabled}")
-    if not _enabled:
+    if not is_v84_dual_post_enabled():
         return  # env not set — quiet fast-path
 
     wd = webhook_data or {}
@@ -6975,6 +6975,129 @@ def _post_v84_credit_card(ticker: str, direction: str, spot: float,
         _record_income_opportunity(_opp, source="v84_credit_dual_post")
     except Exception as _rec_err:
         log.warning(f"v8.4 credit rec-tracker failed for {ticker}: {_rec_err}")
+
+
+# ─────────────────────────────────────────────────────────
+# v8.4.3 (Patch 1E): Scorer-path credit hook
+# ─────────────────────────────────────────────────────────
+# Decouples credit card posting from debit card success. Previously Patch 1C
+# only fired when check_ticker successfully built a debit spread — but check_ticker
+# rejects most signals on liquidity/slippage/EV filters the CREDIT gate doesn't
+# care about. This hook fires right after _mark_scorer_posted so the credit card
+# gets its own chance regardless of whether the debit side can place a spread.
+
+def _post_v84_credit_from_scorer(ticker: str, bias: str, webhook_data: dict,
+                                  worker_id: int = 0):
+    """Fire v8.4 credit hook directly from the scorer-post path.
+
+    Called from _process_job right after _mark_scorer_posted. Fetches spot +
+    nearest 3-7 DTE expiry itself (since check_ticker hasn't run yet). Delegates
+    gate checking + spread building + Telegram post to _post_v84_credit_card.
+
+    Never raises — any failure logs and returns. Purely additive to the debit
+    card flow, which proceeds unchanged.
+    """
+    try:
+        # Fast-path env check — avoid work if dual-post disabled
+        try:
+            from credit_card_builder import is_v84_dual_post_enabled
+            if not is_v84_dual_post_enabled():
+                return
+        except ImportError:
+            return
+
+        log.info(f"[worker-{worker_id}] v8.4 scorer-path credit hook: "
+                 f"{ticker} {bias}")
+
+        # 1) Fetch spot (cached via get_spot's own cache)
+        try:
+            _spot = get_spot(ticker)
+        except Exception as _spot_err:
+            log.warning(f"v8.4 scorer-path: spot fetch failed for {ticker}: {_spot_err}")
+            return
+        if not _spot or _spot <= 0:
+            log.warning(f"v8.4 scorer-path: invalid spot for {ticker}: {_spot}")
+            return
+
+        # 2) Pick an expiry — target 3-7 DTE window per Phase 1 backtest edge
+        _chosen_exp = ""
+        _chosen_dte = None
+        try:
+            from datetime import date as _date
+            _today = _date.today()
+            _exps = get_expirations(ticker) if 'get_expirations' in dir() else []
+            if not _exps:
+                # Fallback: try a few common weekly expiries
+                from datetime import timedelta as _td
+                for _offset in (3, 4, 5, 7):
+                    _exps.append((_today + _td(days=_offset)).strftime("%Y-%m-%d"))
+            # Prefer first expiry with DTE >=3 and <=7
+            for _exp_str in sorted(_exps):
+                try:
+                    _exp_d = datetime.strptime(_exp_str[:10], "%Y-%m-%d").date()
+                    _dte_v = (_exp_d - _today).days
+                    if 3 <= _dte_v <= 7:
+                        _chosen_exp = _exp_str[:10]
+                        _chosen_dte = _dte_v
+                        break
+                except ValueError:
+                    continue
+            # If none in sweet spot, take nearest >=1
+            if not _chosen_exp:
+                for _exp_str in sorted(_exps):
+                    try:
+                        _exp_d = datetime.strptime(_exp_str[:10], "%Y-%m-%d").date()
+                        _dte_v = (_exp_d - _today).days
+                        if _dte_v >= 1:
+                            _chosen_exp = _exp_str[:10]
+                            _chosen_dte = _dte_v
+                            break
+                    except ValueError:
+                        continue
+        except Exception as _exp_err:
+            log.warning(f"v8.4 scorer-path: expiry selection failed for {ticker}: {_exp_err}")
+
+        if not _chosen_exp:
+            log.warning(f"v8.4 scorer-path: no valid expiry found for {ticker}")
+            return
+
+        # 3) Fetch the option chain for the chosen expiry (needed for strike
+        # alignment + live credit price). Failure here is non-fatal —
+        # credit_card_builder will fall back to the 33%-of-width estimate.
+        _chains_arg = None
+        try:
+            _chain_raw = _get_0dte_chain(ticker, _chosen_exp) if 'get_options_chain' not in dir() else None
+            if _chain_raw:
+                # _get_0dte_chain returns (chain_data, spot, exp) — normalize to list-of-tuples
+                _cd, _cs, _ce = _chain_raw
+                if _cd and _ce:
+                    # Synthesize the (exp, dte, contracts) tuple format check_ticker uses
+                    _contracts = []
+                    for _strike, _sides in (_cd or {}).items():
+                        for _side_key, _payload in (_sides or {}).items():
+                            _contracts.append({
+                                "strike": float(_strike),
+                                "side": _side_key,
+                                "bid": float(_payload.get("bid", 0) or 0),
+                                "ask": float(_payload.get("ask", 0) or 0),
+                            })
+                    _chains_arg = [(_ce, _chosen_dte, _contracts)]
+        except Exception as _chain_err:
+            log.debug(f"v8.4 scorer-path: chain fetch failed for {ticker}: {_chain_err}")
+
+        # 4) Delegate to the existing helper. regime_trend from webhook_data
+        # is already populated by the scorer path (market_regime field).
+        _regime_trend = (webhook_data or {}).get("market_regime", "")
+        _post_v84_credit_card(
+            ticker=ticker, direction=bias, spot=_spot,
+            expiry=_chosen_exp, regime_trend=_regime_trend,
+            webhook_data=webhook_data or {},
+            chains=_chains_arg,
+        )
+
+    except Exception as _hook_err:
+        log.warning(f"[worker-{worker_id}] v8.4 scorer-path hook failed for "
+                    f"{ticker} {bias}: {_hook_err}")
 
 
 # ─────────────────────────────────────────────────────────
