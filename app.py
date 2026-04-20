@@ -3636,6 +3636,10 @@ def _build_context_snapshot(ticker: str, bias: str, webhook_data: dict) -> dict:
                         d_roof  = abs(roof - spot) / spot if roof  > 0 else 999.0
                         d_floor = abs(spot - floor) / spot if floor > 0 else 999.0
                         ctx["at_edge"] = min(d_roof, d_floor) < 0.02
+                    # v8.4 (Patch 1A): stash raw floor/roof so the v8.4 credit hook
+                    # can place the short strike without re-fetching the PB box.
+                    ctx["pb_floor"] = floor
+                    ctx["pb_roof"]  = roof
                 except Exception:
                     pass
     except Exception as _pbe:
@@ -4011,6 +4015,14 @@ def _process_job(worker_id: int, job: dict):
                 webhook_data["conviction_breakdown"] = _sc_breakdown
                 webhook_data["conviction_reasons"]   = _sc_reasons
                 webhook_data["conviction_decision"]  = _scorer_decision
+                # v8.4 (Patch 1B): stash PB context for the v8.4 credit hook.
+                # Used by _post_v84_credit_card inside check_ticker at the end
+                # of the successful debit-card path.
+                webhook_data["pb_state"]      = _sc_ctx.get("pb_state", "")
+                webhook_data["pb_floor"]      = _sc_ctx.get("pb_floor", 0.0)
+                webhook_data["pb_roof"]       = _sc_ctx.get("pb_roof", 0.0)
+                webhook_data["pb_wave_label"] = _sc_ctx.get("wave_label", "")
+                webhook_data["cb_side"]       = _sc_ctx.get("cb_side", "")
 
                 # v8.3.1 Fix #1+#3+#6: audit row → scorer_decisions.csv
                 # (NOT signal_decisions.csv — that's a pre-existing v6 regime log).
@@ -6807,6 +6819,20 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
         except Exception:
             pass  # non-critical
 
+        # v8.4 (Patch 1C): dual-post credit card if V84_CREDIT_DUAL_POST=true
+        # AND the credit gate passes (in_box + CB aligned + non-established wave).
+        # Env-gated — defaults off — zero behavior change when unset.
+        try:
+            _post_v84_credit_card(
+                ticker=ticker, direction=direction, spot=spot,
+                expiry=best_rec.get("exp", ""),
+                regime_trend=(webhook_data or {}).get("market_regime", ""),
+                webhook_data=webhook_data or {},
+                chains=chains,
+            )
+        except Exception as _v84_err:
+            log.warning(f"v8.4 credit hook failed for {ticker}: {_v84_err}")
+
         return {
             "ticker": ticker, "ok": True, "posted": True, "card": card,
             "confidence": best_rec.get("confidence"), "trade": trade,
@@ -6821,6 +6847,127 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
                     "error": f"{type(e).__name__}: {str(e)[:160]}"}
         return {"ticker": ticker, "ok": False, "posted": False,
                 "error": f"{type(e).__name__}: {str(e)[:160]}"}
+
+
+# ─────────────────────────────────────────────────────────
+# v8.4 (Patch 1D): Credit dual-post helper
+# ─────────────────────────────────────────────────────────
+
+def _post_v84_credit_card(ticker: str, direction: str, spot: float,
+                          expiry: str, regime_trend: str,
+                          webhook_data: dict, chains=None):
+    """Post a v8.4 credit spread card alongside the debit card.
+
+    Runs at the end of a successful check_ticker() debit post. Gated by
+    V84_CREDIT_DUAL_POST env var (default off). Never raises — any failure
+    logs and returns. Purely additive: debit card path is untouched.
+
+    The credit gate (in_box + CB aligned + wave != established + ticker
+    in Tier-A/B + BULL regime for bears) and strike placement (PB floor/roof)
+    are authoritative per Phase 1 backtest validation (83% credit WR, +32%
+    EV on 15,700 trades).
+    """
+    try:
+        from credit_card_builder import (
+            is_v84_dual_post_enabled,
+            build_credit_spread_if_gated,
+            format_credit_card,
+        )
+    except ImportError as _imp_err:
+        log.debug(f"v8.4 credit hook: credit_card_builder not available: {_imp_err}")
+        return
+
+    if not is_v84_dual_post_enabled():
+        return  # env not set — quiet fast-path
+
+    wd = webhook_data or {}
+    pb_state   = wd.get("pb_state", "")
+    pb_floor   = float(wd.get("pb_floor", 0) or 0)
+    pb_roof    = float(wd.get("pb_roof", 0) or 0)
+    cb_side    = wd.get("cb_side", "")
+    wave_label = wd.get("pb_wave_label", "")
+    conv_score = wd.get("conviction_score")
+    dte_hint = None
+    try:
+        if expiry:
+            import datetime as _dt
+            _exp_dt = _dt.datetime.strptime(expiry[:10], "%Y-%m-%d").date()
+            dte_hint = max(0, (_exp_dt - _dt.date.today()).days)
+    except Exception:
+        pass
+
+    # Extract a live chain (columnar) for the target expiry if available
+    chain = None
+    try:
+        if chains:
+            for exp, _dte, contracts in chains:
+                if str(exp)[:10] == str(expiry)[:10]:
+                    strikes, sides, bids, asks = [], [], [], []
+                    for c in contracts:
+                        strikes.append(c.get("strike"))
+                        sides.append(c.get("side") or c.get("option_type"))
+                        bids.append(c.get("bid", 0) or 0)
+                        asks.append(c.get("ask", 0) or 0)
+                    chain = {"strike": strikes, "side": sides, "bid": bids, "ask": asks}
+                    break
+    except Exception as _chain_err:
+        log.debug(f"v8.4 chain extract failed for {ticker}: {_chain_err}")
+
+    spread, reason = build_credit_spread_if_gated(
+        bias=direction, ticker=ticker, spot=spot,
+        pb_state=pb_state, pb_floor=pb_floor, pb_roof=pb_roof,
+        cb_side=cb_side, wave_label=wave_label, regime_trend=regime_trend,
+        expiry=expiry, chain=chain, dte=dte_hint,
+    )
+    if spread is None:
+        log.info(f"v8.4 credit gated out for {ticker} {direction}: {reason}")
+        return
+
+    card_text = format_credit_card(
+        spread, conviction_score=conv_score,
+        wave_label=wave_label, cb_side=cb_side,
+    )
+    try:
+        _tg_rate_limited_post(card_text)
+        log.info(f"v8.4 CREDIT posted: {ticker} {spread['trade_type']} "
+                 f"${spread['short_strike']}/${spread['long_strike']} "
+                 f"(RoC {spread['roc_pct']:.0f}%)")
+    except Exception as _tg_err:
+        log.warning(f"v8.4 credit Telegram post failed for {ticker}: {_tg_err}")
+        return
+
+    # Register spread tracking for 50% TP / 2x credit SL alerts — reuses the
+    # existing track_spread infrastructure that powers debit trade exits.
+    try:
+        from schwab_stream import build_occ_symbol, _stream_manager
+        store = get_option_store()
+        spread_side = "put" if spread["trade_type"] == "bull_put" else "call"
+        short_occ = build_occ_symbol(ticker, expiry, spread_side, spread["short_strike"])
+        long_occ  = build_occ_symbol(ticker, expiry, spread_side, spread["long_strike"])
+        store.track_spread(short_occ, long_occ, ticker, spread["trade_type"], entry_credit=0)
+        if _stream_manager:
+            _stream_manager.add_option_symbols([short_occ, long_occ])
+    except Exception as _track_err:
+        log.warning(f"v8.4 credit spread tracking register failed for {ticker}: {_track_err}")
+
+    # Write to recommendation tracker for dashboard visibility
+    try:
+        _opp = {
+            "ticker": ticker, "trade_type": spread["trade_type"],
+            "short_strike": spread["short_strike"], "long_strike": spread["long_strike"],
+            "width": spread["width"], "credit": spread["credit"],
+            "roc_pct": spread["roc_pct"], "cushion_pct": spread["cushion_pct"],
+            "breakeven": spread["breakeven"], "spot": spot,
+            "expiry": expiry, "dte": dte_hint,
+            "level": spread.get("pb_floor") or spread.get("pb_roof"),
+            "level_type": "pb_floor" if spread["trade_type"] == "bull_put" else "pb_roof",
+            "touches": 0, "last_touch_days_ago": 0, "quality": 0,
+            "itqs": {"score": conv_score or 0, "grade": "v84", "decision": "v8.4 credit"},
+            "chain_available": spread["chain_tag"] == "live",
+        }
+        _record_income_opportunity(_opp, source="v84_credit_dual_post")
+    except Exception as _rec_err:
+        log.warning(f"v8.4 credit rec-tracker failed for {ticker}: {_rec_err}")
 
 
 # ─────────────────────────────────────────────────────────
