@@ -5950,13 +5950,10 @@ def _run_v4_prefilter(ticker: str, spot: float, chains: list, candle_closes: lis
                             log.info(f"🔇 EXIT SIGNAL SUPPRESSED: {cp['ticker']} "
                                      f"— prior entry was never posted to user")
                         elif route == "immediate":
-                            # 0-2 DTE: fire to BOTH channels immediately
-                            # FIX BUG #2: route through _tg_rate_limited_post so
-                            # rapid-fire conviction alerts share the global TG gap
-                            # lock and don't each individually hit the 429 wall.
-                            _tg_rate_limited_post(msg)
-                            if TELEGRAM_CHAT_INTRADAY and TELEGRAM_CHAT_INTRADAY != TELEGRAM_CHAT_ID:
-                                _tg_rate_limited_post(msg, chat_id=TELEGRAM_CHAT_INTRADAY)
+                            # v8.4.4 (Patch 2A): all conviction flow → intraday only
+                            # (was: dual-posted to main + intraday, now single post)
+                            _cp_chat = TELEGRAM_CHAT_INTRADAY or TELEGRAM_CHAT_ID
+                            _tg_rate_limited_post(msg, chat_id=_cp_chat)
                             try:
                                 _record_conviction_recommendation(cp, spot, chain_data=chain_data, source="conviction_flow")
                             except Exception as _rce:
@@ -6046,26 +6043,27 @@ def _run_v4_prefilter(ticker: str, spot: float, chains: list, candle_closes: lis
                             else:
                                 msg += "\n\n📊 Income scan: no qualifying opportunities found"
 
-                            post_to_telegram(msg)
+                            # v8.4.4 (Patch 2A): conviction flow → intraday, not main
+                            _cp_chat = TELEGRAM_CHAT_INTRADAY or TELEGRAM_CHAT_ID
+                            _tg_rate_limited_post(msg, chat_id=_cp_chat)
                             try:
                                 _record_conviction_recommendation(cp, spot, chain_data=chain_data, best_income=_best_income, source="conviction_flow")
                             except Exception as _rce:
                                 log.warning(f"Rec tracker conviction failed for {cp.get('ticker','?')}: {_rce}")
 
                         elif route == "swing":
-                            # 8-30 DTE: post to both channels
-                            # FIX BUG #2: route through rate limiter
-                            _tg_rate_limited_post(msg)
-                            if TELEGRAM_CHAT_INTRADAY and TELEGRAM_CHAT_INTRADAY != TELEGRAM_CHAT_ID:
-                                _tg_rate_limited_post(msg, chat_id=TELEGRAM_CHAT_INTRADAY)
+                            # v8.4.4 (Patch 2A): conviction flow → intraday, not main (was dual-posted)
+                            _cp_chat = TELEGRAM_CHAT_INTRADAY or TELEGRAM_CHAT_ID
+                            _tg_rate_limited_post(msg, chat_id=_cp_chat)
                             try:
                                 _record_conviction_recommendation(cp, spot, chain_data=chain_data, source="conviction_flow")
                             except Exception as _rce:
                                 log.warning(f"Rec tracker conviction failed for {cp.get('ticker','?')}: {_rce}")
 
                         elif route == "stalk":
-                            # 30-60 DTE: post campaign alert to main channel
-                            post_to_telegram(msg)
+                            # v8.4.4 (Patch 2A): conviction flow → intraday, not main
+                            _cp_chat = TELEGRAM_CHAT_INTRADAY or TELEGRAM_CHAT_ID
+                            _tg_rate_limited_post(msg, chat_id=_cp_chat)
 
                         log.info(f"💎 CONVICTION [{route.upper()}]{' (SHADOW)' if _is_shadow else ''}: "
                                f"{cp['ticker']} {cp['trade_side']} ${cp['strike']:.0f} "
@@ -7662,10 +7660,9 @@ def _get_0dte_iv(ticker: str, target_date_str: str = None) -> tuple:
                             log.info(f"🔇 EXIT SIGNAL SUPPRESSED: {cp['ticker']} "
                                      f"— prior entry was never posted to user")
                         else:
-                            # FIX BUG #2: route through rate limiter to share global TG gap lock
-                            _tg_rate_limited_post(msg)
-                            if route in ("immediate", "swing") and TELEGRAM_CHAT_INTRADAY and TELEGRAM_CHAT_INTRADAY != TELEGRAM_CHAT_ID:
-                                _tg_rate_limited_post(msg, chat_id=TELEGRAM_CHAT_INTRADAY)
+                            # v8.4.4 (Patch 2A): conviction flow → intraday, not main
+                            _cp_chat = TELEGRAM_CHAT_INTRADAY or TELEGRAM_CHAT_ID
+                            _tg_rate_limited_post(msg, chat_id=_cp_chat)
                             try:
                                 _record_conviction_recommendation(cp, spot, chain_data=rows if "rows" in locals() else None, source="conviction_flow")
                             except Exception as _rce:
@@ -7904,10 +7901,9 @@ def _get_chain_iv_for_expiry(ticker: str, target_date_str: str, dte: float) -> t
                             log.info(f"🔇 EXIT SIGNAL SUPPRESSED: {cp['ticker']} "
                                      f"— prior entry was never posted to user")
                         else:
-                            # FIX BUG #2: route through rate limiter to share global TG gap lock
-                            _tg_rate_limited_post(msg)
-                            if route in ("immediate", "swing") and TELEGRAM_CHAT_INTRADAY and TELEGRAM_CHAT_INTRADAY != TELEGRAM_CHAT_ID:
-                                _tg_rate_limited_post(msg, chat_id=TELEGRAM_CHAT_INTRADAY)
+                            # v8.4.4 (Patch 2A): conviction flow → intraday, not main
+                            _cp_chat = TELEGRAM_CHAT_INTRADAY or TELEGRAM_CHAT_ID
+                            _tg_rate_limited_post(msg, chat_id=_cp_chat)
                             try:
                                 _record_conviction_recommendation(cp, spot, chain_data=rows if "rows" in locals() else None, source="conviction_flow")
                             except Exception as _rce:
@@ -11757,10 +11753,9 @@ def _initialize_app():
                                 log.info(f"🔇 EXIT SIGNAL SUPPRESSED (sweep): {cp['ticker']} "
                                          f"— prior entry was never posted to user")
                             elif not cp.get("is_shadow_only"):
-                                # FIX BUG #2: route through rate limiter
-                                _tg_rate_limited_post(cp_msg)
-                                if cp.get("route") in ("immediate", "swing") and TELEGRAM_CHAT_INTRADAY:
-                                    _tg_rate_limited_post(cp_msg, chat_id=TELEGRAM_CHAT_INTRADAY)
+                                # v8.4.4 (Patch 2A): conviction sweep → intraday, not main
+                                _cp_chat = TELEGRAM_CHAT_INTRADAY or TELEGRAM_CHAT_ID
+                                _tg_rate_limited_post(cp_msg, chat_id=_cp_chat)
                                 try:
                                     _record_conviction_recommendation(cp, get_spot(cp.get("ticker")) or 0, source="conviction_sweep")
                                 except Exception as _rce:
