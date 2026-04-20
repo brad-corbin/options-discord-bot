@@ -6823,6 +6823,8 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
         # AND the credit gate passes (in_box + CB aligned + non-established wave).
         # Env-gated — defaults off — zero behavior change when unset.
         try:
+            # v8.4.2 (probe): prove Patch 1C site is reached. Remove after diagnosis.
+            log.info(f"v8.4 Patch 1C REACHED: ticker={ticker} direction={direction}")
             _post_v84_credit_card(
                 ticker=ticker, direction=direction, spot=spot,
                 expiry=best_rec.get("exp", ""),
@@ -6867,6 +6869,8 @@ def _post_v84_credit_card(ticker: str, direction: str, spot: float,
     are authoritative per Phase 1 backtest validation (83% credit WR, +32%
     EV on 15,700 trades).
     """
+    # v8.4.2 (probe): prove entry. Remove after diagnosis.
+    log.info(f"v8.4 hook ENTERED: ticker={ticker} dir={direction} spot={spot}")
     try:
         from credit_card_builder import (
             is_v84_dual_post_enabled,
@@ -6874,10 +6878,13 @@ def _post_v84_credit_card(ticker: str, direction: str, spot: float,
             format_credit_card,
         )
     except ImportError as _imp_err:
-        log.debug(f"v8.4 credit hook: credit_card_builder not available: {_imp_err}")
+        log.warning(f"v8.4 hook IMPORT FAILED: {_imp_err}")  # v8.4.2 (probe): was log.debug
         return
 
-    if not is_v84_dual_post_enabled():
+    # v8.4.2 (probe): log env gate decision
+    _enabled = is_v84_dual_post_enabled()
+    log.info(f"v8.4 hook env check: enabled={_enabled}")
+    if not _enabled:
         return  # env not set — quiet fast-path
 
     wd = webhook_data or {}
