@@ -3291,7 +3291,184 @@ def _tg_rate_limited_post(text: str, max_retries: int = 6, chat_id: str = None):
 
 
 # ══════════════════════════════════════════════════════════════════
-# v8.3.1 Fix #4: Plain-English reason builder for conviction card lines.
+# v8.3.2 Fix A: Flow + Scorer integration helpers
+#
+# Problem solved: prior behavior fired separate CONVICTION PLAY cards for
+# every flow detection, which overlapped with v8.3 scorer trade cards on the
+# same ticker+direction. Could produce 2-4 near-duplicate posts per event.
+#
+# New behavior:
+#   1. Flow fires for ticker T, direction D → check persistent state.
+#   2. If scorer already POSTed for T/D today → post ONE "FLOW CONFIRMS" card.
+#   3. If scorer has NOT posted → stash pending flow, post nothing now.
+#   4. When scorer POSTs, if pending flow exists → enrich card via
+#      webhook_data["conviction_reasons"] append. Clear pending.
+#   5. Any subsequent flow fire on same T/D/date → silent (dedup).
+#
+# Keys (all TTL 86400 = 24 hours; resets at midnight UTC):
+#   scorer_posted:{TICKER}:{direction}:{YYYY-MM-DD}   — scorer fired POST
+#   pending_flow:{TICKER}:{direction}:{YYYY-MM-DD}    — flow fired, waiting
+#   flow_confirmed:{TICKER}:{direction}:{YYYY-MM-DD}  — confirmation posted (dedup)
+#
+# All helpers fail-closed: on persistent_state exception, returns None/False
+# (treats as "no state known") so flow + scorer behave as they did pre-v8.3.2.
+# ══════════════════════════════════════════════════════════════════
+def _flow_date_str() -> str:
+    """Current date in CT for key namespacing. Keys expire at midnight UTC
+    anyway via TTL, but using CT date keeps the mental model aligned with
+    market hours."""
+    try:
+        import pytz as _pytz
+        return datetime.now(_pytz.timezone("America/Chicago")).strftime("%Y-%m-%d")
+    except Exception:
+        return datetime.utcnow().strftime("%Y-%m-%d")
+
+
+def _flow_key(ticker: str, direction: str, kind: str) -> str:
+    """Build namespaced persistent-state key for flow/scorer tracking."""
+    t = str(ticker or "").upper().strip()
+    d = str(direction or "").lower().strip()
+    # Normalize direction: bullish/bull/call → bull, bearish/bear/put → bear
+    if d in ("bull", "bullish", "call"):
+        d = "bull"
+    elif d in ("bear", "bearish", "put"):
+        d = "bear"
+    return f"{kind}:{t}:{d}:{_flow_date_str()}"
+
+
+def _mark_scorer_posted(ticker: str, direction: str, score: int = 0) -> None:
+    """Called by _process_job after scorer decision == 'post' and card posted."""
+    if not _persistent_state:
+        return
+    try:
+        _persistent_state._json_set(
+            _flow_key(ticker, direction, "scorer_posted"),
+            {"ticker": ticker, "direction": direction, "score": int(score),
+             "posted_at": datetime.utcnow().isoformat() + "Z"},
+            ttl=86400,
+        )
+    except Exception as e:
+        log.debug(f"_mark_scorer_posted failed for {ticker}: {e}")
+
+
+def _check_scorer_posted(ticker: str, direction: str) -> bool:
+    """Did the v8.3 scorer already POST a card for this ticker/direction today?"""
+    if not _persistent_state:
+        return False
+    try:
+        data = _persistent_state._json_get(_flow_key(ticker, direction, "scorer_posted"))
+        return data is not None
+    except Exception:
+        return False
+
+
+def _stash_pending_flow(ticker: str, direction: str, cp: dict) -> None:
+    """Flow fired before scorer. Save minimal flow payload so that when
+    scorer posts next, the trade card can append a FLOW CONFIRMS line."""
+    if not _persistent_state:
+        return
+    try:
+        payload = {
+            "vol_oi_ratio": cp.get("vol_oi_ratio"),
+            "strike": cp.get("strike"),
+            "side": cp.get("trade_side"),
+            "dte": cp.get("dte"),
+            "em_aligned": cp.get("em_aligned", False),
+            "shadow_agrees": cp.get("shadow_agrees", False),
+            "detected_at": datetime.utcnow().isoformat() + "Z",
+        }
+        _persistent_state._json_set(
+            _flow_key(ticker, direction, "pending_flow"), payload, ttl=86400)
+    except Exception as e:
+        log.debug(f"_stash_pending_flow failed for {ticker}: {e}")
+
+
+def _pop_pending_flow(ticker: str, direction: str) -> dict | None:
+    """Read-and-clear pending flow for this ticker/direction. Returns None
+    if no flow was stashed. Called by scorer when deciding POST."""
+    if not _persistent_state:
+        return None
+    try:
+        key = _flow_key(ticker, direction, "pending_flow")
+        data = _persistent_state._json_get(key)
+        if data is not None:
+            # Clear it so we don't enrich twice
+            try:
+                _persistent_state._json_set(key, {}, ttl=1)  # ~expire quickly
+            except Exception:
+                pass
+        return data
+    except Exception:
+        return None
+
+
+def _check_flow_confirmed(ticker: str, direction: str) -> bool:
+    """Has a flow confirmation already been posted today? Used to silence
+    the 2nd/3rd/Nth flow fire on the same ticker/direction/date."""
+    if not _persistent_state:
+        return False
+    try:
+        data = _persistent_state._json_get(_flow_key(ticker, direction, "flow_confirmed"))
+        return data is not None
+    except Exception:
+        return False
+
+
+def _mark_flow_confirmed(ticker: str, direction: str, path: str = "") -> None:
+    """Set the flow-confirmed sentinel. Accepts `path` for debug: either
+    'enriched_card' (scorer enriched during POST) or 'standalone_confirm'
+    (FLOW CONFIRMS card posted after scorer POST already happened)."""
+    if not _persistent_state:
+        return
+    try:
+        _persistent_state._json_set(
+            _flow_key(ticker, direction, "flow_confirmed"),
+            {"path": path, "confirmed_at": datetime.utcnow().isoformat() + "Z"},
+            ttl=86400,
+        )
+    except Exception as e:
+        log.debug(f"_mark_flow_confirmed failed for {ticker}: {e}")
+
+
+def _should_suppress_flow_post(ticker: str, direction: str) -> tuple[bool, str]:
+    """Decide whether to suppress a flow post at a conviction play site.
+
+    Returns (suppress, reason):
+      (True,  "already_confirmed") → silent skip, something already posted today
+      (True,  "stash_pending")     → silent skip, pending flow stashed for scorer
+      (False, "standalone_confirm") → caller should post ONE FLOW CONFIRMS card
+    """
+    if _check_flow_confirmed(ticker, direction):
+        return (True, "already_confirmed")
+    if _check_scorer_posted(ticker, direction):
+        # Scorer already posted, we'll let caller convert to FLOW CONFIRMS card
+        return (False, "standalone_confirm")
+    # Scorer hasn't posted yet. Stash and go silent.
+    return (True, "stash_pending")
+
+
+def _build_flow_confirms_card(cp: dict) -> str:
+    """Build a compact FLOW CONFIRMS card for flow that fires AFTER a scorer
+    POST has already happened. One-time per ticker/direction/day (dedup
+    enforced by caller via _mark_flow_confirmed)."""
+    ticker = cp.get("ticker", "?")
+    side = cp.get("trade_side", "?")
+    direction = "bullish" if side in ("call", "C", "bull") else "bearish" if side in ("put", "P", "bear") else str(side)
+    vol_oi = cp.get("vol_oi_ratio", 0)
+    strike = cp.get("strike", 0)
+    dte = cp.get("dte", 0)
+    em_aligned = "EM ALIGNED" if cp.get("em_aligned") else ("EM CONFLICT" if cp.get("em_conflict") else "")
+    shadow = "+ SHADOW AGREES" if cp.get("shadow_agrees") else ""
+    lines = [
+        f"⚡ FLOW CONFIRMS {ticker} {direction.upper()}",
+        f"Prior trade card already fired — institutional flow now confirms the direction.",
+        f"Signal: {vol_oi:.0f}x vol/OI @ ${strike:.0f} strike ({dte}DTE) {em_aligned} {shadow}".strip(),
+        "— Not financial advice —",
+    ]
+    return "\n".join(lines)
+
+
+
 #
 # Maps scorer breakdown rule codes (B1..B13, P1..P15, G1..G3) + their
 # weights to short human-readable sentences. Called from _process_job
@@ -3883,6 +4060,31 @@ def _process_job(worker_id: int, job: dict):
                 # POST: fall through to existing v7 filter → chain fetch → Telegram post.
                 # Attach score to base so downstream logging sees it.
                 base["confidence"] = _sc_score
+
+                # v8.3.2 Fix A: Flow+scorer integration.
+                # Mark scorer as having posted for this ticker/direction/date.
+                # Then check if flow ALREADY fired earlier today for same
+                # ticker/direction — if so, enrich the trade card with a
+                # FLOW CONFIRMS line so user sees both in one card.
+                try:
+                    _mark_scorer_posted(ticker, bias, _sc_score)
+                    _pending = _pop_pending_flow(ticker, bias)
+                    if _pending:
+                        # Append flow confirm to conviction_reasons so card shows it
+                        _vol_oi = _pending.get("vol_oi_ratio", 0)
+                        _strike = _pending.get("strike", 0)
+                        _dte_pf = _pending.get("dte", 0)
+                        _flow_line = f"⚡ FLOW: {_vol_oi:.0f}x vol/OI @ ${_strike:.0f} ({_dte_pf}DTE)"
+                        _existing = webhook_data.get("conviction_reasons") or []
+                        if isinstance(_existing, list):
+                            _existing.insert(0, _flow_line)
+                            webhook_data["conviction_reasons"] = _existing
+                        _mark_flow_confirmed(ticker, bias, path="enriched_card")
+                        log.info(f"[worker-{worker_id}] FLOW+SCORER MERGED: "
+                                 f"{ticker} {bias} — flow from {_pending.get('detected_at','?')} "
+                                 f"merged into trade card")
+                except Exception as _fsc_err:
+                    log.debug(f"Flow+scorer merge failed for {ticker}: {_fsc_err}")
 
             except Exception as _sc_err:
                 # v8.3.1 Fix #7: Surface scorer exceptions clearly + write audit row.
@@ -5596,6 +5798,20 @@ def _run_v4_prefilter(ticker: str, spot: float, chains: list, candle_closes: lis
 
                 for cp in _flow_detector.detect_conviction_plays(flow_alerts, dte=max(dte, 0)):
                     try:
+                        # v8.3.2 Fix A: Flow+scorer dedup gate.
+                        _fa_tkr = cp.get("ticker", "").upper()
+                        _fa_dir = "bull" if cp.get("trade_direction") == "bullish" else "bear"
+                        _fa_action, _fa_reason = _should_suppress_flow_post(_fa_tkr, _fa_dir)
+                        if _fa_action:
+                            if _fa_reason == "stash_pending":
+                                _stash_pending_flow(_fa_tkr, _fa_dir, cp)
+                                log.info(f"\U0001f48e FLOW STASHED: {_fa_tkr} {_fa_dir} — "
+                                         f"waiting for scorer POST to enrich card")
+                            else:
+                                log.debug(f"\U0001f48e FLOW SUPPRESSED: {_fa_tkr} {_fa_dir} — {_fa_reason}")
+                            continue
+                        _fa_standalone_confirm = (_fa_reason == "standalone_confirm")
+
                         route = cp.get("route", "immediate")
 
                         # Earnings gate: check if earnings fall within expiry window
@@ -5627,6 +5843,10 @@ def _run_v4_prefilter(ticker: str, spot: float, chains: list, candle_closes: lis
                             pass
 
                         msg = _flow_detector.format_conviction_play(cp)
+                        if _fa_standalone_confirm:
+                            # v8.3.2 Fix A: Scorer already posted today. Compact confirm card.
+                            msg = _build_flow_confirms_card(cp)
+                            _mark_flow_confirmed(_fa_tkr, _fa_dir, path="standalone_confirm")
 
                         # v7.2: Silent Thesis Layer — informational enrichment (no gating)
                         try:
@@ -7120,8 +7340,28 @@ def _get_0dte_iv(ticker: str, target_date_str: str = None) -> tuple:
                 flow_alerts = _flow_detector.check_intraday_flow(ticker, target, data, spot)
                 for cp in _flow_detector.detect_conviction_plays(flow_alerts, dte=max(dte, 0)):
                     try:
+                        # v8.3.2 Fix A: Flow+scorer dedup gate.
+                        _fa_tkr = cp.get("ticker", "").upper()
+                        _fa_dir = "bull" if cp.get("trade_direction") == "bullish" else "bear"
+                        _fa_action, _fa_reason = _should_suppress_flow_post(_fa_tkr, _fa_dir)
+                        if _fa_action:
+                            if _fa_reason == "stash_pending":
+                                _stash_pending_flow(_fa_tkr, _fa_dir, cp)
+                                log.info(f"💎 FLOW STASHED: {_fa_tkr} {_fa_dir} — "
+                                         f"waiting for scorer POST to enrich card")
+                            else:
+                                log.debug(f"💎 FLOW SUPPRESSED: {_fa_tkr} {_fa_dir} — {_fa_reason}")
+                            continue
+                        _fa_standalone_confirm = (_fa_reason == "standalone_confirm")
+
                         route = cp.get("route", "immediate")
                         msg = _flow_detector.format_conviction_play(cp)
+                        if _fa_standalone_confirm:
+                            # v8.3.2 Fix A: Scorer already posted trade card today for
+                            # this ticker/direction. Convert the full conviction play
+                            # card into a compact FLOW CONFIRMS card — one-time only.
+                            msg = _build_flow_confirms_card(cp)
+                            _mark_flow_confirmed(_fa_tkr, _fa_dir, path="standalone_confirm")
                         # v7.2: Silent Thesis Layer — informational enrichment (no gating)
                         try:
                             _thesis_block = _get_thesis_enrichment(cp["ticker"], cp.get("trade_direction", ""))
@@ -7342,8 +7582,28 @@ def _get_chain_iv_for_expiry(ticker: str, target_date_str: str, dte: float) -> t
                 flow_alerts = _flow_detector.check_intraday_flow(ticker, target, data, spot)
                 for cp in _flow_detector.detect_conviction_plays(flow_alerts, dte=max(dte, 0)):
                     try:
+                        # v8.3.2 Fix A: Flow+scorer dedup gate.
+                        _fa_tkr = cp.get("ticker", "").upper()
+                        _fa_dir = "bull" if cp.get("trade_direction") == "bullish" else "bear"
+                        _fa_action, _fa_reason = _should_suppress_flow_post(_fa_tkr, _fa_dir)
+                        if _fa_action:
+                            if _fa_reason == "stash_pending":
+                                _stash_pending_flow(_fa_tkr, _fa_dir, cp)
+                                log.info(f"💎 FLOW STASHED: {_fa_tkr} {_fa_dir} — "
+                                         f"waiting for scorer POST to enrich card")
+                            else:
+                                log.debug(f"💎 FLOW SUPPRESSED: {_fa_tkr} {_fa_dir} — {_fa_reason}")
+                            continue
+                        _fa_standalone_confirm = (_fa_reason == "standalone_confirm")
+
                         route = cp.get("route", "immediate")
                         msg = _flow_detector.format_conviction_play(cp)
+                        if _fa_standalone_confirm:
+                            # v8.3.2 Fix A: Scorer already posted trade card today for
+                            # this ticker/direction. Convert the full conviction play
+                            # card into a compact FLOW CONFIRMS card — one-time only.
+                            msg = _build_flow_confirms_card(cp)
+                            _mark_flow_confirmed(_fa_tkr, _fa_dir, path="standalone_confirm")
                         # v7.2: Silent Thesis Layer — informational enrichment (no gating)
                         try:
                             _thesis_block = _get_thesis_enrichment(cp["ticker"], cp.get("trade_direction", ""))
@@ -11178,7 +11438,25 @@ def _initialize_app():
                         # Only post to Telegram if conviction pipeline promotes it to a trade
                         plays = _flow_detector.detect_conviction_plays([alert])
                         for cp in plays:
+                            # v8.3.2 Fix A: Flow+scorer dedup gate (sweep path).
+                            _fa_tkr = cp.get("ticker", "").upper()
+                            _fa_dir = "bull" if cp.get("trade_direction") == "bullish" else "bear"
+                            _fa_action, _fa_reason = _should_suppress_flow_post(_fa_tkr, _fa_dir)
+                            if _fa_action:
+                                if _fa_reason == "stash_pending":
+                                    _stash_pending_flow(_fa_tkr, _fa_dir, cp)
+                                    log.info(f"\U0001f48e FLOW STASHED (sweep): {_fa_tkr} {_fa_dir} — "
+                                             f"waiting for scorer POST to enrich card")
+                                else:
+                                    log.debug(f"\U0001f48e FLOW SUPPRESSED (sweep): {_fa_tkr} {_fa_dir} — {_fa_reason}")
+                                continue
+                            _fa_standalone_confirm = (_fa_reason == "standalone_confirm")
+
                             cp_msg = _flow_detector.format_conviction_play(cp)
+                            if _fa_standalone_confirm:
+                                # v8.3.2 Fix A: Scorer already posted today. Compact confirm card.
+                                cp_msg = _build_flow_confirms_card(cp)
+                                _mark_flow_confirmed(_fa_tkr, _fa_dir, path="standalone_confirm_sweep")
                             # v7.2: Silent Thesis Layer — informational enrichment (no gating)
                             try:
                                 _thesis_block = _get_thesis_enrichment(cp["ticker"], cp.get("trade_direction", ""))
