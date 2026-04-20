@@ -173,11 +173,44 @@ def detect_boxes(bars, ticker):
                 if confirmed and break_idx:
                     if break_dir == "up": rd = max(b["h"] for b in bars[break_idx:]) - roof
                     else: rd = floor - min(b["l"] for b in bars[break_idx:])
+
+                # v8.3 Phase 2a: derive state field using same logic as
+                # backtest_v3_runner.py:487-505. Needed for conviction_scorer's
+                # pb_state-dependent rules (G2, B2, B13, P12, state-gated G1).
+                if still_active:
+                    _state = "in_box"
+                elif broken and confirmed:
+                    if break_dir == "up":
+                        _state = "above_roof"
+                    elif break_dir == "down":
+                        _state = "below_floor"
+                    else:
+                        _state = "post_box"
+                else:
+                    # Box ended without confirmed break — treat as post_box
+                    # (backtest's "bars_since_end <= 5 → still in_box" rule
+                    #  applies to bt runner which has a signal timestamp; here
+                    #  we're building per-box records so post_box is correct)
+                    _state = "post_box"
+
+                # v8.3 Phase 2a: derive wave_dir_original using same logic as
+                # bt_resolution_study_v3.py:1115-1120. rt > ft and rt >= 3 → bullish,
+                # ft > rt and ft >= 3 → bearish, else none. Needed for B3 rule.
+                if rt > ft and rt >= 3:
+                    _wave_dir_original = "bullish"
+                elif ft > rt and ft >= 3:
+                    _wave_dir_original = "bearish"
+                else:
+                    _wave_dir_original = "none"
+
                 boxes.append({
                     "ticker": ticker.upper(), "roof": round(roof, 2), "floor": round(floor, 2),
                     "midpoint": round(midpoint, 2), "range_pct": round(rp, 2),
                     "duration_bars": box_bars, "roof_touches": rt, "floor_touches": ft,
                     "wave_label": wl, "max_touches": mt,
+                    # v8.3 Phase 2a: new fields for scorer field alignment
+                    "state": _state,
+                    "wave_dir_original": _wave_dir_original,
                     "start_idx": box_start, "end_idx": box_end,
                     "start_date": str(bars[box_start].get("date", ""))[:10],
                     "end_date": str(bars[box_end].get("date", ""))[:10],
