@@ -1,24 +1,6 @@
 # app.py
 # NOTE: Educational/demo code. Not financial advice. Use at your own risk.
 #
-# v8.2 (2026-04-17) — FEATURE RELEASE
-#   Fixes (all 11 from FIX_BUNDLE_v7_3.md, deploy order):
-#     Patch 1  — schwab_stream.py     OCC letter bug (accept C/P and call/put)
-#     Patch 2  — thesis_monitor.py    _HIGH_RES_TICKERS via self.engine
-#     Patch 3  — thesis_monitor.py    Conviction OCC failure: debug → warn
-#     Patch 4  — schwab_adapter.py    Rate limiter wiring (rate_limiter.py)
-#     Patch 5  — schwab_adapter.py    Expected 400/404s demoted to DEBUG
-#     Patch 6  — app.py               Silent EM prediction log: surface fails at WARN
-#     Patch 7  — app.py               Silent thesis outer catch: debug → warn
-#     Patch 8  — app.py               Silent thesis wrapper counts + lists failures
-#     Patch 9  — app.py               Silent EM fallback to nearest listed expiry
-#     Patch 10 — app.py               Wire /confidence Telegram gate (post suppression)
-#     Patch 11 — app.py               BOT_STARTUP_QUIET env + post_to_telegram gate
-#   New modules:
-#     rate_limiter.py                 Global Schwab token bucket (110/min default)
-#     dashboard.py                    Phase-1 observability + Position PnL tracking
-#   See FIX_BUNDLE_v7_3.md and v8_2_HANDOFF.md for per-patch rationale.
-#
 # v4.2 UPGRADE (2026-03-17):
 #   - CHECK_TICKER_TIMEOUT_SEC imported from trading_rules (45s, was hardcoded 75s)
 #   - PREFETCH_WORKER_WAIT_SEC used consistently (was hardcoded 60s in one path)
@@ -281,16 +263,6 @@ ACCOUNT_CHAT_IDS = {
 # DATASET / DIAGNOSTICS AUT0-LOGGING
 # ─────────────────────────────────────────────────────────
 DIAGNOSTIC_CHAT_ID = os.getenv("DIAGNOSTIC_CHAT_ID", "").strip()
-
-# v7.3 (Patch 11): Startup-quiet window. During rapid deploy iteration
-# (multiple restarts within a few minutes), each boot emits Telegram
-# status messages and can hit rate-limit warnings. Set BOT_STARTUP_QUIET=1
-# to suppress sends for the first N seconds after boot (default 300s = 5m).
-# Does not affect trading logic — trade cards posted during the quiet
-# window still log/track/cache; only the Telegram send is skipped.
-BOT_STARTUP_QUIET = os.getenv("BOT_STARTUP_QUIET", "0").strip().lower() in ("1", "true", "yes", "on")
-BOT_STARTUP_QUIET_SEC = int(os.getenv("BOT_STARTUP_QUIET_SEC", "300") or 300)
-_BOT_BOOT_TS = time.time()
 AUTO_LOG_DIR = os.getenv("AUTO_LOG_DIR", "/mnt/data/bot_logs").strip() or "/mnt/data/bot_logs"
 AUTO_LOG_ENABLE = os.getenv("AUTO_LOG_ENABLE", "1").strip().lower() not in ("0", "false", "no", "off")
 AUTO_LOG_DIAGNOSTICS = os.getenv("AUTO_LOG_DIAGNOSTICS", "0").strip().lower() in ("1", "true", "yes", "on")
@@ -3246,17 +3218,9 @@ def _flush_wave_digest():
                 (tier in IMMEDIATE_POST_TIER and conf is not None and conf >= IMMEDIATE_POST_MIN_CONF)
             )
 
-            # v7.3 (Patch 10): honor the confidence-gate suppression flag set
-            # in check_ticker. Card still appears in the digest listing and
-            # stays retrievable via /tradecard TICKER — only the immediate
-            # Telegram post is skipped.
-            _suppressed = bool(r.get("_suppress_telegram_post"))
-
-            if is_immediate and not _suppressed:
+            if is_immediate:
                 immediate_cards.append(card)
                 digest_lines.append(f"  ✅ {ticker} T{tier} {dir_emoji} {conf_str} — POSTED ⬆️")
-            elif is_immediate and _suppressed:
-                digest_lines.append(f"  🔇 {ticker} T{tier} {dir_emoji} {conf_str} — gated (/tradecard {ticker})")
             else:
                 digest_lines.append(f"  📋 {ticker} T{tier} {dir_emoji} {conf_str} — /tradecard {ticker}")
         elif r.get("outcome") == "pending":
@@ -3322,6 +3286,174 @@ def _tg_rate_limited_post(text: str, max_retries: int = 6, chat_id: str = None):
             time.sleep(TG_MIN_GAP_SEC - gap)
         _tg_last_post_time = time.time()
     return post_to_telegram(text, max_retries=max_retries, chat_id=chat_id)
+
+
+# ══════════════════════════════════════════════════════════════════
+# v8.3.0 Patch 6a: Build context snapshot for conviction scorer.
+#
+# Pulls every field the Phase 2f+2g scorer needs from existing live data
+# stores. All failures fall back to safe defaults — the scorer handles
+# missing fields gracefully (rules check for empty/None and skip).
+#
+# Field alignment with the 621K backtest (per FIELD_ALIGNMENT_AUDIT.md):
+#   - cb_side only populated when pb_state == "in_box"
+#   - maturity uses classify_maturity() — same function backtest calls
+#   - diamond computed natively via diamond_detector.compute_diamond_live
+#   - SR distances via fractal_detector (byte-identical to backtest)
+#   - quintiles via quintile_store.get_quintile_bucket (Redis + fallback)
+# ══════════════════════════════════════════════════════════════════
+def _build_context_snapshot(ticker: str, bias: str, webhook_data: dict) -> dict:
+    wd = webhook_data or {}
+    ctx = {
+        "ticker": ticker,
+        "direction": str(bias).lower(),
+        "scoring_source": str(wd.get("source", "active_scanner") or "active_scanner").lower(),
+        "timeframe": (str(wd.get("timeframe", "5")) or "5").lower(),
+    }
+    if not ctx["timeframe"].endswith("m"):
+        ctx["timeframe"] = ctx["timeframe"] + "m"
+
+    tier_raw = str(wd.get("tier", "") or "").strip().upper()
+    if tier_raw and not tier_raw.startswith("T"):
+        tier_raw = "T" + tier_raw
+    ctx["tier"] = tier_raw
+
+    # ── Potter Box fields ─────────────────────────────────────────
+    pb_state = ""
+    pb_box = None
+    try:
+        if _potter_box:
+            pb_box = _potter_box.get_active_box(ticker)
+            if pb_box:
+                pb_state = str(pb_box.get("state", "") or "").lower()
+                ctx["pb_state"] = pb_state
+                ctx["wave_label"] = str(pb_box.get("wave_label", "") or "").lower()
+                ctx["wave_dir_original"] = str(pb_box.get("wave_dir_original", "") or "").lower()
+
+                try:
+                    from potter_box import classify_maturity as _classify_maturity
+                    avg_dur = _potter_box.get_avg_duration(ticker) or 15
+                    mat = _classify_maturity(pb_box, avg_dur)
+                    ctx["maturity"] = str(mat.get("maturity", "") or "")
+                except Exception as _me:
+                    log.debug(f"_build_context_snapshot maturity failed for {ticker}: {_me}")
+
+                # cb_side — ONLY compute when in_box (matches backtest semantics)
+                if pb_state == "in_box":
+                    try:
+                        spot = get_spot(ticker)
+                        mid = pb_box.get("midpoint") or pb_box.get("cb") or 0
+                        if spot and mid and spot > 0 and mid > 0:
+                            if spot > mid:
+                                ctx["cb_side"] = "above_cb"
+                            elif spot < mid:
+                                ctx["cb_side"] = "below_cb"
+                            else:
+                                ctx["cb_side"] = "at_cb"
+                    except Exception:
+                        pass
+
+                # at_edge — within 2% of floor or roof
+                try:
+                    spot = get_spot(ticker)
+                    floor = float(pb_box.get("floor", 0) or 0)
+                    roof  = float(pb_box.get("roof", 0) or 0)
+                    if spot and (floor or roof):
+                        d_roof  = abs(roof - spot) / spot if roof  > 0 else 999.0
+                        d_floor = abs(spot - floor) / spot if floor > 0 else 999.0
+                        ctx["at_edge"] = min(d_roof, d_floor) < 0.02
+                except Exception:
+                    pass
+    except Exception as _pbe:
+        log.debug(f"_build_context_snapshot Potter Box fetch failed for {ticker}: {_pbe}")
+
+    if "pb_state" not in ctx:
+        ctx["pb_state"] = "no_box"
+
+    # ── SR proximity (fractal_detector) ──────────────────────────
+    try:
+        from fractal_detector import get_sr_distances_live
+        spot_for_sr = None
+        try:
+            spot_for_sr = get_spot(ticker)
+        except Exception:
+            pass
+        if spot_for_sr and spot_for_sr > 0:
+            sr = get_sr_distances_live(ticker, spot_for_sr)
+            ctx["fractal_resistance_above_spot_pct"] = float(sr.get("fractal_dist_above_pct", 999.0))
+            ctx["fractal_support_below_spot_pct"]   = float(sr.get("fractal_dist_below_pct", 999.0))
+            ctx["pivot_resistance_above_spot_pct"]  = float(sr.get("pivot_dist_above_pct", 999.0))
+            ctx["pivot_support_below_spot_pct"]     = float(sr.get("pivot_dist_below_pct", 999.0))
+    except Exception as _sr_err:
+        log.debug(f"_build_context_snapshot SR fetch failed for {ticker}: {_sr_err}")
+
+    for _sr_field in ("fractal_resistance_above_spot_pct",
+                      "fractal_support_below_spot_pct",
+                      "pivot_resistance_above_spot_pct",
+                      "pivot_support_below_spot_pct"):
+        if _sr_field not in ctx:
+            ctx[_sr_field] = 999.0
+
+    # ── Indicator quintiles (quintile_store) ─────────────────────
+    try:
+        from quintile_store import get_quintile_bucket
+        for _q_name, _wd_key in (
+            ("ema_diff_quintile",  "ema_dist_pct"),
+            ("macd_hist_quintile", "macd_hist"),
+            ("rsi_quintile",       "rsi_mfi"),
+            ("wt2_quintile",       "wt2"),
+            ("adx_quintile",       "adx"),
+        ):
+            _raw = wd.get(_wd_key)
+            if _raw is None or _raw == "":
+                ctx[_q_name] = "unknown"
+                continue
+            try:
+                _val = float(_raw)
+            except (TypeError, ValueError):
+                ctx[_q_name] = "unknown"
+                continue
+            _bucket = get_quintile_bucket(
+                indicator=_wd_key if _wd_key != "ema_dist_pct" else "ema_diff_pct",
+                value=_val,
+                scoring_source=ctx["scoring_source"],
+                timeframe=ctx["timeframe"],
+                tier=ctx["tier"] or "T2",
+                direction=ctx["direction"],
+            )
+            ctx[_q_name] = _bucket
+    except Exception as _qe:
+        log.debug(f"_build_context_snapshot quintile lookup failed for {ticker}: {_qe}")
+        for _q_name in ("ema_diff_quintile", "macd_hist_quintile",
+                        "rsi_quintile", "wt2_quintile", "adx_quintile"):
+            if _q_name not in ctx:
+                ctx[_q_name] = "unknown"
+
+    # ── Diamond (diamond_detector) ───────────────────────────────
+    try:
+        from diamond_detector import compute_diamond_live
+        ema_val = wd.get("ema_dist_pct")
+        macd_val = wd.get("macd_hist")
+        if ema_val is not None and macd_val is not None:
+            try:
+                ctx["diamond"] = compute_diamond_live(
+                    ema_diff_value=float(ema_val),
+                    macd_hist_value=float(macd_val),
+                    scoring_source=ctx["scoring_source"],
+                    timeframe=ctx["timeframe"],
+                    tier=ctx["tier"] or "T2",
+                    direction=ctx["direction"],
+                )
+            except (TypeError, ValueError):
+                ctx["diamond"] = False
+        else:
+            ctx["diamond"] = False
+    except Exception as _de:
+        log.debug(f"_build_context_snapshot diamond compute failed for {ticker}: {_de}")
+        ctx["diamond"] = False
+
+    ctx["recent_flow"] = None
+    return ctx
 
 
 def _enqueue_signal(job_type: str, ticker: str, bias: str,
@@ -3569,6 +3701,85 @@ def _process_job(worker_id: int, job: dict):
             base["reason"] = f"{bias} not in allowed directions"
             _record_wave_result(base)
             return
+
+        # ── v8.3: CONVICTION SCORER ─────────────────────────────────
+        # Phase 4 validated: +8.75 WR lift on 572K trades when score >= 70.
+        # Runs early, before chain fetches, to save API calls on LOG_ONLY/DISCARD.
+        # Env-gated: CONVICTION_SCORER_ENABLED=false to disable (fail-open rollback).
+        _scorer_decision = None  # "post" | "log_only" | "discard" | None (unavailable)
+        if os.getenv("CONVICTION_SCORER_ENABLED", "true").strip().lower() == "true":
+            try:
+                from conviction_scorer import score_signal as _score_signal
+                _sc_event = {
+                    "job_type": job_type, "ticker": ticker, "bias": bias,
+                    "webhook_data": webhook_data or {},
+                    "signal_msg": job.get("signal_msg", ""),
+                }
+                _sc_ctx = _build_context_snapshot(ticker, bias, webhook_data or {})
+                _sc_result = _score_signal(_sc_event, _sc_ctx)
+                _scorer_decision = str(getattr(_sc_result, "decision", "") or "").lower()
+                _sc_score = int(getattr(_sc_result, "score", 0) or 0)
+                _sc_gate = str(getattr(_sc_result, "hard_gate_triggered", "") or "")
+
+                log.info(f"[worker-{worker_id}] SCORER: {ticker} {bias} "
+                         f"score={_sc_score} decision={_scorer_decision}"
+                         + (f" gate={_sc_gate}" if _sc_gate else ""))
+
+                # Persist audit row for post-deploy monitoring
+                try:
+                    _append_csv_row("signal_decisions.csv",
+                                    ["timestamp_utc", "ticker", "bias", "tier",
+                                     "source", "timeframe",
+                                     "score", "decision", "hard_gate",
+                                     "diamond", "pb_state", "cb_side", "maturity",
+                                     "at_edge", "wave_label",
+                                     "ema_dist_pct", "macd_hist", "rsi_mfi", "wt2", "adx"],
+                                    {
+                                        "timestamp_utc": time.time(),
+                                        "ticker": ticker, "bias": bias,
+                                        "tier": _sc_ctx.get("tier", ""),
+                                        "source": _sc_ctx.get("scoring_source", ""),
+                                        "timeframe": _sc_ctx.get("timeframe", ""),
+                                        "score": _sc_score,
+                                        "decision": _scorer_decision,
+                                        "hard_gate": _sc_gate,
+                                        "diamond": _sc_ctx.get("diamond", False),
+                                        "pb_state": _sc_ctx.get("pb_state", ""),
+                                        "cb_side": _sc_ctx.get("cb_side", ""),
+                                        "maturity": _sc_ctx.get("maturity", ""),
+                                        "at_edge": _sc_ctx.get("at_edge", False),
+                                        "wave_label": _sc_ctx.get("wave_label", ""),
+                                        "ema_dist_pct": (webhook_data or {}).get("ema_dist_pct"),
+                                        "macd_hist":    (webhook_data or {}).get("macd_hist"),
+                                        "rsi_mfi":      (webhook_data or {}).get("rsi_mfi"),
+                                        "wt2":          (webhook_data or {}).get("wt2"),
+                                        "adx":          (webhook_data or {}).get("adx"),
+                                    })
+                except Exception as _sl_err:
+                    log.debug(f"signal_decisions log failed: {_sl_err}")
+
+                # DISCARD: hard gate fired (e.g., G1 CB-misalignment). Drop silently.
+                if _scorer_decision == "discard":
+                    base["reason"] = f"scorer discard: {_sc_gate or 'hard_gate'}"
+                    base["outcome"] = "scorer_discarded"
+                    _record_wave_result(base)
+                    return
+
+                # LOG_ONLY: recorded above. Skip Telegram post and any chain fetch work.
+                if _scorer_decision == "log_only":
+                    base["reason"] = f"scorer log_only (score={_sc_score})"
+                    base["outcome"] = "scorer_log_only"
+                    base["confidence"] = _sc_score
+                    _record_wave_result(base)
+                    return
+
+                # POST: fall through to existing v7 filter → chain fetch → Telegram post.
+                # Attach score to base so downstream logging sees it.
+                base["confidence"] = _sc_score
+
+            except Exception as _sc_err:
+                # Fail-open: scorer exception → proceed with existing flow
+                log.warning(f"[worker-{worker_id}] Scorer error for {ticker}, proceeding: {_sc_err}")
 
         # ── v7: Backtest filter gate ──────────────────────────────
         # Check if this signal should be blocked by v7 rules BEFORE
@@ -3825,10 +4036,6 @@ def _process_job(worker_id: int, job: dict):
         card_text = rec.get("card")
         base["outcome"] = "trade"
         base["card"]    = card_text
-        # v7.3 (Patch 10): forward suppression flag into the wave result so
-        # _flush_wave_digest can skip the Telegram post without skipping
-        # caching, digest line, or /tradecard retrieval.
-        base["_suppress_telegram_post"] = bool(rec.get("_suppress_telegram_post"))
         _record_wave_result(base)
         log.info(f"TV winner queued for digest: {ticker} {bias} T{tier_label} conf={rec.get('confidence')}/100")
 
@@ -4126,20 +4333,6 @@ def check_ticker_with_timeout(ticker, direction="bull", webhook_data=None, timeo
 # ─────────────────────────────────────────────────────────
 
 def post_to_telegram(text: str, max_retries: int = 4, chat_id: str = None):
-    # v7.3 (Patch 11): startup-quiet suppression — prevents rate-limit spam
-    # during rapid-deploy iteration. Trading logic is unaffected; cards are
-    # still built/logged/tracked, they just don't hit Telegram during the
-    # quiet window. Unset BOT_STARTUP_QUIET (or wait out the window) for
-    # normal posting to resume.
-    if BOT_STARTUP_QUIET:
-        _since_boot = time.time() - _BOT_BOOT_TS
-        if _since_boot < BOT_STARTUP_QUIET_SEC:
-            preview = text[:60].replace("\n", " ")
-            log.info(
-                f"Telegram SUPPRESSED (startup-quiet, "
-                f"{int(BOT_STARTUP_QUIET_SEC - _since_boot)}s remain): {preview}..."
-            )
-            return 200, "suppressed during startup-quiet window"
     cid = chat_id or TELEGRAM_CHAT_ID
     if not TELEGRAM_BOT_TOKEN or not cid:
         log.error("post_to_telegram: TELEGRAM_BOT_TOKEN or CHAT_ID not set")
@@ -6153,23 +6346,6 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
 
         conf = best_rec.get("confidence", 0)
         log.info(f"Trade card built: {ticker} {direction} conf={conf}/100")
-
-        # v7.3 (Patch 10): Telegram post gate. Check user's /confidence
-        # threshold — if the trade's confidence is below, mark the card
-        # for suppression at the post site (wave digest). Build, log,
-        # cache, journal, track, and register position as normal — only
-        # the Telegram send gets suppressed. The card is still retrievable
-        # via /tradecard TICKER.
-        try:
-            _tg_gate = get_confidence_gate()
-            if int(conf or 0) < int(_tg_gate or 0):
-                best_rec["_suppress_telegram_post"] = True
-                log.info(
-                    f"Trade card posted suppressed: {ticker} conf={conf} "
-                    f"< telegram gate {_tg_gate} (logged/tracked but not sent)"
-                )
-        except Exception as _gate_e:
-            log.warning(f"Confidence gate check failed (not suppressing): {_gate_e}")
         mark_trade_sent(ticker, direction, trade.get("short"), trade.get("long"))
         trade_journal.log_signal(ticker, webhook_data,
             outcome="trade_opened" if risk_result["allowed"] else "risk_blocked",
@@ -6250,9 +6426,6 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
             "confidence": best_rec.get("confidence"), "trade": trade,
             "expirations_checked": len(chains),
             "signal_validation": signal_validation,
-            # v7.3 (Patch 10): forward the suppression flag to the wave-digest
-            # poster, which is the actual Telegram post site for trade cards.
-            "_suppress_telegram_post": bool(best_rec.get("_suppress_telegram_post")),
         }
     except Exception as e:
         log.error(f"check_ticker({ticker}): {type(e).__name__}: {e}")
@@ -8562,40 +8735,8 @@ def _generate_silent_thesis(ticker: str):
         vix = result_tuple[7]
         v4_result = result_tuple[8] if len(result_tuple) > 8 else {}
 
-        # v7.3 fix (Patch 9): many flow tickers (AMD, ARM, COIN, ORCL, MRNA,
-        # PLTR, SMCI, XLE/XLF/XLV, etc.) don't have 0DTE/daily options —
-        # asking MarketData for today's expiry will 404. Fall back to the
-        # nearest listed future expiry (typically Friday weekly).
         if iv is None or spot is None:
-            try:
-                exps = get_expirations(ticker) or []
-                from datetime import date as _date, datetime as _dt
-                today_d = _date.fromisoformat(today_str) if today_str else _date.today()
-                nearest = None
-                for exp_str in sorted(exps):
-                    try:
-                        exp_d = _dt.strptime(exp_str, "%Y-%m-%d").date()
-                        if exp_d > today_d:  # strictly future (today already failed)
-                            nearest = exp_str
-                            break
-                    except Exception:
-                        continue
-                if nearest:
-                    result_tuple = _get_0dte_iv(ticker, nearest)
-                    iv, spot, expiration = result_tuple[0], result_tuple[1], result_tuple[2]
-                    eng = result_tuple[3]
-                    walls = result_tuple[4]
-                    skew = result_tuple[5]
-                    pcr = result_tuple[6]
-                    vix = result_tuple[7]
-                    v4_result = result_tuple[8] if len(result_tuple) > 8 else {}
-                    if iv is not None and spot is not None:
-                        log.info(f"Silent thesis using fallback expiry {nearest} for {ticker} (no 0DTE chain)")
-            except Exception as _fb_e:
-                log.debug(f"Silent thesis fallback-expiry lookup failed for {ticker}: {_fb_e}")
-
-        if iv is None or spot is None:
-            log.warning(f"Silent thesis skipped for {ticker}: IV unavailable even with fallback expiry")
+            log.debug(f"Silent thesis skipped for {ticker}: IV unavailable")
             return False
 
         em = _calc_intraday_em(spot, iv, hours_for_em)
@@ -8659,11 +8800,8 @@ def _generate_silent_thesis(ticker: str):
         try:
             _log_em_prediction(ticker, "silent", spot, em, bias, v4_result,
                                walls=walls, eng=eng, cagf=cagf, vol_regime=vol_regime)
-        except Exception as e:
-            # v7.3 fix (Patch 6): previously swallowed silently. Surface the
-            # failure so we can see which tickers are failing sheet writes
-            # without aborting the in-memory thesis store.
-            log.warning(f"Silent EM prediction log failed for {ticker}: {e}")
+        except Exception:
+            pass
 
         log.info(f"Silent thesis stored: {ticker} | bias={bias.get('direction','?')} "
                  f"score={bias.get('score',0):+d}/14 | gex={_thesis.gex_sign} | "
@@ -8671,9 +8809,7 @@ def _generate_silent_thesis(ticker: str):
         return True
 
     except Exception as e:
-        # v7.3 fix (Patch 7): was log.debug, hiding the 22-of-35 silent-EM
-        # failures. WARN surfaces them so we can see which tickers die and why.
-        log.warning(f"Silent thesis generation failed for {ticker}: {e}")
+        log.debug(f"Silent thesis generation failed for {ticker}: {e}")
         return False
 
 
@@ -8686,10 +8822,6 @@ def _generate_all_silent_theses():
     from oi_flow import FLOW_TICKERS
     count = 0
     skipped = 0
-    # v7.3 (Patch 8): track failures and which tickers failed, so the summary
-    # line shows the gap by name instead of hiding it.
-    failed = 0
-    failed_tickers = []
     for ticker in FLOW_TICKERS:
         # Skip tickers that already have a thesis from the full EM card
         existing = get_thesis_engine().get_thesis(ticker)
@@ -8699,22 +8831,10 @@ def _generate_all_silent_theses():
         try:
             if _generate_silent_thesis(ticker):
                 count += 1
-            else:
-                failed += 1
-                failed_tickers.append(ticker)
             time.sleep(1.5)  # rate limit: ~23 tickers/min
-        except Exception as e:
-            failed += 1
-            failed_tickers.append(ticker)
-            log.warning(f"Silent thesis wrapper error for {ticker}: {e}")
-    msg = (
-        f"Silent thesis generation complete: {count} generated, "
-        f"{skipped} already had EM cards, {failed} failed"
-    )
-    if failed_tickers:
-        # Truncate so a complete-failure day doesn't produce a 4KB log line
-        msg += f" ({', '.join(failed_tickers[:10])}{'...' if len(failed_tickers) > 10 else ''})"
-    log.info(msg)
+        except Exception:
+            pass
+    log.info(f"Silent thesis generation complete: {count} generated, {skipped} already had EM cards")
 
 
 # ─────────────────────────────────────────────────────────────────────
