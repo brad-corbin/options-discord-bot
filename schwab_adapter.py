@@ -520,7 +520,10 @@ class SchwabDataProvider:
             start = end - timedelta(days=days + 10)
             raw = self._schwab_get(
                 "get_price_history", ticker.upper(),
-                period_type=Client.PriceHistory.PeriodType.MONTH,
+                # v8.4.1 (hotfix): YEAR not MONTH — MONTH caps at ~22 daily bars
+                # which breaks market_regime's 55-bar MA50 requirement and defaults
+                # the regime to BEAR on every restart when Schwab's primary is up.
+                period_type=Client.PriceHistory.PeriodType.YEAR,
                 frequency_type=Client.PriceHistory.FrequencyType.DAILY,
                 frequency=Client.PriceHistory.Frequency.EVERY_MINUTE,  # ignored for daily
                 start_datetime=start,
