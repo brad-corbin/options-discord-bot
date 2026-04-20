@@ -3929,6 +3929,26 @@ class ThesisMonitorDaemon:
             fast = ticker.upper() in MONITOR_FAST_POLL_TICKERS
             if not fast and not slow: continue
             thesis = self.engine.get_thesis(ticker)
+
+            # v8.3.2 Fix (post-review): For non-SPY/QQQ tickers, only evaluate
+            # when an active trade exists. This preserves exit logic for any
+            # open position on any ticker while eliminating thesis-phase/level
+            # alert noise from the other 33 tickers.
+            #
+            # Prior behavior (pre-fix): every cycle, every ticker in the watchlist
+            # evaluated and posted priority≥4 alerts → Alpha SPY Omega flood.
+            # First revert (MONITOR_FAST_POLL_TICKERS=["SPY","QQQ"]) only changed
+            # poll rate, not the post-gate — cooldown cap (5min) still let 35×
+            # tickers fire 7 alerts/min in an active session.
+            # This fix: non-SPY/QQQ tickers skip entirely unless they have trades.
+            if not fast:
+                state = self.engine.get_state(ticker)
+                _has_active = (state and any(
+                    t.status in ("OPEN", "SCALED", "TRAILED")
+                    for t in state.active_trades))
+                if not _has_active:
+                    continue
+
             # Issue 1: Don't skip tickers without thesis if they have active trades
             # (conviction trades create state but may not have thesis)
             if not thesis:
