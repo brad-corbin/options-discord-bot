@@ -3216,13 +3216,22 @@ def _flush_wave_digest():
             store_set(cache_key, card, ttl=DIGEST_CARD_CACHE_TTL_SEC)
 
         if won and card:
-            # v8.4.4 (Patch 2B): scorer is the authoritative gate — any signal
-            # that reached `won=True` already passed CONVICTION_POST_THRESHOLD
-            # (default 70). Don't double-filter on tier+conf here; post the
-            # full card. The old is_immediate check suppressed Tier 2 cards
-            # and any Tier 1 under 75, hiding them behind /tradecard.
-            immediate_cards.append(card)
-            digest_lines.append(f"  ✅ {ticker} T{tier} {dir_emoji} {conf_str} — POSTED ⬆️")
+            # v8.4.6 (Patch 2B-refined): ONLY the scorer-path (job_type="tv")
+            # gets auto-posted full cards. The v8.3 conviction scorer + Phase 1
+            # backtest (572K trades, +8.75 WR lift at score≥70) only validated
+            # the active-scanner/scorer pipeline. Swing scanner uses a different
+            # ticker universe (106 tickers vs 35) and a separate v7 backtest
+            # that is NOT part of the v8.3/v8.4 edge — keep swing on the
+            # digest-one-liner treatment (the original pre-2B behavior).
+            # v8.4.4 (Patch 2B) originally auto-posted both; that was too broad.
+            if job_type == "swing":
+                # Original pre-2B behavior: digest-only (user must /tradecard).
+                # Keeps backtest-unvalidated swing signals from spamming main.
+                digest_lines.append(f"  📋 {ticker} T{tier} {dir_emoji} {conf_str} — /tradecard {ticker}")
+            else:
+                # Scorer/tv path — backtest-validated at score ≥70. Auto-post.
+                immediate_cards.append(card)
+                digest_lines.append(f"  ✅ {ticker} T{tier} {dir_emoji} {conf_str} — POSTED ⬆️")
         elif r.get("outcome") == "pending":
             reason = r.get("reason", "waiting on recheck")[:50]
             pending_lines.append(f"  ⏳ {ticker} T{tier} {dir_emoji} {conf_str} — {reason}")
@@ -7061,27 +7070,35 @@ def _post_v84_credit_from_scorer(ticker: str, bias: str, webhook_data: dict,
 
         # 3) Fetch the option chain for the chosen expiry (needed for strike
         # alignment + live credit price). Failure here is non-fatal —
-        # credit_card_builder will fall back to the 33%-of-width estimate.
+        # credit_card_builder will fall back to its estimate.
+        #
+        # v8.4.6 (Patch 2D): prior version called _get_0dte_chain + a broken
+        # dict-iteration normalizer, which left the chain None on every
+        # non-0DTE expiry → every card printed with the 33% fallback estimate.
+        # Observed live: XLV bear_call showed $0.83 credit ($2.50 width × 33%)
+        # but actual fill was $0.33 (real mid ~13% of width for tight-cushion
+        # OTM low-vol sector ETFs). The fallback is structurally too optimistic.
+        # Now uses the proper _get_chain_for_expiry + _chain_rows_from_response
+        # pair so the card prints the true live bid/ask mid.
         _chains_arg = None
         try:
-            _chain_raw = _get_0dte_chain(ticker, _chosen_exp) if 'get_options_chain' not in dir() else None
-            if _chain_raw:
-                # _get_0dte_chain returns (chain_data, spot, exp) — normalize to list-of-tuples
-                _cd, _cs, _ce = _chain_raw
-                if _cd and _ce:
-                    # Synthesize the (exp, dte, contracts) tuple format check_ticker uses
-                    _contracts = []
-                    for _strike, _sides in (_cd or {}).items():
-                        for _side_key, _payload in (_sides or {}).items():
-                            _contracts.append({
-                                "strike": float(_strike),
-                                "side": _side_key,
-                                "bid": float(_payload.get("bid", 0) or 0),
-                                "ask": float(_payload.get("ask", 0) or 0),
-                            })
-                    _chains_arg = [(_ce, _chosen_dte, _contracts)]
+            _raw, _cs, _ce = _get_chain_for_expiry(ticker, _chosen_exp)
+            if _raw and _ce:
+                _rows = _chain_rows_from_response(_raw)
+                if _rows:
+                    # _post_v84_credit_card expects list-of-(exp, dte, contracts)
+                    # and contracts are row-dicts already — exactly what rows is.
+                    _chains_arg = [(_ce, _chosen_dte, _rows)]
+                    log.info(f"v8.4 scorer-path chain fetched: {ticker} {_chosen_exp} "
+                             f"({len(_rows)} contracts)")
+                else:
+                    log.warning(f"v8.4 scorer-path: chain for {ticker} {_chosen_exp} "
+                                f"returned no rows — card will use estimate fallback")
+            else:
+                log.warning(f"v8.4 scorer-path: chain fetch returned empty for "
+                            f"{ticker} {_chosen_exp} — card will use estimate fallback")
         except Exception as _chain_err:
-            log.debug(f"v8.4 scorer-path: chain fetch failed for {ticker}: {_chain_err}")
+            log.warning(f"v8.4 scorer-path: chain fetch failed for {ticker}: {_chain_err}")
 
         # 4) Delegate to the existing helper. regime_trend from webhook_data
         # is already populated by the scorer path (market_regime field).
