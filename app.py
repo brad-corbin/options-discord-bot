@@ -376,6 +376,8 @@ def _tab_for_filename(filename: str) -> str:
         "crisis_put_signals.csv": GOOGLE_SHEET_CRISIS_TAB,
         "shadow_signals.csv": GOOGLE_SHEET_SHADOW_TAB,
         "conviction_plays.csv": GOOGLE_SHEET_CONVICTION_TAB,
+        # v8.3.1: scorer audit writes to its own tab, distinct from v6 regime log
+        "scorer_decisions.csv": os.getenv("GOOGLE_SHEET_SCORER_TAB", "scorer_decisions"),
         # v7 position tracking tabs — name IS the tab
         "position_tracking_active": "position_tracking_active",
         "position_tracking_swing": "position_tracking_swing",
@@ -3289,6 +3291,87 @@ def _tg_rate_limited_post(text: str, max_retries: int = 6, chat_id: str = None):
 
 
 # ══════════════════════════════════════════════════════════════════
+# v8.3.1 Fix #4: Plain-English reason builder for conviction card lines.
+#
+# Maps scorer breakdown rule codes (B1..B13, P1..P15, G1..G3) + their
+# weights to short human-readable sentences. Called from _process_job
+# after scorer returns; output attached to webhook_data["conviction_reasons"]
+# and rendered by options_engine_v3.format_trade_card.
+#
+# Only rules that actually contributed (non-zero weight) get a reason.
+# ══════════════════════════════════════════════════════════════════
+_CONVICTION_RULE_LABELS = {
+    # Boosts (positive score)
+    "B1":  "Potter Box breakout imminent",
+    "B2":  "Bull above box roof (trend continuation)",
+    "B3":  "Wave direction aligned with bias",
+    "B4":  "Diamond setup active (ema+macd mid-quintiles)",
+    "B5":  "At box edge on Tier-2 ticker",
+    "B6":  "Bear signal on late-maturity box",
+    "B7":  "Bull near pivot resistance (breakout fuel)",
+    "B8":  "Bull blue-sky (above all resistance)",
+    "B9":  "Bear in rejection zone",
+    "B10": "Bear + RSI oversold bucket",
+    "B11": "Bear + WT2 oversold bucket",
+    "B12": "Flow confirms direction",
+    "B13": "Post-box bull active trend",
+    # Penalties (negative score)
+    "P1":  "Bear near known support",
+    "P2_P3": "Established move (late entry risk)",
+    "P4":  "XLE bear in active regime",
+    "P5":  "Bull + EMA already extended (Q5)",
+    "P6":  "Bull + MACD already extended (Q5)",
+    "P7":  "Bear + EMA already extended (Q5)",
+    "P8":  "Bear 30m + MACD Q5",
+    "P9":  "Bear + RSI overbought bucket",
+    "P10": "Bull 30m + EMA oversold (Q1)",
+    "P11": "Bull + ADX overheated (Q5)",
+    "P12": "Bull below box floor",
+    "P13": "Weak debit on difficult bear ticker",
+    "P14": "Weak marginal bull setup",
+    "P15": "Bull on late-maturity box",
+    # Hard gates (discarding)
+    "G1":  "HARD GATE: CB-side misaligned with bias",
+    "G2":  "HARD GATE: Bear with no Potter Box",
+    "G3":  "HARD GATE: Other pre-filter",
+}
+
+
+def _build_conviction_reasons(breakdown: dict, ctx: dict) -> list:
+    """Convert scorer breakdown dict → list of plain-English reason strings.
+
+    Args:
+        breakdown: dict like {"B1": 3, "B4": 2, "P5": -4, "_reason": 0, ...}
+        ctx: context snapshot (used for richer messages)
+
+    Returns:
+        List of strings, sorted by abs weight descending (biggest drivers first).
+        Empty list if breakdown is empty/invalid.
+    """
+    if not isinstance(breakdown, dict) or not breakdown:
+        return []
+
+    items = []
+    for code, weight in breakdown.items():
+        # Skip metadata-only keys (start with underscore) and zero-weight rules
+        if not code or str(code).startswith("_"):
+            continue
+        try:
+            w = int(weight)
+        except (TypeError, ValueError):
+            continue
+        if w == 0:
+            continue
+        label = _CONVICTION_RULE_LABELS.get(str(code), str(code))
+        sign = "+" if w > 0 else ""
+        items.append((abs(w), f"{sign}{w} {code}: {label}"))
+
+    # Sort biggest contributors first
+    items.sort(key=lambda t: -t[0])
+    return [s for _, s in items]
+
+
+# ══════════════════════════════════════════════════════════════════
 # v8.3.0 Patch 6a: Build context snapshot for conviction scorer.
 #
 # Pulls every field the Phase 2f+2g scorer needs from existing live data
@@ -3319,8 +3402,13 @@ def _build_context_snapshot(ticker: str, bias: str, webhook_data: dict) -> dict:
     ctx["tier"] = tier_raw
 
     # ── Potter Box fields ─────────────────────────────────────────
+    # v8.3.1 Fix #6: pb_state has THREE terminal values:
+    #   "in_box" / "above_roof" / "below_floor" / "post_box"  — box exists, state from box dict
+    #   "no_box"          — Potter Box returned None (no box for this ticker right now)
+    #   "pb_fetch_error"  — Potter Box fetch raised an exception
     pb_state = ""
     pb_box = None
+    _pb_fetch_failed = False
     try:
         if _potter_box:
             pb_box = _potter_box.get_active_box(ticker)
@@ -3365,10 +3453,11 @@ def _build_context_snapshot(ticker: str, bias: str, webhook_data: dict) -> dict:
                 except Exception:
                     pass
     except Exception as _pbe:
-        log.debug(f"_build_context_snapshot Potter Box fetch failed for {ticker}: {_pbe}")
+        _pb_fetch_failed = True
+        log.warning(f"_build_context_snapshot Potter Box fetch error for {ticker}: {_pbe}")
 
     if "pb_state" not in ctx:
-        ctx["pb_state"] = "no_box"
+        ctx["pb_state"] = "pb_fetch_error" if _pb_fetch_failed else "no_box"
 
     # ── SR proximity (fractal_detector) ──────────────────────────
     try:
@@ -3720,22 +3809,38 @@ def _process_job(worker_id: int, job: dict):
                 _scorer_decision = str(getattr(_sc_result, "decision", "") or "").lower()
                 _sc_score = int(getattr(_sc_result, "score", 0) or 0)
                 _sc_gate = str(getattr(_sc_result, "hard_gate_triggered", "") or "")
+                _sc_breakdown = getattr(_sc_result, "breakdown", {}) or {}
 
                 log.info(f"[worker-{worker_id}] SCORER: {ticker} {bias} "
                          f"score={_sc_score} decision={_scorer_decision}"
                          + (f" gate={_sc_gate}" if _sc_gate else ""))
 
-                # Persist audit row for post-deploy monitoring
+                # v8.3.1 Fix #4: Stash conviction payload onto webhook_data so
+                # check_ticker → format_trade_card can render it on the card.
+                # Plain-English reasons built from breakdown keys + weights.
+                _sc_reasons = _build_conviction_reasons(_sc_breakdown, _sc_ctx)
+                if webhook_data is None:
+                    webhook_data = {}
+                webhook_data["conviction_score"]     = _sc_score
+                webhook_data["conviction_breakdown"] = _sc_breakdown
+                webhook_data["conviction_reasons"]   = _sc_reasons
+                webhook_data["conviction_decision"]  = _scorer_decision
+
+                # v8.3.1 Fix #1+#3+#6: audit row → scorer_decisions.csv
+                # (NOT signal_decisions.csv — that's a pre-existing v6 regime log).
+                # ISO timestamp. pb_state preserves no_box vs pb_fetch_error split
+                # from _build_context_snapshot.
                 try:
-                    _append_csv_row("signal_decisions.csv",
+                    _append_csv_row("scorer_decisions.csv",
                                     ["timestamp_utc", "ticker", "bias", "tier",
                                      "source", "timeframe",
                                      "score", "decision", "hard_gate",
                                      "diamond", "pb_state", "cb_side", "maturity",
                                      "at_edge", "wave_label",
-                                     "ema_dist_pct", "macd_hist", "rsi_mfi", "wt2", "adx"],
+                                     "ema_dist_pct", "macd_hist", "rsi_mfi", "wt2", "adx",
+                                     "breakdown_json", "reasons_summary"],
                                     {
-                                        "timestamp_utc": time.time(),
+                                        "timestamp_utc": datetime.utcnow().isoformat() + "Z",
                                         "ticker": ticker, "bias": bias,
                                         "tier": _sc_ctx.get("tier", ""),
                                         "source": _sc_ctx.get("scoring_source", ""),
@@ -3754,9 +3859,11 @@ def _process_job(worker_id: int, job: dict):
                                         "rsi_mfi":      (webhook_data or {}).get("rsi_mfi"),
                                         "wt2":          (webhook_data or {}).get("wt2"),
                                         "adx":          (webhook_data or {}).get("adx"),
+                                        "breakdown_json": json.dumps(_sc_breakdown, default=str),
+                                        "reasons_summary": " | ".join(_sc_reasons[:4]),
                                     })
                 except Exception as _sl_err:
-                    log.debug(f"signal_decisions log failed: {_sl_err}")
+                    log.warning(f"[worker-{worker_id}] scorer_decisions audit write failed for {ticker}: {_sl_err}")
 
                 # DISCARD: hard gate fired (e.g., G1 CB-misalignment). Drop silently.
                 if _scorer_decision == "discard":
@@ -3778,8 +3885,48 @@ def _process_job(worker_id: int, job: dict):
                 base["confidence"] = _sc_score
 
             except Exception as _sc_err:
-                # Fail-open: scorer exception → proceed with existing flow
-                log.warning(f"[worker-{worker_id}] Scorer error for {ticker}, proceeding: {_sc_err}")
+                # v8.3.1 Fix #7: Surface scorer exceptions clearly + write audit row.
+                # Prior: log.warning with no traceback, no audit row → silent audit gap.
+                # Now: log.error with traceback AND one audit row per exception so
+                # grep "SCORER-ERROR" always matches signals lost to scorer failure.
+                import traceback as _sc_tb
+                _sc_err_tb = _sc_tb.format_exc()
+                log.error(f"[worker-{worker_id}] SCORER-ERROR for {ticker} {bias}: {_sc_err}\n{_sc_err_tb}")
+                try:
+                    _append_csv_row("scorer_decisions.csv",
+                                    ["timestamp_utc", "ticker", "bias", "tier",
+                                     "source", "timeframe",
+                                     "score", "decision", "hard_gate",
+                                     "diamond", "pb_state", "cb_side", "maturity",
+                                     "at_edge", "wave_label",
+                                     "ema_dist_pct", "macd_hist", "rsi_mfi", "wt2", "adx",
+                                     "breakdown_json", "reasons_summary"],
+                                    {
+                                        "timestamp_utc": datetime.utcnow().isoformat() + "Z",
+                                        "ticker": ticker, "bias": bias,
+                                        "tier": str((webhook_data or {}).get("tier", "")),
+                                        "source": str((webhook_data or {}).get("source", "")),
+                                        "timeframe": str((webhook_data or {}).get("timeframe", "")),
+                                        "score": 0,
+                                        "decision": "error",
+                                        "hard_gate": "exception_before_scorer",
+                                        "diamond": "",
+                                        "pb_state": "",
+                                        "cb_side": "",
+                                        "maturity": "",
+                                        "at_edge": "",
+                                        "wave_label": "",
+                                        "ema_dist_pct": (webhook_data or {}).get("ema_dist_pct"),
+                                        "macd_hist":    (webhook_data or {}).get("macd_hist"),
+                                        "rsi_mfi":      (webhook_data or {}).get("rsi_mfi"),
+                                        "wt2":          (webhook_data or {}).get("wt2"),
+                                        "adx":          (webhook_data or {}).get("adx"),
+                                        "breakdown_json": "",
+                                        "reasons_summary": f"EXCEPTION: {str(_sc_err)[:200]}",
+                                    })
+                except Exception as _sl_err2:
+                    log.error(f"[worker-{worker_id}] scorer_decisions error-row write ALSO failed for {ticker}: {_sl_err2}")
+                # Fail-open: proceed to existing v7 filter path even though scorer failed.
 
         # ── v7: Backtest filter gate ──────────────────────────────
         # Check if this signal should be blocked by v7 rules BEFORE
@@ -6170,6 +6317,16 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
 
         all_recs.sort(key=rec_score, reverse=True)
         best_rec = all_recs[0]
+
+        # v8.3.1 Fix #4: Pass conviction scorer payload from webhook_data → best_rec
+        # so format_trade_card can render it on the Telegram card. These fields
+        # are stashed by _process_job BEFORE calling check_ticker. Absent on
+        # swing or other non-scorer paths — format_trade_card checks existence.
+        if webhook_data and isinstance(webhook_data, dict):
+            for _sc_key in ("conviction_score", "conviction_breakdown",
+                            "conviction_reasons", "conviction_decision"):
+                if _sc_key in webhook_data:
+                    best_rec[_sc_key] = webhook_data[_sc_key]
 
         other_exps = []; seen_exps = {best_rec.get("exp")}
         for r in all_recs[1:]:
