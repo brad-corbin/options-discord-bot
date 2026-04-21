@@ -7027,78 +7027,94 @@ def _post_v84_credit_from_scorer(ticker: str, bias: str, webhook_data: dict,
             return
 
         # 2) Pick an expiry — target 3-7 DTE window per Phase 1 backtest edge
-        _chosen_exp = ""
-        _chosen_dte = None
+        # v8.4.7 (Patch 2E): prior logic had two bugs:
+        #   (a) `get_expirations(ticker) if 'get_expirations' in dir() else []`
+        #       — dir() inside a function returns only local names, so this
+        #       was ALWAYS False, always fell through to the calendar-date
+        #       fallback. Today(4/20) + 3 = 4/23 Thursday — no weekly exp → 404.
+        #   (b) chain fetch tried only the FIRST candidate. On 404 it gave up
+        #       instead of trying the next expiry. Both NFLX and UNH tonight
+        #       tried 4/23 (no exp), failed, fell back to 33% estimate — even
+        #       though 4/24 was live and fetched fine by the prefetch pipeline.
+        # Fix: call get_expirations directly, build a ranked candidate list,
+        # try chain fetch per candidate, stop at the first one that returns rows.
+        from datetime import date as _date, timedelta as _td
+        _today = _date.today()
+        _candidates = []  # list of (exp_str, dte) tuples, ranked best-first
         try:
-            from datetime import date as _date
-            _today = _date.today()
-            _exps = get_expirations(ticker) if 'get_expirations' in dir() else []
-            if not _exps:
-                # Fallback: try a few common weekly expiries
-                from datetime import timedelta as _td
-                for _offset in (3, 4, 5, 7):
-                    _exps.append((_today + _td(days=_offset)).strftime("%Y-%m-%d"))
-            # Prefer first expiry with DTE >=3 and <=7
-            for _exp_str in sorted(_exps):
-                try:
-                    _exp_d = datetime.strptime(_exp_str[:10], "%Y-%m-%d").date()
-                    _dte_v = (_exp_d - _today).days
-                    if 3 <= _dte_v <= 7:
-                        _chosen_exp = _exp_str[:10]
-                        _chosen_dte = _dte_v
-                        break
-                except ValueError:
-                    continue
-            # If none in sweet spot, take nearest >=1
-            if not _chosen_exp:
-                for _exp_str in sorted(_exps):
-                    try:
-                        _exp_d = datetime.strptime(_exp_str[:10], "%Y-%m-%d").date()
-                        _dte_v = (_exp_d - _today).days
-                        if _dte_v >= 1:
-                            _chosen_exp = _exp_str[:10]
-                            _chosen_dte = _dte_v
-                            break
-                    except ValueError:
-                        continue
+            _exps = get_expirations(ticker) or []
         except Exception as _exp_err:
-            log.warning(f"v8.4 scorer-path: expiry selection failed for {ticker}: {_exp_err}")
+            log.warning(f"v8.4 scorer-path: get_expirations failed for {ticker}: {_exp_err}")
+            _exps = []
 
-        if not _chosen_exp:
+        # Build ranked candidates — prefer 3-7 DTE window, then nearest ≥1 DTE
+        _sweet_spot = []
+        _other = []
+        for _exp_str in _exps:
+            try:
+                _exp_d = datetime.strptime(str(_exp_str)[:10], "%Y-%m-%d").date()
+                _dte_v = (_exp_d - _today).days
+                if _dte_v < 1:
+                    continue
+                if 3 <= _dte_v <= 7:
+                    _sweet_spot.append((str(_exp_str)[:10], _dte_v))
+                else:
+                    _other.append((str(_exp_str)[:10], _dte_v))
+            except (ValueError, TypeError):
+                continue
+        _sweet_spot.sort(key=lambda x: x[1])  # nearest within sweet spot first
+        _other.sort(key=lambda x: x[1])       # nearest overall next
+        _candidates = _sweet_spot + _other
+
+        # If get_expirations returned nothing, fall back to calendar dates
+        # (rare — happens if Schwab expirationchain endpoint is down).
+        if not _candidates:
+            log.warning(f"v8.4 scorer-path: no expirations from API for {ticker}, "
+                        f"using calendar-date fallback")
+            for _offset in (2, 3, 4, 5, 7):
+                _d = _today + _td(days=_offset)
+                _candidates.append((_d.strftime("%Y-%m-%d"), _offset))
+
+        if not _candidates:
             log.warning(f"v8.4 scorer-path: no valid expiry found for {ticker}")
             return
 
-        # 3) Fetch the option chain for the chosen expiry (needed for strike
-        # alignment + live credit price). Failure here is non-fatal —
-        # credit_card_builder will fall back to its estimate.
-        #
-        # v8.4.6 (Patch 2D): prior version called _get_0dte_chain + a broken
-        # dict-iteration normalizer, which left the chain None on every
-        # non-0DTE expiry → every card printed with the 33% fallback estimate.
-        # Observed live: XLV bear_call showed $0.83 credit ($2.50 width × 33%)
-        # but actual fill was $0.33 (real mid ~13% of width for tight-cushion
-        # OTM low-vol sector ETFs). The fallback is structurally too optimistic.
-        # Now uses the proper _get_chain_for_expiry + _chain_rows_from_response
-        # pair so the card prints the true live bid/ask mid.
+        # 3) Try chain fetch per candidate — stop at first success.
+        # credit_card_builder will fall back to its estimate only if ALL
+        # candidates fail (extreme edge case — chain API fully down).
         _chains_arg = None
-        try:
-            _raw, _cs, _ce = _get_chain_for_expiry(ticker, _chosen_exp)
-            if _raw and _ce:
+        _chosen_exp = ""
+        _chosen_dte = None
+        for _cand_exp, _cand_dte in _candidates:
+            try:
+                _raw, _cs, _ce = _get_chain_for_expiry(ticker, _cand_exp)
+                if not (_raw and _ce):
+                    log.debug(f"v8.4 scorer-path: no chain for {ticker} {_cand_exp} — trying next")
+                    continue
                 _rows = _chain_rows_from_response(_raw)
-                if _rows:
-                    # _post_v84_credit_card expects list-of-(exp, dte, contracts)
-                    # and contracts are row-dicts already — exactly what rows is.
-                    _chains_arg = [(_ce, _chosen_dte, _rows)]
-                    log.info(f"v8.4 scorer-path chain fetched: {ticker} {_chosen_exp} "
-                             f"({len(_rows)} contracts)")
-                else:
-                    log.warning(f"v8.4 scorer-path: chain for {ticker} {_chosen_exp} "
-                                f"returned no rows — card will use estimate fallback")
-            else:
-                log.warning(f"v8.4 scorer-path: chain fetch returned empty for "
-                            f"{ticker} {_chosen_exp} — card will use estimate fallback")
-        except Exception as _chain_err:
-            log.warning(f"v8.4 scorer-path: chain fetch failed for {ticker}: {_chain_err}")
+                if not _rows:
+                    log.debug(f"v8.4 scorer-path: empty rows for {ticker} {_cand_exp} — trying next")
+                    continue
+                # Success — use this expiry
+                _chains_arg = [(_ce, _cand_dte, _rows)]
+                _chosen_exp = _cand_exp
+                _chosen_dte = _cand_dte
+                log.info(f"v8.4 scorer-path chain fetched: {ticker} {_cand_exp} "
+                         f"(DTE {_cand_dte}, {len(_rows)} contracts)")
+                break
+            except Exception as _chain_err:
+                log.debug(f"v8.4 scorer-path: chain fetch exception for "
+                          f"{ticker} {_cand_exp}: {_chain_err} — trying next")
+                continue
+
+        if not _chosen_exp:
+            # All candidates failed — log the first one so credit_card_builder
+            # gets SOMETHING for its expiry arg (even though it won't find strikes).
+            _chosen_exp = _candidates[0][0]
+            _chosen_dte = _candidates[0][1]
+            log.warning(f"v8.4 scorer-path: all {len(_candidates)} expiry "
+                        f"candidates failed chain fetch for {ticker} — "
+                        f"card will use estimate fallback on {_chosen_exp}")
 
         # 4) Delegate to the existing helper. regime_trend from webhook_data
         # is already populated by the scorer path (market_regime field).
