@@ -103,6 +103,10 @@ SIGNAL_LOG_HEADERS = [
     "Vol Regime",           # NORMAL / TRANSITION / EMERGENCY
     "Dealer Regime",        # per-ticker if available
     "VIX",                  # raw VIX level
+    # v8.5 (Phase 3.3): spot at callout so weekly grading can compare to
+    # Friday close without re-fetching historicals. Snap['spot'] is already
+    # available at tick time; threaded into _signal_log_row below.
+    "Spot",
     "Outcome",              # (manual tag: win / loss / scratch / skip)
     "Notes",                # (manual: free-form)
 ]
@@ -146,6 +150,9 @@ _get_vix_ts_fn = None            # () -> dict (vix term structure)
 _thread_started = False
 _dashboard_lock = threading.Lock()
 _signal_log_seen_keys = set()  # dedup: skip re-logging the same event
+# v8.5 (Phase 3.3): diagnostic — fires once per ticker per deploy for the
+# Active Scanner trade_journal query. See _get_active_scanner_snapshot.
+_as_signal_diag_seen: set = set()
 
 # Tab ID cache so we don't re-resolve sheetId on every write
 _sheet_tab_ids: Dict[str, int] = {}
@@ -400,7 +407,8 @@ def _append_signal_log_rows(rows: List[List[Any]], token: str) -> bool:
     if not rows:
         return True
     try:
-        rng = requests.utils.quote(f"{TAB_SIGNAL_LOG}!A:L", safe="!:")
+        # v8.5 (Phase 3.3): widened A:L → A:M for the new Spot column (13 cols).
+        rng = requests.utils.quote(f"{TAB_SIGNAL_LOG}!A:M", safe="!:")
         resp = requests.post(
             _sheets_url(f"/values/{rng}:append"),
             params={"valueInputOption": "USER_ENTERED", "insertDataOption": "INSERT_ROWS"},
@@ -539,7 +547,19 @@ def _get_oi_snapshot(ticker: str) -> Dict[str, Any]:
     elif "unwind" in flow_type or "confirmed_unwinding" in flow_type:
         direction = "unwind"
     else:
-        direction = flow_type or "none"
+        # v8.5 (Phase 3.3): same-day flags never have flow_type (that's
+        # assigned during next-morning OI confirmation). Fall back to
+        # the `directional_bias` field which IS written at save time
+        # (oi_flow.py:1173). Translates the bias into a dashboard-readable
+        # direction using the side.
+        db = (latest.get("directional_bias") or "").upper()
+        side_lc = (latest.get("side") or "").lower()
+        if "BULLISH" in db:
+            direction = "buildup" if side_lc == "call" else ("unwind" if side_lc == "put" else "bullish")
+        elif "BEARISH" in db:
+            direction = "buildup" if side_lc == "put" else ("unwind" if side_lc == "call" else "bearish")
+        else:
+            direction = flow_type or "none"
 
     side = (latest.get("side") or "none").lower()
 
@@ -585,7 +605,17 @@ def _get_flow_snapshot(ticker: str) -> Dict[str, Any]:
 
 def _get_active_scanner_snapshot(ticker: str) -> str:
     """Read latest active scanner signal for a ticker from trade_journal.
-    Returns a short label like 'T2 🐂' or '' if none today."""
+    Returns a short label like 'T2 🐂' or '' if none today.
+
+    v8.5 (Phase 3.3): added one-time diagnostic logging so that persistent
+    blank AS Signal cells can be root-caused from a live Render log. Logs
+    once per tick-cycle per session: how many entries came back, and for
+    the most recent entry the fields the renderer cares about (tier,
+    side, bias, outcome). Does not repeat per-ticker — key is `ticker`
+    so each ticker logs at most once until _as_signal_diag_seen is reset
+    (which happens on process restart only, by design — one datapoint
+    per deploy is enough to diagnose).
+    """
     try:
         import trade_journal as _tj
         entries = _tj.query_journal(
@@ -598,37 +628,103 @@ def _get_active_scanner_snapshot(ticker: str) -> str:
         log.debug(f"dashboard: trade_journal query failed for {ticker}: {e}")
         return ""
 
+    # v8.5 (Phase 3.3): diagnostic — fires at most once per ticker per deploy.
+    try:
+        if ticker.upper() not in _as_signal_diag_seen:
+            _as_signal_diag_seen.add(ticker.upper())
+            if entries:
+                _e0 = entries[0]
+                log.info(
+                    f"[Phase3.3 diag] AS {ticker}: {len(entries)} entries, "
+                    f"latest keys=tier={_e0.get('tier')!r} "
+                    f"side={_e0.get('side')!r} bias={_e0.get('bias')!r} "
+                    f"outcome={_e0.get('outcome')!r}"
+                )
+            else:
+                log.info(
+                    f"[Phase3.3 diag] AS {ticker}: 0 entries "
+                    f"(date_from={_today_ct_str()})"
+                )
+    except Exception:
+        pass
+
     if not entries:
         return ""
 
     # Most recent entry is first (query_journal returns most-recent-first)
     latest = entries[0]
     tier = latest.get("tier") or ""
-    side = (latest.get("side") or "").lower()
-    arrow = "🐂" if side in ("bull", "long", "buy") else ("🐻" if side in ("bear", "short", "sell") else "")
+    # v8.5 (Phase 3.3): journal stores `bias` not `side` — reader was looking
+    # for the wrong key. Fall back to `bias` for the bull/bear arrow.
+    side = (latest.get("side") or latest.get("bias") or "").lower()
+    arrow = "🐂" if side in ("bull", "bullish", "long", "buy") else (
+        "🐻" if side in ("bear", "bearish", "short", "sell") else "")
     if tier:
         return f"T{tier} {arrow}".strip()
     return arrow or ""
 
 
 def _get_thesis_snapshot(ticker: str) -> Dict[str, Any]:
-    """Read thesis for a ticker."""
+    """Read thesis for a ticker.
+
+    v8.5 (Phase 3.3): FIXED — was calling `_persistent_state.get_thesis(ticker)`
+    which reads Redis key `thesis:{TICKER}`. That key is NEVER written;
+    thesis_monitor persists to `thesis_monitor:{ticker}` instead (see
+    thesis_monitor._persist_thesis at line ~917). Consequence: Dashboard's
+    Thesis Bias column showed "NEUTRAL" and Thesis Score showed "0" for
+    every ticker, every day, even though thesis data existed for all 35
+    FLOW_TICKERS.
+
+    Now reads the correct key directly. Also returns `prior_day_close`
+    which the thesis blob already carries — enables the Dashboard `%Day`
+    column (previously hardcoded to None).
+    """
+    empty = {"bias": "", "score": "", "prior_day_close": None}
     try:
-        t = _persistent_state.get_thesis(ticker)
+        if not _persistent_state:
+            return empty
+        # Direct Redis read from the thesis_monitor key
+        raw = _persistent_state._json_get(f"thesis_monitor:{ticker.upper()}")
     except Exception as e:
         log.debug(f"dashboard: thesis read failed for {ticker}: {e}")
-        return {"bias": "NEUTRAL", "score": 0}
+        return empty
 
-    if not t:
-        return {"bias": "NEUTRAL", "score": 0}
+    if not raw:
+        # No thesis for this ticker (expected for tickers thesis_monitor
+        # hasn't run on yet). Render blank rather than a synthetic NEUTRAL/0
+        # which hides the "no data" state.
+        return empty
 
-    bias = _safe_get(t, "bias", "NEUTRAL") or "NEUTRAL"
-    score = _safe_get(t, "bias_score", 0) or 0
+    # `_json_get` already returns a parsed dict; if a legacy string sneaks
+    # through, parse it.
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            return empty
+    if not isinstance(raw, dict):
+        return empty
+
+    bias = raw.get("bias") or ""
+    score = raw.get("bias_score", raw.get("score"))
     try:
-        score = int(score)
+        score = int(score) if score is not None else ""
     except (TypeError, ValueError):
-        score = 0
-    return {"bias": str(bias).upper(), "score": score}
+        score = ""
+
+    pdc = raw.get("prior_day_close")
+    try:
+        pdc = float(pdc) if pdc is not None else None
+        if pdc is not None and pdc <= 0:
+            pdc = None
+    except (TypeError, ValueError):
+        pdc = None
+
+    return {
+        "bias": str(bias).upper() if bias else "",
+        "score": score,
+        "prior_day_close": pdc,
+    }
 
 
 def _get_gex_snapshot(ticker: str) -> Dict[str, Any]:
@@ -751,10 +847,6 @@ def get_ticker_snapshot(ticker: str, pnl_rollup: Optional[Dict[str, float]] = No
         spot = None
     snap["spot"] = spot
 
-    # TODO: %day requires previous close — leave empty for Phase 1 to avoid
-    # another data dependency. Can add later from daily candles.
-    snap["pct_day"] = None
-
     pb = _get_potter_box_snapshot(ticker)
     oi = _get_oi_snapshot(ticker)
     flow = _get_flow_snapshot(ticker)
@@ -762,6 +854,19 @@ def get_ticker_snapshot(ticker: str, pnl_rollup: Optional[Dict[str, float]] = No
     thesis = _get_thesis_snapshot(ticker)
     gex = _get_gex_snapshot(ticker)
     camps = _get_open_campaigns_snapshot(ticker)
+
+    # v8.5 (Phase 3.3): %Day sourced from thesis_monitor's `prior_day_close`.
+    # Previously hardcoded to None (Phase 1 TODO, never completed) so every
+    # Dashboard %Day cell was blank. thesis_monitor persists prior_day_close
+    # for every monitored ticker; _get_thesis_snapshot now returns it.
+    pct_day = None
+    try:
+        pdc = thesis.get("prior_day_close")
+        if pdc and spot and pdc > 0:
+            pct_day = (float(spot) - float(pdc)) / float(pdc) * 100.0
+    except (TypeError, ValueError):
+        pct_day = None
+    snap["pct_day"] = pct_day
 
     snap.update({
         "pb_floor": pb["floor"],
@@ -817,7 +922,20 @@ def get_ticker_snapshot(ticker: str, pnl_rollup: Optional[Dict[str, float]] = No
 # ═══════════════════════════════════════════════════════════════════
 
 def _get_regime_context() -> Dict[str, Any]:
-    """Single-call regime snapshot for signal log stamping and header display."""
+    """Single-call regime snapshot for signal log stamping and header display.
+
+    v8.5 (Phase 3.3) changes:
+      - vol_regime: was reading `vts.get("state") or vts.get("regime")`,
+        neither key exists in vix_term_structure.get_vix_term_structure()'s
+        return dict. Actual key is `term_structure` (values:
+        CONTANGO / FLAT / BACKWARDATION / SEVERE_BACKWARDATION). Signal
+        Log `Vol Regime` column was blank on every row.
+      - dealer_regime: previously never queried. Now reads the latest
+        `unified_regime` snapshot from persistent state for SPY — the
+        closest proxy available on the dashboard's background thread
+        without re-running the full regime compute. Tickers without a
+        cached snapshot render blank.
+    """
     ctx = {
         "market_regime": "",
         "vol_regime": "",
@@ -837,11 +955,30 @@ def _get_regime_context() -> Dict[str, Any]:
         try:
             vts = _get_vix_ts_fn() or {}
             ctx["vix"] = vts.get("vix") or vts.get("VIX")
-            # Vol regime: derive from term structure state if present
-            state = vts.get("state") or vts.get("regime") or ""
-            ctx["vol_regime"] = str(state).upper() if state else ""
+            # v8.5 (Phase 3.3): correct key is `term_structure`, not `state`.
+            ts_label = vts.get("term_structure") or ""
+            ctx["vol_regime"] = str(ts_label).upper() if ts_label else ""
         except Exception as e:
             log.debug(f"dashboard: vix term structure fetch failed: {e}")
+
+    # v8.5 (Phase 3.3): dealer regime — read `regime` from SPY's thesis blob
+    # at `thesis_monitor:SPY`. That's the closest proxy to a dashboard-wide
+    # "market dealer regime" without re-running the full compute. Thesis blob
+    # is guaranteed to exist once thesis_monitor has run at least once.
+    try:
+        if _persistent_state:
+            spy_thesis = _persistent_state._json_get("thesis_monitor:SPY")
+            if isinstance(spy_thesis, str):
+                try:
+                    spy_thesis = json.loads(spy_thesis)
+                except Exception:
+                    spy_thesis = None
+            if isinstance(spy_thesis, dict):
+                label = (spy_thesis.get("regime") or "").strip()
+                if label and label.upper() != "UNKNOWN":
+                    ctx["dealer_regime"] = label.upper()
+    except Exception as e:
+        log.debug(f"dashboard: SPY thesis regime read failed: {e}")
 
     return ctx
 
@@ -1418,8 +1555,20 @@ def _dashboard_row_values(snap: Dict[str, Any]) -> List[Any]:
     ]
 
 
-def _signal_log_row(ticker: str, event: Dict[str, Any], regime_ctx: Dict[str, Any]) -> List[Any]:
+def _signal_log_row(ticker: str, event: Dict[str, Any],
+                    regime_ctx: Dict[str, Any],
+                    spot: Optional[float] = None) -> List[Any]:
     now = _ct_now()
+    # v8.5 (Phase 3.3): spot column added for weekly grading. spot is
+    # pulled from the per-ticker snap at tick time (ticker events) or
+    # from the position record's entry_spot (close events). Renders
+    # blank if caller didn't pass one.
+    spot_cell = ""
+    if spot is not None:
+        try:
+            spot_cell = round(float(spot), 2)
+        except (TypeError, ValueError):
+            spot_cell = ""
     return [
         now.strftime("%Y-%m-%d"),
         now.strftime("%H:%M:%S"),
@@ -1431,6 +1580,7 @@ def _signal_log_row(ticker: str, event: Dict[str, Any], regime_ctx: Dict[str, An
         regime_ctx.get("vol_regime", ""),
         regime_ctx.get("dealer_regime", ""),
         regime_ctx.get("vix", ""),
+        spot_cell,
         "",  # Outcome — filled manually
         "",  # Notes — filled manually
     ]
@@ -1555,7 +1705,10 @@ def _dashboard_tick() -> None:
             try:
                 events = _detect_new_signals(t, snap)
                 for e in events:
-                    all_events.append(_signal_log_row(t, e, regime_ctx))
+                    # v8.5 (Phase 3.3): pass ticker spot through for
+                    # the new Signal Log Spot column.
+                    all_events.append(_signal_log_row(t, e, regime_ctx,
+                                                      spot=snap.get("spot")))
             except Exception as e:
                 log.warning(f"dashboard: event detection failed for {t}: {e}")
 
@@ -1564,8 +1717,11 @@ def _dashboard_tick() -> None:
         try:
             close_events = _detect_close_events(position_records)
             for ce in close_events:
+                # v8.5 (Phase 3.3): close events carry exit_spot in the
+                # position record if available.
+                _ce_spot = ce.get("exit_spot") or ce.get("spot")
                 all_events.append(
-                    _signal_log_row(ce["ticker"], ce, regime_ctx)
+                    _signal_log_row(ce["ticker"], ce, regime_ctx, spot=_ce_spot)
                 )
             if close_events:
                 log.info(f"dashboard: detected {len(close_events)} newly-closed positions")
