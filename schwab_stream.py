@@ -888,7 +888,15 @@ class ContinuousFlowScanner:
                  get_regime_fn: Callable = None,
                  income_scan_fn: Callable = None,
                  persistent_state=None,
-                 intraday_chat_id: str = None):
+                 intraday_chat_id: str = None,
+                 post_gate_fn: Callable = None):
+        # v8.5 (Phase 3.1): post_gate_fn lets app.py apply the same sub-gate
+        # used at the 4 worker-side post sites (app.py 6029/7829/8120/11990).
+        # Contract: fn(cp, formatted_msg) -> "full" | "compact_posted" | "silent"
+        #   "full"           -> scanner posts full card as before
+        #   "compact_posted" -> gate already posted a compact prompt; skip full post
+        #   "silent"          -> suppress everything (exit CD hit, or un-subbed exit)
+        # When None (default), scanner behaves exactly as pre-Phase-3.1 (always full-post).
         self._tickers = tickers
         self._cached_md = cached_md
         self._flow = flow_detector
@@ -900,6 +908,7 @@ class ContinuousFlowScanner:
         self._income_scan = income_scan_fn
         self._state = persistent_state
         self._intraday_chat_id = intraday_chat_id
+        self._post_gate = post_gate_fn  # v8.5 (Phase 3.1)
 
         self._batch_index = 0
         self._thread = None
@@ -1070,6 +1079,35 @@ class ContinuousFlowScanner:
                         continue
 
                     msg = self._flow.format_conviction_play(cp)
+
+                    # v8.5 (Phase 3.1): apply optional subscription gate.
+                    # Completes Phase 3 — the 4 worker-side post sites in app.py
+                    # already gate on /daytrade /conviction subs; this path was
+                    # the 5th site that Phase 3 missed. See DEPLOY_PHASE3_1.md.
+                    _gate_decision = "full"
+                    if self._post_gate is not None:
+                        try:
+                            _gate_decision = self._post_gate(cp, msg) or "full"
+                        except Exception as _gate_err:
+                            log.warning(
+                                f"Phase 3.1 gate raised for "
+                                f"{cp.get('ticker','?')}: {_gate_err} — failing open to full post"
+                            )
+                            _gate_decision = "full"
+
+                    if _gate_decision == "silent":
+                        # Exit cooldown hit, or un-subbed exit signal.
+                        # No posts, no confirm, no boost, no stats — fully suppressed.
+                        continue
+                    if _gate_decision == "compact_posted":
+                        # Gate already posted a compact prompt. Skip full card
+                        # AND the downstream side-effects (confirm / boost /
+                        # income scan / log_conviction) — those attach to a
+                        # posted full card, not a prompt. Stats still incremented.
+                        with self._lock:
+                            self._stats["convictions"] += 1
+                        continue
+
                     self._post(msg)
 
                     # Also post to intraday channel
@@ -1177,8 +1215,13 @@ def start_continuous_flow(cached_md, flow_detector,
                           post_fn, log_conviction_fn=None,
                           get_regime_fn=None, income_scan_fn=None,
                           persistent_state=None,
-                          intraday_chat_id=None) -> ContinuousFlowScanner:
+                          intraday_chat_id=None,
+                          post_gate_fn=None) -> ContinuousFlowScanner:
     """Start continuous flow scanning (replaces 4x daily sweeps).
+
+    v8.5 (Phase 3.1): post_gate_fn (optional) lets app.py apply the same
+    subscription gate used at the 4 worker-side conviction post sites.
+    See ContinuousFlowScanner.__init__ for the callback contract.
 
     Usage in app.py:
         from schwab_stream import start_continuous_flow
@@ -1193,6 +1236,7 @@ def start_continuous_flow(cached_md, flow_detector,
             income_scan_fn=_income_scan_fn,
             persistent_state=_persistent_state,
             intraday_chat_id=TELEGRAM_CHAT_INTRADAY,
+            post_gate_fn=_continuous_post_gate,  # v8.5 Phase 3.1
         )
     """
     global _flow_scanner
@@ -1211,6 +1255,7 @@ def start_continuous_flow(cached_md, flow_detector,
             income_scan_fn=income_scan_fn,
             persistent_state=persistent_state,
             intraday_chat_id=intraday_chat_id,
+            post_gate_fn=post_gate_fn,  # v8.5 (Phase 3.1)
         )
         _flow_scanner.start()
         return _flow_scanner
