@@ -1,6 +1,19 @@
 # app.py
 # NOTE: Educational/demo code. Not financial advice. Use at your own risk.
 #
+# v8.5 Phase 3.1 (built on Phase 3):
+#   - Completes the Phase 3 subscription gate by wrapping the 5th conviction
+#     post site: ContinuousFlowScanner._scan_expiration in schwab_stream.py.
+#     That path was not in the original Phase 3 handoff ("4 conviction post
+#     sites"). Result: every continuous-scanner conviction was still posting
+#     a full card to both main + intraday regardless of sub state.
+#   - New env var CONTINUOUS_FLOW_SUB_GATE_ENABLED (default off per project
+#     convention). Set to "true" on Render to enable. When enabled, unsubbed
+#     flow conviction plays post a compact prompt to intraday only; unsubbed
+#     exit signals go silent; exit CD shared with the 4 existing post sites.
+#   - New callback contract in schwab_stream.ContinuousFlowScanner.__init__:
+#     post_gate_fn(cp, msg) -> "full" | "compact_posted" | "silent".
+#
 # v8.5 Phase 3 (built on Phase 2 + v8.4.7):
 #   - New module: subscriptions.py — /daytrade and /conviction sub manager.
 #   - Thesis daemon now gates on subscription presence (was: gated on
@@ -11949,6 +11962,114 @@ def _initialize_app():
             try:
                 from schwab_stream import start_streaming, start_continuous_flow
                 start_streaming(_cached_md)
+
+                # v8.5 (Phase 3.1): subscription gate for the ContinuousFlowScanner
+                # post path. This is the 5th conviction post site that Phase 3
+                # missed — the scanner's _scan_expiration calls self._post(msg)
+                # directly, bypassing the /daytrade + /conviction gates applied
+                # at the 4 worker-side sites (app.py 6029/7829/8120/11990).
+                # Contract: returns "full" | "compact_posted" | "silent".
+                # Env gate: CONTINUOUS_FLOW_SUB_GATE_ENABLED (default off per
+                # project convention — set to "true" on Render to enable).
+                _cflow_gate_enabled = (os.getenv(
+                    "CONTINUOUS_FLOW_SUB_GATE_ENABLED", "false"
+                ).strip().lower() == "true")
+
+                def _continuous_post_gate(cp: dict, formatted_msg: str) -> str:
+                    # Mirrors the Phase 3 branch logic at app.py:6029-6200 but
+                    # from the continuous-scanner path. Any exception fails open
+                    # to "full" so a buggy gate never silences real signals.
+                    try:
+                        _tkr = cp.get("ticker", "")
+                        _sub_dir = "call" if cp.get("trade_direction") == "bullish" else "put"
+                        _is_exit = bool(cp.get("is_exit_signal", False))
+                        _is_phantom_exit = (
+                            cp.get("is_exit_signal")
+                            and not cp.get("exit_prior_was_posted", True)
+                        )
+
+                        # Phase 2 (Bug #4): 20-min cooldown on exit re-fires.
+                        # Uses the SAME cooldown key as the 4 app.py sites so
+                        # a worker-side exit and a continuous-scanner exit
+                        # dedupe against each other, not against themselves.
+                        if cp.get("is_exit_signal") and not _is_phantom_exit:
+                            try:
+                                from oi_flow import CONVICTION_EXIT_COOLDOWN
+                                _cd_key = f"conviction_exit:{_tkr}"
+                                if _flow_detector and not _flow_detector._state.check_and_set_cooldown(
+                                        _cd_key, CONVICTION_EXIT_COOLDOWN):
+                                    log.info(
+                                        f"🔇 EXIT CD (continuous): {_tkr} — exit already "
+                                        f"posted within {CONVICTION_EXIT_COOLDOWN/60:.0f}min, suppressed"
+                                    )
+                                    return "silent"
+                            except Exception as _cd_err:
+                                log.debug(f"Exit CD check (continuous) for {_tkr}: {_cd_err}")
+
+                        # Subscription lookup
+                        _sub_mode = None
+                        try:
+                            from subscriptions import get_subscription_manager
+                            _sm = get_subscription_manager()
+                            if _sm:
+                                _sub_mode = _sm.mode_for(TELEGRAM_CHAT_ID, _tkr, _sub_dir)
+                        except Exception as _se:
+                            log.debug(f"Sub check (continuous) for {_tkr}: {_se}")
+
+                        # Exit signal, not subscribed → silent
+                        if _is_exit and not _sub_mode:
+                            log.info(
+                                f"🔇 EXIT SIGNAL (un-subbed, continuous): {_tkr} "
+                                f"— user not subscribed, suppressing"
+                            )
+                            return "silent"
+
+                        # New conviction, not subscribed → compact prompt
+                        if (not _is_exit) and (not _sub_mode):
+                            try:
+                                _compact = _build_compact_conviction_prompt(cp)
+                                _cp_chat = TELEGRAM_CHAT_INTRADAY or TELEGRAM_CHAT_ID
+                                _tg_rate_limited_post(_compact, chat_id=_cp_chat)
+                                _dte_disp = cp.get("dte", "?")
+                                _notional_m = (cp.get("notional", 0) or 0) / 1e6
+                                log.info(
+                                    f"💎 COMPACT PROMPT (continuous): {_tkr} {_sub_dir} "
+                                    f"({_dte_disp}DTE, ${_notional_m:.1f}M)"
+                                )
+                                return "compact_posted"
+                            except Exception as _cpe:
+                                log.warning(
+                                    f"Compact prompt failed (continuous) for {_tkr}: {_cpe} "
+                                    f"— failing open to full post"
+                                )
+                                return "full"
+
+                        # Exit with active /conviction sub → full post, then auto-close
+                        if _is_exit and _sub_mode == "conviction":
+                            try:
+                                from subscriptions import get_subscription_manager as _gsm2
+                                _sm2 = _gsm2()
+                                if _sm2:
+                                    _sm2.remove(TELEGRAM_CHAT_ID, _tkr, _sub_dir)
+                                    log.info(
+                                        f"🔄 AUTO-CLOSED conviction sub on exit (continuous): "
+                                        f"{_tkr} {_sub_dir}"
+                                    )
+                            except Exception as _ace:
+                                log.warning(
+                                    f"Auto-close conviction sub (continuous) failed for {_tkr}: {_ace}"
+                                )
+                            return "full"
+
+                        # Subscribed (any mode), new conviction or non-auto-close exit → full
+                        return "full"
+                    except Exception as _gate_outer:
+                        log.warning(
+                            f"Phase 3.1 gate outer exception for "
+                            f"{cp.get('ticker','?')}: {_gate_outer} — failing open to full post"
+                        )
+                        return "full"
+
                 start_continuous_flow(
                     cached_md=_cached_md,
                     flow_detector=_flow_detector,
@@ -11960,7 +12081,15 @@ def _initialize_app():
                     income_scan_fn=_income_scan_fn,
                     persistent_state=_persistent_state,
                     intraday_chat_id=TELEGRAM_CHAT_INTRADAY,
+                    # v8.5 (Phase 3.1): pass the gate only when enabled; when
+                    # disabled, scanner behaves exactly as pre-3.1 (always full-post).
+                    post_gate_fn=(_continuous_post_gate if _cflow_gate_enabled else None),
                 )
+                if _cflow_gate_enabled:
+                    log.info("Phase 3.1: continuous flow sub-gate ENABLED")
+                else:
+                    log.info("Phase 3.1: continuous flow sub-gate disabled "
+                             "(set CONTINUOUS_FLOW_SUB_GATE_ENABLED=true to enable)")
             except Exception as _e:
                 log.warning(f"Phase 2 streaming init failed: {_e}")
 
