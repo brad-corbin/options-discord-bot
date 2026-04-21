@@ -80,6 +80,19 @@ CONVICTION_COOLDOWN = 300           # 5 min between conviction alerts per ticker
 # 5-7 min from entry → 15 min gives comfortable buffer for trade execution.
 CONVICTION_EXIT_MIN_HOLD_SEC = 15 * 60  # 15 minutes
 
+# v8.5 (Phase 2): Conviction quality gates
+CONVICTION_NOTIONAL_TIER1 = 10_000_000   # index + mega_cap: $10M premium floor
+CONVICTION_NOTIONAL_TIER2 =  5_000_000   # everything else:  $5M floor
+CONVICTION_MIN_OI = {                     # min OI before vol/OI ratio is trusted
+    "index":     2000,
+    "mega_cap":  1000,
+    "large_cap":  500,
+    "mid_cap":    250,
+}
+TIER1_NOTIONAL_TICKERS = (VOLUME_TIERS["index"]["tickers"]
+                          | VOLUME_TIERS["mega_cap"]["tickers"])
+CONVICTION_EXIT_COOLDOWN = 20 * 60       # Bug #4: suppress exit re-fires for 20 min
+
 # Scoring impact
 SCORE_NOTABLE_ALIGNED = 3
 SCORE_NOTABLE_OPPOSING = -2
@@ -855,7 +868,10 @@ class FlowDetector:
             "mid": (sweep.get("bid", 0) + sweep.get("ask", 0)) / 2 if sweep.get("bid") else sweep.get("last", 0),
             "bid": sweep.get("bid", 0),
             "ask": sweep.get("ask", 0),
-            "burst": f"SWEEP ${sweep.get('notional', 0):,.0f}",
+            # v8.5 (Phase 2): burst must be numeric (str crashes detect_conviction_plays
+            # at `burst >= CONVICTION_MIN_BURST` with silent TypeError). SWEEP display
+            # label is still driven by is_streaming_sweep + sweep_notional in formatter.
+            "burst": sweep.get("volume_delta", 0),
             "is_burst": True,
             "is_new_strike": False,
             "sustained_flow": False,
@@ -1924,6 +1940,35 @@ class FlowDetector:
             return 0.0
         return abs(current_spot - oldest_spot) / oldest_spot * 100
 
+    def _detect_move_start(self, ticker: str, direction: str,
+                           lookback_min: int = 30) -> Optional[float]:
+        """v8.5 Phase 3: Return epoch ts of when price started moving in
+        `direction` by >0.3%. None if move can't be isolated.
+
+        Uses self._spot_history (same primitive as _get_recent_move_pct)
+        rather than schwab_stream bars — keeps this method self-contained
+        and dependency-free.
+        """
+        try:
+            history = self._spot_history.get(ticker.upper(), [])
+            if len(history) < 5:
+                return None
+            now_ts = time.time()
+            cutoff = now_ts - (lookback_min * 60)
+            # Walk newest -> oldest; find first sample where move from that
+            # sample to current crossed 0.3% in the requested direction.
+            sign = 1 if direction == "bullish" else -1
+            current_px = history[-1][1]
+            for ts, px in reversed(history[:-1]):
+                if ts < cutoff or px <= 0:
+                    break
+                pct = ((current_px - px) / px) * 100 * sign
+                if pct >= 0.3:
+                    return float(ts)
+            return None
+        except Exception:
+            return None
+
     @staticmethod
     def _get_ct_time() -> Tuple[int, int]:
         """Get current Central Time hour and minute."""
@@ -2098,8 +2143,10 @@ class FlowDetector:
             # revisit this block and decide whether to add a real gate.
             # --- To remove: delete this entire block. ---
             LATE_DAY_CUTOFF_MIN = 14 * 60 + 45  # 2:45 PM CT
+            # v8.5 (Phase 2, Bug #1): narrowed 3-30 -> 3-7 DTE. EOD de-risking
+            # isn't plausible for 11/18 DTE contracts — they don't expire soon enough.
             if (ct_minutes_total >= LATE_DAY_CUTOFF_MIN
-                    and 3 <= alert_dte <= 30):
+                    and 3 <= alert_dte <= 7):
                 log.warning(
                     f"LATE_DAY_HEURISTIC [LOW_CONFIDENCE]: {ticker} "
                     f"{alert_dte}DTE conviction fired at "
@@ -2108,6 +2155,18 @@ class FlowDetector:
                     f"Tag for later review; not blocking."
                 )
             # ── end Fix #10 ──
+
+            # v8.5 (Phase 2, Gate A): MIN OI FLOOR
+            # vol/OI ratio is meaningless on tiny OI bases (Mon open, deep OTM,
+            # Friday-post-expiry resets). Require real OI before trusting the ratio.
+            oi_val = alert.get("oi", 0)
+            _tier_name = next(
+                (n for n, cfg in VOLUME_TIERS.items() if ticker in cfg["tickers"]),
+                "mid_cap"
+            )
+            _min_oi = CONVICTION_MIN_OI.get(_tier_name, 500)
+            if oi_val < _min_oi:
+                continue  # insufficient OI base — ratio is noise
 
             # Gate: Vol/OI ratio
             if vol_oi < CONVICTION_MIN_VOL_OI:
@@ -2126,6 +2185,21 @@ class FlowDetector:
             # the flow is real even without a single massive burst.
             has_sustained = alert.get("sustained_flow", False)
             if not has_burst and not has_overwhelming and not has_sustained:
+                continue
+
+            # v8.5 (Phase 2, Gate B): NOTIONAL DOLLAR FLOOR
+            # Real institutional conviction is ≥$5-10M in premium, not N contracts.
+            # 30k NVDA contracts × $0.15 = $450k is lottery flow, not smart money.
+            _mid_early = alert.get("mid", 0) or 0
+            if _mid_early <= 0:
+                _mid_early = (alert.get("bid", 0) + alert.get("ask", 0)) / 2
+            _notional_early = volume * _mid_early * 100
+            _notional_floor = (CONVICTION_NOTIONAL_TIER1
+                               if ticker in TIER1_NOTIONAL_TICKERS
+                               else CONVICTION_NOTIONAL_TIER2)
+            if _notional_early < _notional_floor:
+                log.debug(f"💎 NOTIONAL FLOOR: {ticker} "
+                          f"${_notional_early/1e6:.2f}M < ${_notional_floor/1e6:.0f}M")
                 continue
 
             # Gate: Clear direction
@@ -2221,6 +2295,20 @@ class FlowDetector:
                 route = "swing"
             else:
                 route = "stalk"
+
+            # v8.5 (Phase 2, Gate C): IMMEDIATE AGGRESSIVENESS GATE
+            # 0-2 DTE "CONVICTION PLAY" posts are highest-urgency alerts.
+            # Require either a streaming sweep (urgency signal: filled across
+            # exchanges) OR sustained flow (3+ consecutive 60s scans same
+            # direction). "One scan, one big number" is where most false
+            # positives live.
+            if route == "immediate":
+                _has_sweep     = alert.get("is_streaming_sweep", False)
+                _has_sustained = alert.get("sustained_flow", False)
+                if not _has_sweep and not _has_sustained:
+                    log.info(f"💎 IMMEDIATE DROP: {ticker} {alert_dte}DTE "
+                             f"— no sweep, no sustained flow (single-scan spike)")
+                    continue
 
             # ── 0DTE NEVER ROUTES TO INCOME ──
             # 0DTE flow expires before the income spread does.
@@ -2359,6 +2447,16 @@ class FlowDetector:
             recent_move_pct = self._get_recent_move_pct(ticker, lookback_min=30)
             is_reactive = recent_move_pct >= 2.0
 
+            # v8.5 (Phase 2, Gate D): REACTIVE + IMMEDIATE = DROP
+            # Reactive flow on 0-2 DTE is almost certainly hedging reaction to
+            # the underlying move, not directional conviction. Promote the flag
+            # to a gate for the immediate route only. Swing/income/stalk still
+            # tolerate reactive flow (real institutions position into moves).
+            if is_reactive and route == "immediate":
+                log.info(f"💎 REACTIVE DROP: {ticker} moved {recent_move_pct:.1f}% "
+                         f"in 30min — 0DTE flow is hedging, not directional")
+                continue
+
             # Dollar estimate
             mid = alert.get("mid", 0) or 0
             if mid <= 0:
@@ -2447,6 +2545,24 @@ class FlowDetector:
             except Exception:
                 pass
 
+            # v8.5 Phase 3: signal lag instrumentation.
+            # Measures seconds between when the underlying began moving in the
+            # flow's direction and when the flow detector generated this alert.
+            # None when the move can't be isolated (chop / no recent movement /
+            # not enough spot history). Purely informational — no gating.
+            _signal_lag_sec = None
+            try:
+                _alert_ts_iso = alert.get("timestamp")
+                if _alert_ts_iso:
+                    _alert_ts = datetime.fromisoformat(_alert_ts_iso).timestamp()
+                    _move_start = self._detect_move_start(
+                        ticker, trade_direction, lookback_min=30
+                    )
+                    if _move_start:
+                        _signal_lag_sec = max(0, int(_alert_ts - _move_start))
+            except Exception:
+                pass
+
             play = {
                 "ticker": ticker,
                 "strike": alert["strike"],
@@ -2508,6 +2624,8 @@ class FlowDetector:
                 # Longer-dated institutional positioning (swing/stalk) operates
                 # on a different timeframe and should not be gated by intraday structure.
                 "is_shadow_only": is_em_conflict and alert_dte < 5,
+                # v8.5 Phase 3: latency instrumentation (None if indeterminate)
+                "signal_lag_sec": _signal_lag_sec,
             }
 
             # ── Issue 3: Resolve recommended contract details ──
