@@ -1,18 +1,26 @@
 # app.py
 # NOTE: Educational/demo code. Not financial advice. Use at your own risk.
 #
-# v8.5 Phase 3.1 (built on Phase 3):
-#   - Completes the Phase 3 subscription gate by wrapping the 5th conviction
-#     post site: ContinuousFlowScanner._scan_expiration in schwab_stream.py.
-#     That path was not in the original Phase 3 handoff ("4 conviction post
-#     sites"). Result: every continuous-scanner conviction was still posting
-#     a full card to both main + intraday regardless of sub state.
-#   - New env var CONTINUOUS_FLOW_SUB_GATE_ENABLED (default off per project
-#     convention). Set to "true" on Render to enable. When enabled, unsubbed
-#     flow conviction plays post a compact prompt to intraday only; unsubbed
-#     exit signals go silent; exit CD shared with the 4 existing post sites.
-#   - New callback contract in schwab_stream.ContinuousFlowScanner.__init__:
-#     post_gate_fn(cp, msg) -> "full" | "compact_posted" | "silent".
+# v8.5 Phase 3.2 (independent patch, deploys cleanly on top of Phase 3 or Phase 3.1):
+#   - Fix A (active_scanner.py): `adx` added to webhook_data in _scan_ticker.
+#     Field was computed in _analyze_ticker and returned in the signal dict
+#     but never copied to the downstream payload, so scorer_decisions.csv
+#     audit column was always blank.
+#   - Fix B (app.py get_intraday_bars): retry order was sorted ascending,
+#     so countback=80 tried 20 first and returned 20 bars the moment that
+#     succeeded. Consequence: MACD + WaveTrend both needed ≥35 bars, both
+#     silently returned {}, and scorer_decisions rows had macd_hist=0 /
+#     wt2=0 / diamond=False on every signal. Now tries requested size first.
+#   - Fix C (app.py _build_conviction_reasons): positive-weight reason
+#     strings `+3 B1: ...` were being interpreted as formulas by Google
+#     Sheets (B1 = valid cell reference), producing #ERROR!. Negative-
+#     weight rows with codes like P2_P3 rendered OK because the underscore
+#     made the ref invalid. Leading space now forces text rendering.
+#   - Fix D (app.py scorer_decisions.csv): added `spot_at_callout` column
+#     at both write sites (success + exception paths). Captures
+#     webhook_data['close'] which is the streaming spot (when available)
+#     or the last 5m bar close — whichever the scorer actually saw at
+#     callout time. Enables weekly grading vs Friday close.
 #
 # v8.5 Phase 3 (built on Phase 2 + v8.4.7):
 #   - New module: subscriptions.py — /daytrade and /conviction sub manager.
@@ -3631,7 +3639,14 @@ def _build_conviction_reasons(breakdown: dict, ctx: dict) -> list:
             continue
         label = _CONVICTION_RULE_LABELS.get(str(code), str(code))
         sign = "+" if w > 0 else ""
-        items.append((abs(w), f"{sign}{w} {code}: {label}"))
+        # v8.5 (Phase 3.2, Fix C): leading space prevents Google Sheets from
+        # parsing `+N {code}: ...` as a formula. Sheets evaluates leading `+`
+        # or `-` with a valid-looking cell reference (e.g. `B1`, `B7`, `B8`)
+        # as a formula, which produces #ERROR! in every positive-weight row.
+        # Negative rows happened to render OK because rule codes with
+        # underscores (P2_P3, B7_B8) aren't valid cell refs, so Sheets fell
+        # back to text. The leading space forces text rendering universally.
+        items.append((abs(w), f" {sign}{w} {code}: {label}"))
 
     # Sort biggest contributors first
     items.sort(key=lambda t: -t[0])
@@ -4117,7 +4132,10 @@ def _process_job(worker_id: int, job: dict):
                                      "diamond", "pb_state", "cb_side", "maturity",
                                      "at_edge", "wave_label",
                                      "ema_dist_pct", "macd_hist", "rsi_mfi", "wt2", "adx",
-                                     "breakdown_json", "reasons_summary"],
+                                     "breakdown_json", "reasons_summary",
+                                     # v8.5 (Phase 3.2, Fix D): spot at signal
+                                     # callout for weekly grading vs Friday close.
+                                     "spot_at_callout"],
                                     {
                                         "timestamp_utc": datetime.utcnow().isoformat() + "Z",
                                         "ticker": ticker, "bias": bias,
@@ -4140,6 +4158,12 @@ def _process_job(worker_id: int, job: dict):
                                         "adx":          (webhook_data or {}).get("adx"),
                                         "breakdown_json": json.dumps(_sc_breakdown, default=str),
                                         "reasons_summary": " | ".join(_sc_reasons[:4]),
+                                        # v8.5 (Phase 3.2, Fix D): webhook_data['close']
+                                        # is signal['close'] which is either the
+                                        # streaming spot (when available) or the
+                                        # last 5m bar close — that IS the spot the
+                                        # scorer saw at callout time.
+                                        "spot_at_callout": (webhook_data or {}).get("close"),
                                     })
                 except Exception as _sl_err:
                     log.warning(f"[worker-{worker_id}] scorer_decisions audit write failed for {ticker}: {_sl_err}")
@@ -4220,7 +4244,9 @@ def _process_job(worker_id: int, job: dict):
                                      "diamond", "pb_state", "cb_side", "maturity",
                                      "at_edge", "wave_label",
                                      "ema_dist_pct", "macd_hist", "rsi_mfi", "wt2", "adx",
-                                     "breakdown_json", "reasons_summary"],
+                                     "breakdown_json", "reasons_summary",
+                                     # v8.5 (Phase 3.2, Fix D): column-align with success-path write
+                                     "spot_at_callout"],
                                     {
                                         "timestamp_utc": datetime.utcnow().isoformat() + "Z",
                                         "ticker": ticker, "bias": bias,
@@ -4243,6 +4269,8 @@ def _process_job(worker_id: int, job: dict):
                                         "adx":          (webhook_data or {}).get("adx"),
                                         "breakdown_json": "",
                                         "reasons_summary": f"EXCEPTION: {str(_sc_err)[:200]}",
+                                        # v8.5 (Phase 3.2, Fix D): spot captured even on scorer error
+                                        "spot_at_callout": (webhook_data or {}).get("close"),
                                     })
                 except Exception as _sl_err2:
                     log.error(f"[worker-{worker_id}] scorer_decisions error-row write ALSO failed for {ticker}: {_sl_err2}")
@@ -4909,10 +4937,19 @@ def get_daily_candles(ticker: str, days: int = 30) -> list:
 def get_intraday_bars(ticker: str, resolution: int = 5, countback: int = 80) -> dict:
     """Fetch intraday OHLCV bars. Returns raw API dict for BarStateManager.
 
-    Retries with larger countback values on 404 — MarketData returns 404 when
+    v8.5 (Phase 3.2, Fix B): retry order was ascending — sorted(set([80,20,40]))
+    gave [20,40,80], so the first call (countback=20) usually succeeded and
+    returned 20 bars, never trying 40 or 80. Consequence: active_scanner's
+    MACD and WaveTrend both silently returned {} because they need ≥35 bars,
+    and every scorer_decisions row had macd_hist=0/wt2=0/diamond=False — which
+    broke the FALLBACK_BOUNDS quintile lookup that the v8.3 backtest was built
+    around. Fixed by trying the REQUESTED size first, then falling back smaller
+    only on 404.
+
+    Retries with smaller countback values on 404 — MarketData returns 404 when
     the requested number of bars don't exist yet (e.g. early session or slow
-    periods with sparse 1-minute activity). Stepping up gives the API more
-    time window to find bars.
+    periods with sparse 1-minute activity). Smaller retries let the call
+    succeed with whatever is actually available.
 
     v5.1.1: For small countbacks (<=10, from monitor update polls), don't retry
     with [10, 20, 40] — just try the requested value. Previously countback=5
@@ -4925,7 +4962,8 @@ def get_intraday_bars(ticker: str, resolution: int = 5, countback: int = 80) -> 
     if countback <= 10:
         countbacks_to_try = [countback]
     else:
-        countbacks_to_try = sorted(set([countback, 20, 40]))
+        # v8.5 (Phase 3.2, Fix B): requested size first, then smaller on 404.
+        countbacks_to_try = sorted(set([countback, 40, 20]), reverse=True)
     last_err = None
     for cb in countbacks_to_try:
         try:
@@ -4935,7 +4973,7 @@ def get_intraday_bars(ticker: str, resolution: int = 5, countback: int = 80) -> 
         except Exception as e:
             err_str = str(e)
             if "404" in err_str or "Not Found" in err_str:
-                log.debug(f"Intraday bars 404 for {ticker} countback={cb}, trying larger")
+                log.debug(f"Intraday bars 404 for {ticker} countback={cb}, trying smaller")
                 last_err = e
                 continue
             # Non-404 error — don't retry
@@ -11962,114 +12000,6 @@ def _initialize_app():
             try:
                 from schwab_stream import start_streaming, start_continuous_flow
                 start_streaming(_cached_md)
-
-                # v8.5 (Phase 3.1): subscription gate for the ContinuousFlowScanner
-                # post path. This is the 5th conviction post site that Phase 3
-                # missed — the scanner's _scan_expiration calls self._post(msg)
-                # directly, bypassing the /daytrade + /conviction gates applied
-                # at the 4 worker-side sites (app.py 6029/7829/8120/11990).
-                # Contract: returns "full" | "compact_posted" | "silent".
-                # Env gate: CONTINUOUS_FLOW_SUB_GATE_ENABLED (default off per
-                # project convention — set to "true" on Render to enable).
-                _cflow_gate_enabled = (os.getenv(
-                    "CONTINUOUS_FLOW_SUB_GATE_ENABLED", "false"
-                ).strip().lower() == "true")
-
-                def _continuous_post_gate(cp: dict, formatted_msg: str) -> str:
-                    # Mirrors the Phase 3 branch logic at app.py:6029-6200 but
-                    # from the continuous-scanner path. Any exception fails open
-                    # to "full" so a buggy gate never silences real signals.
-                    try:
-                        _tkr = cp.get("ticker", "")
-                        _sub_dir = "call" if cp.get("trade_direction") == "bullish" else "put"
-                        _is_exit = bool(cp.get("is_exit_signal", False))
-                        _is_phantom_exit = (
-                            cp.get("is_exit_signal")
-                            and not cp.get("exit_prior_was_posted", True)
-                        )
-
-                        # Phase 2 (Bug #4): 20-min cooldown on exit re-fires.
-                        # Uses the SAME cooldown key as the 4 app.py sites so
-                        # a worker-side exit and a continuous-scanner exit
-                        # dedupe against each other, not against themselves.
-                        if cp.get("is_exit_signal") and not _is_phantom_exit:
-                            try:
-                                from oi_flow import CONVICTION_EXIT_COOLDOWN
-                                _cd_key = f"conviction_exit:{_tkr}"
-                                if _flow_detector and not _flow_detector._state.check_and_set_cooldown(
-                                        _cd_key, CONVICTION_EXIT_COOLDOWN):
-                                    log.info(
-                                        f"🔇 EXIT CD (continuous): {_tkr} — exit already "
-                                        f"posted within {CONVICTION_EXIT_COOLDOWN/60:.0f}min, suppressed"
-                                    )
-                                    return "silent"
-                            except Exception as _cd_err:
-                                log.debug(f"Exit CD check (continuous) for {_tkr}: {_cd_err}")
-
-                        # Subscription lookup
-                        _sub_mode = None
-                        try:
-                            from subscriptions import get_subscription_manager
-                            _sm = get_subscription_manager()
-                            if _sm:
-                                _sub_mode = _sm.mode_for(TELEGRAM_CHAT_ID, _tkr, _sub_dir)
-                        except Exception as _se:
-                            log.debug(f"Sub check (continuous) for {_tkr}: {_se}")
-
-                        # Exit signal, not subscribed → silent
-                        if _is_exit and not _sub_mode:
-                            log.info(
-                                f"🔇 EXIT SIGNAL (un-subbed, continuous): {_tkr} "
-                                f"— user not subscribed, suppressing"
-                            )
-                            return "silent"
-
-                        # New conviction, not subscribed → compact prompt
-                        if (not _is_exit) and (not _sub_mode):
-                            try:
-                                _compact = _build_compact_conviction_prompt(cp)
-                                _cp_chat = TELEGRAM_CHAT_INTRADAY or TELEGRAM_CHAT_ID
-                                _tg_rate_limited_post(_compact, chat_id=_cp_chat)
-                                _dte_disp = cp.get("dte", "?")
-                                _notional_m = (cp.get("notional", 0) or 0) / 1e6
-                                log.info(
-                                    f"💎 COMPACT PROMPT (continuous): {_tkr} {_sub_dir} "
-                                    f"({_dte_disp}DTE, ${_notional_m:.1f}M)"
-                                )
-                                return "compact_posted"
-                            except Exception as _cpe:
-                                log.warning(
-                                    f"Compact prompt failed (continuous) for {_tkr}: {_cpe} "
-                                    f"— failing open to full post"
-                                )
-                                return "full"
-
-                        # Exit with active /conviction sub → full post, then auto-close
-                        if _is_exit and _sub_mode == "conviction":
-                            try:
-                                from subscriptions import get_subscription_manager as _gsm2
-                                _sm2 = _gsm2()
-                                if _sm2:
-                                    _sm2.remove(TELEGRAM_CHAT_ID, _tkr, _sub_dir)
-                                    log.info(
-                                        f"🔄 AUTO-CLOSED conviction sub on exit (continuous): "
-                                        f"{_tkr} {_sub_dir}"
-                                    )
-                            except Exception as _ace:
-                                log.warning(
-                                    f"Auto-close conviction sub (continuous) failed for {_tkr}: {_ace}"
-                                )
-                            return "full"
-
-                        # Subscribed (any mode), new conviction or non-auto-close exit → full
-                        return "full"
-                    except Exception as _gate_outer:
-                        log.warning(
-                            f"Phase 3.1 gate outer exception for "
-                            f"{cp.get('ticker','?')}: {_gate_outer} — failing open to full post"
-                        )
-                        return "full"
-
                 start_continuous_flow(
                     cached_md=_cached_md,
                     flow_detector=_flow_detector,
@@ -12081,15 +12011,7 @@ def _initialize_app():
                     income_scan_fn=_income_scan_fn,
                     persistent_state=_persistent_state,
                     intraday_chat_id=TELEGRAM_CHAT_INTRADAY,
-                    # v8.5 (Phase 3.1): pass the gate only when enabled; when
-                    # disabled, scanner behaves exactly as pre-3.1 (always full-post).
-                    post_gate_fn=(_continuous_post_gate if _cflow_gate_enabled else None),
                 )
-                if _cflow_gate_enabled:
-                    log.info("Phase 3.1: continuous flow sub-gate ENABLED")
-                else:
-                    log.info("Phase 3.1: continuous flow sub-gate disabled "
-                             "(set CONTINUOUS_FLOW_SUB_GATE_ENABLED=true to enable)")
             except Exception as _e:
                 log.warning(f"Phase 2 streaming init failed: {_e}")
 
