@@ -1065,6 +1065,91 @@ def handle_command(
         )
         return
 
+    # ─────────────────────────────────────
+    # SUBSCRIPTION COMMANDS (v8.5 Phase 3)
+    # ─────────────────────────────────────
+
+    if cmd in ("/daytrade", "/daytrade@omegabot"):
+        try:
+            from subscriptions import get_subscription_manager
+            sm = get_subscription_manager()
+        except Exception:
+            sm = None
+        if not sm:
+            reply("Subscription manager not ready. Try again in a moment.")
+            return
+        if len(args) < 2:
+            reply("Usage: /daytrade <TICKER> <call|put|close>")
+            return
+        ticker = args[0].upper()
+        action = args[1].lower()
+        if action == "close":
+            n = sm.remove(chat_id, ticker)
+            reply(f"Closed {n} daytrade subscription(s) for {ticker}" if n
+                  else f"No active daytrade sub for {ticker}")
+            return
+        if action not in ("call", "put"):
+            reply("Direction must be 'call', 'put', or 'close'")
+            return
+        sm.add(chat_id, ticker, action, mode="daytrade", source="manual")
+        reply(f"📡 Daytrade active: {ticker} {action.upper()}\n"
+              f"You'll receive thesis alerts, trade cards, flow conviction, "
+              f"and exits for {ticker}. Stop with /daytrade {ticker} close")
+        return
+
+    if cmd in ("/conviction", "/conviction@omegabot"):
+        try:
+            from subscriptions import get_subscription_manager
+            sm = get_subscription_manager()
+        except Exception:
+            sm = None
+        if not sm:
+            reply("Subscription manager not ready. Try again in a moment.")
+            return
+        if len(args) < 2:
+            reply("Usage: /conviction <TICKER> <call|put|close>")
+            return
+        ticker = args[0].upper()
+        action = args[1].lower()
+        if action == "close":
+            n = sm.remove(chat_id, ticker)
+            reply(f"Closed {n} conviction subscription(s) for {ticker}" if n
+                  else f"No active conviction sub for {ticker}")
+            return
+        if action not in ("call", "put"):
+            reply("Direction must be 'call', 'put', or 'close'")
+            return
+        sm.add(chat_id, ticker, action, mode="conviction", source="manual")
+        reply(f"💎 Conviction tracking: {ticker} {action.upper()}\n"
+              f"You'll receive conviction re-fires and exit signals. "
+              f"Technical thesis alerts stay silent. Auto-closes on exit signal. "
+              f"Stop with /conviction {ticker} close")
+        return
+
+    if cmd in ("/positions", "/positions@omegabot"):
+        try:
+            from subscriptions import get_subscription_manager
+            sm = get_subscription_manager()
+        except Exception:
+            sm = None
+        if not sm:
+            reply("Subscription manager not ready.")
+            return
+        subs = sm.list_all(chat_id)
+        if not subs:
+            reply("No active subscriptions.\n"
+                  "Use /daytrade <TICKER> <call|put> or /conviction <TICKER> <call|put>")
+            return
+        lines = ["📋 Active subscriptions:"]
+        for s in subs:
+            tag = "📡" if s["mode"] == "daytrade" else "💎"
+            line = f"  {tag} {s['ticker']} {s['direction'].upper()} ({s['mode']})"
+            if s.get("source_expiry"):
+                line += f" — exp {s['source_expiry']} ({s.get('source_dte','?')}DTE)"
+            lines.append(line)
+        reply("\n".join(lines))
+        return
+
     if cmd in ("/exportlogs", "/exportlogs@omegabot", "/logs", "/logs@omegabot"):
         try:
             import os as _os
