@@ -1,6 +1,27 @@
 # app.py
 # NOTE: Educational/demo code. Not financial advice. Use at your own risk.
 #
+# v8.5 Phase 3 (built on Phase 2 + v8.4.7):
+#   - New module: subscriptions.py — /daytrade and /conviction sub manager.
+#   - Thesis daemon now gates on subscription presence (was: gated on
+#     active_trades alone). Un-subbed tickers skip thesis evaluation entirely.
+#   - Conviction posts on un-subbed tickers replaced by compact prompt;
+#     exit signals on un-subbed tickers go silent.
+#   - /conviction sub auto-closes when the corresponding exit signal posts.
+#   - Conviction ActiveTrade entries now status=SHADOW (not OPEN) — tracked
+#     for Sheets edge analysis, never drive alerts.
+#   - signal_lag_sec field added to conviction plays (informational).
+#   - 4 conviction post sites (5997 main, 7802 0dte-chain, 8090 chain-iv,
+#     12000 sweep) wrapped with subscription gate; Phase 2 Bug #4 exit
+#     cooldown preserved inside each.
+#
+# v8.5 Phase 2 (built on v8.4.7):
+#   - Bug #4: conviction exit-signal 20-min cooldown at all 4 post sites
+#     (5950 main, 7708 0dte-chain, 7963 chain-iv, 11832 sweep)
+#     Suppresses whipsaw exit spam (TSLA 4/13 had 8 exits on one position).
+#   - Accompanies oi_flow.py Phase 2 (quality gates A/B/C/D + sweep burst
+#     type fix + LATE_DAY DTE bound). Deploy as one unit.
+#
 # v4.2 UPGRADE (2026-03-17):
 #   - CHECK_TICKER_TIMEOUT_SEC imported from trading_rules (45s, was hardcoded 75s)
 #   - PREFETCH_WORKER_WAIT_SEC used consistently (was hardcoded 60s in one path)
@@ -3463,6 +3484,46 @@ def _should_suppress_flow_post(ticker: str, direction: str) -> tuple[bool, str]:
     return (True, "stash_pending")
 
 
+def _build_compact_conviction_prompt(cp: dict) -> str:
+    """v8.5 Phase 3: compact 'subscribe to receive more' prompt fired when
+    a conviction event lands on a ticker the user has no subscription for.
+
+    Includes a DTE-horizon tag so the user can judge quickly whether this
+    flow is worth subscribing to: longer-dated = forward-looking institutional
+    positioning, shorter-dated = reactive/hedging territory."""
+    ticker = cp.get("ticker", "?")
+    direction = "call" if cp.get("trade_direction") == "bullish" else "put"
+    dir_emoji = "📗" if direction == "call" else "📕"
+    dte = cp.get("dte", 0)
+    expiry = str(cp.get("expiry", ""))[:10]
+    notional = cp.get("notional", 0) or 0
+
+    if notional >= 1_000_000:
+        notional_str = f"${notional/1e6:.1f}M"
+    elif notional >= 1_000:
+        notional_str = f"${notional/1e3:.0f}K"
+    else:
+        notional_str = f"${notional:.0f}"
+
+    if dte <= 2:
+        horizon_tag = "IMMEDIATE — intraday horizon (hedging/scalping territory)"
+    elif dte <= 7:
+        horizon_tag = "SHORT-TERM — weekly thesis"
+    elif dte <= 30:
+        horizon_tag = "INSTITUTIONAL POSITIONING — forward-looking"
+    else:
+        horizon_tag = "INSTITUTIONAL CAMPAIGN — slow build, multi-week thesis"
+
+    lines = [
+        f"💎 {ticker} flow conviction — {direction.upper()} {dir_emoji} {notional_str} notional",
+        f"   Expiry: {expiry} ({dte}DTE) — {horizon_tag}",
+        f"",
+        f"Reply /conviction {ticker} {direction} to track this flow thesis",
+        f"Reply /daytrade {ticker} {direction} for full intraday monitoring",
+    ]
+    return "\n".join(lines)
+
+
 def _build_flow_confirms_card(cp: dict) -> str:
     """Build a compact FLOW CONFIRMS card for flow that fires AFTER a scorer
     POST has already happened. One-time per ticker/direction/day (dedup
@@ -5950,12 +6011,61 @@ def _run_v4_prefilter(ticker: str, spot: float, chains: list, candle_closes: lis
                         _is_phantom_exit = (cp.get("is_exit_signal") and
                                            not cp.get("exit_prior_was_posted", True))
 
+                        # v8.5 (Phase 2, Bug #4): suppress exit re-fires within 20 min
+                        # of last exit post. Real whipsaw on volatile tickers (NVDA
+                        # flipped bull↔bear 3 times in 40 min on 4/20) was producing
+                        # exit spam. One exit per session window.
+                        _exit_within_cd = False
+                        if cp.get("is_exit_signal") and not _is_phantom_exit:
+                            _exit_cd_key = f"conviction_exit:{cp['ticker']}"
+                            try:
+                                from oi_flow import CONVICTION_EXIT_COOLDOWN
+                                if not _flow_detector._state.check_and_set_cooldown(
+                                        _exit_cd_key, CONVICTION_EXIT_COOLDOWN):
+                                    _exit_within_cd = True
+                            except Exception:
+                                pass
+
+                        # v8.5 Phase 3: subscription-based gating.
+                        # No sub -> compact prompt (non-exit) or silent (exit).
+                        # /conviction sub -> full card + auto-close on exit.
+                        # /daytrade sub  -> full card (sub stays open on exit).
+                        _sub_mode = None
+                        _sub_ticker = cp["ticker"]
+                        _sub_dir = "call" if cp.get("trade_direction") == "bullish" else "put"
+                        try:
+                            from subscriptions import get_subscription_manager
+                            _sm = get_subscription_manager()
+                            if _sm:
+                                _sub_mode = _sm.mode_for(TELEGRAM_CHAT_ID,
+                                                        _sub_ticker, _sub_dir)
+                        except Exception as _se:
+                            log.debug(f"Sub check failed for {_sub_ticker}: {_se}")
+                        _is_exit = bool(cp.get("is_exit_signal", False))
+
                         if _is_shadow:
                             log.info(f"🔇 SHADOW: {cp['ticker']} {cp['trade_side']} ${cp['strike']:.0f} "
                                      f"— flow fights EM card ({cp.get('em_detail','')})")
                         elif _is_phantom_exit:
                             log.info(f"🔇 EXIT SIGNAL SUPPRESSED: {cp['ticker']} "
                                      f"— prior entry was never posted to user")
+                        elif _exit_within_cd:
+                            log.info(f"🔇 EXIT CD: {cp['ticker']} — exit already posted "
+                                     f"within {CONVICTION_EXIT_COOLDOWN/60:.0f}min, suppressed")
+                        elif _is_exit and not _sub_mode:
+                            # Exit signal on un-subscribed ticker = noise
+                            log.info(f"🔇 EXIT SIGNAL (un-subbed): {cp['ticker']} "
+                                     f"— user not subscribed, suppressing")
+                        elif not _sub_mode and not _is_exit:
+                            # Un-subscribed new conviction — compact prompt only
+                            try:
+                                _compact = _build_compact_conviction_prompt(cp)
+                                _cp_chat = TELEGRAM_CHAT_INTRADAY or TELEGRAM_CHAT_ID
+                                _tg_rate_limited_post(_compact, chat_id=_cp_chat)
+                                log.info(f"💎 COMPACT PROMPT: {cp['ticker']} {_sub_dir} "
+                                         f"({cp.get('dte')}DTE, ${(cp.get('notional',0) or 0)/1e6:.1f}M)")
+                            except Exception as _cpe:
+                                log.warning(f"Compact prompt failed for {cp['ticker']}: {_cpe}")
                         elif route == "immediate":
                             # v8.4.4 (Patch 2A): all conviction flow → intraday only
                             # (was: dual-posted to main + intraday, now single post)
@@ -6077,6 +6187,22 @@ def _run_v4_prefilter(ticker: str, spot: float, chains: list, candle_closes: lis
                                f"({cp['vol_oi_ratio']:.0f}x, {cp['dte']}DTE"
                                f"{', EM ALIGNED' if cp.get('em_aligned') else ', EM CONFLICT' if cp.get('em_conflict') else ''}"
                                f"{', SHADOW CONFIRMS' if cp.get('shadow_agrees') else ''})")
+
+                        # v8.5 Phase 3: auto-close /conviction sub on posted exit.
+                        # Only fires when we actually posted to the user (none of
+                        # the suppress branches caught the event).
+                        if (_is_exit and _sub_mode == "conviction"
+                                and not _is_shadow and not _is_phantom_exit
+                                and not _exit_within_cd):
+                            try:
+                                from subscriptions import get_subscription_manager as _gsm
+                                _sm_close = _gsm()
+                                if _sm_close:
+                                    _sm_close.remove(TELEGRAM_CHAT_ID, _sub_ticker, _sub_dir)
+                                    log.info(f"🔄 AUTO-CLOSED conviction sub on exit: "
+                                             f"{_sub_ticker} {_sub_dir}")
+                            except Exception as _ace:
+                                log.warning(f"Auto-close conviction sub failed: {_ace}")
 
                         # v7.2 fix: Confirm direction ONLY after actual Telegram post.
                         # Prevents exit signals for positions never shown to user.
@@ -7689,9 +7815,47 @@ def _get_0dte_iv(ticker: str, target_date_str: str = None) -> tuple:
                         # v7.2: Suppress exit signals for positions never shown to user
                         _is_phantom_exit = (cp.get("is_exit_signal") and
                                            not cp.get("exit_prior_was_posted", True))
+                        # v8.5 (Phase 2, Bug #4): exit cooldown (site2 — 0dte chain path)
+                        _exit_within_cd = False
+                        if cp.get("is_exit_signal") and not _is_phantom_exit:
+                            _exit_cd_key = f"conviction_exit:{cp['ticker']}"
+                            try:
+                                from oi_flow import CONVICTION_EXIT_COOLDOWN
+                                if not _flow_detector._state.check_and_set_cooldown(
+                                        _exit_cd_key, CONVICTION_EXIT_COOLDOWN):
+                                    _exit_within_cd = True
+                            except Exception:
+                                pass
+                        # v8.5 Phase 3: subscription gate (site2)
+                        _sub_mode = None
+                        _sub_ticker = cp["ticker"]
+                        _sub_dir = "call" if cp.get("trade_direction") == "bullish" else "put"
+                        try:
+                            from subscriptions import get_subscription_manager
+                            _sm = get_subscription_manager()
+                            if _sm:
+                                _sub_mode = _sm.mode_for(TELEGRAM_CHAT_ID, _sub_ticker, _sub_dir)
+                        except Exception as _se:
+                            log.debug(f"Sub check failed (site2) for {_sub_ticker}: {_se}")
+                        _is_exit = bool(cp.get("is_exit_signal", False))
                         if _is_phantom_exit:
                             log.info(f"🔇 EXIT SIGNAL SUPPRESSED: {cp['ticker']} "
                                      f"— prior entry was never posted to user")
+                        elif _exit_within_cd:
+                            log.info(f"🔇 EXIT CD: {cp['ticker']} — exit already posted "
+                                     f"within {CONVICTION_EXIT_COOLDOWN/60:.0f}min, suppressed")
+                        elif _is_exit and not _sub_mode:
+                            log.info(f"🔇 EXIT SIGNAL (un-subbed): {cp['ticker']} "
+                                     f"— user not subscribed, suppressing")
+                        elif not _sub_mode and not _is_exit:
+                            try:
+                                _compact = _build_compact_conviction_prompt(cp)
+                                _cp_chat = TELEGRAM_CHAT_INTRADAY or TELEGRAM_CHAT_ID
+                                _tg_rate_limited_post(_compact, chat_id=_cp_chat)
+                                log.info(f"💎 COMPACT PROMPT: {cp['ticker']} {_sub_dir} "
+                                         f"({cp.get('dte')}DTE, ${(cp.get('notional',0) or 0)/1e6:.1f}M)")
+                            except Exception as _cpe:
+                                log.warning(f"Compact prompt failed (site2) for {cp['ticker']}: {_cpe}")
                         else:
                             # v8.4.4 (Patch 2A): conviction flow → intraday, not main
                             _cp_chat = TELEGRAM_CHAT_INTRADAY or TELEGRAM_CHAT_ID
@@ -7703,6 +7867,15 @@ def _get_0dte_iv(ticker: str, target_date_str: str = None) -> tuple:
                             # v7.2 fix: Confirm direction posted for exit signal tracking
                             _flow_detector.confirm_conviction_posted(
                                 cp["ticker"], cp.get("trade_direction", ""), cp.get("strike", 0))
+                            # v8.5 Phase 3: auto-close /conviction sub on posted exit
+                            if _is_exit and _sub_mode == "conviction":
+                                try:
+                                    if _sm:
+                                        _sm.remove(TELEGRAM_CHAT_ID, _sub_ticker, _sub_dir)
+                                        log.info(f"🔄 AUTO-CLOSED conviction sub on exit: "
+                                                 f"{_sub_ticker} {_sub_dir}")
+                                except Exception as _ace:
+                                    log.warning(f"Auto-close (site2) failed: {_ace}")
                         log.info(f"💎 CONVICTION [{route.upper()}]: {cp['ticker']} "
                                f"{cp['trade_side']} ${cp['strike']:.0f} ({cp['dte']}DTE)")
                         # Store conviction boost for EntryValidator
@@ -7930,9 +8103,50 @@ def _get_chain_iv_for_expiry(ticker: str, target_date_str: str, dte: float) -> t
                         # v7.2: Suppress exit signals for positions never shown to user
                         _is_phantom_exit = (cp.get("is_exit_signal") and
                                            not cp.get("exit_prior_was_posted", True))
+                        # v8.5 (Phase 2, Bug #4): exit cooldown (site3 — chain_iv_for_expiry path)
+                        # Site 3 is not mentioned in the Phase 2 handoff but has
+                        # structurally identical code to site 2; leaving it unpatched
+                        # would defeat the cooldown whenever this code path executes.
+                        _exit_within_cd = False
+                        if cp.get("is_exit_signal") and not _is_phantom_exit:
+                            _exit_cd_key = f"conviction_exit:{cp['ticker']}"
+                            try:
+                                from oi_flow import CONVICTION_EXIT_COOLDOWN
+                                if not _flow_detector._state.check_and_set_cooldown(
+                                        _exit_cd_key, CONVICTION_EXIT_COOLDOWN):
+                                    _exit_within_cd = True
+                            except Exception:
+                                pass
+                        # v8.5 Phase 3: subscription gate (site3)
+                        _sub_mode = None
+                        _sub_ticker = cp["ticker"]
+                        _sub_dir = "call" if cp.get("trade_direction") == "bullish" else "put"
+                        try:
+                            from subscriptions import get_subscription_manager
+                            _sm = get_subscription_manager()
+                            if _sm:
+                                _sub_mode = _sm.mode_for(TELEGRAM_CHAT_ID, _sub_ticker, _sub_dir)
+                        except Exception as _se:
+                            log.debug(f"Sub check failed (site3) for {_sub_ticker}: {_se}")
+                        _is_exit = bool(cp.get("is_exit_signal", False))
                         if _is_phantom_exit:
                             log.info(f"🔇 EXIT SIGNAL SUPPRESSED: {cp['ticker']} "
                                      f"— prior entry was never posted to user")
+                        elif _exit_within_cd:
+                            log.info(f"🔇 EXIT CD: {cp['ticker']} — exit already posted "
+                                     f"within {CONVICTION_EXIT_COOLDOWN/60:.0f}min, suppressed")
+                        elif _is_exit and not _sub_mode:
+                            log.info(f"🔇 EXIT SIGNAL (un-subbed): {cp['ticker']} "
+                                     f"— user not subscribed, suppressing")
+                        elif not _sub_mode and not _is_exit:
+                            try:
+                                _compact = _build_compact_conviction_prompt(cp)
+                                _cp_chat = TELEGRAM_CHAT_INTRADAY or TELEGRAM_CHAT_ID
+                                _tg_rate_limited_post(_compact, chat_id=_cp_chat)
+                                log.info(f"💎 COMPACT PROMPT: {cp['ticker']} {_sub_dir} "
+                                         f"({cp.get('dte')}DTE, ${(cp.get('notional',0) or 0)/1e6:.1f}M)")
+                            except Exception as _cpe:
+                                log.warning(f"Compact prompt failed (site3) for {cp['ticker']}: {_cpe}")
                         else:
                             # v8.4.4 (Patch 2A): conviction flow → intraday, not main
                             _cp_chat = TELEGRAM_CHAT_INTRADAY or TELEGRAM_CHAT_ID
@@ -7944,6 +8158,15 @@ def _get_chain_iv_for_expiry(ticker: str, target_date_str: str, dte: float) -> t
                             # v7.2 fix: Confirm direction posted for exit signal tracking
                             _flow_detector.confirm_conviction_posted(
                                 cp["ticker"], cp.get("trade_direction", ""), cp.get("strike", 0))
+                            # v8.5 Phase 3: auto-close /conviction sub on posted exit
+                            if _is_exit and _sub_mode == "conviction":
+                                try:
+                                    if _sm:
+                                        _sm.remove(TELEGRAM_CHAT_ID, _sub_ticker, _sub_dir)
+                                        log.info(f"🔄 AUTO-CLOSED conviction sub on exit: "
+                                                 f"{_sub_ticker} {_sub_dir}")
+                                except Exception as _ace:
+                                    log.warning(f"Auto-close (site3) failed: {_ace}")
                         log.info(f"💎 CONVICTION [{route.upper()}]: {cp['ticker']} "
                                f"{cp['trade_side']} ${cp['strike']:.0f} ({cp['dte']}DTE)")
                         # Store conviction boost for EntryValidator
@@ -11467,6 +11690,7 @@ def _start_background_services_once():
             get_spot_fn=get_spot, intraday_post_fn=post_to_intraday,
             store_get_fn=store_get, store_set_fn=store_set,
             get_bars_fn=lambda ticker, res, count: get_intraday_bars(ticker, res, count),
+            chat_id=TELEGRAM_CHAT_ID,   # v8.5 Phase 3: subscription gate
         )
 
         # v7: start position monitor polling thread
@@ -11691,6 +11915,13 @@ def _initialize_app():
                                            post_fn=post_to_telegram)
         log.info(f"OI cache + tracker + flow detector + Potter Box initialized (Redis: {_get_redis() is not None})")
 
+        # v8.5 Phase 3: subscription manager (backs /daytrade, /conviction, /positions)
+        try:
+            from subscriptions import init_subscription_manager
+            init_subscription_manager(_persistent_state)
+        except Exception as _sub_init_err:
+            log.warning(f"Subscription manager init failed (non-fatal, commands will report not-ready): {_sub_init_err}")
+
         # v7: position monitor + shadow logger
         global _shadow_logger, _position_monitor
         _shadow_logger = ShadowFilterLogger(
@@ -11782,9 +12013,47 @@ def _initialize_app():
                             # Shadow gate + phantom exit gate
                             _is_phantom_exit = (cp.get("is_exit_signal") and
                                                not cp.get("exit_prior_was_posted", True))
+                            # v8.5 (Phase 2, Bug #4): exit cooldown (site4 — sweep path)
+                            _exit_within_cd = False
+                            if cp.get("is_exit_signal") and not _is_phantom_exit:
+                                _exit_cd_key = f"conviction_exit:{cp['ticker']}"
+                                try:
+                                    from oi_flow import CONVICTION_EXIT_COOLDOWN
+                                    if not _flow_detector._state.check_and_set_cooldown(
+                                            _exit_cd_key, CONVICTION_EXIT_COOLDOWN):
+                                        _exit_within_cd = True
+                                except Exception:
+                                    pass
+                            # v8.5 Phase 3: subscription gate (site4 — sweep path)
+                            _sub_mode = None
+                            _sub_ticker = cp["ticker"]
+                            _sub_dir = "call" if cp.get("trade_direction") == "bullish" else "put"
+                            try:
+                                from subscriptions import get_subscription_manager
+                                _sm = get_subscription_manager()
+                                if _sm:
+                                    _sub_mode = _sm.mode_for(TELEGRAM_CHAT_ID, _sub_ticker, _sub_dir)
+                            except Exception as _se:
+                                log.debug(f"Sub check failed (sweep) for {_sub_ticker}: {_se}")
+                            _is_exit = bool(cp.get("is_exit_signal", False))
                             if _is_phantom_exit:
                                 log.info(f"🔇 EXIT SIGNAL SUPPRESSED (sweep): {cp['ticker']} "
                                          f"— prior entry was never posted to user")
+                            elif _exit_within_cd:
+                                log.info(f"🔇 EXIT CD (sweep): {cp['ticker']} — "
+                                         f"within {CONVICTION_EXIT_COOLDOWN/60:.0f}min, suppressed")
+                            elif _is_exit and not _sub_mode:
+                                log.info(f"🔇 EXIT SIGNAL (un-subbed, sweep): {cp['ticker']} "
+                                         f"— user not subscribed, suppressing")
+                            elif not _sub_mode and not _is_exit and not cp.get("is_shadow_only"):
+                                try:
+                                    _compact = _build_compact_conviction_prompt(cp)
+                                    _cp_chat = TELEGRAM_CHAT_INTRADAY or TELEGRAM_CHAT_ID
+                                    _tg_rate_limited_post(_compact, chat_id=_cp_chat)
+                                    log.info(f"💎 COMPACT PROMPT (sweep): {cp['ticker']} {_sub_dir} "
+                                             f"({cp.get('dte')}DTE, ${(cp.get('notional',0) or 0)/1e6:.1f}M)")
+                                except Exception as _cpe:
+                                    log.warning(f"Compact prompt failed (sweep) for {cp['ticker']}: {_cpe}")
                             elif not cp.get("is_shadow_only"):
                                 # v8.4.4 (Patch 2A): conviction sweep → intraday, not main
                                 _cp_chat = TELEGRAM_CHAT_INTRADAY or TELEGRAM_CHAT_ID
@@ -11796,6 +12065,15 @@ def _initialize_app():
                                 # v7.2 fix: Confirm direction posted for exit signal tracking
                                 _flow_detector.confirm_conviction_posted(
                                     cp["ticker"], cp.get("trade_direction", ""), cp.get("strike", 0))
+                                # v8.5 Phase 3: auto-close /conviction sub on posted exit
+                                if _is_exit and _sub_mode == "conviction":
+                                    try:
+                                        if _sm:
+                                            _sm.remove(TELEGRAM_CHAT_ID, _sub_ticker, _sub_dir)
+                                            log.info(f"🔄 AUTO-CLOSED conviction sub on exit (sweep): "
+                                                     f"{_sub_ticker} {_sub_dir}")
+                                    except Exception as _ace:
+                                        log.warning(f"Auto-close (sweep) failed: {_ace}")
                             else:
                                 log.info(f"🔇 SHADOW (sweep): {cp['ticker']} {cp.get('em_detail','')}")
                             if _log_conviction_play:
