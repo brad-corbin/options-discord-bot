@@ -1182,11 +1182,23 @@ class FlowDetector:
                     "directional_bias": directional,
                     "spot": spot,
                     "date": today_str,
+                    # v8.5 (Phase 3.3): timestamp needed by Dashboard `OI Time`
+                    # column reader at dashboard._get_oi_snapshot. Previously
+                    # the save omitted it, so the reader's fallback chain
+                    # (timestamp|time|ts) found nothing and rendered blank.
+                    "timestamp": datetime.now().isoformat(),
                 })
 
                 # Store flow direction for real-time queries by all subsystems
                 # (active scanner override, EntryValidator boost, Potter Box bias)
                 flow_dir_str = "bullish" if "BULLISH" in directional.upper() else "bearish"
+                # v8.5 (Phase 3.3): compute notional here and save it.
+                # Previously this dict omitted `notional` entirely, so both
+                # the Dashboard "Flow Notional" column AND the Signal Log
+                # flow_conviction `notional=$0` detail were always $0.
+                # Options contracts are 100 shares; notional = vol * mid * 100.
+                _mid_est = p.get("mid", 0) or 0
+                _flow_notional = int(vol * _mid_est * 100) if _mid_est > 0 else 0
                 self._state.save_flow_direction(ticker, {
                     "direction": flow_dir_str,
                     "vol_oi": round(vol_oi, 1),
@@ -1196,6 +1208,7 @@ class FlowDetector:
                     "strike": p["strike"],
                     "spot": spot,
                     "expiry": expiry,
+                    "notional": _flow_notional,
                     "timestamp": datetime.now().isoformat(),
                 })
 
