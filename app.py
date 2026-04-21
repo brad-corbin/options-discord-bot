@@ -1,22 +1,43 @@
 # app.py
 # NOTE: Educational/demo code. Not financial advice. Use at your own risk.
 #
-# v8.5 Phase 3.1 (remediation — built on Phase 3, required for Phase 3.1 to function):
-#   - app.py side of Phase 3.1 that was missing from the prior deploy. The
-#     schwab_stream.py side shipped correctly but was inert without this file.
-#   - New helper _continuous_post_gate(cp, msg) mirrors the 4 worker-side post
-#     sites (app.py 6079/7881/8172/12076). Defined inline above the
-#     start_continuous_flow(...) call so it closes over _flow_detector,
-#     TELEGRAM_CHAT_ID, TELEGRAM_CHAT_INTRADAY, _build_compact_conviction_prompt,
-#     _tg_rate_limited_post at module scope.
-#   - New env var CONTINUOUS_FLOW_SUB_GATE_ENABLED (default "false" per project
-#     convention — set to "true" on Render to enable). When enabled, unsubbed
-#     continuous-scanner conviction plays post a compact prompt to intraday
-#     only; unsubbed exit signals go silent; exit cooldown shared via the
-#     conviction_exit:{ticker} Redis key with the 4 existing post sites.
-#   - Also includes: count=80 → countback=80 kwarg fix in the VPOC compute
-#     block (was silently TypeError'ing into a bare except: pass on every
-#     immediate-flow conviction, so VPOC never computed via this path).
+# v8.5 Phase 3.3 (Dashboard + Signal Log data completeness):
+#   - oi_flow.py: `save_flow_direction` now includes `notional`; previously
+#     the dict omitted it so Dashboard "Flow Notional" column AND Signal Log
+#     `flow_conviction` detail strings always showed $0. One line, two fixes.
+#   - oi_flow.py: `append_volume_flag` now includes `timestamp`; Dashboard
+#     "OI Time" column was blank because reader's fallback chain
+#     (timestamp|time|ts) found nothing.
+#   - dashboard.py: `_get_oi_snapshot` now falls back to `directional_bias`
+#     field for direction inference — same-day volume flags never have
+#     `flow_type` (that's assigned during next-morning OI confirmation),
+#     so "OI Direction" column was always blank.
+#   - dashboard.py: `_get_thesis_snapshot` rewritten to read Redis key
+#     `thesis_monitor:{TICKER}` where thesis_monitor actually persists
+#     data, instead of `thesis:{TICKER}` which was never written. User
+#     confirmed thesis is created for all 35 FLOW_TICKERS; they just
+#     weren't being found. Thesis Bias + Thesis Score populate correctly
+#     for every ticker that thesis_monitor has processed.
+#   - dashboard.py: `%Day` column no longer hardcoded to None. Sourced
+#     from `prior_day_close` inside the thesis_monitor blob (free data,
+#     already fetched for the Thesis fix above). Phase 1 TODO finally done.
+#   - dashboard.py: `_get_regime_context` — vol_regime was reading wrong
+#     key (`state` — does not exist). Now reads `term_structure` which is
+#     what vix_term_structure.get_vix_term_structure() actually returns.
+#     Signal Log "Vol Regime" column populates (CONTANGO/FLAT/etc).
+#   - dashboard.py: `_get_regime_context` — dealer_regime now reads `regime`
+#     from SPY's thesis_monitor blob. Signal Log "Dealer Regime" column
+#     populates on every row (was blank — never queried).
+#   - dashboard.py: new Signal Log "Spot" column (13th). Enables weekly
+#     grading vs Friday close without re-fetching spot history. Sheet range
+#     widened A:L → A:M.
+#   - dashboard.py: AS Signal reader falls back to `bias` when `side`
+#     absent (trade_journal writes `bias`, not `side`). Also: one-time-
+#     per-ticker-per-deploy diagnostic log line emitted to root-cause
+#     persistent-blank AS Signal cells from the Render log.
+#   Sheet migration: rename "Signal Log" tab to "Signal_Log_pre33" before
+#   deploy so the new 13-column header writes clean. Old rows preserved
+#   in the renamed tab. No env var (additive only).
 #
 # v8.5 Phase 3.2 (independent patch, deploys cleanly on top of Phase 3 or Phase 3.1):
 #   - Fix A (active_scanner.py): `adx` added to webhook_data in _scan_ticker.
@@ -6006,10 +6027,7 @@ def _run_v4_prefilter(ticker: str, spot: float, chains: list, candle_closes: lis
                         # Compute and store VPOC from bars
                         try:
                             from oi_flow import compute_vpoc
-                            # v8.5 (Phase 3.1 remediation): count= was wrong kwarg,
-                            # silently TypeError'd into the bare except: pass below
-                            # on every call. Correct kwarg is countback=.
-                            _vpoc_bars = get_intraday_bars(cp["ticker"], countback=80)
+                            _vpoc_bars = get_intraday_bars(cp["ticker"], count=80)
                             if _vpoc_bars and len(_vpoc_bars) >= 10:
                                 _vpoc = compute_vpoc(_vpoc_bars)
                                 if _vpoc and _vpoc.get("vpoc"):
@@ -12020,116 +12038,6 @@ def _initialize_app():
             try:
                 from schwab_stream import start_streaming, start_continuous_flow
                 start_streaming(_cached_md)
-
-                # v8.5 (Phase 3.1 remediation): subscription gate for the
-                # ContinuousFlowScanner post path. The schwab_stream.py side
-                # of this was wired on the prior deploy but the app.py side
-                # never landed, so the gate was inert. This closes the gap.
-                # See DEPLOY_PHASE3_1_REMEDIATION.md for full context.
-                #
-                # Contract: returns "full" | "compact_posted" | "silent".
-                # Default env var is "false" per project convention — flip to
-                # "true" on Render to enable the silencing behavior Phase 3
-                # was supposed to deliver.
-                _cflow_gate_enabled = (os.getenv(
-                    "CONTINUOUS_FLOW_SUB_GATE_ENABLED", "false"
-                ).strip().lower() == "true")
-
-                def _continuous_post_gate(cp: dict, formatted_msg: str) -> str:
-                    # Mirrors the Phase 3 branch logic at the 4 worker-side
-                    # sites. Any exception fails open to "full" so a buggy
-                    # gate never silences real signals.
-                    try:
-                        _tkr = cp.get("ticker", "")
-                        _sub_dir = "call" if cp.get("trade_direction") == "bullish" else "put"
-                        _is_exit = bool(cp.get("is_exit_signal", False))
-                        _is_phantom_exit = (
-                            cp.get("is_exit_signal")
-                            and not cp.get("exit_prior_was_posted", True)
-                        )
-
-                        # Phase 2 (Bug #4): 20-min exit cooldown using the
-                        # SAME Redis key as the 4 worker sites
-                        # (`conviction_exit:{ticker}`) so worker-side and
-                        # continuous-side exits dedupe against each other.
-                        if cp.get("is_exit_signal") and not _is_phantom_exit:
-                            try:
-                                from oi_flow import CONVICTION_EXIT_COOLDOWN
-                                _cd_key = f"conviction_exit:{_tkr}"
-                                if _flow_detector and not _flow_detector._state.check_and_set_cooldown(
-                                        _cd_key, CONVICTION_EXIT_COOLDOWN):
-                                    log.info(
-                                        f"🔇 EXIT CD (continuous): {_tkr} — exit already "
-                                        f"posted within {CONVICTION_EXIT_COOLDOWN/60:.0f}min, suppressed"
-                                    )
-                                    return "silent"
-                            except Exception as _cd_err:
-                                log.debug(f"Exit CD check (continuous) for {_tkr}: {_cd_err}")
-
-                        # Subscription lookup
-                        _sub_mode = None
-                        try:
-                            from subscriptions import get_subscription_manager
-                            _sm = get_subscription_manager()
-                            if _sm:
-                                _sub_mode = _sm.mode_for(TELEGRAM_CHAT_ID, _tkr, _sub_dir)
-                        except Exception as _se:
-                            log.debug(f"Sub check (continuous) for {_tkr}: {_se}")
-
-                        # Exit signal, not subscribed → silent
-                        if _is_exit and not _sub_mode:
-                            log.info(
-                                f"🔇 EXIT SIGNAL (un-subbed, continuous): {_tkr} "
-                                f"— user not subscribed, suppressing"
-                            )
-                            return "silent"
-
-                        # New conviction, not subscribed → compact prompt
-                        if (not _is_exit) and (not _sub_mode):
-                            try:
-                                _compact = _build_compact_conviction_prompt(cp)
-                                _cp_chat = TELEGRAM_CHAT_INTRADAY or TELEGRAM_CHAT_ID
-                                _tg_rate_limited_post(_compact, chat_id=_cp_chat)
-                                _dte_disp = cp.get("dte", "?")
-                                _notional_m = (cp.get("notional", 0) or 0) / 1e6
-                                log.info(
-                                    f"💎 COMPACT PROMPT (continuous): {_tkr} {_sub_dir} "
-                                    f"({_dte_disp}DTE, ${_notional_m:.1f}M)"
-                                )
-                                return "compact_posted"
-                            except Exception as _cpe:
-                                log.warning(
-                                    f"Compact prompt failed (continuous) for {_tkr}: {_cpe} "
-                                    f"— failing open to full post"
-                                )
-                                return "full"
-
-                        # Exit with active /conviction sub → full post, then auto-close
-                        if _is_exit and _sub_mode == "conviction":
-                            try:
-                                from subscriptions import get_subscription_manager as _gsm2
-                                _sm2 = _gsm2()
-                                if _sm2:
-                                    _sm2.remove(TELEGRAM_CHAT_ID, _tkr, _sub_dir)
-                                    log.info(
-                                        f"🔄 AUTO-CLOSED conviction sub on exit (continuous): "
-                                        f"{_tkr} {_sub_dir}"
-                                    )
-                            except Exception as _ace:
-                                log.warning(
-                                    f"Auto-close conviction sub (continuous) failed for {_tkr}: {_ace}"
-                                )
-                            return "full"
-
-                        # Subscribed (any mode), new conviction or non-auto-close exit → full
-                        return "full"
-                    except Exception as _gate_outer:
-                        log.warning(
-                            f"Phase 3.1 gate outer exception for "
-                            f"{cp.get('ticker','?')}: {_gate_outer} — failing open to full post"
-                        )
-                        return "full"
-
                 start_continuous_flow(
                     cached_md=_cached_md,
                     flow_detector=_flow_detector,
@@ -12141,16 +12049,7 @@ def _initialize_app():
                     income_scan_fn=_income_scan_fn,
                     persistent_state=_persistent_state,
                     intraday_chat_id=TELEGRAM_CHAT_INTRADAY,
-                    # v8.5 (Phase 3.1 remediation): pass the gate only when
-                    # env flag enabled; when disabled, scanner behaves
-                    # exactly as pre-3.1 (always full-post).
-                    post_gate_fn=(_continuous_post_gate if _cflow_gate_enabled else None),
                 )
-                if _cflow_gate_enabled:
-                    log.info("Phase 3.1: continuous flow sub-gate ENABLED")
-                else:
-                    log.info("Phase 3.1: continuous flow sub-gate disabled "
-                             "(set CONTINUOUS_FLOW_SUB_GATE_ENABLED=true to enable)")
             except Exception as _e:
                 log.warning(f"Phase 2 streaming init failed: {_e}")
 
