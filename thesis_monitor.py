@@ -223,7 +223,12 @@ class ActiveTrade:
     stop_level: float
     trade_id: str = field(default_factory=lambda: str(uuid.uuid4())[:12])
     targets: list = field(default_factory=list)  # [float] — next S/R levels
-    status: str = "OPEN"  # OPEN / SCALED / TRAILED / CLOSED / INVALIDATED
+    status: str = "OPEN"  # SHADOW / OPEN / SCALED / TRAILED / CLOSED / INVALIDATED
+    # v8.5 Phase 3: SHADOW = system-generated conviction tracking entry (for
+    # Google Sheets edge analysis, NOT the user's position). Intentionally
+    # excluded from the ("OPEN", "SCALED", "TRAILED") tuple checks (~14 sites)
+    # that drive active-trade behavior — that exclusion is how SHADOW stays
+    # silent. Do not add SHADOW to those tuples.
     entry_time: float = 0.0       # monotonic — in-process only
     entry_epoch: float = 0.0      # time.time() — survives restart
     entry_time_str: str = ""
@@ -1806,6 +1811,12 @@ class ThesisMonitorEngine:
                        round(spot * (1 + mult * 0.02), 2)]
 
         now = time.monotonic()
+        # v8.5 Phase 3: conviction trades are always SHADOW. They're tracked
+        # internally for Google Sheets edge analysis but are NOT the user's
+        # position. The user's actual positions come from /hold, portfolio
+        # entries, and other manual trade paths, which remain status="OPEN".
+        # Thesis daemon gates on subscription presence (not on trade status),
+        # so SHADOW trades silently feed stats without driving any alerts.
         trade = ActiveTrade(
             ticker=ticker,
             direction=direction,
@@ -1813,7 +1824,7 @@ class ThesisMonitorEngine:
             entry_price=spot,
             stop_level=stop,
             targets=targets,
-            status="OPEN",
+            status="SHADOW",
             entry_time=now,
             entry_epoch=time.time(),
             entry_time_str=datetime.now().strftime("%H:%M:%S CT"),
@@ -3878,8 +3889,9 @@ def _trade_quality_badge(trade) -> str:
     return "⚠️"
 
 class ThesisMonitorDaemon:
-    def __init__(self, engine, get_spot_fn, post_fn):
+    def __init__(self, engine, get_spot_fn, post_fn, chat_id=""):
         self.engine = engine; self.get_spot = get_spot_fn; self.post_fn = post_fn
+        self.chat_id = chat_id   # v8.5 Phase 3: used by subscription gate in _poll_cycle
         self._enabled = True; self._thread = None; self._stop_event = threading.Event()
         self._last_phase = ""
         self._digest_fired: set = set()  # "PHASE:YYYY-MM-DD" keys — prevents re-firing same phase same day
@@ -3925,39 +3937,42 @@ class ThesisMonitorDaemon:
                 self._fire_phase_digest(current_phase, tp["label"])
             self._last_phase = current_phase
         slow = (self._cycle_count % self._slow_n == 0)
+
+        # v8.5 Phase 3: subscription-gated evaluation.
+        # Thesis daemon evaluates a ticker ONLY IF:
+        #   (a) user has a /daytrade subscription on this ticker, OR
+        #   (b) a real (non-SHADOW) OPEN/SCALED/TRAILED trade exists.
+        # /conviction subscriptions do NOT enable thesis evaluation — they're
+        # flow-only by design. SHADOW trades (conviction tracking entries)
+        # don't count either — they're stats-only, not user positions.
+        try:
+            from subscriptions import get_subscription_manager
+            _sm = get_subscription_manager()
+        except Exception:
+            _sm = None
+
         for ticker in self.engine.get_monitored_tickers():
             fast = ticker.upper() in MONITOR_FAST_POLL_TICKERS
             if not fast and not slow: continue
+
+            # Phase 3 GATE
+            _has_daytrade = bool(_sm and self.chat_id
+                                 and _sm.has_daytrade(self.chat_id, ticker))
+            _has_real_trade = False
+            state = self.engine.get_state(ticker)
+            if state:
+                _has_real_trade = any(
+                    t.status in ("OPEN", "SCALED", "TRAILED")
+                    for t in state.active_trades
+                )
+            if not _has_daytrade and not _has_real_trade:
+                continue
+
             thesis = self.engine.get_thesis(ticker)
+            if not thesis and not _has_real_trade:
+                # No thesis AND no real trade — nothing to evaluate
+                continue
 
-            # v8.3.2 Fix (post-review): For non-SPY/QQQ tickers, only evaluate
-            # when an active trade exists. This preserves exit logic for any
-            # open position on any ticker while eliminating thesis-phase/level
-            # alert noise from the other 33 tickers.
-            #
-            # Prior behavior (pre-fix): every cycle, every ticker in the watchlist
-            # evaluated and posted priority≥4 alerts → Alpha SPY Omega flood.
-            # First revert (MONITOR_FAST_POLL_TICKERS=["SPY","QQQ"]) only changed
-            # poll rate, not the post-gate — cooldown cap (5min) still let 35×
-            # tickers fire 7 alerts/min in an active session.
-            # This fix: non-SPY/QQQ tickers skip entirely unless they have trades.
-            if not fast:
-                state = self.engine.get_state(ticker)
-                _has_active = (state and any(
-                    t.status in ("OPEN", "SCALED", "TRAILED")
-                    for t in state.active_trades))
-                if not _has_active:
-                    continue
-
-            # Issue 1: Don't skip tickers without thesis if they have active trades
-            # (conviction trades create state but may not have thesis)
-            if not thesis:
-                state = self.engine.get_state(ticker)
-                has_active = state and any(
-                    t.status in ("OPEN", "SCALED", "TRAILED")
-                    for t in state.active_trades)
-                if not has_active:
-                    continue
             try:
                 price = self.get_spot(ticker)
                 if not price or price <= 0: continue
@@ -4466,7 +4481,7 @@ def _pg_close(trade):
 # ────────────────────────────────────────────────────────────────────────────
 
 def init_daemon(get_spot_fn, post_fn=None, store_get_fn=None, store_set_fn=None,
-                get_bars_fn=None, intraday_post_fn=None):
+                get_bars_fn=None, intraday_post_fn=None, chat_id=""):
     """Initialise and start the thesis monitor daemon.
 
     Args:
@@ -4480,6 +4495,10 @@ def init_daemon(get_spot_fn, post_fn=None, store_get_fn=None, store_set_fn=None,
         store_get_fn:      Redis get callable
         store_set_fn:      Redis set callable
         get_bars_fn:       callable(ticker, resolution, countback) -> dict
+        chat_id:           v8.5 Phase 3 — user's chat ID for subscription gate.
+                           When set, _poll_cycle uses SubscriptionManager.has_daytrade
+                           to decide whether to evaluate each ticker. Empty string
+                           falls back to real-trade-only evaluation (Phase 2 behavior).
     """
     global _monitor_daemon
     _monitor_engine._store_get = store_get_fn; _monitor_engine._store_set = store_set_fn
@@ -4492,5 +4511,6 @@ def init_daemon(get_spot_fn, post_fn=None, store_get_fn=None, store_set_fn=None,
         log.info("Thesis monitor: routing all alerts to INTRADAY channel")
     else:
         log.warning("Thesis monitor: intraday_post_fn not set — posting to main channel (legacy mode)")
-    _monitor_daemon = ThesisMonitorDaemon(_monitor_engine, get_spot_fn, effective_post_fn)
+    _monitor_daemon = ThesisMonitorDaemon(_monitor_engine, get_spot_fn, effective_post_fn,
+                                          chat_id=chat_id)
     _monitor_daemon.start(); log.info("Thesis monitor daemon initialized"); return _monitor_daemon
