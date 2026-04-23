@@ -1,6 +1,23 @@
 # app.py
 # NOTE: Educational/demo code. Not financial advice. Use at your own risk.
 #
+# v8.5 Phase 3.5 (Scorer Audit endpoint — read-only diagnostic):
+#   - app.py: new Flask route /scorer_audit (GET). Reads scorer_decisions.csv
+#     and joins against trade_journal entries to quantify the gap between
+#     "scorer decision=post" and "trade actually opened". Purely additive —
+#     reads two existing data stores and returns JSON. Does not modify any
+#     trading path, scorer logic, or journal. Safe to query during market
+#     hours. Returns:
+#       • summary: by-decision and by-outcome tallies
+#       • post_to_trade: N scorer posts vs N trades actually fired + ratio
+#       • top_drop_reasons: top rejection reasons ranked by frequency
+#       • gaps_per_ticker_bias_date: rows where scorer said post but no
+#         trade fired, with journal outcomes (rejected, pending, duplicate)
+#       • by_ticker: per-ticker breakdown of post / log_only / discard /
+#         trades_fired / scorer_posts_no_trade
+#     Query params: days (default 3, max 30), ticker (optional filter).
+#     Zero risk to v8.3, v8.4, or any trading path.
+#
 # v8.5 Phase 3.4 (Silent-thesis fallback + logging cleanup + flow expiry):
 #   - app.py:_get_0dte_chain: expanded fallback so tickers without 0DTE
 #     chains (AMD, ARM, BA, CAT, COIN, ~21 of 33 FLOW_TICKERS) use the
@@ -12600,6 +12617,234 @@ def journal_view():
 
         return jsonify(result)
     except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ═══════════════════════════════════════════════════════════
+# v8.5 Phase 3.5: SCORER AUDIT
+# ═══════════════════════════════════════════════════════════
+# Joins scorer_decisions.csv (what the scorer decided) against the
+# trade_journal (what actually fired) so you can see the gap between
+# "decision=post" rows and trades that hit Telegram.
+#
+# The scorer saying "post" is only one of several gates. Downstream,
+# check_ticker has to find a valid debit spread; otherwise the signal
+# is rejected with a reason (drift, no valid spread, duplicate, etc.).
+# This audit reconstructs that full pipeline per-signal.
+#
+# Pure read-only. Never blocks trading. Always wrapped in try/except
+# so a malformed CSV or Redis hiccup can't break the endpoint.
+# ═══════════════════════════════════════════════════════════
+
+@app.route("/scorer_audit", methods=["GET"])
+def scorer_audit():
+    """Forensic scorer audit — maps CSV post decisions to actual trade outcomes.
+
+    Query params:
+        days:   lookback in days (default: 3, max: 30)
+        ticker: optional ticker filter (e.g. ticker=SPY)
+
+    Returns JSON with:
+        summary:  counts by decision and by final outcome
+        gaps:     signals where scorer said "post" but no trade fired
+        by_ticker: per-ticker post-vs-trade breakdown
+        discards: per-gate counts (G1/G2/G3) and per-reason counts
+
+    Examples:
+        /scorer_audit              — last 3 trading days
+        /scorer_audit?days=7       — last 7 days
+        /scorer_audit?ticker=SPY   — SPY only, last 3 days
+
+    Trading-critical paths (v8.3 options_engine_v3, v8.4 income_scanner,
+    conviction_scorer fire logic) are NOT touched. This is read-only
+    reporting over existing CSV and Redis state.
+    """
+    try:
+        days = min(int(request.args.get("days", 3)), 30)
+        ticker_filter = (request.args.get("ticker") or "").upper().strip() or None
+
+        # ── 1. Load scorer_decisions.csv rows for window ──
+        from datetime import timedelta
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        csv_path = os.path.join(AUTO_LOG_DIR, "scorer_decisions.csv")
+
+        scorer_rows = []
+        if os.path.exists(csv_path):
+            try:
+                with open(csv_path, "r", encoding="utf-8", newline="") as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        _ts = (row.get("timestamp_utc") or "").strip()
+                        if not _ts:
+                            continue
+                        try:
+                            _tsd = datetime.fromisoformat(_ts.replace("Z", "+00:00"))
+                        except Exception:
+                            continue
+                        if _tsd < cutoff:
+                            continue
+                        if ticker_filter and (row.get("ticker") or "").upper() != ticker_filter:
+                            continue
+                        scorer_rows.append(row)
+            except Exception as _csv_err:
+                log.warning(f"scorer_audit: CSV read failed: {_csv_err}")
+
+        # ── 2. Load trade_journal signal entries for window ──
+        journal_entries = []
+        try:
+            _date_from = cutoff.strftime("%Y-%m-%d")
+            journal_entries = trade_journal.query_journal(
+                entry_type="signal",
+                ticker=ticker_filter,
+                date_from=_date_from,
+                limit=5000,  # 5000 > any realistic N-day signal volume
+            ) or []
+        except Exception as _jq_err:
+            log.warning(f"scorer_audit: journal query failed: {_jq_err}")
+
+        # ── 3. Tallies ──
+        summary = {
+            "total_evaluated": len(scorer_rows),
+            "by_decision": {"post": 0, "log_only": 0, "discard": 0, "other": 0},
+            "hard_gate_discards": {"G1": 0, "G2": 0, "G3": 0, "other": 0},
+            "journal_outcomes": {},
+        }
+        for r in scorer_rows:
+            d = (r.get("decision") or "").lower()
+            if d in summary["by_decision"]:
+                summary["by_decision"][d] += 1
+            else:
+                summary["by_decision"]["other"] += 1
+            if d == "discard":
+                g = (r.get("hard_gate") or "").strip()
+                if g in summary["hard_gate_discards"]:
+                    summary["hard_gate_discards"][g] += 1
+                else:
+                    summary["hard_gate_discards"]["other"] += 1
+
+        for e in journal_entries:
+            o = (e.get("outcome") or "unknown").lower()
+            summary["journal_outcomes"][o] = summary["journal_outcomes"].get(o, 0) + 1
+
+        # ── 4. Gap analysis: decision=post rows by ticker/bias/date ──
+        # Match against journal by (ticker, bias, date) — imperfect but good
+        # enough because scorer posts and journal signals fire close in time.
+        post_keys = {}  # (ticker, bias, date) -> list of scorer rows
+        for r in scorer_rows:
+            if (r.get("decision") or "").lower() != "post":
+                continue
+            _ts = (r.get("timestamp_utc") or "")[:10]  # YYYY-MM-DD
+            key = (r.get("ticker", "").upper(), r.get("bias", "").lower(), _ts)
+            post_keys.setdefault(key, []).append(r)
+
+        journal_keys = {}  # (ticker, bias, date) -> list of journal entries
+        for e in journal_entries:
+            key = (
+                (e.get("ticker") or "").upper(),
+                (e.get("bias") or "").lower(),
+                (e.get("date") or "")[:10],
+            )
+            journal_keys.setdefault(key, []).append(e)
+
+        # For each scorer post, find what happened in the journal
+        gaps = []
+        for key, scorer_list in post_keys.items():
+            ticker_k, bias_k, date_k = key
+            journal_match = journal_keys.get(key, [])
+            outcomes = [
+                (j.get("outcome"), j.get("reason"))
+                for j in journal_match
+            ]
+            # A scorer "post" becomes a real trade when the journal has at
+            # least one "trade_opened" for that (ticker, bias, date).
+            had_trade = any(o == "trade_opened" for o, _ in outcomes)
+            rejection_reasons = [r for o, r in outcomes if o == "rejected" and r]
+            pending_reasons = [r for o, r in outcomes if o == "pending" and r]
+            duplicate_reasons = [r for o, r in outcomes if o == "duplicate"]
+
+            if not had_trade:
+                gaps.append({
+                    "ticker": ticker_k,
+                    "bias": bias_k,
+                    "date": date_k,
+                    "scorer_posts": len(scorer_list),
+                    "scorer_scores": [int(r.get("score") or 0) for r in scorer_list],
+                    "journal_outcomes": [o for o, _ in outcomes] or ["NO_JOURNAL_ENTRY"],
+                    "rejection_reasons": rejection_reasons[:3],  # cap noise
+                    "pending_reasons": pending_reasons[:3],
+                    "duplicate_count": len(duplicate_reasons),
+                })
+
+        # ── 5. Per-ticker breakdown ──
+        by_ticker = {}
+        for r in scorer_rows:
+            t = (r.get("ticker") or "").upper()
+            d = (r.get("decision") or "").lower()
+            if t not in by_ticker:
+                by_ticker[t] = {"post": 0, "log_only": 0, "discard": 0,
+                                "trades_fired": 0, "scorer_posts_no_trade": 0}
+            if d in ("post", "log_only", "discard"):
+                by_ticker[t][d] += 1
+
+        for key, j_list in journal_keys.items():
+            t = key[0]
+            if t not in by_ticker:
+                continue
+            for j in j_list:
+                if j.get("outcome") == "trade_opened":
+                    by_ticker[t]["trades_fired"] += 1
+
+        for key, s_list in post_keys.items():
+            t = key[0]
+            if t not in by_ticker:
+                continue
+            j_match = journal_keys.get(key, [])
+            if not any(j.get("outcome") == "trade_opened" for j in j_match):
+                by_ticker[t]["scorer_posts_no_trade"] += len(s_list)
+
+        # ── 6. Build response ──
+        scorer_post_count = summary["by_decision"]["post"]
+        trade_opened_count = summary["journal_outcomes"].get("trade_opened", 0)
+        post_to_trade_ratio = (
+            round(trade_opened_count / scorer_post_count, 2)
+            if scorer_post_count > 0 else None
+        )
+
+        # Aggregate reasons across all gap rows (top reasons)
+        all_reasons = {}
+        for g in gaps:
+            for r in g["rejection_reasons"] + g["pending_reasons"]:
+                # Normalize reason to first 50 chars so near-duplicates bucket
+                key = (r or "")[:50]
+                if not key:
+                    continue
+                all_reasons[key] = all_reasons.get(key, 0) + 1
+        top_reasons = sorted(all_reasons.items(), key=lambda x: -x[1])[:15]
+
+        result = {
+            "window": {
+                "days": days,
+                "cutoff_utc": cutoff.isoformat(),
+                "ticker_filter": ticker_filter,
+            },
+            "summary": summary,
+            "post_to_trade": {
+                "scorer_said_post": scorer_post_count,
+                "trades_actually_opened": trade_opened_count,
+                "ratio": post_to_trade_ratio,
+                "gap_count": len(gaps),
+            },
+            "top_drop_reasons": [
+                {"reason": k, "count": v} for k, v in top_reasons
+            ],
+            "gaps_per_ticker_bias_date": sorted(
+                gaps, key=lambda g: g["date"], reverse=True
+            )[:100],  # cap to first 100, newest first
+            "by_ticker": by_ticker,
+        }
+        return jsonify(result)
+    except Exception as e:
+        log.warning(f"scorer_audit: endpoint error: {e}")
         return jsonify({"error": str(e)}), 500
 
 
