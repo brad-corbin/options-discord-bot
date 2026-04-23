@@ -65,11 +65,18 @@ FILTERS: List[Tuple[str, Callable[[dict], bool], str]] = [
     ("macd_hist_negative", lambda r: _t(r.get("macd_hist_negative")),
                            "Weekly MACD hist < 0 at signal"),
     ("bar_green",          lambda r: _t(r.get("bar_green")),
-                           "Signal-week close > open (confirming reversal)"),
+                           "Signal-bar close > open (confirming reversal)"),
     ("not_chop",           lambda r: str(r.get("regime_trend","")).strip() != "CHOP",
                            "Regime != CHOP at entry"),
     ("bull_regime",        lambda r: str(r.get("regime_trend","")).strip().startswith("BULL"),
                            "Regime in BULL_BASE or BULL_TRANSITION"),
+    # v8.2 (Patch 3): Potter Box confluence. Only populated in bt_marketcipher_daily
+    # output; on weekly CSVs these fields don't exist and the filter returns False
+    # for every row (no effect on stacks where it's not used).
+    ("near_potter_floor_2pct", lambda r: _t(r.get("near_potter_floor_2pct")),
+                               "Signal within 2% of a historical Potter Box floor"),
+    ("near_potter_floor_5pct", lambda r: _t(r.get("near_potter_floor_5pct")),
+                               "Signal within 5% of a historical Potter Box floor"),
 ]
 
 
@@ -352,7 +359,8 @@ def write_report(results: List[dict], baseline: dict, rows: List[dict],
 def main():
     ap = argparse.ArgumentParser(description="Filter stack analysis on MC weekly trades.csv")
     ap.add_argument("--csv", type=Path, default=DEFAULT_CSV)
-    ap.add_argument("--out-dir", type=Path, default=DEFAULT_OUT)
+    ap.add_argument("--out-dir", type=Path, default=None,
+                    help="Output dir for analysis files. Defaults to --csv's parent dir.")
     ap.add_argument("--min-n", type=int, default=100,
                     help="Minimum signals in bucket to qualify (default 100)")
     args = ap.parse_args()
@@ -366,6 +374,12 @@ def main():
     with open(args.csv) as f:
         rows = list(csv.DictReader(f))
     print(f"  {len(rows)} rows loaded")
+
+    # v8.2 (Patch 3): if --out-dir not provided, derive from csv parent
+    # so running on /tmp/backtest_mc_daily/trades.csv writes analysis
+    # files to /tmp/backtest_mc_daily, not /tmp/backtest_mc_weekly.
+    if args.out_dir is None:
+        args.out_dir = args.csv.parent
 
     baseline = _stats(rows, "BASELINE")
     print(f"  baseline: WR {baseline['win_rate_pct']}%, "
