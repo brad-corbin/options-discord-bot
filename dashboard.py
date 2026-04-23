@@ -571,20 +571,27 @@ def _get_oi_snapshot(ticker: str) -> Dict[str, Any]:
 
 
 def _get_flow_snapshot(ticker: str) -> Dict[str, Any]:
-    """Read latest flow direction for a ticker."""
+    """Read latest flow direction for a ticker.
+
+    v8.5 (Phase 3.4): surface `expiry` so the Signal Log flow_conviction
+    detail can include contract-date context. oi_flow.save_flow_direction
+    already persists it (oi_flow.py:1210); this reader just hadn't been
+    returning it.
+    """
+    empty = {"time": "", "direction": "none", "notional": 0, "expiry": ""}
     try:
         fd = _persistent_state.get_flow_direction(ticker) or {}
     except Exception as e:
         log.debug(f"dashboard: flow direction read failed for {ticker}: {e}")
-        return {"time": "", "direction": "none", "notional": 0}
+        return empty
 
     if not fd:
-        return {"time": "", "direction": "none", "notional": 0}
+        return empty
 
     # Only surface if it's today
     ts = fd.get("time") or fd.get("timestamp") or fd.get("ts")
     if not _is_today_ct(ts):
-        return {"time": "", "direction": "none", "notional": 0}
+        return empty
 
     direction = (fd.get("direction") or "").lower()
     if direction not in ("bullish", "bearish"):
@@ -596,10 +603,13 @@ def _get_flow_snapshot(ticker: str) -> Dict[str, Any]:
     except (TypeError, ValueError):
         notional = 0
 
+    expiry = str(fd.get("expiry") or "")[:10]  # YYYY-MM-DD, truncate if longer
+
     return {
         "time": _fmt_time_ct(ts),
         "direction": direction,
         "notional": notional,
+        "expiry": expiry,
     }
 
 
@@ -878,6 +888,8 @@ def get_ticker_snapshot(ticker: str, pnl_rollup: Optional[Dict[str, float]] = No
         "flow_time": flow["time"],
         "flow_direction": flow["direction"],
         "flow_notional": flow["notional"],
+        # v8.5 (Phase 3.4): contract expiry of the flow event, for Signal Log
+        "flow_expiry": flow.get("expiry", ""),
         "active_scanner": as_sig,
         "thesis_bias": thesis["bias"],
         "thesis_score": thesis["score"],
@@ -1004,10 +1016,25 @@ def _detect_new_signals(ticker: str, snap: Dict[str, Any]) -> List[Dict[str, Any
 
     # Flow conviction transitions
     if _changed("flow_direction") and snap.get("flow_direction") in ("bullish", "bearish"):
+        # v8.5 (Phase 3.4): include contract expiry + DTE so Signal Log rows
+        # capture the trade's time horizon. oi_flow persists expiry in the
+        # flow_direction dict; _get_flow_snapshot now surfaces it. DTE is
+        # computed from today's CT date against the YYYY-MM-DD expiry.
+        _exp = snap.get("flow_expiry", "") or ""
+        _dte_str = ""
+        if _exp:
+            try:
+                from datetime import date as _date
+                _exp_d = _date.fromisoformat(_exp)
+                _today_d = _ct_now().date()
+                _dte = (_exp_d - _today_d).days
+                _dte_str = f" | exp={_exp} ({_dte}DTE)"
+            except Exception:
+                _dte_str = f" | exp={_exp}"
         events.append({
             "signal_type": "flow_conviction",
             "direction": snap["flow_direction"],
-            "detail": f"notional=${snap.get('flow_notional', 0):,}",
+            "detail": f"notional=${snap.get('flow_notional', 0):,}{_dte_str}",
         })
 
     # OI confirmation transitions
