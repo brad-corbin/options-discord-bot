@@ -885,7 +885,15 @@ class DataRouter:
                     or "404 Not Found" in _emsg
                 )
                 if _is_expected:
-                    log.debug(f"Schwab {method_name} returned {_emsg[:80]} — using MarketData fallback")
+                    # v8.5 (Phase 3.4): upgraded from DEBUG → INFO. The 400 /
+                    # 404 / "no contracts found" path IS the common case (e.g.
+                    # single names with no 0DTE), but visibility matters:
+                    # without it we couldn't tell whether Schwab or MarketData
+                    # was the one returning 404 on the log you actually see.
+                    # Still no error state — just "Schwab said no, trying
+                    # MarketData." If noise becomes a problem, move back to
+                    # DEBUG with a counter that INFO-summarizes once per minute.
+                    log.info(f"Schwab {method_name} returned {_emsg[:80]} — using MarketData fallback")
                 else:
                     log.warning(f"Schwab {method_name} failed, falling back to MarketData: {e}")
 
