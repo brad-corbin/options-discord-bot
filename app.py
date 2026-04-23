@@ -1,6 +1,39 @@
 # app.py
 # NOTE: Educational/demo code. Not financial advice. Use at your own risk.
 #
+# v8.5 Phase 3.4 (Silent-thesis fallback + logging cleanup + flow expiry):
+#   - app.py:_get_0dte_chain: expanded fallback so tickers without 0DTE
+#     chains (AMD, ARM, BA, CAT, COIN, ~21 of 33 FLOW_TICKERS) use the
+#     NEAREST future expiration instead of returning (None, None, None).
+#     Root cause (confirmed from 4/23 Render log): Schwab returns 400/404/
+#     "no contracts" for same-day on tickers without 0DTE → fallback to
+#     MarketData → MarketData also 404s → function exited. The existing
+#     nearest-expiration fallback only ran on the no-data path, not the
+#     exception path, so transient errors bypassed fallback entirely.
+#     Silent thesis should now build for ALL 33 FLOW_TICKERS, with thesis
+#     sourced from nearest-weekly for non-0DTE names. Trade-critical paths
+#     (v8.3 options_engine_v3, v8.4 income_scanner, conviction scorer) do
+#     NOT use this function — they fetch chains at the concrete trade
+#     expiration through separate paths. Zero risk to pricing-critical code.
+#   - app.py:_generate_silent_thesis: log.debug → log.warning on exception.
+#     Phase 3.4 fallback should make these rare; remaining warnings point
+#     to real issues (auth, rate limits).
+#   - app.py:_generate_all_silent_theses: bare `except: pass` replaced with
+#     log.warning. Second swallow layer removed.
+#   - schwab_adapter.py:_try_schwab_first: DEBUG → INFO on expected-fallback
+#     path (400/404/no-contracts). Visibility without behavior change —
+#     without this, we couldn't tell if Schwab or MarketData was returning
+#     the 404 you saw in the log.
+#   - dashboard.py:_get_flow_snapshot: now surfaces `expiry` from the Redis
+#     flow_direction blob (oi_flow already persists it).
+#   - dashboard.py:_detect_new_signals flow_conviction event: detail string
+#     now includes `| exp=YYYY-MM-DD (NDTE)` so Signal Log captures time
+#     horizon of the flow event. Answers "is this imminent or 2-week?"
+#   - app.py:_flush_wave_digest: suppressed "── Skipped ──" section of the
+#     AS Signal Digest. User trust-confirmed continuous AS runtime post-
+#     v5 deploy; skipped-ticker summary is noise at this point. Log
+#     counter retained for audit; Telegram post no longer shows it.
+#
 # v8.5 Phase 3.3 (Dashboard + Signal Log data completeness):
 #   - oi_flow.py: `save_flow_direction` now includes `notional`; previously
 #     the dict omitted it so Dashboard "Flow Notional" column AND Signal Log
@@ -3337,8 +3370,15 @@ def _flush_wave_digest():
             skipped_lines.append(f"  ❌ {ticker} T{tier} {dir_emoji} {conf_str} — {reason}")
 
     lines = []
-    if digest_lines or pending_lines or skipped_lines:
-        lines.append(f"📊 SIGNAL DIGEST ({len(digest_lines)} trades, {len(pending_lines)} pending, {len(skipped_lines)} skipped)")
+    # v8.5 (Phase 3.4): suppress "Skipped" section in the Signal Digest.
+    # User confirmed trust that Active Scanner is continuously running in
+    # v5 deploy, so the skipped-ticker summary is noise at this point —
+    # it was useful during early monitoring and is kept in the log counter
+    # below for audit but no longer posted to Telegram. Header count also
+    # no longer shows "skipped" since it would mislead (count still runs,
+    # just not shown). digest_lines and pending_lines are preserved intact.
+    if digest_lines or pending_lines:
+        lines.append(f"📊 SIGNAL DIGEST ({len(digest_lines)} trades, {len(pending_lines)} pending)")
         lines.append("")
         if digest_lines:
             lines.append("── Trades ──")
@@ -3347,10 +3387,6 @@ def _flush_wave_digest():
             lines.append("")
             lines.append("── Pending / Recheck ──")
             lines.extend(pending_lines)
-        if skipped_lines:
-            lines.append("")
-            lines.append("── Skipped ──")
-            lines.extend(skipped_lines)
         lines.append("")
         lines.append("💡 Use /tradecard TICKER for full card")
 
@@ -7803,32 +7839,69 @@ def _chain_cache_set(ticker: str, expiry: str, data, spot: float):
 
 
 def _get_0dte_chain(ticker: str, target_date_str: str = None) -> tuple:
-    try:
-        today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        target = target_date_str or today_utc
-        cached = _chain_cache_get(ticker, target)
+    # v8.5 (Phase 3.4): expanded fallback so that tickers without 0DTE chains
+    # (AMD, ARM, BA, CAT, COIN, etc. — ~21 of the 33 FLOW_TICKERS) pick up the
+    # NEAREST future expiration instead of returning (None, None, None) and
+    # leaving silent thesis unbuilt. Behavior change is scoped to the six
+    # callers of this function: silent thesis, full EM card, ATM option
+    # data for premium stop, and the next-day-preview EM. Does NOT touch
+    # v8.3 options_engine_v3, v8.4 income_scanner, or the conviction scorer
+    # — those use their own chain-fetch paths tied to the concrete trade
+    # expiration, not 0DTE.
+    today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    target = target_date_str or today_utc
+
+    def _fetch_and_return(exp_str: str):
+        """Inner helper: fetch chain for a specific expiration, return
+        (data, spot, exp_str) or None on no-data. Raises on real errors."""
+        cached = _chain_cache_get(ticker, exp_str)
         if cached:
             return cached
-        spot = get_spot(ticker)
-        data = _cached_md.get_chain(ticker, target, strike_limit=20)  # v5.1.1: strikeLimit saves credits
-        if not isinstance(data, dict) or data.get("s") != "ok" or not data.get("optionSymbol"):
+        _spot = get_spot(ticker)
+        _data = _cached_md.get_chain(ticker, exp_str, strike_limit=20)
+        if (not isinstance(_data, dict)
+                or _data.get("s") != "ok"
+                or not _data.get("optionSymbol")):
+            return None
+        _chain_cache_set(ticker, exp_str, _data, _spot)
+        return (_data, _spot, exp_str)
+
+    try:
+        # Primary: requested expiration (usually today = 0DTE)
+        result = _fetch_and_return(target)
+        if result is not None:
+            return result
+        # Fallback path 1 — requested expiration had no data. Find nearest
+        # future expiration. This is the existing behavior from pre-3.4.
+        try:
+            exps = get_expirations(ticker)
+        except Exception as _ee:
+            log.debug(f"get_expirations failed for {ticker}: {_ee}")
+            exps = []
+        future_exps = [e for e in exps if e >= target]
+        if future_exps:
+            result = _fetch_and_return(future_exps[0])
+            if result is not None:
+                return result
+        return None, None, None
+    except Exception as e:
+        # v8.5 (Phase 3.4): on exception, ALSO try the nearest-future-expiration
+        # fallback before giving up. Previously the except path returned
+        # (None, None, None) unconditionally, so any transient error on the
+        # primary call skipped fallback entirely — which is what was causing
+        # 21 tickers to miss silent-thesis generation.
+        log.warning(f"Chain fetch failed for {ticker} (primary={target}): {e}")
+        try:
             exps = get_expirations(ticker)
             future_exps = [e for e in exps if e >= target]
-            if not future_exps:
-                return None, None, None
-            target = future_exps[0]
-            cached = _chain_cache_get(ticker, target)
-            if cached:
-                return cached
-            data = _cached_md.get_chain(ticker, target, strike_limit=20)  # v5.1.1: strikeLimit saves credits
-            if not isinstance(data, dict) or data.get("s") != "ok":
-                return None, None, None
-        if not data.get("optionSymbol"):
-            return None, None, None
-        _chain_cache_set(ticker, target, data, spot)
-        return data, spot, target
-    except Exception as e:
-        log.warning(f"Chain fetch failed for {ticker}: {e}")
+            if future_exps:
+                alt = future_exps[0]
+                log.info(f"Chain fetch: retrying {ticker} with nearest future expiry {alt}")
+                result = _fetch_and_return(alt)
+                if result is not None:
+                    return result
+        except Exception as e2:
+            log.debug(f"Chain fetch fallback also failed for {ticker}: {e2}")
         return None, None, None
 
 
@@ -9873,7 +9946,13 @@ def _generate_silent_thesis(ticker: str):
         return True
 
     except Exception as e:
-        log.debug(f"Silent thesis generation failed for {ticker}: {e}")
+        # v8.5 (Phase 3.4): upgraded from log.debug → log.warning so silent
+        # thesis failures become visible in Render logs. Paired with the
+        # _get_0dte_chain nearest-expiry fallback that should now keep
+        # failures rare — after Phase 3.4 deploy, any remaining warnings
+        # here point to real issues (auth, rate limits, malformed chains),
+        # not the expected "ticker has no 0DTE" case.
+        log.warning(f"Silent thesis generation failed for {ticker}: {e}")
         return False
 
 
@@ -9896,8 +9975,10 @@ def _generate_all_silent_theses():
             if _generate_silent_thesis(ticker):
                 count += 1
             time.sleep(1.5)  # rate limit: ~23 tickers/min
-        except Exception:
-            pass
+        except Exception as _ste:
+            # v8.5 (Phase 3.4): was bare `except: pass` — swallowed errors
+            # outside the inner try/except. Now visible at WARN.
+            log.warning(f"Silent thesis loop exception for {ticker}: {_ste}")
     log.info(f"Silent thesis generation complete: {count} generated, {skipped} already had EM cards")
 
 
