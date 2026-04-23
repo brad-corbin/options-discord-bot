@@ -90,6 +90,18 @@ try:
 except ImportError as e:
     log.error(f"Cannot import active_scanner._compute_ema: {e}"); sys.exit(1)
 
+# v8.2 (Patch 3): Potter Box confluence — optional. If unavailable, filter
+# fields stay at defaults (False / 0.0) and filter just becomes a no-op.
+try:
+    from potter_box import detect_boxes as _pb_detect_boxes
+    _HAS_POTTER_BOX = True
+    log.info("Loaded potter_box.detect_boxes — near_potter_floor filter enabled")
+except ImportError as _e:
+    _HAS_POTTER_BOX = False
+    _pb_detect_boxes = None
+    log.warning(f"potter_box not available ({_e}) — filter disabled, all signals will show "
+                "near_potter_floor=False")
+
 
 # ═══════════════════════════════════════════════════════════
 # CONSTANTS (daily-scale)
@@ -160,6 +172,13 @@ class MCSignal:
     above_weekly_200sma: bool = False
     bar_green: bool = False
     confluence_score: int = 0
+
+    # v8.2 (Patch 3): Potter Box confluence
+    nearest_potter_floor: float = 0.0          # price of closest historical box floor
+    pct_from_potter_floor: float = 0.0         # signed: + = above floor, − = below
+    near_potter_floor_2pct: bool = False       # |pct| <= 2
+    near_potter_floor_5pct: bool = False       # |pct| <= 5 (looser variant)
+    potter_floors_in_history: int = 0          # how many historical floors existed at signal time
 
     regime_trend: str = ""
     regime_vol: str = ""
@@ -339,6 +358,61 @@ def _detect_red_dots_daily(wt1, wt2, daily_bars) -> List[int]:
 
 
 # ═══════════════════════════════════════════════════════════
+# v8.2 (Patch 3): Potter Box confluence helpers
+# ═══════════════════════════════════════════════════════════
+
+def _compute_potter_floors(daily_bars: List[dict], ticker: str
+                           ) -> List[Tuple[int, float]]:
+    """Return list of (end_idx, floor_price) for all Potter Boxes formed
+    on this ticker's daily bars. Returns [] if potter_box unavailable or
+    no boxes detected.
+
+    We key by end_idx (walk-forward safety): a box's floor is only KNOWN
+    to exist after the box closes. For signal at daily index t, only
+    floors where end_idx < t are "historical known support."
+    """
+    if not _HAS_POTTER_BOX or _pb_detect_boxes is None:
+        return []
+    try:
+        boxes = _pb_detect_boxes(daily_bars, ticker)
+    except Exception as e:
+        log.debug(f"{ticker}: potter_box.detect_boxes failed: {e}")
+        return []
+    out: List[Tuple[int, float]] = []
+    for b in boxes or []:
+        try:
+            end_idx = int(b.get("end_idx", -1))
+            floor = float(b.get("floor", 0.0))
+            if end_idx >= 0 and floor > 0:
+                out.append((end_idx, floor))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _nearest_historical_floor(floors: List[Tuple[int, float]],
+                              signal_idx: int, signal_close: float
+                              ) -> Tuple[float, float, int]:
+    """Return (nearest_floor_price, pct_from_floor_signed, n_historical_floors).
+
+    - nearest_floor_price: 0.0 if none
+    - pct_from_floor_signed: (signal_close - floor) / floor * 100
+      (positive = signal above floor; negative = below)
+    - n_historical_floors: count of boxes with end_idx < signal_idx
+
+    Walk-forward safe: only considers boxes that closed before signal_idx.
+    """
+    if not floors or signal_close <= 0:
+        return 0.0, 0.0, 0
+    candidates = [f for (e, f) in floors if e < signal_idx and f > 0]
+    if not candidates:
+        return 0.0, 0.0, 0
+    best = min(candidates, key=lambda f: abs(signal_close - f))
+    pct = (signal_close - best) / best * 100.0
+    return best, pct, len(candidates)
+
+
+# ═══════════════════════════════════════════════════════════
 # PER-TICKER BACKTEST
 # ═══════════════════════════════════════════════════════════
 
@@ -381,6 +455,9 @@ def run_ticker(ticker: str, daily_bars: List[dict],
     if not green:
         return out
 
+    # v8.2 (Patch 3): compute Potter Box floors once for this ticker
+    potter_floors = _compute_potter_floors(daily_bars, ticker)
+
     active_until = -1
 
     for g_idx in green:
@@ -422,6 +499,13 @@ def run_ticker(ticker: str, daily_bars: List[dict],
 
         stop = ep - DAILY_ATR_STOP_MULT * atr
 
+        # v8.2 (Patch 3): Potter Box confluence — distance to nearest
+        # historical floor. Uses signal-bar close, walk-forward-safe.
+        pf_nearest, pf_pct, pf_count = _nearest_historical_floor(
+            potter_floors, g_idx, bar_c)
+        near_pf_2 = (pf_nearest > 0) and (abs(pf_pct) <= 2.0)
+        near_pf_5 = (pf_nearest > 0) and (abs(pf_pct) <= 5.0)
+
         regime_info = regime_map.get(entry_bar.get("date", ""), {})
         row = MCSignal(
             ticker=ticker,
@@ -440,6 +524,11 @@ def run_ticker(ticker: str, daily_bars: List[dict],
             above_weekly_200sma=bool(above200),
             bar_green=bool(bar_g),
             confluence_score=int(conf),
+            nearest_potter_floor=round(pf_nearest, 4),
+            pct_from_potter_floor=round(pf_pct, 4),
+            near_potter_floor_2pct=bool(near_pf_2),
+            near_potter_floor_5pct=bool(near_pf_5),
+            potter_floors_in_history=int(pf_count),
             regime_trend=regime_info.get("trend", "UNKNOWN"),
             regime_vol=regime_info.get("vol", "UNKNOWN"),
             stop_initial=round(stop, 4),
@@ -675,6 +764,10 @@ def write_report(rows, out_dir, n_tickers, start_s, end_s):
         ("macd_hist_negative", lambda r: r.macd_hist_negative),
         ("above_200sma", lambda r: r.above_weekly_200sma),
         ("bar_green", lambda r: r.bar_green),
+        # v8.2 (Patch 3): Potter Box confluence rows
+        ("near_potter_floor_2pct", lambda r: r.near_potter_floor_2pct),
+        ("near_potter_floor_5pct", lambda r: r.near_potter_floor_5pct),
+        ("bar_green & near_pf_2pct", lambda r: r.bar_green and r.near_potter_floor_2pct),
         ("confluence_score >= 2", lambda r: r.confluence_score >= 2),
         ("confluence_score >= 3", lambda r: r.confluence_score >= 3),
         ("confluence_score >= 4", lambda r: r.confluence_score >= 4),
