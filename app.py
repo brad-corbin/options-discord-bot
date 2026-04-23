@@ -2,6 +2,15 @@
 # NOTE: Educational/demo code. Not financial advice. Use at your own risk.
 #
 # v8.5 Phase 3.5 (Scorer Audit endpoint — read-only diagnostic):
+#   3.5.1 hotfix: adds a `_diagnostics` block to /scorer_audit response.
+#   When the endpoint returns empty or sparse results, _diagnostics now
+#   surfaces: CSV file path, exists/size/mtime, total rows in file vs
+#   rows in window vs parse errors, env state (AUTO_LOG_DIR,
+#   AUTO_LOG_ENABLE, CONVICTION_SCORER_ENABLED), and plain-text hints
+#   explaining why the result is what it is. No behavior change to
+#   the actual audit query or any trading path — purely diagnostic.
+#   Motivated by a zero-return where journal had 16 entries but CSV
+#   read came back empty with no indication why.
 #   - app.py: new Flask route /scorer_audit (GET). Reads scorer_decisions.csv
 #     and joins against trade_journal entries to quantify the gap between
 #     "scorer decision=post" and "trade actually opened". Purely additive —
@@ -12636,6 +12645,54 @@ def journal_view():
 # so a malformed CSV or Redis hiccup can't break the endpoint.
 # ═══════════════════════════════════════════════════════════
 
+# v8.5 Phase 3.5.1 hotfix: hints helper — interprets diagnostic signals
+# and returns plain-text notes so you don't have to reason about empty
+# counters. Separate function keeps the route body focused.
+def _scorer_audit_hints(csv_diag, summary, journal_entries):
+    hints = []
+    if not csv_diag.get("exists"):
+        hints.append(
+            f"scorer_decisions.csv NOT FOUND at {csv_diag.get('path_checked')}. "
+            "Either the CSV was never written (check CONVICTION_SCORER_ENABLED "
+            "and AUTO_LOG_ENABLE env vars) OR the disk isn't persistent — "
+            "Render wipes non-persistent-disk files on every deploy. If you "
+            "just deployed, the CSV will only contain signals evaluated since "
+            "deploy. If AUTO_LOG_DIR points at /mnt/data, make sure that's a "
+            "mounted persistent disk on Render."
+        )
+    elif csv_diag.get("size_bytes", 0) == 0:
+        hints.append("scorer_decisions.csv exists but is empty (0 bytes).")
+    elif csv_diag.get("rows_in_file_total", 0) == 0:
+        hints.append(
+            "scorer_decisions.csv has a header but no data rows. Either the "
+            "scorer path hasn't fired since the last deploy/truncation, or "
+            "CONVICTION_SCORER_ENABLED is false."
+        )
+    elif csv_diag.get("rows_in_window", 0) == 0:
+        hints.append(
+            f"CSV has {csv_diag['rows_in_file_total']} total rows but none "
+            f"are within the lookback window. File mtime was "
+            f"{csv_diag.get('mtime_utc')}. Try widening with ?days=14 or ?days=30."
+        )
+
+    # Journal-side hints
+    if summary.get("journal_outcomes") and summary["by_decision"].get("post", 0) == 0:
+        outcomes = summary["journal_outcomes"]
+        j_total = sum(outcomes.values())
+        if j_total > 0:
+            hints.append(
+                f"Trade journal has {j_total} signal entries but scorer CSV "
+                "has 0 in window. These signals bypassed the scorer path "
+                "(flow_conviction, direct conviction play, or some other "
+                "non-scorer route). Check trading_rules.py for what paths "
+                "write to the journal without going through the scorer."
+            )
+
+    if not hints:
+        hints.append("Diagnostics nominal — results reflect real scorer activity.")
+    return hints
+
+
 @app.route("/scorer_audit", methods=["GET"])
 def scorer_audit():
     """Forensic scorer audit — maps CSV post decisions to actual trade outcomes.
@@ -12664,30 +12721,59 @@ def scorer_audit():
         ticker_filter = (request.args.get("ticker") or "").upper().strip() or None
 
         # ── 1. Load scorer_decisions.csv rows for window ──
+        # v8.5 Phase 3.5.1 hotfix: track counters so a zero result surfaces
+        # WHY in the diagnostics block rather than silently returning 0.
         from datetime import timedelta
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
         csv_path = os.path.join(AUTO_LOG_DIR, "scorer_decisions.csv")
 
         scorer_rows = []
-        if os.path.exists(csv_path):
-            try:
+        csv_diag = {
+            "path_checked": csv_path,
+            "exists": False,
+            "size_bytes": 0,
+            "mtime_utc": None,
+            "rows_in_file_total": 0,
+            "rows_in_window": 0,
+            "rows_filtered_out_old": 0,
+            "rows_filtered_out_ticker": 0,
+            "parse_errors": 0,
+            "read_exception": None,
+        }
+        try:
+            if os.path.exists(csv_path):
+                csv_diag["exists"] = True
+                csv_diag["size_bytes"] = os.path.getsize(csv_path)
+                try:
+                    csv_diag["mtime_utc"] = datetime.fromtimestamp(
+                        os.path.getmtime(csv_path), tz=timezone.utc
+                    ).isoformat()
+                except Exception:
+                    pass
                 with open(csv_path, "r", encoding="utf-8", newline="") as f:
                     reader = csv.DictReader(f)
                     for row in reader:
+                        csv_diag["rows_in_file_total"] += 1
                         _ts = (row.get("timestamp_utc") or "").strip()
                         if not _ts:
+                            csv_diag["parse_errors"] += 1
                             continue
                         try:
                             _tsd = datetime.fromisoformat(_ts.replace("Z", "+00:00"))
                         except Exception:
+                            csv_diag["parse_errors"] += 1
                             continue
                         if _tsd < cutoff:
+                            csv_diag["rows_filtered_out_old"] += 1
                             continue
                         if ticker_filter and (row.get("ticker") or "").upper() != ticker_filter:
+                            csv_diag["rows_filtered_out_ticker"] += 1
                             continue
                         scorer_rows.append(row)
-            except Exception as _csv_err:
-                log.warning(f"scorer_audit: CSV read failed: {_csv_err}")
+                csv_diag["rows_in_window"] = len(scorer_rows)
+        except Exception as _csv_err:
+            csv_diag["read_exception"] = str(_csv_err)
+            log.warning(f"scorer_audit: CSV read failed: {_csv_err}")
 
         # ── 2. Load trade_journal signal entries for window ──
         journal_entries = []
@@ -12841,6 +12927,23 @@ def scorer_audit():
                 gaps, key=lambda g: g["date"], reverse=True
             )[:100],  # cap to first 100, newest first
             "by_ticker": by_ticker,
+            # v8.5 Phase 3.5.1 hotfix: diagnostics block tells you WHY a
+            # zero / small result is zero / small before you guess at it.
+            "_diagnostics": {
+                "csv": csv_diag,
+                "env": {
+                    "AUTO_LOG_DIR": AUTO_LOG_DIR,
+                    "AUTO_LOG_ENABLE": AUTO_LOG_ENABLE,
+                    "CONVICTION_SCORER_ENABLED": os.getenv(
+                        "CONVICTION_SCORER_ENABLED", "true"
+                    ).strip().lower() == "true",
+                },
+                "journal": {
+                    "signal_entries_in_window": len(journal_entries),
+                    "outcomes_distribution": summary["journal_outcomes"],
+                },
+                "hints": _scorer_audit_hints(csv_diag, summary, journal_entries),
+            },
         }
         return jsonify(result)
     except Exception as e:
