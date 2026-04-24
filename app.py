@@ -9543,6 +9543,11 @@ def _log_em_prediction(ticker: str, session: str, spot: float, em: dict, bias: d
             "local_resistance_sources": struct.get("local_resistance_sources"),
             "local_support_sources": struct.get("local_support_sources"),
             "structure_confluence": struct.get("structure_confluence"),
+            # v8.3: GEX polarity + gamma flip distance for launch studies
+            "gex_value": eng.get("gex", 0),
+            "gex_sign": "positive" if eng.get("gex", 0) >= 0 else "negative",
+            "dex_value": eng.get("dex", 0),
+            "gamma_flip_distance": (spot - (struct.get("gamma_flip") or eng.get("flip_price") or spot)) if spot else 0,
             "cagf_direction": (cagf or {}).get("direction"),
             "cagf_regime": (cagf or {}).get("regime"),
             "trend_day_probability": (cagf or {}).get("trend_day_probability"),
@@ -9565,6 +9570,7 @@ def _log_em_prediction(ticker: str, session: str, spot: float, em: dict, bias: d
             "pin_zone_low","pin_zone_high","pivot","r1","s1","r2","s2","swing_high","swing_low",
             "fib_resistance","fib_support","vp_resistance","vp_support","vpoc","local_resistance_1","local_support_1",
             "local_resistance_sources","local_support_sources","structure_confluence",
+            "gex_value","gex_sign","dex_value","gamma_flip_distance",
             "cagf_direction","cagf_regime","trend_day_probability",
             "vol_regime_label","vol_regime_base","vol_caution_score","vol_transition_warning","vol_term_structure","vol_vvix","vol_size_mult"
         ]
