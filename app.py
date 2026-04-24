@@ -1,6 +1,64 @@
 # app.py
 # NOTE: Educational/demo code. Not financial advice. Use at your own risk.
 #
+# v8.5 Phase 3.6 (Scorer is authoritative + signal-only cards):
+#   Problem solved: scorer=post signals were silently dying in three places:
+#     (1) _um_apply_effective_regime_gate_to_rec with requires_trigger=True
+#         when raw regime UNKNOWN or spot inside balance zone → pending
+#     (2) _apply_final_trade_gate blocking on EV/confidence/win-prob math
+#         that disagreed with scorer's validated directional call
+#     (3) "No valid spreads across any expiration" when a clean debit
+#         spread couldn't be built — rejected with no card, no context
+#   On 4/23 this killed all 7 scorer=post events (SOXX, NVDA x2, QQQ x4).
+#   User saw zero cards; signals landed in pending digests as one-liners.
+#
+#   Fix (check_ticker, four edits):
+#     - Patch 1: has_confirmed_trigger = True when conviction_decision=="post".
+#       Scorer (572K backtest, +8.75 WR at score≥70) is authoritative. The
+#       older structure-trigger heuristic and requires_trigger defaults were
+#       unvalidated overrides — they no longer veto scorer-post decisions.
+#       Non-scorer paths (manual /check, swing, rechecks) unchanged.
+#     - Patch 2: _apply_final_trade_gate becomes informational warnings
+#       (not blocks) for scorer-post signals. Trade metadata stashes
+#       final_gate_warning; flow continues.
+#     - Patch 3: "No valid spreads" → for scorer-post, build a signal-only
+#       card via _build_signal_only_card with vehicle hints (long call,
+#       long put, shares, LEAP, etc.) derived from scorer breakdown +
+#       vol regime + spread-failure reasons. Posts to main Telegram channel.
+#       Banner: "🔍 SCORER SIGNAL — NO STANDARD SPREAD / FIND BETTER TRADE VEHICLE"
+#     - Patch 4 (new helper): _build_signal_only_card + _vehicle_hints_from_context.
+#       Hints heuristics: B8 blue-sky → long call/shares; B1 breakout
+#       imminent → wait for break then shares/ITM; B9 rejection → long put;
+#       B7 near-pivot → shares or ITM long; else review chain. Adds
+#       OI/width/vol-regime warnings from spread-attempt reasons.
+#
+#   Phase 3.6 Fix 1 (digest line cosmetic):
+#     Signal-only cards previously showed "✅ POSTED ⬆️" in the wave digest,
+#     identical to real trade entries — misleading since no entry was taken.
+#     _process_job now propagates `signal_only=True` from the check_ticker
+#     return onto the wave result. _flush_wave_digest tags these distinctly:
+#       🔍 TICKER T2 🐂 72/100 — SIGNAL ONLY ⬆️ (find vehicle)
+#     vs. the real-trade line:
+#       ✅ TICKER T2 🐂 72/100 — POSTED ⬆️
+#
+#   Phase 3.6 Fix 2 (audit dedup on exception):
+#     Prior ordering wrote the signal_no_vehicle audit row BEFORE attempting
+#     _build_signal_only_card. On card-build failure, the fallthrough wrote
+#     a second `rejected` audit row — two entries for one signal. Reordered:
+#     build the card first, write the audit row only on success and return.
+#     On build failure, fall through clean to the original rejection path
+#     which writes exactly one `rejected` audit row. One signal = one row.
+#
+#   What stays hard-gated (unchanged):
+#     - is_duplicate_trade dedup window (no spam)
+#     - _validate_live_signal STALE_SIGNAL / HARD_BLOCK (signal integrity)
+#     - Scorer G1/G2/G3 hard gates (the actual ruleset, not defaults)
+#     - v7 filter, CAGF, PIN/CHOP regime, pre-chain gate
+#
+#   Zero new env vars. No schema changes. Rollback: revert file.
+#   Journal adds new outcome "signal_no_vehicle" for signal-only cards.
+#   _log_signal_dataset_event writes same outcome for dataset tracking.
+#
 # v8.5 Phase 3.5 (Scorer Audit endpoint — read-only diagnostic):
 #   3.5.1 hotfix: adds a `_diagnostics` block to /scorer_audit response.
 #   When the endpoint returns empty or sparse results, _diagnostics now
@@ -3384,6 +3442,13 @@ def _flush_wave_digest():
                 # Original pre-2B behavior: digest-only (user must /tradecard).
                 # Keeps backtest-unvalidated swing signals from spamming main.
                 digest_lines.append(f"  📋 {ticker} T{tier} {dir_emoji} {conf_str} — /tradecard {ticker}")
+            elif r.get("signal_only"):
+                # v8.5 (Phase 3.6, Fix 1): signal-only card was posted to main
+                # channel because scorer said post but no standard spread fit.
+                # Tag distinctly so the digest doesn't misleadingly claim an
+                # entry was taken.
+                immediate_cards.append(card)
+                digest_lines.append(f"  🔍 {ticker} T{tier} {dir_emoji} {conf_str} — SIGNAL ONLY ⬆️ (find vehicle)")
             else:
                 # Scorer/tv path — backtest-validated at score ≥70. Auto-post.
                 immediate_cards.append(card)
@@ -4648,6 +4713,12 @@ def _process_job(worker_id: int, job: dict):
         card_text = rec.get("card")
         base["outcome"] = "trade"
         base["card"]    = card_text
+        # v8.5 (Phase 3.6, Fix 1): propagate signal_only flag so the wave digest
+        # can distinguish "real trade entered" from "signal-only card posted
+        # because no standard spread fit" — avoids the misleading "POSTED ⬆️"
+        # label on signal-only cards.
+        if rec.get("signal_only"):
+            base["signal_only"] = True
         _record_wave_result(base)
         log.info(f"TV winner queued for digest: {ticker} {bias} T{tier_label} conf={rec.get('confidence')}/100")
 
@@ -6734,6 +6805,149 @@ def _build_pending_trade_card(best_rec: dict, signal_validation: dict | None, pe
     return "\n".join([x for x in prefix_lines if x]).strip() + "\n\n" + card
 
 
+# v8.5 (Phase 3.6): Signal-only card for scorer-post signals where no
+# standard debit spread is viable. The scorer already validated the
+# directional setup; we surface the signal context and suggest alternative
+# trade vehicles (long option, shares, LEAP) rather than silently killing
+# the signal with "No valid spreads across any expiration".
+def _vehicle_hints_from_context(bias: str, breakdown: dict, vol_regime: dict,
+                                 signal_validation: dict,
+                                 all_reasons: list) -> list:
+    """Build 2-3 vehicle hints based on scorer reasons, vol regime, and
+    why spreads failed. Returns list of hint strings."""
+    hints = []
+    b = breakdown or {}
+    bias = str(bias or "bull").lower()
+    vol_label = str((vol_regime or {}).get("label") or "").upper()
+
+    # Primary hint based on strongest scorer reason
+    if b.get("B8"):  # bull blue-sky / bear capitulation above-all-resistance
+        if bias == "bull":
+            if vol_label in ("ELEVATED", "CRISIS"):
+                hints.append("📈 Long call with tight stop — momentum in elevated vol; spreads drain theta")
+            else:
+                hints.append("📈 Long call or shares — blue-sky breakout, no clean short strike for spread")
+        else:
+            hints.append("📉 Long put or short shares — breakdown with no clean long strike for spread")
+    elif b.get("B1"):  # Potter Box breakout imminent
+        hints.append("⏱️ Consider waiting for confirmed break of box edge, then shares or ITM directional")
+    elif b.get("B9"):  # bear rejection zone
+        hints.append("📉 Long put — rejection zone, limited upside for put spread")
+    elif b.get("B7"):  # near pivot resistance / support
+        hints.append("📈 Shares or ITM long call — near-pivot move; spread width too narrow for clean R:R"
+                     if bias == "bull"
+                     else "📉 Shares or ITM long put — near-pivot move; spread width too narrow for clean R:R")
+    else:
+        hints.append("🔍 Review chain — standard spread not viable; consider long single-leg or shares")
+
+    # Secondary hint from spread-failure reasons
+    _reason_blob = " | ".join(all_reasons or []).lower()
+    if "insufficient liquidity" in _reason_blob or "open interest" in _reason_blob:
+        hints.append("⚠️ OI/liquidity thin — use limits only, small size, wide B/A caution")
+    elif "width" in _reason_blob or "ror" in _reason_blob:
+        hints.append("⚠️ Spread R:R insufficient — long single-leg may have better risk profile")
+    elif "itm" in _reason_blob:
+        hints.append("⚠️ Not enough ITM strikes — dealer pin likely, consider shares over options")
+
+    # Vol regime note
+    if vol_label == "CRISIS":
+        hints.append("🚨 CRISIS vol — reduce size 50%, tight stops, fast exits")
+    elif vol_label == "ELEVATED":
+        hints.append("🌡️ Elevated IV — premium expensive; prefer shares or deep ITM")
+
+    return hints[:4]
+
+
+def _build_signal_only_card(ticker: str, direction: str, spot: float,
+                             webhook_data: dict, signal_validation: dict,
+                             structure_ctx: dict, vol_regime: dict,
+                             v4_flow: dict, all_reasons: list,
+                             expirations_checked: int) -> str:
+    """Build a signal-context card when scorer said post but no spread builds.
+    Banner flags as needing better vehicle selection. Caller posts to main
+    Telegram channel."""
+    webhook_data = webhook_data or {}
+    sv = signal_validation or {}
+    sc = structure_ctx or {}
+    vr = vol_regime or {}
+
+    score = webhook_data.get("conviction_score")
+    reasons = webhook_data.get("conviction_reasons") or []
+    breakdown = webhook_data.get("conviction_breakdown") or {}
+    pb_state = webhook_data.get("pb_state") or "—"
+    cb_side = webhook_data.get("cb_side") or "—"
+    wave_label = webhook_data.get("pb_wave_label") or "—"
+    diamond = bool(webhook_data.get("diamond") or False)
+
+    dir_emoji = "🐂" if direction == "bull" else "🐻"
+    dir_text = direction.upper()
+
+    lines = []
+    lines.append(f"🔍 SCORER SIGNAL — NO STANDARD SPREAD")
+    lines.append(f"⚠️ *FIND BETTER TRADE VEHICLE*")
+    lines.append("")
+    lines.append(f"{dir_emoji} *{ticker}* {dir_text} — spot ${spot:.2f}"
+                 + (f" 💎" if diamond else ""))
+    if score is not None:
+        lines.append(f"Conviction score: {score}/100")
+    lines.append("")
+
+    # Why the scorer said post
+    if reasons:
+        lines.append("*Why scorer posted:*")
+        for r in reasons[:4]:
+            lines.append(f"  • {r}")
+        lines.append("")
+
+    # Context snapshot
+    ctx_bits = []
+    if pb_state and pb_state != "—":
+        ctx_bits.append(f"PB: {pb_state}")
+    if cb_side and cb_side != "—":
+        ctx_bits.append(f"CB: {cb_side}")
+    if wave_label and wave_label != "—":
+        ctx_bits.append(f"wave: {wave_label}")
+    if vr.get("label"):
+        ctx_bits.append(f"vol: {vr.get('label')}")
+    if v4_flow and v4_flow.get("composite_regime"):
+        ctx_bits.append(f"v4: {v4_flow.get('composite_regime')}")
+    if ctx_bits:
+        lines.append("*Context:* " + " | ".join(ctx_bits))
+
+    # Structure levels
+    ps = (sc or {}).get("price_structure") or {}
+    ls = ps.get("local_support_1"); lr = ps.get("local_resistance_1")
+    if ls or lr:
+        sp_bits = []
+        if ls: sp_bits.append(f"S ${ls:.2f}")
+        if lr: sp_bits.append(f"R ${lr:.2f}")
+        lines.append(f"*Structure:* " + " / ".join(sp_bits))
+    lines.append("")
+
+    # Vehicle hints
+    hints = _vehicle_hints_from_context(direction, breakdown, vol_regime,
+                                        signal_validation, all_reasons)
+    if hints:
+        lines.append("*Vehicle options:*")
+        for h in hints:
+            lines.append(f"  {h}")
+        lines.append("")
+
+    # Why spreads didn't build
+    if all_reasons:
+        lines.append(f"*Spread attempts ({expirations_checked} DTE checked):*")
+        for r in all_reasons[:3]:
+            lines.append(f"  ❌ {r}")
+
+    # Validation note if any
+    vn = sv.get("card_note")
+    if vn:
+        lines.append("")
+        lines.append(vn)
+
+    return "\n".join(lines).strip()
+
+
 def check_ticker(ticker, direction="bull", webhook_data=None):
     ticker = ticker.strip().upper()
     webhook_data = webhook_data or {"bias": direction, "tier": "2"}
@@ -6860,6 +7074,50 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
             combined_reason = "No valid spreads across any expiration"
             if all_reasons:
                 combined_reason += "\n" + "\n".join(all_reasons[:4])
+            # v8.5 (Phase 3.6): For scorer-post signals, do NOT silently reject.
+            # Build a signal-only card with vehicle hints and post to main channel.
+            # Scorer already validated the setup; we just can't fit a standard spread.
+            #
+            # v8.5 (Phase 3.6, Fix 2): ordering matters for audit cleanliness.
+            # Build the card FIRST. On success, write a single `signal_no_vehicle`
+            # audit entry and return. On failure, fall through to the original
+            # rejection path which writes a single `rejected` entry. Either way
+            # the audit log gets exactly one row — not two.
+            _scorer_post_nospread = str((webhook_data or {}).get("conviction_decision", "")).lower() == "post"
+            if _scorer_post_nospread:
+                try:
+                    signal_card = _build_signal_only_card(
+                        ticker=ticker, direction=direction, spot=spot,
+                        webhook_data=webhook_data, signal_validation=signal_validation,
+                        structure_ctx=structure_ctx, vol_regime=vol_regime,
+                        v4_flow=v4_flow, all_reasons=all_reasons,
+                        expirations_checked=len(chains),
+                    )
+                    # Card built successfully — now write audit (once).
+                    trade_journal.log_signal(ticker, webhook_data, outcome="signal_no_vehicle",
+                                             reason=combined_reason[:200],
+                                             confidence=(webhook_data or {}).get("conviction_score"))
+                    _log_signal_dataset_event(ticker, webhook_data, outcome="signal_no_vehicle",
+                                              reason=combined_reason,
+                                              signal_validation=signal_validation,
+                                              regime=regime, v4_flow=v4_flow, spot=spot,
+                                              expirations_checked=len(chains),
+                                              vol_regime=vol_regime)
+                    log.info(f"[scorer-post] {ticker} signal-only card built (no spread) — "
+                             f"score={(webhook_data or {}).get('conviction_score')}")
+                    return {
+                        "ticker": ticker, "ok": True, "posted": True,
+                        "card": signal_card,
+                        "reason": "signal-only: find better trade vehicle",
+                        "confidence": (webhook_data or {}).get("conviction_score"),
+                        "signal_only": True,
+                    }
+                except Exception as _sox_err:
+                    log.error(f"[scorer-post] {ticker} signal-only card build failed: {_sox_err}",
+                              exc_info=True)
+                    # Fall through to original rejection path — no audit row written
+                    # yet, so the fallthrough's log_signal call produces the single
+                    # audit entry for this signal.
             trade_journal.log_signal(ticker, webhook_data, outcome="rejected", reason=combined_reason[:200])
             _log_signal_dataset_event(ticker, webhook_data, outcome="rejected_no_setup", reason=combined_reason, signal_validation=signal_validation, regime=regime, v4_flow=v4_flow, spot=spot, expirations_checked=len(chains), vol_regime=vol_regime)
             return {"ticker": ticker, "ok": False, "posted": False,
@@ -6937,10 +7195,19 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
                 "reason": pending_reason, "confidence": best_rec.get("confidence")
             }
 
+        # v8.5 (Phase 3.6): Scorer-post is authoritative for entry validity.
+        # Rationale: the conviction scorer (v8.3, Phase 4 backtest: 572K trades,
+        # +8.75 WR lift at score≥70) IS the entry-validity model. The older
+        # structure-trigger heuristic (_derive_structure_trigger) and
+        # effective-regime requires_trigger gate are unvalidated defaults from
+        # earlier pipeline epochs. When they disagree with a scorer=post decision,
+        # the scorer wins. Non-scorer paths (manual /check, swing, rechecks) still
+        # require trigger confirmation because they have no scorer behind them.
+        _scorer_post_auth = str((webhook_data or {}).get("conviction_decision", "")).lower() == "post"
         has_confirmed_trigger = bool(
             (webhook_data or {}).get("source") != "check"
             and (signal_validation or {}).get("ok")
-            and trigger_eval.get("confirmed")
+            and (trigger_eval.get("confirmed") or _scorer_post_auth)
         )
         eff_allowed, eff_reason, best_rec = _um_apply_effective_regime_gate_to_rec(
             best_rec,
@@ -7005,6 +7272,16 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
             return {"ticker": ticker, "ok": False, "posted": True, "card": card, "reason": eff_reason, "confidence": best_rec.get("confidence")}
 
         final_allowed, final_reason, best_rec = _apply_final_trade_gate(best_rec, mode="scalp")
+        # v8.5 (Phase 3.6): For scorer-post signals, post-overlay EV/confidence/win-prob
+        # checks become informational warnings, NOT blocks. The scorer (572K backtest)
+        # validated the setup; spread-level math shouldn't silently kill it.
+        # Non-scorer paths still hard-gate on these checks.
+        _scorer_post_final = str((webhook_data or {}).get("conviction_decision", "")).lower() == "post"
+        if not final_allowed and _scorer_post_final:
+            # Demote block to warning. Let the trade flow through.
+            best_rec["final_gate_warning"] = final_reason
+            log.info(f"[scorer-post] {ticker} final_gate demoted to warning: {final_reason}")
+            final_allowed = True  # proceed as if allowed
         if not final_allowed:
             best_rec["ok"] = False
             best_rec["reason"] = final_reason
