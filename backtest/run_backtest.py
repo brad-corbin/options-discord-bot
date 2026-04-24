@@ -495,19 +495,11 @@ def ensure_bars_dir():
         print(f"[bars] WARNING: {BARS_DIR} empty and {BARS_ARCHIVE} not found")
 
 def parse_ts_ct(s):
-    # Accept "YYYY-MM-DD HH:MM:SS", "YYYY-MM-DDTHH:MM:SS", with optional fractional seconds.
+    # ISO 8601 including timezone offset (e.g. 2026-04-17T08:30:00-05:00).
+    # Python 3.11+ fromisoformat handles this natively.
     s = s.strip()
-    if "T" in s:
-        s = s.replace("T", " ")
-    # Strip any timezone suffix
-    if "+" in s:
-        s = s.split("+", 1)[0]
-    if s.endswith("Z"):
-        s = s[:-1]
-    # Split off fractional seconds if present
-    if "." in s:
-        s = s.split(".", 1)[0]
-    return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+    dt = datetime.fromisoformat(s)
+    return dt.replace(tzinfo=None)
 
 def load_bars_for(ticker, date_str):
     path = os.path.join(BARS_DIR, f"{ticker}_{date_str}.csv")
