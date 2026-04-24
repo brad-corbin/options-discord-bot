@@ -1,4 +1,5 @@
 # app.py
+# GitHub Desktop workflow test - 2026-04-23
 # NOTE: Educational/demo code. Not financial advice. Use at your own risk.
 #
 # v8.5 Phase 3.6 (Scorer is authoritative + signal-only cards):
