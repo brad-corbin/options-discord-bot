@@ -10036,6 +10036,49 @@ def _post_em_card(ticker: str, session: str):
         )
         # ─────────────────────────────────────────────────────────────────────
 
+        # ─────────────────────────────────────────────────────────────────────
+        # v8.3 (Paper Trade Tag): eyeball marker for the 2:45 CT overnight
+        # 1-DTE trade study. Filter:
+        #   - is_afternoon (afternoon/next-day-preview card)
+        #   - ticker in (SPY, QQQ)
+        #   - cagf.direction in (STRONG UPSIDE, UPSIDE)
+        #   - cagf.regime == STRONG TREND / EXPLOSIVE
+        #   - bias.score >= 1
+        # Env-gated: set PAPER_TRADE_TAG_ENABLED=1 to show the tag.
+        # Shows nothing when fewer than 2 conditions match (noise suppression).
+        # Wrapped in try/except — cannot break card rendering.
+        # ─────────────────────────────────────────────────────────────────────
+        if os.getenv("PAPER_TRADE_TAG_ENABLED", "0") == "1" and is_afternoon:
+            try:
+                _pt_cagf = cagf or {}
+                _pt_regime = (_pt_cagf.get("regime") or "").strip()
+                _pt_dir    = (_pt_cagf.get("direction") or "").strip()
+                _pt_bias   = int((bias or {}).get("score", 0))
+                _pt_ticker = (ticker or "").upper()
+
+                _pt_checks = [
+                    ("ticker SPY/QQQ",      _pt_ticker in ("SPY", "QQQ")),
+                    ("regime STRONG TREND", _pt_regime == "STRONG TREND / EXPLOSIVE"),
+                    ("cagf UPSIDE",         _pt_dir in ("STRONG UPSIDE", "UPSIDE")),
+                    ("bias >= +1",          _pt_bias >= 1),
+                ]
+                _pt_hits = sum(1 for _, ok in _pt_checks if ok)
+                _pt_total = len(_pt_checks)
+
+                if _pt_hits == _pt_total:
+                    lines.append(f"🟢 PAPER TRADE SETUP — {_pt_hits}/{_pt_total} ✓")
+                elif _pt_hits >= 2:
+                    _pt_missing = ", ".join(name for name, ok in _pt_checks if not ok)
+                    lines.append(f"⚪ paper trade setup — {_pt_hits}/{_pt_total} (missing: {_pt_missing})")
+                # else: 0-1 matches, stay silent (not a relevant setup to flag)
+
+                log.debug(
+                    f"Paper trade tag: {_pt_ticker} | hits={_pt_hits}/{_pt_total} | "
+                    f"regime={_pt_regime!r} dir={_pt_dir!r} bias={_pt_bias:+d}"
+                )
+            except Exception as _pt_e:
+                log.debug(f"Paper trade tag failed for {ticker}: {_pt_e}")
+                
         lines += ["═" * 32, "", f"💡 {iv_note}", "— Not financial advice —"]
 
         log.info(f"EM snapshot built: {ticker} | {session_label} | spot={spot} | IV={iv_pct:.1f}% | "
