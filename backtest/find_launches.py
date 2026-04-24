@@ -22,9 +22,11 @@ RECON_PATH = "/tmp/recon.tsv"
 
 # --- tuning knobs -----------------------------------------------------------
 MOVE_THRESHOLD_DOLLARS = 3.0        # $3+ move qualifies
-WINDOWS_MIN = [5, 10, 15, 30]       # look-forward windows in minutes
-MAX_ADV_RATIO = 1.0                 # adverse move must be < MAX_ADV_RATIO * favorable
-                                    # (we want clean runs, not chop)
+WINDOWS_MIN = [10, 15, 30, 60, 120] # look-forward windows in minutes
+                                    # (user: "$3+ in <2 hours is viable")
+MAX_ADV_RATIO = 0.5                 # adverse move before peak must stay below
+                                    # MAX_ADV_RATIO * favorable. 0.5 = "clean scalp":
+                                    # no more than half the move's size as pre-move chop.
 DEDUP_SKIP_BARS = 30                # after a launch fires, skip this many bars
 # ----------------------------------------------------------------------------
 
@@ -558,7 +560,7 @@ def extract_features(launch, thesis_row=None, em_1sd=None):
     f["upper_wick_pct"] = (upper_wick / rng) if rng > 1e-6 else 0.0
     f["lower_wick_pct"] = (lower_wick / rng) if rng > 1e-6 else 0.0
 
-    # --- volume anomaly vs recent 20 bars ---
+    # --- volume anomaly vs recent 20 bars, also 10 bars ---
     lookback = bars[max(0, i-20):i]
     vols = [b[5] for b in lookback if b[5] > 0]
     if vols:
@@ -566,6 +568,13 @@ def extract_features(launch, thesis_row=None, em_1sd=None):
         f["vol_ratio_20"] = v / mean_v if mean_v > 0 else 1.0
     else:
         f["vol_ratio_20"] = 1.0
+    lookback10 = bars[max(0, i-10):i]
+    vols10 = [b[5] for b in lookback10 if b[5] > 0]
+    if vols10:
+        mean_v10 = sum(vols10) / len(vols10)
+        f["vol_ratio_10"] = v / mean_v10 if mean_v10 > 0 else 1.0
+    else:
+        f["vol_ratio_10"] = 1.0
 
     # --- range anomaly vs recent 20 bars ---
     ranges = [(b[2] - b[3]) for b in lookback if (b[2] - b[3]) > 0]
@@ -590,11 +599,12 @@ def extract_features(launch, thesis_row=None, em_1sd=None):
     f["break_low_15"]  = 1 if c < min_low_last_n(15)  else 0
     f["break_low_30"]  = 1 if c < min_low_last_n(30)  else 0
 
-    # --- prior drift (was price already moving?) ---
+    # --- prior drift (was price already moving?) — 5, 10, 15 min lookback ---
     def drift_over(n):
         if i < n: return None
         return c - bars[i-n][4]
     f["drift_5m"]  = drift_over(5)
+    f["drift_10m"] = drift_over(10)
     f["drift_15m"] = drift_over(15)
 
     # --- time of day (minutes since 08:30 CT open) ---
@@ -777,9 +787,11 @@ def main():
     pct(lambda f: f.get("upper_wick_pct", 0) >= 0.4,       "upper wick >= 40% of range")
     pct(lambda f: f.get("lower_wick_pct", 0) >= 0.4,       "lower wick >= 40% of range")
     print("— Volume / range —")
-    pct(lambda f: f.get("vol_ratio_20", 1) >= 1.5,         "vol_ratio_20 >= 1.5x")
-    pct(lambda f: f.get("vol_ratio_20", 1) >= 2.0,         "vol_ratio_20 >= 2.0x")
-    pct(lambda f: f.get("vol_ratio_20", 1) >= 3.0,         "vol_ratio_20 >= 3.0x")
+    pct(lambda f: f.get("vol_ratio_10", 1) >= 1.5,         "vol_ratio_10 (last 10min) >= 1.5x")
+    pct(lambda f: f.get("vol_ratio_10", 1) >= 2.0,         "vol_ratio_10 (last 10min) >= 2.0x")
+    pct(lambda f: f.get("vol_ratio_20", 1) >= 1.5,         "vol_ratio_20 (last 20min) >= 1.5x")
+    pct(lambda f: f.get("vol_ratio_20", 1) >= 2.0,         "vol_ratio_20 (last 20min) >= 2.0x")
+    pct(lambda f: f.get("vol_ratio_20", 1) >= 3.0,         "vol_ratio_20 (last 20min) >= 3.0x")
     pct(lambda f: f.get("range_ratio_20", 1) >= 1.5,       "range_ratio_20 >= 1.5x")
     pct(lambda f: f.get("range_ratio_20", 1) >= 2.0,       "range_ratio_20 >= 2.0x")
     print("— Breaks —")
