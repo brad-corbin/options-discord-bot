@@ -23,6 +23,8 @@ WHAT IT ADDS vs bt_active.py:
       * Credit spread outcomes at Potter Box boundaries
       * RSI / MACD / EMA / ADX quintile bins for per-indicator WR
   - Same v3_runner-style output: trades.csv + 7 summary CSVs + report.md
+  - Phase 1.3: exits graded from 5-minute bars (not adjusted daily closes)
+  - Phase 1.3: writes backtest_audit.csv so we can prove bars evaluated vs signals fired
   - Resume-from-checkpoint
   - `--all` flag runs all watchlist tickers
 
@@ -244,6 +246,10 @@ class Trade:
     credit_50_win_5d: bool = False
     # ── Confluence bucket label (for summary) ──
     confluence_bucket: str = "none"
+    # ── Data/audit flags ──
+    exit_source: str = "5min_last_close"
+    bad_data_flag: bool = False
+    bad_data_reason: str = ""
 
 
 # ═══════════════════════════════════════════════════════════
@@ -714,69 +720,143 @@ def _classify_confluence(direction, pb_state):
 # MAIN BACKTEST LOOP
 # ═══════════════════════════════════════════════════════════
 
+def _build_intraday_exit_index(bars_by_date: dict) -> tuple[list[str], dict[str, float]]:
+    """Build same-source exit prices from the 5-minute dataset.
+
+    This prevents the old split-adjustment mismatch where entries came from
+    intraday bars but exits came from adjusted daily closes.
+    """
+    dates = sorted(bars_by_date.keys())
+    last_close_by_date: dict[str, float] = {}
+    for d in dates:
+        bars = sorted(bars_by_date.get(d, []), key=lambda b: b.get("ts", 0))
+        if not bars:
+            continue
+        last_close_by_date[d] = float(bars[-1].get("c", 0) or 0)
+    return dates, last_close_by_date
+
+
+def _exit_dates_from_intraday(trade_date: str, intraday_dates: list[str]) -> dict:
+    """Return eod/1d/2d/3d/5d dates using actual intraday trading dates."""
+    labels = {"eod": 0, "1d": 1, "2d": 2, "3d": 3, "5d": 5}
+    out = {}
+    try:
+        idx = intraday_dates.index(trade_date)
+    except ValueError:
+        return {k: "" for k in labels}
+    for label, offset in labels.items():
+        j = idx + offset
+        out[label] = intraday_dates[j] if 0 <= j < len(intraday_dates) else ""
+    return out
+
+
+def _sanity_check_trade_move(entry_price: float, exit_fields: dict) -> tuple[bool, str]:
+    """Flag impossible-looking data without deleting the row."""
+    if entry_price <= 0:
+        return True, "bad_entry_price"
+    reasons = []
+    for lbl in ("eod", "1d", "2d", "3d", "5d"):
+        px = float(exit_fields.get(f"exit_price_{lbl}", 0) or 0)
+        if px <= 0:
+            continue
+        raw_move = abs(px - entry_price) / entry_price * 100.0
+        if raw_move > 60.0:
+            reasons.append(f"{lbl}_raw_move_{raw_move:.1f}%")
+    return (bool(reasons), ";".join(reasons))
+
+
 def run_ticker(ticker: str, intraday: list, daily: list, regime_cache: dict,
-               daily_close_by_date: dict, sorted_dates: list) -> list[Trade]:
+               daily_close_by_date: dict, sorted_dates: list) -> tuple[list[Trade], dict]:
     """Run the active scanner over all 5-min bars for one ticker.
 
-    At each bar (after the first DEDUP_BARS), call detect_signal_backtest
-    with the last 80 bars (same window size as live scanner's countback=80).
-    Exits graded at eod/1d/2d/3d/5d horizons.
+    Phase 1.3 grading fix:
+      - Entry and exit prices now both come from the same 5-minute dataset.
+      - Daily bars are still used for regime/HTF/overlay context only.
+      - Audit counters prove how many bars were evaluated vs final signals.
     """
     trades: list[Trade] = []
     last_sig_bar: dict = {}
 
-    # Group intraday bars by date
+    audit = {
+        "ticker": ticker,
+        "intraday_bars_loaded": len(intraday or []),
+        "daily_bars_loaded": len(daily or []),
+        "market_dates": 0,
+        "bars_evaluated": 0,
+        "no_signal_or_below_threshold": 0,
+        "raw_signals_before_dedup": 0,
+        "deduped_signals_removed": 0,
+        "signals_after_dedup": 0,
+        "regime_valid_true": 0,
+        "regime_valid_false": 0,
+        "final_trades": 0,
+        "missing_5d_exit": 0,
+        "bad_data_flags": 0,
+        "first_date": "",
+        "last_date": "",
+    }
+
     bars_by_date: dict = {}
     for b in intraday:
         bars_by_date.setdefault(b["date"], []).append(b)
+    for d in list(bars_by_date.keys()):
+        bars_by_date[d] = sorted(bars_by_date[d], key=lambda b: b.get("ts", 0))
 
-    # Precompute daily bar index for Potter Box lookup
+    intraday_dates, intraday_last_close_by_date = _build_intraday_exit_index(bars_by_date)
+    audit["market_dates"] = len(intraday_dates)
+    if intraday_dates:
+        audit["first_date"] = intraday_dates[0]
+        audit["last_date"] = intraday_dates[-1]
+
     daily_date_to_idx = {b["date"]: i for i, b in enumerate(daily)}
     swing_highs, swing_lows = _find_swings(daily) if daily else ([], [])
 
     for trade_date in sorted(bars_by_date.keys()):
         day_bars = bars_by_date[trade_date]
         regime = regime_cache.get(trade_date, "BEAR")
-
-        # Daily close series up to the day BEFORE (HTF lookup uses day-before context)
         dc = [daily_close_by_date[d] for d in sorted_dates if d < trade_date]
 
         for i in range(DEDUP_BARS, len(day_bars)):
-            # Scanner uses countback=80 5-min bars — emulate that here
             window_start = max(0, i - 79)
             window = day_bars[window_start: i + 1]
+            if len(window) < 12:
+                continue
 
+            audit["bars_evaluated"] += 1
             sig = detect_signal_backtest(window, dc[-30:], regime, ticker)
             if sig is None:
+                audit["no_signal_or_below_threshold"] += 1
                 continue
 
-            # Dedup
+            audit["raw_signals_before_dedup"] += 1
+
             key = (ticker, sig["bias"])
             if key in last_sig_bar and i - last_sig_bar[key] < DEDUP_BARS:
+                audit["deduped_signals_removed"] += 1
                 continue
             last_sig_bar[key] = i
+            audit["signals_after_dedup"] += 1
 
-            # Ticker-rules regime gate
             try:
                 valid, reason = is_signal_valid_for_regime(
                     ticker, sig["bias"], sig["score"], sig["htf_status"], regime
                 )
             except Exception as e:
                 valid = True; reason = f"rule_check_failed: {e}"
+            if valid:
+                audit["regime_valid_true"] += 1
+            else:
+                audit["regime_valid_false"] += 1
 
             entry_price = sig["close"]
             entry_time_ct = day_bars[i].get("time_ct", "")
 
-            # Exit grading
-            exits = exit_dates_for(trade_date, sorted_dates)
+            exits = _exit_dates_from_intraday(trade_date, intraday_dates)
             exit_fields = {}
             for label, exit_date in exits.items():
-                if exit_date and exit_date in daily_close_by_date:
-                    exit_p = daily_close_by_date[exit_date]
-                    if sig["bias"] == "bull":
-                        pnl = exit_p - entry_price
-                    else:
-                        pnl = entry_price - exit_p
+                exit_p = intraday_last_close_by_date.get(exit_date, 0.0) if exit_date else 0.0
+                if exit_date and exit_p > 0:
+                    pnl = (exit_p - entry_price) if sig["bias"] == "bull" else (entry_price - exit_p)
                     pnl_pct = (pnl / entry_price) * 100 if entry_price > 0 else 0.0
                     exit_fields[f"exit_date_{label}"] = exit_date
                     exit_fields[f"exit_price_{label}"] = round(exit_p, 4)
@@ -787,8 +867,13 @@ def run_ticker(ticker: str, intraday: list, daily: list, regime_cache: dict,
                     exit_fields[f"exit_price_{label}"] = 0.0
                     exit_fields[f"pnl_pct_{label}"] = 0.0
                     exit_fields[f"win_{label}"] = False
+            if not exit_fields.get("exit_date_5d") or exit_fields.get("exit_price_5d", 0) <= 0:
+                audit["missing_5d_exit"] += 1
 
-            # MFE/MAE on entry day (intraday)
+            bad_flag, bad_reason = _sanity_check_trade_move(entry_price, exit_fields)
+            if bad_flag:
+                audit["bad_data_flags"] += 1
+
             remaining = day_bars[i:]
             mfe_pct = 0.0; mae_pct = 0.0
             if remaining and entry_price > 0:
@@ -801,34 +886,26 @@ def run_ticker(ticker: str, intraday: list, daily: list, regime_cache: dict,
                 mfe_pct = (mfe_abs / entry_price) * 100
                 mae_pct = (mae_abs / entry_price) * 100
 
-            # Overlay: Potter Box at signal date (use daily bar index for day BEFORE)
             d_idx = daily_date_to_idx.get(trade_date, -1)
-            pb_lookup_idx = max(0, d_idx - 1)   # previous day's state (to avoid lookahead)
+            pb_lookup_idx = max(0, d_idx - 1)
             pb = _potter_state_at(daily, pb_lookup_idx, ticker, entry_price)
             fib = _fib_state_at(daily, pb_lookup_idx)
             sw = _swing_state_at(daily, pb_lookup_idx, swing_highs, swing_lows) if d_idx > 0 else {"above_pct": 999.0, "below_pct": 999.0}
 
-            # Credit spread sim (only when in_box + have 5d exit)
             cs_short = 0.0
             cs_25_b = "n/a"; cs_25_w = False; cs_50_b = "n/a"; cs_50_w = False
-            if pb["state"] == "in_box" and pb["floor"] > 0 and pb["roof"] > 0 and exit_fields["win_5d"] is not None:
+            if pb["state"] == "in_box" and pb["floor"] > 0 and pb["roof"] > 0:
                 exit_p_5d = exit_fields["exit_price_5d"]
                 if exit_p_5d > 0:
                     if sig["bias"] == "bull":
-                        cs_short = pb["floor"]
-                        cs_25_long = pb["floor"] - 2.50
-                        cs_50_long = pb["floor"] - 5.00
+                        cs_short = pb["floor"]; cs_25_long = pb["floor"] - 2.50; cs_50_long = pb["floor"] - 5.00
                     else:
-                        cs_short = pb["roof"]
-                        cs_25_long = pb["roof"] + 2.50
-                        cs_50_long = pb["roof"] + 5.00
+                        cs_short = pb["roof"]; cs_25_long = pb["roof"] + 2.50; cs_50_long = pb["roof"] + 5.00
                     cs_25_b, cs_25_w = _grade_credit(sig["bias"], cs_short, cs_25_long, exit_p_5d)
                     cs_50_b, cs_50_w = _grade_credit(sig["bias"], cs_short, cs_50_long, exit_p_5d)
 
-            # Confluence bucket
             conf_bucket = _classify_confluence(sig["bias"], pb["state"])
 
-            # Build Trade
             t = Trade(
                 ticker=ticker, signal_date=trade_date, signal_time_ct=entry_time_ct,
                 signal_ts=int(day_bars[i].get("ts", 0)), entry_price=entry_price,
@@ -873,11 +950,15 @@ def run_ticker(ticker: str, intraday: list, daily: list, regime_cache: dict,
                 credit_25_bucket=cs_25_b, credit_25_win_5d=cs_25_w,
                 credit_50_bucket=cs_50_b, credit_50_win_5d=cs_50_w,
                 confluence_bucket=conf_bucket,
+                exit_source="5min_last_close",
+                bad_data_flag=bad_flag,
+                bad_data_reason=bad_reason,
                 **{k: exit_fields[k] for k in exit_fields},
             )
             trades.append(t)
 
-    return trades
+    audit["final_trades"] = len(trades)
+    return trades, audit
 
 
 # ═══════════════════════════════════════════════════════════
@@ -894,14 +975,28 @@ def _wr_stats(subset: list, exit_label: str = "5d") -> tuple:
 
 
 def write_trades_csv(trades, path):
-    if not trades:
-        return
     fields = list(Trade.__dataclass_fields__.keys())
     with open(path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
         for t in trades:
             w.writerow(asdict(t))
+
+
+def write_audit_csv(audits, path):
+    fields = [
+        "ticker", "intraday_bars_loaded", "daily_bars_loaded", "market_dates",
+        "bars_evaluated", "no_signal_or_below_threshold",
+        "raw_signals_before_dedup", "deduped_signals_removed",
+        "signals_after_dedup", "regime_valid_true", "regime_valid_false",
+        "final_trades", "missing_5d_exit", "bad_data_flags",
+        "first_date", "last_date",
+    ]
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for a in audits:
+            w.writerow({k: a.get(k, "") for k in fields})
 
 
 def write_summary_by_ticker(trades, path):
@@ -1222,8 +1317,13 @@ def write_summary_by_credit(trades, path):
                         f"{wr_debit:.1f}", f"{wr_c25:.1f}", f"{wr_c50:.1f}", best])
 
 
-def write_report(trades, start, end, path):
+def write_report(trades, start, end, path, audits=None):
     n = len(trades)
+    audits = audits or []
+    bars_eval = sum(int(a.get("bars_evaluated", 0) or 0) for a in audits)
+    raw_signals = sum(int(a.get("raw_signals_before_dedup", 0) or 0) for a in audits)
+    dedup_removed = sum(int(a.get("deduped_signals_removed", 0) or 0) for a in audits)
+    bad_flags = sum(int(a.get("bad_data_flags", 0) or 0) for a in audits)
     if n == 0:
         Path(path).write_text("# bt_active_v8 report\n\nNo trades generated.\n")
         return
@@ -1254,6 +1354,19 @@ def write_report(trades, start, end, path):
 
 Faithful port of `active_scanner._analyze_ticker()` v6.1 production logic.
 Overlay columns added on every trade (Potter Box, CB side, Fib, credit spreads).
+
+**Phase 1.3 grading fix:** entries and exits are graded from the same 5-minute dataset.
+Daily bars are used for regime/HTF/overlay context only, not exit pricing.
+
+## Backtest audit
+
+| Metric | Value |
+|---|---:|
+| Bars evaluated | {bars_eval:,} |
+| Raw signals before dedup | {raw_signals:,} |
+| Deduped signals removed | {dedup_removed:,} |
+| Final signals/trades | {n:,} |
+| Bad-data flags | {bad_flags:,} |
 
 ## Headline numbers (5-day exit)
 
@@ -1290,7 +1403,8 @@ Overlay columns added on every trade (Potter Box, CB side, Fib, credit spreads).
 
 ## Drill-downs
 
-- **`trades.csv`** — one row per signal, all columns
+- **`trades.csv`** — one row per final scanner signal, exits graded from 5-minute last closes
+- **`backtest_audit.csv`** — bars evaluated, raw signals, deduped signals, final trades by ticker
 - **`summary_by_ticker.csv`** — which tickers carry the edge
 - **`summary_by_regime.csv`** — does edge only exist in specific regimes
 - **`summary_by_htf_status.csv`** — P2 TRANSITION CONVERGING fix validation
@@ -1361,6 +1475,7 @@ def main():
     progress_path = OUT_DIR / ".progress.json"
     trades_path = OUT_DIR / "trades.csv"
     all_trades: list[Trade] = []
+    all_audits: list[dict] = []
     done: set = set()
 
     if progress_path.exists():
@@ -1468,22 +1583,30 @@ def main():
                 regime_cache[d] = "BEAR"
 
         log.info(f"{ticker}: {len(intraday)} 5-min bars, {len(daily)} daily bars, signals...")
-        trades = run_ticker(ticker, intraday, daily, regime_cache,
-                            daily_close_by_date, sorted_dates)
+        trades, audit = run_ticker(ticker, intraday, daily, regime_cache,
+                                   daily_close_by_date, sorted_dates)
         n_t1 = sum(1 for t in trades if t.tier == "1")
         n_t2 = sum(1 for t in trades if t.tier == "2")
-        log.info(f"{ticker}: {len(trades)} trades (T1={n_t1}, T2={n_t2})")
+        log.info(
+            f"{ticker}: {len(trades)} trades (T1={n_t1}, T2={n_t2}); "
+            f"bars_evaluated={audit.get('bars_evaluated', 0):,}, "
+            f"raw_signals={audit.get('raw_signals_before_dedup', 0):,}, "
+            f"dedup_removed={audit.get('deduped_signals_removed', 0):,}"
+        )
         all_trades.extend(trades)
+        all_audits.append(audit)
 
         # Checkpoint after each ticker
         done.add(ticker)
         write_trades_csv(all_trades, trades_path)
+        write_audit_csv(all_audits, OUT_DIR / "backtest_audit.csv")
         with open(progress_path, "w") as f:
             json.dump({"done": sorted(done)}, f)
 
     # ── Final writes ──
     log.info(f"Writing summaries (total: {len(all_trades)} trades)")
     write_trades_csv(all_trades, trades_path)
+    write_audit_csv(all_audits, OUT_DIR / "backtest_audit.csv")
     write_summary_by_ticker(all_trades, OUT_DIR / "summary_by_ticker.csv")
     write_summary_by_regime(all_trades, OUT_DIR / "summary_by_regime.csv")
     write_summary_by_tier(all_trades, OUT_DIR / "summary_by_tier.csv")
@@ -1491,7 +1614,7 @@ def main():
     write_summary_by_confluence(all_trades, OUT_DIR / "summary_by_confluence.csv")
     write_summary_by_indicator(all_trades, OUT_DIR / "summary_by_indicator.csv")
     write_summary_by_credit(all_trades, OUT_DIR / "summary_by_credit.csv")
-    write_report(all_trades, from_date, to_date, OUT_DIR / "report.md")
+    write_report(all_trades, from_date, to_date, OUT_DIR / "report.md", audits=all_audits)
 
     log.info(f"DONE. Outputs in {OUT_DIR}:")
     for fn in sorted(os.listdir(OUT_DIR)):
