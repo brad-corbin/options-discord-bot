@@ -63,7 +63,7 @@ jobs:
           MARKETDATA_TOKEN: ${{ secrets.MARKETDATA_TOKEN }}
         run: |
           mkdir -p results
-          python backtest/active_backtest.py ${{ steps.dates.outputs.args }} --out-dir results
+          BACKTEST_OUT_DIR=results python backtest/bt_active_v8.py ${{ steps.dates.outputs.args }}
 
       - name: Upload results
         uses: actions/upload-artifact@v4

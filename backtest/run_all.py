@@ -5,7 +5,7 @@ run_all.py — Omega 3000 Full System Backtest
 Runs all backtest engines and produces a combined report.
 
 Engines:
-  1. Active Scanner (bt_active.py)     — Intraday 5min signals, 1-5d holds
+  1. Active Scanner (bt_active_v8.py)     — Intraday 5min signals, 1-5d holds
   2. Swing Scanner (bt_swing.py)       — Daily Fib retracement, 1-15d holds
   3. EM Model (bt_em.py)               — Expected move predictions, premium selling
   4. Income Scanner (bt_income.py)     — Credit spreads at support/resistance
@@ -42,7 +42,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # Engine definitions
 ENGINES = {
     "active": {
-        "script": "bt_active.py",
+        "script": "bt_active_v8.py",
         "desc": "Active Scanner (intraday 5min → 1-5d holds)",
         "quick_args": ["--ticker", "SPY", "--days", "90"],
         "full_args": ["--all", "--days", "270"],

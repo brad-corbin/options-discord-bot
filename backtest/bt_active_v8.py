@@ -86,7 +86,7 @@ log = logging.getLogger("bt_active_v8")
 # ── Live scanner helpers ──
 try:
     from active_scanner import (
-        _compute_ema, _compute_rsi, _compute_macd, _compute_wavetrend,
+        _compute_ema, _compute_rsi, _compute_macd, _compute_wavetrend, _compute_adx,
         EMA_FAST, EMA_SLOW, MACD_FAST, MACD_SLOW, MACD_SIGNAL,
         RSI_PERIOD, WT_CHANNEL, WT_AVERAGE,
         SIGNAL_TIER_1_SCORE, SIGNAL_TIER_2_SCORE, MIN_SIGNAL_SCORE,
@@ -185,6 +185,7 @@ class Trade:
     wt1: float = 0.0
     wt2: float = 0.0
     rsi: float = 50.0
+    adx: float = 0.0
     volume_ratio: float = 1.0
     htf_status: str = "UNKNOWN"       # CONFIRMED / CONVERGING / OPPOSING / UNKNOWN
     htf_confirmed: bool = False
@@ -331,6 +332,9 @@ def detect_signal_backtest(window_bars: list, daily_closes: list, regime: str, t
 
     # RSI (on 5-min closes; 14-period)
     rsi = _compute_rsi(closes, RSI_PERIOD)
+
+    # ADX (same live scanner helper)
+    adx_current = _compute_adx(highs, lows, closes, length=14)
 
     # Volume ratio
     avg_vol      = sum(volumes[-20:]) / min(20, len(volumes)) if volumes else 0
@@ -511,6 +515,7 @@ def detect_signal_backtest(window_bars: list, daily_closes: list, regime: str, t
         "wt1": wt.get("wt1", 0) if wt else 0,
         "wt2": wt.get("wt2", 0) if wt else 0,
         "rsi": rsi if rsi else 50.0,
+        "adx": round(adx_current, 2),
         "volume_ratio": round(volume_ratio, 2),
         "vwap": vwap,
         "above_vwap": (spot > vwap) if vwap else False,
@@ -845,6 +850,7 @@ def run_ticker(ticker: str, intraday: list, daily: list, regime_cache: dict,
                 macd_cross_bear=sig["macd_cross_bear"],
                 wt1=sig["wt1"], wt2=sig["wt2"],
                 rsi=sig["rsi"], volume_ratio=sig["volume_ratio"],
+                adx=sig.get("adx", 0.0),
                 htf_status=sig["htf_status"],
                 htf_confirmed=sig["htf_confirmed"],
                 htf_converging=sig["htf_converging"],
@@ -1130,6 +1136,7 @@ def write_summary_by_indicator(trades, path):
         ("ema_dist_pct",  lambda t: t.ema_dist_pct),
         ("macd_hist",     lambda t: t.macd_hist),
         ("rsi",           lambda t: t.rsi),
+        ("adx",           lambda t: t.adx),
         ("wt2",           lambda t: t.wt2),
         ("volume_ratio",  lambda t: t.volume_ratio),
     ]

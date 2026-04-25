@@ -3424,7 +3424,7 @@ def _flush_wave_digest():
 
         dir_emoji = "🐻" if bias == "bear" else "🐂"
         conf_str = f"{conf}/100" if conf is not None else "—"
-        type_label = "SWING" if job_type == "swing" else "TV"
+        type_label = "SWING" if job_type == "swing" else ("SCANNER" if job_type == "scanner" else "TV")
 
         if (won or r.get("outcome") == "pending") and card:
             cache_key = f"tradecard:{ticker.upper()}"
@@ -4239,7 +4239,7 @@ def _process_job(worker_id: int, job: dict):
                 log.info(f"[worker-{worker_id}] {ticker} CRISIS regime, manual swing check — allowing through")
 
             # TV scalp: block bull calls in CRISIS (risk_manager blocks anyway)
-            if job_type == "tv" and bias == "bull":
+            if job_type in ("tv", "scanner") and bias == "bull":
                 reason = f"🚨 VIX Crisis Regime (VIX {_early_vix:.1f}) — bull calls blocked before chain fetch"
                 base["reason"] = reason
                 log.info(f"[worker-{worker_id}] {ticker} {job_type} EARLY BLOCK: {reason}")
@@ -4247,12 +4247,12 @@ def _process_job(worker_id: int, job: dict):
                 return
 
             # TV bear puts in CRISIS: allow through (bears can work) but log
-            if job_type == "tv":
+            if job_type in ("tv", "scanner"):
                 log.info(f"[worker-{worker_id}] {ticker} CRISIS regime but bear signal — allowing through")
     except Exception as e:
         log.debug(f"[worker-{worker_id}] Vol regime early gate skipped for {ticker}: {e}")
 
-    if job_type == "tv":
+    if job_type in ("tv", "scanner"):
         check_spread_exit_warning(ticker, bias, webhook_data)
 
         if bias not in ALLOWED_DIRECTIONS:
@@ -4670,7 +4670,7 @@ def _process_job(worker_id: int, job: dict):
                 enrichment=_cached.get("enrichment") if _cached else None,
                 econ_events=_cached.get("econ_events") if _cached else None,
                 sector_data=_cached.get("sector_data") if _cached else None,
-                job_type="tv",
+                job_type=job_type,
             )
 
             if not _gate_result["qualified"]:
@@ -4721,7 +4721,7 @@ def _process_job(worker_id: int, job: dict):
         if rec.get("signal_only"):
             base["signal_only"] = True
         _record_wave_result(base)
-        log.info(f"TV winner queued for digest: {ticker} {bias} T{tier_label} conf={rec.get('confidence')}/100")
+        log.info(f"{job_type.upper()} winner queued for digest: {ticker} {bias} T{tier_label} conf={rec.get('confidence')}/100")
 
     elif job_type == "swing":
         from swing_engine import recommend_swing_trade, format_swing_card

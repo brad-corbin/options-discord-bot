@@ -242,7 +242,7 @@ def should_pull_chains(
     gates_passed.append("earnings")
 
     # ── Gate 4: Economic Calendar (0DTE only) ──
-    if PRECHAIN_MACRO_EVENT_BLOCK_0DTE and econ_events and job_type == "tv":
+    if PRECHAIN_MACRO_EVENT_BLOCK_0DTE and econ_events and job_type in ("tv", "scanner"):
         from trading_rules import MIN_DTE, MAX_DTE
         # Only block if DTE range includes today (0DTE)
         if MIN_DTE == 0:
@@ -265,7 +265,7 @@ def should_pull_chains(
             if job_type == "swing" and bias == "bull":
                 return _reject("vol_regime",
                     f"CRISIS regime (VIX {vol_regime.get('vix', '?')}, caution {caution}/8) — bull swing blocked")
-            if job_type == "tv" and bias == "bull":
+            if job_type in ("tv", "scanner") and bias == "bull":
                 return _reject("vol_regime",
                     f"CRISIS regime (VIX {vol_regime.get('vix', '?')}) — bull calls blocked")
             # Bears in CRISIS: log but allow through
