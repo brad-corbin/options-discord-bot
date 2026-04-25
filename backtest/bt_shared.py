@@ -292,27 +292,123 @@ def _md_download_daily(ticker, from_date, to_date):
     return bars if bars else None
 
 
-def _md_download_5min(ticker, from_date, to_date):
-    """Fallback: download 5-min bars from MarketData.app."""
+def _date_chunks(from_date: str, to_date: str, chunk_days: int):
+    """Yield inclusive YYYY-MM-DD chunks for large historical downloads.
+
+    MarketData can fail or return empty data when asked for multi-year 5-minute
+    candles in a single request. Chunking keeps each request small and makes
+    deep backtests practical while preserving a single combined bars list for
+    the scanner.
+    """
+    start = datetime.strptime(from_date, "%Y-%m-%d").date()
+    end = datetime.strptime(to_date, "%Y-%m-%d").date()
+    if chunk_days <= 0:
+        chunk_days = 30
+
+    cur = start
+    while cur <= end:
+        chunk_end = min(cur + timedelta(days=chunk_days - 1), end)
+        yield cur.strftime("%Y-%m-%d"), chunk_end.strftime("%Y-%m-%d")
+        cur = chunk_end + timedelta(days=1)
+
+
+def _dedupe_5min_bars(bars: list) -> list:
+    """De-duplicate 5-minute bars by timestamp and return sorted rows."""
+    by_ts = {}
+    for b in bars or []:
+        ts = b.get("ts")
+        if ts is None:
+            continue
+        by_ts[int(ts)] = b
+    out = list(by_ts.values())
+    out.sort(key=lambda b: b["ts"])
+    return out
+
+
+def _md_download_5min_single(ticker, from_date, to_date):
+    """Download one small 5-minute MarketData chunk."""
     url = f"https://api.marketdata.app/v1/stocks/candles/5/{ticker}/"
     params = {"from": from_date, "to": to_date, "dateformat": "timestamp"}
     data = _md_get(url, params)
     if not data or data.get("s") != "ok":
         return None
+
     bars = []
-    for i, ts in enumerate(data.get("t", [])):
-        try: dt_ct = _parse_ts(ts)
-        except ValueError: continue
+    times = data.get("t", [])
+    vols = data.get("v", [0] * len(times))
+    for i, ts in enumerate(times):
+        try:
+            dt_ct = _parse_ts(ts)
+        except ValueError:
+            continue
+        try:
+            close = data["c"][i]
+        except (KeyError, IndexError):
+            continue
+        if close is None:
+            continue
         bars.append({
-            "ts": int(dt_ct.timestamp()), "date": dt_ct.strftime("%Y-%m-%d"),
+            "ts": int(dt_ct.timestamp()),
+            "date": dt_ct.strftime("%Y-%m-%d"),
             "time_ct": dt_ct.strftime("%H:%M"),
-            "o": data["o"][i], "h": data["h"][i], "l": data["l"][i],
-            "c": data["c"][i], "v": data.get("v", [0]*len(data["t"]))[i],
+            "o": data["o"][i],
+            "h": data["h"][i],
+            "l": data["l"][i],
+            "c": close,
+            "v": vols[i] if i < len(vols) else 0,
         })
-    bars = [b for b in bars if b["c"] is not None]
-    bars.sort(key=lambda b: b["ts"])
+
     return bars if bars else None
 
+
+def _md_download_5min(ticker, from_date, to_date):
+    """Fallback: download 5-minute bars from MarketData.app.
+
+    Deep scanner backtests need far more than 90 days. MarketData's 5-minute
+    endpoint is much more reliable when the request is chunked instead of
+    asking for a multi-year range in one call.
+
+    Env knobs:
+      MARKETDATA_5M_CHUNK_DAYS   default 30
+      MARKETDATA_CHUNK_SLEEP     default 0.15 seconds between chunks
+    """
+    try:
+        chunk_days = int(os.getenv("MARKETDATA_5M_CHUNK_DAYS", "30"))
+    except ValueError:
+        chunk_days = 30
+    try:
+        chunk_sleep = float(os.getenv("MARKETDATA_CHUNK_SLEEP", "0.15"))
+    except ValueError:
+        chunk_sleep = 0.15
+
+    chunks = list(_date_chunks(from_date, to_date, chunk_days))
+    if len(chunks) <= 1:
+        bars = _md_download_5min_single(ticker, from_date, to_date)
+        return _dedupe_5min_bars(bars) if bars else None
+
+    print(f"  MarketData 5m: chunking {ticker} into {len(chunks)} requests ({chunk_days}d chunks)")
+    all_bars = []
+    empty_chunks = 0
+
+    for idx, (chunk_from, chunk_to) in enumerate(chunks, 1):
+        bars = _md_download_5min_single(ticker, chunk_from, chunk_to)
+        if bars:
+            all_bars.extend(bars)
+        else:
+            empty_chunks += 1
+
+        # Lightweight progress so a long GitHub Action does not look stuck.
+        if idx == 1 or idx == len(chunks) or idx % 10 == 0:
+            print(f"    {ticker} MarketData chunk {idx}/{len(chunks)}: total_bars={len(all_bars)}")
+
+        if chunk_sleep > 0 and idx < len(chunks):
+            time.sleep(chunk_sleep)
+
+    bars = _dedupe_5min_bars(all_bars)
+    if empty_chunks:
+        print(f"  MarketData 5m chunks for {ticker}: bars={len(bars)}, empty_chunks={empty_chunks}/{len(chunks)}")
+
+    return bars if bars else None
 
 # ═══════════════════════════════════════════════════════════
 # UNIFIED DOWNLOAD (Schwab → MarketData fallback → cache)

@@ -23,7 +23,7 @@ on:
 jobs:
   backtest:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 180
 
     steps:
       - name: Checkout
@@ -72,6 +72,8 @@ jobs:
           SCHWAB_TOKEN_JSON: ${{ secrets.SCHWAB_TOKEN_JSON }}
           BOT_REPO_PATH: ${{ github.workspace }}
           PYTHONPATH: ${{ github.workspace }}
+          MARKETDATA_5M_CHUNK_DAYS: "30"
+          MARKETDATA_CHUNK_SLEEP: "0.15"
         run: |
           mkdir -p results
           BACKTEST_OUT_DIR=results python backtest/bt_active_v8.py ${{ steps.dates.outputs.args }}
