@@ -775,7 +775,6 @@ def run_ticker(ticker: str, intraday: list, daily: list, regime_cache: dict,
       - Audit counters prove how many bars were evaluated vs final signals.
     """
     trades: list[Trade] = []
-    last_sig_bar: dict = {}
 
     audit = {
         "ticker": ticker,
@@ -815,6 +814,14 @@ def run_ticker(ticker: str, intraday: list, daily: list, regime_cache: dict,
         day_bars = bars_by_date[trade_date]
         regime = regime_cache.get(trade_date, "BEAR")
         dc = [daily_close_by_date[d] for d in sorted_dates if d < trade_date]
+
+        # DEDUP BUGFIX (Phase 1.4):
+        # `i` is the bar index inside a single trading day and resets to zero
+        # every morning.  The prior implementation kept last_sig_bar across
+        # days, so a late-day signal (e.g., i=70) caused the next day's first
+        # ~70 bars to be falsely counted as duplicates because `i - 70 < 3`.
+        # Reset per day so DEDUP_BARS only suppresses repeated same-day alerts.
+        last_sig_bar: dict = {}
 
         for i in range(DEDUP_BARS, len(day_bars)):
             window_start = max(0, i - 79)
@@ -1357,6 +1364,9 @@ Overlay columns added on every trade (Potter Box, CB side, Fib, credit spreads).
 
 **Phase 1.3 grading fix:** entries and exits are graded from the same 5-minute dataset.
 Daily bars are used for regime/HTF/overlay context only, not exit pricing.
+
+**Phase 1.4 dedup fix:** intraday duplicate suppression resets each trading day,
+so a late-day signal no longer blocks most of the next day's signals.
 
 ## Backtest audit
 
