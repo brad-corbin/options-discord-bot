@@ -58,9 +58,11 @@ jobs:
 
           echo "args=$ARGS" >> $GITHUB_OUTPUT
 
-      - name: Run backtest
+            - name: Run backtest
         env:
           MARKETDATA_TOKEN: ${{ secrets.MARKETDATA_TOKEN }}
+          BOT_REPO_PATH: ${{ github.workspace }}
+          PYTHONPATH: ${{ github.workspace }}
         run: |
           mkdir -p results
           BACKTEST_OUT_DIR=results python backtest/bt_active_v8.py ${{ steps.dates.outputs.args }}
