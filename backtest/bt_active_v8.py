@@ -56,6 +56,8 @@ OUTPUTS: /tmp/backtest_active_v8/
     edge_by_combo.csv
     missed_edge_candidates.csv
     negative_edge_filters.csv
+    approved_setups.csv
+    setup_classifier_summary.csv
     report.md
     .progress.json (for resume)
 """
@@ -255,6 +257,14 @@ class Trade:
     exit_source: str = "5min_last_close"
     bad_data_flag: bool = False
     bad_data_reason: str = ""
+    # ── Phase 1.6 approved-setup classifier (backtest-only) ──
+    setup_archetype: str = "UNCLASSIFIED"
+    approved_setup: bool = False
+    setup_action: str = "RESEARCH"          # APPROVE / SHADOW / BLOCK / RESEARCH
+    block_reason: str = ""
+    suggested_hold_window: str = ""
+    suggested_vehicle: str = ""
+    setup_score: int = 0
 
 
 # ═══════════════════════════════════════════════════════════
@@ -967,10 +977,197 @@ def run_ticker(ticker: str, intraday: list, daily: list, regime_cache: dict,
                 bad_data_reason=bad_reason,
                 **{k: exit_fields[k] for k in exit_fields},
             )
+            apply_setup_classifier(t)
             trades.append(t)
 
     audit["final_trades"] = len(trades)
     return trades, audit
+
+
+# ═══════════════════════════════════════════════════════════
+# PHASE 1.6 — APPROVED SETUP CLASSIFIER (BACKTEST-ONLY)
+# ═══════════════════════════════════════════════════════════
+
+def classify_setup_archetype(t: Trade) -> dict:
+    """Classify a scanner-qualified candidate into an approved/shadow/block
+    setup bucket based on Phase 1.5 edge-discovery findings.
+
+    This is intentionally backtest-only. It does NOT change live Telegram
+    posting or production scoring. The goal is to test whether named setup
+    archetypes improve the tradeable edge before promoting anything live.
+    """
+    bias = (t.bias or "").lower()
+    pb = (t.pb_state or "no_box").lower()
+    cb = (t.cb_side or "n/a").lower()
+    htf = (t.htf_status or "UNKNOWN").upper()
+    regime = (t.regime or "UNKNOWN").upper()
+    wave = (t.pb_wave_label or "none").lower()
+    above_vwap = bool(t.above_vwap)
+
+    out = {
+        "setup_archetype": "RAW_SCANNER_RESEARCH",
+        "approved_setup": False,
+        "setup_action": "RESEARCH",
+        "block_reason": "",
+        "suggested_hold_window": "observe only",
+        "suggested_vehicle": "none",
+        "setup_score": 0,
+    }
+
+    if t.bad_data_flag:
+        out.update({
+            "setup_archetype": "BAD_DATA_EXCLUDE",
+            "setup_action": "BLOCK",
+            "block_reason": t.bad_data_reason or "bad_data_flag",
+            "suggested_hold_window": "exclude",
+            "suggested_vehicle": "none",
+            "setup_score": -100,
+        })
+        return out
+
+    if not t.exit_date_5d or t.exit_price_5d <= 0:
+        out.update({
+            "setup_archetype": "MISSING_5D_EXIT_EXCLUDE",
+            "setup_action": "BLOCK",
+            "block_reason": "missing_5d_exit",
+            "suggested_hold_window": "exclude",
+            "suggested_vehicle": "none",
+            "setup_score": -50,
+        })
+        return out
+
+    if bias == "bull":
+        # Strong hidden edge: inside Potter Box, below/near CB line.
+        if pb == "in_box" and cb in ("below_cb", "at_cb"):
+            score = 82
+            if htf == "CONFIRMED": score += 6
+            if regime in ("BULL", "TRANSITION"): score += 4
+            if above_vwap: score += 3
+            if wave in ("weakening", "breakout_probable", "breakout_imminent"): score += 3
+            out.update({
+                "setup_archetype": "PB_CB_RECLAIM_BULL_APPROVED",
+                "approved_setup": True,
+                "setup_action": "APPROVE",
+                "suggested_hold_window": "2-5 trading days",
+                "suggested_vehicle": "bullish spread or ITM call; consider bull put spread if IV rich",
+                "setup_score": min(100, score),
+            })
+            return out
+
+        # Broad robust bullish continuation bucket.
+        if pb in ("above_roof", "post_box"):
+            score = 76
+            if htf == "CONFIRMED": score += 7
+            elif htf == "CONVERGING" and regime == "TRANSITION": score += 5
+            if above_vwap: score += 4
+            if regime == "BULL": score += 5
+            if wave in ("breakout_probable", "breakout_imminent"): score += 4
+            out.update({
+                "setup_archetype": "PB_BREAKOUT_BULL_APPROVED",
+                "approved_setup": True,
+                "setup_action": "APPROVE",
+                "suggested_hold_window": "2-5 trading days",
+                "suggested_vehicle": "call debit spread / ITM call; bull put spread if structure support is clear",
+                "setup_score": min(100, score),
+            })
+            return out
+
+        # Negative/chase bucket from Phase 1.5.
+        if pb == "in_box" and cb == "above_cb":
+            out.update({
+                "setup_archetype": "BULL_CHASE_IN_BOX_BLOCK",
+                "setup_action": "BLOCK",
+                "block_reason": "bull_in_box_above_cb_late_chase",
+                "suggested_hold_window": "none",
+                "suggested_vehicle": "wait for pullback to CB or clean break above roof",
+                "setup_score": 20,
+            })
+            return out
+
+        if pb == "below_floor":
+            out.update({
+                "setup_archetype": "BULL_BELOW_FLOOR_SHADOW",
+                "setup_action": "SHADOW",
+                "block_reason": "bull_against_potter_box_structure",
+                "suggested_hold_window": "research only",
+                "suggested_vehicle": "none until reclaim",
+                "setup_score": 35,
+            })
+            return out
+
+        out.update({
+            "setup_archetype": "BULL_RAW_SCANNER_SHADOW",
+            "setup_action": "SHADOW",
+            "block_reason": "no_approved_bull_structure",
+            "suggested_hold_window": "research only",
+            "suggested_vehicle": "none",
+            "setup_score": 45,
+        })
+        return out
+
+    if bias == "bear":
+        # Bear side remains mostly shadow/block until a separate bearish model proves edge.
+        if pb == "no_box":
+            out.update({
+                "setup_archetype": "BEAR_NO_BOX_BLOCK",
+                "setup_action": "BLOCK",
+                "block_reason": "bear_no_potter_box_structure",
+                "suggested_hold_window": "none",
+                "suggested_vehicle": "none",
+                "setup_score": 10,
+            })
+            return out
+        if pb == "above_roof":
+            out.update({
+                "setup_archetype": "BEAR_ABOVE_ROOF_BLOCK",
+                "setup_action": "BLOCK",
+                "block_reason": "bear_against_bullish_potter_breakout",
+                "suggested_hold_window": "none",
+                "suggested_vehicle": "none unless separate rejection model confirms",
+                "setup_score": 15,
+            })
+            return out
+        if pb == "in_box" and cb == "below_cb":
+            out.update({
+                "setup_archetype": "BEAR_IN_BOX_BELOW_CB_BLOCK",
+                "setup_action": "BLOCK",
+                "block_reason": "bear_in_box_below_cb_historically_weak",
+                "suggested_hold_window": "none",
+                "suggested_vehicle": "none",
+                "setup_score": 15,
+            })
+            return out
+        if pb == "below_floor" and not above_vwap and htf in ("CONFIRMED", "CONVERGING"):
+            score = 58
+            if regime in ("BEAR", "TRANSITION"): score += 5
+            out.update({
+                "setup_archetype": "PB_BREAKDOWN_BEAR_RESEARCH",
+                "setup_action": "RESEARCH",
+                "approved_setup": False,
+                "block_reason": "bear_side_requires_separate_validation",
+                "suggested_hold_window": "1-3 trading days if separately confirmed",
+                "suggested_vehicle": "bear put spread only after rejection/breakdown confirmation",
+                "setup_score": min(75, score),
+            })
+            return out
+        out.update({
+            "setup_archetype": "BEAR_RAW_SCANNER_SHADOW",
+            "setup_action": "SHADOW",
+            "block_reason": "bear_side_not_approved_yet",
+            "suggested_hold_window": "research only",
+            "suggested_vehicle": "none",
+            "setup_score": 35,
+        })
+        return out
+
+    return out
+
+
+def apply_setup_classifier(t: Trade) -> Trade:
+    c = classify_setup_archetype(t)
+    for k, v in c.items():
+        setattr(t, k, v)
+    return t
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1394,6 +1591,7 @@ def write_edge_discovery_csv(trades, path):
         "fib_nearest_level","fib_distance_pct","fib_bucket","swing_dist_above_pct","swing_above_bucket","swing_dist_below_pct","swing_below_bucket",
         "ema_dist_pct","macd_hist","macd_sign","rsi","rsi_bucket","adx","adx_bucket","wt1","wt2","wt_cross","volume_ratio","volume_bucket",
         "score_bucket","regime_htf","structure_combo","core_combo","location_combo",
+        "setup_archetype","approved_setup","setup_action","block_reason","suggested_hold_window","suggested_vehicle","setup_score",
         "pnl_pct_eod","win_eod","pnl_pct_1d","win_1d","pnl_pct_2d","win_2d","pnl_pct_3d","win_3d","pnl_pct_5d","win_5d",
         "mfe_eod_pct","mae_eod_pct","bad_data_flag","bad_data_reason"
     ]
@@ -1450,6 +1648,9 @@ def write_edge_by_feature(trades, path):
         ("volume_bucket", lambda t: _edge_fields(t)["volume_bucket"]),
         ("macd_sign", lambda t: _edge_fields(t)["macd_sign"]),
         ("wt_cross", lambda t: _edge_fields(t)["wt_cross"]),
+        ("setup_archetype", lambda t: t.setup_archetype),
+        ("setup_action", lambda t: t.setup_action),
+        ("approved_setup", lambda t: bool(t.approved_setup)),
     ]
     _write_group_summary(trades, path, groupers)
 
@@ -1465,6 +1666,9 @@ def write_edge_by_combo(trades, path):
         ("bias_regime_confluence", lambda t: f"{t.bias}|{t.regime}|{t.confluence_bucket}"),
         ("ticker_bias_confluence", lambda t: f"{t.ticker}|{t.bias}|{t.confluence_bucket}"),
         ("ticker_bias_regime", lambda t: f"{t.ticker}|{t.bias}|{t.regime}"),
+        ("setup_archetype", lambda t: t.setup_archetype),
+        ("setup_action_archetype", lambda t: f"{t.setup_action}|{t.setup_archetype}"),
+        ("approved_bias_regime", lambda t: f"approved={t.approved_setup}|{t.bias}|{t.regime}"),
     ]
     _write_group_summary(trades, path, groupers)
 
@@ -1507,12 +1711,64 @@ def write_missed_edge_candidates(trades, path):
 def write_negative_edge_filters(trades, path):
     _write_screen(trades, path, positive=False)
 
+def write_approved_setups_csv(trades, path):
+    fields = [
+        "ticker","signal_date","signal_time_ct","bias","tier","score","setup_score",
+        "setup_archetype","approved_setup","setup_action","block_reason",
+        "suggested_hold_window","suggested_vehicle","regime","regime_valid","htf_status",
+        "pb_state","cb_side","pb_wave_label","above_vwap","confluence_bucket",
+        "entry_price","pnl_pct_1d","win_1d","pnl_pct_3d","win_3d","pnl_pct_5d","win_5d",
+        "mfe_eod_pct","mae_eod_pct","bad_data_flag","bad_data_reason",
+    ]
+    rows = [t for t in _edge_clean(trades) if t.setup_action in ("APPROVE", "BLOCK", "SHADOW", "RESEARCH")]
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for t in rows:
+            d = asdict(t)
+            w.writerow({k: d.get(k, "") for k in fields})
+
+
+def write_setup_classifier_summary(trades, path):
+    rows = _edge_clean(trades)
+    g = defaultdict(list)
+    for t in rows:
+        g[(t.setup_action, t.setup_archetype, t.bias)].append(t)
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow([
+            "setup_action","setup_archetype","bias","n","wr_eod","wr_1d","wr_2d","wr_3d","wr_5d",
+            "avg_pnl_5d","avg_mfe_eod","avg_mae_eod","suggested_hold_window","suggested_vehicle"
+        ])
+        for (action, archetype, bias), ts in sorted(g.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+            if len(ts) < 25:
+                continue
+            row = [action, archetype, bias, len(ts)]
+            for lbl in ("eod", "1d", "2d", "3d", "5d"):
+                _, _, wr, _ = _wr_stats(ts, lbl)
+                row.append(f"{wr:.1f}")
+            _, _, _, avg5 = _wr_stats(ts, "5d")
+            amfe = sum(t.mfe_eod_pct for t in ts) / len(ts)
+            amae = sum(t.mae_eod_pct for t in ts) / len(ts)
+            hold_counts = defaultdict(int)
+            vehicle_counts = defaultdict(int)
+            for item in ts:
+                hold_counts[item.suggested_hold_window] += 1
+                vehicle_counts[item.suggested_vehicle] += 1
+            hold = max(hold_counts.items(), key=lambda kv: kv[1])[0] if hold_counts else ""
+            vehicle = max(vehicle_counts.items(), key=lambda kv: kv[1])[0] if vehicle_counts else ""
+            row += [f"{avg5:+.3f}", f"{amfe:+.3f}", f"{amae:+.3f}", hold, vehicle]
+            w.writerow(row)
+
+
 def write_edge_discovery_outputs(trades, out_dir: Path):
     write_edge_discovery_csv(trades, out_dir / "edge_discovery.csv")
     write_edge_by_feature(trades, out_dir / "edge_by_feature.csv")
     write_edge_by_combo(trades, out_dir / "edge_by_combo.csv")
     write_missed_edge_candidates(trades, out_dir / "missed_edge_candidates.csv")
     write_negative_edge_filters(trades, out_dir / "negative_edge_filters.csv")
+    write_approved_setups_csv(trades, out_dir / "approved_setups.csv")
+    write_setup_classifier_summary(trades, out_dir / "setup_classifier_summary.csv")
 
 def write_report(trades, start, end, path, audits=None):
     n = len(trades)
@@ -1617,6 +1873,8 @@ so a late-day signal no longer blocks most of the next day's signals.
 - **`edge_by_combo.csv`** — which feature combinations contain hidden edge
 - **`missed_edge_candidates.csv`** — strong combinations the live bot may be underusing
 - **`negative_edge_filters.csv`** — weak combinations that may deserve shadow-only/block treatment
+- **`approved_setups.csv`** — Phase 1.6 classifier output for every clean scanner candidate
+- **`setup_classifier_summary.csv`** — approved/shadow/block archetype performance summary
 
 ## Compared to v3_runner (pinescript) results
 
