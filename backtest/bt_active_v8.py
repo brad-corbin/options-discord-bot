@@ -1862,7 +1862,7 @@ def write_edge_by_combo(trades, path):
         ("approved_mtf", lambda t: f"{t.setup_archetype}|mtf={t.mtf_alignment_label}"),
         ("approved_mtf_score", lambda t: f"{t.setup_archetype}|mtf_score={t.mtf_alignment_score}"),
         ("bias_pb_mtf", lambda t: f"{t.bias}|pb={t.pb_state}|cb={t.cb_side}|mtf={t.mtf_alignment_label}"),
-        ("bias_fib_mtf", lambda t: f"{t.bias}|fib={_fib_bucket(t.fib_distance_pct)}|mtf={t.mtf_alignment_label}"),
+        ("bias_fib_mtf", lambda t: f"{t.bias}|fib={_edge_fields(t)['fib_bucket']}|mtf={t.mtf_alignment_label}"),
     ]
     _write_group_summary(trades, path, groupers)
 
