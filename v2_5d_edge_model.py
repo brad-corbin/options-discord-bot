@@ -26,6 +26,7 @@ All outputs are REVIEW ONLY. The calling app must not register this as OPEN.
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
+from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
@@ -200,32 +201,90 @@ def classify_v2_setup(context: Dict[str, Any]) -> V2SetupResult:
     return res
 
 
-def breakeven_wr(debit: float, width: float) -> Optional[float]:
+# Trade types that are credit spreads (you collect premium, max profit = credit,
+# max loss = width - credit). Anything else is treated as a debit spread.
+CREDIT_TRADE_TYPES = {"bull_put", "bear_call", "credit", "iron_condor"}
+
+
+def _is_credit_candidate(candidate: Dict[str, Any]) -> bool:
+    """Detect whether a spread candidate is a credit spread.
+
+    Order of precedence:
+      1. Explicit `is_credit` flag if present.
+      2. trade_type in CREDIT_TRADE_TYPES.
+      3. Has `credit`/`net_credit` and no `debit`/`net_debit`/`cost`.
+    """
+    if "is_credit" in candidate:
+        return _bool(candidate.get("is_credit"))
+    tt = _sl(candidate.get("trade_type") or candidate.get("strategy") or "", "")
+    if tt in CREDIT_TRADE_TYPES:
+        return True
+    has_credit = any(candidate.get(k) for k in ("credit", "net_credit"))
+    has_debit = any(candidate.get(k) for k in ("debit", "net_debit", "cost"))
+    return has_credit and not has_debit
+
+
+def _candidate_premium(candidate: Dict[str, Any], is_credit: bool) -> float:
+    """Pull the cash flow that defines the spread:
+       - credit collected for credit spreads
+       - debit paid for debit spreads
+    """
+    if is_credit:
+        v = _field(candidate, "credit", "net_credit", default=0) or 0
+    else:
+        v = _field(candidate, "debit", "net_debit", "cost", default=0) or 0
     try:
-        debit = float(debit); width = float(width)
-        if debit <= 0 or width <= 0:
+        return float(v)
+    except Exception:
+        return 0.0
+
+
+def breakeven_wr(premium: float, width: float, is_credit: bool = False) -> Optional[float]:
+    """Win-rate threshold above which the spread is +EV in a binary win/loss model.
+
+    Debit spread:  pay `premium`, max profit = width - premium → BE_WR = premium / width.
+    Credit spread: collect `premium`, max loss = width - premium → BE_WR = (width - premium) / width.
+
+    Backward-compatible positional signature: passing (debit, width) without the
+    keyword still computes the debit breakeven.
+    """
+    try:
+        premium = float(premium); width = float(width)
+        if premium <= 0 or width <= 0:
             return None
-        return debit / width
+        if is_credit:
+            be = (width - premium) / width
+        else:
+            be = premium / width
+        if be <= 0 or be >= 1:
+            return None
+        return be
     except Exception:
         return None
 
 
-def edge_cushion(hist_wr: float, debit: float, width: float) -> Optional[float]:
-    be = breakeven_wr(debit, width)
+def edge_cushion(hist_wr: float, premium: float, width: float, is_credit: bool = False) -> Optional[float]:
+    be = breakeven_wr(premium, width, is_credit=is_credit)
     if be is None:
         return None
     return hist_wr - be
 
 
-def expected_value(width: float, debit: float, hist_wr: float) -> Optional[float]:
+def expected_value(width: float, premium: float, hist_wr: float, is_credit: bool = False) -> Optional[float]:
+    """Binary-outcome EV. premium is debit paid OR credit collected based on is_credit."""
     try:
-        width = float(width); debit = float(debit); hist_wr = float(hist_wr)
-        if width <= 0 or debit <= 0 or hist_wr < 0 or hist_wr > 1:
+        width = float(width); premium = float(premium); hist_wr = float(hist_wr)
+        if width <= 0 or premium <= 0 or hist_wr < 0 or hist_wr > 1:
             return None
-        max_profit = width - debit
-        if max_profit <= 0:
+        if is_credit:
+            max_profit = premium
+            max_loss = width - premium
+        else:
+            max_profit = width - premium
+            max_loss = premium
+        if max_profit <= 0 or max_loss <= 0:
             return None
-        return (hist_wr * max_profit) - ((1.0 - hist_wr) * debit)
+        return (hist_wr * max_profit) - ((1.0 - hist_wr) * max_loss)
     except Exception:
         return None
 
@@ -233,18 +292,22 @@ def expected_value(width: float, debit: float, hist_wr: float) -> Optional[float
 def rank_spread_candidates(candidates: Iterable[Dict[str, Any]], historical_wr: float) -> List[Dict[str, Any]]:
     """Rank already-built real spread candidates from the existing options engine.
 
-    Expected candidate keys are flexible but should include width and debit.
-    This does not fetch chains or build spreads. It only ranks real candidates
-    produced by the existing spread builder.
+    Per-candidate the helper auto-detects credit vs debit and applies the
+    correct breakeven / EV math. The original candidate dicts are not mutated;
+    enriched copies are returned with v2_* annotations including v2_is_credit
+    and v2_premium so downstream rendering can use the right labels.
     """
     ranked: List[Dict[str, Any]] = []
     for c in candidates or []:
         width = _field(c, "width", "spread_width", default=0) or 0
-        debit = _field(c, "debit", "net_debit", "cost", default=0) or 0
-        be = breakeven_wr(debit, width)
-        cushion = edge_cushion(historical_wr, debit, width)
-        ev = expected_value(width, debit, historical_wr)
+        is_credit = _is_credit_candidate(c)
+        premium = _candidate_premium(c, is_credit)
+        be = breakeven_wr(premium, width, is_credit=is_credit)
+        cushion = edge_cushion(historical_wr, premium, width, is_credit=is_credit)
+        ev = expected_value(width, premium, historical_wr, is_credit=is_credit)
         out = dict(c)
+        out["v2_is_credit"] = is_credit
+        out["v2_premium"] = round(premium, 4) if premium else 0.0
         out["v2_hist_wr"] = round(historical_wr, 4)
         out["v2_breakeven_wr"] = round(be, 4) if be is not None else None
         out["v2_edge_cushion"] = round(cushion, 4) if cushion is not None else None
@@ -289,16 +352,46 @@ def build_v2_card(result: V2SetupResult, ticker: str = "", spot: Optional[float]
         ]
         if best_spread:
             width = _field(best_spread, "width", "spread_width", default=None)
-            debit = _field(best_spread, "debit", "net_debit", "cost", default=None)
             long_strike = _field(best_spread, "long_strike", "long", default=None)
             short_strike = _field(best_spread, "short_strike", "short", default=None)
+
+            # rank_spread_candidates stamps v2_is_credit + v2_premium. Fall back
+            # to detecting from the candidate itself for callers that hand a
+            # raw spread dict to build_v2_card without ranking it first.
+            if "v2_is_credit" in best_spread:
+                is_credit = bool(best_spread.get("v2_is_credit"))
+            else:
+                is_credit = _is_credit_candidate(best_spread)
+            if "v2_premium" in best_spread and best_spread["v2_premium"]:
+                premium = best_spread.get("v2_premium")
+            else:
+                premium = _candidate_premium(best_spread, is_credit)
+            premium_label = "Credit collected" if is_credit else "Debit paid"
+
             lines += [
                 "",
                 "Best real spread candidate from existing builder:",
                 f"Long/Short: {long_strike} / {short_strike}",
                 f"Width: ${float(width):.2f}" if width is not None else "Width: n/a",
-                f"Debit: ${float(debit):.2f}" if debit is not None else "Debit: n/a",
+                (f"{premium_label}: ${float(premium):.2f}" if premium else f"{premium_label}: n/a"),
             ]
+
+            # Show the dollar max profit / max loss explicitly so the EV proxy
+            # line below reads correctly for both spread types.
+            try:
+                w = float(width) if width is not None else None
+                p = float(premium) if premium else None
+                if w and p and w > 0 and p > 0:
+                    if is_credit:
+                        max_profit = p
+                        max_loss = max(0.0, w - p)
+                    else:
+                        max_profit = max(0.0, w - p)
+                        max_loss = p
+                    lines.append(f"Max profit / max loss: ${max_profit:.2f} / ${max_loss:.2f}")
+            except Exception:
+                pass
+
             if best_spread.get("v2_breakeven_wr") is not None:
                 lines.append(f"Breakeven WR: {best_spread['v2_breakeven_wr']:.0%}")
             if best_spread.get("v2_edge_cushion") is not None:
@@ -315,7 +408,14 @@ def build_v2_card(result: V2SetupResult, ticker: str = "", spot: Optional[float]
 def build_v2_audit_row(result: V2SetupResult, ticker: str, spot: Optional[float] = None,
                        extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     row = result.to_dict()
-    row.update({"ticker": ticker.upper(), "spot": spot})
+    row.update({
+        "ticker": ticker.upper(),
+        "spot": spot,
+        # Always stamp UTC so model_comparison_signals.csv has a real timestamp
+        # column (the integration declares "logged_at_utc" in its header but
+        # never populated it before this fix).
+        "logged_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    })
     if extra:
         row.update(extra)
     return row

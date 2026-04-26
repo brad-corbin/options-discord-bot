@@ -94,22 +94,41 @@ def post_v2_under_v1(
                 "action", "setup_grade", "setup_archetype", "mtf_alignment",
                 "historical_proxy_wr", "preferred_structure", "short_strike_target",
                 "width_guidance", "reason", "block_reason", "review_only_note",
-                "best_width", "best_debit", "best_debit_to_width", "best_edge_cushion", "best_ev_proxy",
+                # Phase 2.4: split credit vs debit columns so credit spreads are
+                # not silently logged as debits. best_premium is the unified
+                # cash flow value, best_is_credit makes the meaning explicit.
+                "best_width", "best_is_credit", "best_premium",
+                "best_debit", "best_credit",
+                "best_premium_to_width", "best_edge_cushion", "best_ev_proxy",
             ]
             extra = {"bias": bias}
             if best_spread:
                 width = _as_float(best_spread.get("width") or best_spread.get("spread_width"), 0)
-                debit = _as_float(best_spread.get("debit") or best_spread.get("net_debit") or best_spread.get("cost"), 0)
+                is_credit = bool(best_spread.get("v2_is_credit"))
+                premium = _as_float(best_spread.get("v2_premium"), 0)
+                if not premium:
+                    if is_credit:
+                        premium = _as_float(best_spread.get("credit") or best_spread.get("net_credit"), 0)
+                    else:
+                        premium = _as_float(
+                            best_spread.get("debit") or best_spread.get("net_debit") or best_spread.get("cost"),
+                            0,
+                        )
                 extra.update({
                     "best_width": width,
-                    "best_debit": debit,
-                    "best_debit_to_width": round(debit / width, 4) if width else "",
+                    "best_is_credit": is_credit,
+                    "best_premium": premium,
+                    "best_debit": premium if not is_credit else "",
+                    "best_credit": premium if is_credit else "",
+                    "best_premium_to_width": round(premium / width, 4) if width else "",
                     "best_edge_cushion": best_spread.get("v2_edge_cushion", ""),
                     "best_ev_proxy": best_spread.get("v2_ev_proxy", ""),
                 })
             else:
                 extra.update({
-                    "best_width": "", "best_debit": "", "best_debit_to_width": "",
+                    "best_width": "", "best_is_credit": "", "best_premium": "",
+                    "best_debit": "", "best_credit": "",
+                    "best_premium_to_width": "",
                     "best_edge_cushion": "", "best_ev_proxy": "",
                 })
             append_csv_row_fn("model_comparison_signals.csv", fields, build_v2_audit_row(result, ticker, spot=spot, extra=extra))

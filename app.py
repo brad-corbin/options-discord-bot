@@ -445,6 +445,21 @@ DEDUP_TTL_SECONDS   = int(os.getenv("DEDUP_TTL_SECONDS", "3600") or 3600)
 # scanner cards as managed/open positions.
 V2_5D_EDGE_ENABLED = os.getenv("V2_5D_EDGE_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
 V2_5D_EDGE_POST_UNDER_V1 = os.getenv("V2_5D_EDGE_POST_UNDER_V1", "1").strip().lower() not in ("0", "false", "no", "off")
+# Phase 2.4 follow-ups (scanner-native cleanup):
+#   V2_5D_EDGE_FOLLOW_V84_CREDIT — also post the V2 review card under the
+#       v8.4 credit card. Was previously hardcoded off (V2 only followed the
+#       v8.3 debit card via the wave digest). Default ON because the credit
+#       card IS V1 from the user's POV.
+#   V2_5D_EDGE_INCLUDE_SIGNAL_ONLY — fire V2 even when the V1 card is a
+#       "signal_only" card (i.e. the scanner posted but no clean spread was
+#       buildable). Default ON because that is exactly when a review-only
+#       grade is most useful. Set to 0 to restore the prior skip.
+#   LEGACY_TV_WEBHOOK_ENABLED — keep the /tv route alive. Default ON for
+#       backward compatibility; set to 0 once the scanner-native path is
+#       fully trusted.
+V2_5D_EDGE_FOLLOW_V84_CREDIT = os.getenv("V2_5D_EDGE_FOLLOW_V84_CREDIT", "1").strip().lower() not in ("0", "false", "no", "off")
+V2_5D_EDGE_INCLUDE_SIGNAL_ONLY = os.getenv("V2_5D_EDGE_INCLUDE_SIGNAL_ONLY", "1").strip().lower() not in ("0", "false", "no", "off")
+LEGACY_TV_WEBHOOK_ENABLED = os.getenv("LEGACY_TV_WEBHOOK_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
 REVIEW_CARDS_AUTO_OPEN_ENABLED = os.getenv("REVIEW_CARDS_AUTO_OPEN_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
 SHADOW_POSITION_TRACKING_ENABLED = os.getenv("SHADOW_POSITION_TRACKING_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
 
@@ -3525,9 +3540,15 @@ def _flush_wave_digest():
         _tg_rate_limited_post(card_text)
         # Phase 2.3: V2 review card posts immediately under V1.
         # It is review-only and logs separately; it never opens/manages a trade.
+        # Phase 2.4: signal_only cards (scanner posted but no clean spread)
+        # are now V2-eligible by default — they are exactly the cards where
+        # a setup grade is most informative. Opt out via
+        # V2_5D_EDGE_INCLUDE_SIGNAL_ONLY=0.
         try:
-            if result and not result.get("signal_only"):
-                _post_v2_review_card_under_v1(result)
+            if result:
+                _signal_only = bool(result.get("signal_only"))
+                if (not _signal_only) or V2_5D_EDGE_INCLUDE_SIGNAL_ONLY:
+                    _post_v2_review_card_under_v1(result)
         except Exception as _v2_flush_err:
             log.warning(f"V2 post-under-V1 failed in digest flush: {_v2_flush_err}")
 
@@ -7657,6 +7678,53 @@ def _post_v84_credit_card(ticker: str, direction: str, spot: float,
         log.warning(f"v8.4 credit Telegram post failed for {ticker}: {_tg_err}")
         return
 
+    # Phase 2.4: V2 review card posts immediately under v8.4 credit card.
+    # Mirrors the wave-digest behavior but for the credit-only path. Gated
+    # by V2_5D_EDGE_FOLLOW_V84_CREDIT (default on). Review-only — never
+    # opens/manages a trade. Any failure is swallowed so the credit-card
+    # path is unaffected.
+    try:
+        if V2_5D_EDGE_FOLLOW_V84_CREDIT and V2_5D_EDGE_ENABLED:
+            _v84_v2_result = {
+                "ticker": ticker,
+                "bias": direction,
+                "direction": direction,
+                "webhook_data": wd,
+                # Pass the live credit spread as a single candidate so the
+                # V2 ranker can show width/credit context on the card. The
+                # v2_5d_edge_model auto-detects credit vs debit per
+                # candidate via trade_type / is_credit flag and applies the
+                # correct breakeven + EV math.
+                "best_rec": {
+                    "spot": spot,
+                    "candidate_spreads": [{
+                        "width": spread.get("width"),
+                        "credit": spread.get("credit"),
+                        "long_strike": spread.get("long_strike"),
+                        "short_strike": spread.get("short_strike"),
+                        "trade_type": spread.get("trade_type"),
+                        "is_credit": True,
+                    }],
+                },
+                "v2_context": {
+                    "ticker": ticker,
+                    "bias": direction,
+                    "direction": direction,
+                    "source": "v84_credit",
+                    "spot": spot,
+                    "close": wd.get("close"),
+                    "expiry": expiry,
+                    "dte": dte_hint,
+                    "pb_state": pb_state,
+                    "cb_side": cb_side,
+                    "pb_wave_label": wave_label,
+                    "market_regime": regime_trend,
+                },
+            }
+            _post_v2_review_card_under_v1(_v84_v2_result)
+    except Exception as _v2_v84_err:
+        log.warning(f"V2 follow-up under v8.4 credit failed for {ticker}: {_v2_v84_err}")
+
     # Register spread tracking for 50% TP / 2x credit SL alerts — reuses the
     # existing track_spread infrastructure that powers debit trade exits.
     try:
@@ -7935,6 +8003,18 @@ def telegram_webhook(secret):
 
 @app.route("/tv", methods=["POST"])
 def tv_webhook():
+    # Phase 2.4: legacy TradingView webhook. Kept enabled by default to avoid
+    # breaking any existing TradingView alerts still pointed at this route.
+    # Set LEGACY_TV_WEBHOOK_ENABLED=0 once the scanner-native pipeline is
+    # fully trusted to retire it. When disabled, returns 410 Gone so an
+    # operator can detect stale webhook configuration immediately.
+    if not LEGACY_TV_WEBHOOK_ENABLED:
+        log.info("[LEGACY] /tv webhook hit but LEGACY_TV_WEBHOOK_ENABLED=0 — returning 410")
+        return jsonify({
+            "error": "gone",
+            "reason": "Legacy TradingView webhook is disabled. Scanner-native pipeline is authoritative.",
+        }), 410
+
     data = request.get_json(silent=True) or {}
     if TV_WEBHOOK_SECRET:
         if data.get("secret") != TV_WEBHOOK_SECRET:
@@ -7954,10 +8034,10 @@ def tv_webhook():
 
     if validation_errors:
         reason = "; ".join(validation_errors)
-        log.warning(f"TV webhook rejected — {reason}")
+        log.warning(f"[LEGACY] TV webhook rejected — {reason}")
         return jsonify({"error": "invalid_payload", "reason": reason}), 400
 
-    log.info(f"TV signal: {ticker} bias={bias} tier={tier} close={close}")
+    log.info(f"[LEGACY] TV signal: {ticker} bias={bias} tier={tier} close={close}")
 
     webhook_data = {
         "tier": tier, "bias": bias, "close": close, "time": data.get("time", ""),
