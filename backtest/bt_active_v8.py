@@ -67,6 +67,8 @@ OUTPUTS: /tmp/backtest_active_v8/
     vehicle_selection_summary.csv
     grade_x_vehicle_summary.csv
     debit_strike_placement_summary.csv
+    debit_expectancy_summary.csv
+    debit_expectancy_topline.csv
     report.md
     .progress.json (for resume)
 """
@@ -2676,6 +2678,163 @@ def write_debit_strike_placement_summary(trades, path):
                 f"{s5['mfe']:+.3f}", f"{s5['mae']:+.3f}"
             ])
 
+
+# ─────────────────────────────────────────────────────────────
+# Phase 2.1 — $2.50 debit spread expectancy proxy
+# ─────────────────────────────────────────────────────────────
+
+def _debit_spread_ev(win_rate_pct: float, debit: float, width: float = 2.50) -> dict:
+    """Simple expiration-style expectancy proxy for a debit spread.
+
+    Winners are treated as full-width wins and losers as full-debit losses.
+    This does not model option mark-to-market, early exits, IV, skew, fills,
+    or commissions. It is a comparison tool for short-strike placement and
+    assumed debit before building a true options P/L model.
+    """
+    max_profit = max(0.0, width - debit)
+    max_loss = max(0.0, debit)
+    wr = max(0.0, min(100.0, win_rate_pct)) / 100.0
+    breakeven_wr = (debit / width * 100.0) if width > 0 else 100.0
+    ev = (wr * max_profit) - ((1.0 - wr) * max_loss)
+    return {
+        "width": width,
+        "debit": debit,
+        "max_profit": max_profit,
+        "max_loss": max_loss,
+        "breakeven_wr": breakeven_wr,
+        "edge_cushion": win_rate_pct - breakeven_wr,
+        "ev_per_spread": ev,
+        "ev_per_contract": ev * 100.0,
+    }
+
+
+def write_debit_expectancy_summary(trades, path):
+    """Summarize $2.50 debit-spread expectancy by setup and ITM short strike.
+
+    Rows are grouped by setup grade/archetype/MTF/vehicle/location, then exploded
+    across short-strike placement and assumed debit paid ($1.50/$1.60/$1.70).
+
+    NOTE: This is a price-threshold proxy. A "win" means the 5D underlying close
+    finished above the modeled short strike for bullish debit spreads. It is not
+    yet a true option P/L model.
+    """
+    rows = _edge_clean(trades)
+    groups = defaultdict(list)
+    for t in rows:
+        groups[(
+            getattr(t, "setup_grade", "UNRATED"),
+            getattr(t, "setup_archetype", "UNKNOWN"),
+            getattr(t, "vehicle_preference", "none"),
+            getattr(t, "recommended_structure", "none"),
+            getattr(t, "mtf_alignment_label", "unknown"),
+            getattr(t, "or30_state", "unknown"),
+            getattr(t, "vwap_location_state", "unknown"),
+            t.bias,
+        )].append(t)
+
+    placements = [
+        ("ATM", 0.0, "debit_atm_short_win_5d"),
+        ("0.5% ITM", 0.5, "debit_itm_0_5_short_win_5d"),
+        ("1.0% ITM", 1.0, "debit_itm_1_0_short_win_5d"),
+        ("1.5% ITM", 1.5, "debit_itm_1_5_short_win_5d"),
+        ("2.0% ITM", 2.0, "debit_itm_2_0_short_win_5d"),
+        ("2.5% ITM", 2.5, "debit_itm_2_5_short_win_5d"),
+    ]
+    debits = [1.50, 1.60, 1.70]
+    width = 2.50
+
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow([
+            "setup_grade", "setup_archetype", "vehicle_preference", "recommended_structure",
+            "mtf_alignment_label", "or30_state", "vwap_location_state", "bias", "n",
+            "short_strike_placement", "short_strike_itm_pct", "assumed_width", "assumed_debit",
+            "max_profit", "max_loss", "proxy_wr_5d", "breakeven_wr", "edge_cushion",
+            "ev_per_spread", "ev_per_contract", "avg_pnl_5d", "avg_mfe_eod", "avg_mae_eod",
+            "expectancy_label"
+        ])
+        for key, ts in sorted(groups.items(), key=lambda kv: (-_grade_rank(kv[0][0]), -len(kv[1]), kv[0])):
+            if len(ts) < 25:
+                continue
+            s5 = _edge_stats(ts, "5d")
+            for placement_name, itm_pct, field in placements:
+                wr = _pct_true(ts, field)
+                for debit in debits:
+                    ev = _debit_spread_ev(wr, debit, width=width)
+                    cushion = ev["edge_cushion"]
+                    if ev["ev_per_spread"] > 0.20 and cushion >= 10:
+                        label = "strong_positive"
+                    elif ev["ev_per_spread"] > 0.05 and cushion >= 3:
+                        label = "positive"
+                    elif ev["ev_per_spread"] >= 0:
+                        label = "thin_positive"
+                    else:
+                        label = "negative"
+                    w.writerow([
+                        *key, len(ts),
+                        placement_name, f"{itm_pct:.1f}", f"{width:.2f}", f"{debit:.2f}",
+                        f"{ev['max_profit']:.2f}", f"{ev['max_loss']:.2f}", f"{wr:.1f}",
+                        f"{ev['breakeven_wr']:.1f}", f"{cushion:+.1f}",
+                        f"{ev['ev_per_spread']:+.3f}", f"{ev['ev_per_contract']:+.2f}",
+                        f"{s5['avg']:+.3f}", f"{s5['mfe']:+.3f}", f"{s5['mae']:+.3f}",
+                        label,
+                    ])
+
+
+def write_debit_expectancy_topline(trades, path):
+    """Smaller high-signal view: grade/archetype only, no OR30/VWAP split."""
+    rows = _edge_clean(trades)
+    groups = defaultdict(list)
+    for t in rows:
+        groups[(
+            getattr(t, "setup_grade", "UNRATED"),
+            getattr(t, "setup_archetype", "UNKNOWN"),
+            getattr(t, "vehicle_preference", "none"),
+            getattr(t, "recommended_structure", "none"),
+            getattr(t, "mtf_alignment_label", "unknown"),
+            t.bias,
+        )].append(t)
+
+    placements = [
+        ("ATM", 0.0, "debit_atm_short_win_5d"),
+        ("0.5% ITM", 0.5, "debit_itm_0_5_short_win_5d"),
+        ("1.0% ITM", 1.0, "debit_itm_1_0_short_win_5d"),
+        ("1.5% ITM", 1.5, "debit_itm_1_5_short_win_5d"),
+        ("2.0% ITM", 2.0, "debit_itm_2_0_short_win_5d"),
+        ("2.5% ITM", 2.5, "debit_itm_2_5_short_win_5d"),
+    ]
+    debits = [1.50, 1.60, 1.70]
+    width = 2.50
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow([
+            "setup_grade", "setup_archetype", "vehicle_preference", "recommended_structure",
+            "mtf_alignment_label", "bias", "n", "short_strike_placement", "short_strike_itm_pct",
+            "assumed_debit", "proxy_wr_5d", "breakeven_wr", "edge_cushion",
+            "ev_per_spread", "ev_per_contract", "expectancy_label"
+        ])
+        for key, ts in sorted(groups.items(), key=lambda kv: (-_grade_rank(kv[0][0]), -len(kv[1]), kv[0])):
+            if len(ts) < 25:
+                continue
+            for placement_name, itm_pct, field in placements:
+                wr = _pct_true(ts, field)
+                for debit in debits:
+                    ev = _debit_spread_ev(wr, debit, width=width)
+                    cushion = ev["edge_cushion"]
+                    if ev["ev_per_spread"] > 0.20 and cushion >= 10:
+                        label = "strong_positive"
+                    elif ev["ev_per_spread"] > 0.05 and cushion >= 3:
+                        label = "positive"
+                    elif ev["ev_per_spread"] >= 0:
+                        label = "thin_positive"
+                    else:
+                        label = "negative"
+                    w.writerow([
+                        *key, len(ts), placement_name, f"{itm_pct:.1f}", f"{debit:.2f}",
+                        f"{wr:.1f}", f"{ev['breakeven_wr']:.1f}", f"{cushion:+.1f}",
+                        f"{ev['ev_per_spread']:+.3f}", f"{ev['ev_per_contract']:+.2f}", label,
+                    ])
+
 def write_edge_discovery_outputs(trades, out_dir: Path):
     write_edge_discovery_csv(trades, out_dir / "edge_discovery.csv")
     write_edge_by_feature(trades, out_dir / "edge_by_feature.csv")
@@ -2688,6 +2847,8 @@ def write_edge_discovery_outputs(trades, out_dir: Path):
     write_vehicle_selection_summary(trades, out_dir / "vehicle_selection_summary.csv")
     write_grade_x_vehicle_summary(trades, out_dir / "grade_x_vehicle_summary.csv")
     write_debit_strike_placement_summary(trades, out_dir / "debit_strike_placement_summary.csv")
+    write_debit_expectancy_summary(trades, out_dir / "debit_expectancy_summary.csv")
+    write_debit_expectancy_topline(trades, out_dir / "debit_expectancy_topline.csv")
     write_edge_by_mtf(trades, out_dir / "edge_by_mtf.csv")
     write_mtf_confluence_summary(trades, out_dir / "mtf_confluence_summary.csv")
     write_edge_by_location(trades, out_dir / "edge_by_location.csv")
