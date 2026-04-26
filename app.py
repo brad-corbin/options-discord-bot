@@ -395,6 +395,13 @@ from thesis_monitor import (
     build_thesis_from_em_card,
 )
 
+# ── Phase 2.3: V2 5D Edge Model review card (posts under V1; review-only)
+try:
+    from v2_dual_card_integration import post_v2_under_v1
+except Exception:
+    post_v2_under_v1 = None
+
+
 # OI cache will be initialized after store_get/store_set are defined
 _oi_cache = None
 _oi_tracker = None  # v5.1: daily OI change tracker
@@ -431,6 +438,15 @@ BOT_URL             = os.getenv("BOT_URL",             "").strip()
 REDIS_URL           = os.getenv("REDIS_URL",           "").strip()
 SCAN_WORKERS        = int(os.getenv("SCAN_WORKERS", "4") or 4)
 DEDUP_TTL_SECONDS   = int(os.getenv("DEDUP_TTL_SECONDS", "3600") or 3600)
+
+# Phase 2.3: V1/V2 review-card mode. Default is review-only — posting a
+# card does NOT mean Brad entered the trade. Set REVIEW_CARDS_AUTO_OPEN_ENABLED=1
+# only if you intentionally want the old behavior of registering posted
+# scanner cards as managed/open positions.
+V2_5D_EDGE_ENABLED = os.getenv("V2_5D_EDGE_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+V2_5D_EDGE_POST_UNDER_V1 = os.getenv("V2_5D_EDGE_POST_UNDER_V1", "1").strip().lower() not in ("0", "false", "no", "off")
+REVIEW_CARDS_AUTO_OPEN_ENABLED = os.getenv("REVIEW_CARDS_AUTO_OPEN_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+
 
 # Live validation: TradingView is the trigger, bot data is the source of truth
 SCALP_SIGNAL_WARN_DRIFT_PCT     = float(os.getenv("SCALP_SIGNAL_WARN_DRIFT_PCT",   "0.20") or 0.20)
@@ -3408,7 +3424,7 @@ def _flush_wave_digest():
         results = list(_wave_results)
         _wave_results = []
 
-    immediate_cards = []   # full cards to post now
+    immediate_cards = []   # (full card, result dict) tuples to post now
     digest_lines = []      # compact one-liners
     pending_lines = []     # watchlist / recheck candidates
     skipped_lines = []     # rejected signals
@@ -3448,12 +3464,12 @@ def _flush_wave_digest():
                 # channel because scorer said post but no standard spread fit.
                 # Tag distinctly so the digest doesn't misleadingly claim an
                 # entry was taken.
-                immediate_cards.append(card)
+                immediate_cards.append((card, r))
                 digest_lines.append(f"  🔍 {ticker} T{tier} {dir_emoji} {conf_str} — SIGNAL ONLY ⬆️ (find vehicle)")
             else:
                 # Scorer/tv path — backtest-validated at score ≥70. Auto-post.
-                immediate_cards.append(card)
-                digest_lines.append(f"  ✅ {ticker} T{tier} {dir_emoji} {conf_str} — POSTED ⬆️")
+                immediate_cards.append((card, r))
+                digest_lines.append(f"  ✅ {ticker} T{tier} {dir_emoji} {conf_str} — V1 REVIEW POSTED ⬆️")
         elif r.get("outcome") == "pending":
             reason = r.get("reason", "waiting on recheck")[:50]
             pending_lines.append(f"  ⏳ {ticker} T{tier} {dir_emoji} {conf_str} — {reason}")
@@ -3491,8 +3507,15 @@ def _flush_wave_digest():
     if lines:
         _tg_rate_limited_post("\n".join(lines))
 
-    for card_text in immediate_cards:
+    for card_text, result in immediate_cards:
         _tg_rate_limited_post(card_text)
+        # Phase 2.3: V2 review card posts immediately under V1.
+        # It is review-only and logs separately; it never opens/manages a trade.
+        try:
+            if result and not result.get("signal_only"):
+                _post_v2_review_card_under_v1(result)
+        except Exception as _v2_flush_err:
+            log.warning(f"V2 post-under-V1 failed in digest flush: {_v2_flush_err}")
 
 
 def _digest_poster_thread():
@@ -3520,6 +3543,63 @@ def _tg_rate_limited_post(text: str, max_retries: int = 6, chat_id: str = None):
             time.sleep(TG_MIN_GAP_SEC - gap)
         _tg_last_post_time = time.time()
     return post_to_telegram(text, max_retries=max_retries, chat_id=chat_id)
+
+
+def _post_v2_review_card_under_v1(result: dict):
+    """Post the Phase 2.3 V2 5D Edge Model card directly under a V1 card.
+
+    Safety rules:
+      - Review-only. This helper never opens/registers/manages a position.
+      - V1 card posting is already complete before this runs. Any V2 failure
+        is logged and ignored so V1 behavior is not broken.
+      - V2 logs separately to model_comparison_signals.csv for proof-of-concept.
+    """
+    if not V2_5D_EDGE_ENABLED or not V2_5D_EDGE_POST_UNDER_V1:
+        return
+    if post_v2_under_v1 is None:
+        log.warning("V2 5D review card skipped: v2_dual_card_integration import unavailable")
+        return
+    try:
+        _ticker = str((result or {}).get("ticker") or "").upper()
+        _bias = str((result or {}).get("bias") or (result or {}).get("direction") or "").lower()
+        if not _ticker or _bias not in ("bull", "bear"):
+            log.debug(f"V2 5D review card skipped: missing ticker/bias in result={result}")
+            return
+
+        _webhook_data = (result or {}).get("webhook_data") or {}
+        _best_rec = (result or {}).get("best_rec") or (result or {}).get("rec") or {}
+        _trade = (result or {}).get("trade") or (_best_rec.get("trade") if isinstance(_best_rec, dict) else {}) or {}
+        _signal_validation = (result or {}).get("signal_validation") or {}
+        _v2_context = (result or {}).get("v2_context") or {}
+
+        # Adapter because post_v2_under_v1 expects a (chat_id, text) poster,
+        # while _tg_rate_limited_post takes (text, chat_id=...).
+        def _post_to_chat(chat_id: str, text: str):
+            return _tg_rate_limited_post(text, chat_id=chat_id)
+
+        post_v2_under_v1(
+            ticker=_ticker,
+            bias=_bias,
+            telegram_chat_id=TELEGRAM_CHAT_ID,
+            telegram_post_fn=_post_to_chat,
+            append_csv_row_fn=_append_csv_row,
+            log_warning_fn=log.warning,
+            context_sources=(
+                _webhook_data,
+                _best_rec if isinstance(_best_rec, dict) else {},
+                _trade if isinstance(_trade, dict) else {},
+                _signal_validation if isinstance(_signal_validation, dict) else {},
+                _v2_context if isinstance(_v2_context, dict) else {},
+            ),
+            candidate_spreads=(
+                _best_rec.get("candidate_spreads")
+                if isinstance(_best_rec, dict) else None
+            ),
+            enabled=V2_5D_EDGE_ENABLED,
+            post_enabled=V2_5D_EDGE_POST_UNDER_V1,
+        )
+    except Exception as _v2_err:
+        log.warning(f"V2 5D review card failed under V1: {_v2_err}")
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -4714,6 +4794,22 @@ def _process_job(worker_id: int, job: dict):
         card_text = rec.get("card")
         base["outcome"] = "trade"
         base["card"]    = card_text
+        # Phase 2.3: carry enough context to the digest poster so the V2 5D
+        # edge model can post directly under the V1 card and log separately.
+        # This does not change V1 scoring or recommendation selection.
+        base["webhook_data"] = webhook_data or {}
+        base["best_rec"] = rec or {}
+        base["trade"] = rec.get("trade") if isinstance(rec, dict) else {}
+        base["signal_validation"] = rec.get("signal_validation") if isinstance(rec, dict) else {}
+        base["v2_context"] = {
+            "ticker": ticker,
+            "bias": bias,
+            "direction": bias,
+            "tier": tier_label,
+            "source": job_type,
+            "close": (webhook_data or {}).get("close"),
+            "spot": (rec or {}).get("spot") if isinstance(rec, dict) else None,
+        }
         # v8.5 (Phase 3.6, Fix 1): propagate signal_only flag so the wave digest
         # can distinguish "real trade entered" from "signal-only card posted
         # because no standard spread fit" — avoids the misleading "POSTED ⬆️"
@@ -7341,12 +7437,19 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
         conf = best_rec.get("confidence", 0)
         log.info(f"Trade card built: {ticker} {direction} conf={conf}/100")
         mark_trade_sent(ticker, direction, trade.get("short"), trade.get("long"))
+        _review_signal_outcome = (
+            "trade_opened" if (risk_result["allowed"] and REVIEW_CARDS_AUTO_OPEN_ENABLED)
+            else "review_posted" if risk_result["allowed"]
+            else "risk_blocked"
+        )
         trade_journal.log_signal(ticker, webhook_data,
-            outcome="trade_opened" if risk_result["allowed"] else "risk_blocked",
+            outcome=_review_signal_outcome,
             confidence=best_rec.get("confidence"))
 
-        # Phase: Wire journal open for feedback loop
-        if risk_result["allowed"]:
+        # Phase 2.3 cleanup: V1/V2 cards are review-only by default. A managed
+        # position should start only after Brad confirms an entry. Set
+        # REVIEW_CARDS_AUTO_OPEN_ENABLED=1 to restore legacy auto-registration.
+        if risk_result["allowed"] and REVIEW_CARDS_AUTO_OPEN_ENABLED:
             try:
                 _spread_id = f"{ticker}:{best_rec.get('exp','')}:{best_rec.get('side','')}:{trade.get('long','')}:{trade.get('short','')}"
                 best_rec["spread_id"] = _spread_id
@@ -7401,7 +7504,7 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
                 log.warning(f"Active position register failed for {ticker}: {_act_pm_err}")
         _log_signal_dataset_event(
             ticker, webhook_data,
-            outcome="trade_opened" if risk_result["allowed"] else "risk_blocked",
+            outcome=_review_signal_outcome,
             reason=("; ".join(risk_result.get("blocks", [])) if not risk_result["allowed"] else ""),
             best_rec=best_rec, signal_validation=signal_validation, regime=regime, v4_flow=v4_flow,
             spot=spot, expirations_checked=len(chains), vol_regime=vol_regime
@@ -7423,6 +7526,8 @@ def check_ticker(ticker, direction="bull", webhook_data=None):
         return {
             "ticker": ticker, "ok": True, "posted": True, "card": card,
             "confidence": best_rec.get("confidence"), "trade": trade,
+            "best_rec": best_rec,
+            "webhook_data": webhook_data or {},
             "expirations_checked": len(chains),
             "signal_validation": signal_validation,
         }
