@@ -51,6 +51,11 @@ OUTPUTS: /tmp/backtest_active_v8/
     summary_by_confluence.csv     ← the money table
     summary_by_indicator.csv      ← quintile WR per indicator
     summary_by_credit.csv
+    edge_discovery.csv
+    edge_by_feature.csv
+    edge_by_combo.csv
+    missed_edge_candidates.csv
+    negative_edge_filters.csv
     report.md
     .progress.json (for resume)
 """
@@ -1324,6 +1329,191 @@ def write_summary_by_credit(trades, path):
                         f"{wr_debit:.1f}", f"{wr_c25:.1f}", f"{wr_c50:.1f}", best])
 
 
+
+# ═══════════════════════════════════════════════════════════
+# EDGE DISCOVERY OUTPUTS (Phase 1.5)
+# ═══════════════════════════════════════════════════════════
+
+EDGE_MIN_N = int(os.environ.get("EDGE_DISCOVERY_MIN_N", "100") or 100)
+
+def _bucket_pct(v, cuts, labels):
+    try:
+        v = float(v)
+    except Exception:
+        return "unknown"
+    for cut, label in zip(cuts, labels):
+        if v <= cut:
+            return label
+    return labels[-1] if labels else "unknown"
+
+def _edge_clean(trades):
+    return [t for t in trades if not getattr(t, "bad_data_flag", False) and getattr(t, "exit_price_5d", 0) > 0]
+
+def _edge_stats(rows, lbl="5d"):
+    n, wins, wr, avg = _wr_stats(rows, lbl)
+    if not rows:
+        return {"n": 0, "wr": 0.0, "avg": 0.0, "mfe": 0.0, "mae": 0.0}
+    return {
+        "n": n,
+        "wr": wr,
+        "avg": avg,
+        "mfe": sum(t.mfe_eod_pct for t in rows) / len(rows),
+        "mae": sum(t.mae_eod_pct for t in rows) / len(rows),
+    }
+
+def _edge_fields(t):
+    fib_bucket = _bucket_pct(t.fib_distance_pct, [0.25, 0.50, 1.00, 2.00, 9999], ["fib_very_near", "fib_near", "fib_workable", "fib_far", "fib_none"])
+    res_bucket = _bucket_pct(t.swing_dist_above_pct, [0.50, 1.00, 2.00, 4.00, 9999], ["res_very_near", "res_near", "res_workable", "res_far", "res_none"])
+    sup_bucket = _bucket_pct(t.swing_dist_below_pct, [0.50, 1.00, 2.00, 4.00, 9999], ["sup_very_near", "sup_near", "sup_workable", "sup_far", "sup_none"])
+    score_bucket = _bucket_pct(t.score, [54, 64, 74, 84, 100], ["score_lt55", "score_55_64", "score_65_74", "score_75_84", "score_85_plus"])
+    rsi_bucket = _bucket_pct(t.rsi, [30, 40, 50, 60, 70, 100], ["rsi_lt30", "rsi_30_40", "rsi_40_50", "rsi_50_60", "rsi_60_70", "rsi_70_plus"])
+    adx_bucket = _bucket_pct(t.adx, [15, 20, 25, 35, 100], ["adx_lt15", "adx_15_20", "adx_20_25", "adx_25_35", "adx_35_plus"])
+    vol_bucket = _bucket_pct(t.volume_ratio, [0.80, 1.00, 1.25, 1.50, 2.00, 9999], ["vol_lt80", "vol_80_100", "vol_100_125", "vol_125_150", "vol_150_200", "vol_200_plus"])
+    macd_sign = "macd_pos" if t.macd_hist > 0 else ("macd_neg" if t.macd_hist < 0 else "macd_zero")
+    wt_cross = "wt_bull" if t.wt1 > t.wt2 else ("wt_bear" if t.wt1 < t.wt2 else "wt_flat")
+    pb_alignment = "pb_aligned_bull" if (t.bias == "bull" and t.pb_state in ("above_roof", "post_box")) else "pb_aligned_bear" if (t.bias == "bear" and t.pb_state == "below_floor") else "pb_in_box" if t.pb_state == "in_box" else "pb_unaligned"
+    return {
+        "fib_bucket": fib_bucket, "swing_above_bucket": res_bucket, "swing_below_bucket": sup_bucket,
+        "score_bucket": score_bucket, "rsi_bucket": rsi_bucket, "adx_bucket": adx_bucket,
+        "volume_bucket": vol_bucket, "macd_sign": macd_sign, "wt_cross": wt_cross,
+        "pb_alignment": pb_alignment,
+        "regime_htf": f"{t.regime}|{t.htf_status}",
+        "structure_combo": f"{t.bias}|{t.pb_state}|{t.cb_side}|{t.pb_wave_label}",
+        "core_combo": f"{t.bias}|{t.regime}|{t.htf_status}|{t.confluence_bucket}",
+        "location_combo": f"{t.bias}|vwap_{'above' if t.above_vwap else 'below'}|{fib_bucket}|{res_bucket}|{sup_bucket}",
+    }
+
+def _baseline_wr(trades, bias=None):
+    rows = _edge_clean([t for t in trades if bias is None or t.bias == bias])
+    return _edge_stats(rows, "5d")["wr"]
+
+def write_edge_discovery_csv(trades, path):
+    fields = [
+        "ticker","signal_date","signal_time_ct","bias","tier","score","regime","regime_valid","regime_reason","htf_status","phase",
+        "entry_price","above_vwap","pb_state","cb_side","pb_wave_label","pb_break_confirmed","pb_alignment","confluence_bucket",
+        "fib_nearest_level","fib_distance_pct","fib_bucket","swing_dist_above_pct","swing_above_bucket","swing_dist_below_pct","swing_below_bucket",
+        "ema_dist_pct","macd_hist","macd_sign","rsi","rsi_bucket","adx","adx_bucket","wt1","wt2","wt_cross","volume_ratio","volume_bucket",
+        "score_bucket","regime_htf","structure_combo","core_combo","location_combo",
+        "pnl_pct_eod","win_eod","pnl_pct_1d","win_1d","pnl_pct_2d","win_2d","pnl_pct_3d","win_3d","pnl_pct_5d","win_5d",
+        "mfe_eod_pct","mae_eod_pct","bad_data_flag","bad_data_reason"
+    ]
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for t in trades:
+            d = asdict(t)
+            d.update(_edge_fields(t))
+            w.writerow({k: d.get(k, "") for k in fields})
+
+def _group_rows(trades, groupers):
+    g = defaultdict(list)
+    for t in _edge_clean(trades):
+        for name, fn in groupers:
+            g[(name, str(fn(t) or "unknown"))].append(t)
+    return g
+
+def _write_group_summary(trades, path, groupers, include_bias_tier=False):
+    all_base = _baseline_wr(trades)
+    bull_base = _baseline_wr(trades, "bull")
+    bear_base = _baseline_wr(trades, "bear")
+    rows = []
+    for (dim, val), ts in _group_rows(trades, groupers).items():
+        if len(ts) < EDGE_MIN_N:
+            continue
+        bias = "bull" if sum(1 for t in ts if t.bias == "bull") >= len(ts)/2 else "bear"
+        base = bull_base if bias == "bull" else bear_base
+        s1, s3, s5 = _edge_stats(ts, "1d"), _edge_stats(ts, "3d"), _edge_stats(ts, "5d")
+        rows.append((s5["wr"] - base, s5["avg"], dim, val, bias, s1, s3, s5, all_base, base))
+    rows.sort(key=lambda r: (r[0], r[1], r[7]["n"]), reverse=True)
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["dimension","value","majority_bias","n","wr_1d","wr_3d","wr_5d","avg_pnl_5d","avg_mfe_eod","avg_mae_eod","vs_majority_bias_wr_5d","vs_all_wr_5d"])
+        for lift, avg, dim, val, bias, s1, s3, s5, all_base, base in rows:
+            w.writerow([dim, val, bias, s5["n"], f"{s1['wr']:.1f}", f"{s3['wr']:.1f}", f"{s5['wr']:.1f}", f"{s5['avg']:+.3f}", f"{s5['mfe']:+.3f}", f"{s5['mae']:+.3f}", f"{lift:+.1f}", f"{s5['wr'] - all_base:+.1f}"])
+
+def write_edge_by_feature(trades, path):
+    groupers = [
+        ("bias", lambda t: t.bias), ("ticker", lambda t: t.ticker), ("tier", lambda t: t.tier),
+        ("regime", lambda t: t.regime), ("regime_valid", lambda t: bool(t.regime_valid)),
+        ("htf_status", lambda t: t.htf_status), ("phase", lambda t: t.phase),
+        ("above_vwap", lambda t: bool(t.above_vwap)), ("pb_state", lambda t: t.pb_state),
+        ("cb_side", lambda t: t.cb_side), ("pb_wave_label", lambda t: t.pb_wave_label),
+        ("pb_break_confirmed", lambda t: bool(t.pb_break_confirmed)),
+        ("confluence_bucket", lambda t: t.confluence_bucket),
+        ("pb_alignment", lambda t: _edge_fields(t)["pb_alignment"]),
+        ("fib_bucket", lambda t: _edge_fields(t)["fib_bucket"]),
+        ("swing_above_bucket", lambda t: _edge_fields(t)["swing_above_bucket"]),
+        ("swing_below_bucket", lambda t: _edge_fields(t)["swing_below_bucket"]),
+        ("score_bucket", lambda t: _edge_fields(t)["score_bucket"]),
+        ("rsi_bucket", lambda t: _edge_fields(t)["rsi_bucket"]),
+        ("adx_bucket", lambda t: _edge_fields(t)["adx_bucket"]),
+        ("volume_bucket", lambda t: _edge_fields(t)["volume_bucket"]),
+        ("macd_sign", lambda t: _edge_fields(t)["macd_sign"]),
+        ("wt_cross", lambda t: _edge_fields(t)["wt_cross"]),
+    ]
+    _write_group_summary(trades, path, groupers)
+
+def write_edge_by_combo(trades, path):
+    groupers = [
+        ("core_combo", lambda t: _edge_fields(t)["core_combo"]),
+        ("structure_combo", lambda t: _edge_fields(t)["structure_combo"]),
+        ("location_combo", lambda t: _edge_fields(t)["location_combo"]),
+        ("bias_regime_htf", lambda t: f"{t.bias}|{t.regime}|{t.htf_status}"),
+        ("bias_pb_cb", lambda t: f"{t.bias}|{t.pb_state}|{t.cb_side}"),
+        ("bias_pb_wave", lambda t: f"{t.bias}|{t.pb_state}|{t.pb_wave_label}"),
+        ("bias_pb_vwap", lambda t: f"{t.bias}|{t.pb_state}|vwap_{'above' if t.above_vwap else 'below'}"),
+        ("bias_regime_confluence", lambda t: f"{t.bias}|{t.regime}|{t.confluence_bucket}"),
+        ("ticker_bias_confluence", lambda t: f"{t.ticker}|{t.bias}|{t.confluence_bucket}"),
+        ("ticker_bias_regime", lambda t: f"{t.ticker}|{t.bias}|{t.regime}"),
+    ]
+    _write_group_summary(trades, path, groupers)
+
+def _write_screen(trades, path, positive=True):
+    temp = OUT_DIR / (".edge_combo_tmp_pos.csv" if positive else ".edge_combo_tmp_neg.csv")
+    write_edge_by_combo(trades, temp)
+    with open(temp, newline="") as f:
+        rows = list(csv.DictReader(f))
+    out = []
+    for r in rows:
+        try:
+            n = int(r["n"])
+            wr = float(r["wr_5d"])
+            avg = float(r["avg_pnl_5d"])
+            lift = float(r["vs_majority_bias_wr_5d"])
+        except Exception:
+            continue
+        if positive:
+            ok = n >= EDGE_MIN_N and wr >= 58 and avg > 0.25 and lift >= 3
+            why = "Candidate missed edge: consider promoting from research/shadow to approved setup filter"
+        else:
+            ok = n >= EDGE_MIN_N and (wr <= 47 or avg < -0.25 or lift <= -5)
+            why = "Candidate negative edge: consider shadow-only, stronger penalty, or hard block"
+        if ok:
+            out.append((lift, avg, wr, r, why))
+    out.sort(key=lambda x: (x[0], x[1], x[2]), reverse=positive)
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["combo_type","combo_value","majority_bias","n","wr_5d","avg_pnl_5d","vs_bias_wr_5d","why_it_matters"])
+        for lift, avg, wr, r, why in out[:300]:
+            w.writerow([r["dimension"], r["value"], r["majority_bias"], r["n"], r["wr_5d"], r["avg_pnl_5d"], r["vs_majority_bias_wr_5d"], why])
+    try:
+        temp.unlink()
+    except Exception:
+        pass
+
+def write_missed_edge_candidates(trades, path):
+    _write_screen(trades, path, positive=True)
+
+def write_negative_edge_filters(trades, path):
+    _write_screen(trades, path, positive=False)
+
+def write_edge_discovery_outputs(trades, out_dir: Path):
+    write_edge_discovery_csv(trades, out_dir / "edge_discovery.csv")
+    write_edge_by_feature(trades, out_dir / "edge_by_feature.csv")
+    write_edge_by_combo(trades, out_dir / "edge_by_combo.csv")
+    write_missed_edge_candidates(trades, out_dir / "missed_edge_candidates.csv")
+    write_negative_edge_filters(trades, out_dir / "negative_edge_filters.csv")
+
 def write_report(trades, start, end, path, audits=None):
     n = len(trades)
     audits = audits or []
@@ -1422,6 +1612,11 @@ so a late-day signal no longer blocks most of the next day's signals.
   `vs_baseline_5d` > +5 means this overlay adds edge. < -5 means it destroys it.
 - **`summary_by_indicator.csv`** — quintile WR per indicator (is RSI a filter?)
 - **`summary_by_credit.csv`** — credit spread WR at Potter Box boundaries
+- **`edge_discovery.csv`** — Phase 1.5 research file, one row per scanner-qualified candidate with derived feature/context fields
+- **`edge_by_feature.csv`** — which individual features help or hurt vs baseline
+- **`edge_by_combo.csv`** — which feature combinations contain hidden edge
+- **`missed_edge_candidates.csv`** — strong combinations the live bot may be underusing
+- **`negative_edge_filters.csv`** — weak combinations that may deserve shadow-only/block treatment
 
 ## Compared to v3_runner (pinescript) results
 
@@ -1624,6 +1819,7 @@ def main():
     write_summary_by_confluence(all_trades, OUT_DIR / "summary_by_confluence.csv")
     write_summary_by_indicator(all_trades, OUT_DIR / "summary_by_indicator.csv")
     write_summary_by_credit(all_trades, OUT_DIR / "summary_by_credit.csv")
+    write_edge_discovery_outputs(all_trades, OUT_DIR)
     write_report(all_trades, from_date, to_date, OUT_DIR / "report.md", audits=all_audits)
 
     log.info(f"DONE. Outputs in {OUT_DIR}:")
