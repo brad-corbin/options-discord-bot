@@ -63,6 +63,9 @@ OUTPUTS: /tmp/backtest_active_v8/
     edge_by_mtf.csv
     mtf_confluence_summary.csv
     edge_by_location.csv
+    setup_grade_summary.csv
+    vehicle_selection_summary.csv
+    grade_x_vehicle_summary.csv
     report.md
     .progress.json (for resume)
 """
@@ -271,6 +274,16 @@ class Trade:
     suggested_hold_window: str = ""
     suggested_vehicle: str = ""
     setup_score: int = 0
+    # ── Phase 1.9 graded setup + vehicle selection (backtest-only) ──
+    setup_grade: str = "UNRATED"          # A+ / A / B / SHADOW / BLOCK / EXCLUDE
+    grade_reason: str = ""
+    vehicle_preference: str = "none"      # credit / debit / wait / shadow / block
+    vehicle_reason: str = ""
+    debit_score: int = 0
+    credit_score: int = 0
+    debit_proxy_win: bool = False
+    credit_proxy_win: bool = False
+    recommended_structure: str = "none"
     # ── Phase 1.7 multi-timeframe confluence (backtest-only) ──
     mtf_15m_trend: str = "unknown"
     mtf_30m_trend: str = "unknown"
@@ -1306,6 +1319,7 @@ def run_ticker(ticker: str, intraday: list, daily: list, regime_cache: dict,
                 **{k: exit_fields[k] for k in exit_fields},
             )
             apply_setup_classifier(t)
+            apply_grade_vehicle_classifier(t)
             trades.append(t)
 
     audit["final_trades"] = len(trades)
@@ -1495,6 +1509,237 @@ def apply_setup_classifier(t: Trade) -> Trade:
     c = classify_setup_archetype(t)
     for k, v in c.items():
         setattr(t, k, v)
+    return t
+
+
+# ═══════════════════════════════════════════════════════════
+# PHASE 1.9 — GRADED SETUP + VEHICLE SELECTION (BACKTEST-ONLY)
+# ═══════════════════════════════════════════════════════════
+
+def _grade_rank(label: str) -> int:
+    return {"A+": 5, "A": 4, "B": 3, "SHADOW": 2, "BLOCK": 1, "EXCLUDE": 0}.get(label, 2)
+
+
+def _score_from_grade(label: str) -> int:
+    return {"A+": 95, "A": 85, "B": 72, "SHADOW": 45, "BLOCK": 15, "EXCLUDE": -100}.get(label, 45)
+
+
+def classify_setup_grade_and_vehicle(t: Trade) -> dict:
+    """Assign a clean A+/A/B/Shadow/Block grade and a vehicle preference.
+
+    This is intentionally backtest-only. The setup grade answers,
+    "Should we care about this signal?" The vehicle preference answers,
+    "If we care, how should the 5D edge be expressed?"
+
+    Credit proxy is based on Potter Box boundary-hold outcomes already
+    computed in the backtest. It is NOT an options P/L model; it is a
+    structure/price-behavior proxy for whether a bull-put / bear-call
+    structure would have survived through the 5D window.
+    """
+    archetype = (getattr(t, "setup_archetype", "") or "").upper()
+    action = (getattr(t, "setup_action", "") or "").upper()
+    bias = (t.bias or "").lower()
+    pb = (t.pb_state or "").lower()
+    cb = (t.cb_side or "").lower()
+    mtf = (getattr(t, "mtf_alignment_label", "") or "unknown").lower()
+    or30 = (getattr(t, "or30_state", "") or "unknown").lower()
+    vwap_state = (getattr(t, "vwap_location_state", "") or "unknown").lower()
+    recent_bucket = (getattr(t, "recent_move_bucket", "") or "unknown").lower()
+
+    debit_win = bool(getattr(t, "win_5d", False))
+    credit_win = bool(getattr(t, "credit_25_win_5d", False) or getattr(t, "credit_50_win_5d", False))
+
+    out = {
+        "setup_grade": "SHADOW",
+        "grade_reason": "default_research_only",
+        "vehicle_preference": "shadow",
+        "vehicle_reason": "no approved vehicle edge yet",
+        "debit_score": 0,
+        "credit_score": 0,
+        "debit_proxy_win": debit_win,
+        "credit_proxy_win": credit_win,
+        "recommended_structure": "none",
+    }
+
+    if getattr(t, "bad_data_flag", False):
+        out.update({
+            "setup_grade": "EXCLUDE",
+            "grade_reason": "bad_data_flag",
+            "vehicle_preference": "block",
+            "vehicle_reason": "bad data excluded from analysis",
+            "recommended_structure": "none",
+            "debit_score": -100,
+            "credit_score": -100,
+        })
+        return out
+
+    if action == "BLOCK" or "BLOCK" in archetype:
+        out.update({
+            "setup_grade": "BLOCK",
+            "grade_reason": getattr(t, "block_reason", "") or "classifier_block",
+            "vehicle_preference": "block",
+            "vehicle_reason": "negative-edge setup bucket",
+            "recommended_structure": "none",
+            "debit_score": -50,
+            "credit_score": -50,
+        })
+        return out
+
+    # ── A+/A/B setup grading ──
+    grade = "SHADOW"
+    reasons = []
+
+    if archetype == "PB_CB_RECLAIM_BULL_APPROVED":
+        if mtf == "full_aligned":
+            grade = "A+"
+            reasons.append("CB reclaim + full MTF alignment")
+        elif mtf in ("strong_aligned", "partial_aligned"):
+            grade = "A"
+            reasons.append("CB reclaim + supportive MTF alignment")
+        elif mtf == "mixed":
+            grade = "B"
+            reasons.append("CB reclaim + mixed MTF")
+        else:
+            grade = "B"
+            reasons.append("CB reclaim structure, but MTF weaker/countertrend")
+
+    elif archetype == "PB_BREAKOUT_BULL_APPROVED":
+        if mtf == "strong_aligned":
+            grade = "A"
+            reasons.append("breakout bull + strong MTF alignment")
+        elif mtf in ("full_aligned", "partial_aligned"):
+            grade = "B"
+            reasons.append("breakout bull + acceptable MTF")
+        else:
+            grade = "B"
+            reasons.append("breakout bull works broadly, but MTF not ideal")
+
+    elif action == "APPROVE":
+        grade = "B"
+        reasons.append("approved setup, unrecognized archetype")
+    elif action in ("SHADOW", "RESEARCH"):
+        grade = "SHADOW"
+        reasons.append(getattr(t, "block_reason", "") or "research only")
+
+    # Location/timing modifiers: these should not rescue a bad setup, but they
+    # can downgrade a marginal approved setup or explain vehicle choice.
+    if grade in ("A+", "A", "B"):
+        if or30 == "below_or30" and grade == "B":
+            grade = "SHADOW"
+            reasons.append("downgraded: below OR30 on marginal setup")
+        elif or30 == "below_or30":
+            reasons.append("caution: below OR30")
+        if vwap_state == "extended_below_vwap":
+            if grade == "A+":
+                grade = "A"
+            elif grade == "A":
+                grade = "B"
+            else:
+                grade = "SHADOW"
+            reasons.append("downgraded: extended below VWAP")
+
+    # ── Vehicle scoring ──
+    debit_score = 0
+    credit_score = 0
+    vehicle_pref = "shadow"
+    rec = "none"
+    vehicle_reason = []
+
+    if grade in ("A+", "A", "B") and bias == "bull":
+        # CB reclaim inside the box appears to behave like a 5D hold/credit
+        # structure: price often does not need to explode; it needs not to fail
+        # below Potter support. Use the credit boundary proxy as the first
+        # vehicle clue, while retaining debit if breakout momentum is strong.
+        if archetype == "PB_CB_RECLAIM_BULL_APPROVED":
+            credit_score += 70
+            debit_score += 50
+            vehicle_reason.append("inside-box CB reclaim: structure favors support-hold expression")
+            if mtf == "full_aligned":
+                credit_score += 12; debit_score += 10
+            elif mtf in ("strong_aligned", "partial_aligned"):
+                credit_score += 8; debit_score += 6
+            if credit_win:
+                credit_score += 10
+            if debit_win:
+                debit_score += 6
+            if vwap_state in ("extended_above_vwap", "above_vwap_clean"):
+                debit_score += 8
+                vehicle_reason.append("VWAP momentum supports debit optionality")
+            if recent_bucket in ("move_100_200", "move_200_plus"):
+                debit_score -= 5
+                credit_score += 4
+                vehicle_reason.append("large recent move: prefer credit or wait for retest over chasing debit")
+
+        elif archetype == "PB_BREAKOUT_BULL_APPROVED":
+            debit_score += 72
+            credit_score += 42
+            vehicle_reason.append("above-roof breakout: directional continuation favors debit/ITM expression")
+            if mtf in ("strong_aligned", "full_aligned"):
+                debit_score += 10
+            if vwap_state == "extended_above_vwap":
+                debit_score += 5
+                credit_score += 6
+                vehicle_reason.append("extended above VWAP: continuation can work, but use smaller size / defined risk")
+            if or30 == "above_or30":
+                debit_score += 4
+            if credit_win:
+                credit_score += 5
+            if debit_win:
+                debit_score += 8
+
+        else:
+            debit_score += 45
+            credit_score += 35
+            vehicle_reason.append("approved bull but no specific vehicle model")
+
+        # Final vehicle selection.
+        if archetype == "PB_CB_RECLAIM_BULL_APPROVED" and credit_score >= debit_score - 5:
+            vehicle_pref = "credit"
+            rec = "bull put spread / put credit spread at or below Potter support"
+        elif debit_score >= credit_score + 8:
+            vehicle_pref = "debit"
+            rec = "call debit spread / ITM call targeting 2-5D continuation"
+        else:
+            vehicle_pref = "hybrid"
+            rec = "either bull put spread or call debit spread; choose by IV/credit and entry timing"
+
+    elif grade == "SHADOW":
+        vehicle_pref = "shadow"
+        rec = "log only / research"
+        vehicle_reason.append("setup not approved yet")
+    else:
+        vehicle_pref = "block"
+        rec = "none"
+        vehicle_reason.append("blocked or excluded")
+
+    out.update({
+        "setup_grade": grade,
+        "grade_reason": "; ".join([r for r in reasons if r])[:240],
+        "vehicle_preference": vehicle_pref,
+        "vehicle_reason": "; ".join(vehicle_reason)[:240],
+        "debit_score": int(max(-100, min(100, debit_score))),
+        "credit_score": int(max(-100, min(100, credit_score))),
+        "debit_proxy_win": debit_win,
+        "credit_proxy_win": credit_win,
+        "recommended_structure": rec,
+    })
+    return out
+
+
+def apply_grade_vehicle_classifier(t: Trade) -> Trade:
+    c = classify_setup_grade_and_vehicle(t)
+    for k, v in c.items():
+        setattr(t, k, v)
+    # Keep legacy suggested_vehicle roughly aligned with the new model so older
+    # summary files remain useful.
+    if getattr(t, "recommended_structure", "none") != "none":
+        t.suggested_vehicle = t.recommended_structure
+    if getattr(t, "setup_grade", "SHADOW") in ("A+", "A", "B"):
+        t.approved_setup = True
+        t.setup_action = "APPROVE"
+    elif getattr(t, "setup_grade", "SHADOW") == "BLOCK":
+        t.approved_setup = False
+        t.setup_action = "BLOCK"
     return t
 
 
@@ -1931,6 +2176,8 @@ def write_edge_discovery_csv(trades, path):
         "ema_dist_pct","macd_hist","macd_sign","rsi","rsi_bucket","adx","adx_bucket","wt1","wt2","wt_cross","volume_ratio","volume_bucket",
         "score_bucket","regime_htf","structure_combo","core_combo","location_combo",
         "setup_archetype","approved_setup","setup_action","block_reason","suggested_hold_window","suggested_vehicle","setup_score",
+        "setup_grade","grade_reason","vehicle_preference","vehicle_reason","debit_score","credit_score",
+        "debit_proxy_win","credit_proxy_win","recommended_structure",
         "mtf_15m_trend","mtf_30m_trend","mtf_60m_trend",
         "mtf_15m_macd","mtf_30m_macd","mtf_60m_macd",
         "mtf_15m_rsi","mtf_30m_rsi","mtf_60m_rsi",
@@ -2002,6 +2249,9 @@ def write_edge_by_feature(trades, path):
         ("wt_cross", lambda t: _edge_fields(t)["wt_cross"]),
         ("setup_archetype", lambda t: t.setup_archetype),
         ("setup_action", lambda t: t.setup_action),
+        ("setup_grade", lambda t: getattr(t, "setup_grade", "UNRATED")),
+        ("vehicle_preference", lambda t: getattr(t, "vehicle_preference", "none")),
+        ("recommended_structure", lambda t: getattr(t, "recommended_structure", "none")),
         ("approved_setup", lambda t: bool(t.approved_setup)),
         ("mtf_alignment_label", lambda t: t.mtf_alignment_label or "unknown"),
         ("mtf_alignment_score", lambda t: str(t.mtf_alignment_score)),
@@ -2024,6 +2274,9 @@ def write_edge_by_combo(trades, path):
         ("ticker_bias_confluence", lambda t: f"{t.ticker}|{t.bias}|{t.confluence_bucket}"),
         ("ticker_bias_regime", lambda t: f"{t.ticker}|{t.bias}|{t.regime}"),
         ("setup_archetype", lambda t: t.setup_archetype),
+        ("setup_grade", lambda t: getattr(t, "setup_grade", "UNRATED")),
+        ("grade_vehicle", lambda t: f"grade={getattr(t, 'setup_grade', 'UNRATED')}|vehicle={getattr(t, 'vehicle_preference', 'none')}"),
+        ("setup_vehicle", lambda t: f"{t.setup_archetype}|vehicle={getattr(t, 'vehicle_preference', 'none')}"),
         ("setup_action_archetype", lambda t: f"{t.setup_action}|{t.setup_archetype}"),
         ("approved_bias_regime", lambda t: f"approved={t.approved_setup}|{t.bias}|{t.regime}"),
         ("approved_mtf", lambda t: f"{t.setup_archetype}|mtf={t.mtf_alignment_label}"),
@@ -2078,8 +2331,10 @@ def write_negative_edge_filters(trades, path):
 def write_approved_setups_csv(trades, path):
     fields = [
         "ticker","signal_date","signal_time_ct","bias","tier","score","setup_score",
-        "setup_archetype","approved_setup","setup_action","block_reason",
-        "suggested_hold_window","suggested_vehicle","regime","regime_valid","htf_status",
+        "setup_archetype","setup_grade","grade_reason","approved_setup","setup_action","block_reason",
+        "suggested_hold_window","suggested_vehicle","vehicle_preference","vehicle_reason",
+        "debit_score","credit_score","debit_proxy_win","credit_proxy_win","recommended_structure",
+        "regime","regime_valid","htf_status",
         "pb_state","cb_side","pb_wave_label","above_vwap","confluence_bucket",
         "entry_price","pnl_pct_1d","win_1d","pnl_pct_3d","win_3d","pnl_pct_5d","win_5d",
         "mfe_eod_pct","mae_eod_pct","bad_data_flag","bad_data_reason",
@@ -2097,17 +2352,17 @@ def write_setup_classifier_summary(trades, path):
     rows = _edge_clean(trades)
     g = defaultdict(list)
     for t in rows:
-        g[(t.setup_action, t.setup_archetype, t.bias)].append(t)
+        g[(t.setup_action, getattr(t, "setup_grade", "UNRATED"), t.setup_archetype, getattr(t, "vehicle_preference", "none"), getattr(t, "recommended_structure", "none"), t.bias)].append(t)
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow([
-            "setup_action","setup_archetype","bias","n","wr_eod","wr_1d","wr_2d","wr_3d","wr_5d",
+            "setup_action","setup_grade","setup_archetype","vehicle_preference","recommended_structure","bias","n","wr_eod","wr_1d","wr_2d","wr_3d","wr_5d",
             "avg_pnl_5d","avg_mfe_eod","avg_mae_eod","suggested_hold_window","suggested_vehicle"
         ])
-        for (action, archetype, bias), ts in sorted(g.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+        for (action, grade, archetype, vehicle_pref, recommended_structure, bias), ts in sorted(g.items(), key=lambda kv: (-len(kv[1]), kv[0])):
             if len(ts) < 25:
                 continue
-            row = [action, archetype, bias, len(ts)]
+            row = [action, grade, archetype, vehicle_pref, recommended_structure, bias, len(ts)]
             for lbl in ("eod", "1d", "2d", "3d", "5d"):
                 _, _, wr, _ = _wr_stats(ts, lbl)
                 row.append(f"{wr:.1f}")
@@ -2124,6 +2379,91 @@ def write_setup_classifier_summary(trades, path):
             row += [f"{avg5:+.3f}", f"{amfe:+.3f}", f"{amae:+.3f}", hold, vehicle]
             w.writerow(row)
 
+
+
+def write_setup_grade_summary(trades, path):
+    rows = _edge_clean(trades)
+    groups = defaultdict(list)
+    for t in rows:
+        groups[(getattr(t, "setup_grade", "UNRATED"), getattr(t, "setup_archetype", "UNKNOWN"), getattr(t, "vehicle_preference", "none"), t.bias)].append(t)
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow([
+            "setup_grade","setup_archetype","vehicle_preference","bias","n",
+            "wr_1d","wr_3d","wr_5d","avg_pnl_5d","avg_mfe_eod","avg_mae_eod",
+            "debit_proxy_wr","credit_proxy_wr","recommended_structure"
+        ])
+        for (grade, archetype, vehicle_pref, bias), ts in sorted(groups.items(), key=lambda kv: (-_grade_rank(kv[0][0]), -len(kv[1]), kv[0])):
+            if len(ts) < 25:
+                continue
+            s1, s3, s5 = _edge_stats(ts, "1d"), _edge_stats(ts, "3d"), _edge_stats(ts, "5d")
+            debit_wr = 100 * sum(1 for t in ts if getattr(t, "debit_proxy_win", False)) / len(ts)
+            credit_wr = 100 * sum(1 for t in ts if getattr(t, "credit_proxy_win", False)) / len(ts)
+            rec_counts = defaultdict(int)
+            for item in ts:
+                rec_counts[getattr(item, "recommended_structure", "none")] += 1
+            rec = max(rec_counts.items(), key=lambda kv: kv[1])[0] if rec_counts else "none"
+            w.writerow([
+                grade, archetype, vehicle_pref, bias, len(ts),
+                f"{s1['wr']:.1f}", f"{s3['wr']:.1f}", f"{s5['wr']:.1f}", f"{s5['avg']:+.3f}",
+                f"{s5['mfe']:+.3f}", f"{s5['mae']:+.3f}",
+                f"{debit_wr:.1f}", f"{credit_wr:.1f}", rec
+            ])
+
+
+def write_vehicle_selection_summary(trades, path):
+    rows = _edge_clean(trades)
+    groups = defaultdict(list)
+    for t in rows:
+        groups[(getattr(t, "vehicle_preference", "none"), getattr(t, "recommended_structure", "none"), getattr(t, "setup_grade", "UNRATED"), getattr(t, "setup_archetype", "UNKNOWN"))].append(t)
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow([
+            "vehicle_preference","recommended_structure","setup_grade","setup_archetype","n",
+            "wr_5d_debit_proxy","avg_debit_pnl_5d","wr_5d_credit_proxy",
+            "avg_debit_score","avg_credit_score","vehicle_edge_note"
+        ])
+        for (vehicle_pref, rec, grade, archetype), ts in sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+            if len(ts) < 25:
+                continue
+            s5 = _edge_stats(ts, "5d")
+            credit_wr = 100 * sum(1 for t in ts if getattr(t, "credit_proxy_win", False)) / len(ts)
+            debit_score = sum(getattr(t, "debit_score", 0) for t in ts) / len(ts)
+            credit_score = sum(getattr(t, "credit_score", 0) for t in ts) / len(ts)
+            if credit_wr >= s5["wr"] + 10:
+                note = "credit proxy materially stronger than debit price-direction outcome"
+            elif s5["wr"] >= credit_wr + 10:
+                note = "debit price-direction outcome materially stronger than credit proxy"
+            else:
+                note = "debit/credit proxies similar; choose by IV/entry"
+            w.writerow([
+                vehicle_pref, rec, grade, archetype, len(ts),
+                f"{s5['wr']:.1f}", f"{s5['avg']:+.3f}", f"{credit_wr:.1f}",
+                f"{debit_score:.1f}", f"{credit_score:.1f}", note
+            ])
+
+
+def write_grade_x_vehicle_summary(trades, path):
+    rows = _edge_clean(trades)
+    groups = defaultdict(list)
+    for t in rows:
+        groups[(getattr(t, "setup_grade", "UNRATED"), getattr(t, "vehicle_preference", "none"), getattr(t, "mtf_alignment_label", "unknown"), getattr(t, "or30_state", "unknown"), getattr(t, "vwap_location_state", "unknown"))].append(t)
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow([
+            "setup_grade","vehicle_preference","mtf_alignment_label","or30_state","vwap_location_state",
+            "n","wr_5d_debit_proxy","avg_debit_pnl_5d","wr_5d_credit_proxy","avg_mfe_eod","avg_mae_eod"
+        ])
+        for key, ts in sorted(groups.items(), key=lambda kv: (-_grade_rank(kv[0][0]), -len(kv[1]), kv[0])):
+            if len(ts) < 50:
+                continue
+            s5 = _edge_stats(ts, "5d")
+            credit_wr = 100 * sum(1 for t in ts if getattr(t, "credit_proxy_win", False)) / len(ts)
+            w.writerow([
+                key[0], key[1], key[2], key[3], key[4], len(ts),
+                f"{s5['wr']:.1f}", f"{s5['avg']:+.3f}", f"{credit_wr:.1f}",
+                f"{s5['mfe']:+.3f}", f"{s5['mae']:+.3f}"
+            ])
 
 
 def write_edge_by_mtf(trades, path):
@@ -2208,6 +2548,9 @@ def write_edge_discovery_outputs(trades, out_dir: Path):
     write_negative_edge_filters(trades, out_dir / "negative_edge_filters.csv")
     write_approved_setups_csv(trades, out_dir / "approved_setups.csv")
     write_setup_classifier_summary(trades, out_dir / "setup_classifier_summary.csv")
+    write_setup_grade_summary(trades, out_dir / "setup_grade_summary.csv")
+    write_vehicle_selection_summary(trades, out_dir / "vehicle_selection_summary.csv")
+    write_grade_x_vehicle_summary(trades, out_dir / "grade_x_vehicle_summary.csv")
     write_edge_by_mtf(trades, out_dir / "edge_by_mtf.csv")
     write_mtf_confluence_summary(trades, out_dir / "mtf_confluence_summary.csv")
     write_edge_by_location(trades, out_dir / "edge_by_location.csv")
