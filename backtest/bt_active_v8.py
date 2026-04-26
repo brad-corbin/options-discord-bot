@@ -25,6 +25,8 @@ WHAT IT ADDS vs bt_active.py:
   - Same v3_runner-style output: trades.csv + 7 summary CSVs + report.md
   - Phase 1.3: exits graded from 5-minute bars (not adjusted daily closes)
   - Phase 1.3: writes backtest_audit.csv so we can prove bars evaluated vs signals fired
+  - Phase 1.8: adds location/timing confluence (OR30, VWAP distance, ATR extension, recent move)
+  - Phase 1.8: final summary writers are non-fatal so long runs still upload artifacts
   - Resume-from-checkpoint
   - `--all` flag runs all watchlist tickers
 
@@ -60,6 +62,7 @@ OUTPUTS: /tmp/backtest_active_v8/
     setup_classifier_summary.csv
     edge_by_mtf.csv
     mtf_confluence_summary.csv
+    edge_by_location.csv
     report.md
     .progress.json (for resume)
 """
@@ -286,6 +289,21 @@ class Trade:
     mtf_oppose_count: int = 0
     mtf_alignment_label: str = "unknown"
     mtf_stack: str = "unknown"
+    # ── Phase 1.8 location/timing confluence (backtest-only) ──
+    or30_high: float = 0.0
+    or30_low: float = 0.0
+    or30_mid: float = 0.0
+    or30_state: str = "unknown"
+    or30_distance_pct: float = 0.0
+    vwap_distance_pct: float = 0.0
+    vwap_location_state: str = "unknown"
+    atr14_5m: float = 0.0
+    atr_extension_pct: float = 0.0
+    atr_extension_bucket: str = "unknown"
+    recent_move_30m_pct: float = 0.0
+    recent_move_60m_pct: float = 0.0
+    recent_move_bucket: str = "unknown"
+    location_timing_combo: str = "unknown"
 
 
 # ═══════════════════════════════════════════════════════════
@@ -315,6 +333,120 @@ def _compute_session_vwap(bars_window: list) -> Optional[float]:
 # ═══════════════════════════════════════════════════════════
 # DETECT SIGNAL — line-for-line port of active_scanner._analyze_ticker
 # ═══════════════════════════════════════════════════════════
+
+
+
+# ═══════════════════════════════════════════════════════════
+# PHASE 1.8 — LOCATION / TIMING CONFLUENCE HELPERS
+# ═══════════════════════════════════════════════════════════
+
+def _safe_pct(num: float, den: float) -> float:
+    try:
+        return (float(num) / float(den)) * 100.0 if den else 0.0
+    except Exception:
+        return 0.0
+
+
+def _or30_for_day(day_bars: list) -> dict:
+    """Compute opening range from the first six 5-minute market bars."""
+    if not day_bars:
+        return {"high": 0.0, "low": 0.0, "mid": 0.0}
+    opening = day_bars[:6]
+    highs = [float(b.get("h", 0) or 0) for b in opening if b.get("h") is not None]
+    lows = [float(b.get("l", 0) or 0) for b in opening if b.get("l") is not None]
+    if not highs or not lows:
+        return {"high": 0.0, "low": 0.0, "mid": 0.0}
+    hi = max(highs); lo = min(lows)
+    return {"high": hi, "low": lo, "mid": (hi + lo) / 2.0 if hi and lo else 0.0}
+
+
+def _or30_state(spot: float, or30: dict) -> tuple[str, float]:
+    hi = float(or30.get("high", 0) or 0)
+    lo = float(or30.get("low", 0) or 0)
+    if spot <= 0 or hi <= 0 or lo <= 0 or hi <= lo:
+        return "no_or30", 0.0
+    if spot > hi:
+        return "above_or30", round(_safe_pct(spot - hi, spot), 3)
+    if spot < lo:
+        return "below_or30", round(_safe_pct(lo - spot, spot), 3)
+    return "inside_or30", round(_safe_pct(min(hi - spot, spot - lo), spot), 3)
+
+
+def _atr_from_window(window_bars: list, period: int = 14) -> float:
+    if len(window_bars) < period + 1:
+        return 0.0
+    trs = []
+    for i in range(1, len(window_bars)):
+        h = float(window_bars[i].get("h", 0) or 0)
+        l = float(window_bars[i].get("l", 0) or 0)
+        pc = float(window_bars[i-1].get("c", 0) or 0)
+        if h <= 0 or l <= 0 or pc <= 0:
+            continue
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    return sum(trs[-period:]) / period if len(trs) >= period else 0.0
+
+
+def _bucket_signed_move(v: float) -> str:
+    try:
+        v = float(v)
+    except Exception:
+        return "unknown"
+    av = abs(v)
+    if av < 0.25: return "move_lt_025"
+    if av < 0.50: return "move_025_050"
+    if av < 1.00: return "move_050_100"
+    if av < 2.00: return "move_100_200"
+    return "move_200_plus"
+
+
+def _location_snapshot(window_bars: list, day_bars: list, idx: int, sig: dict, or30: dict) -> dict:
+    spot = float(sig.get("close", 0) or 0)
+    vwap = sig.get("vwap") or 0.0
+    ostate, odist = _or30_state(spot, or30)
+    vwap_dist = round(_safe_pct(spot - float(vwap or 0), spot), 3) if spot > 0 and vwap else 0.0
+    if not vwap:
+        vstate = "no_vwap"
+    elif vwap_dist >= 0.75:
+        vstate = "extended_above_vwap"
+    elif vwap_dist > 0:
+        vstate = "above_vwap_clean"
+    elif vwap_dist <= -0.75:
+        vstate = "extended_below_vwap"
+    else:
+        vstate = "below_vwap_clean"
+    atr = _atr_from_window(window_bars, 14)
+    closes = [float(b.get("c", 0) or 0) for b in window_bars if b.get("c") is not None]
+    ema12 = _compute_ema(closes, EMA_SLOW) if len(closes) >= EMA_SLOW else []
+    atr_ext = abs(spot - ema12[-1]) / atr * 100.0 if atr > 0 and ema12 else 0.0
+    if atr_ext < 50: eb = "atr_ext_lt_050"
+    elif atr_ext < 100: eb = "atr_ext_050_100"
+    elif atr_ext < 150: eb = "atr_ext_100_150"
+    elif atr_ext < 250: eb = "atr_ext_150_250"
+    else: eb = "atr_ext_250_plus"
+    def _move_back(nbars: int) -> float:
+        if idx - nbars < 0 or spot <= 0:
+            return 0.0
+        prior = float(day_bars[idx - nbars].get("c", 0) or 0)
+        return round(_safe_pct(spot - prior, prior), 3) if prior > 0 else 0.0
+    m30 = _move_back(6)
+    m60 = _move_back(12)
+    move_bucket = _bucket_signed_move(m60 if abs(m60) >= abs(m30) else m30)
+    return {
+        "or30_high": round(float(or30.get("high", 0) or 0), 4),
+        "or30_low": round(float(or30.get("low", 0) or 0), 4),
+        "or30_mid": round(float(or30.get("mid", 0) or 0), 4),
+        "or30_state": ostate,
+        "or30_distance_pct": odist,
+        "vwap_distance_pct": vwap_dist,
+        "vwap_location_state": vstate,
+        "atr14_5m": round(atr, 4),
+        "atr_extension_pct": round(atr_ext, 1),
+        "atr_extension_bucket": eb,
+        "recent_move_30m_pct": m30,
+        "recent_move_60m_pct": m60,
+        "recent_move_bucket": move_bucket,
+        "location_timing_combo": f"or30={ostate}|vwap={vstate}|atr={eb}|move={move_bucket}",
+    }
 
 def detect_signal_backtest(window_bars: list, daily_closes: list, regime: str, ticker: str) -> Optional[dict]:
     """Port of active_scanner._analyze_ticker to operate on a historical
@@ -984,6 +1116,7 @@ def run_ticker(ticker: str, intraday: list, daily: list, regime_cache: dict,
 
     for trade_date in sorted(bars_by_date.keys()):
         day_bars = bars_by_date[trade_date]
+        day_or30 = _or30_for_day(day_bars)
         regime = regime_cache.get(trade_date, "BEAR")
         dc = [daily_close_by_date[d] for d in sorted_dates if d < trade_date]
 
@@ -1090,6 +1223,7 @@ def run_ticker(ticker: str, intraday: list, daily: list, regime_cache: dict,
                 sig["bias"],
                 bool(sig["daily_bull"]) if sig["daily_bull"] is not None else False,
             )
+            loc = _location_snapshot(window, day_bars, i, sig, day_or30)
 
             t = Trade(
                 ticker=ticker, signal_date=trade_date, signal_time_ct=entry_time_ct,
@@ -1152,6 +1286,20 @@ def run_ticker(ticker: str, intraday: list, daily: list, regime_cache: dict,
                 mtf_oppose_count=mtf.get("mtf_oppose_count", 0),
                 mtf_alignment_label=mtf.get("mtf_alignment_label", "unknown"),
                 mtf_stack=mtf.get("mtf_stack", "unknown"),
+                or30_high=loc.get("or30_high", 0.0),
+                or30_low=loc.get("or30_low", 0.0),
+                or30_mid=loc.get("or30_mid", 0.0),
+                or30_state=loc.get("or30_state", "unknown"),
+                or30_distance_pct=loc.get("or30_distance_pct", 0.0),
+                vwap_distance_pct=loc.get("vwap_distance_pct", 0.0),
+                vwap_location_state=loc.get("vwap_location_state", "unknown"),
+                atr14_5m=loc.get("atr14_5m", 0.0),
+                atr_extension_pct=loc.get("atr_extension_pct", 0.0),
+                atr_extension_bucket=loc.get("atr_extension_bucket", "unknown"),
+                recent_move_30m_pct=loc.get("recent_move_30m_pct", 0.0),
+                recent_move_60m_pct=loc.get("recent_move_60m_pct", 0.0),
+                recent_move_bucket=loc.get("recent_move_bucket", "unknown"),
+                location_timing_combo=loc.get("location_timing_combo", "unknown"),
                 exit_source="5min_last_close",
                 bad_data_flag=bad_flag,
                 bad_data_reason=bad_reason,
@@ -1758,6 +1906,8 @@ def _edge_fields(t):
         "structure_combo": f"{t.bias}|{t.pb_state}|{t.cb_side}|{t.pb_wave_label}",
         "core_combo": f"{t.bias}|{t.regime}|{t.htf_status}|{t.confluence_bucket}",
         "location_combo": f"{t.bias}|vwap_{'above' if t.above_vwap else 'below'}|{fib_bucket}|{res_bucket}|{sup_bucket}",
+        "timing_location_combo": f"{t.bias}|{getattr(t, 'or30_state', 'unknown')}|{getattr(t, 'vwap_location_state', 'unknown')}|{getattr(t, 'atr_extension_bucket', 'unknown')}",
+        "approved_location_combo": f"{getattr(t, 'setup_archetype', 'unknown')}|mtf={getattr(t, 'mtf_alignment_label', 'unknown')}|{getattr(t, 'or30_state', 'unknown')}|{getattr(t, 'vwap_location_state', 'unknown')}|{getattr(t, 'atr_extension_bucket', 'unknown')}",
     }
 
 def _baseline_wr(trades, bias=None):
@@ -1777,6 +1927,10 @@ def write_edge_discovery_csv(trades, path):
         "mtf_15m_rsi","mtf_30m_rsi","mtf_60m_rsi",
         "mtf_15m_adx","mtf_30m_adx","mtf_60m_adx",
         "mtf_alignment_score","mtf_match_count","mtf_oppose_count","mtf_alignment_label","mtf_stack",
+        "or30_high","or30_low","or30_mid","or30_state","or30_distance_pct",
+        "vwap_distance_pct","vwap_location_state","atr14_5m","atr_extension_pct","atr_extension_bucket",
+        "recent_move_30m_pct","recent_move_60m_pct","recent_move_bucket","location_timing_combo",
+        "timing_location_combo","approved_location_combo",
         "pnl_pct_eod","win_eod","pnl_pct_1d","win_1d","pnl_pct_2d","win_2d","pnl_pct_3d","win_3d","pnl_pct_5d","win_5d",
         "mfe_eod_pct","mae_eod_pct","bad_data_flag","bad_data_reason"
     ]
@@ -1819,7 +1973,11 @@ def write_edge_by_feature(trades, path):
         ("bias", lambda t: t.bias), ("ticker", lambda t: t.ticker), ("tier", lambda t: t.tier),
         ("regime", lambda t: t.regime), ("regime_valid", lambda t: bool(t.regime_valid)),
         ("htf_status", lambda t: t.htf_status), ("phase", lambda t: t.phase),
-        ("above_vwap", lambda t: bool(t.above_vwap)), ("pb_state", lambda t: t.pb_state),
+        ("above_vwap", lambda t: bool(t.above_vwap)), ("vwap_location_state", lambda t: getattr(t, "vwap_location_state", "unknown")),
+        ("or30_state", lambda t: getattr(t, "or30_state", "unknown")),
+        ("atr_extension_bucket", lambda t: getattr(t, "atr_extension_bucket", "unknown")),
+        ("recent_move_bucket", lambda t: getattr(t, "recent_move_bucket", "unknown")),
+        ("pb_state", lambda t: t.pb_state),
         ("cb_side", lambda t: t.cb_side), ("pb_wave_label", lambda t: t.pb_wave_label),
         ("pb_break_confirmed", lambda t: bool(t.pb_break_confirmed)),
         ("confluence_bucket", lambda t: t.confluence_bucket),
@@ -1863,6 +2021,9 @@ def write_edge_by_combo(trades, path):
         ("approved_mtf_score", lambda t: f"{t.setup_archetype}|mtf_score={t.mtf_alignment_score}"),
         ("bias_pb_mtf", lambda t: f"{t.bias}|pb={t.pb_state}|cb={t.cb_side}|mtf={t.mtf_alignment_label}"),
         ("bias_fib_mtf", lambda t: f"{t.bias}|fib={_edge_fields(t)['fib_bucket']}|mtf={t.mtf_alignment_label}"),
+        ("location_timing", lambda t: getattr(t, "location_timing_combo", "unknown")),
+        ("approved_location_timing", lambda t: _edge_fields(t).get("approved_location_combo", "unknown")),
+        ("setup_or30_vwap", lambda t: f"{t.setup_archetype}|or30={getattr(t, 'or30_state', 'unknown')}|vwap={getattr(t, 'vwap_location_state', 'unknown')}"),
     ]
     _write_group_summary(trades, path, groupers)
 
@@ -1992,6 +2153,44 @@ def write_mtf_confluence_summary(trades, path):
             ])
 
 
+
+
+def write_edge_by_location(trades, path):
+    groupers = [
+        ("or30_state", lambda t: getattr(t, "or30_state", "unknown")),
+        ("vwap_location_state", lambda t: getattr(t, "vwap_location_state", "unknown")),
+        ("atr_extension_bucket", lambda t: getattr(t, "atr_extension_bucket", "unknown")),
+        ("recent_move_bucket", lambda t: getattr(t, "recent_move_bucket", "unknown")),
+        ("location_timing_combo", lambda t: getattr(t, "location_timing_combo", "unknown")),
+        ("approved_location_combo", lambda t: _edge_fields(t).get("approved_location_combo", "unknown")),
+        ("setup_or30", lambda t: f"{t.setup_archetype}|{getattr(t, 'or30_state', 'unknown')}"),
+        ("setup_vwap", lambda t: f"{t.setup_archetype}|{getattr(t, 'vwap_location_state', 'unknown')}"),
+        ("setup_atr_extension", lambda t: f"{t.setup_archetype}|{getattr(t, 'atr_extension_bucket', 'unknown')}"),
+    ]
+    _write_group_summary(trades, path, groupers)
+
+
+def _safe_final_write(label: str, writer, *args, errors: list | None = None):
+    """Run a final writer without allowing a late report/summary bug to fail a long run."""
+    try:
+        writer(*args)
+        return True
+    except Exception as e:
+        msg = f"{label} failed: {type(e).__name__}: {e}"
+        log.exception(msg)
+        if errors is not None:
+            errors.append({"writer": label, "error": str(e), "type": type(e).__name__})
+        return False
+
+
+def write_summary_errors(errors: list, path):
+    if not errors:
+        return
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["writer", "type", "error"])
+        w.writeheader()
+        w.writerows(errors)
+
 def write_edge_discovery_outputs(trades, out_dir: Path):
     write_edge_discovery_csv(trades, out_dir / "edge_discovery.csv")
     write_edge_by_feature(trades, out_dir / "edge_by_feature.csv")
@@ -2002,6 +2201,7 @@ def write_edge_discovery_outputs(trades, out_dir: Path):
     write_setup_classifier_summary(trades, out_dir / "setup_classifier_summary.csv")
     write_edge_by_mtf(trades, out_dir / "edge_by_mtf.csv")
     write_mtf_confluence_summary(trades, out_dir / "mtf_confluence_summary.csv")
+    write_edge_by_location(trades, out_dir / "edge_by_location.csv")
 
 def write_report(trades, start, end, path, audits=None):
     n = len(trades)
@@ -2303,18 +2503,22 @@ def main():
 
     # ── Final writes ──
     log.info(f"Writing summaries (total: {len(all_trades)} trades)")
-    write_trades_csv(all_trades, trades_path)
-    write_audit_csv(all_audits, OUT_DIR / "backtest_audit.csv")
-    write_summary_by_ticker(all_trades, OUT_DIR / "summary_by_ticker.csv")
-    write_summary_by_regime(all_trades, OUT_DIR / "summary_by_regime.csv")
-    write_summary_by_tier(all_trades, OUT_DIR / "summary_by_tier.csv")
-    write_summary_by_htf(all_trades, OUT_DIR / "summary_by_htf_status.csv")
-    write_summary_by_confluence(all_trades, OUT_DIR / "summary_by_confluence.csv")
-    write_summary_by_indicator(all_trades, OUT_DIR / "summary_by_indicator.csv")
-    write_summary_by_credit(all_trades, OUT_DIR / "summary_by_credit.csv")
-    write_edge_discovery_outputs(all_trades, OUT_DIR)
-    write_report(all_trades, from_date, to_date, OUT_DIR / "report.md", audits=all_audits)
+    final_errors = []
+    _safe_final_write("trades.csv", write_trades_csv, all_trades, trades_path, errors=final_errors)
+    _safe_final_write("backtest_audit.csv", write_audit_csv, all_audits, OUT_DIR / "backtest_audit.csv", errors=final_errors)
+    _safe_final_write("summary_by_ticker.csv", write_summary_by_ticker, all_trades, OUT_DIR / "summary_by_ticker.csv", errors=final_errors)
+    _safe_final_write("summary_by_regime.csv", write_summary_by_regime, all_trades, OUT_DIR / "summary_by_regime.csv", errors=final_errors)
+    _safe_final_write("summary_by_tier.csv", write_summary_by_tier, all_trades, OUT_DIR / "summary_by_tier.csv", errors=final_errors)
+    _safe_final_write("summary_by_htf_status.csv", write_summary_by_htf, all_trades, OUT_DIR / "summary_by_htf_status.csv", errors=final_errors)
+    _safe_final_write("summary_by_confluence.csv", write_summary_by_confluence, all_trades, OUT_DIR / "summary_by_confluence.csv", errors=final_errors)
+    _safe_final_write("summary_by_indicator.csv", write_summary_by_indicator, all_trades, OUT_DIR / "summary_by_indicator.csv", errors=final_errors)
+    _safe_final_write("summary_by_credit.csv", write_summary_by_credit, all_trades, OUT_DIR / "summary_by_credit.csv", errors=final_errors)
+    _safe_final_write("edge discovery outputs", write_edge_discovery_outputs, all_trades, OUT_DIR, errors=final_errors)
+    _safe_final_write("report.md", write_report, all_trades, from_date, to_date, OUT_DIR / "report.md", all_audits, errors=final_errors)
+    write_summary_errors(final_errors, OUT_DIR / "summary_writer_errors.csv")
 
+    if final_errors:
+        log.warning(f"Final writer errors were captured but run will continue: {final_errors}")
     log.info(f"DONE. Outputs in {OUT_DIR}:")
     for fn in sorted(os.listdir(OUT_DIR)):
         if not fn.startswith("."):
