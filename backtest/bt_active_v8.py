@@ -66,6 +66,7 @@ OUTPUTS: /tmp/backtest_active_v8/
     setup_grade_summary.csv
     vehicle_selection_summary.csv
     grade_x_vehicle_summary.csv
+    debit_strike_placement_summary.csv
     report.md
     .progress.json (for resume)
 """
@@ -284,6 +285,16 @@ class Trade:
     debit_proxy_win: bool = False
     credit_proxy_win: bool = False
     recommended_structure: str = "none"
+    # ── Phase 2.0 debit-spread short-strike placement proxy (backtest-only) ──
+    debit_short_proxy_pnl_pct: float = 0.0     # directional 5D move used for short-strike win proxy
+    debit_required_itm_pct: float = 0.0        # minimum ITM % short strike needed to finish winning
+    debit_required_itm_bucket: str = "unknown"
+    debit_atm_short_win_5d: bool = False
+    debit_itm_0_5_short_win_5d: bool = False
+    debit_itm_1_0_short_win_5d: bool = False
+    debit_itm_1_5_short_win_5d: bool = False
+    debit_itm_2_0_short_win_5d: bool = False
+    debit_itm_2_5_short_win_5d: bool = False
     # ── Phase 1.7 multi-timeframe confluence (backtest-only) ──
     mtf_15m_trend: str = "unknown"
     mtf_30m_trend: str = "unknown"
@@ -1319,6 +1330,7 @@ def run_ticker(ticker: str, intraday: list, daily: list, regime_cache: dict,
                 **{k: exit_fields[k] for k in exit_fields},
             )
             apply_setup_classifier(t)
+            apply_debit_strike_placement_proxy(t)
             apply_grade_vehicle_classifier(t)
             trades.append(t)
 
@@ -1725,6 +1737,64 @@ def classify_setup_grade_and_vehicle(t: Trade) -> dict:
     })
     return out
 
+
+
+# ═══════════════════════════════════════════════════════════
+# PHASE 2.0 — DEBIT SPREAD SHORT-STRIKE PLACEMENT PROXY
+# ═══════════════════════════════════════════════════════════
+
+def _required_itm_bucket(required: float) -> str:
+    """Bucket the minimum ITM short-strike distance required for a 5D proxy win."""
+    try:
+        r = float(required)
+    except Exception:
+        return "unknown"
+    if r <= 0:
+        return "atm_or_better"
+    if r <= 0.5:
+        return "needs_0_5_itm"
+    if r <= 1.0:
+        return "needs_1_0_itm"
+    if r <= 1.5:
+        return "needs_1_5_itm"
+    if r <= 2.0:
+        return "needs_2_0_itm"
+    if r <= 2.5:
+        return "needs_2_5_itm"
+    return "needs_gt_2_5_itm"
+
+
+def apply_debit_strike_placement_proxy(t: Trade) -> Trade:
+    """Add short-strike placement proxy fields for 5D debit spreads.
+
+    This is NOT a real options P/L model. It answers one question:
+    if the debit spread's short strike were ATM or X% ITM at entry, did
+    the underlying finish beyond that short strike at the 5D exit?
+
+    Directional 5D PnL already normalizes bull/bear:
+      bull: positive if exit > entry
+      bear: positive if exit < entry
+
+    A short strike X% ITM wins if directional_pnl_pct >= -X.
+    """
+    if getattr(t, "bad_data_flag", False) or getattr(t, "exit_price_5d", 0.0) <= 0:
+        t.debit_required_itm_bucket = "bad_or_missing_exit"
+        return t
+
+    directional_pct = float(getattr(t, "pnl_pct_5d", 0.0) or 0.0)
+    required = max(0.0, -directional_pct)
+
+    t.debit_short_proxy_pnl_pct = round(directional_pct, 3)
+    t.debit_required_itm_pct = round(required, 3)
+    t.debit_required_itm_bucket = _required_itm_bucket(required)
+
+    t.debit_atm_short_win_5d = directional_pct >= 0.0
+    t.debit_itm_0_5_short_win_5d = directional_pct >= -0.5
+    t.debit_itm_1_0_short_win_5d = directional_pct >= -1.0
+    t.debit_itm_1_5_short_win_5d = directional_pct >= -1.5
+    t.debit_itm_2_0_short_win_5d = directional_pct >= -2.0
+    t.debit_itm_2_5_short_win_5d = directional_pct >= -2.5
+    return t
 
 def apply_grade_vehicle_classifier(t: Trade) -> Trade:
     c = classify_setup_grade_and_vehicle(t)
@@ -2178,6 +2248,9 @@ def write_edge_discovery_csv(trades, path):
         "setup_archetype","approved_setup","setup_action","block_reason","suggested_hold_window","suggested_vehicle","setup_score",
         "setup_grade","grade_reason","vehicle_preference","vehicle_reason","debit_score","credit_score",
         "debit_proxy_win","credit_proxy_win","recommended_structure",
+        "debit_short_proxy_pnl_pct","debit_required_itm_pct","debit_required_itm_bucket",
+        "debit_atm_short_win_5d","debit_itm_0_5_short_win_5d","debit_itm_1_0_short_win_5d",
+        "debit_itm_1_5_short_win_5d","debit_itm_2_0_short_win_5d","debit_itm_2_5_short_win_5d",
         "mtf_15m_trend","mtf_30m_trend","mtf_60m_trend",
         "mtf_15m_macd","mtf_30m_macd","mtf_60m_macd",
         "mtf_15m_rsi","mtf_30m_rsi","mtf_60m_rsi",
@@ -2540,6 +2613,69 @@ def write_summary_errors(errors: list, path):
         w.writeheader()
         w.writerows(errors)
 
+
+def _pct_true(rows, field: str) -> float:
+    if not rows:
+        return 0.0
+    return 100.0 * sum(1 for t in rows if bool(getattr(t, field, False))) / len(rows)
+
+
+def write_debit_strike_placement_summary(trades, path):
+    """Summarize proxy win rate by debit-spread short-strike placement."""
+    rows = _edge_clean(trades)
+    groups = defaultdict(list)
+    for t in rows:
+        groups[(
+            getattr(t, "setup_grade", "UNRATED"),
+            getattr(t, "setup_archetype", "UNKNOWN"),
+            getattr(t, "vehicle_preference", "none"),
+            getattr(t, "recommended_structure", "none"),
+            getattr(t, "mtf_alignment_label", "unknown"),
+            getattr(t, "or30_state", "unknown"),
+            getattr(t, "vwap_location_state", "unknown"),
+            t.bias,
+        )].append(t)
+
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow([
+            "setup_grade","setup_archetype","vehicle_preference","recommended_structure",
+            "mtf_alignment_label","or30_state","vwap_location_state","bias","n",
+            "avg_pnl_5d",
+            "wr_atm_short","wr_0_5_itm_short","wr_1_0_itm_short","wr_1_5_itm_short",
+            "wr_2_0_itm_short","wr_2_5_itm_short",
+            "lift_0_5_vs_atm","lift_1_0_vs_atm","lift_1_5_vs_atm","lift_2_0_vs_atm",
+            "avg_required_itm_pct","median_required_itm_pct","required_itm_bucket_mode",
+            "avg_mfe_eod","avg_mae_eod"
+        ])
+        for key, ts in sorted(groups.items(), key=lambda kv: (-_grade_rank(kv[0][0]), -len(kv[1]), kv[0])):
+            if len(ts) < 25:
+                continue
+            s5 = _edge_stats(ts, "5d")
+            wr_atm = _pct_true(ts, "debit_atm_short_win_5d")
+            wr05 = _pct_true(ts, "debit_itm_0_5_short_win_5d")
+            wr10 = _pct_true(ts, "debit_itm_1_0_short_win_5d")
+            wr15 = _pct_true(ts, "debit_itm_1_5_short_win_5d")
+            wr20 = _pct_true(ts, "debit_itm_2_0_short_win_5d")
+            wr25 = _pct_true(ts, "debit_itm_2_5_short_win_5d")
+            reqs = sorted(float(getattr(t, "debit_required_itm_pct", 0.0) or 0.0) for t in ts)
+            avg_req = sum(reqs) / len(reqs) if reqs else 0.0
+            med_req = reqs[len(reqs)//2] if reqs else 0.0
+            bucket_counts = defaultdict(int)
+            for t in ts:
+                bucket_counts[getattr(t, "debit_required_itm_bucket", "unknown")] += 1
+            mode_bucket = max(bucket_counts.items(), key=lambda kv: kv[1])[0] if bucket_counts else "unknown"
+            w.writerow([
+                *key, len(ts),
+                f"{s5['avg']:+.3f}",
+                f"{wr_atm:.1f}", f"{wr05:.1f}", f"{wr10:.1f}", f"{wr15:.1f}",
+                f"{wr20:.1f}", f"{wr25:.1f}",
+                f"{(wr05 - wr_atm):+.1f}", f"{(wr10 - wr_atm):+.1f}",
+                f"{(wr15 - wr_atm):+.1f}", f"{(wr20 - wr_atm):+.1f}",
+                f"{avg_req:.3f}", f"{med_req:.3f}", mode_bucket,
+                f"{s5['mfe']:+.3f}", f"{s5['mae']:+.3f}"
+            ])
+
 def write_edge_discovery_outputs(trades, out_dir: Path):
     write_edge_discovery_csv(trades, out_dir / "edge_discovery.csv")
     write_edge_by_feature(trades, out_dir / "edge_by_feature.csv")
@@ -2551,6 +2687,7 @@ def write_edge_discovery_outputs(trades, out_dir: Path):
     write_setup_grade_summary(trades, out_dir / "setup_grade_summary.csv")
     write_vehicle_selection_summary(trades, out_dir / "vehicle_selection_summary.csv")
     write_grade_x_vehicle_summary(trades, out_dir / "grade_x_vehicle_summary.csv")
+    write_debit_strike_placement_summary(trades, out_dir / "debit_strike_placement_summary.csv")
     write_edge_by_mtf(trades, out_dir / "edge_by_mtf.csv")
     write_mtf_confluence_summary(trades, out_dir / "mtf_confluence_summary.csv")
     write_edge_by_location(trades, out_dir / "edge_by_location.csv")
