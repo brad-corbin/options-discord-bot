@@ -58,12 +58,15 @@ OUTPUTS: /tmp/backtest_active_v8/
     negative_edge_filters.csv
     approved_setups.csv
     setup_classifier_summary.csv
+    edge_by_mtf.csv
+    mtf_confluence_summary.csv
     report.md
     .progress.json (for resume)
 """
 
 from __future__ import annotations
 
+import bisect
 import csv
 import json
 import logging
@@ -265,6 +268,24 @@ class Trade:
     suggested_hold_window: str = ""
     suggested_vehicle: str = ""
     setup_score: int = 0
+    # ── Phase 1.7 multi-timeframe confluence (backtest-only) ──
+    mtf_15m_trend: str = "unknown"
+    mtf_30m_trend: str = "unknown"
+    mtf_60m_trend: str = "unknown"
+    mtf_15m_macd: str = "unknown"
+    mtf_30m_macd: str = "unknown"
+    mtf_60m_macd: str = "unknown"
+    mtf_15m_rsi: float = 0.0
+    mtf_30m_rsi: float = 0.0
+    mtf_60m_rsi: float = 0.0
+    mtf_15m_adx: float = 0.0
+    mtf_30m_adx: float = 0.0
+    mtf_60m_adx: float = 0.0
+    mtf_alignment_score: int = 0      # matches - opposes across 15/30/60/daily
+    mtf_match_count: int = 0
+    mtf_oppose_count: int = 0
+    mtf_alignment_label: str = "unknown"
+    mtf_stack: str = "unknown"
 
 
 # ═══════════════════════════════════════════════════════════
@@ -731,6 +752,141 @@ def _classify_confluence(direction, pb_state):
     return "none"
 
 
+
+# ═══════════════════════════════════════════════════════════
+# PHASE 1.7 — MULTI-TIMEFRAME OVERLAY HELPERS (BACKTEST-ONLY)
+# ═══════════════════════════════════════════════════════════
+
+def _time_ct_to_minutes(time_ct: str) -> Optional[int]:
+    try:
+        hh, mm = str(time_ct).split(":")[:2]
+        return int(hh) * 60 + int(mm)
+    except Exception:
+        return None
+
+
+def _aggregate_intraday_tf(intraday: list, tf_minutes: int) -> list:
+    """Aggregate market-hours 5m bars into completed 15/30/60m bars.
+
+    Buckets are anchored to 08:30 CT. A signal only uses higher-timeframe
+    bars whose bucket has completed, avoiding lookahead from still-forming
+    15/30/60m candles.
+    """
+    if not intraday:
+        return []
+    buckets = {}
+    order = []
+    session_open_min = 8 * 60 + 30
+    for b in sorted(intraday, key=lambda x: x.get("ts", 0)):
+        mins = _time_ct_to_minutes(b.get("time_ct", ""))
+        if mins is None:
+            continue
+        elapsed = mins - session_open_min
+        if elapsed < 0:
+            continue
+        bucket_start = (elapsed // tf_minutes) * tf_minutes
+        key = (b.get("date"), bucket_start)
+        if key not in buckets:
+            buckets[key] = {
+                "date": b.get("date", ""), "bucket_start": bucket_start,
+                "tf_minutes": tf_minutes, "ts": int(b.get("ts", 0) or 0),
+                "o": float(b.get("o", b.get("c", 0)) or 0),
+                "h": float(b.get("h", 0) or 0),
+                "l": float(b.get("l", 0) or 0),
+                "c": float(b.get("c", 0) or 0),
+                "v": int(b.get("v", 0) or 0), "count": 1,
+            }
+            order.append(key)
+        else:
+            a = buckets[key]
+            a["h"] = max(a["h"], float(b.get("h", 0) or 0))
+            lo = float(b.get("l", 0) or 0)
+            a["l"] = lo if a["l"] <= 0 else min(a["l"], lo)
+            a["c"] = float(b.get("c", 0) or 0)
+            a["v"] += int(b.get("v", 0) or 0)
+            a["ts"] = int(b.get("ts", 0) or 0)
+            a["count"] += 1
+    expected = max(1, tf_minutes // 5)
+    out = [buckets[k] for k in order if buckets[k].get("count", 0) >= expected]
+    out.sort(key=lambda x: x.get("ts", 0))
+    return out
+
+
+def _indicator_state_from_agg(agg_bars: list, end_pos: int, lookback: int = 90) -> dict:
+    if end_pos <= 0:
+        return {"trend": "unknown", "macd": "unknown", "rsi": 0.0, "adx": 0.0, "ema_dist_pct": 0.0}
+    w = agg_bars[max(0, end_pos - lookback): end_pos]
+    closes = [float(b.get("c", 0) or 0) for b in w]
+    highs = [float(b.get("h", 0) or 0) for b in w]
+    lows = [float(b.get("l", 0) or 0) for b in w]
+    if len(closes) < 12:
+        return {"trend": "unknown", "macd": "unknown", "rsi": 0.0, "adx": 0.0, "ema_dist_pct": 0.0}
+    ema_fast = _compute_ema(closes, EMA_FAST)
+    ema_slow = _compute_ema(closes, EMA_SLOW)
+    trend = "unknown"
+    ema_dist_pct = 0.0
+    if ema_fast and ema_slow:
+        ema_dist_pct = ((ema_fast[-1] - ema_slow[-1]) / ema_slow[-1]) * 100 if ema_slow[-1] else 0.0
+        trend = "neutral" if abs(ema_dist_pct) < 0.02 else ("bull" if ema_fast[-1] > ema_slow[-1] else "bear")
+    m = _compute_macd(closes) if len(closes) >= 35 else {}
+    hist = float(m.get("macd_hist", 0) or 0) if m else 0.0
+    macd_state = "neutral" if abs(hist) < 1e-9 else ("bull" if hist > 0 else "bear")
+    rsi_v = _compute_rsi(closes, RSI_PERIOD) or 0.0
+    adx_v = _compute_adx(highs, lows, closes, length=14) if len(closes) >= 20 else 0.0
+    return {"trend": trend, "macd": macd_state, "rsi": round(float(rsi_v or 0.0), 2),
+            "adx": round(float(adx_v or 0.0), 2), "ema_dist_pct": round(float(ema_dist_pct or 0.0), 4)}
+
+
+def _build_mtf_sources(intraday: list) -> dict:
+    sources = {}
+    for tf in (15, 30, 60):
+        bars = _aggregate_intraday_tf(intraday, tf)
+        sources[tf] = {"bars": bars, "ts": [int(b.get("ts", 0) or 0) for b in bars]}
+    return sources
+
+
+def _mtf_snapshot_at(mtf_sources: dict, signal_ts: int, bias: str, daily_bull: bool) -> dict:
+    """Alignment score = matches - opposes across 15m, 30m, 60m, and daily trend."""
+    bias = (bias or "").lower()
+    out = {}; matches = 0; opposes = 0; stack_parts = []
+    for tf in (15, 30, 60):
+        src = mtf_sources.get(tf, {})
+        ts_list = src.get("ts", []); bars = src.get("bars", [])
+        pos = bisect.bisect_right(ts_list, int(signal_ts or 0))
+        st = _indicator_state_from_agg(bars, pos)
+        trend = st.get("trend", "unknown"); macd_state = st.get("macd", "unknown")
+        out[f"mtf_{tf}m_trend"] = trend
+        out[f"mtf_{tf}m_macd"] = macd_state
+        out[f"mtf_{tf}m_rsi"] = st.get("rsi", 0.0)
+        out[f"mtf_{tf}m_adx"] = st.get("adx", 0.0)
+        stack_parts.append(f"{tf}m={trend}")
+        if trend == bias:
+            matches += 1
+        elif trend in ("bull", "bear") and bias in ("bull", "bear"):
+            opposes += 1
+    daily_state = "bull" if daily_bull else "bear"
+    stack_parts.append(f"D={daily_state}")
+    if daily_state == bias:
+        matches += 1
+    elif bias in ("bull", "bear"):
+        opposes += 1
+    score = matches - opposes
+    if matches >= 4:
+        label = "full_aligned"
+    elif matches >= 3 and score >= 2:
+        label = "strong_aligned"
+    elif score >= 1:
+        label = "partial_aligned"
+    elif score == 0:
+        label = "mixed"
+    else:
+        label = "countertrend"
+    out.update({"mtf_alignment_score": int(score), "mtf_match_count": int(matches),
+                "mtf_oppose_count": int(opposes), "mtf_alignment_label": label,
+                "mtf_stack": "|".join(stack_parts)})
+    return out
+
+
 # ═══════════════════════════════════════════════════════════
 # MAIN BACKTEST LOOP
 # ═══════════════════════════════════════════════════════════
@@ -824,6 +980,7 @@ def run_ticker(ticker: str, intraday: list, daily: list, regime_cache: dict,
 
     daily_date_to_idx = {b["date"]: i for i, b in enumerate(daily)}
     swing_highs, swing_lows = _find_swings(daily) if daily else ([], [])
+    mtf_sources = _build_mtf_sources(intraday)
 
     for trade_date in sorted(bars_by_date.keys()):
         day_bars = bars_by_date[trade_date]
@@ -927,6 +1084,12 @@ def run_ticker(ticker: str, intraday: list, daily: list, regime_cache: dict,
                     cs_50_b, cs_50_w = _grade_credit(sig["bias"], cs_short, cs_50_long, exit_p_5d)
 
             conf_bucket = _classify_confluence(sig["bias"], pb["state"])
+            mtf = _mtf_snapshot_at(
+                mtf_sources,
+                int(day_bars[i].get("ts", 0) or 0),
+                sig["bias"],
+                bool(sig["daily_bull"]) if sig["daily_bull"] is not None else False,
+            )
 
             t = Trade(
                 ticker=ticker, signal_date=trade_date, signal_time_ct=entry_time_ct,
@@ -972,6 +1135,23 @@ def run_ticker(ticker: str, intraday: list, daily: list, regime_cache: dict,
                 credit_25_bucket=cs_25_b, credit_25_win_5d=cs_25_w,
                 credit_50_bucket=cs_50_b, credit_50_win_5d=cs_50_w,
                 confluence_bucket=conf_bucket,
+                mtf_15m_trend=mtf.get("mtf_15m_trend", "unknown"),
+                mtf_30m_trend=mtf.get("mtf_30m_trend", "unknown"),
+                mtf_60m_trend=mtf.get("mtf_60m_trend", "unknown"),
+                mtf_15m_macd=mtf.get("mtf_15m_macd", "unknown"),
+                mtf_30m_macd=mtf.get("mtf_30m_macd", "unknown"),
+                mtf_60m_macd=mtf.get("mtf_60m_macd", "unknown"),
+                mtf_15m_rsi=mtf.get("mtf_15m_rsi", 0.0),
+                mtf_30m_rsi=mtf.get("mtf_30m_rsi", 0.0),
+                mtf_60m_rsi=mtf.get("mtf_60m_rsi", 0.0),
+                mtf_15m_adx=mtf.get("mtf_15m_adx", 0.0),
+                mtf_30m_adx=mtf.get("mtf_30m_adx", 0.0),
+                mtf_60m_adx=mtf.get("mtf_60m_adx", 0.0),
+                mtf_alignment_score=mtf.get("mtf_alignment_score", 0),
+                mtf_match_count=mtf.get("mtf_match_count", 0),
+                mtf_oppose_count=mtf.get("mtf_oppose_count", 0),
+                mtf_alignment_label=mtf.get("mtf_alignment_label", "unknown"),
+                mtf_stack=mtf.get("mtf_stack", "unknown"),
                 exit_source="5min_last_close",
                 bad_data_flag=bad_flag,
                 bad_data_reason=bad_reason,
@@ -1592,6 +1772,11 @@ def write_edge_discovery_csv(trades, path):
         "ema_dist_pct","macd_hist","macd_sign","rsi","rsi_bucket","adx","adx_bucket","wt1","wt2","wt_cross","volume_ratio","volume_bucket",
         "score_bucket","regime_htf","structure_combo","core_combo","location_combo",
         "setup_archetype","approved_setup","setup_action","block_reason","suggested_hold_window","suggested_vehicle","setup_score",
+        "mtf_15m_trend","mtf_30m_trend","mtf_60m_trend",
+        "mtf_15m_macd","mtf_30m_macd","mtf_60m_macd",
+        "mtf_15m_rsi","mtf_30m_rsi","mtf_60m_rsi",
+        "mtf_15m_adx","mtf_30m_adx","mtf_60m_adx",
+        "mtf_alignment_score","mtf_match_count","mtf_oppose_count","mtf_alignment_label","mtf_stack",
         "pnl_pct_eod","win_eod","pnl_pct_1d","win_1d","pnl_pct_2d","win_2d","pnl_pct_3d","win_3d","pnl_pct_5d","win_5d",
         "mfe_eod_pct","mae_eod_pct","bad_data_flag","bad_data_reason"
     ]
@@ -1651,6 +1836,11 @@ def write_edge_by_feature(trades, path):
         ("setup_archetype", lambda t: t.setup_archetype),
         ("setup_action", lambda t: t.setup_action),
         ("approved_setup", lambda t: bool(t.approved_setup)),
+        ("mtf_alignment_label", lambda t: t.mtf_alignment_label or "unknown"),
+        ("mtf_alignment_score", lambda t: str(t.mtf_alignment_score)),
+        ("mtf_15m_trend", lambda t: t.mtf_15m_trend or "unknown"),
+        ("mtf_30m_trend", lambda t: t.mtf_30m_trend or "unknown"),
+        ("mtf_60m_trend", lambda t: t.mtf_60m_trend or "unknown"),
     ]
     _write_group_summary(trades, path, groupers)
 
@@ -1669,6 +1859,10 @@ def write_edge_by_combo(trades, path):
         ("setup_archetype", lambda t: t.setup_archetype),
         ("setup_action_archetype", lambda t: f"{t.setup_action}|{t.setup_archetype}"),
         ("approved_bias_regime", lambda t: f"approved={t.approved_setup}|{t.bias}|{t.regime}"),
+        ("approved_mtf", lambda t: f"{t.setup_archetype}|mtf={t.mtf_alignment_label}"),
+        ("approved_mtf_score", lambda t: f"{t.setup_archetype}|mtf_score={t.mtf_alignment_score}"),
+        ("bias_pb_mtf", lambda t: f"{t.bias}|pb={t.pb_state}|cb={t.cb_side}|mtf={t.mtf_alignment_label}"),
+        ("bias_fib_mtf", lambda t: f"{t.bias}|fib={_fib_bucket(t.fib_distance_pct)}|mtf={t.mtf_alignment_label}"),
     ]
     _write_group_summary(trades, path, groupers)
 
@@ -1761,6 +1955,43 @@ def write_setup_classifier_summary(trades, path):
             w.writerow(row)
 
 
+
+def write_edge_by_mtf(trades, path):
+    groupers = [
+        ("mtf_alignment_label", lambda t: t.mtf_alignment_label or "unknown"),
+        ("mtf_alignment_score", lambda t: str(t.mtf_alignment_score)),
+        ("mtf_stack", lambda t: t.mtf_stack or "unknown"),
+        ("setup_mtf", lambda t: f"{t.setup_archetype}|{t.mtf_alignment_label}"),
+        ("approved_mtf", lambda t: f"approved={t.approved_setup}|{t.mtf_alignment_label}"),
+        ("pb_mtf", lambda t: f"pb={t.pb_state}|cb={t.cb_side}|{t.mtf_alignment_label}"),
+    ]
+    _write_group_summary(trades, path, groupers)
+
+
+def write_mtf_confluence_summary(trades, path):
+    clean = [t for t in trades if not t.bad_data_flag]
+    groups = defaultdict(list)
+    for t in clean:
+        groups[(t.setup_archetype, t.bias, t.mtf_alignment_label, t.mtf_alignment_score)].append(t)
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow([
+            "setup_archetype","bias","mtf_alignment_label","mtf_alignment_score",
+            "n","wr_1d","wr_3d","wr_5d","avg_pnl_5d","approved_setup","setup_action",
+            "suggested_hold_window","suggested_vehicle",
+        ])
+        for key, ts in sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+            if len(ts) < 50:
+                continue
+            s1 = _stat(ts, "1d"); s3 = _stat(ts, "3d"); s5 = _stat(ts, "5d")
+            sample = ts[0]
+            w.writerow([
+                key[0], key[1], key[2], key[3], len(ts),
+                f"{s1['wr']:.1f}", f"{s3['wr']:.1f}", f"{s5['wr']:.1f}", f"{s5['avg']:+.3f}",
+                sample.approved_setup, sample.setup_action, sample.suggested_hold_window, sample.suggested_vehicle,
+            ])
+
+
 def write_edge_discovery_outputs(trades, out_dir: Path):
     write_edge_discovery_csv(trades, out_dir / "edge_discovery.csv")
     write_edge_by_feature(trades, out_dir / "edge_by_feature.csv")
@@ -1769,6 +2000,8 @@ def write_edge_discovery_outputs(trades, out_dir: Path):
     write_negative_edge_filters(trades, out_dir / "negative_edge_filters.csv")
     write_approved_setups_csv(trades, out_dir / "approved_setups.csv")
     write_setup_classifier_summary(trades, out_dir / "setup_classifier_summary.csv")
+    write_edge_by_mtf(trades, out_dir / "edge_by_mtf.csv")
+    write_mtf_confluence_summary(trades, out_dir / "mtf_confluence_summary.csv")
 
 def write_report(trades, start, end, path, audits=None):
     n = len(trades)
@@ -1875,6 +2108,8 @@ so a late-day signal no longer blocks most of the next day's signals.
 - **`negative_edge_filters.csv`** — weak combinations that may deserve shadow-only/block treatment
 - **`approved_setups.csv`** — Phase 1.6 classifier output for every clean scanner candidate
 - **`setup_classifier_summary.csv`** — approved/shadow/block archetype performance summary
+- **`edge_by_mtf.csv`** — 15m/30m/60m/daily alignment summary
+- **`mtf_confluence_summary.csv`** — approved setup archetypes segmented by MTF alignment
 
 ## Compared to v3_runner (pinescript) results
 
