@@ -448,6 +448,7 @@ V2_5D_EDGE_POST_UNDER_V1 = os.getenv("V2_5D_EDGE_POST_UNDER_V1", "1").strip().lo
 REVIEW_CARDS_AUTO_OPEN_ENABLED = os.getenv("REVIEW_CARDS_AUTO_OPEN_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
 
 
+
 # Live validation: TradingView is the trigger, bot data is the source of truth
 SCALP_SIGNAL_WARN_DRIFT_PCT     = float(os.getenv("SCALP_SIGNAL_WARN_DRIFT_PCT",   "0.20") or 0.20)
 SCALP_SIGNAL_REJECT_DRIFT_PCT   = float(os.getenv("SCALP_SIGNAL_REJECT_DRIFT_PCT", "0.35") or 0.35)
@@ -1800,7 +1801,7 @@ def _classify_source_type(source: str, ts_utc_str: str) -> str:
     FIX #5: Caller must pass the actual signal timestamp, not datetime.now().
     """
     source = (source or "").strip().lower()
-    if source == "active_scanner":
+    if source in ("active_scanner", "scanner"):
         return "scanner"
     if source == "check":
         return "manual"
@@ -4158,13 +4159,29 @@ def _pending_recheck_delays() -> list[int]:
     return out or [300, 900, 1800]
 
 
-def _schedule_pending_recheck(ticker: str, bias: str, webhook_data: dict, reason: str = "") -> tuple[bool, int | None, int, int]:
+def _schedule_pending_recheck(
+    ticker: str,
+    bias: str,
+    webhook_data: dict,
+    reason: str = "",
+    job_type: str | None = None,
+) -> tuple[bool, int | None, int, int]:
     if not PENDING_RECHECK_ENABLE:
         return False, None, 0, 0
 
     wd = dict(webhook_data or {})
     if str(wd.get("source") or "").lower() == "check":
         return False, None, int(wd.get("recheck_attempt") or 0), 0
+
+    # Scanner-native cleanup: pending rechecks must preserve their original
+    # source. Previously every recheck was re-enqueued as job_type="tv", which
+    # made scanner-native signals look like TradingView on retry.
+    source = str(wd.get("source") or "").strip().lower()
+    original_job_type = str(job_type or wd.get("job_type") or "").strip().lower()
+    if not original_job_type:
+        original_job_type = "scanner" if source in ("active_scanner", "scanner") else "tv"
+    if original_job_type not in ("scanner", "tv", "swing"):
+        original_job_type = "scanner" if source in ("active_scanner", "scanner") else "tv"
 
     delays = _pending_recheck_delays()
     attempt = int(wd.get("recheck_attempt") or 0)
@@ -4183,13 +4200,22 @@ def _schedule_pending_recheck(ticker: str, bias: str, webhook_data: dict, reason
     next_wd["allow_recheck_after_stale"] = True
     next_wd["pending_reason"] = (reason or wd.get("pending_reason") or "")[:200]
     next_wd["is_recheck"] = True
+    next_wd["job_type"] = original_job_type
+    if original_job_type == "scanner":
+        next_wd["source"] = next_wd.get("source") or "active_scanner"
+    elif original_job_type == "tv":
+        next_wd["source"] = next_wd.get("source") or "tv"
 
     def _fire():
         try:
             time.sleep(delays[attempt])
             signal_msg = f"Pending recheck {attempt+1}/{total}: {ticker} {bias.upper()}"
-            _enqueue_signal("tv", ticker, bias, next_wd, signal_msg)
-            log.info(f"Pending recheck enqueued: {ticker} {bias} attempt {attempt+1}/{total} after {delays[attempt]}s")
+            _enqueue_signal(original_job_type, ticker, bias, next_wd, signal_msg)
+            log.info(
+                f"Pending recheck enqueued: {ticker} {bias} "
+                f"job_type={original_job_type} attempt {attempt+1}/{total} "
+                f"after {delays[attempt]}s"
+            )
         except Exception as e:
             log.warning(f"Pending recheck failed for {ticker}: {e}")
 
@@ -4269,8 +4295,17 @@ def _process_job(worker_id: int, job: dict):
     job_type     = job["job_type"]
     ticker       = job["ticker"]
     bias         = job["bias"]
-    webhook_data = job["webhook_data"]
+    webhook_data = job.get("webhook_data") or {}
     enqueued_at  = job["enqueued_at"]
+
+    # Scanner-native cleanup: make the worker context honest before any
+    # downstream scorer, pending-recheck, logging, or card logic sees it.
+    webhook_data["job_type"] = job_type
+    if job_type == "scanner":
+        webhook_data["source"] = webhook_data.get("source") or "active_scanner"
+    elif job_type == "tv":
+        webhook_data["source"] = webhook_data.get("source") or "tv"
+
     tier_label   = webhook_data.get("tier", "?")
 
     age_sec = time.time() - enqueued_at
@@ -7948,6 +7983,9 @@ def tv_webhook():
         "htf_converging": data.get("htf_converging") in (True, "true"),
         "daily_bull": data.get("daily_bull") in (True, "true"),
         "volume": as_float(data.get("volume")), "timeframe": data.get("timeframe", ""),
+        "source": "tv",
+        "source_label": "legacy_tv_webhook",
+        "legacy_source": True,
     }
 
     def _build_signal_msg():
