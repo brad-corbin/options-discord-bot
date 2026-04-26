@@ -47,7 +47,7 @@ HIST_WR_BY_GRADE = {
 class V2SetupResult:
     model_version: str = MODEL_VERSION
     label: str = MODEL_LABEL
-    action: str = "SHADOW"          # REVIEW / SHADOW / BLOCK
+    action: str = "STALK"           # REVIEW / STALK / NO TRADE
     setup_grade: str = "SHADOW"     # A+ / A / B / SHADOW / BLOCK
     setup_archetype: str = "UNCLASSIFIED"
     bias: str = "unknown"
@@ -104,9 +104,25 @@ def classify_v2_setup(context: Dict[str, Any]) -> V2SetupResult:
     bias = _sl(_field(context, "bias", "direction", "side", default="unknown"), "unknown")
     pb_state = _sl(_field(context, "pb_state", "potter_state", default="no_box"), "no_box")
     cb_side = _sl(_field(context, "cb_side", default="n/a"), "n/a")
-    mtf = _sl(_field(context, "mtf_alignment_label", "mtf_label", default="unknown"), "unknown")
+    htf_status = _s(_field(context, "htf_status", default=""), "").upper()
+    mtf_raw = _sl(_field(context, "mtf_alignment_label", "mtf_label", default=""), "")
     above_vwap = _bool(_field(context, "above_vwap", default=False))
-    or30_state = _sl(_field(context, "or30_state", default="unknown"), "unknown")
+    daily_bull = _bool(_field(context, "daily_bull", default=False))
+    htf_confirmed = _bool(_field(context, "htf_confirmed", default=False)) or htf_status == "CONFIRMED"
+    htf_converging = _bool(_field(context, "htf_converging", default=False)) or htf_status == "CONVERGING"
+    regime = _s(_field(context, "market_regime", "regime", default=""), "").upper()
+    wave = _sl(_field(context, "pb_wave_label", "wave_label", default=""), "")
+
+    if mtf_raw:
+        mtf = mtf_raw
+    elif htf_confirmed and daily_bull and above_vwap:
+        mtf = "full_aligned"
+    elif htf_confirmed and (daily_bull or above_vwap):
+        mtf = "strong_aligned"
+    elif htf_converging or daily_bull or above_vwap:
+        mtf = "partial_aligned"
+    else:
+        mtf = "unknown"
 
     # Some paths may already pass these from the backtest-derived classifier.
     existing_archetype = _s(_field(context, "setup_archetype", default=""), "")
@@ -115,7 +131,7 @@ def classify_v2_setup(context: Dict[str, Any]) -> V2SetupResult:
     res = V2SetupResult(bias=bias, mtf_alignment=mtf)
 
     if bias != "bull":
-        res.action = "BLOCK"
+        res.action = "NO TRADE"
         res.setup_grade = "BLOCK"
         res.setup_archetype = "BEAR_RESEARCH_ONLY"
         res.historical_proxy_wr = HIST_WR_BY_GRADE["BLOCK"]
@@ -125,7 +141,7 @@ def classify_v2_setup(context: Dict[str, Any]) -> V2SetupResult:
 
     # Block known negative bullish structure.
     if pb_state == "in_box" and cb_side == "above_cb":
-        res.action = "BLOCK"
+        res.action = "NO TRADE"
         res.setup_grade = "BLOCK"
         res.setup_archetype = "BULL_CHASE_IN_BOX_BLOCK"
         res.historical_proxy_wr = HIST_WR_BY_GRADE["BLOCK"]
@@ -135,7 +151,7 @@ def classify_v2_setup(context: Dict[str, Any]) -> V2SetupResult:
 
     # A+ CB reclaim: inside box and below/near CB with full MTF alignment.
     if pb_state == "in_box" and cb_side in {"below_cb", "at_cb"}:
-        res.setup_archetype = "PB_CB_RECLAIM_BULL"
+        res.setup_archetype = "PB_CB_RECLAIM_BULL_APPROVED"
         res.preferred_structure = "Call debit spread review; bull put spread may also fit structure."
         res.short_strike_target = "1.0%–1.5% ITM short strike preferred"
         res.width_guidance = "Scan available $1 / $2 / $2.50 / $5 / wider spreads; choose best debit/width edge, not fixed width."
@@ -158,8 +174,8 @@ def classify_v2_setup(context: Dict[str, Any]) -> V2SetupResult:
         return res
 
     # Breakout bull above roof.
-    if pb_state == "above_roof":
-        res.setup_archetype = "PB_BREAKOUT_BULL"
+    if pb_state in {"above_roof", "post_box"}:
+        res.setup_archetype = "PB_BREAKOUT_BULL_APPROVED"
         res.preferred_structure = "Call debit spread / ITM call debit spread review."
         res.short_strike_target = "1.0%–1.5% ITM short strike preferred; 1.5% minimum for weaker grades."
         res.width_guidance = "Scan available widths and rank real spreads by debit/width edge cushion."
@@ -176,7 +192,7 @@ def classify_v2_setup(context: Dict[str, Any]) -> V2SetupResult:
             res.reason = "Breakout bull structure; MTF not optimal but historically positive as a 5D continuation bucket."
             return res
 
-    res.action = "SHADOW"
+    res.action = "STALK"
     res.setup_grade = existing_grade or "SHADOW"
     res.setup_archetype = existing_archetype or "UNCLASSIFIED"
     res.historical_proxy_wr = HIST_WR_BY_GRADE["SHADOW"]
@@ -245,7 +261,7 @@ def build_v2_card(result: V2SetupResult, ticker: str = "", spot: Optional[float]
                   best_spread: Optional[Dict[str, Any]] = None,
                   alternatives: Optional[List[Dict[str, Any]]] = None) -> str:
     """Build the Telegram V2 card text."""
-    header_emoji = "🟢" if result.setup_grade in {"A+", "A"} else ("🟡" if result.setup_grade == "B" else ("⛔" if result.setup_grade == "BLOCK" else "🧪"))
+    header_emoji = "🟢" if result.setup_grade in {"A+", "A"} else ("🟡" if result.setup_grade == "B" else ("⛔" if result.action == "NO TRADE" else "🧪"))
     title_ticker = ticker.upper() if ticker else "SIGNAL"
     lines = [
         "━━━━━━━━━━━━━━━━━━━━",
@@ -263,7 +279,7 @@ def build_v2_card(result: V2SetupResult, ticker: str = "", spot: Optional[float]
         "",
     ]
 
-    if result.action != "BLOCK":
+    if result.action != "NO TRADE":
         lines += [
             "Preferred structure:",
             result.preferred_structure,
@@ -274,8 +290,8 @@ def build_v2_card(result: V2SetupResult, ticker: str = "", spot: Optional[float]
         if best_spread:
             width = _field(best_spread, "width", "spread_width", default=None)
             debit = _field(best_spread, "debit", "net_debit", "cost", default=None)
-            long_strike = _field(best_spread, "long_strike", default=None)
-            short_strike = _field(best_spread, "short_strike", default=None)
+            long_strike = _field(best_spread, "long_strike", "long", default=None)
+            short_strike = _field(best_spread, "short_strike", "short", default=None)
             lines += [
                 "",
                 "Best real spread candidate from existing builder:",

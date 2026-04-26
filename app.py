@@ -446,7 +446,20 @@ DEDUP_TTL_SECONDS   = int(os.getenv("DEDUP_TTL_SECONDS", "3600") or 3600)
 V2_5D_EDGE_ENABLED = os.getenv("V2_5D_EDGE_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
 V2_5D_EDGE_POST_UNDER_V1 = os.getenv("V2_5D_EDGE_POST_UNDER_V1", "1").strip().lower() not in ("0", "false", "no", "off")
 REVIEW_CARDS_AUTO_OPEN_ENABLED = os.getenv("REVIEW_CARDS_AUTO_OPEN_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+SHADOW_POSITION_TRACKING_ENABLED = os.getenv("SHADOW_POSITION_TRACKING_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
 
+
+def _should_auto_register_recommendation(trade_type: str) -> bool:
+    """Review-card safety gate.
+
+    Posting a recommendation/review card must not create a monitored/open
+    position unless Brad has explicitly opted back into legacy auto-registration.
+    Shadow research tracking has its own opt-in because it is not a real fill.
+    """
+    tt = str(trade_type or "").strip().lower()
+    if tt == "shadow":
+        return bool(SHADOW_POSITION_TRACKING_ENABLED)
+    return bool(REVIEW_CARDS_AUTO_OPEN_ENABLED)
 
 
 # Live validation: TradingView is the trigger, bot data is the source of truth
@@ -1801,7 +1814,7 @@ def _classify_source_type(source: str, ts_utc_str: str) -> str:
     FIX #5: Caller must pass the actual signal timestamp, not datetime.now().
     """
     source = (source or "").strip().lower()
-    if source in ("active_scanner", "scanner"):
+    if source == "active_scanner":
         return "scanner"
     if source == "check":
         return "manual"
@@ -3415,7 +3428,7 @@ def _record_wave_result(result: dict):
 def _flush_wave_digest():
     """
     v4.1: Compact digest with /tradecard retrieval.
-    - Immediate post: T1 + conf >= 75 (or 0DTE)
+    - Immediate post: highest-quality REVIEW cards only
     - Digest: one-liner per signal, full card cached for /tradecard TICKER
     """
     global _wave_results
@@ -3437,17 +3450,17 @@ def _flush_wave_digest():
         tier = r.get("tier", "?")
         conf = r.get("confidence")
         card = r.get("card")
-        won = r.get("outcome") == "trade"
+        review_ready = r.get("outcome") == "trade"
 
         dir_emoji = "🐻" if bias == "bear" else "🐂"
         conf_str = f"{conf}/100" if conf is not None else "—"
         type_label = "SWING" if job_type == "swing" else ("SCANNER" if job_type == "scanner" else "TV")
 
-        if (won or r.get("outcome") == "pending") and card:
+        if (review_ready or r.get("outcome") == "pending") and card:
             cache_key = f"tradecard:{ticker.upper()}"
             store_set(cache_key, card, ttl=DIGEST_CARD_CACHE_TTL_SEC)
 
-        if won and card:
+        if review_ready and card:
             # v8.4.6 (Patch 2B-refined): ONLY the scorer-path (job_type="tv")
             # gets auto-posted full cards. The v8.3 conviction scorer + Phase 1
             # backtest (572K trades, +8.75 WR lift at score≥70) only validated
@@ -3459,24 +3472,24 @@ def _flush_wave_digest():
             if job_type == "swing":
                 # Original pre-2B behavior: digest-only (user must /tradecard).
                 # Keeps backtest-unvalidated swing signals from spamming main.
-                digest_lines.append(f"  📋 {ticker} T{tier} {dir_emoji} {conf_str} — /tradecard {ticker}")
+                digest_lines.append(f"  📋 {ticker} T{tier} {dir_emoji} {conf_str} — STALK /tradecard {ticker}")
             elif r.get("signal_only"):
                 # v8.5 (Phase 3.6, Fix 1): signal-only card was posted to main
                 # channel because scorer said post but no standard spread fit.
                 # Tag distinctly so the digest doesn't misleadingly claim an
                 # entry was taken.
                 immediate_cards.append((card, r))
-                digest_lines.append(f"  🔍 {ticker} T{tier} {dir_emoji} {conf_str} — SIGNAL ONLY ⬆️ (find vehicle)")
+                digest_lines.append(f"  🔍 {ticker} T{tier} {dir_emoji} {conf_str} — STALK ⬆️ (find vehicle)")
             else:
                 # Scorer/tv path — backtest-validated at score ≥70. Auto-post.
                 immediate_cards.append((card, r))
-                digest_lines.append(f"  ✅ {ticker} T{tier} {dir_emoji} {conf_str} — V1 REVIEW POSTED ⬆️")
+                digest_lines.append(f"  ✅ {ticker} T{tier} {dir_emoji} {conf_str} — REVIEW POSTED ⬆️")
         elif r.get("outcome") == "pending":
             reason = r.get("reason", "waiting on recheck")[:50]
-            pending_lines.append(f"  ⏳ {ticker} T{tier} {dir_emoji} {conf_str} — {reason}")
+            pending_lines.append(f"  ⏳ {ticker} T{tier} {dir_emoji} {conf_str} — STALK / {reason}")
         else:
             reason = r.get("reason", "no setup")[:60]
-            skipped_lines.append(f"  ❌ {ticker} T{tier} {dir_emoji} {conf_str} — {reason}")
+            skipped_lines.append(f"  ❌ {ticker} T{tier} {dir_emoji} {conf_str} — NO TRADE / {reason}")
 
     lines = []
     # v8.5 (Phase 3.4): suppress "Skipped" section in the Signal Digest.
@@ -3487,7 +3500,7 @@ def _flush_wave_digest():
     # no longer shows "skipped" since it would mislead (count still runs,
     # just not shown). digest_lines and pending_lines are preserved intact.
     if digest_lines or pending_lines:
-        lines.append(f"📊 SIGNAL DIGEST ({len(digest_lines)} trades, {len(pending_lines)} pending)")
+        lines.append(f"📊 SIGNAL DIGEST ({len(digest_lines)} reviews, {len(pending_lines)} stalk)")
         lines.append("")
         if digest_lines:
             lines.append("── Trades ──")
@@ -4159,29 +4172,14 @@ def _pending_recheck_delays() -> list[int]:
     return out or [300, 900, 1800]
 
 
-def _schedule_pending_recheck(
-    ticker: str,
-    bias: str,
-    webhook_data: dict,
-    reason: str = "",
-    job_type: str | None = None,
-) -> tuple[bool, int | None, int, int]:
+def _schedule_pending_recheck(ticker: str, bias: str, webhook_data: dict, reason: str = "") -> tuple[bool, int | None, int, int]:
     if not PENDING_RECHECK_ENABLE:
         return False, None, 0, 0
 
     wd = dict(webhook_data or {})
+    wd.setdefault("job_type", str(wd.get("job_type") or wd.get("source_job_type") or "scanner").lower())
     if str(wd.get("source") or "").lower() == "check":
         return False, None, int(wd.get("recheck_attempt") or 0), 0
-
-    # Scanner-native cleanup: pending rechecks must preserve their original
-    # source. Previously every recheck was re-enqueued as job_type="tv", which
-    # made scanner-native signals look like TradingView on retry.
-    source = str(wd.get("source") or "").strip().lower()
-    original_job_type = str(job_type or wd.get("job_type") or "").strip().lower()
-    if not original_job_type:
-        original_job_type = "scanner" if source in ("active_scanner", "scanner") else "tv"
-    if original_job_type not in ("scanner", "tv", "swing"):
-        original_job_type = "scanner" if source in ("active_scanner", "scanner") else "tv"
 
     delays = _pending_recheck_delays()
     attempt = int(wd.get("recheck_attempt") or 0)
@@ -4200,22 +4198,20 @@ def _schedule_pending_recheck(
     next_wd["allow_recheck_after_stale"] = True
     next_wd["pending_reason"] = (reason or wd.get("pending_reason") or "")[:200]
     next_wd["is_recheck"] = True
-    next_wd["job_type"] = original_job_type
-    if original_job_type == "scanner":
-        next_wd["source"] = next_wd.get("source") or "active_scanner"
-    elif original_job_type == "tv":
-        next_wd["source"] = next_wd.get("source") or "tv"
 
     def _fire():
         try:
             time.sleep(delays[attempt])
             signal_msg = f"Pending recheck {attempt+1}/{total}: {ticker} {bias.upper()}"
-            _enqueue_signal(original_job_type, ticker, bias, next_wd, signal_msg)
-            log.info(
-                f"Pending recheck enqueued: {ticker} {bias} "
-                f"job_type={original_job_type} attempt {attempt+1}/{total} "
-                f"after {delays[attempt]}s"
-            )
+            # Preserve scanner-native identity through rechecks. Older code
+            # hardcoded "tv" here, so scanner signals could silently re-enter
+            # as TradingView-shaped jobs after the first pending pass.
+            next_job_type = str(next_wd.get("job_type") or next_wd.get("source_job_type") or wd.get("job_type") or "scanner").lower()
+            if next_job_type not in ("scanner", "tv", "swing"):
+                next_job_type = "scanner"
+            next_wd["job_type"] = next_job_type
+            _enqueue_signal(next_job_type, ticker, bias, next_wd, signal_msg)
+            log.info(f"Pending recheck enqueued: {ticker} {bias} job_type={next_job_type} attempt {attempt+1}/{total} after {delays[attempt]}s")
         except Exception as e:
             log.warning(f"Pending recheck failed for {ticker}: {e}")
 
@@ -4295,17 +4291,14 @@ def _process_job(worker_id: int, job: dict):
     job_type     = job["job_type"]
     ticker       = job["ticker"]
     bias         = job["bias"]
-    webhook_data = job.get("webhook_data") or {}
+    webhook_data = job["webhook_data"]
+    if webhook_data is None:
+        webhook_data = {}
+    else:
+        webhook_data = dict(webhook_data)
+    webhook_data.setdefault("job_type", job_type)
+    webhook_data.setdefault("source_job_type", job_type)
     enqueued_at  = job["enqueued_at"]
-
-    # Scanner-native cleanup: make the worker context honest before any
-    # downstream scorer, pending-recheck, logging, or card logic sees it.
-    webhook_data["job_type"] = job_type
-    if job_type == "scanner":
-        webhook_data["source"] = webhook_data.get("source") or "active_scanner"
-    elif job_type == "tv":
-        webhook_data["source"] = webhook_data.get("source") or "tv"
-
     tier_label   = webhook_data.get("tier", "?")
 
     age_sec = time.time() - enqueued_at
@@ -4594,7 +4587,7 @@ def _process_job(worker_id: int, job: dict):
 
                 # Register shadow position for live option P&L tracking
                 try:
-                    if _position_monitor:
+                    if _position_monitor and _should_auto_register_recommendation("shadow"):
                         from schwab_stream import build_occ_symbol, get_live_premium
                         _v7_spot = float((webhook_data or {}).get("close", 0)) or get_spot(ticker)
                         _v7_side = "C" if bias == "bull" else "P"
@@ -5007,7 +5000,7 @@ def _process_job(worker_id: int, job: dict):
 
             # v7: register swing trade for live option P&L tracking
             try:
-                if _position_monitor and rec.get("trade"):
+                if _position_monitor and rec.get("trade") and _should_auto_register_recommendation("swing"):
                     from schwab_stream import build_occ_symbol
                     _sw_side = "C" if rec.get("direction", "bull") == "bull" else "P"
                     _sw_occ = build_occ_symbol(ticker, rec.get("exp", ""), _sw_side, rec["trade"].get("long", 0))
@@ -6508,7 +6501,7 @@ def _run_v4_prefilter(ticker: str, spot: float, chains: list, candle_closes: lis
 
                                 # v7: register income trade for live option P&L tracking
                                 try:
-                                    if _position_monitor:
+                                    if _position_monitor and _should_auto_register_recommendation("income"):
                                         from schwab_stream import build_occ_symbol
                                         _inc_side = "P" if _best_income["trade_type"] == "bull_put" else "C"
                                         _inc_occ = build_occ_symbol(
@@ -6601,7 +6594,8 @@ def _run_v4_prefilter(ticker: str, spot: float, chains: list, candle_closes: lis
 
                         # v7: register conviction trade for live option P&L tracking
                         try:
-                            if _position_monitor and cp.get("strike") and cp.get("expiry"):
+                            if (_position_monitor and cp.get("strike") and cp.get("expiry")
+                                    and _should_auto_register_recommendation("conviction")):
                                 from schwab_stream import build_occ_symbol, get_live_premium
                                 _cv_side_str = (cp.get("trade_side", "") or "").upper()
                                 _cv_side = "C" if "CALL" in _cv_side_str else "P"
@@ -7983,9 +7977,6 @@ def tv_webhook():
         "htf_converging": data.get("htf_converging") in (True, "true"),
         "daily_bull": data.get("daily_bull") in (True, "true"),
         "volume": as_float(data.get("volume")), "timeframe": data.get("timeframe", ""),
-        "source": "tv",
-        "source_label": "legacy_tv_webhook",
-        "legacy_source": True,
     }
 
     def _build_signal_msg():
@@ -11665,8 +11656,8 @@ def _post_checkswing_card(ticker: str, forced_direction: str = None):
             _log_signal_dataset_event(
                 ticker=ticker,
                 webhook_data={"type": "swing", "source": "check", "bias": rec.get("direction"), "requested_bias": forced_direction or rec.get("direction"), "tier": rec.get("tier", "manual"), "manual_scoreable": rec.get("scoreable")},
-                outcome="trade_opened",
-                reason="",
+                outcome="review_posted",
+                reason="manual swing card posted; not an open trade",
                 best_rec=rec,
                 spot=spot,
                 expirations_checked=len(chains),

@@ -49,7 +49,7 @@ SHORT_LEG_MIN_DELTA_PUT  = -0.40    # Short put delta floor (absolute value)
 # For 0-3 DTE: allow ATM short leg (delta ~0.45-0.55) for cheaper spreads.
 # For 4+ DTE: prefer ITM short leg (delta >= 0.55) for higher probability.
 SHORT_LEG_DTE_ITM_THRESHOLD = 4     # DTE above this prefers ITM short leg
-WIDTH_PREFERENCE         = [1.0, 2.0, 2.50, 5.0]
+WIDTH_PREFERENCE         = [1.0, 2.0, 2.50, 5.0, 10.0]
 NO_HALF_DOLLAR_WIDTHS    = True
 
 # ─────────────────────────────────────────────────────────

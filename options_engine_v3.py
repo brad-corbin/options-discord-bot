@@ -56,6 +56,13 @@ from trading_rules import (
     get_em_strike_multiplier, get_naked_dte_range,
 )
 
+# Phase 2.4: optional V2 5D edge model context. This is ranking-only;
+# it does not fetch chains, open trades, or replace the existing builder.
+try:
+    from v2_5d_edge_model import classify_v2_setup as _classify_v2_setup
+except Exception:  # pragma: no cover - fail-open for deploy safety
+    _classify_v2_setup = None
+
 
 # ─────────────────────────────────────────────────────────
 # HELPERS
@@ -1714,10 +1721,176 @@ def _build_naked_result(
 
 
 # ─────────────────────────────────────────────────────────
+# V2 5D EDGE MODEL — RANKING CONTEXT ONLY
+# ─────────────────────────────────────────────────────────
+
+def _build_v2_spread_context(webhook_data: Dict, ticker: str, bias: str):
+    """Return V2 setup result for spread ranking, or None if unavailable.
+
+    This deliberately uses the existing V2 classifier instead of creating a
+    second live/backtest scorer copy. Missing fields fail open to None/STALK.
+    """
+    if _classify_v2_setup is None:
+        return None
+    try:
+        ctx = dict(webhook_data or {})
+        ctx.setdefault("ticker", ticker)
+        ctx.setdefault("bias", bias)
+        ctx.setdefault("direction", bias)
+        return _classify_v2_setup(ctx)
+    except Exception:
+        return None
+
+
+def _v2_safe_float(x, default=0.0) -> float:
+    try:
+        return float(x) if x is not None else default
+    except Exception:
+        return default
+
+
+def _v2_breakeven_wr(debit: float, width: float):
+    debit = _v2_safe_float(debit, 0.0)
+    width = _v2_safe_float(width, 0.0)
+    if debit <= 0 or width <= 0:
+        return None
+    return max(0.0, min(0.99, debit / width))
+
+
+def _v2_ev_proxy(width: float, debit: float, hist_wr: float):
+    width = _v2_safe_float(width, 0.0)
+    debit = _v2_safe_float(debit, 0.0)
+    hist_wr = _v2_safe_float(hist_wr, 0.0)
+    if width <= 0 or debit <= 0 or hist_wr <= 0 or hist_wr >= 1:
+        return None
+    max_profit = width - debit
+    if max_profit <= 0:
+        return None
+    return (hist_wr * max_profit) - ((1.0 - hist_wr) * debit)
+
+
+def _v2_short_itm_pct(candidate: Dict, spot: float, bias: str) -> float:
+    spot = _v2_safe_float(spot, 0.0)
+    short_k = _v2_safe_float(candidate.get("short") or candidate.get("short_strike"), 0.0)
+    if spot <= 0 or short_k <= 0:
+        return 0.0
+    if str(bias).lower() == "bull":
+        # Bull call debit spread short strike is ITM when below spot.
+        return max(0.0, (spot - short_k) / spot * 100.0)
+    # Bear put debit spread short strike is ITM when above spot.
+    return max(0.0, (short_k - spot) / spot * 100.0)
+
+
+def _v2_short_strike_score(short_itm_pct: float, setup_grade: str) -> float:
+    """Score how well the real short strike matches the tested 1.0%-1.5% ITM target."""
+    pct = _v2_safe_float(short_itm_pct, 0.0)
+    grade = str(setup_grade or "").upper()
+    if pct <= 0:
+        return 0.10
+    target_mid = 1.25
+    # B-grade breakouts need the most cushion; exact target gets full credit.
+    if 1.0 <= pct <= 1.5:
+        return 1.00
+    if grade == "B" and pct < 1.0:
+        return max(0.20, pct / 1.0 * 0.55)
+    distance = abs(pct - target_mid)
+    return max(0.25, min(0.95, 1.0 - distance / 3.0))
+
+
+def _v2_width_score(width: float) -> float:
+    width = _v2_safe_float(width, 0.0)
+    # Compare real widths when available; do not force a fixed $2.50 spread.
+    if width <= 0:
+        return 0.0
+    if width <= 1.0:
+        return 0.96
+    if width <= 2.0:
+        return 0.93
+    if width <= 2.5:
+        return 0.88
+    if width <= 5.0:
+        return 0.72
+    if width <= 10.0:
+        return 0.55
+    return 0.35
+
+
+def _v2_liquidity_score(candidate: Dict) -> float:
+    warnings = candidate.get("warnings") or []
+    score = max(0.0, 1.0 - 0.20 * len(warnings))
+    long_oi = _v2_safe_float(candidate.get("long_oi"), 0.0)
+    short_oi = _v2_safe_float(candidate.get("short_oi"), 0.0)
+    avg_oi = (long_oi + short_oi) / 2.0
+    long_spread = _v2_safe_float(candidate.get("long_spread_pct"), 0.0)
+    short_spread = _v2_safe_float(candidate.get("short_spread_pct"), 0.0)
+    avg_spread = (long_spread + short_spread) / 2.0 if (long_spread or short_spread) else 0.0
+    if avg_oi >= 5000:
+        score += 0.15
+    elif avg_oi >= 2000:
+        score += 0.08
+    if avg_spread and avg_spread <= 0.08:
+        score += 0.10
+    elif avg_spread and avg_spread >= 0.25:
+        score -= 0.15
+    return max(0.0, min(1.0, score))
+
+
+def _annotate_candidates_with_v2(candidates: List[Dict], v2_result, spot: float, bias: str) -> None:
+    """Add V2 ranking fields to existing real spread candidates in-place."""
+    if not candidates or v2_result is None:
+        return
+    hist_wr = _v2_safe_float(getattr(v2_result, "historical_proxy_wr", 0.0), 0.0)
+    action = str(getattr(v2_result, "action", "STALK") or "STALK").upper()
+    grade = str(getattr(v2_result, "setup_grade", "SHADOW") or "SHADOW").upper()
+    grade_score = {"A+": 1.00, "A": 0.88, "B": 0.72, "SHADOW": 0.34, "BLOCK": 0.05}.get(grade, 0.30)
+    if action == "NO TRADE":
+        grade_score = min(grade_score, 0.05)
+
+    for c in candidates:
+        width = _v2_safe_float(c.get("width") or c.get("spread_width"), 0.0)
+        debit = _v2_safe_float(c.get("debit") or c.get("net_debit") or c.get("cost"), 0.0)
+        be = _v2_breakeven_wr(debit, width)
+        cushion = (hist_wr - be) if (be is not None and hist_wr > 0) else None
+        ev = _v2_ev_proxy(width, debit, hist_wr)
+        itm_pct = _v2_short_itm_pct(c, spot, bias)
+        strike_score = _v2_short_strike_score(itm_pct, grade)
+        liq_score = _v2_liquidity_score(c)
+        width_score = _v2_width_score(width)
+        cushion_score = 0.0 if cushion is None else max(0.0, min(1.0, (cushion + 0.05) / 0.35))
+        ev_score = 0.0 if ev is None else max(0.0, min(1.0, (ev + 0.05) / max(width, 0.01)))
+
+        v2_rank = (
+            cushion_score * 0.30 +
+            ev_score * 0.20 +
+            strike_score * 0.20 +
+            liq_score * 0.15 +
+            width_score * 0.10 +
+            grade_score * 0.05
+        )
+        if action == "NO TRADE":
+            v2_rank *= 0.25
+        elif action == "STALK":
+            v2_rank *= 0.65
+
+        c["v2_model_action"] = action
+        c["v2_setup_grade"] = grade
+        c["v2_setup_archetype"] = getattr(v2_result, "setup_archetype", "")
+        c["v2_hist_wr"] = round(hist_wr, 4) if hist_wr else None
+        c["v2_breakeven_wr"] = round(be, 4) if be is not None else None
+        c["v2_edge_cushion"] = round(cushion, 4) if cushion is not None else None
+        c["v2_ev_proxy"] = round(ev, 4) if ev is not None else None
+        c["v2_short_strike_itm_pct"] = round(itm_pct, 3)
+        c["v2_short_strike_score"] = round(strike_score, 4)
+        c["v2_liquidity_score"] = round(liq_score, 4)
+        c["v2_width_score"] = round(width_score, 4)
+        c["v2_rank_score"] = round(v2_rank, 4)
+
+
+# ─────────────────────────────────────────────────────────
 # RANKING
 # ─────────────────────────────────────────────────────────
 
-def rank_candidates(candidates: List[Dict], iv_edge_label: str = "NEUTRAL", entry_plan: Dict = None, ticker: str = "") -> List[Dict]:
+def rank_candidates(candidates: List[Dict], iv_edge_label: str = "NEUTRAL", entry_plan: Dict = None, ticker: str = "", v2_result=None) -> List[Dict]:
     """
     Composite scoring model with hybrid-entry preference.
     Candidates are scored on quality, then nudged toward the entry profile
@@ -1822,6 +1995,15 @@ def rank_candidates(candidates: List[Dict], iv_edge_label: str = "NEUTRAL", entr
         profile_mult = _profile_fit_multiplier(profile, aggression)
         composite *= profile_mult
 
+        # Phase 2.4: V2 model context nudges rank among real live-chain
+        # candidates. It never creates candidates, never fixes width, and never
+        # opens trades. Existing EV/liquidity gates above still control pass/fail.
+        v2_rank = c.get("v2_rank_score")
+        if v2_result is not None and v2_rank is not None:
+            action = str(getattr(v2_result, "action", "STALK") or "STALK").upper()
+            v2_weight = 0.30 if action == "REVIEW" else 0.15 if action == "STALK" else 0.05
+            composite = (composite * (1.0 - v2_weight)) + (float(v2_rank) * v2_weight)
+
         c["entry_fit_multiplier"] = round(profile_mult, 4)
         c["rank_score"] = round(composite, 4)
         c["rank_context"] = {
@@ -1830,6 +2012,12 @@ def rank_candidates(candidates: List[Dict], iv_edge_label: str = "NEUTRAL", entr
             "wp_minus_hurdle": round(wp - breakeven_prob_needed, 4),
             "entry_aggression": aggression,
             "entry_profile": profile,
+            "v2_model_action": c.get("v2_model_action"),
+            "v2_setup_grade": c.get("v2_setup_grade"),
+            "v2_edge_cushion": c.get("v2_edge_cushion"),
+            "v2_ev_proxy": c.get("v2_ev_proxy"),
+            "v2_short_strike_itm_pct": c.get("v2_short_strike_itm_pct"),
+            "v2_rank_score": c.get("v2_rank_score"),
         }
 
         if composite >= RANK_MIN_SCORE:
@@ -2352,6 +2540,7 @@ def recommend_trade(
     regime = regime or {}
     entry_plan = _determine_entry_plan(webhook_data, bias, regime=regime, v4_flow=v4_flow, vol_edge=vol_edge, dte=dte)
     atm_band = _atm_band(spot)
+    v2_result = _build_v2_spread_context(webhook_data, ticker, bias)
 
     # ═══ Build spread candidates ═══
     # v5.0: If spreads fail (no candidates or all slippage-rejected),
@@ -2384,6 +2573,8 @@ def recommend_trade(
         candidates = build_bull_call_spreads(quotes, spot, available_widths, expected_move, dte=dte, atm_band=atm_band)
         spread_side = "call"
         spread_label = "BULL CALL"
+
+    _annotate_candidates_with_v2(candidates, v2_result, spot, bias)
 
     # v5.1: VIX value for long option fallback (used by both fallback paths)
     _vix_val = (vol_regime or {}).get("vix", avg_iv * 100 if avg_iv < 1 else avg_iv)
@@ -2430,6 +2621,7 @@ def recommend_trade(
         iv_edge_label=vol_edge.get("edge_label", "NEUTRAL") if vol_edge else "NEUTRAL",
         entry_plan=entry_plan,
         ticker=ticker,  # v5.0: index-tier slippage
+        v2_result=v2_result,
     )
     if not ranked:
         rejected = {}
@@ -2612,6 +2804,10 @@ def recommend_trade(
         "iv_rv_ratio": round(avg_iv / rv, 3) if rv > 0 and avg_iv > 0 else None,
         "avg_iv": avg_iv,
         "hv20": rv,
+        # Phase 2.4: expose ranked real candidates so the V2 card can show the
+        # best live spread without building a second spread engine.
+        "candidate_spreads": ranked[:12],
+        "v2_model": v2_result.to_dict() if hasattr(v2_result, "to_dict") else None,
     }
 
 
