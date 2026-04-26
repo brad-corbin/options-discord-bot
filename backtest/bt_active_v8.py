@@ -1886,6 +1886,15 @@ def _edge_stats(rows, lbl="5d"):
         "mae": sum(t.mae_eod_pct for t in rows) / len(rows),
     }
 
+def _stat(rows, lbl="5d"):
+    """Compatibility helper used by MTF/location summary writers.
+
+    Phase 1.8 introduced additional summary writers that referenced `_stat`
+    while the canonical helper in this file is `_edge_stats`. Keep this thin
+    alias so late summary/report writers cannot fail after a long data run.
+    """
+    return _edge_stats(rows, lbl)
+
 def _edge_fields(t):
     fib_bucket = _bucket_pct(t.fib_distance_pct, [0.25, 0.50, 1.00, 2.00, 9999], ["fib_very_near", "fib_near", "fib_workable", "fib_far", "fib_none"])
     res_bucket = _bucket_pct(t.swing_dist_above_pct, [0.50, 1.00, 2.00, 4.00, 9999], ["res_very_near", "res_near", "res_workable", "res_far", "res_none"])
