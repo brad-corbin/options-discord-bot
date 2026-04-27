@@ -474,6 +474,14 @@ LEGACY_TV_WEBHOOK_ENABLED = os.getenv("LEGACY_TV_WEBHOOK_ENABLED", "1").strip().
 #       inlining and logging). Default "A".
 V2_PEER_MODE_ENABLED = os.getenv("V2_PEER_MODE_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
 V2_ORPHAN_POST_MIN_GRADE = (os.getenv("V2_ORPHAN_POST_MIN_GRADE", "A") or "A").strip().upper()
+# Phase 2.5 follow-up: swing engine kill switch.
+# Default OFF — Brad's call: the swing engine has not produced consistent winners
+# in the current parameter set and is being benched until a backtested edge is
+# found. When 0, the worker's `elif job_type == "swing":` branch returns early
+# with reason="swing_engine_disabled" and never touches swing_engine,
+# get_options_chain_swing, or fundamental enrichment. Set to 1 to re-enable
+# without code changes once you've identified an edge worth running live.
+SWING_ENGINE_ENABLED = os.getenv("SWING_ENGINE_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
 REVIEW_CARDS_AUTO_OPEN_ENABLED = os.getenv("REVIEW_CARDS_AUTO_OPEN_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
 SHADOW_POSITION_TRACKING_ENABLED = os.getenv("SHADOW_POSITION_TRACKING_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
 
@@ -4856,6 +4864,14 @@ def _process_job(worker_id: int, job: dict):
                 except Exception as _sl_err2:
                     log.error(f"[worker-{worker_id}] scorer_decisions error-row write ALSO failed for {ticker}: {_sl_err2}")
                 # Fail-open: proceed to existing v7 filter path even though scorer failed.
+                # Phase 2.5: V2 peer-mode classify lives inside the success branch,
+                # so a scorer crash silently skips V2 (orphan + inline both no-op).
+                # Surface this with a unique grep token so missed V2 events are
+                # countable without trawling stack traces.
+                if V2_PEER_MODE_ENABLED:
+                    log.warning(f"[worker-{worker_id}] V2 SCORER-MISS for {ticker} {bias} "
+                                f"— peer-mode V2 skipped because scorer raised; "
+                                f"orphan + inline paths will no-op for this signal")
 
         # ── v7: Backtest filter gate ──────────────────────────────
         # Check if this signal should be blocked by v7 rules BEFORE
@@ -4919,6 +4935,15 @@ def _process_job(worker_id: int, job: dict):
 
                 base["reason"] = f"v7 filter: {_v7_reason}"
                 base["outcome"] = "v7_filtered"
+                # Phase 2.5: V1 silent here. V2 may disagree on structural grade
+                # — v7 filter is regime/category-based historical loser detection,
+                # not a structural read. If V2 sees A+ structure, orphan-post.
+                _maybe_post_v2_orphan(
+                    ticker, bias, _v2_result,
+                    v1_status=f"v7 filter [{_v7_category}]: {_v7_reason}",
+                    spot=(webhook_data or {}).get("close"),
+                    webhook_data=webhook_data,
+                )
                 _record_wave_result(base)
                 return
         except Exception as _v7_err:
@@ -4986,6 +5011,16 @@ def _process_job(worker_id: int, job: dict):
                             )
                             log.info(f"[worker-{worker_id}] {ticker} T{tier_label} blocked by CAGF: "
                                      f"trend={_trend_prob:.0%} regime={_regime} prob={_prob:.0f}%")
+                            # Phase 2.5: V1 silent here. CAGF is a market regime
+                            # gate (SPY/QQQ/SPX only) — V2 may still see a clean
+                            # 5D structural setup even when the regime is weak.
+                            _maybe_post_v2_orphan(
+                                ticker, bias, _v2_result,
+                                v1_status=(f"CAGF regime gate: trend {_trend_prob:.0%} "
+                                           f"< {min_trend:.0%} ({_regime})"),
+                                spot=(webhook_data or {}).get("close") or _spot,
+                                webhook_data=webhook_data,
+                            )
                             _record_wave_result(base)
                             return
 
@@ -5013,6 +5048,14 @@ def _process_job(worker_id: int, job: dict):
                     if "BEAR" not in _mkt_label_for_pin:
                         base["reason"] = f"PIN regime ({_composite}) — bear puts blocked (non-BEAR market)"
                         log.info(f"[worker-{worker_id}] {ticker} blocked: {base['reason']}")
+                        # Phase 2.5: V1 silent here. PIN gate blocks on regime,
+                        # not structure — V2 may still see a clean structural grade.
+                        _maybe_post_v2_orphan(
+                            ticker, bias, _v2_result,
+                            v1_status=f"PIN regime ({_composite}) — bear puts blocked",
+                            spot=(webhook_data or {}).get("close"),
+                            webhook_data=webhook_data,
+                        )
                         _record_wave_result(base)
                         return
                     else:
@@ -5020,6 +5063,14 @@ def _process_job(worker_id: int, job: dict):
                 if bias == "bull" and PIN_REGIME_BLOCK_BULL_CALLS:
                     base["reason"] = f"PIN regime ({_composite}) — bull calls blocked"
                     log.info(f"[worker-{worker_id}] {ticker} blocked: {base['reason']}")
+                    # Phase 2.5: V1 silent here. PIN gate blocks on regime,
+                    # not structure — V2 may still see a clean structural grade.
+                    _maybe_post_v2_orphan(
+                        ticker, bias, _v2_result,
+                        v1_status=f"PIN regime ({_composite}) — bull calls blocked",
+                        spot=(webhook_data or {}).get("close"),
+                        webhook_data=webhook_data,
+                    )
                     _record_wave_result(base)
                     return
 
@@ -5039,6 +5090,15 @@ def _process_job(worker_id: int, job: dict):
                         f"< {CHOP_REGIME_CONF_GATE} (LOW VOL CHOP)"
                     )
                     log.info(f"[worker-{worker_id}] {ticker} blocked: {base['reason']}")
+                    # Phase 2.5: V1 silent here. CHOP gate blocks on confidence
+                    # in chop regime — V2's structural read is independent.
+                    _maybe_post_v2_orphan(
+                        ticker, bias, _v2_result,
+                        v1_status=(f"CHOP regime gate: v4 conf {_conf_score*100:.0f}/100 "
+                                   f"< {CHOP_REGIME_CONF_GATE}"),
+                        spot=(webhook_data or {}).get("close"),
+                        webhook_data=webhook_data,
+                    )
                     _record_wave_result(base)
                     return
 
@@ -5175,6 +5235,17 @@ def _process_job(worker_id: int, job: dict):
         log.info(f"{job_type.upper()} winner queued for digest: {ticker} {bias} T{tier_label} conf={rec.get('confidence')}/100")
 
     elif job_type == "swing":
+        # Phase 2.5 follow-up: swing engine kill switch (default OFF).
+        # Returns immediately with a clear reason so the wave digest reports
+        # the skip without trying to fetch chains, run swing_engine, or
+        # write a card. Re-enable via SWING_ENGINE_ENABLED=1.
+        if not SWING_ENGINE_ENABLED:
+            base["reason"] = "swing_engine_disabled"
+            base["outcome"] = "swing_disabled"
+            log.info(f"[worker-{worker_id}] SWING DISABLED: {ticker} {bias} "
+                     f"— SWING_ENGINE_ENABLED=0, skipping swing engine entirely")
+            _record_wave_result(base)
+            return
         from swing_engine import recommend_swing_trade, format_swing_card
         try:
             spot   = get_spot(ticker)
