@@ -20,56 +20,69 @@ CT_OFFSET = timezone(timedelta(hours=-5))
 DATA_DIR = Path(__file__).parent / "data"
 
 # ═══════════════════════════════════════════════════════════
-# SCHWAB CLIENT (primary data source — no throttle)
+# SCHWAB PROVIDER (primary data source — same path as fetch_backtest_bars.py)
 # ═══════════════════════════════════════════════════════════
 
-_schwab_client = None
+_schwab_provider = None
+_schwab_provider_checked = False
 
-def _get_schwab_client():
-    """Lazy-init Schwab client from env vars. Returns client or None."""
-    global _schwab_client
-    if _schwab_client is not None:
-        return _schwab_client
 
-    app_key = os.environ.get("SCHWAB_APP_KEY", "")
-    app_secret = os.environ.get("SCHWAB_APP_SECRET", "")
-    token_path = os.environ.get("SCHWAB_TOKEN_PATH", "schwab_token.json")
+def _get_schwab_provider():
+    """Lazy-init SchwabDataProvider from schwab_adapter.py.
 
-    if not app_key or not app_secret:
-        return None
+    This intentionally uses the same proven access path as
+    backtest/fetch_backtest_bars.py instead of maintaining a second
+    Schwab client implementation inside bt_shared.py.
+    """
+    global _schwab_provider, _schwab_provider_checked
+    if _schwab_provider_checked:
+        return _schwab_provider
 
-    # Decode base64 token from env if present
-    token_b64 = os.environ.get("SCHWAB_TOKEN_JSON", "")
-    if token_b64:
-        try:
-            import base64
-            token_bytes = base64.b64decode(token_b64)
-            os.makedirs(os.path.dirname(token_path) or ".", exist_ok=True)
-            with open(token_path, "wb") as f:
-                f.write(token_bytes)
-        except Exception as e:
-            print(f"  WARNING: Failed to decode SCHWAB_TOKEN_JSON: {e}")
+    _schwab_provider_checked = True
 
     try:
-        from schwab.auth import client_from_token_file
-        _schwab_client = client_from_token_file(token_path, app_key, app_secret)
-        print("  ✓ Schwab client initialised (no throttle)")
-        return _schwab_client
-    except FileNotFoundError:
-        print(f"  WARNING: Schwab token not found at {token_path}")
+        from schwab_adapter import SchwabDataProvider
+    except ImportError as e:
+        print(f"  WARNING: cannot import SchwabDataProvider from schwab_adapter: {e}")
         return None
+
+    try:
+        provider = SchwabDataProvider()
     except Exception as e:
-        print(f"  WARNING: Schwab init failed: {e}")
+        print(f"  WARNING: SchwabDataProvider init raised {type(e).__name__}: {e}")
         return None
+
+    if not getattr(provider, "available", False):
+        has_key = bool(os.environ.get("SCHWAB_APP_KEY"))
+        has_secret = bool(os.environ.get("SCHWAB_APP_SECRET"))
+        has_token = bool(os.environ.get("SCHWAB_TOKEN_JSON")) or os.path.exists(os.environ.get("SCHWAB_TOKEN_PATH", "schwab_token.json"))
+        print(
+            "  WARNING: SchwabDataProvider unavailable "
+            f"(SCHWAB_APP_KEY={'yes' if has_key else 'no'}, "
+            f"SCHWAB_APP_SECRET={'yes' if has_secret else 'no'}, "
+            f"token={'yes' if has_token else 'no'})"
+        )
+        return None
+
+    _schwab_provider = provider
+    print("  ✓ SchwabDataProvider initialised via schwab_adapter")
+    return _schwab_provider
 
 
 def _schwab_price_history(ticker, period_type, freq_type, freq, start_dt, end_dt):
-    """Call Schwab get_price_history and return raw JSON."""
-    client = _get_schwab_client()
-    if client is None:
+    """Call Schwab get_price_history through SchwabDataProvider.
+
+    Returns raw JSON on success or None on failure. Failures are logged with
+    enough detail to know whether Schwab credentials, request shape, or API
+    availability caused the MarketData fallback.
+    """
+    provider = _get_schwab_provider()
+    if provider is None:
         return None
+
     try:
-        resp = client.get_price_history(
+        return provider._schwab_get(
+            "get_price_history",
             ticker.upper(),
             period_type=period_type,
             frequency_type=freq_type,
@@ -78,10 +91,17 @@ def _schwab_price_history(ticker, period_type, freq_type, freq, start_dt, end_dt
             end_datetime=end_dt,
             need_extended_hours_data=False,
         )
-        resp.raise_for_status()
-        return resp.json()
     except Exception as e:
-        print(f"  WARNING: Schwab price_history failed for {ticker}: {e}")
+        resp = getattr(e, "response", None)
+        status = getattr(resp, "status_code", None)
+        text = getattr(resp, "text", "") or ""
+        status_part = f" HTTP {status}" if status else ""
+        text_part = f" — {text[:200]}" if text else ""
+        print(
+            f"  WARNING: Schwab price_history failed for {ticker} "
+            f"{start_dt.date()}→{end_dt.date()}{status_part}: "
+            f"{type(e).__name__}: {e}{text_part}"
+        )
         return None
 
 
@@ -89,7 +109,8 @@ def _schwab_download_daily(ticker, from_date, to_date):
     """Download daily bars from Schwab. Returns list of bar dicts."""
     try:
         from schwab.client import Client
-    except ImportError:
+    except ImportError as e:
+        print(f"  WARNING: schwab-py import failed for daily bars: {e}")
         return None
 
     start = datetime.strptime(from_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
@@ -97,9 +118,9 @@ def _schwab_download_daily(ticker, from_date, to_date):
 
     raw = _schwab_price_history(
         ticker,
-        period_type=Client.PriceHistory.PeriodType.MONTH,
+        period_type=Client.PriceHistory.PeriodType.YEAR,
         freq_type=Client.PriceHistory.FrequencyType.DAILY,
-        freq=Client.PriceHistory.Frequency.EVERY_MINUTE,  # ignored for daily
+        freq=Client.PriceHistory.Frequency.DAILY,
         start_dt=start, end_dt=end,
     )
     if raw is None:
@@ -107,6 +128,7 @@ def _schwab_download_daily(ticker, from_date, to_date):
 
     candles = raw.get("candles", [])
     if not candles:
+        print(f"  WARNING: Schwab daily returned zero candles for {ticker} {from_date}→{to_date}")
         return None
 
     bars = []
@@ -115,7 +137,6 @@ def _schwab_download_daily(ticker, from_date, to_date):
         ts_ms = c.get("datetime", 0)
         if any(x is None for x in [o, h, l, cl]):
             continue
-        # Schwab timestamps are milliseconds UTC
         dt = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).astimezone(CT_OFFSET)
         bars.append({
             "date": dt.strftime("%Y-%m-%d"),
@@ -124,15 +145,20 @@ def _schwab_download_daily(ticker, from_date, to_date):
         })
 
     bars.sort(key=lambda b: b["date"])
-    return bars
+    return bars if bars else None
 
 
 def _schwab_download_5min(ticker, from_date, to_date):
-    """Download 5-min bars from Schwab. Chunks into 30-day windows
-    (Schwab intraday limit is ~30 days per request)."""
+    """Download 5-min bars from Schwab.
+
+    Uses the same SchwabDataProvider path as fetch_backtest_bars.py. The
+    request is chunked into 7-day windows so Schwab's DAY/MINUTE historical
+    endpoint is not asked for an oversized intraday range.
+    """
     try:
         from schwab.client import Client
-    except ImportError:
+    except ImportError as e:
+        print(f"  WARNING: schwab-py import failed for 5m bars: {e}")
         return None
 
     start = datetime.strptime(from_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
@@ -140,7 +166,9 @@ def _schwab_download_5min(ticker, from_date, to_date):
 
     all_bars = []
     chunk_start = start
-    chunk_size = timedelta(days=28)  # Stay under 30-day limit
+    chunk_size = timedelta(days=7)
+    failed_chunks = 0
+    empty_chunks = 0
 
     while chunk_start < end:
         chunk_end = min(chunk_start + chunk_size, end)
@@ -150,10 +178,13 @@ def _schwab_download_5min(ticker, from_date, to_date):
             period_type=Client.PriceHistory.PeriodType.DAY,
             freq_type=Client.PriceHistory.FrequencyType.MINUTE,
             freq=Client.PriceHistory.Frequency.EVERY_FIVE_MINUTES,
-            start_dt=chunk_start, end_dt=chunk_end,
+            start_dt=chunk_start,
+            end_dt=chunk_end,
         )
 
-        if raw and raw.get("candles"):
+        if raw is None:
+            failed_chunks += 1
+        elif raw.get("candles"):
             for c in raw["candles"]:
                 o, h, l, cl, v = c.get("open"), c.get("high"), c.get("low"), c.get("close"), c.get("volume", 0)
                 ts_ms = c.get("datetime", 0)
@@ -167,8 +198,16 @@ def _schwab_download_5min(ticker, from_date, to_date):
                     "o": float(o), "h": float(h), "l": float(l), "c": float(cl),
                     "v": int(v or 0),
                 })
+        else:
+            empty_chunks += 1
 
         chunk_start = chunk_end + timedelta(days=1)
+
+    if failed_chunks or empty_chunks:
+        print(
+            f"  Schwab 5m chunks for {ticker}: "
+            f"bars={len(all_bars)}, failed_chunks={failed_chunks}, empty_chunks={empty_chunks}"
+        )
 
     all_bars.sort(key=lambda b: b["ts"])
     return all_bars if all_bars else None
@@ -253,27 +292,123 @@ def _md_download_daily(ticker, from_date, to_date):
     return bars if bars else None
 
 
-def _md_download_5min(ticker, from_date, to_date):
-    """Fallback: download 5-min bars from MarketData.app."""
+def _date_chunks(from_date: str, to_date: str, chunk_days: int):
+    """Yield inclusive YYYY-MM-DD chunks for large historical downloads.
+
+    MarketData can fail or return empty data when asked for multi-year 5-minute
+    candles in a single request. Chunking keeps each request small and makes
+    deep backtests practical while preserving a single combined bars list for
+    the scanner.
+    """
+    start = datetime.strptime(from_date, "%Y-%m-%d").date()
+    end = datetime.strptime(to_date, "%Y-%m-%d").date()
+    if chunk_days <= 0:
+        chunk_days = 30
+
+    cur = start
+    while cur <= end:
+        chunk_end = min(cur + timedelta(days=chunk_days - 1), end)
+        yield cur.strftime("%Y-%m-%d"), chunk_end.strftime("%Y-%m-%d")
+        cur = chunk_end + timedelta(days=1)
+
+
+def _dedupe_5min_bars(bars: list) -> list:
+    """De-duplicate 5-minute bars by timestamp and return sorted rows."""
+    by_ts = {}
+    for b in bars or []:
+        ts = b.get("ts")
+        if ts is None:
+            continue
+        by_ts[int(ts)] = b
+    out = list(by_ts.values())
+    out.sort(key=lambda b: b["ts"])
+    return out
+
+
+def _md_download_5min_single(ticker, from_date, to_date):
+    """Download one small 5-minute MarketData chunk."""
     url = f"https://api.marketdata.app/v1/stocks/candles/5/{ticker}/"
     params = {"from": from_date, "to": to_date, "dateformat": "timestamp"}
     data = _md_get(url, params)
     if not data or data.get("s") != "ok":
         return None
+
     bars = []
-    for i, ts in enumerate(data.get("t", [])):
-        try: dt_ct = _parse_ts(ts)
-        except ValueError: continue
+    times = data.get("t", [])
+    vols = data.get("v", [0] * len(times))
+    for i, ts in enumerate(times):
+        try:
+            dt_ct = _parse_ts(ts)
+        except ValueError:
+            continue
+        try:
+            close = data["c"][i]
+        except (KeyError, IndexError):
+            continue
+        if close is None:
+            continue
         bars.append({
-            "ts": int(dt_ct.timestamp()), "date": dt_ct.strftime("%Y-%m-%d"),
+            "ts": int(dt_ct.timestamp()),
+            "date": dt_ct.strftime("%Y-%m-%d"),
             "time_ct": dt_ct.strftime("%H:%M"),
-            "o": data["o"][i], "h": data["h"][i], "l": data["l"][i],
-            "c": data["c"][i], "v": data.get("v", [0]*len(data["t"]))[i],
+            "o": data["o"][i],
+            "h": data["h"][i],
+            "l": data["l"][i],
+            "c": close,
+            "v": vols[i] if i < len(vols) else 0,
         })
-    bars = [b for b in bars if b["c"] is not None]
-    bars.sort(key=lambda b: b["ts"])
+
     return bars if bars else None
 
+
+def _md_download_5min(ticker, from_date, to_date):
+    """Fallback: download 5-minute bars from MarketData.app.
+
+    Deep scanner backtests need far more than 90 days. MarketData's 5-minute
+    endpoint is much more reliable when the request is chunked instead of
+    asking for a multi-year range in one call.
+
+    Env knobs:
+      MARKETDATA_5M_CHUNK_DAYS   default 30
+      MARKETDATA_CHUNK_SLEEP     default 0.15 seconds between chunks
+    """
+    try:
+        chunk_days = int(os.getenv("MARKETDATA_5M_CHUNK_DAYS", "30"))
+    except ValueError:
+        chunk_days = 30
+    try:
+        chunk_sleep = float(os.getenv("MARKETDATA_CHUNK_SLEEP", "0.15"))
+    except ValueError:
+        chunk_sleep = 0.15
+
+    chunks = list(_date_chunks(from_date, to_date, chunk_days))
+    if len(chunks) <= 1:
+        bars = _md_download_5min_single(ticker, from_date, to_date)
+        return _dedupe_5min_bars(bars) if bars else None
+
+    print(f"  MarketData 5m: chunking {ticker} into {len(chunks)} requests ({chunk_days}d chunks)")
+    all_bars = []
+    empty_chunks = 0
+
+    for idx, (chunk_from, chunk_to) in enumerate(chunks, 1):
+        bars = _md_download_5min_single(ticker, chunk_from, chunk_to)
+        if bars:
+            all_bars.extend(bars)
+        else:
+            empty_chunks += 1
+
+        # Lightweight progress so a long GitHub Action does not look stuck.
+        if idx == 1 or idx == len(chunks) or idx % 10 == 0:
+            print(f"    {ticker} MarketData chunk {idx}/{len(chunks)}: total_bars={len(all_bars)}")
+
+        if chunk_sleep > 0 and idx < len(chunks):
+            time.sleep(chunk_sleep)
+
+    bars = _dedupe_5min_bars(all_bars)
+    if empty_chunks:
+        print(f"  MarketData 5m chunks for {ticker}: bars={len(bars)}, empty_chunks={empty_chunks}/{len(chunks)}")
+
+    return bars if bars else None
 
 # ═══════════════════════════════════════════════════════════
 # UNIFIED DOWNLOAD (Schwab → MarketData fallback → cache)
