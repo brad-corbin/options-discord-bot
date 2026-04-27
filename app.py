@@ -558,6 +558,9 @@ GOOGLE_SHEET_RECON_TAB = os.getenv("GOOGLE_SHEET_RECON_TAB", "em_reconciliation"
 GOOGLE_SHEET_CRISIS_TAB = os.getenv("GOOGLE_SHEET_CRISIS_TAB", "crisis_put_signals").strip() or "crisis_put_signals"
 GOOGLE_SHEET_SHADOW_TAB = os.getenv("GOOGLE_SHEET_SHADOW_TAB", "shadow_signals").strip() or "shadow_signals"
 GOOGLE_SHEET_CONVICTION_TAB = os.getenv("GOOGLE_SHEET_CONVICTION_TAB", "conviction_plays").strip() or "conviction_plays"
+# Phase 2.5: V2 peer-mode signals get their own tab so Brad can analyze
+# V1-vs-V2 disagreement without leaving the spreadsheet.
+GOOGLE_SHEET_PEER_TAB = os.getenv("GOOGLE_SHEET_PEER_TAB", "v2_peer_signals").strip() or "v2_peer_signals"
 
 # ─────────────────────────────────────────────────────────
 # REDIS
@@ -660,6 +663,10 @@ def _tab_for_filename(filename: str) -> str:
         "conviction_plays.csv": GOOGLE_SHEET_CONVICTION_TAB,
         # v8.3.1: scorer audit writes to its own tab, distinct from v6 regime log
         "scorer_decisions.csv": os.getenv("GOOGLE_SHEET_SCORER_TAB", "scorer_decisions"),
+        # Phase 2.5: V2 peer-mode classifications. v1_status + card_mode columns
+        # let you filter by orphan vs. inline vs. below-threshold so you can
+        # measure where V2 disagrees with V1 in real time.
+        "model_comparison_peer_signals.csv": GOOGLE_SHEET_PEER_TAB,
         # v7 position tracking tabs — name IS the tab
         "position_tracking_active": "position_tracking_active",
         "position_tracking_swing": "position_tracking_swing",
