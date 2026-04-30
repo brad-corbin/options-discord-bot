@@ -3016,6 +3016,70 @@ class FlowDetector:
 
         return "\n".join(lines)
 
+    @staticmethod
+    def _dte_label(expiry: str) -> tuple[int, str, str]:
+        """Return (dte, label, active_status) for an option expiration."""
+        try:
+            exp_dt = datetime.strptime(str(expiry)[:10], "%Y-%m-%d").date()
+            dte = (exp_dt - date.today()).days
+        except Exception:
+            return -999, "DTE?", "unknown"
+        if dte < 0:
+            return dte, f"EXPIRED {abs(dte)}D ago", "expired"
+        if dte == 0:
+            return dte, "0DTE", "intraday only"
+        if dte <= 3:
+            return dte, f"{dte}DTE", "very short-term"
+        if dte <= 10:
+            return dte, f"{dte}DTE", "weekly"
+        if dte <= 30:
+            return dte, f"{dte}DTE", "swing"
+        return dte, f"{dte}DTE", "larger thesis"
+
+    @staticmethod
+    def _strike_context_line(ticker: str, strike: float, side: str, expiry: str,
+                             spot: float, oi_change: int, oi_change_pct: float,
+                             flow_type: str = "buildup") -> str:
+        """Plain-English DTE + moneyness context for morning OI confirmations."""
+        dte, dte_label, active = FlowDetector._dte_label(expiry)
+        try:
+            strike_f = float(strike)
+            spot_f = float(spot or 0)
+            if spot_f > 0:
+                dist = abs(strike_f - spot_f) / spot_f * 100.0
+                loc = "above" if strike_f > spot_f else "below"
+                if dist < 0.35:
+                    money = "ATM"
+                else:
+                    if side == "call":
+                        money = "OTM" if strike_f > spot_f else "ITM"
+                    else:
+                        money = "OTM" if strike_f < spot_f else "ITM"
+                mny = f" — {money} {dist:.1f}% {loc} spot ${spot_f:.2f}"
+            else:
+                mny = ""
+        except Exception:
+            mny = ""
+        if active == "expired":
+            read = "historical only; expiration has passed"
+        elif dte == 0:
+            read = "intraday-only positioning"
+        elif dte <= 3 and dte >= 1:
+            read = "short-term momentum / expiry magnet"
+        elif dte <= 10 and dte >= 4:
+            read = "weekly directional positioning"
+        elif dte <= 30 and dte >= 11:
+            read = "swing positioning"
+        else:
+            read = active
+        side_emoji = "📗" if side == "call" else "📕"
+        flow_word = "OI" if flow_type != "unwinding" else "OI unwind"
+        return (
+            f"  {side_emoji} {ticker} ${float(strike):.0f} {str(side).upper()} "
+            f"exp {str(expiry)[:10]} ({dte_label}, {active}){mny} — "
+            f"{flow_word} {int(oi_change):+,} ({float(oi_change_pct):+.0f}%) | {read}"
+        )
+
     # ─────────────────────────────────────────────────────
     # FORMATTING
     # ─────────────────────────────────────────────────────
@@ -3120,22 +3184,24 @@ class FlowDetector:
                     camp_tag = f" 🏗️ {campaign['consecutive_days']}D CAMPAIGN"
                 elif campaign.get("consecutive_days", 0) >= CAMPAIGN_MIN_DAYS:
                     camp_tag = f" 📅 Day {campaign['consecutive_days']}"
-                lines.append(
-                    f"  {side_emoji} {c['ticker']} ${c['strike']:.0f} {c['side'].upper()} "
-                    f"({c['expiry']}) — OI {c['oi_change']:+,} "
-                    f"({c['oi_change_pct']:+.0f}%){camp_tag}{div_tag}"
+                _ctx_line = self._strike_context_line(
+                    c['ticker'], c['strike'], c['side'], c['expiry'],
+                    c.get('today_spot') or c.get('yesterday_spot') or 0,
+                    c['oi_change'], c['oi_change_pct'], flow_type="buildup",
                 )
+                lines.append(_ctx_line + camp_tag + div_tag)
 
         if unwinds:
             lines.append("")
             lines.append("🔻 CONFIRMED UNWINDING (positions closed):")
             for c in unwinds[:5]:
                 side_emoji = "📗" if c["side"] == "call" else "📕"
-                lines.append(
-                    f"  {side_emoji} {c['ticker']} ${c['strike']:.0f} {c['side'].upper()} "
-                    f"({c['expiry']}) — OI {c['oi_change']:+,} "
-                    f"({c['oi_change_pct']:+.0f}%)"
+                _ctx_line = self._strike_context_line(
+                    c['ticker'], c['strike'], c['side'], c['expiry'],
+                    c.get('today_spot') or c.get('yesterday_spot') or 0,
+                    c['oi_change'], c['oi_change_pct'], flow_type="unwinding",
                 )
+                lines.append(_ctx_line)
 
         if rolls:
             lines.append("")

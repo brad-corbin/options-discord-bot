@@ -192,6 +192,7 @@ class OITracker:
                 "strikes": {}, "expirations": set(),
                 "updated_at": time.time(), "spot": spot,
                 "per_exp": {},  # v5.1: per-expiration totals {exp_str: {call_oi, put_oi, dte}}
+                "strikes_by_exp": {},  # Phase 2.4: per-exp strike OI for DTE-aware flow cards
             }
         entry = self._today[ticker]
         if spot > 0:
@@ -215,6 +216,7 @@ class OITracker:
                 "call_oi": call_oi, "put_oi": put_oi,
                 "total": call_oi + put_oi, "dte": _dte,
             }
+            entry.setdefault("strikes_by_exp", {})[expiration] = dict(strike_oi)
 
     def _flush_to_store(self, date_str: str):
         for ticker, data in self._today.items():
@@ -234,6 +236,8 @@ class OITracker:
                 "call_pct": round(data["call_oi"] / total * 100, 1) if total > 0 else 50,
                 "put_pct": round(data["put_oi"] / total * 100, 1) if total > 0 else 50,
                 "top_strikes": [{"strike_key": k, "oi": v} for k, v in top],
+                "strikes_by_exp": data.get("strikes_by_exp", {}),
+                "per_exp": data.get("per_exp", {}),
                 "put_wall": put_wall,
                 "call_wall": call_wall,
                 "spot": data.get("spot", 0),
@@ -374,6 +378,7 @@ class OITracker:
             "is_spike": abs(total_change_pct) >= OI_SPIKE_THRESHOLD,
             # v5.1: per-expiration breakdown
             "per_exp": today_data.get("per_exp", {}),
+            "strikes_by_exp": today_data.get("strikes_by_exp", {}),
         }
 
     def get_daily_movers(self) -> List[dict]:
@@ -641,33 +646,74 @@ class OITracker:
             today_strikes = data.get("strikes", {})
 
             # ── Signal 1: Large overnight addition at a forward strike ──
+            # Phase 2.4: prefer per-expiration strike data so every top line can
+            # show expiration + DTE. Fall back to the old aggregate strike map
+            # until one full day of patched snapshots exists.
             large_additions = []
-            for key, oi in today_strikes.items():
-                prev = prior_strikes.get(key, 0)
-                delta = oi - prev
-                if delta < OI_UNUSUAL_MIN_CONTRACTS:
-                    continue
-                pct_chg = delta / prev if prev > 0 else 1.0
-                if pct_chg < OI_UNUSUAL_PCT_THRESHOLD and prev > 0:
-                    continue
-                parts = key.split("|")
-                if len(parts) != 2:
-                    continue
-                strike_val = float(parts[0])
-                side = parts[1]
-                dist_pct = abs(strike_val - spot) / spot * 100 if spot > 0 else 0
-                moneyness = self._classify_strike(strike_val, side, spot)
-                large_additions.append({
-                    "strike": strike_val,
-                    "side": side,
-                    "delta": delta,
-                    "pct_change": round(pct_chg * 100, 1),
-                    "current_oi": oi,
-                    "prior_oi": prev,
-                    "moneyness": moneyness,
-                    "dist_from_spot_pct": round(dist_pct, 1),
-                    "direction": "above" if strike_val > spot else "below",
-                })
+            prior_by_exp = (prior or {}).get("strikes_by_exp", {}) if prior else {}
+            today_by_exp = data.get("strikes_by_exp", {}) or {}
+            if prior_by_exp and today_by_exp:
+                for exp_str, exp_strikes in today_by_exp.items():
+                    exp_data = per_exp.get(exp_str, {})
+                    dte = exp_data.get("dte", -1)
+                    prior_exp_strikes = prior_by_exp.get(exp_str, {})
+                    for key, oi in exp_strikes.items():
+                        prev = prior_exp_strikes.get(key, 0)
+                        delta = oi - prev
+                        if delta < OI_UNUSUAL_MIN_CONTRACTS:
+                            continue
+                        pct_chg = delta / prev if prev > 0 else 1.0
+                        if pct_chg < OI_UNUSUAL_PCT_THRESHOLD and prev > 0:
+                            continue
+                        parts = key.split("|")
+                        if len(parts) != 2:
+                            continue
+                        strike_val = float(parts[0])
+                        side = parts[1]
+                        dist_pct = abs(strike_val - spot) / spot * 100 if spot > 0 else 0
+                        moneyness = self._classify_strike(strike_val, side, spot)
+                        large_additions.append({
+                            "strike": strike_val,
+                            "side": side,
+                            "expiry": exp_str,
+                            "dte": dte,
+                            "delta": delta,
+                            "pct_change": round(pct_chg * 100, 1),
+                            "current_oi": oi,
+                            "prior_oi": prev,
+                            "moneyness": moneyness,
+                            "dist_from_spot_pct": round(dist_pct, 1),
+                            "direction": "above" if strike_val > spot else "below",
+                        })
+            else:
+                for key, oi in today_strikes.items():
+                    prev = prior_strikes.get(key, 0)
+                    delta = oi - prev
+                    if delta < OI_UNUSUAL_MIN_CONTRACTS:
+                        continue
+                    pct_chg = delta / prev if prev > 0 else 1.0
+                    if pct_chg < OI_UNUSUAL_PCT_THRESHOLD and prev > 0:
+                        continue
+                    parts = key.split("|")
+                    if len(parts) != 2:
+                        continue
+                    strike_val = float(parts[0])
+                    side = parts[1]
+                    dist_pct = abs(strike_val - spot) / spot * 100 if spot > 0 else 0
+                    moneyness = self._classify_strike(strike_val, side, spot)
+                    large_additions.append({
+                        "strike": strike_val,
+                        "side": side,
+                        "expiry": "aggregate",
+                        "dte": -1,
+                        "delta": delta,
+                        "pct_change": round(pct_chg * 100, 1),
+                        "current_oi": oi,
+                        "prior_oi": prev,
+                        "moneyness": moneyness,
+                        "dist_from_spot_pct": round(dist_pct, 1),
+                        "direction": "above" if strike_val > spot else "below",
+                    })
 
             if not large_additions:
                 continue
@@ -727,6 +773,20 @@ class OITracker:
         signals.sort(key=lambda x: x["total_contracts_added"], reverse=True)
         return signals
 
+    @staticmethod
+    def _flow_horizon(dte: int) -> str:
+        if dte is None or dte < 0:
+            return "aggregate across expirations"
+        if dte == 0:
+            return "0DTE intraday pressure"
+        if dte <= 3:
+            return "1–3DTE short-term momentum"
+        if dte <= 10:
+            return "4–10DTE weekly positioning"
+        if dte <= 30:
+            return "11–30DTE swing positioning"
+        return "31–60DTE larger thesis"
+
     def format_unusual_flow(self) -> str:
         """Format unusual flow signals for Telegram/Discord posting."""
         signals = self.detect_unusual_flow()
@@ -757,14 +817,19 @@ class OITracker:
                 f"Puts: +{s['put_contracts_added']:,}"
             )
 
-            # Top strike additions
+            # Top strike additions — include expiry/DTE when available.
             for st in s["top_strikes"][:3]:
                 emoji = "📞" if st["side"] == "call" else "📉"
+                exp = st.get("expiry", "aggregate")
+                dte = st.get("dte", -1)
+                dte_label = "DTE?" if dte is None or dte < 0 else ("0DTE" if dte == 0 else f"{dte}DTE")
+                horizon = self._flow_horizon(dte if dte is not None else -1)
+                exp_part = f" exp {exp} ({dte_label})" if exp and exp != "aggregate" else " aggregate exp"
                 lines.append(
-                    f"   {emoji} ${st['strike']:.0f} {st['side'].upper()} "
+                    f"   {emoji} ${st['strike']:.0f} {st['side'].upper()}{exp_part} "
                     f"+{st['delta']:,} ({st['pct_change']:+.0f}%) "
                     f"— {st['moneyness']} {st['dist_from_spot_pct']:.1f}% "
-                    f"{'above' if st['direction'] == 'above' else 'below'} spot"
+                    f"{'above' if st['direction'] == 'above' else 'below'} spot | {horizon}"
                 )
 
             # Per-expiration breakdown — show WHERE they're positioning

@@ -435,9 +435,36 @@ def format_accuracy_report(stats: Dict) -> str:
         return "📊 EM Scorecard: No reconciled predictions yet."
 
     n = stats["n"]
+    # Phase 2.4: put the plain-English read first so this card is actionable.
+    raw_dir = stats.get("direction_correct_pct")
+    buf_dir = stats.get("buffered_direction_correct_pct")
+    neutral = stats.get("neutral_correct_pct")
+    condor = stats.get("condor_success_pct")
+    move_ratio = stats.get("avg_move_ratio")
+
+    read_lines = ["── Plain-English Read ──"]
+    if raw_dir is not None and buf_dir is not None:
+        if raw_dir < 55 and buf_dir < 45:
+            read_lines.append("  Directional EM calls are weak right now. Do not use EM alone for bullish/bearish entries.")
+        elif raw_dir >= 60:
+            read_lines.append("  Directional EM calls are useful when quality is high, but still require structure confirmation.")
+        else:
+            read_lines.append("  Directional EM is mixed. Treat it as context, not the entry signal.")
+    if neutral is not None and condor is not None:
+        if neutral >= 60 or condor >= 60:
+            read_lines.append("  Range / neutral reads are stronger than direction. EM is useful for pin/range/no-trade zones.")
+    if move_ratio is not None:
+        if move_ratio < 0.50:
+            read_lines.append(f"  Realized move is only {move_ratio:.2f}x EM — options may be overpriced vs actual movement.")
+        elif move_ratio > 1.0:
+            read_lines.append(f"  Realized move is {move_ratio:.2f}x EM — market is outrunning implied move.")
+    read_lines.append("  Action: use EM for targets, pin risk, range trades, and no-trade zones; require V2/scanner structure for entries.")
+
     lines = [
         f"📊 EM PREDICTION SCORECARD — {n} predictions",
         "═" * 32,
+        "",
+        *read_lines,
         "",
         "── Useful Direction ──",
         f"  Raw direction:      {stats['direction_correct_pct']:.1f}%  ({stats['direction_n']})" if stats.get("direction_n") else "  Raw direction:      n/a",

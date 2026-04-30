@@ -94,6 +94,9 @@ def post_v2_under_v1(
                 "action", "setup_grade", "setup_archetype", "mtf_alignment",
                 "historical_proxy_wr", "preferred_structure", "short_strike_target",
                 "width_guidance", "reason", "block_reason", "review_only_note",
+                "vehicle_status", "vehicle_reason", "final_action", "trade_expression",
+                "momentum_burst_score", "momentum_burst_label", "momentum_burst_reasons",
+                "momentum_hold_window",
                 # Phase 2.4: split credit vs debit columns so credit spreads are
                 # not silently logged as debits. best_premium is the unified
                 # cash flow value, best_is_credit makes the meaning explicit.
