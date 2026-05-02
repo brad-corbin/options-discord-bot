@@ -49,8 +49,10 @@ def post_morning_briefing(
         generate_open_positions_report, reply_long,
     )
 
-    lines = [f"☕ MORNING BRIEFING — {datetime.now().strftime('%Y-%m-%d %A')}"]
+    lines = [f"☕ BOT IDEA BRIEFING — {datetime.now().strftime('%Y-%m-%d %A')}"]
     lines.append("━" * 44)
+    lines.append("Diagnostic only unless RECOMMENDATION_REPORTS_MAIN_ENABLED=1.")
+    lines.append("")
 
     # Regime context
     if regime_fn:
@@ -121,7 +123,7 @@ def post_weekly_digest(
     post_fn: Callable,
     rec_tracker_store,
 ) -> None:
-    """Post weekly summary + shadow edge analysis."""
+    """Post weekly bot idea summary + diagnostic shadow edge analysis."""
     from recommendation_tracker import (
         generate_weekly_summary,
         analyze_shadow_edge_from_campaigns,
@@ -162,7 +164,7 @@ def post_monthly_attribution(
         reply_long,
     )
 
-    lines = ["📅 MONTHLY ATTRIBUTION"]
+    lines = ["📅 MONTHLY BOT IDEA ATTRIBUTION"]
     lines.append(f"Period ending {datetime.now().strftime('%Y-%m-%d')}")
     lines.append("━" * 44)
     lines.append("")

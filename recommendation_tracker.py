@@ -114,8 +114,67 @@ def _is_review_only_record(rec: Optional[Dict]) -> bool:
 
 def _filter_review_only_enabled() -> bool:
     """Master switch for the Phase 2.7 filter. DEFAULT OFF — flipping
-    RECTRACKER_FILTER_REVIEW_ONLY_FROM_REPORTS=1 turns the fix on."""
+    RECTRACKER_FILTER_REVIEW_ONLY_FROM_REPORTS=1 turns the fix on.
+
+    v8.4: superseded by RECTRACKER_REVIEW_ONLY_DISPLAY (see below).
+    Kept for back-compat — when set on, it forces display_mode='hide'.
+    """
     return os.getenv("RECTRACKER_FILTER_REVIEW_ONLY_FROM_REPORTS", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _review_only_display_mode() -> str:
+    """v8.4: how should reports render review-only records?
+
+      - 'inline'  (default) — pre-2.7 behavior. Mixed in with confirmed.
+      - 'split'   — separate "Bot Found / Review-Only" section in each
+                    report, with its own grade/WR rollup. The behavior
+                    Brad asked for: keep the scorecard clean while still
+                    auditing what the bot called.
+      - 'hide'    — 2.7 behavior. Review-only records are filtered out
+                    of display entirely. Still tracked + graded; just
+                    not surfaced.
+
+    Companion-long records (paired with a spread for vehicle comparison)
+    always render in their own section regardless of mode, since they're
+    structural shadows of confirmed plays — not real entries.
+    """
+    # Back-compat: legacy env var maps to 'hide'.
+    if _filter_review_only_enabled():
+        return "hide"
+    raw = os.getenv("RECTRACKER_REVIEW_ONLY_DISPLAY", "inline").strip().lower()
+    if raw not in ("inline", "split", "hide"):
+        return "inline"
+    return raw
+
+
+def _is_companion_record(rec: Optional[Dict]) -> bool:
+    """v8.4: True if record is a companion-long shadow paired with a spread.
+    Set by app.py:_record_companion_long_for_spread via
+    extra_metadata.companion_of=<original_campaign_id>."""
+    if not isinstance(rec, dict):
+        return False
+    extra = rec.get("extra_metadata") or rec.get("extra") or {}
+    if isinstance(extra, dict) and extra.get("companion_of"):
+        return True
+    return False
+
+
+def _split_records_for_display(records: List[Dict]) -> Tuple[List[Dict], List[Dict], List[Dict]]:
+    """v8.4: Categorize records into (confirmed, review_only, companion).
+
+    Companion records always pull out into their own bucket regardless of
+    display mode. Review/confirmed split is informational — display mode
+    decides what to render.
+    """
+    confirmed, review_only, companion = [], [], []
+    for r in records or []:
+        if _is_companion_record(r):
+            companion.append(r)
+        elif _is_review_only_record(r):
+            review_only.append(r)
+        else:
+            confirmed.append(r)
+    return confirmed, review_only, companion
 
 
 def _filter_records_for_display(records: List[Dict]) -> Tuple[List[Dict], int]:
@@ -123,20 +182,32 @@ def _filter_records_for_display(records: List[Dict]) -> Tuple[List[Dict], int]:
     when the filter env var is enabled. Returns (filtered_list, hidden_count).
 
     When the filter is disabled, returns (records, 0) — pre-2.7 behavior.
+
+    v8.4: this remains for back-compat. New code paths use
+    _split_records_for_display + _review_only_display_mode to render the
+    Bot Found / Review-Only / Companion sections separately.
     """
-    if not _filter_review_only_enabled():
+    mode = _review_only_display_mode()
+    if mode == "inline":
+        # Pre-2.7 behavior — everything in one bucket.
         return list(records or []), 0
-    kept = []
-    hidden = 0
-    for r in records or []:
-        if _is_review_only_record(r):
-            hidden += 1
-        else:
-            kept.append(r)
-    if hidden > 0:
-        log.info(f"Phase 2.7: hid {hidden} review-only record(s) from display "
-                 f"({len(kept)} confirmed shown)")
-    return kept, hidden
+    if mode == "hide":
+        kept = []
+        hidden = 0
+        for r in records or []:
+            if _is_review_only_record(r) or _is_companion_record(r):
+                hidden += 1
+            else:
+                kept.append(r)
+        if hidden > 0:
+            log.info(f"display(hide): hid {hidden} review-only/companion record(s) "
+                     f"({len(kept)} confirmed shown)")
+        return kept, hidden
+    # 'split' — return only confirmed; callers using the 3-way splitter
+    # will render the other sections themselves.
+    confirmed, review_only, companion = _split_records_for_display(records)
+    hidden = len(review_only) + len(companion)
+    return confirmed, hidden
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -402,7 +473,8 @@ class RecommendationStore:
                 seen.add(cid)
                 rec = self.load_campaign(cid)
                 if rec and rec.get("status") == STATUS_GRADED:
-                    if rec.get("exit_ts", rec.get("entry_ts", 0)) >= since_ts:
+                    rec_ts = rec.get("exit_ts") or rec.get("entry_ts") or 0
+                    if rec_ts >= since_ts:
                         out.append(rec)
         return out
 
@@ -900,6 +972,44 @@ def _fmt_structure(rec: Dict) -> str:
     return f"{s.upper()}"
 
 
+def _render_graded_section(records: List[Dict], header_label: str) -> List[str]:
+    """v8.4: render a 'Graded — {label}' section with its own WR/net rollup.
+    Used to append review-only and companion sections to daily/weekly reports
+    when display mode is 'split'."""
+    if not records:
+        return []
+    wins = [r for r in records if r.get("grade") == GRADE_WIN]
+    losses = [r for r in records if r.get("grade") == GRADE_LOSS]
+    scratch = [r for r in records if r.get("grade") == GRADE_SCRATCH]
+    net = sum(r.get("pnl_per_contract", 0) or 0 for r in records)
+    wr = len(wins) / len(records) if records else 0
+    out = [
+        "",
+        "━" * 44,
+        f"📋 {header_label} — {len(records)} graded",
+        f"  WR {wr:.0%}  ({len(wins)}W / {len(losses)}L / {len(scratch)}S)  "
+        f"net ${net:+,.0f}/contract",
+    ]
+    return out
+
+
+def _render_open_section(records: List[Dict], header_label: str) -> List[str]:
+    """v8.4: compact open-positions roll-up for review-only / companion
+    sections. Mirrors the structure of generate_open_positions_report's
+    confirmed body but condensed — one line per position."""
+    if not records:
+        return []
+    out = ["", "━" * 44, f"📋 {header_label} — {len(records)} open"]
+    for r in sorted(records, key=lambda x: -(x.get("mfe_pct") or 0)):
+        current_pnl = _current_pnl_from_record(r)
+        out.append(
+            f"  {r['ticker']} {_fmt_structure(r)}  "
+            f"MFE {r.get('mfe_pct', 0):+.1%}  Cur {current_pnl:+.1%}  "
+            f"Src: {r.get('first_source', '?')}"
+        )
+    return out
+
+
 def generate_daily_report(
     store: RecommendationStore,
     date_str: Optional[str] = None,
@@ -963,7 +1073,7 @@ def generate_daily_report(
     losses = [r for r in graded if r.get("grade") == GRADE_LOSS]
     scratch = [r for r in graded if r.get("grade") == GRADE_SCRATCH]
 
-    lines = [f"📊 RECOMMENDATION RESULTS — {date_str}"]
+    lines = [f"📊 BOT IDEA TRACKING — {date_str}"]
     lines.append("━" * 44)
 
     total_graded = len(graded)
@@ -994,8 +1104,9 @@ def generate_daily_report(
     lines.append("")
 
     if not graded and not posted_today and not open_from_prior_days:
-        lines.append("No activity.")
-        return "\n".join(lines)
+        if _review_only_display_mode() != "split":
+            lines.append("No confirmed activity.")
+            return "\n".join(lines)
 
     # ── By trade type (graded trades only) ──
     if graded:
@@ -1128,6 +1239,16 @@ def generate_daily_report(
                 f"[MFE {r.get('mfe_pct', 0):+.1%} "
                 f"on {datetime.fromtimestamp(r.get('peak_ts', r.get('entry_ts', 0)), tz=timezone.utc).strftime('%m-%d')}]"
             )
+
+    # v8.4: when display mode is 'split', append separate Bot-Found and
+    # Companion sections from the unfiltered raw lists. These are graded
+    # separately so their WR/net don't pollute the confirmed numbers above.
+    if _review_only_display_mode() == "split":
+        _, ro_graded, comp_graded = _split_records_for_display(graded_raw)
+        lines.extend(_render_graded_section(ro_graded,
+            "BOT FOUND — review-only (graded today)"))
+        lines.extend(_render_graded_section(comp_graded,
+            "COMPANION LONGS (graded today)"))
 
     return "\n".join(lines)
 
@@ -1409,12 +1530,19 @@ def generate_weekly_summary(store: RecommendationStore, days: int = 7) -> str:
     graded_raw = store.list_graded_in_range(since)
     graded, _hidden = _filter_records_for_display(graded_raw)
     if not graded:
-        return f"📊 Weekly Recommendation Summary ({days}d)\n\nNo graded recommendations in window."
+        if _review_only_display_mode() == "split":
+            _, ro_graded, comp_graded = _split_records_for_display(graded_raw)
+            if ro_graded or comp_graded:
+                lines = [f"📊 Weekly Bot Idea Tracking ({days}d)", "━" * 44, "No confirmed graded recommendations in window."]
+                lines.extend(_render_graded_section(ro_graded, f"BOT FOUND — review-only ({days}d)"))
+                lines.extend(_render_graded_section(comp_graded, f"COMPANION LONGS ({days}d)"))
+                return "\n".join(lines)
+        return f"📊 Weekly Bot Idea Tracking ({days}d)\n\nNo graded recommendations in window."
 
     wins = [r for r in graded if r["grade"] == GRADE_WIN]
     losses = [r for r in graded if r["grade"] == GRADE_LOSS]
 
-    lines = [f"📊 Weekly Recommendation Summary ({days}d)"]
+    lines = [f"📊 Weekly Bot Idea Tracking ({days}d)"]
     lines.append("━" * 44)
     lines.append(f"Graded: {len(graded)}")
     lines.append(
@@ -1447,6 +1575,14 @@ def generate_weekly_summary(store: RecommendationStore, days: int = 7) -> str:
             f"  {src:22s} {len(recs):3d} trades, WR {w/len(recs):.0%}, net ${net_s:+,.0f}"
         )
 
+    # v8.4: split-mode appends Bot-Found and Companion sections.
+    if _review_only_display_mode() == "split":
+        _, ro_graded, comp_graded = _split_records_for_display(graded_raw)
+        lines.extend(_render_graded_section(ro_graded,
+            f"BOT FOUND — review-only ({days}d)"))
+        lines.extend(_render_graded_section(comp_graded,
+            f"COMPANION LONGS ({days}d)"))
+
     return "\n".join(lines)
 
 
@@ -1462,6 +1598,13 @@ def generate_open_positions_report(store: RecommendationStore) -> str:
     active_raw = store.list_all_active()
     active, _hidden = _filter_records_for_display(active_raw)
     if not active:
+        if _review_only_display_mode() == "split":
+            _, ro_active, comp_active = _split_records_for_display(active_raw)
+            if ro_active or comp_active:
+                lines = ["📊 Currently Open — confirmed positions", "━" * 44, "No confirmed active recommendations."]
+                lines.extend(_render_open_section(ro_active, "BOT FOUND — review-only (open)"))
+                lines.extend(_render_open_section(comp_active, "COMPANION LONGS (open)"))
+                return "\n".join(lines)
         return "📊 Currently Open Positions\n\nNo active recommendations."
 
     lines = [f"📊 Currently Open — {len(active)} positions"]
@@ -1517,6 +1660,15 @@ def generate_open_positions_report(store: RecommendationStore) -> str:
             lines.append(
                 f"    Target: {tgt:+.0%}  Stop: {stop:+.0%}"
             )
+
+    # v8.4: split-mode appends Bot-Found and Companion open sections.
+    if _review_only_display_mode() == "split":
+        _, ro_active, comp_active = _split_records_for_display(active_raw)
+        lines.extend(_render_open_section(ro_active,
+            "BOT FOUND — review-only (open)"))
+        lines.extend(_render_open_section(comp_active,
+            "COMPANION LONGS (open)"))
+
     return "\n".join(lines)
 
 
@@ -1569,48 +1721,6 @@ def poll_and_update_if_market_open(
         }
 
     return poll_and_update(store, price_fn, spot_fn, now_ts)
-    since = time.time() - days * 86400
-    graded = store.list_graded_in_range(since)
-    if not graded:
-        return f"📊 Weekly Recommendation Summary ({days}d)\n\nNo graded recommendations in window."
-
-    wins = [r for r in graded if r["grade"] == GRADE_WIN]
-    losses = [r for r in graded if r["grade"] == GRADE_LOSS]
-
-    lines = [f"📊 Weekly Recommendation Summary ({days}d)"]
-    lines.append("━" * 44)
-    lines.append(f"Graded: {len(graded)}")
-    lines.append(
-        f"Win rate: {len(wins)/len(graded):.0%}  ({len(wins)}W / {len(losses)}L)"
-    )
-    net = sum(r.get("pnl_per_contract", 0) or 0 for r in graded)
-    lines.append(f"Net $/contract: ${net:+,.0f}")
-    lines.append("")
-
-    lines.append("━━━━ BY TRADE TYPE ━━━━")
-    by_type: Dict[str, List[Dict]] = defaultdict(list)
-    for r in graded:
-        by_type[r["trade_type"]].append(r)
-    for tt, recs in sorted(by_type.items(), key=lambda kv: -len(kv[1])):
-        w = sum(1 for r in recs if r["grade"] == GRADE_WIN)
-        net_tt = sum(r.get("pnl_per_contract", 0) or 0 for r in recs)
-        lines.append(
-            f"  {tt:10s} {len(recs):3d} ideas, WR {w/len(recs):.0%}, net ${net_tt:+,.0f}"
-        )
-
-    lines.append("")
-    lines.append("━━━━ BY SOURCE ━━━━")
-    by_source: Dict[str, List[Dict]] = defaultdict(list)
-    for r in graded:
-        by_source[r.get("first_source", "unknown")].append(r)
-    for src, recs in sorted(by_source.items(), key=lambda kv: -len(kv[1])):
-        w = sum(1 for r in recs if r["grade"] == GRADE_WIN)
-        net_s = sum(r.get("pnl_per_contract", 0) or 0 for r in recs)
-        lines.append(
-            f"  {src:22s} {len(recs):3d} ideas, WR {w/len(recs):.0%}, net ${net_s:+,.0f}"
-        )
-
-    return "\n".join(lines)
 
 
 # ═══════════════════════════════════════════════════════════════════

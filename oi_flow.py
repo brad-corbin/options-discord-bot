@@ -3287,6 +3287,98 @@ class FlowDetector:
 
         return "\n".join(lines)
 
+    def format_stalk_digest(self, stalks: List[dict], max_items: int = 12) -> str:
+        """Phase 2.8: one compact morning stalk digest instead of many cards."""
+        if not stalks:
+            return ""
+
+        def _dte(expiry: str) -> str:
+            try:
+                _dte_n, _label, _active = FlowDetector._dte_label(str(expiry or ""))
+                return _label
+            except Exception:
+                return "DTE?"
+
+        def _is_bearish(stalk: dict) -> bool:
+            side = str(stalk.get("side", "")).lower()
+            exp_dir = str(stalk.get("expected_direction", "")).lower()
+            return side == "put" or "bear" in exp_dir or "down" in exp_dir
+
+        def _line(stalk: dict) -> str:
+            side = str(stalk.get("side", "?")).upper()
+            strike = stalk.get("strike", 0)
+            exp = str(stalk.get("expiry", ""))[:10]
+            dte_label = _dte(exp)
+            flow = str(stalk.get("flow_type", "confirmed")).replace("confirmed_", "")
+            oi = int(stalk.get("oi_change", 0) or 0)
+            oi_pct = float(stalk.get("oi_change_pct", 0) or 0)
+            price_chg = float(stalk.get("price_change_pct", 0) or 0)
+            campaign_days = int(stalk.get("campaign_days", 0) or 0)
+            tags = []
+            if stalk.get("divergence"):
+                tags.append("divergence")
+            if campaign_days >= CAMPAIGN_MIN_DAYS:
+                tags.append(f"{campaign_days}D persistent")
+            tag = f" [{', '.join(tags)}]" if tags else ""
+            try:
+                strike_txt = f"${float(strike):.0f}"
+            except Exception:
+                strike_txt = f"${strike}"
+            return (
+                f"  • {stalk.get('ticker', '?')} {strike_txt} {side} exp {exp} "
+                f"({dte_label}) — {flow}, OI {oi:+,} ({oi_pct:+.0f}%), "
+                f"price since {price_chg:+.1f}%{tag}"
+            )
+
+        room_left = [s for s in stalks if s.get("stalk_type") == "room_left" and not _is_bearish(s)]
+        watch_trigger = [s for s in stalks if s.get("stalk_type") == "watch_for_trigger" and not _is_bearish(s)]
+        do_not_chase = [s for s in stalks if s.get("stalk_type") == "do_not_chase" and not _is_bearish(s)]
+        bearish = [s for s in stalks if _is_bearish(s)]
+        divergence = [s for s in stalks if s.get("divergence") or int(s.get("campaign_days", 0) or 0) >= CAMPAIGN_MIN_DAYS]
+
+        sections = [
+            ("🟢 ROOM LEFT", room_left),
+            ("🎯 WATCH FOR TRIGGER", watch_trigger),
+            ("⛔ DO NOT CHASE", do_not_chase),
+            ("🐻 BEARISH WATCH", bearish),
+            ("🔀 DIVERGENCE / PERSISTENT FLOW", divergence),
+        ]
+
+        lines = [
+            f"👁️ MORNING STALK DIGEST — {len(stalks)} candidates",
+            "━" * 28,
+            "Use this as a watchlist, not an entry signal. Wait for chart trigger / reclaim / breakdown.",
+        ]
+        shown_total = 0
+        seen = set()
+        per_section_cap = max(1, max_items // 3)
+        for title, items in sections:
+            unique_items = []
+            for item in items:
+                key = (item.get("ticker"), item.get("strike"), item.get("side"), item.get("expiry"), title)
+                # Let divergence/persistent repeat once because it carries a different read.
+                if key in seen:
+                    continue
+                seen.add(key)
+                unique_items.append(item)
+            if not unique_items:
+                continue
+            lines.append("")
+            lines.append(title)
+            for item in unique_items[:per_section_cap]:
+                lines.append(_line(item))
+                shown_total += 1
+            if len(unique_items) > per_section_cap:
+                lines.append(f"  … +{len(unique_items) - per_section_cap} more")
+
+        if shown_total == 0:
+            lines.append("No clean stalk candidates after grouping.")
+        elif shown_total < len(stalks):
+            lines.append("")
+            lines.append(f"Shown {shown_total} lines from {len(stalks)} candidates. Full raw stalk cards stay diagnostic/log-only.")
+
+        return "\n".join(lines)
+
     def format_flow_trade_idea(self, idea: dict) -> str:
         """Format a flow-generated trade idea for Telegram."""
         trigger = idea["flow_trigger"]
