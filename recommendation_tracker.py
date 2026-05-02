@@ -34,12 +34,109 @@ import time
 import json
 import hashlib
 import logging
+import os
 from typing import Dict, List, Optional, Any, Tuple, Callable
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
 log = logging.getLogger(__name__)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# v8.4 (Phase 2.7): Review-only record filter
+# ═══════════════════════════════════════════════════════════════════
+# Some posted cards (notably v8.4 credit dual-post cards) are review-only —
+# the bot posts them but Brad only enters a position when the chart confirms.
+# Pre-2.7 behavior: those review-only records were tracked by the same
+# campaign machinery as confirmed entries, so they showed up under
+# "Currently Open" in the morning briefing AND were graded into win-rate
+# stats as if they had been taken. The 5/01 daily report graded MSFT
+# 405/400 BULL PUT (×3 fires) at +100% target_hit even though Brad
+# entered a different expiry at a different credit at 12:08.
+#
+# Fix: env-gated filter. When RECTRACKER_FILTER_REVIEW_ONLY_FROM_REPORTS
+# is on, _is_review_only_record(rec) returns True for either:
+#   (a) explicit flag in extra_metadata.review_only (set by writers
+#       going forward — see app.py _record_income_opportunity call site)
+#   (b) source name matches RECTRACKER_REVIEW_ONLY_SOURCES (default
+#       "v84_credit_dual_post" — covers existing legacy records)
+#
+# Filter applied in:
+#   - generate_open_positions_report      (morning briefing "Currently Open")
+#   - generate_daily_report                (graded list + win-rate math)
+#   - generate_weekly_summary              (graded list)
+#
+# Records are NOT deleted; they're just hidden from these display reports.
+# The campaign machinery (grading, polling, ledger) keeps running so the
+# data stays available for backtest and audit.
+# ═══════════════════════════════════════════════════════════════════
+
+def _is_review_only_record(rec: Optional[Dict]) -> bool:
+    """v8.4 (Phase 2.7): True if this record was a review-only post that
+    was never actually entered. Conservative — fail-False on ambiguous
+    inputs so legitimate trades aren't silently dropped.
+
+    Two signals, either sufficient:
+      (a) extra_metadata.review_only flag set explicitly (forward-compatible).
+      (b) first_source matches RECTRACKER_REVIEW_ONLY_SOURCES (handles legacy
+          records that pre-date the explicit flag).
+
+    Returns False (treat as confirmed) when:
+      - rec is not a dict
+      - extra_metadata.confirmed_entry is True (explicit override — for
+        future /confirm command support)
+    """
+    if not isinstance(rec, dict):
+        return False
+    extra = rec.get("extra_metadata") or {}
+    if isinstance(extra, dict):
+        # Explicit confirmed-entry flag overrides any review-only signal.
+        if bool(extra.get("confirmed_entry")):
+            return False
+        # Explicit review-only flag is sufficient.
+        if bool(extra.get("review_only")):
+            return True
+    # Legacy fallback: source-name match.
+    # v8.4 (Phase 2.5b — Patch Q): default list now includes both review-only
+    # bot sources. v84_credit_dual_post → Phase 2.4 dual-post credit cards;
+    # v84_long_call_burst → Phase 2.6 burst cards. Both are bot heads-ups
+    # not confirmed entries, so both get filtered from win-rate by default
+    # when the master switch is on.
+    src = str(rec.get("first_source") or "").strip().lower()
+    review_csv = os.getenv("RECTRACKER_REVIEW_ONLY_SOURCES",
+                            "v84_credit_dual_post,v84_long_call_burst").strip()
+    if not review_csv:
+        return False
+    review_sources = {s.strip().lower() for s in review_csv.split(",") if s.strip()}
+    return src in review_sources
+
+
+def _filter_review_only_enabled() -> bool:
+    """Master switch for the Phase 2.7 filter. DEFAULT OFF — flipping
+    RECTRACKER_FILTER_REVIEW_ONLY_FROM_REPORTS=1 turns the fix on."""
+    return os.getenv("RECTRACKER_FILTER_REVIEW_ONLY_FROM_REPORTS", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _filter_records_for_display(records: List[Dict]) -> Tuple[List[Dict], int]:
+    """v8.4 (Phase 2.7): apply the review-only filter to a list of records
+    when the filter env var is enabled. Returns (filtered_list, hidden_count).
+
+    When the filter is disabled, returns (records, 0) — pre-2.7 behavior.
+    """
+    if not _filter_review_only_enabled():
+        return list(records or []), 0
+    kept = []
+    hidden = 0
+    for r in records or []:
+        if _is_review_only_record(r):
+            hidden += 1
+        else:
+            kept.append(r)
+    if hidden > 0:
+        log.info(f"Phase 2.7: hid {hidden} review-only record(s) from display "
+                 f"({len(kept)} confirmed shown)")
+    return kept, hidden
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -825,23 +922,34 @@ def generate_daily_report(
 
     # Trades graded on this date (regardless of entry date)
     graded_ids = store.list_campaign_ids_graded_on(date_str)
-    graded = []
+    graded_raw = []
     for cid in graded_ids:
         rec = store.load_campaign(cid)
         if rec and rec.get("status") == STATUS_GRADED:
-            graded.append(rec)
+            graded_raw.append(rec)
 
     # Trades posted on this date (may be active or already graded)
     posted_today_ids = store.list_campaign_ids_for_date(date_str)
-    posted_today = []
+    posted_today_raw = []
     for cid in posted_today_ids:
         rec = store.load_campaign(cid)
         if rec:
-            posted_today.append(rec)
-    posted_today_active = [r for r in posted_today if r.get("status") == STATUS_ACTIVE]
+            posted_today_raw.append(rec)
 
     # All active positions across all dates (for CURRENTLY OPEN section)
-    all_active = store.list_all_active()
+    all_active_raw = store.list_all_active()
+
+    # v8.4 (Phase 2.7): when the filter is enabled, hide review-only records
+    # from BOTH the display sections AND the win-rate / avg-PnL math.
+    # Review-only records weren't actually traded — including them in
+    # win-rate corrupts the stat (5/01 MSFT 405/400 ×3 fires graded as
+    # +100% target_hit when no contract was held).
+    graded, _g_hidden = _filter_records_for_display(graded_raw)
+    posted_today, _p_hidden = _filter_records_for_display(posted_today_raw)
+    all_active, _a_hidden = _filter_records_for_display(all_active_raw)
+
+    posted_today_active = [r for r in posted_today if r.get("status") == STATUS_ACTIVE]
+
     # De-dupe with posted_today_active
     posted_today_ids_set = {r["campaign_id"] for r in posted_today_active}
     open_from_prior_days = [r for r in all_active
@@ -1292,9 +1400,14 @@ def format_shadow_edge_report(analysis: Dict) -> str:
 
 def generate_weekly_summary(store: RecommendationStore, days: int = 7) -> str:
     """Summary across the last N days, showing overall performance and
-    breakdowns by trade type and source."""
+    breakdowns by trade type and source.
+
+    v8.4 (Phase 2.7): when RECTRACKER_FILTER_REVIEW_ONLY_FROM_REPORTS is on,
+    review-only records are filtered before the win-rate / net-PnL math runs.
+    """
     since = time.time() - days * 86400
-    graded = store.list_graded_in_range(since)
+    graded_raw = store.list_graded_in_range(since)
+    graded, _hidden = _filter_records_for_display(graded_raw)
     if not graded:
         return f"📊 Weekly Recommendation Summary ({days}d)\n\nNo graded recommendations in window."
 
@@ -1339,8 +1452,15 @@ def generate_weekly_summary(store: RecommendationStore, days: int = 7) -> str:
 
 def generate_open_positions_report(store: RecommendationStore) -> str:
     """All currently-tracking positions regardless of entry date.
-    Use this for /recopen. Useful for seeing the full swing/income book."""
-    active = store.list_all_active()
+    Use this for /recopen. Useful for seeing the full swing/income book.
+
+    v8.4 (Phase 2.7): when RECTRACKER_FILTER_REVIEW_ONLY_FROM_REPORTS is on,
+    review-only records (e.g. v8.4 credit dual-post cards never confirmed
+    as actual entries) are filtered out of this list. The tracker still
+    holds them for grading/audit; they just don't show as "Currently Open".
+    """
+    active_raw = store.list_all_active()
+    active, _hidden = _filter_records_for_display(active_raw)
     if not active:
         return "📊 Currently Open Positions\n\nNo active recommendations."
 

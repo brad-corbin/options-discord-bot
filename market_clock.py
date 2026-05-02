@@ -193,3 +193,52 @@ def time_urgency_multiplier(is_0dte: bool = True, dt: datetime = None) -> float:
         return 3.0
     else:               # after 2:45
         return 5.0
+
+
+# ─────────────────────────────────────────────────────────
+# v8.4 Phase 2.6: trading-day arithmetic
+# ─────────────────────────────────────────────────────────
+
+def count_trading_days_between(start, end) -> int:
+    """Count trading days strictly between `start` and `end`, inclusive of
+    `end` but not `start`. Trading days are weekdays (Mon-Fri).
+
+    NOTE: does NOT honor market holidays. For the bot's 0-7 DTE windows
+    this is acceptable — holidays inside that window are rare and the
+    failure mode is benign (count is off by 1, picks one expiry over
+    another). A holiday-aware version can use pandas_market_calendars
+    later if we ever need precision beyond a 1-day window.
+
+    Args:
+        start: datetime.date or datetime.datetime — the reference day
+        end:   datetime.date or datetime.datetime — the target day
+
+    Returns:
+        Integer count of weekdays from start (exclusive) to end (inclusive).
+        Negative if end < start. 0 if same day or only weekends between.
+
+    Examples (assuming weekdays):
+        Friday 2026-05-01 → Monday 2026-05-04   → 1 trading day
+        Friday 2026-05-01 → Tuesday 2026-05-05  → 2 trading days
+        Friday 2026-05-01 → Friday 2026-05-08   → 5 trading days
+        (vs calendar-day count: 3, 4, 7 respectively)
+    """
+    from datetime import date, datetime as _dt, timedelta
+    if isinstance(start, _dt):
+        start = start.date()
+    if isinstance(end, _dt):
+        end = end.date()
+    if not isinstance(start, date) or not isinstance(end, date):
+        raise TypeError(f"start/end must be date or datetime, got {type(start).__name__}/{type(end).__name__}")
+    if end < start:
+        return -count_trading_days_between(end, start)
+
+    # Walk one day at a time, counting weekdays. Faster algorithm exists
+    # (full-weeks math) but our windows are tiny (≤ 14 days) so simplicity wins.
+    days = 0
+    cur = start + timedelta(days=1)
+    while cur <= end:
+        if cur.weekday() < 5:  # 0=Mon, 4=Fri
+            days += 1
+        cur = cur + timedelta(days=1)
+    return days
