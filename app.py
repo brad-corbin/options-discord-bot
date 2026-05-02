@@ -623,6 +623,11 @@ from card_formatters import (
     resolve_unified_regime,
     regime_gate,
 )
+from options_map import (
+    build_contract_ladders,
+    calc_calendar_dte,
+    format_options_map_card,
+)
 from unified_models import (
     build_canonical_vol_regime as _um_build_canonical_vol_regime,
     format_canonical_vol_line as _um_format_canonical_vol_line,
@@ -740,6 +745,15 @@ UNUSUAL_FLOW_SUMMARY_MAIN_ENABLED = os.getenv("UNUSUAL_FLOW_SUMMARY_MAIN_ENABLED
 # matches Phase 2.8's intent for the rest of the rec-tracker reports.
 CONVICTION_RESULTS_MAIN_ENABLED = os.getenv("CONVICTION_RESULTS_MAIN_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
 EM_SCORECARD_MAIN_ENABLED = os.getenv("EM_SCORECARD_MAIN_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+
+# Phase 3.0-B/C: Watch Map sidecar. Manual-command first; default route
+# is intraday/diagnosis only, never main unless explicitly allowed.
+# WATCH_MAP_* names are preferred; OPTIONS_MAP_* aliases are kept for backward compatibility.
+OPTIONS_MAP_ENABLED = os.getenv("WATCH_MAP_ENABLED", os.getenv("OPTIONS_MAP_ENABLED", "1")).strip().lower() not in ("0", "false", "no", "off")
+OPTIONS_MAP_ROUTE = os.getenv("WATCH_MAP_ROUTE", os.getenv("OPTIONS_MAP_ROUTE", "intraday")).strip().lower()  # intraday | diagnosis | both | main
+OPTIONS_MAP_ALLOW_MAIN = os.getenv("WATCH_MAP_ALLOW_MAIN", os.getenv("OPTIONS_MAP_ALLOW_MAIN", "0")).strip().lower() in ("1", "true", "yes", "on")
+OPTIONS_MAP_TOP_N = int(os.getenv("WATCH_MAP_TOP_N", os.getenv("OPTIONS_MAP_TOP_N", "3")) or 3)
+WATCH_MAP_SHOW_TRIGGERS = os.getenv("WATCH_MAP_SHOW_TRIGGERS", "1").strip().lower() not in ("0", "false", "no", "off")
 
 TV_WEBHOOK_SECRET   = os.getenv("TV_WEBHOOK_SECRET",   "").strip()
 MARKETDATA_TOKEN    = os.getenv("MARKETDATA_TOKEN",    "").strip()
@@ -9449,6 +9463,7 @@ def telegram_webhook(secret):
             thesis_engine=get_thesis_engine(),
             post_income_scan_fn=_income_scan_fn,
             post_income_score_fn=_income_score_fn,
+            post_options_map_fn=_post_options_map_card,
         )
 
     threading.Thread(target=run_command, daemon=True).start()
@@ -11402,6 +11417,180 @@ def _extract_atm_option_data(chain_data: dict, spot: float) -> dict:
 # Now shows confidence, downgrades, trade sign, vol regime from v4 engine.
 # _calc_bias 14-signal scoring preserved exactly.
 # ─────────────────────────────────────────────────────────────────────
+
+
+def _hours_remaining_for_options_map(now_ct) -> tuple[str, float, str]:
+    """Return target expiration date, EM hours, and session label for /optionsmap."""
+    market_open_ct = now_ct.replace(hour=8, minute=30, second=0, microsecond=0)
+    market_close_ct = now_ct.replace(hour=15, minute=0, second=0, microsecond=0)
+    if now_ct > market_close_ct or now_ct < market_open_ct:
+        target_date_str = _get_next_trading_day(now_ct.date())
+        return target_date_str, 6.5, "Next Day Preview"
+    target_date_str = now_ct.date().strftime("%Y-%m-%d")
+    hours_for_em = max((market_close_ct - now_ct).total_seconds() / 3600, 0.25)
+    return target_date_str, hours_for_em, "Today Live"
+
+
+def _build_options_map_card(ticker: str, compact: bool = False) -> str:
+    """Build the Phase 3.0-B/C Watch Map sidecar card.
+
+    Display/context only. This intentionally avoids _get_0dte_iv() because that
+    path can trigger intraday flow detection and conviction routing side effects.
+    """
+    import pytz
+    from datetime import date as _date
+
+    ticker = (ticker or "SPY").upper().strip()
+    ct = pytz.timezone("America/Chicago")
+    now_ct = datetime.now(ct)
+    target_date_str, hours_for_em, session_label = _hours_remaining_for_options_map(now_ct)
+
+    data, spot, expiration = _get_0dte_chain(ticker, target_date_str)
+    if data is None or spot is None or not expiration:
+        return f"⚠️ {ticker} Watch Map: could not fetch a valid chain for {target_date_str}."
+
+    try:
+        dte = calc_calendar_dte(expiration, as_of=now_ct.date())
+    except Exception:
+        dte = None
+    if dte is None:
+        return f"⚠️ {ticker} Watch Map: chain returned missing/invalid expiration ({expiration})."
+
+    # Add OI deltas if prior snapshot exists, but do not save a new snapshot and
+    # do not trigger flow detector. This card is observational only.
+    try:
+        if _oi_cache:
+            _oi_cache.apply_oi_changes_to_chain(ticker, expiration, data)
+    except Exception as _oi_err:
+        log.debug(f"Watch map OI-change overlay failed for {ticker}: {_oi_err}")
+
+    rows = build_chain_dicts(data) or []
+
+    try:
+        bars = _get_ohlc_bars(ticker, days=65)
+    except Exception:
+        bars = []
+    try:
+        adv, spread = _estimate_liquidity(ticker, spot)
+    except Exception:
+        adv, spread = None, None
+
+    try:
+        v4 = run_institutional_snapshot(
+            chain_data=data,
+            spot=spot,
+            dte=max(dte, 0.5),
+            recent_bars=bars,
+            is_0dte=(dte == 0),
+            avg_daily_dollar_volume=adv,
+            bid_ask_spread_pct=spread,
+            liquid_index=_is_liquid(ticker),
+        ) or {}
+    except Exception as _snap_err:
+        log.warning(f"Watch map snapshot failed for {ticker}: {_snap_err}")
+        v4 = {}
+
+    eng = v4.get("engine_result", {}) if isinstance(v4, dict) else {}
+    raw_walls = v4.get("walls", {}) if isinstance(v4, dict) else {}
+    skew = v4.get("skew", {}) if isinstance(v4, dict) else {}
+    pcr = v4.get("pcr", {}) if isinstance(v4, dict) else {}
+    vix = _discover_vix_market_snapshot()
+
+    walls = _derive_structure_levels_from_chain(data, spot, raw_walls or {}, eng or {})
+    price_struct = _compute_price_structure_levels(ticker, spot, days=90)
+    structure = _merge_price_structure_with_walls(price_struct, walls, spot, None)
+
+    # IV: use v4 result if present, otherwise reuse the existing fallback logic.
+    iv = v4.get("iv") if isinstance(v4, dict) else None
+    if iv is None:
+        try:
+            iv_meta = _infer_expiry_iv_with_fallbacks(ticker, expiration, max(dte, 0.5), data, spot)
+            iv = iv_meta.get("iv")
+        except Exception:
+            iv = None
+    if iv is None:
+        return f"⚠️ {ticker} Watch Map: could not infer IV for {expiration}."
+
+    em = _calc_intraday_em(spot, iv, hours_for_em)
+    if not em:
+        return f"⚠️ {ticker} Watch Map: could not calculate EM range."
+
+    try:
+        # Re-merge with EM-aware sanity checks now that EM exists.
+        structure = _merge_price_structure_with_walls(price_struct, walls, spot, em)
+    except Exception:
+        pass
+
+    try:
+        if not vix or not vix.get("vix"):
+            vix = {"vix": round(float(iv) * 100, 1), "source": "iv_proxy"}
+    except Exception:
+        pass
+
+    try:
+        bias = _calc_bias(spot, em, structure or {}, skew or {}, eng or {}, pcr or {}, vix or {})
+    except Exception as _bias_err:
+        log.debug(f"Watch map bias failed for {ticker}: {_bias_err}")
+        bias = {"score": 0, "direction": "NEUTRAL"}
+
+    def _lookup_contract_confirmation(_ticker, _strike, _side, _expiry):
+        try:
+            if _flow_detector and hasattr(_flow_detector, "lookup_confirmation_for"):
+                return _flow_detector.lookup_confirmation_for(_ticker, _strike, _side, _expiry)
+        except Exception:
+            return None
+        return None
+
+    ladders = build_contract_ladders(
+        rows,
+        ticker=ticker,
+        spot=float(spot),
+        expiry=expiration,
+        dte=dte,
+        lookup_fn=_lookup_contract_confirmation,
+        top_n=max(1, OPTIONS_MAP_TOP_N),
+    )
+
+    context = {
+        "ticker": ticker,
+        "spot": spot,
+        "expiry": expiration,
+        "dte": dte,
+        "em": em,
+        "structure": structure or {},
+        "eng": eng or {},
+        "bias": bias or {},
+        "v4_result": v4 or {},
+        "ladders": ladders,
+        "generated_at": f"{now_ct.strftime('%Y-%m-%d %H:%M CT')} ({session_label})",
+        "compact": bool(compact),
+        "show_triggers": WATCH_MAP_SHOW_TRIGGERS,
+    }
+    return format_options_map_card(context)
+
+
+def _post_options_map_card(ticker: str, route: str = None, compact: bool = False):
+    """Post /watchmap output to intraday/diagnosis only by default."""
+    if not OPTIONS_MAP_ENABLED:
+        post_to_diagnosis(f"⚠️ Watch Map disabled by WATCH_MAP_ENABLED/OPTIONS_MAP_ENABLED=0 ({ticker}).")
+        return
+    route = (route or OPTIONS_MAP_ROUTE or "intraday").strip().lower()
+    if route not in ("intraday", "diagnosis", "diag", "both", "main"):
+        route = OPTIONS_MAP_ROUTE or "intraday"
+    msg = _build_options_map_card(ticker, compact=compact)
+    if route == "both":
+        post_to_intraday(msg)
+        post_to_diagnosis(msg)
+    elif route in ("diagnosis", "diag"):
+        post_to_diagnosis(msg)
+    elif route == "main":
+        if OPTIONS_MAP_ALLOW_MAIN:
+            post_to_telegram(msg)
+        else:
+            post_to_diagnosis("⚠️ /watchmap main route blocked because WATCH_MAP_ALLOW_MAIN/OPTIONS_MAP_ALLOW_MAIN=0. Posting to diagnosis instead.\n\n" + msg)
+    else:
+        post_to_intraday(msg)
+
 
 def _post_em_card(ticker: str, session: str):
     try:

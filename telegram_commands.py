@@ -209,6 +209,7 @@ def handle_command(
     thesis_engine=None,
     post_income_scan_fn=None,
     post_income_score_fn=None,
+    post_options_map_fn=None,
 ) -> None:
     if not is_authorized(user_id):
         send_reply(chat_id, "⛔ You are not authorized to use this bot.")
@@ -393,6 +394,39 @@ def handle_command(
             args=(handle_journal, clean_args, _portfolio_reply(account), None, chat_id, account),
             daemon=True,
         ).start()
+        return
+
+    # ─────────────────────────────────────
+    # /watchmap [TICKER] [intraday|diag|both] [compact]
+    # Phase 3.0-B/C — Watch Map sidecar. Context only.
+    # ─────────────────────────────────────
+    if cmd in ("/watchmap", "/watchmap@omegabot", "/optionsmap", "/optionsmap@omegabot", "/omap", "/omap@omegabot", "/emap", "/emap@omegabot"):
+        if not post_options_map_fn:
+            reply("⚠️ Watch Map function not wired — post_options_map_fn missing.")
+            return
+        ticker = "SPY"
+        route = None
+        route_words = {"intraday", "diag", "diagnosis", "both", "main"}
+        compact = False
+        for arg in args:
+            al = arg.lower().strip()
+            if al in route_words:
+                route = al
+            elif al in {"compact", "short", "brief"}:
+                compact = True
+            elif arg.upper().replace(".", "").isalpha():
+                ticker = arg.upper()
+        mode = "compact" if compact else "full"
+        reply(f"🧭 Building Watch Map for {ticker} ({route or 'default route'}, {mode})...")
+
+        def run_options_map():
+            try:
+                post_options_map_fn(ticker, route, compact=compact)
+            except Exception as e:
+                log.error(f"/watchmap {ticker}: {e}", exc_info=True)
+                reply(f"⚠️ Watch Map error for {ticker}: {type(e).__name__}")
+
+        threading.Thread(target=run_options_map, daemon=True).start()
         return
 
     # ─────────────────────────────────────
