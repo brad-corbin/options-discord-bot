@@ -28,6 +28,7 @@ import math
 import time
 import logging
 import threading
+import os
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Callable
 
@@ -53,11 +54,17 @@ try:
         SWING_RS_LOOKBACK_DAYS, SWING_RS_REJECT_LONG_BELOW, SWING_RS_REJECT_SHORT_ABOVE,
         SWING_MAX_PER_SECTOR, SWING_SECTOR_MAP,
         SWING_PRIMARY_TREND_SMA, SWING_PRIMARY_TREND_LMA, SWING_PRIMARY_TREND_ENABLED,
-        SWING_ATR_LENGTH,
+        SWING_ATR_LENGTH, SWING_TICKER_STRUCTURE,
     )
 except ImportError:
     log.warning("swing_scanner: trading_rules imports failed, using defaults")
     SWING_SCANNER_ENABLED = False
+    SWING_TICKER_STRUCTURE = {}
+
+# Phase 2.8: swing scanner is allowed to find ideas, but it should not flood
+# the execution queue/main channel unless explicitly enabled. Default is quiet:
+# summarized digest only, no auto-enqueue.
+SWING_AUTO_ENQUEUE_ENABLED = os.getenv("SWING_AUTO_ENQUEUE_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1241,111 +1248,186 @@ class SwingScanner:
                 return sector
         return "OTHER"
 
+    def _swing_vehicle_label(self, sig: dict) -> str:
+        """Plain-English practical vehicle label for digest grouping."""
+        ticker = str(sig.get("ticker", "")).upper()
+        direction = sig.get("direction", "bull")
+        structure = str(SWING_TICKER_STRUCTURE.get(ticker, "")).strip().lower()
+        if structure == "shares_only":
+            return "shares only / options too inefficient"
+        if structure == "long_call":
+            return "long call review" if direction == "bull" else "long put review"
+        if direction == "bear":
+            return "bear put spread review"
+        return "debit spread review"
+
+    def _swing_invalidation(self, sig: dict) -> str:
+        """Simple invalidation line: bull loses support, bear reclaims resistance."""
+        try:
+            if sig.get("direction") == "bear":
+                return f"invalidate on reclaim above ${float(sig.get('swing_high', 0)):.2f}"
+            return f"invalidate on break below ${float(sig.get('swing_low', 0)):.2f}"
+        except Exception:
+            return "define invalidation before entry"
+
+    def _swing_digest_line(self, sig: dict) -> str:
+        dir_emoji = "🟢" if sig.get("direction") == "bull" else "🔴"
+        vol = "vol contraction" if sig.get("vol_contracting") else "volume not contracted"
+        trend = []
+        if sig.get("weekly_bull"):
+            trend.append("weekly bull")
+        elif sig.get("weekly_bear"):
+            trend.append("weekly bear")
+        else:
+            trend.append("weekly neutral")
+        if sig.get("daily_bull"):
+            trend.append("daily bull")
+        elif sig.get("daily_bear"):
+            trend.append("daily bear")
+        else:
+            trend.append("daily neutral")
+        warnings = sig.get("warnings") or []
+        warn = f" | ⚠️ {', '.join(warnings[:2])}" if warnings else ""
+        return (
+            f"  • {dir_emoji} {sig.get('ticker')} T{sig.get('tier')} "
+            f"{str(sig.get('direction', '')).upper()} — "
+            f"fib {sig.get('fib_level')}% @ ${float(sig.get('fib_price', 0)):.2f}, "
+            f"conf {sig.get('confidence')}, {vol}, {', '.join(trend)} | "
+            f"{self._swing_vehicle_label(sig)} | {self._swing_invalidation(sig)}{warn}"
+        )
+
     def _fire_signals(self, signals: List[dict]):
-        """Enqueue signals into the swing engine and post summary."""
+        """Phase 2.8: summarize swing ideas and auto-enqueue only when enabled."""
         if not signals:
             return
 
+        flagship = []
+        tactical = []
+        stalk_only = []
+        log_only = []
+
         for sig in signals:
-            ticker = sig["ticker"]
-            direction = sig["direction"]
-            tier = sig["tier"]
-
-            webhook_data = {
-                "bias": direction,
-                "tier": str(tier),
-                "type": "swing",
-                "source": "swing_scanner",
-                "fib_level": sig["fib_level"],
-                "fib_distance_pct": sig["fib_dist_pct"],
-                "fib_high": sig["swing_high"],
-                "fib_low": sig["swing_low"],
-                "fib_range": sig["fib_range"],
-                "weekly_bull": sig["weekly_bull"],
-                "weekly_bear": sig["weekly_bear"],
-                "htf_confirmed": sig["htf_confirmed"],
-                "htf_converging": sig["htf_converging"],
-                "daily_bull": sig["daily_bull"],
-                "daily_bear": sig["daily_bear"],
-                "rsi": sig["rsi"],
-                "vol_contracting": sig["vol_contracting"],
-                "vol_expanding": sig["vol_expanding"],
-                "volume": sig["volume"],
-                "vol_ma": sig["vol_ma"],
-                "fib_ext_127": sig["fib_target_1"],
-                "fib_ext_162": sig["fib_target_2"],
-                "pre_confidence": sig["confidence"],
-                "rs_vs_spy": sig["rs_vs_spy"],
-                "primary_trend": sig["primary_trend"],
-                "atr": sig["atr"],
-                "is_snapback": (direction == "bull" and sig["primary_trend"] == "bearish"),
-                "vix": sig.get("vix", 20),
-                # Hold-horizon (backtest-derived)
-                "hold_class": sig["hold_class"],
-                "default_hold_days": sig["default_hold_days"],
-                "max_hold_days": sig["max_hold_days"],
-                "runner_eligible": sig["runner_eligible"],
-                "income_eligible": sig["income_eligible"],
-            }
-
-            webhook_data["setup_quality"] = sig.get("setup_quality", "STANDARD")
-
-            # Hold-horizon labels for display
-            hold_class = sig["hold_class"]
-            hold_emoji = {"long_hold": "🏗️", "medium_hold": "📅", "selective": "⚡", "tactical": "💨", "standard": "📅"}.get(hold_class, "📅")
-            runner_tag = " 🏃 runner" if sig["runner_eligible"] else ""
-            income_tag = " 💰 income" if sig["income_eligible"] else ""
-
-            # Setup quality header
             quality = sig.get("setup_quality", "STANDARD")
-            quality_header = sig.get("setup_label", "")
+            warnings = sig.get("warnings") or []
+            has_event_risk = any("earnings" in str(w).lower() for w in warnings)
+            if has_event_risk:
+                log_only.append(sig)
+            elif quality in ("FLAGSHIP", "PREMIUM"):
+                flagship.append(sig)
+            elif quality in ("STRONG", "SELECTIVE", "TACTICAL"):
+                tactical.append(sig)
+            else:
+                stalk_only.append(sig)
 
-            signal_msg = (
-                f"📊 Swing Scanner: {ticker} T{tier} {direction.upper()}\n"
-                f"{quality_header}\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"Fib {sig['fib_level']}% @ ${sig['fib_price']:.2f} "
-                f"(dist {sig['fib_dist_pct']:.1f}%)\n"
-                f"Conf: {sig['confidence']}/100 | RS: {sig['rs_vs_spy']:+.1f}%\n"
-                f"Weekly: {'🟢' if sig['weekly_bull'] else '🔴' if sig['weekly_bear'] else '⚪'} | "
-                f"Daily: {'🟢' if sig['daily_bull'] else '🔴' if sig['daily_bear'] else '⚪'} | "
-                f"RSI: {sig['rsi']:.0f}\n"
-                f"Primary: {sig['primary_trend']} | "
-                f"Vol: {'📉 contracting' if sig['vol_contracting'] else '📈 expanding' if sig['vol_expanding'] else '➡️ normal'}\n"
-                f"Targets: ${sig['fib_target_1']:.2f} / ${sig['fib_target_2']:.2f}\n"
-                f"{hold_emoji} Hold: {sig['default_hold_days']}–{sig['max_hold_days']}D ({hold_class.replace('_', ' ')}){runner_tag}{income_tag}\n"
-                f"T1: {sig['t1_policy']}\n"
-                + (f"⚠️ {', '.join(sig['warnings'])}" if sig.get("warnings") else "")
+        enqueueable = flagship + tactical + stalk_only
+        if not SWING_AUTO_ENQUEUE_ENABLED:
+            log.info(
+                "Swing scanner Phase 2.8: auto-enqueue disabled; "
+                f"{len(enqueueable)} ideas summarized only"
             )
+        else:
+            for sig in enqueueable:
+                ticker = sig["ticker"]
+                direction = sig["direction"]
+                tier = sig["tier"]
 
-            if self._enqueue:
-                self._enqueue("swing", ticker, direction, webhook_data, signal_msg)
-                log.info(f"Swing signal enqueued: {ticker} T{tier} {direction.upper()} [{quality}]")
+                webhook_data = {
+                    "bias": direction,
+                    "tier": str(tier),
+                    "type": "swing",
+                    "source": "swing_scanner",
+                    "fib_level": sig["fib_level"],
+                    "fib_distance_pct": sig["fib_dist_pct"],
+                    "fib_high": sig["swing_high"],
+                    "fib_low": sig["swing_low"],
+                    "fib_range": sig["fib_range"],
+                    "weekly_bull": sig["weekly_bull"],
+                    "weekly_bear": sig["weekly_bear"],
+                    "htf_confirmed": sig["htf_confirmed"],
+                    "htf_converging": sig["htf_converging"],
+                    "daily_bull": sig["daily_bull"],
+                    "daily_bear": sig["daily_bear"],
+                    "rsi": sig["rsi"],
+                    "vol_contracting": sig["vol_contracting"],
+                    "vol_expanding": sig["vol_expanding"],
+                    "volume": sig["volume"],
+                    "vol_ma": sig["vol_ma"],
+                    "fib_ext_127": sig["fib_target_1"],
+                    "fib_ext_162": sig["fib_target_2"],
+                    "pre_confidence": sig["confidence"],
+                    "rs_vs_spy": sig["rs_vs_spy"],
+                    "primary_trend": sig["primary_trend"],
+                    "atr": sig["atr"],
+                    "is_snapback": (direction == "bull" and sig["primary_trend"] == "bearish"),
+                    "vix": sig.get("vix", 20),
+                    "hold_class": sig["hold_class"],
+                    "default_hold_days": sig["default_hold_days"],
+                    "max_hold_days": sig["max_hold_days"],
+                    "runner_eligible": sig["runner_eligible"],
+                    "income_eligible": sig["income_eligible"],
+                    "setup_quality": sig.get("setup_quality", "STANDARD"),
+                }
 
-        # Post summary to Telegram
+                hold_class = sig["hold_class"]
+                hold_emoji = {
+                    "long_hold": "🏗️", "medium_hold": "📅", "selective": "⚡",
+                    "tactical": "💨", "standard": "📅",
+                }.get(hold_class, "📅")
+                runner_tag = " 🏃 runner" if sig["runner_eligible"] else ""
+                income_tag = " 💰 income" if sig["income_eligible"] else ""
+                quality_header = sig.get("setup_label", "")
+
+                signal_msg = (
+                    f"📊 Swing Scanner: {ticker} T{tier} {direction.upper()}\n"
+                    f"{quality_header}\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"Fib {sig['fib_level']}% @ ${sig['fib_price']:.2f} "
+                    f"(dist {sig['fib_dist_pct']:.1f}%)\n"
+                    f"Conf: {sig['confidence']}/100 | RS: {sig['rs_vs_spy']:+.1f}%\n"
+                    f"Weekly: {'🟢' if sig['weekly_bull'] else '🔴' if sig['weekly_bear'] else '⚪'} | "
+                    f"Daily: {'🟢' if sig['daily_bull'] else '🔴' if sig['daily_bear'] else '⚪'} | "
+                    f"RSI: {sig['rsi']:.0f}\n"
+                    f"Primary: {sig['primary_trend']} | "
+                    f"Vol: {'📉 contracting' if sig['vol_contracting'] else '📈 expanding' if sig['vol_expanding'] else '➡️ normal'}\n"
+                    f"Targets: ${sig['fib_target_1']:.2f} / ${sig['fib_target_2']:.2f}\n"
+                    f"{hold_emoji} Hold: {sig['default_hold_days']}–{sig['max_hold_days']}D ({hold_class.replace('_', ' ')}){runner_tag}{income_tag}\n"
+                    f"T1: {sig['t1_policy']}\n"
+                    + (f"⚠️ {', '.join(sig['warnings'])}" if sig.get("warnings") else "")
+                )
+
+                if self._enqueue:
+                    self._enqueue("swing", ticker, direction, webhook_data, signal_msg)
+                    log.info(f"Swing signal enqueued: {ticker} T{tier} {direction.upper()} [{sig.get('setup_quality', 'STANDARD')}]")
+
         if self._post and signals:
             summary_lines = [
-                f"📊 ── SWING SCAN RESULTS ({len(signals)} setups) ──",
-                "",
+                f"📊 SWING DIGEST — {len(signals)} setups",
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+                "Scanner-native watchlist only. Use as review/stalk unless auto-enqueue is explicitly enabled.",
+                "Rules: fib touch/reclaim, weekly/daily not fighting, volume contraction preferred, clear invalidation, no major event risk.",
             ]
-            for sig in signals:
-                quality = sig.get("setup_quality", "STANDARD")
-                q_emoji = {"FLAGSHIP": "⭐", "PREMIUM": "🔷", "STRONG": "🔹",
-                           "SELECTIVE": "⚪", "TACTICAL": "💨", "STANDARD": "📊"}.get(quality, "📊")
-                dir_emoji = "🟢" if sig["direction"] == "bull" else "🔴"
-                hold_tag = f"{sig['default_hold_days']}D"
-                extras = []
-                if sig.get("runner_eligible"): extras.append("🏃")
-                if sig.get("income_eligible"): extras.append("💰")
-                extra_str = " " + "".join(extras) if extras else ""
-                summary_lines.append(
-                    f"{q_emoji}{dir_emoji} {sig['ticker']} T{sig['tier']} "
-                    f"{sig['direction'].upper()} — "
-                    f"Fib {sig['fib_level']}% | Conf {sig['confidence']} | "
-                    f"{hold_tag}{extra_str} [{quality}]"
-                )
+
+            groups = [
+                ("⭐ FLAGSHIP SWINGS", flagship),
+                ("🔷 TACTICAL IDEAS", tactical),
+                ("👁️ STALK ONLY", stalk_only),
+                ("🧾 LOG ONLY / EVENT RISK", log_only),
+            ]
+            for title, items in groups:
+                if not items:
+                    continue
+                summary_lines.append("")
+                summary_lines.append(title)
+                for sig in items[:8]:
+                    summary_lines.append(self._swing_digest_line(sig))
+                if len(items) > 8:
+                    summary_lines.append(f"  … +{len(items) - 8} more")
+
             summary_lines.append("")
-            summary_lines.append("Signals auto-enqueued for swing engine.")
+            if SWING_AUTO_ENQUEUE_ENABLED:
+                summary_lines.append(f"Queue: {len(enqueueable)} ideas auto-enqueued; {len(log_only)} log-only blocked.")
+            else:
+                summary_lines.append("Queue: auto-enqueue OFF — no swing ideas were sent to the trade engine.")
             self._post("\n".join(summary_lines))
 
     def _loop(self):

@@ -2,6 +2,70 @@
 # GitHub Desktop workflow test - 2026-04-23
 # NOTE: Educational/demo code. Not financial advice. Use at your own risk.
 #
+# v8.4 OBSERVABILITY OVERHAUL — single deploy fixing all known grading
+# and tracking corruption. None of these change what the bot recommends
+# or posts. They fix what gets recorded, how it's graded, and how it's
+# displayed.
+#
+#   Patch GBUG1 — credit-spread sign error in _rec_tracker_price_fn
+#     (~line 3519). Spread branch returned max(buy_mid - sell_mid, 0) for
+#     all spreads. For credits (bull_put_spread, bear_call_spread) that
+#     value is always 0 → _compute_credit_pnl_pct(credit, 0) = +100% →
+#     instant target_hit on first poll. Now branches on structure.
+#
+#   Patch GBUG2 — entry-mark mismatch in _record_conviction_recommendation
+#     (line ~3469). Cross-side conviction plays (flow on calls, recommend
+#     puts or vice versa) recorded the FLOW side's mid as entry while the
+#     poller correctly fetched the recommended side's mid → instant
+#     +600%+ target_hit. Now prefers cp.get("rec_mid") in the fallback
+#     chain, mirroring _position_monitor.register_position.
+#
+#   Patch GBUG3 (dashboard.py) — _pnl_pct_current used long-option math
+#     for all positions. Credit spreads rendered with inverted sign even
+#     when the underlying data was correct. Now branches on pricing_mode.
+#
+#   Position PnL tab schema — added 3 columns: Source Type
+#     (confirmed / review_only / companion_long), Peak At CT (timestamp
+#     of peak_option_mark from peak_ts), Companion Of (campaign_id of
+#     paired record). Old tabs auto-migrate via _sync_headers_if_drifted
+#     on first tick after deploy.
+#
+#   Display split — new env var RECTRACKER_REVIEW_ONLY_DISPLAY=
+#     inline (default, pre-2.7 behavior) | split (Bot-Found section
+#     beneath confirmed) | hide (2.7 behavior). When 'split', daily,
+#     weekly, and open-positions reports append separate "Bot Found"
+#     and "Companion Longs" sections with their own WR/net rollup.
+#     Old RECTRACKER_FILTER_REVIEW_ONLY_FROM_REPORTS=1 still works
+#     (mapped to 'hide').
+#
+#   Companion shadow longs — every spread record (debit AND credit) now
+#     spawns a sibling long_call or long_put record with the same expiry
+#     when RECTRACKER_COMPANION_LONGS_ENABLED=1. Strike selection:
+#       - Debit spreads: long-leg strike (lean (b), apples-to-apples)
+#       - Credit spreads: short-leg strike, directionally-matched right
+#         (bull_put → long_call, bear_call → long_put)
+#     Companions are tagged extra_metadata.companion_of=<spread_cid>,
+#     graded independently, displayed in the "Companion Longs" section.
+#     Default OFF; enable per Brad's monitoring of vehicle-comparison
+#     edge.
+#
+#   Sheet join key — conviction_plays.csv now writes campaign_id as the
+#     last column. Recorder mutates cp["campaign_id"] on success;
+#     logger reads it. Empty for shadow/skipped plays. Lets you VLOOKUP
+#     between the Omega 3000 decision sheet (conviction_plays tab) and
+#     the Dashboard 3000 outcome sheet (Position PnL tab).
+#
+#   Conviction_plays peak-fill audit (no patch) — root cause of blank
+#     opt_peak_*/opt_pnl_peak_pct columns documented:
+#     get_option_store().track_conviction is gated on _live_entry_mid > 0
+#     at recording time. When the live mid is unavailable (cross-side
+#     pre-GBUG2, one-sided quotes, streaming subscription delays), the
+#     OCC is never registered → EOD reconciler finds nothing. The forward
+#     fix is the recommendation_tracker, which polls every 90s via
+#     MarketData regardless of streaming state. Position PnL with Peak At
+#     becomes the reliable source. The conviction_plays opt_peak_*
+#     columns become supplementary.
+#
 # v8.4 Phase 2.5c HOTFIX (true vehicle-aware gate):
 #   The 2.5b comments said the gate was vehicle-aware, but _process_job still
 #   checked suppression before the post path knew the current vehicle. This
@@ -657,6 +721,26 @@ TELEGRAM_BOT_TOKEN      = os.getenv("TELEGRAM_BOT_TOKEN",      "").strip()
 TELEGRAM_CHAT_ID        = os.getenv("TELEGRAM_CHAT_ID",        "").strip()
 TELEGRAM_CHAT_INTRADAY  = os.getenv("TELEGRAM_CHAT_INTRADAY",  "").strip()  # intraday monitor alerts
 TELEGRAM_CHAT_DIAGNOSIS = os.getenv("DIAGNOSTIC_CHAT_ID", "").strip()  # v7.1: noise/diagnostic alerts
+
+# Phase 2.8 Telegram routing defaults. Main channel should stay actionable.
+# Diagnostic/research posts should NOT silently fall back into main unless
+# explicitly enabled for testing. Potter Box + old Unusual Flow summaries stay
+# main-enabled by default because Brad uses them.
+TELEGRAM_DIAG_FALLBACK_TO_MAIN = os.getenv("TELEGRAM_DIAG_FALLBACK_TO_MAIN", "0").strip().lower() in ("1", "true", "yes", "on")
+NIGHTLY_SCREEN_MAIN_ENABLED = os.getenv("NIGHTLY_SCREEN_MAIN_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+MORNING_OI_CONFIRMATION_TO_MAIN = os.getenv("MORNING_OI_CONFIRMATION_TO_MAIN", "1").strip().lower() not in ("0", "false", "no", "off")
+MORNING_STALK_DIGEST_TO_MAIN = os.getenv("MORNING_STALK_DIGEST_TO_MAIN", "1").strip().lower() not in ("0", "false", "no", "off")
+SWING_DIGEST_MAIN_ENABLED = os.getenv("SWING_DIGEST_MAIN_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+POTTER_BOX_SUMMARY_MAIN_ENABLED = os.getenv("POTTER_BOX_SUMMARY_MAIN_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+UNUSUAL_FLOW_SUMMARY_MAIN_ENABLED = os.getenv("UNUSUAL_FLOW_SUMMARY_MAIN_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+# v8.4 audit follow-up (regressions found in fixed zip): three routing sites
+# from original Phase 2.8 had been reverted to direct post_to_telegram. Both
+# of these post bot-idea / accuracy summaries that fall under Phase 2.8's
+# "diagnostic-by-default" rubric, not actionable trade alerts. Default OFF
+# matches Phase 2.8's intent for the rest of the rec-tracker reports.
+CONVICTION_RESULTS_MAIN_ENABLED = os.getenv("CONVICTION_RESULTS_MAIN_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+EM_SCORECARD_MAIN_ENABLED = os.getenv("EM_SCORECARD_MAIN_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+
 TV_WEBHOOK_SECRET   = os.getenv("TV_WEBHOOK_SECRET",   "").strip()
 MARKETDATA_TOKEN    = os.getenv("MARKETDATA_TOKEN",    "").strip()
 WATCHLIST           = os.getenv("WATCHLIST",           "").strip()
@@ -1214,6 +1298,11 @@ _CONVICTION_FIELDS = [
     # v7.2: Silent Thesis Layer — structural alignment data for edge measurement
     "thesis_direction", "thesis_aligned", "gex_sign",
     "gamma_flip_vs_spot", "put_wall", "call_wall",
+    # v8.4: join key linking decision sheet (this CSV) to outcome sheet
+    # (Position PnL tab on Dashboard 3000). Populated when this conviction
+    # play also becomes a tracked recommendation. Empty for shadow/skipped
+    # plays. Lets you VLOOKUP across sheets.
+    "campaign_id",
 ]
 
 def _check_spread_fillability(ticker: str, long_strike: float, short_strike: float,
@@ -1632,6 +1721,16 @@ def _log_conviction_play(play: dict, regime: str = "", vix: float = 0):
         except Exception as _occ_err:
             log.debug(f"Conviction OCC tracking setup failed: {_occ_err}")
 
+        # v8.4: write the campaign_id join key. Empty when the play didn't
+        # become a tracked recommendation (shadow, exit signal, stalk route,
+        # missing strike/expiry). Populated upstream by
+        # _record_conviction_recommendation, which mutates cp["campaign_id"]
+        # on success. VLOOKUP-able against Position PnL on Dashboard 3000.
+        try:
+            row["campaign_id"] = play.get("campaign_id", "") or ""
+        except Exception:
+            row["campaign_id"] = ""
+
         _append_csv_row("conviction_plays.csv", _CONVICTION_FIELDS, row)
     except Exception as e:
         log.debug(f"Conviction play log failed for {play.get('ticker','?')}: {e}")
@@ -1892,6 +1991,81 @@ def _reconcile_conviction_plays(date_str: str):
     except Exception as _wm_err:
         log.warning(f"Conviction recon: watermark fill failed: {_wm_err}")
 
+    # v8.4 audit follow-up: rec-tracker fallback for opt_peak_*.
+    # Streaming watermarks miss whenever track_conviction() didn't fire at
+    # post time (one-sided quotes, streaming subscription delays, cross-side
+    # plays pre-GBUG2). The recommendation_tracker polls every 90s via
+    # MarketData regardless of streaming state and stores peak_option_mark
+    # + peak_ts on every campaign. Use the v8.4 campaign_id join key on each
+    # row to pull peak data for any row still blank after the streaming fill.
+    rt_updated = 0
+    try:
+        global _rec_tracker
+        if _rec_tracker is not None:
+            import pytz
+            ct_tz = pytz.timezone("America/Chicago")
+            from datetime import datetime as _dt
+            for row in rows:
+                if row.get("date") != date_str:
+                    continue
+                if row.get("opt_peak_mid") not in ("", None):
+                    continue  # already filled by streaming or prior pass
+                cid = row.get("campaign_id") or ""
+                if not cid:
+                    continue
+                try:
+                    rec = _rec_tracker.load_campaign(cid)
+                except Exception:
+                    rec = None
+                if not rec:
+                    continue
+                def _safe_float(v, default=0.0):
+                    try:
+                        return float(v)
+                    except (TypeError, ValueError):
+                        return default
+
+                entry_mark = _safe_float(rec.get("entry_option_mark"))
+                peak_mark = _safe_float(rec.get("peak_option_mark"))
+                peak_ts = rec.get("peak_ts") or 0
+                last_mark = _safe_float(rec.get("last_option_mark"))
+                if peak_mark <= 0 or entry_mark <= 0:
+                    continue
+                # Don't overwrite a non-empty opt_entry_mid with a tracker value
+                # that may differ slightly — entry mark in the CSV came from the
+                # post-time live mid, which is the contract Brad would have
+                # entered. Leave it. Just fill peak / eod.
+                row["opt_peak_mid"] = round(float(peak_mark), 4)
+                row["opt_eod_mid"] = round(float(last_mark or peak_mark), 4)
+                if peak_ts:
+                    try:
+                        peak_dt = _dt.fromtimestamp(float(peak_ts),
+                                                     tz=pytz.utc).astimezone(ct_tz)
+                        row["opt_peak_time_ct"] = peak_dt.strftime("%H:%M")
+                    except Exception:
+                        pass
+                # Compute % from the CSV's stored entry mid, since that's the
+                # one that matches the conviction post. If the CSV entry is
+                # missing, fall back to the tracker's entry mark.
+                csv_entry = row.get("opt_entry_mid")
+                try:
+                    base_entry = float(csv_entry) if csv_entry not in ("", None) else float(entry_mark)
+                except (TypeError, ValueError):
+                    base_entry = float(entry_mark)
+                if base_entry > 0:
+                    row["opt_pnl_peak_pct"] = round(
+                        (float(peak_mark) - base_entry) / base_entry * 100, 1)
+                    if last_mark:
+                        row["opt_pnl_eod_pct"] = round(
+                            (float(last_mark) - base_entry) / base_entry * 100, 1)
+                rt_updated += 1
+            if rt_updated:
+                log.info(f"Conviction recon: {rt_updated} plays got peak data "
+                         f"from rec-tracker fallback (streaming watermark blank)")
+                updated = max(updated, 1)
+    except Exception as _rt_err:
+        log.warning(f"Conviction recon: rec-tracker fallback failed: {_rt_err}")
+
     if updated > 0:
         try:
             with open(csv_path, "w", newline="") as f:
@@ -1928,7 +2102,10 @@ def _reconcile_conviction_plays(date_str: str):
                         summary += f" | opt peak {float(opt_peak):+.0f}%"
                     summary += f" (vol/OI {r.get('vol_oi_ratio','')}x)\n"
                 try:
-                    post_to_telegram(summary)
+                    # v8.4 audit follow-up: route through Phase 2.8 router
+                    # so this lands in diagnostic by default. The conviction
+                    # ✅/❌ summary is bot-idea outcome data, not a trade alert.
+                    _post_report_message(summary, allow_main=CONVICTION_RESULTS_MAIN_ENABLED)
                 except Exception:
                     pass
         except Exception as e:
@@ -3101,6 +3278,153 @@ def _record_recommendation_campaign(*, source: str, ticker: str, direction: str,
         return None
 
 
+def _companion_longs_enabled() -> bool:
+    """v8.4: master switch for companion-long shadow tracking. Default OFF.
+
+    When ON, every spread record (debit OR credit) the bot writes spawns
+    a sibling long_call/long_put record using the LONG LEG of the spread
+    as the strike, the same expiry, and the same entry timestamp. Both
+    records grade independently. Brad can later compare 'spread vs naked
+    long' on the same setup.
+    """
+    return os.getenv("RECTRACKER_COMPANION_LONGS_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _find_strike_mid_in_chain(chain_rows: list, strike: float, right: str) -> float:
+    """Pull bid+ask/2 (or last) for a single (strike, right) from already-fetched chain_rows.
+    Returns 0.0 when not found — caller should treat 0.0 as 'no usable mid'."""
+    if not chain_rows or strike is None:
+        return 0.0
+    target_strike = float(strike)
+    target_right = (right or "").lower()
+    for row in chain_rows:
+        try:
+            row_strike = float(row.get("strike") or 0)
+            if abs(row_strike - target_strike) > 0.01:
+                continue
+            row_side = (row.get("side") or row.get("right") or "").lower()
+            # Many chain responses don't carry side per-row when the chain
+            # was already filtered by side. Accept any matching strike when
+            # row_side is blank (caller is responsible for passing a
+            # side-filtered chain).
+            if row_side and target_right and row_side != target_right:
+                continue
+            bid = as_float(row.get("bid"), 0.0)
+            ask = as_float(row.get("ask"), 0.0)
+            last = as_float(row.get("last"), 0.0)
+            if bid > 0 and ask > 0:
+                return (bid + ask) / 2.0
+            if last > 0:
+                return last
+            if ask > 0:
+                return ask  # one-sided fallback
+            return 0.0
+        except (TypeError, ValueError):
+            continue
+    return 0.0
+
+
+def _record_companion_long_for_spread(
+    *,
+    spread_result,
+    ticker: str,
+    direction: str,
+    trade_type: str,
+    spread_legs: list,
+    chain_rows=None,
+    intraday_rows=None,
+    prior_day_ctx=None,
+    confidence=None,
+    regime=None,
+    orig_source: str = "unknown",
+):
+    """v8.4: Spawn a companion long_call/long_put record paired with the
+    spread that was just recorded. Uses the spread's LONG LEG as the
+    strike (lean (b) — apples-to-apples vehicle comparison).
+
+    Returns the companion's tracker result, or None when:
+      - feature disabled
+      - spread_result is None (the spread itself wasn't recorded)
+      - spread_result is a duplicate (companion was created on the original)
+      - long leg can't be identified
+      - companion entry mid is 0 (no usable price)
+
+    Failure here MUST NOT raise — companion recording is purely
+    observability; the spread's main record has already been written.
+    """
+    if not _companion_longs_enabled():
+        return None
+    if not spread_result or not spread_result.get("is_new_campaign"):
+        return None
+    spread_record = spread_result.get("record") or {}
+    spread_cid = spread_record.get("campaign_id") or spread_result.get("campaign_id")
+    if not spread_cid:
+        return None
+    # Find the long leg (action="buy")
+    long_leg = next((l for l in (spread_legs or []) if (l.get("action") or "").lower() == "buy"), None)
+    if not long_leg:
+        return None
+    right = (long_leg.get("right") or "").lower()
+    if right not in ("call", "put"):
+        return None
+    strike = long_leg.get("strike")
+    expiry = (long_leg.get("expiry") or "")[:10]
+    if strike is None or not expiry:
+        return None
+
+    # Get a current mid for the long leg from the chain_rows the spread
+    # recorder already fetched. If that's missing/stale, fall back to a
+    # fresh _cached_md fetch.
+    entry_mid = _find_strike_mid_in_chain(chain_rows or [], strike, right)
+    if entry_mid <= 0 and _cached_md is not None:
+        try:
+            fresh_chain = _chain_rows_from_response(
+                _cached_md.get_chain(ticker, expiry, side=right)
+            )
+            entry_mid = _find_strike_mid_in_chain(fresh_chain, strike, right)
+        except Exception as e:
+            log.debug(f"Companion long: chain refetch failed for {ticker} {expiry}: {e}")
+    if entry_mid <= 0:
+        log.info(f"Companion long: skipping {ticker} {right} ${strike} {expiry} — "
+                 f"no usable mid (paired with spread {spread_cid})")
+        return None
+
+    # Pull the spread's stored entry_underlying so the companion has the
+    # same spot reference. Falls back to whatever the spread record has.
+    entry_underlying = float(spread_record.get("entry_underlying") or 0)
+
+    companion_source = f"companion_{orig_source}"
+    extra = {
+        "companion_of": spread_cid,
+        "companion_strike_basis": "long_leg",   # lean (b)
+        "review_only": False,                    # not a review-only post
+        "confirmed_entry": False,                # not a confirmed entry either
+        "vehicle_compare": True,
+    }
+
+    try:
+        return _record_recommendation_campaign(
+            source=companion_source,
+            ticker=ticker,
+            direction=direction,
+            trade_type=trade_type,
+            structure=f"long_{right}",
+            legs=[{"right": right, "strike": strike, "expiry": expiry, "action": "buy"}],
+            entry_option_mark=entry_mid,
+            entry_underlying=entry_underlying,
+            confidence=confidence,
+            regime=regime,
+            extra_metadata=extra,
+            pricing_mode="long_mark",
+            chain_rows=chain_rows,
+            intraday_rows=intraday_rows,
+            prior_day_ctx=prior_day_ctx,
+        )
+    except Exception as e:
+        log.warning(f"Companion long record failed for {ticker} (spread {spread_cid}): {e}")
+        return None
+
+
 def _record_check_ticker_recommendation(ticker: str, direction: str, best_rec: dict, spot: float, regime, chains):
     trade = (best_rec or {}).get("trade") or {}
     if not trade:
@@ -3122,7 +3446,7 @@ def _record_check_ticker_recommendation(ticker: str, direction: str, best_rec: d
     intraday_rows = _raw_intraday_to_rows(get_intraday_bars(ticker, resolution=5, countback=60))
     prior_ctx = _build_prior_day_gap_context(ticker, intraday_rows)
     chain_rows = _find_chain_rows_for_expiration(chains, exp)
-    return _record_recommendation_campaign(
+    _result = _record_recommendation_campaign(
         source="check_ticker", ticker=ticker, direction=direction,
         trade_type=("immediate" if dte <= 2 else "swing"),
         structure=structure, legs=legs, entry_option_mark=trade.get("debit") or 0,
@@ -3130,6 +3454,18 @@ def _record_check_ticker_recommendation(ticker: str, direction: str, best_rec: d
         extra_metadata={"spread_id": best_rec.get("spread_id"), "tier": best_rec.get("tier")},
         pricing_mode=pricing_mode, chain_rows=chain_rows, intraday_rows=intraday_rows, prior_day_ctx=prior_ctx,
     )
+    # v8.4: companion long-only shadow paired with this spread (lean (b) —
+    # uses long-leg strike for apples-to-apples vehicle comparison).
+    # No-op when RECTRACKER_COMPANION_LONGS_ENABLED is unset.
+    if structure not in ("long_call", "long_put"):
+        _record_companion_long_for_spread(
+            spread_result=_result, ticker=ticker, direction=direction,
+            trade_type=("immediate" if dte <= 2 else "swing"),
+            spread_legs=legs, chain_rows=chain_rows, intraday_rows=intraday_rows,
+            prior_day_ctx=prior_ctx, confidence=best_rec.get("confidence"),
+            regime=regime, orig_source="check_ticker",
+        )
+    return _result
 
 
 def _record_swing_recommendation(ticker: str, rec: dict, spot: float, chains=None, source: str = "swing_engine"):
@@ -3151,13 +3487,23 @@ def _record_swing_recommendation(ticker: str, rec: dict, spot: float, chains=Non
     intraday_rows = _raw_intraday_to_rows(get_intraday_bars(ticker, resolution=5, countback=60))
     prior_ctx = _build_prior_day_gap_context(ticker, intraday_rows)
     chain_rows = _find_chain_rows_for_expiration(chains, exp) if chains else []
-    return _record_recommendation_campaign(
+    _result = _record_recommendation_campaign(
         source=source, ticker=ticker, direction=direction, trade_type="swing",
         structure=structure, legs=legs, entry_option_mark=trade.get("debit") or 0,
         entry_underlying=spot, confidence=rec.get("confidence"), regime=rec.get("regime"),
         extra_metadata={"tier": rec.get("tier")}, pricing_mode=pricing_mode,
         chain_rows=chain_rows, intraday_rows=intraday_rows, prior_day_ctx=prior_ctx,
     )
+    # v8.4: companion long-only shadow paired with this spread.
+    if structure not in ("long_call", "long_put"):
+        _record_companion_long_for_spread(
+            spread_result=_result, ticker=ticker, direction=direction,
+            trade_type="swing", spread_legs=legs, chain_rows=chain_rows,
+            intraday_rows=intraday_rows, prior_day_ctx=prior_ctx,
+            confidence=rec.get("confidence"), regime=rec.get("regime"),
+            orig_source=source,
+        )
+    return _result
 
 
 def _record_income_opportunity(opp: dict, source: str = "income_scanner",
@@ -3191,7 +3537,7 @@ def _record_income_opportunity(opp: dict, source: str = "income_scanner",
     _meta = {"grade": (opp.get("itqs") or {}).get("grade")}
     if isinstance(extra_metadata, dict):
         _meta.update(extra_metadata)
-    return _record_recommendation_campaign(
+    _result = _record_recommendation_campaign(
         source=source, ticker=ticker, direction=("bull" if trade_type == "bull_put" else "bear"),
         trade_type="income", structure=structure, legs=legs,
         entry_option_mark=opp.get("credit") or 0, entry_underlying=opp.get("spot") or 0,
@@ -3199,6 +3545,36 @@ def _record_income_opportunity(opp: dict, source: str = "income_scanner",
         extra_metadata=_meta,
         pricing_mode="credit_spread_debit_to_close", chain_rows=chain_rows, intraday_rows=intraday_rows, prior_day_ctx=prior_ctx,
     )
+    # v8.4: companion long for credit spreads. For a bull_put_spread the
+    # directionally-matching long is a long_call (bullish bet); for a
+    # bear_call_spread it's a long_put. Lean (b) — same expiry, but the
+    # "long leg" in a credit spread is the protection wing (further OTM)
+    # which would be a poor naked-long comparable. Instead use the SHORT
+    # leg's strike as the companion's strike — it's the closer-to-money
+    # strike and a more meaningful "what would buying outright have done"
+    # baseline. Override the helper's default by passing tailored legs.
+    short_leg_strike = next((l.get("strike") for l in legs
+                             if (l.get("action") or "").lower() == "sell"), None)
+    if short_leg_strike is not None:
+        # Companion right matches the spread's directional intent, not the
+        # short leg's right. bull_put → long_call; bear_call → long_put.
+        comp_right = "call" if trade_type == "bull_put" else "put"
+        comp_legs = [{"right": comp_right, "strike": short_leg_strike,
+                      "expiry": exp, "action": "buy"}]
+        _record_companion_long_for_spread(
+            spread_result=_result, ticker=ticker,
+            direction=("bull" if trade_type == "bull_put" else "bear"),
+            trade_type="income", spread_legs=comp_legs,
+            # chain_rows above are fetched for the credit spread side (puts/calls).
+            # For the companion long, force the helper to fetch the directional
+            # side (bull_put→call, bear_call→put) so we don't accidentally price
+            # a long call with a same-strike put row when side metadata is blank.
+            chain_rows=[], intraday_rows=intraday_rows,
+            prior_day_ctx=prior_ctx,
+            confidence=((opp.get("itqs") or {}).get("score")), regime=None,
+            orig_source=source,
+        )
+    return _result
 
 
 def _record_conviction_recommendation(cp: dict, spot: float, chain_data=None, best_income: dict = None, source: str = "conviction_flow"):
@@ -3221,14 +3597,35 @@ def _record_conviction_recommendation(cp: dict, spot: float, chain_data=None, be
     prior_ctx = _build_prior_day_gap_context(cp["ticker"], intraday_rows)
     # FIX BUG #1: normalize — chain_data may be the raw dict-of-arrays response
     chain_rows = _chain_rows_from_response(chain_data)
-    return _record_recommendation_campaign(
+    _result = _record_recommendation_campaign(
         source=source, ticker=cp["ticker"], direction=direction, trade_type=route,
         structure=f"long_{right}", legs=[{"right": right, "strike": strike, "expiry": exp, "action": "buy"}],
-        entry_option_mark=(cp.get("current_mark") or cp.get("mid") or cp.get("premium") or 0),
+        # v8.4 (Patch GBUG2): prefer rec_mid (the actually-recommended contract's mid)
+        # over the flow alert's mid. When trade_direction implies a recommendation
+        # on the OPPOSITE side from the flow (e.g. heavy call selling → bearish →
+        # recommend long puts), oi_flow.py:2647 sets play["rec_mid"] to the
+        # recommended-side mid. Old code only checked current_mark (never set) →
+        # mid (the FLOW side's mid), so the entry was the call's price while the
+        # poller correctly fetched the put's price → instant +650% target_hit.
+        # Mirrors the working pattern in _position_monitor.register_position
+        # at the conviction registration site (~line 7255).
+        entry_option_mark=(cp.get("current_mark") or cp.get("rec_mid") or cp.get("mid") or cp.get("premium") or 0),
         entry_underlying=spot, confidence=cp.get("confidence") or 70, regime=None,
         extra_metadata={"vol_oi_ratio": cp.get("vol_oi_ratio"), "burst": cp.get("burst")},
         pricing_mode="long_mark", chain_rows=chain_rows, intraday_rows=intraday_rows, prior_day_ctx=prior_ctx,
     )
+    # v8.4: thread the campaign_id back onto cp so _log_conviction_play can
+    # write it as the sheet join key. _log_conviction_play runs AFTER this
+    # in every observed call site, so by the time it appends a row, cp
+    # carries the linkage to the Position PnL record on the outcome sheet.
+    try:
+        if isinstance(_result, dict):
+            _cid = _result.get("campaign_id") or (_result.get("record") or {}).get("campaign_id")
+            if _cid:
+                cp["campaign_id"] = _cid
+    except Exception:
+        pass
+    return _result
 
 
 def _rec_tracker_price_fn(ticker, expiry, right, strike, structure, legs):
@@ -3276,6 +3673,18 @@ def _rec_tracker_price_fn(ticker, expiry, right, strike, structure, legs):
             sell_mid = mids.get((sell_leg.get("action"), sell_leg.get("strike"), sell_leg.get("expiry"), sell_leg.get("right")))
             if buy_mid is None or sell_mid is None:
                 return None
+            # v8.4 (Patch GBUG1): credit-spread sign fix.
+            # For a CREDIT spread (bull_put_spread, bear_call_spread) the live
+            # cost-to-close = sell_mid - buy_mid (we buy back the short, sell
+            # the long for less). Old code returned max(buy_mid - sell_mid, 0)
+            # which for a credit spread is always 0, and fed into
+            # _compute_credit_pnl_pct(credit, 0) = +100% → instant target_hit
+            # on the very first poll. Affected every income credit spread and
+            # every v84_credit_dual_post record.
+            # For a DEBIT spread (bull_call_spread, bear_put_spread) the live
+            # value-of-position = buy_mid - sell_mid (unchanged behavior).
+            if structure in ("bull_put_spread", "bear_call_spread"):
+                return max(sell_mid - buy_mid, 0.0)
             return max(buy_mid - sell_mid, 0.0)
         return None
     except Exception as e:
@@ -3434,7 +3843,7 @@ def _rec_tracker_report_scheduler():
             if _is_time(8, 0) and _weekday_only():
                 try:
                     _sr.post_morning_briefing(
-                        post_fn=post_to_telegram,
+                        post_fn=post_to_diagnosis,
                         rec_tracker_store=_rec_tracker,
                     )
                     log.info("Scheduled: morning briefing posted")
@@ -3444,7 +3853,7 @@ def _rec_tracker_report_scheduler():
             # 15:15 CT — end-of-day recresults (weekdays)
             if _is_time(15, 15) and _weekday_only():
                 try:
-                    _sr.post_eod_report(post_to_telegram, _rec_tracker)
+                    _sr.post_eod_report(post_to_diagnosis, _rec_tracker)
                     log.info("Scheduled: EOD recresults posted")
                 except Exception as e:
                     log.warning(f"EOD recresults failed: {e}")
@@ -3452,7 +3861,7 @@ def _rec_tracker_report_scheduler():
             # 15:30 CT Fridays — weekly digest + shadow edge
             if _is_time(15, 30) and datetime.now(_CT).weekday() == 4:
                 try:
-                    _sr.post_weekly_digest(post_to_telegram, _rec_tracker)
+                    _sr.post_weekly_digest(post_to_diagnosis, _rec_tracker)
                     log.info("Scheduled: weekly digest posted")
                 except Exception as e:
                     log.warning(f"Weekly digest failed: {e}")
@@ -3460,7 +3869,7 @@ def _rec_tracker_report_scheduler():
             # 09:00 CT on 1st of month — monthly attribution
             if _is_time(9, 0) and datetime.now(_CT).day == 1:
                 try:
-                    _sr.post_monthly_attribution(post_to_telegram, _rec_tracker)
+                    _sr.post_monthly_attribution(post_to_diagnosis, _rec_tracker)
                     log.info("Scheduled: monthly attribution posted")
                 except Exception as e:
                     log.warning(f"Monthly attribution failed: {e}")
@@ -5839,15 +6248,26 @@ def post_to_intraday(text: str):
 
 
 def post_to_diagnosis(text: str):
-    """Post to the diagnosis/noise channel (TELEGRAM_CHAT_DIAGNOSIS).
-    v7.1: All non-actionable noise routes here — swing fibs, Potter Box,
-    OI confirmations, stalk alerts, income scans, level breaks.
-    Falls back to intraday, then main channel if not configured."""
-    cid = TELEGRAM_CHAT_DIAGNOSIS or TELEGRAM_CHAT_INTRADAY or TELEGRAM_CHAT_ID
+    """Post to the diagnosis/noise channel.
+
+    Phase 2.8: diagnostic/research alerts should not silently fall back to
+    the main channel. Set TELEGRAM_DIAG_FALLBACK_TO_MAIN=1 only while testing
+    or if you intentionally want diagnostics mixed into main.
+    """
+    cid = TELEGRAM_CHAT_DIAGNOSIS or TELEGRAM_CHAT_INTRADAY
+    if not cid and TELEGRAM_DIAG_FALLBACK_TO_MAIN:
+        cid = TELEGRAM_CHAT_ID
     if not cid:
-        log.error("post_to_diagnosis: no chat ID configured")
+        log.error("post_to_diagnosis: no diagnostic/intraday chat ID configured")
         return
     post_to_telegram(text, chat_id=cid)
+
+
+def _post_report_message(text: str, *, allow_main: bool = False):
+    """Route report-style messages using Phase 2.8 channel rules."""
+    if allow_main:
+        return post_to_telegram(text)
+    return post_to_diagnosis(text)
 
 # ─────────────────────────────────────────────────────────
 # MARKETDATA API
@@ -9299,8 +9719,11 @@ def reconcile_route():
                      f"dir={stats.get('direction_correct_pct')}%")
 
             if post_summary and stats.get("n", 0) > 0:
-                post_to_telegram(report)
-                log.info("Reconciler: accuracy report posted to Telegram")
+                # v8.4 audit follow-up: route through Phase 2.8 router. EM
+                # accuracy stats are research, not a trade alert.
+                _post_report_message(report, allow_main=EM_SCORECARD_MAIN_ENABLED)
+                _route = "main" if EM_SCORECARD_MAIN_ENABLED else "diagnostic"
+                log.info(f"Reconciler: accuracy report posted to {_route}")
 
         except Exception as e:
             log.error(f"Reconciler error: {e}", exc_info=True)
@@ -9331,8 +9754,10 @@ def _run_reconciler_auto():
             if stats.get("n", 0) >= 5:
                 # Only post summary once we have enough data
                 report = format_accuracy_report(stats)
-                post_to_telegram(report)
-                log.info(f"Auto-reconciler: posted accuracy report ({stats['n']} entries)")
+                # v8.4 audit follow-up: route through Phase 2.8 router.
+                _post_report_message(report, allow_main=EM_SCORECARD_MAIN_ENABLED)
+                _route = "main" if EM_SCORECARD_MAIN_ENABLED else "diagnostic"
+                log.info(f"Auto-reconciler: posted accuracy report to {_route} ({stats['n']} entries)")
             else:
                 log.info(f"Auto-reconciler: {stats.get('n', 0)} entries — waiting for more data before posting")
     except Exception as e:
@@ -13072,14 +13497,14 @@ def _em_scheduler():
                             )
                             alerts = _shadow_logger.check_alert_thresholds()
                             for a in alerts:
-                                post_to_telegram(a)
+                                post_to_diagnosis(a)
                             # Monthly report on 1st of month
                             if now_ct.day == 1:
                                 report = _shadow_logger.format_monthly_report()
-                                post_to_telegram(report)
+                                post_to_diagnosis(report)
                                 if _position_monitor:
                                     shadow_sc = _position_monitor.format_shadow_scorecard()
-                                    post_to_telegram(shadow_sc)
+                                    post_to_diagnosis(shadow_sc)
                                 log.info("v7: monthly shadow reports posted")
                     except Exception as _pm_eod_err:
                         log.warning(f"v7 EOD processing error: {_pm_eod_err}")
@@ -13132,7 +13557,7 @@ def _em_scheduler():
                     try:
                         _oi_msg = _oi_tracker.format_unusual_flow()
                         if _oi_msg and "No unusual" not in _oi_msg:
-                            post_to_telegram(_oi_msg)
+                            _post_report_message(_oi_msg, allow_main=UNUSUAL_FLOW_SUMMARY_MAIN_ENABLED)
                             log.info("OI tracker: unusual flow summary posted")
                     except Exception as _oe:
                         log.debug(f"OI tracker summary error: {_oe}")
@@ -13200,7 +13625,9 @@ def _em_scheduler():
                     fired_today.add(_income_key)
                     log.info("Income scanner firing (8:15 AM CT)")
                     try:
-                        _inc_cid = TELEGRAM_CHAT_DIAGNOSIS or TELEGRAM_CHAT_INTRADAY or TELEGRAM_CHAT_ID  # v7.1: route to diagnosis
+                        _inc_cid = TELEGRAM_CHAT_DIAGNOSIS or TELEGRAM_CHAT_INTRADAY
+                        if not _inc_cid and TELEGRAM_DIAG_FALLBACK_TO_MAIN:
+                            _inc_cid = TELEGRAM_CHAT_ID
                         _income_scan_fn(_inc_cid)
                     except Exception as _ie:
                         log.debug(f"Income scan error: {_ie}")
@@ -13233,8 +13660,8 @@ def _em_scheduler():
                                 if setups:
                                     summary = _potter_box.format_summary(setups)
                                     if summary:
-                                        # v8.3.1 Fix B: summary digest goes to main
-                                        post_to_telegram(summary)
+                                        # Phase 2.8 correction: Potter Box summary remains main-enabled by default.
+                                        _post_report_message(summary, allow_main=POTTER_BOX_SUMMARY_MAIN_ENABLED)
                                     for s in setups:
                                         if s.get("trade") and s.get("flow_direction"):
                                             try:
@@ -13272,8 +13699,8 @@ def _em_scheduler():
                                 if setups:
                                     summary = _potter_box.format_summary(setups)
                                     if summary:
-                                        # v8.3.1 Fix B: summary digest goes to main
-                                        post_to_telegram(summary)
+                                        # Phase 2.8 correction: Potter Box summary remains main-enabled by default.
+                                        _post_report_message(summary, allow_main=POTTER_BOX_SUMMARY_MAIN_ENABLED)
                                     for s in setups:
                                         if s.get("trade") and s.get("flow_direction"):
                                             try:
@@ -13311,8 +13738,8 @@ def _em_scheduler():
                                 if setups:
                                     summary = _potter_box.format_summary(setups)
                                     if summary:
-                                        # v8.3.1 Fix B: summary digest goes to main
-                                        post_to_telegram(summary)
+                                        # Phase 2.8 correction: Potter Box summary remains main-enabled by default.
+                                        _post_report_message(summary, allow_main=POTTER_BOX_SUMMARY_MAIN_ENABLED)
                                     for s in setups:
                                         if s.get("trade") and s.get("flow_direction"):
                                             try:
@@ -13355,17 +13782,24 @@ def _em_scheduler():
                                 if confirmations:
                                     rolls = _flow_detector.detect_rolls(confirmations)
                                     sector = _flow_detector.detect_sector_flow(confirmations)
+                                    stalks = _flow_detector.generate_stalk_alerts(confirmations)
                                     msg = _flow_detector.format_confirmation_summary(
                                         confirmations, rolls, sector)
                                     if msg:
-                                        post_to_diagnosis(msg)  # v7.1: route to diagnosis
+                                        msg = (
+                                            msg
+                                            + f"\n\n👁️ Stalk candidates: {len(stalks)} deduped names; "
+                                            + ("Morning Stalk Digest follows." if stalks else "none after filters.")
+                                        )
+                                        _post_report_message(msg, allow_main=MORNING_OI_CONFIRMATION_TO_MAIN)
 
-                                    stalks = _flow_detector.generate_stalk_alerts(confirmations)
-                                    for stalk in stalks:
-                                        try:
-                                            post_to_diagnosis(_flow_detector.format_stalk_alert(stalk))  # v7.1
-                                        except Exception:
-                                            pass
+                                    # Phase 2.8: replace individual STALK ALERT cards with one
+                                    # compact digest. Raw per-stalk cards are no longer posted.
+                                    if stalks:
+                                        digest_fn = getattr(_flow_detector, "format_stalk_digest", None)
+                                        digest = digest_fn(stalks) if callable(digest_fn) else None
+                                        if digest:
+                                            _post_report_message(digest, allow_main=MORNING_STALK_DIGEST_TO_MAIN)
                             except Exception as _fe:
                                 log.warning(f"Morning flow confirmation error: {_fe}")
                         threading.Thread(target=_run_morning_confirm, daemon=True,
@@ -13389,7 +13823,7 @@ def _em_scheduler():
                                 summary_msgs = _flow_detector.format_eod_flow_summary(eod_alerts)
                                 for sm in summary_msgs:
                                     try:
-                                        post_to_telegram(sm)
+                                        post_to_diagnosis(sm)
                                     except Exception:
                                         pass
 
@@ -13397,7 +13831,7 @@ def _em_scheduler():
                                 rotations = _flow_detector.detect_cross_asset_rotation(eod_alerts)
                                 for rot in rotations:
                                     try:
-                                        post_to_telegram(_flow_detector.format_rotation_alert(rot))
+                                        post_to_diagnosis(_flow_detector.format_rotation_alert(rot))
                                         log.info(f"🔄 Rotation detected: {rot['description']} "
                                                f"({rot['match_count']} matches)")
                                     except Exception:
@@ -13574,7 +14008,7 @@ def _start_background_services_once():
                     return 20
             _swing_scanner = SwingScanner(
                 enqueue_fn=_enqueue_signal,
-                post_fn=post_to_telegram,
+                post_fn=(post_to_telegram if SWING_DIGEST_MAIN_ENABLED else post_to_diagnosis),
                 earnings_fn=lambda t: enrich_ticker(t),
                 vix_fn=_get_vix_for_scanner,
             )
@@ -14622,11 +15056,12 @@ def run_fundamental_screen():
         fast_growers = [t for t, d in results.items()
                         if d.get("lynch_category", {}).get("category") == "FAST_GROWER"]
         if fast_growers:
-            post_to_telegram(
-                f"📊 Nightly Screen: {len(fast_growers)} fast growers detected\n"
+            _screen_msg = (
+                f"📊 Nightly Screen (DIAGNOSTIC): {len(fast_growers)} fast growers detected\n"
                 + "\n".join(f"  • {t} (PEG={results[t].get('peg_ratio', '?')})"
                             for t in fast_growers[:10])
             )
+            _post_report_message(_screen_msg, allow_main=NIGHTLY_SCREEN_MAIN_ENABLED)
         log.info(f"Fundamental screen complete: {len(fast_growers)} fast growers")
 
     threading.Thread(target=_run, daemon=True).start()

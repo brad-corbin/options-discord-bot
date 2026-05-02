@@ -117,12 +117,14 @@ POSITION_PNL_HEADERS = [
     "Opened CT",                    # YYYY-MM-DD HH:MM CT
     "Ticker",
     "Campaign ID",                  # tracker's id; primary key for update-in-place
+    "Source Type",                  # v8.4: confirmed / review_only / companion_long
     "Structure",                    # long_call / long_put / bull_call_spread / etc.
     "Legs",                         # compact string: "+165C 250516 / -170C 250516"
     "Side",                         # bull / bear (direction)
     "Strike",                       # primary (first) leg strike
     "Entry Premium",                # entry_option_mark
     "Peak Premium",                 # peak_option_mark (live while active)
+    "Peak At CT",                   # v8.4: timestamp of peak_option_mark, YYYY-MM-DD HH:MM
     "Peak PnL% Lifetime",           # (peak - entry) / entry * 100
     "2:45 PnL%",                    # snapshot at 2:45 PM CT on expiry day (or last hold day)
     "Peak PnL% During Hold",        # peak PnL while user was actively holding
@@ -130,6 +132,7 @@ POSITION_PNL_HEADERS = [
     "Close Premium",                # exit_option_mark, blank while active
     "Current PnL%",                 # live if active, final if closed
     "Status",                       # open / closed
+    "Companion Of",                 # v8.4: campaign_id of paired record (e.g. spread that this companion long mirrors), blank otherwise
 ]
 
 
@@ -331,6 +334,55 @@ def _write_tab_headers(tab_name: str, headers: List[str], token: str) -> bool:
     except Exception as e:
         log.warning(f"dashboard: header write failed for '{tab_name}': {e}")
         return False
+
+
+# v8.4: track which tabs have had their header schema verified this process.
+# Once per process, on first tick after deploy, we read the live header row
+# and rewrite it if it doesn't match the in-code schema. This handles the
+# case where columns were added (e.g. Source Type, Peak At CT, Companion Of
+# on Position PnL) and the live tab was created with the old shape.
+_headers_verified_this_process: set = set()
+
+
+def _sync_headers_if_drifted(tab_name: str, headers: List[str], token: str) -> None:
+    """Read live header row; if it doesn't match in-code schema, rewrite it.
+
+    Idempotent and runs at most once per (tab, process). Safe — the data
+    area (A2+) is cleared and rewritten on every tick by the row-write
+    paths anyway, so a header-shape change just causes the next tick's
+    write to land in the correct columns. Logs at INFO when drift is
+    detected so deploys are auditable.
+    """
+    if tab_name in _headers_verified_this_process:
+        return
+    try:
+        rng = requests.utils.quote(f"{tab_name}!1:1", safe="!:")
+        resp = requests.get(
+            _sheets_url(f"/values/{rng}"),
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            log.debug(f"dashboard: header read for '{tab_name}' returned "
+                      f"{resp.status_code}; deferring sync")
+            return
+        live = (resp.json().get("values") or [[]])[0] if resp.json().get("values") else []
+        # Compare as lists. Trailing empty cells in the live row are noise.
+        live_trimmed = list(live)
+        while live_trimmed and not str(live_trimmed[-1]).strip():
+            live_trimmed.pop()
+        if live_trimmed == list(headers):
+            _headers_verified_this_process.add(tab_name)
+            return
+        log.info(
+            f"dashboard: header drift detected on '{tab_name}' — "
+            f"live={len(live_trimmed)} cols, expected={len(headers)} cols. "
+            f"Rewriting header row."
+        )
+        if _write_tab_headers(tab_name, headers, token):
+            _headers_verified_this_process.add(tab_name)
+    except Exception as e:
+        log.warning(f"dashboard: header sync failed for '{tab_name}': {e}")
 
 
 def _write_dashboard_values(rows: List[List[Any]], token: str) -> bool:
@@ -1188,6 +1240,12 @@ def _pnl_pct_lifetime(rec: Dict[str, Any]) -> Optional[float]:
         e = float(entry)
         p = float(peak)
         if e > 0:
+            pricing_mode = (rec.get("pricing_mode") or "").lower()
+            if pricing_mode == "credit_spread_debit_to_close":
+                # Credit-spread peak/close marks are debit-to-close. Lower is
+                # better, so use the credit convention when mfe_pct is missing
+                # on older records.
+                return (e - p) / e
             return (p - e) / e
     except (TypeError, ValueError):
         pass
@@ -1200,6 +1258,13 @@ def _pnl_pct_current(rec: Dict[str, Any]) -> Optional[float]:
     Returns None when the relevant mark is missing — a graded record without
     exit_option_mark, or an active record without last_option_mark, is a
     data-integrity case and shouldn't silently render as '-100%'.
+
+    v8.4 (Patch GBUG3): branch on pricing_mode for credit spreads. The old
+    formula (current - entry) / entry rendered every credit spread with
+    inverted sign — a bull_put_spread closing at $0.30 against a $0.75
+    credit would show '-60%' instead of '+60%'. Mirrors _pnl_pct_lifetime's
+    use of the credit-spread sign convention. Long options and debit
+    spreads are unchanged.
     """
     entry = rec.get("entry_option_mark")
     if rec.get("status") == "graded":
@@ -1212,6 +1277,10 @@ def _pnl_pct_current(rec: Dict[str, Any]) -> Optional[float]:
         e = float(entry)
         c = float(current)
         if e > 0:
+            pricing_mode = (rec.get("pricing_mode") or "").lower()
+            if pricing_mode == "credit_spread_debit_to_close":
+                # Credit: pnl = (credit_received - debit_to_close) / credit
+                return (e - c) / e
             return (c - e) / e
     except (TypeError, ValueError):
         pass
@@ -1387,7 +1456,10 @@ def _get_position_pnl_rollup_map(records: List[Dict[str, Any]]) -> Dict[str, Dic
 
 
 def _position_pnl_row(rec: Dict[str, Any]) -> List[Any]:
-    """One row of the Position PnL tab, matching POSITION_PNL_HEADERS order."""
+    """One row of the Position PnL tab, matching POSITION_PNL_HEADERS order.
+
+    v8.4: adds Source Type, Peak At CT, and Companion Of columns.
+    Width is now 19 (was 16). Caller must keep header row in sync."""
     from datetime import datetime as _dt
 
     cid = rec.get("campaign_id", "")
@@ -1395,6 +1467,17 @@ def _position_pnl_row(rec: Dict[str, Any]) -> List[Any]:
     structure = rec.get("structure", "")
     status_raw = rec.get("status", "")
     status = "closed" if status_raw == "graded" else "open"
+
+    # v8.4: Source Type derives from extra_metadata + source.
+    # Order of precedence: companion_long > review_only > confirmed.
+    extra = rec.get("extra") or {}
+    if extra.get("companion_of"):
+        source_type = "companion_long"
+    elif extra.get("review_only") and not extra.get("confirmed_entry"):
+        source_type = "review_only"
+    else:
+        source_type = "confirmed"
+    companion_of = str(extra.get("companion_of") or "")
 
     # Times in Central
     try:
@@ -1411,6 +1494,19 @@ def _position_pnl_row(rec: Dict[str, Any]) -> List[Any]:
                          .strftime("%Y-%m-%d %H:%M"))
         except Exception:
             closed_ct = ""
+
+    # v8.4: Peak At CT — when did peak_option_mark occur. Blank when peak_ts
+    # equals entry_ts (no favorable excursion observed yet).
+    peak_at_ct = ""
+    try:
+        peak_ts = float(rec.get("peak_ts") or 0)
+        entry_ts = float(rec.get("entry_ts") or 0)
+        if peak_ts > 0 and peak_ts != entry_ts:
+            peak_at_ct = (_dt.fromtimestamp(peak_ts,
+                                            tz=ZoneInfo("America/Chicago"))
+                          .strftime("%Y-%m-%d %H:%M"))
+    except Exception:
+        pass
 
     leg = _primary_leg(rec)
     side_raw = (rec.get("direction") or "").lower()
@@ -1437,12 +1533,14 @@ def _position_pnl_row(rec: Dict[str, Any]) -> List[Any]:
         opened_ct,
         ticker,
         cid,
+        source_type,
         structure,
         _format_legs_short(rec),
         side,
         strike_s,
         _fmt_num(entry_prem, 2),
         _fmt_num(peak_prem, 2),
+        peak_at_ct,
         _fmt_pct(pnl_lifetime),
         _fmt_pct(pnl_245),
         _fmt_pct(pnl_hold),
@@ -1450,6 +1548,7 @@ def _position_pnl_row(rec: Dict[str, Any]) -> List[Any]:
         _fmt_num(close_prem, 2) if close_prem is not None else "",
         _fmt_pct(pnl_current),
         status,
+        companion_of,
     ]
 
 
@@ -1677,6 +1776,13 @@ def _dashboard_tick() -> None:
                 f"dashboard: {TAB_POSITION_PNL} tab not ready — "
                 f"continuing without PnL tab; dashboard rollup columns will be blank"
             )
+
+        # v8.4: re-sync header rows once per process. Schema drifts (added
+        # columns) on existing tabs without this. Idempotent after first hit.
+        _sync_headers_if_drifted(TAB_DASHBOARD, DASHBOARD_HEADERS, token)
+        _sync_headers_if_drifted(TAB_SIGNAL_LOG, SIGNAL_LOG_HEADERS, token)
+        if pnl_tab_ready:
+            _sync_headers_if_drifted(TAB_POSITION_PNL, POSITION_PNL_HEADERS, token)
 
         tickers = []
         try:

@@ -26,6 +26,7 @@ import logging
 import time
 import json
 import threading
+import os
 from datetime import datetime, timezone, timedelta, date
 from typing import Dict, List, Optional, Callable
 
@@ -397,25 +398,37 @@ class ShadowFilterLogger:
             return "📊 Shadow Filter Report: No reconciled signals yet."
 
         lines = [
-            "📊 SHADOW FILTER MONTHLY REPORT",
+            "📊 SHADOW FILTER MONTHLY REPORT (DIAGNOSTIC)",
             "═" * 40,
+            "Source: Redis shadow_filter:log"
+            f" + Google Sheet tab {os.getenv('GOOGLE_SHEET_SHADOW_TAB', 'shadow_signals')}",
             "",
         ]
 
         total_blocked = sum(d["n"] for d in scorecard.values())
         total_saved = sum(d["n"] * d["saved_pct"] / 100 for d in scorecard.values())
+        if total_blocked >= 100:
+            confidence_label = "HIGH sample"
+        elif total_blocked >= 30:
+            confidence_label = "MEDIUM sample"
+        else:
+            confidence_label = "LOW sample — directional only"
 
-        lines.append(f"Total blocked signals: {total_blocked}")
+        lines.append(f"Total blocked signals: {total_blocked} ({confidence_label})")
         lines.append(f"Correctly blocked (losers): {total_saved:.0f} ({total_saved/total_blocked*100:.0f}%)")
+        lines.append("Note: this is filter research, not trade performance. Keep out of main channel.")
         lines.append("")
 
         for cat, data in sorted(scorecard.items(), key=lambda x: -x[1]["n"]):
             emoji = "✅" if data["saved_pct"] > 55 else "⚠️" if data["saved_pct"] > 45 else "🔴"
+            n = int(data.get("n", 0) or 0)
+            sample = "LOW" if n < 30 else "MED" if n < 100 else "HIGH"
+            explanation = "removed/not active ticker/watchlist/regime block" if cat == "ticker_removed" else cat.replace("_", " ")
             lines.append(
-                f"{emoji} {cat}: {data['n']} signals | "
+                f"{emoji} {cat}: {n} signals ({sample}) | "
                 f"Shadow WR: {data['wr_5d']:.0f}% | "
                 f"EV: {data['ev_5d']:+.2f}% | "
-                f"Saved: {data['saved_pct']:.0f}%"
+                f"Saved: {data['saved_pct']:.0f}% | {explanation}"
             )
 
         alerts = self.check_alert_thresholds()

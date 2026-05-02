@@ -27,13 +27,27 @@ def _load_live_scorer() -> ModuleType:
     if not live_path.exists():
         raise ImportError(f"Live conviction_scorer.py not found at {live_path}")
     if live_path.resolve() == Path(__file__).resolve():
-        raise ImportError("backtest conviction_scorer shim resolved to itself; check BOT_REPO_PATH")
+        raise ImportError("backtest conviction scorer shim resolved to itself; check BOT_REPO_PATH")
 
     spec = importlib.util.spec_from_file_location("_live_conviction_scorer", str(live_path))
     if spec is None or spec.loader is None:
         raise ImportError(f"Unable to load live conviction scorer from {live_path}")
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    # v8.4 audit fix: register the loaded module in sys.modules BEFORE calling
+    # spec.loader.exec_module(...). Under Python 3.13, @dataclass introspection
+    # resolves forward references by looking up the owning module in sys.modules;
+    # if the module isn't registered yet, dataclass init can fail with a
+    # NameError. Pattern documented at:
+    #   https://docs.python.org/3/library/importlib.html#importing-a-source-file-directly
+    import sys
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        # If exec fails, don't leave a half-initialized module sitting in
+        # sys.modules — that would mask the real error on the next import.
+        sys.modules.pop(spec.name, None)
+        raise
     return module
 
 

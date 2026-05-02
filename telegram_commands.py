@@ -908,13 +908,13 @@ def handle_command(
             from app import _rec_tracker
             from recommendation_tracker import generate_daily_report, reply_long
             if _rec_tracker is None:
-                reply("⚠️ Recommendation tracker not initialized.")
+                reply("⚠️ Bot idea tracker not initialized.")
                 return
             date_arg = args[0] if args else None
             report = generate_daily_report(_rec_tracker, date_str=date_arg)
             reply_long(reply, report)
         except Exception as e:
-            reply(f"⚠️ Recommendation results error: {e}")
+            reply(f"⚠️ Bot idea tracking report error: {e}")
         return
 
     if cmd in ("/recweek", "/recweek@omegabot", "/recmonth", "/recmonth@omegabot"):
@@ -922,12 +922,12 @@ def handle_command(
             from app import _rec_tracker
             from recommendation_tracker import generate_weekly_summary, reply_long
             if _rec_tracker is None:
-                reply("⚠️ Recommendation tracker not initialized.")
+                reply("⚠️ Bot idea tracker not initialized.")
                 return
             days = 7 if "week" in cmd else 30
             reply_long(reply, generate_weekly_summary(_rec_tracker, days=days))
         except Exception as e:
-            reply(f"⚠️ Recommendation summary error: {e}")
+            reply(f"⚠️ Bot idea tracking summary error: {e}")
         return
 
     if cmd in ("/recopen", "/recopen@omegabot"):
@@ -935,11 +935,11 @@ def handle_command(
             from app import _rec_tracker
             from recommendation_tracker import generate_open_positions_report, reply_long
             if _rec_tracker is None:
-                reply("⚠️ Recommendation tracker not initialized.")
+                reply("⚠️ Bot idea tracker not initialized.")
                 return
             reply_long(reply, generate_open_positions_report(_rec_tracker))
         except Exception as e:
-            reply(f"⚠️ Open recommendation report error: {e}")
+            reply(f"⚠️ Open bot idea report error: {e}")
         return
 
     if cmd in ("/shadowedge", "/shadowedge@omegabot"):
@@ -951,7 +951,7 @@ def handle_command(
                 reply_long,
             )
             if _rec_tracker is None:
-                reply("⚠️ Recommendation tracker not initialized.")
+                reply("⚠️ Bot idea tracker not initialized.")
                 return
             lookback = int(args[0]) if args else 30
             analysis = analyze_shadow_edge_from_campaigns(
