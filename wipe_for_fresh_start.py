@@ -58,6 +58,12 @@ CSV_FILES = [
 
 # Sheets — tab names to clear (rows 2+, leave header alone).
 # Verified against actual sheet 2026-05-02 — all 3 + 12 tabs.
+# position_tracking_active is included defensively: it's defined in
+# position_monitor.py SHEET_TABS but has never actually been written to
+# (trade dict gating in app.py:8579 has been rejecting all attempts).
+# When it eventually auto-creates on a successful write, the next wipe
+# will catch it. If the tab still doesn't exist at wipe time, the API
+# returns 400 and the script logs+continues — no harm done.
 DASHBOARD_3000_TABS = ["Dashboard", "Signal Log", "Position PnL"]
 OMEGA_3000_TABS = [
     "conviction_plays",
@@ -72,6 +78,7 @@ OMEGA_3000_TABS = [
     "position_tracking_income",
     "position_tracking_conviction",
     "position_tracking_shadow",
+    "position_tracking_active",  # defensive — see comment above
 ]
 
 
