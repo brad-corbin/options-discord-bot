@@ -2,6 +2,233 @@
 # GitHub Desktop workflow test - 2026-04-23
 # NOTE: Educational/demo code. Not financial advice. Use at your own risk.
 #
+# v8.4 Phase 2.5c HOTFIX (true vehicle-aware gate):
+#   The 2.5b comments said the gate was vehicle-aware, but _process_job still
+#   checked suppression before the post path knew the current vehicle. This
+#   hotfix removes pre-vehicle suppression and runs the gate only at actual
+#   post sites after a stable vehicle_id exists: burst, credit, or signal_only.
+#   That protects MSFT-style no_vehicle → valid_vehicle upgrades while still
+#   suppressing identical repeated SOXX/XLF/MSFT posts.
+#
+#   Patch S (signal-only suppression when real vehicle posted):
+#     The 2.5c base let the signal-only block run AFTER the credit/burst
+#     post path. If both fired, the user got contradictory cards (credit +
+#     "NO STANDARD SPREAD") and the signal-only mark overwrote the credit
+#     snapshot, so the next identical credit fire saw vehicle_changed and
+#     was allowed (defeating spam suppression).
+#     Fix: at top of the signal-only block, if _vehicle_kind in
+#     ("credit", "burst") for THIS event, skip both the post AND the
+#     mark — credit/burst snapshot is the source of truth and must not
+#     be clobbered. Initialize _vehicle_kind/_vehicle_id at job-level
+#     scope so the signal-only block can read it whether or not the
+#     scorer block ran.
+#
+# v8.4 Phase 2.5b (Reviewer-fix bundle — Patches N, O, P, Q):
+#   Three real concerns surfaced after Phase 2.5/2.6/2.7 were drafted:
+#
+#   (1) The cooldown gate was state-aware (score + wave_label) but not
+#       vehicle-aware. MSFT 5/01: V2 said burst=YES at 10:38 but
+#       vehicle was REJECTED so no card posted; the prior version still
+#       called _mark_scorer_posted before the post path ran, so the
+#       legitimate retry at 13:19 (when a different vehicle might be
+#       valid) would be suppressed by the gate. The user got nothing
+#       from the first fire AND would get nothing from the retry.
+#
+#   (2) _mark_scorer_posted was called BEFORE the credit/burst card
+#       posted, so any internal failure in the post path (Telegram down,
+#       chain fetch failed, builder rejected) left the bot believing
+#       it had posted when no card hit Telegram. Same suppression
+#       problem as (1) from a different angle.
+#
+#   (3) Long Call Burst card posted to Telegram but never wrote to the
+#       recommendation tracker, so per-burst performance was unknowable.
+#       "Are these burst cards working?" was unanswerable.
+#
+#   Fix:
+#     - Patch N (app.py): _post_v84_credit_card and _try_post_long_call_burst
+#       now return (vehicle_kind, vehicle_id) and (posted_bool, vehicle_id)
+#       respectively, propagated up through _post_v84_credit_from_scorer
+#       which returns (vehicle_kind, vehicle_id). _process_job calls the
+#       post path FIRST and only then calls _mark_scorer_posted, with the
+#       vehicle info captured from the post-path return. If nothing posted,
+#       no mark happens — next fire is unblocked.
+#     - Patch O (app.py): _mark_scorer_posted snapshot now includes
+#       vehicle_kind and vehicle_id. _should_suppress_scorer_repost now
+#       has two new allow paths: "no_prior_vehicle" (prior fire posted
+#       no card → user saw nothing → not a duplicate) and
+#       "vehicle_changed" (prior posted credit on different strikes/expiry,
+#       or burst when current is credit → different trade idea, allow).
+#     - Patch P (app.py): on burst card post success, write a record to
+#       the recommendation tracker via _record_recommendation_campaign
+#       with source="v84_long_call_burst" and extra_metadata that includes
+#       review_only=True (matches Phase 2.7 treatment), momentum_burst=True,
+#       v2_model=True, burst_score, burst_reasons, trading_dte, wave_label,
+#       cb_side. Tracker write failures are soft — the post already shipped.
+#     - Patch Q (recommendation_tracker.py): default
+#       RECTRACKER_REVIEW_ONLY_SOURCES is now
+#       "v84_credit_dual_post,v84_long_call_burst" so the Phase 2.7
+#       filter hides both bot sources by default when enabled.
+#
+#   Behavior with all 2.5/2.5b/2.6/2.7 envs OFF: clean deploy is no-op.
+#   Behavior with SCORER_REPOST_GATE_ENABLED=1 only: gate uses the
+#     vehicle-aware logic; "no_prior_vehicle" allow path catches the
+#     MSFT-style sequence; non-posted attempts no longer poison the
+#     snapshot.
+#   Behavior with BURST_FIRST_ROUTING_ENABLED=1: burst cards now record
+#     to the recommendation tracker so per-burst performance is auditable
+#     once /confirm-style entry tracking lands.
+#   Behavior with RECTRACKER_FILTER_REVIEW_ONLY_FROM_REPORTS=1: the
+#     filter additionally hides v84_long_call_burst records (along with
+#     v84_credit_dual_post) from win-rate / open-positions reports.
+#
+#   Rollback: same as 2.5/2.6/2.7 — unset the relevant env var. The new
+#   tuple returns are signature-additive; older callers were updated
+#   in this same patch (only one other call site exists).
+#
+# v8.4 Phase 2.7 (Review-only filter for legacy positions + grading):
+#   Problem: morning briefing showed v8.4 CREDIT dual-post cards under
+#   "Currently Open" with $0.00 movement, and the daily grading report
+#   counted them as wins/losses in the win-rate stat. 5/01 example:
+#   "✅ MSFT BULL PUT SPREAD 405.0/400.0 (income) (×3 fires) → +100.0%
+#   target_hit" — the bot graded its own posted card three times, none
+#   of which was Brad's actual entry (different expiry, different credit).
+#   Currently Open also showed XLV/UNH/NFLX entries from prior days that
+#   were review-only never-entered cards.
+#
+#   Fix: env-gated review-only filter in recommendation_tracker.py.
+#     - recommendation_tracker.py Patch I: NEW _is_review_only_record(),
+#       _filter_review_only_enabled(), _filter_records_for_display()
+#       helpers. Two trigger conditions: explicit
+#       extra_metadata.review_only=True flag (forward-compatible), OR
+#       first_source matches RECTRACKER_REVIEW_ONLY_SOURCES env list
+#       (default "v84_credit_dual_post" — handles legacy records that
+#       pre-date the explicit flag). extra_metadata.confirmed_entry=True
+#       overrides the filter (reserved for a future /confirm command).
+#     - recommendation_tracker.py Patches J, K, L: filter applied in
+#       generate_open_positions_report (morning briefing), generate_daily_report
+#       (graded list AND win-rate math AND posted_today/all_active sections),
+#       generate_weekly_summary (graded list).
+#     - app.py Patch M: extend _record_income_opportunity to accept and
+#       merge caller-supplied extra_metadata. At the v8.4 credit dual-post
+#       call site, pass extra_metadata={"review_only": True} so all NEW
+#       v8.4 credit records are flagged at write time.
+#
+#   Master switch: RECTRACKER_FILTER_REVIEW_ONLY_FROM_REPORTS (DEFAULT OFF).
+#   Tunable: RECTRACKER_REVIEW_ONLY_SOURCES (CSV, default "v84_credit_dual_post").
+#
+#   Records are NOT deleted by the filter — campaigns continue tracking,
+#   grading, and polling so the data is preserved for backtest and audit.
+#   The filter only changes which records are SHOWN in the three display
+#   reports and which records contribute to the win-rate computation.
+#
+#   Rollback: unset RECTRACKER_FILTER_REVIEW_ONLY_FROM_REPORTS. Default
+#   off means a clean deploy without env changes is a no-op. The
+#   review_only flag added to new v84 records is harmless metadata
+#   when the filter is off.
+#
+# v8.4 Phase 2.6 (Long Call Burst routing + trading-day DTE picker):
+#   Problem: when V2 5D edge model says momentum_burst_label="YES",
+#   the bot was still posting a v8.4 BULL PUT credit spread as the
+#   headline. Burst regimes are intraday-to-1D directional moves; a
+#   slow theta-decay credit spread is the wrong vehicle. MSFT 5/01:
+#   V2 said burst=YES from 10:38 onward; bot posted BULL PUT 405/400
+#   on 5/04 expiry @ $0.32 credit / 7% RoC. The actual Long Call
+#   ATM-ish 1-DTE captured the move; user manually entered a 5/08
+#   credit spread (different expiry) at $1.05 credit / 26.6% RoC at
+#   12:08 PM after the chart confirmed the level. The bot's BULL PUT
+#   on 5/04 was wrong vehicle (slow) AND wrong DTE (1 trading day vs
+#   5 trading days for 5/08).
+#
+#   Fix (3 patches in app.py + 1 new module + 1 helper in market_clock):
+#     - long_call_burst_builder.py NEW: parallel to credit_card_builder.
+#       Picks ATM-to-2.5%-OTM call strike with liquid bid/ask spread,
+#       computes debit, breakeven, and renders 🚀 LONG CALL BURST card
+#       with target/stop/time-stop guidance. Bull-only (V2 design).
+#       Tunable env: BURST_OTM_BAND_LOW (-0.005), BURST_OTM_BAND_HIGH
+#       (0.025), BURST_MAX_BID_ASK_SPREAD_FRAC (0.25).
+#     - market_clock.count_trading_days_between(start, end) NEW: counts
+#       weekdays between two dates. Does not honor market holidays
+#       (acceptable for 0-7 DTE windows). Replaces calendar-day arithmetic
+#       in the credit DTE picker.
+#     - Patch F: 2 new env vars adjacent to Phase 2.5 vars. Both DEFAULT OFF.
+#         BURST_FIRST_ROUTING_ENABLED       (master switch, burst routing)
+#         USE_TRADING_DAYS_FOR_CREDIT_DTE   (independent DTE-counting fix)
+#     - Patch G: _post_v84_credit_from_scorer DTE picker now optionally
+#       uses count_trading_days_between() instead of calendar-day delta.
+#       Independent of burst routing — fixes the credit-card DTE selection
+#       regardless of whether burst is enabled.
+#     - Patch H: NEW _try_post_long_call_burst helper. Called from the top
+#       of _post_v84_credit_from_scorer AFTER spot fetch, BEFORE expiry
+#       ranking. If V2 says momentum_burst=YES AND a Long Call Burst card
+#       builds and posts → return True; outer function returns early
+#       (credit card suppressed). Otherwise → return False; existing
+#       credit flow runs unchanged.
+#       Burst expiry preference: 1 trading-DTE > 0DTE > 2 trading-DTE.
+#
+#   Fail-open everywhere: env disabled, V2 import failure, V2 classify
+#   error, market_clock unavailable, chain fetch failure, builder error,
+#   format error, Telegram error — every path falls through to the
+#   existing credit card flow. The burst path must NEVER block credit.
+#
+#   Replay against 5/01 MSFT signal trail (in v8.4_phase_2_6/replay_2_6.py):
+#     With BURST_FIRST_ROUTING_ENABLED=1, the 10:37 / 12:42 / 12:45 BULL
+#     PUT cards collapse to ONE Long Call Burst card (Phase 2.5 dedup
+#     handles the repeats; Phase 2.6 changes vehicle on the first fire).
+#     With USE_TRADING_DAYS_FOR_CREDIT_DTE=1, the bot picks 5/08 (5
+#     trading-DTE) over 5/04 (1 trading-DTE) for credit-spread expiries.
+#
+#   Rollback: unset BURST_FIRST_ROUTING_ENABLED and
+#   USE_TRADING_DAYS_FOR_CREDIT_DTE. Both default off, so a clean deploy
+#   without env changes is a no-op. The new module long_call_burst_builder.py
+#   simply exists on disk unused.
+#
+# v8.4 Phase 2.5 (Scorer Repost Gate + Single-Item Digest Cleanup):
+#   Problem: same scorer signal (e.g. SOXX BULL conv-72) was posting full
+#   cards every ~5 minutes on each new webhook fire, plus a redundant
+#   "📊 SIGNAL DIGEST (1 reviews, 0 stalk)" right before the full card.
+#   Production export 4/30–5/1: SOXX BULL fired 10x, XLF 5x, IWM 4x,
+#   MSFT 405/400 v8.4 credit 3x within 2 hours — same conv, same wave,
+#   no state change. v8.4 credit hook inherits the duplicates because it
+#   fires from the same scorer-POST branch.
+#
+#   Fix (5 patches in app.py):
+#     - Patch A: 4 new env vars adjacent to V84_CREDIT_*. All DEFAULT OFF.
+#         SCORER_REPOST_GATE_ENABLED              (master switch)
+#         SCORER_REPOST_COOLDOWN_MIN              (default 60)
+#         SCORER_REPOST_MIN_SCORE_DELTA           (default 5)
+#         SUPPRESS_SINGLE_ITEM_DIGEST_BEFORE_FULL_CARD (digest collapse)
+#     - Patch B: _mark_scorer_posted now snapshots wave_label too. New
+#       helper _get_last_scorer_post_snapshot reads it back.
+#     - Patch C: _wave_label_is_upgrade + _should_suppress_scorer_repost
+#       + _log_scorer_repost_suppressed (CSV: scorer_suppressed_reposts.csv).
+#       Wave-label upgrade detection: any prior→current transition where
+#       current contains 'confirm' or 'burst' tokens that prior did not.
+#       Catches breakout_probable→breakout_confirmed and *→momentum_burst
+#       so legitimate state changes are NOT suppressed.
+#     - Patch D: gate wired into _process_job POST branch BEFORE
+#       _mark_scorer_posted, _post_v84_credit_from_scorer, and check_ticker.
+#       When suppress=True: log to CSV, _record_wave_result with outcome
+#       "scorer_suppressed_repost", return. v8.4 credit hook never fires
+#       on suppressed repeats (single bail covers both surfaces).
+#     - Patch E: in _flush_wave_digest, suppress the entire digest message
+#       when len(digest_lines)==1 AND len(pending_lines)==0 AND
+#       len(immediate_cards)>=1 — the digest would only restate the full
+#       card we're about to post in the same flush.
+#
+#   Fail-open everywhere: persistent_state outage, helper exception, or
+#   parse failure all fall through to "do not suppress". Gate must never
+#   silently drop a signal due to internal error.
+#
+#   Production replay (messages.html, 26 scorer cards 4/30–5/1):
+#     With gate enabled → 8 cards posted, 18 suppressed (69% reduction).
+#     All 18 suppressed are confirmed duplicates (same ticker/bias/score/wave).
+#     Zero false suppressions in the export.
+#
+#   Rollback: unset SCORER_REPOST_GATE_ENABLED (or set to 0) and
+#   SUPPRESS_SINGLE_ITEM_DIGEST_BEFORE_FULL_CARD. Both default off, so
+#   "do nothing on deploy" preserves pre-2.5 behavior — the patches are
+#   no-ops until the env vars are flipped on.
+#
 # v8.5 Phase 3.6 (Scorer is authoritative + signal-only cards):
 #   Problem solved: scorer=post signals were silently dying in three places:
 #     (1) _um_apply_effective_regime_gate_to_rec with requires_trigger=True
@@ -467,6 +694,36 @@ V84_CREDIT_SUPPRESS_BAD_VEHICLES = os.getenv("V84_CREDIT_SUPPRESS_BAD_VEHICLES",
 V84_CREDIT_MIN_CREDIT = float(os.getenv("V84_CREDIT_MIN_CREDIT", "0.10") or 0.10)
 V84_CREDIT_MIN_ROC = float(os.getenv("V84_CREDIT_MIN_ROC", "0.06") or 0.06)
 V84_CREDIT_POST_V2_WHEN_SUPPRESSED = os.getenv("V84_CREDIT_POST_V2_WHEN_SUPPRESSED", "1").strip().lower() not in ("0", "false", "no", "off")
+
+# v8.4 (Phase 2.5): Scorer Repost Gate.
+# Stops the same scorer signal (ticker+bias) from posting full cards every few
+# minutes. Allows a repost only when (a) cooldown elapsed AND score jumped
+# materially, or (b) wave label upgraded into a 'confirm'/'burst' state.
+# v8.4 credit hook inherits this gate (suppressed scorer => no credit card).
+# Ships DEFAULT OFF — flip SCORER_REPOST_GATE_ENABLED=1 to enable.
+SCORER_REPOST_GATE_ENABLED = os.getenv("SCORER_REPOST_GATE_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+SCORER_REPOST_COOLDOWN_MIN = int(os.getenv("SCORER_REPOST_COOLDOWN_MIN", "60") or 60)
+SCORER_REPOST_MIN_SCORE_DELTA = int(os.getenv("SCORER_REPOST_MIN_SCORE_DELTA", "5") or 5)
+# Phase 2.5: suppress the one-line SIGNAL DIGEST when a full card is posting
+# in the same wave flush (avoids the "📊 SIGNAL DIGEST (1 reviews, 0 stalk) +
+# full SCORER SIGNAL card" double-post pattern). DEFAULT OFF.
+SUPPRESS_SINGLE_ITEM_DIGEST_BEFORE_FULL_CARD = os.getenv("SUPPRESS_SINGLE_ITEM_DIGEST_BEFORE_FULL_CARD", "0").strip().lower() in ("1", "true", "yes", "on")
+
+# v8.4 (Phase 2.6): Burst-First Routing.
+# When V2 5D edge model returns momentum_burst_label="YES", post a Long
+# Call Burst card as the headline INSTEAD of a v8.4 credit spread card.
+# Burst signals are intraday-to-1D directional vehicles; a 3-DTE bull put
+# spread has 5-7% RoC and negative EV in those regimes (see MSFT 5/01:
+# bot saw $0.32 credit / 7% RoC, the actual long call captured the move).
+# Strike picker logic lives in long_call_burst_builder.py.
+# DEFAULT OFF — flip BURST_FIRST_ROUTING_ENABLED=1 to enable.
+BURST_FIRST_ROUTING_ENABLED = os.getenv("BURST_FIRST_ROUTING_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+# Trading-day-aware DTE picker for v8.4 credit. Replaces calendar-day 3-7
+# DTE sweet spot. Friday-with-weekend-attached used to pull a 1-trading-DTE
+# candidate (e.g. 5/01 → 5/04) when 5/08 was the better income window.
+# Independent of BURST_FIRST_ROUTING — fixes credit-card DTE selection
+# regardless of whether burst routing is enabled. DEFAULT OFF.
+USE_TRADING_DAYS_FOR_CREDIT_DTE = os.getenv("USE_TRADING_DAYS_FOR_CREDIT_DTE", "0").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _should_auto_register_recommendation(trade_type: str) -> bool:
@@ -2903,7 +3160,8 @@ def _record_swing_recommendation(ticker: str, rec: dict, spot: float, chains=Non
     )
 
 
-def _record_income_opportunity(opp: dict, source: str = "income_scanner"):
+def _record_income_opportunity(opp: dict, source: str = "income_scanner",
+                                 extra_metadata: dict = None):
     ticker = (opp or {}).get("ticker")
     trade_type = (opp or {}).get("trade_type")
     if not ticker or trade_type not in ("bull_put", "bear_call"):
@@ -2926,12 +3184,19 @@ def _record_income_opportunity(opp: dict, source: str = "income_scanner"):
         chain_rows = _chain_rows_from_response(_cached_md.get_chain(ticker, exp, side=right)) if _cached_md else []
     except Exception:
         chain_rows = []
+    # v8.4 (Phase 2.7): merge caller-supplied metadata (e.g. review_only=True
+    # from the v8.4 credit dual-post path) on top of the existing grade field.
+    # Caller-supplied keys win over the hardcoded ones — but in practice the
+    # only overlap would be "grade" which the caller is unlikely to override.
+    _meta = {"grade": (opp.get("itqs") or {}).get("grade")}
+    if isinstance(extra_metadata, dict):
+        _meta.update(extra_metadata)
     return _record_recommendation_campaign(
         source=source, ticker=ticker, direction=("bull" if trade_type == "bull_put" else "bear"),
         trade_type="income", structure=structure, legs=legs,
         entry_option_mark=opp.get("credit") or 0, entry_underlying=opp.get("spot") or 0,
         confidence=((opp.get("itqs") or {}).get("score")), regime=None,
-        extra_metadata={"grade": (opp.get("itqs") or {}).get("grade")},
+        extra_metadata=_meta,
         pricing_mode="credit_spread_debit_to_close", chain_rows=chain_rows, intraday_rows=intraday_rows, prior_day_ctx=prior_ctx,
     )
 
@@ -3526,18 +3791,35 @@ def _flush_wave_digest():
     # below for audit but no longer posted to Telegram. Header count also
     # no longer shows "skipped" since it would mislead (count still runs,
     # just not shown). digest_lines and pending_lines are preserved intact.
+    #
+    # v8.4 (Phase 2.5): suppress the digest entirely when it would only
+    # restate ONE full card we are about to post in this same flush. The
+    # double-post pattern ("📊 SIGNAL DIGEST (1 reviews, 0 stalk) / 🔍 SOXX
+    # T2 🐂 72/100 — STALK ⬆️" immediately followed by the full SCORER
+    # SIGNAL card) adds a redundant Telegram message every wave. Env-gated
+    # by SUPPRESS_SINGLE_ITEM_DIGEST_BEFORE_FULL_CARD (default off).
+    _digest_suppressed_p25 = (
+        SUPPRESS_SINGLE_ITEM_DIGEST_BEFORE_FULL_CARD
+        and len(digest_lines) == 1
+        and len(pending_lines) == 0
+        and len(immediate_cards) >= 1
+    )
     if digest_lines or pending_lines:
-        lines.append(f"📊 SIGNAL DIGEST ({len(digest_lines)} reviews, {len(pending_lines)} stalk)")
-        lines.append("")
-        if digest_lines:
-            lines.append("── Trades ──")
-            lines.extend(digest_lines)
-        if pending_lines:
+        if _digest_suppressed_p25:
+            log.info(f"Phase 2.5: single-item digest suppressed "
+                     f"({len(immediate_cards)} immediate cards posting)")
+        else:
+            lines.append(f"📊 SIGNAL DIGEST ({len(digest_lines)} reviews, {len(pending_lines)} stalk)")
             lines.append("")
-            lines.append("── Pending / Recheck ──")
-            lines.extend(pending_lines)
-        lines.append("")
-        lines.append("💡 Use /tradecard TICKER for full card")
+            if digest_lines:
+                lines.append("── Trades ──")
+                lines.extend(digest_lines)
+            if pending_lines:
+                lines.append("")
+                lines.append("── Pending / Recheck ──")
+                lines.extend(pending_lines)
+            lines.append("")
+            lines.append("💡 Use /tradecard TICKER for full card")
 
     if not lines and not immediate_cards:
         return
@@ -3695,14 +3977,38 @@ def _flow_key(ticker: str, direction: str, kind: str) -> str:
     return f"{kind}:{t}:{d}:{_flow_date_str()}"
 
 
-def _mark_scorer_posted(ticker: str, direction: str, score: int = 0) -> None:
-    """Called by _process_job after scorer decision == 'post' and card posted."""
+def _mark_scorer_posted(ticker: str, direction: str, score: int = 0,
+                        wave_label: str = "",
+                        vehicle_kind: str = "",
+                        vehicle_id: str = "") -> None:
+    """Called by _process_job after scorer decision == 'post' and card posted.
+
+    v8.4 (Phase 2.5): wave_label is now part of the snapshot so the repost
+    gate can detect a meaningful state change (e.g. breakout_probable →
+    breakout_confirmed) and allow a re-alert even within cooldown.
+
+    v8.4 (Phase 2.5b — Patch N+O): vehicle_kind/vehicle_id are also stored
+    so the gate can suppress only true duplicate-vehicle reposts. A signal
+    that fires twice with no card in between (no_vehicle → valid_credit, or
+    valid_credit → valid_burst, or new strikes/expiry) is now ALLOWED.
+
+      vehicle_kind: "" | "credit" | "burst" | "none"
+      vehicle_id:   stable string per vehicle (e.g. "MSFT_405.0_400.0_2026-05-04"
+                    for credit, "MSFT_415.0C_2026-05-02" for burst, "" for none)
+
+    The mark is called only after at least one card has actually posted to
+    Telegram (Patch N), so an internal failure that posts nothing leaves the
+    snapshot untouched and the next fire gets a fresh shot at the gate.
+    """
     if not _persistent_state:
         return
     try:
         _persistent_state._json_set(
             _flow_key(ticker, direction, "scorer_posted"),
             {"ticker": ticker, "direction": direction, "score": int(score),
+             "wave_label": str(wave_label or ""),
+             "vehicle_kind": str(vehicle_kind or ""),
+             "vehicle_id":   str(vehicle_id   or ""),
              "posted_at": datetime.utcnow().isoformat() + "Z"},
             ttl=86400,
         )
@@ -3719,6 +4025,19 @@ def _check_scorer_posted(ticker: str, direction: str) -> bool:
         return data is not None
     except Exception:
         return False
+
+
+def _get_last_scorer_post_snapshot(ticker: str, direction: str) -> dict | None:
+    """v8.4 (Phase 2.5): return the last scorer-post snapshot for this
+    ticker/direction or None if no prior post today (or persistent_state is
+    unavailable). Used by the repost gate to compare current vs prior state."""
+    if not _persistent_state:
+        return None
+    try:
+        data = _persistent_state._json_get(_flow_key(ticker, direction, "scorer_posted"))
+        return data if isinstance(data, dict) and data else None
+    except Exception:
+        return None
 
 
 def _stash_pending_flow(ticker: str, direction: str, cp: dict) -> None:
@@ -3813,6 +4132,165 @@ def _should_suppress_flow_post(ticker: str, direction: str) -> tuple[bool, str]:
         return (False, "standalone_confirm")
     # Scorer hasn't posted yet. Stash and go silent.
     return (True, "stash_pending")
+
+
+# v8.4 (Phase 2.5): Scorer Repost Gate helpers ────────────────────────
+def _wave_label_is_upgrade(prior: str, current: str) -> bool:
+    """Return True if `current` is a meaningful state-upgrade vs `prior`.
+
+    Conservative: only allow repost when the new label crosses into a
+    'confirm' or 'burst' state that the prior didn't already have. This
+    catches the canonical case the gate must NOT swallow:
+      breakout_probable → breakout_confirmed
+      breakout_probable → momentum_burst
+    Anything fuzzier (no_box → ranging, breakout_imminent → breakout_probable)
+    falls into the cooldown+score-delta path instead.
+    """
+    p = (prior or "").strip().lower()
+    c = (current or "").strip().lower()
+    if not c or c == p:
+        return False
+    upgrade_tokens = ("confirm", "burst")
+    prior_has = any(tok in p for tok in upgrade_tokens)
+    curr_has  = any(tok in c for tok in upgrade_tokens)
+    return curr_has and not prior_has
+
+
+def _should_suppress_scorer_repost(ticker: str, direction: str,
+                                    current_score: int,
+                                    current_wave_label: str,
+                                    current_vehicle_kind: str = "",
+                                    current_vehicle_id: str = ""
+                                    ) -> tuple[bool, str, dict]:
+    """Phase 2.5: decide whether a scorer POST should be suppressed because
+    we already posted essentially the same signal recently.
+
+    Returns (suppress, reason, debug_dict):
+      (False, "gate_disabled", {})          → env-var off, do nothing
+      (False, "no_state", {})               → persistent_state unavailable, fail-open
+      (False, "first_post", {})             → no prior post today, allow
+      (False, "vehicle_changed", debug)     → Patch O: prior vehicle_id differs
+                                              from current — different strikes,
+                                              different expiry, or burst↔credit
+                                              transition; always allow.
+      (False, "no_prior_vehicle", debug)    → Patch O: prior fire posted no
+                                              card (kind="none"); current fire
+                                              has a real vehicle to try; allow.
+      (False, "cooldown_elapsed_score_jump", debug)
+                                            → cooldown elapsed AND score jumped ≥ delta
+      (False, "wave_label_upgrade", debug)  → wave changed to confirm/burst, allow
+      (True,  "duplicate_within_cooldown", debug)
+                                            → suppress; caller logs to CSV
+
+    Fail-open everywhere: any exception or unknown state means we DO NOT
+    suppress (preserving pre-2.5 behavior). The gate must never silently
+    drop a signal because of an internal error.
+
+    v8.4 (Phase 2.5b — Patch O): the gate now considers the vehicle the
+    current fire is going to attempt. If the prior fire had no vehicle (the
+    credit was rejected and burst didn't qualify), the current fire is
+    allowed regardless of cooldown — the user got nothing from the prior
+    fire so this isn't a duplicate. If the prior fire posted a credit
+    spread on different strikes/expiry, the current fire is allowed even
+    for the same wave_label/score. Same vehicle_id within cooldown is the
+    only suppression case now.
+    """
+    if not SCORER_REPOST_GATE_ENABLED:
+        return (False, "gate_disabled", {})
+    # Fail-open if persistent_state is unavailable. Without distinguishing
+    # this from "first post" the audit CSV would count Redis outages as
+    # legitimate first-fires and obscure real recurrence.
+    if not _persistent_state:
+        return (False, "no_state", {})
+    try:
+        snap = _get_last_scorer_post_snapshot(ticker, direction)
+    except Exception as _e:
+        log.debug(f"scorer-repost-gate: snapshot read failed for {ticker} {direction}: {_e}")
+        return (False, "no_state", {})
+    if not snap:
+        return (False, "first_post", {})
+
+    prior_score = int(snap.get("score") or 0)
+    prior_wave  = str(snap.get("wave_label") or "")
+    prior_vehicle_kind = str(snap.get("vehicle_kind") or "")
+    prior_vehicle_id   = str(snap.get("vehicle_id")   or "")
+    posted_at   = str(snap.get("posted_at") or "")
+
+    # Compute minutes since last post; on parse failure, fail-open (allow).
+    minutes_since = None
+    try:
+        from datetime import datetime as _dt
+        # posted_at is ISO with trailing Z
+        _ts = _dt.strptime(posted_at.rstrip("Z"), "%Y-%m-%dT%H:%M:%S.%f") \
+              if "." in posted_at else _dt.strptime(posted_at.rstrip("Z"), "%Y-%m-%dT%H:%M:%S")
+        minutes_since = max(0.0, (_dt.utcnow() - _ts).total_seconds() / 60.0)
+    except Exception as _e:
+        log.debug(f"scorer-repost-gate: posted_at parse failed ({posted_at!r}): {_e}")
+        return (False, "no_state", {})
+
+    score_delta = int(current_score or 0) - prior_score
+    debug = {
+        "prior_score": prior_score,
+        "score": int(current_score or 0),
+        "score_delta": score_delta,
+        "prior_wave_label": prior_wave,
+        "wave_label": current_wave_label or "",
+        "prior_vehicle_kind": prior_vehicle_kind,
+        "prior_vehicle_id":   prior_vehicle_id,
+        "vehicle_kind":       str(current_vehicle_kind or ""),
+        "vehicle_id":         str(current_vehicle_id   or ""),
+        "minutes_since_last": round(minutes_since, 1),
+    }
+
+    # Patch O: prior fire posted nothing (kind="none" or empty) → always allow.
+    # The user did not see a card from the prior fire, so this is not a
+    # duplicate-from-the-user's-perspective and must not be suppressed.
+    if prior_vehicle_kind in ("", "none"):
+        return (False, "no_prior_vehicle", debug)
+
+    # Patch O: vehicle changed (strikes, expiry, or burst↔credit) → allow.
+    # vehicle_id is constructed deterministically per vehicle, so equal IDs
+    # mean the literal same trade idea. Different IDs mean a new trade.
+    cur_id = str(current_vehicle_id or "")
+    if cur_id and cur_id != prior_vehicle_id:
+        return (False, "vehicle_changed", debug)
+
+    # Wave-label upgrade always allows a repost (most important case).
+    if _wave_label_is_upgrade(prior_wave, current_wave_label or ""):
+        return (False, "wave_label_upgrade", debug)
+
+    # Cooldown elapsed AND score jumped enough → allow.
+    if (minutes_since >= float(SCORER_REPOST_COOLDOWN_MIN)
+            and score_delta >= int(SCORER_REPOST_MIN_SCORE_DELTA)):
+        return (False, "cooldown_elapsed_score_jump", debug)
+
+    return (True, "duplicate_within_cooldown", debug)
+
+
+def _log_scorer_repost_suppressed(ticker: str, direction: str,
+                                  reason: str, debug: dict) -> None:
+    """Phase 2.5: append a row to scorer_suppressed_reposts.csv so we can
+    audit a week from now whether the gate hid anything we'd have wanted.
+    Never raises — a logging failure must not block trading."""
+    try:
+        _append_csv_row("scorer_suppressed_reposts.csv",
+                        ["timestamp_utc", "ticker", "direction",
+                         "score", "prior_score", "score_delta",
+                         "wave_label", "prior_wave_label",
+                         "minutes_since_last", "reason"],
+                        {
+                            "timestamp_utc": datetime.utcnow().isoformat() + "Z",
+                            "ticker": ticker, "direction": direction,
+                            "score": debug.get("score"),
+                            "prior_score": debug.get("prior_score"),
+                            "score_delta": debug.get("score_delta"),
+                            "wave_label": debug.get("wave_label", ""),
+                            "prior_wave_label": debug.get("prior_wave_label", ""),
+                            "minutes_since_last": debug.get("minutes_since_last"),
+                            "reason": reason,
+                        })
+    except Exception as _e:
+        log.debug(f"_log_scorer_repost_suppressed failed: {_e}")
 
 
 def _build_compact_conviction_prompt(cp: dict) -> str:
@@ -4401,6 +4879,16 @@ def _process_job(worker_id: int, job: dict):
             _record_wave_result(base)
             return
 
+        # v8.4 (Phase 2.5c — Patch S): initialize the scorer-path vehicle
+        # tracking at job-level scope so the signal-only block downstream
+        # can see whether the credit/burst path already posted. Default
+        # "none" means scorer ran but built no vehicle; "credit"/"burst"
+        # means a real card already shipped to Telegram and the signal-only
+        # follow-up must be suppressed (otherwise we'd post a contradictory
+        # "NO STANDARD SPREAD" card AND overwrite the snapshot, weakening
+        # duplicate suppression on the next legitimate same-credit fire).
+        _vehicle_kind, _vehicle_id = "none", ""
+
         # ── v8.3: CONVICTION SCORER ─────────────────────────────────
         # Phase 4 validated: +8.75 WR lift on 572K trades when score >= 70.
         # Runs early, before chain fetches, to save API calls on LOG_ONLY/DISCARD.
@@ -4511,15 +4999,34 @@ def _process_job(worker_id: int, job: dict):
                 # Attach score to base so downstream logging sees it.
                 base["confidence"] = _sc_score
 
+                # v8.4 (Phase 2.5c): Vehicle-aware repost gate.
+                # Do NOT suppress here before the vehicle is known. The earlier
+                # Phase 2.5 gate ran at this point using only ticker/bias/score/wave,
+                # which could hide a legitimate later alert where the same setup
+                # finally produced a valid vehicle. Repost suppression now happens
+                # at the actual post sites after a stable vehicle_id exists:
+                #   - Long Call Burst card: vehicle_kind="burst"
+                #   - v8.4 credit card:    vehicle_kind="credit"
+                #   - signal-only card:     vehicle_kind="signal_only"
+                # This keeps the spam reduction while protecting MSFT-style
+                # no_vehicle → valid_vehicle upgrades.
+                _gate_wave = (webhook_data or {}).get("pb_wave_label", "") or ""
+
                 # v8.3.2 Fix A: Flow+scorer integration.
-                # Mark scorer as having posted for this ticker/direction/date.
-                # Then check if flow ALREADY fired earlier today for same
-                # ticker/direction — if so, enrich the trade card with a
-                # FLOW CONFIRMS line so user sees both in one card.
+                # Pop any pending flow for this ticker/direction so that when
+                # the credit card builds, it gets a FLOW CONFIRMS line.
+                # v8.4 (Phase 2.5b — Patch N): _mark_scorer_posted has been
+                # moved from BEFORE the credit/burst post path to AFTER, so
+                # that an internal failure that posts no card leaves the
+                # snapshot untouched. Without that move, a 10:38 fire that
+                # built no vehicle (V2 rejected) would still be "posted" in
+                # the snapshot, suppressing the legit 12:08 retry that did
+                # have a valid vehicle. Only flow-merge enrichment runs here.
+                _pending_flow_payload = None
                 try:
-                    _mark_scorer_posted(ticker, bias, _sc_score)
                     _pending = _pop_pending_flow(ticker, bias)
                     if _pending:
+                        _pending_flow_payload = _pending
                         # Append flow confirm to conviction_reasons so card shows it
                         _vol_oi = _pending.get("vol_oi_ratio", 0)
                         _strike = _pending.get("strike", 0)
@@ -4542,8 +5049,13 @@ def _process_job(worker_id: int, job: dict):
                 # != established) is the authoritative filter per Phase 1
                 # backtest, not debit spread viability. Env-gated by
                 # V84_CREDIT_DUAL_POST — no-op when disabled.
+                #
+                # v8.4 (Phase 2.5b — Patch N): the post fn now returns
+                # (vehicle_kind, vehicle_id) describing what actually
+                # posted to Telegram, so we mark scorer-posted accurately.
+                _vehicle_kind, _vehicle_id = "none", ""
                 try:
-                    _post_v84_credit_from_scorer(
+                    _vehicle_kind, _vehicle_id = _post_v84_credit_from_scorer(
                         ticker=ticker, bias=bias,
                         webhook_data=webhook_data or {},
                         worker_id=worker_id,
@@ -4551,6 +5063,40 @@ def _process_job(worker_id: int, job: dict):
                 except Exception as _v84_sp_err:
                     log.warning(f"[worker-{worker_id}] v8.4 scorer-path hook outer "
                                 f"failed for {ticker} {bias}: {_v84_sp_err}")
+                    _vehicle_kind, _vehicle_id = "none", ""
+
+                # If a concrete post-site suppressed the duplicate vehicle, bail
+                # out before check_ticker can create a redundant signal-only card.
+                # The suppress decision was made with a real vehicle_id, not the
+                # old pre-build ticker/bias-only gate.
+                if _vehicle_kind == "suppressed":
+                    base["reason"] = f"scorer repost suppressed: {_vehicle_id or 'duplicate_within_cooldown'}"
+                    base["outcome"] = "scorer_suppressed_repost"
+                    _record_wave_result(base)
+                    return
+
+                # v8.4 (Phase 2.5b — Patch N): mark scorer-posted ONLY if a
+                # card actually posted. If both burst and credit paths bailed
+                # (no valid vehicle), no mark is recorded — the next fire
+                # gets a clean shot at the gate via the "no_prior_vehicle"
+                # allow path. This is the fix for the MSFT 5/01 sequence
+                # where 10:38 attempted but rejected, and the legit retry
+                # would have been suppressed under the prior ordering.
+                if _vehicle_kind and _vehicle_kind != "none":
+                    try:
+                        _mark_scorer_posted(
+                            ticker, bias, _sc_score,
+                            wave_label=(webhook_data or {}).get("pb_wave_label", ""),
+                            vehicle_kind=_vehicle_kind,
+                            vehicle_id=_vehicle_id,
+                        )
+                    except Exception as _mark_err:
+                        log.debug(f"[worker-{worker_id}] _mark_scorer_posted post-hook "
+                                  f"failed for {ticker} {bias}: {_mark_err}")
+                else:
+                    log.info(f"[worker-{worker_id}] scorer-post: no vehicle posted "
+                             f"for {ticker} {bias} — leaving snapshot untouched "
+                             f"(retry will be allowed via no_prior_vehicle path)")
 
             except Exception as _sc_err:
                 # v8.3.1 Fix #7: Surface scorer exceptions clearly + write audit row.
@@ -4877,6 +5423,76 @@ def _process_job(worker_id: int, job: dict):
         # label on signal-only cards.
         if rec.get("signal_only"):
             base["signal_only"] = True
+
+            # v8.4 (Phase 2.5c — Patch S): if the scorer path already posted
+            # a real vehicle (credit or burst) for THIS scorer event, do
+            # not post the signal-only follow-up. Two failure modes this
+            # prevents:
+            #   (1) UX: you'd see a v8.4 CREDIT card AND a "NO STANDARD
+            #       SPREAD / FIND BETTER VEHICLE" card for the same fire.
+            #       The two contradict each other.
+            #   (2) Snapshot integrity: signal-only would overwrite the
+            #       credit/burst vehicle_id with its own, so the next
+            #       identical credit fire would compute vehicle_changed
+            #       (signal_only → credit) and be allowed — defeating the
+            #       Phase 2.5 spam suppression.
+            # Skip both the post AND the _mark_scorer_posted call: the
+            # credit/burst snapshot from the earlier path is the correct
+            # source of truth and must not be clobbered.
+            if _vehicle_kind in ("credit", "burst"):
+                log.info(f"[worker-{worker_id}] SIGNAL-ONLY suppressed: real "
+                         f"vehicle already posted ({_vehicle_kind}={_vehicle_id}) "
+                         f"for {ticker} {bias}")
+                base["reason"] = (f"signal_only suppressed: "
+                                   f"real {_vehicle_kind} vehicle already posted")
+                base["outcome"] = "signal_only_suppressed_real_vehicle_posted"
+                _record_wave_result(base)
+                return
+
+            # Phase 2.5c: signal-only cards still need duplicate suppression.
+            # Credit/burst duplicates are gated at their post sites where a
+            # real vehicle_id exists; signal-only has no spread vehicle, so use
+            # a stable signal vehicle_id built from ticker/bias/tier/wave. This
+            # stops repeated SOXX-style "NO STANDARD SPREAD" cards without
+            # suppressing a later credit/burst vehicle.
+            try:
+                _sig_wave = (webhook_data or {}).get("pb_wave_label", "") or ""
+                _sig_vehicle_id = f"{ticker}_{bias}_signal_only_T{tier_label}_{_sig_wave or 'no_wave'}"
+                _sig_sup, _sig_reason, _sig_debug = _should_suppress_scorer_repost(
+                    ticker, bias, int(_sc_score or rec.get("confidence") or 0), _sig_wave,
+                    current_vehicle_kind="signal_only",
+                    current_vehicle_id=_sig_vehicle_id,
+                )
+            except Exception as _sig_gate_err:
+                log.warning(f"[worker-{worker_id}] signal-only repost-gate error "
+                            f"for {ticker} {bias}: {_sig_gate_err}")
+                _sig_sup, _sig_reason, _sig_debug = (False, "gate_error", {})
+                _sig_vehicle_id = ""
+
+            if _sig_sup:
+                log.info(f"[worker-{worker_id}] SIGNAL-ONLY duplicate suppressed: "
+                         f"{ticker} {bias} vehicle={_sig_vehicle_id} "
+                         f"reason={_sig_reason} debug={_sig_debug}")
+                _log_scorer_repost_suppressed(ticker, bias, _sig_reason, _sig_debug)
+                base["reason"] = f"scorer repost suppressed: {_sig_reason}"
+                base["outcome"] = "scorer_suppressed_repost"
+                _record_wave_result(base)
+                return
+
+            # Mark after the signal-only card has been built and queued.
+            # This gives later credit/burst vehicles a chance to override via
+            # vehicle_changed while suppressing identical signal-only repeats.
+            try:
+                _mark_scorer_posted(
+                    ticker, bias, int(_sc_score or rec.get("confidence") or 0),
+                    wave_label=_sig_wave,
+                    vehicle_kind="signal_only",
+                    vehicle_id=_sig_vehicle_id,
+                )
+            except Exception as _sig_mark_err:
+                log.debug(f"[worker-{worker_id}] signal-only scorer mark failed "
+                          f"for {ticker} {bias}: {_sig_mark_err}")
+
         _record_wave_result(base)
         log.info(f"{job_type.upper()} winner queued for digest: {ticker} {bias} T{tier_label} conf={rec.get('confidence')}/100")
 
@@ -7638,6 +8254,13 @@ def _post_v84_credit_card(ticker: str, direction: str, spot: float,
     in Tier-A/B + BULL regime for bears) and strike placement (PB floor/roof)
     are authoritative per Phase 1 backtest validation (83% credit WR, +32%
     EV on 15,700 trades).
+
+    v8.4 (Phase 2.5b — Patch N): returns (vehicle_kind, vehicle_id).
+      ("credit", "TICKER_SHORT_LONG_EXPIRY")  — credit card actually posted
+      ("none",   "")                          — anything short of post (gate
+                                                rejected, builder rejected,
+                                                Telegram failed)
+    Caller uses this so _mark_scorer_posted is only marked on actual post.
     """
     try:
         from credit_card_builder import (
@@ -7647,10 +8270,10 @@ def _post_v84_credit_card(ticker: str, direction: str, spot: float,
         )
     except ImportError as _imp_err:
         log.debug(f"v8.4 credit hook: credit_card_builder not available: {_imp_err}")
-        return
+        return ("none", "")
 
     if not is_v84_dual_post_enabled():
-        return  # env not set — quiet fast-path
+        return ("none", "")  # env not set — quiet fast-path
 
     wd = webhook_data or {}
     pb_state   = wd.get("pb_state", "")
@@ -7693,7 +8316,7 @@ def _post_v84_credit_card(ticker: str, direction: str, spot: float,
     )
     if spread is None:
         log.info(f"v8.4 credit gated out for {ticker} {direction}: {reason}")
-        return
+        return ("none", "")
 
     # Phase 2.4: suppress garbage credit vehicles before they hit Telegram.
     # Example: $0.03 credit on $2.50 wide is not a tradeable idea even if
@@ -7738,7 +8361,35 @@ def _post_v84_credit_card(ticker: str, direction: str, spot: float,
                 _post_v2_review_card_under_v1(_supp_v2_result)
             except Exception as _v2_supp_err:
                 log.warning(f"V2 suppressed-credit follow-up failed for {ticker}: {_v2_supp_err}")
-        return
+        return ("none", "")
+
+    # Phase 2.5c: build a stable vehicle_id BEFORE posting so duplicate
+    # suppression can be vehicle-aware. This prevents repeated identical
+    # MSFT/XLF/SOXX cards while still allowing a new expiry/strike/burst
+    # vehicle to post even with the same score and wave label.
+    try:
+        _vid = (f"{ticker}_{float(spread['short_strike'])}"
+                f"_{float(spread['long_strike'])}_{str(expiry)[:10]}")
+    except Exception:
+        _vid = f"{ticker}_credit_{str(expiry)[:10]}"
+
+    try:
+        _sup, _reason, _debug = _should_suppress_scorer_repost(
+            ticker, direction, int(conv_score or 0), wave_label,
+            current_vehicle_kind="credit", current_vehicle_id=_vid,
+        )
+    except Exception as _gate_err:
+        log.warning(f"v8.4 credit repost-gate error for {ticker}: {_gate_err}")
+        _sup, _reason, _debug = (False, "gate_error", {})
+
+    if _sup:
+        log.info(f"v8.4 CREDIT duplicate suppressed: {ticker} vehicle={_vid} "
+                 f"reason={_reason} debug={_debug}")
+        _log_scorer_repost_suppressed(ticker, direction, _reason, _debug)
+        return ("suppressed", _reason)
+    elif _reason not in ("gate_disabled", "first_post", "no_state", "no_prior_vehicle"):
+        log.info(f"v8.4 CREDIT repost allowed: {ticker} vehicle={_vid} "
+                 f"reason={_reason} debug={_debug}")
 
     card_text = format_credit_card(
         spread, conviction_score=conv_score,
@@ -7751,7 +8402,7 @@ def _post_v84_credit_card(ticker: str, direction: str, spot: float,
                  f"(RoC {spread['roc_pct']:.0f}%)")
     except Exception as _tg_err:
         log.warning(f"v8.4 credit Telegram post failed for {ticker}: {_tg_err}")
-        return
+        return ("none", "")
 
     # Phase 2.4: V2 review card posts immediately under v8.4 credit card.
     # Mirrors the wave-digest behavior but for the credit-only path. Gated
@@ -7835,9 +8486,22 @@ def _post_v84_credit_card(ticker: str, direction: str, spot: float,
             "itqs": {"score": conv_score or 0, "grade": "v84", "decision": "v8.4 credit"},
             "chain_available": spread["chain_tag"] == "live",
         }
-        _record_income_opportunity(_opp, source="v84_credit_dual_post")
+        # v8.4 (Phase 2.7): mark v8.4 credit dual-post records as review-only.
+        # Brad enters on his own timing after the chart confirms — the bot's
+        # post is a heads-up, not a confirmed entry. The review_only flag
+        # gates the record out of "Currently Open" and grading reports
+        # when RECTRACKER_FILTER_REVIEW_ONLY_FROM_REPORTS is enabled.
+        # A future /confirm command can flip extra_metadata.confirmed_entry=True
+        # to override the review-only filter for an actual entry.
+        _record_income_opportunity(_opp, source="v84_credit_dual_post",
+                                    extra_metadata={"review_only": True})
     except Exception as _rec_err:
         log.warning(f"v8.4 credit rec-tracker failed for {ticker}: {_rec_err}")
+
+    # v8.4 (Phase 2.5c): announce the same pre-post vehicle_id to caller for
+    # the scorer snapshot. Same strikes/expiry => same id => future duplicate
+    # suppresses; different strikes/expiry => new id => allowed.
+    return ("credit", _vid)
 
 
 # ─────────────────────────────────────────────────────────
@@ -7849,25 +8513,274 @@ def _post_v84_credit_card(ticker: str, direction: str, spot: float,
 # care about. This hook fires right after _mark_scorer_posted so the credit card
 # gets its own chance regardless of whether the debit side can place a spread.
 
+def _try_post_long_call_burst(ticker: str, bias: str, spot: float,
+                                webhook_data: dict, exps: list,
+                                today, worker_id: int) -> bool:
+    """v8.4 (Phase 2.6): Try to post a Long Call Burst card.
+
+    v8.4 (Phase 2.5b — Patch N): returns (posted_bool, vehicle_id).
+      (True,  "TICKER_STRIKEC_EXPIRY") — burst card posted; caller skips credit
+      (False, "")                      — burst not viable; caller continues credit
+
+    v8.4 (Phase 2.5b — Patch P): when a burst card posts, the trade is
+    recorded into the recommendation tracker as review-only (source=
+    "v84_long_call_burst") so we can track per-burst performance over time.
+    Brad does not auto-enter — review-only matches the Phase 2.7 v8.4 credit
+    treatment. A future /confirm command can flip review_only off.
+
+    Gating order:
+      1. Env BURST_FIRST_ROUTING_ENABLED off → return (False, "") (no-op).
+      2. Bias != bull → return (False, "") (V2 burst is bull-only by design).
+      3. classify_v2_setup(webhook_data).momentum_burst_label != "YES"
+         → return (False, "") (let credit path handle).
+      4. No 0-2 trading-DTE expiry has a liquid ATM call → return (False, "")
+         (let credit path handle the slower-DTE setup it's designed for).
+      5. Burst card built + posted → return (True, vehicle_id).
+
+    Fail-open in every error path: if any step raises unexpectedly, log
+    and return (False, "") so the existing credit card flow runs as before.
+    The burst path must never silently break the credit path.
+    """
+    try:
+        from long_call_burst_builder import (
+            is_burst_first_routing_enabled,
+            build_burst_card_if_gated,
+            format_burst_card,
+        )
+    except ImportError as _imp:
+        log.debug(f"[worker-{worker_id}] burst routing skipped: import failed: {_imp}")
+        return (False, "")
+
+    if not is_burst_first_routing_enabled():
+        return (False, "")
+
+    if (bias or "").lower() != "bull":
+        return (False, "")
+
+    # Step 1: peek at V2 to decide if this is a burst signal.
+    try:
+        from v2_5d_edge_model import classify_v2_setup
+        _v2_ctx = dict(webhook_data or {})
+        _v2_ctx["ticker"] = ticker
+        _v2_ctx["bias"] = bias
+        _v2_ctx["direction"] = bias
+        _v2_ctx["spot"] = spot
+        _v2_res = classify_v2_setup(_v2_ctx)
+    except Exception as _v2_err:
+        log.warning(f"[worker-{worker_id}] burst routing: V2 classify failed for "
+                    f"{ticker} — {_v2_err}; falling through to credit path")
+        return (False, "")
+
+    _burst_label = getattr(_v2_res, "momentum_burst_label", "NO") or "NO"
+    if _burst_label != "YES":
+        return (False, "")
+
+    log.info(f"[worker-{worker_id}] BURST FIRST: V2 says momentum_burst=YES on "
+             f"{ticker} {bias} (score={getattr(_v2_res, 'momentum_burst_score', 0)}/10) "
+             f"— attempting Long Call Burst card")
+
+    # Step 2: rank expirations for burst window (0-2 trading DTE preferred).
+    try:
+        from market_clock import count_trading_days_between
+    except ImportError:
+        log.warning(f"[worker-{worker_id}] burst routing: market_clock unavailable; "
+                    f"falling through to credit path")
+        return (False, "")
+
+    _burst_candidates = []
+    for _exp_str in (exps or []):
+        try:
+            _exp_d = datetime.strptime(str(_exp_str)[:10], "%Y-%m-%d").date()
+            _td_count = count_trading_days_between(today, _exp_d)
+            if _td_count < 0:
+                continue
+            if _td_count <= 2:
+                _burst_candidates.append((str(_exp_str)[:10], _td_count))
+        except (ValueError, TypeError):
+            continue
+    # Prefer 1 trading day (catches burst + overnight), then 0DTE, then 2DTE.
+    _burst_candidates.sort(key=lambda x: (0 if x[1] == 1 else (1 if x[1] == 0 else 2), x[1]))
+
+    if not _burst_candidates:
+        log.info(f"[worker-{worker_id}] burst routing: no 0-2 trading-DTE expiry "
+                 f"found for {ticker}; falling through to credit path")
+        return (False, "")
+
+    # Step 3: try chain fetch + burst build per candidate, stop at first success.
+    for _cand_exp, _cand_td in _burst_candidates:
+        try:
+            _raw, _cs, _ce = _get_chain_for_expiry(ticker, _cand_exp)
+            if not (_raw and _ce):
+                continue
+            _rows = _chain_rows_from_response(_raw)
+            if not _rows:
+                continue
+            # Convert rows to columnar format expected by the burst builder.
+            _strikes, _sides, _bids, _asks = [], [], [], []
+            for c in _rows:
+                _strikes.append(c.get("strike"))
+                _sides.append(c.get("side") or c.get("option_type"))
+                _bids.append(c.get("bid", 0) or 0)
+                _asks.append(c.get("ask", 0) or 0)
+            _chain = {"strike": _strikes, "side": _sides, "bid": _bids, "ask": _asks}
+        except Exception as _ce_err:
+            log.debug(f"[worker-{worker_id}] burst routing: chain fetch failed for "
+                      f"{ticker} {_cand_exp}: {_ce_err}")
+            continue
+
+        try:
+            _burst, _br_reason = build_burst_card_if_gated(
+                bias=bias, ticker=ticker, spot=spot,
+                expiry=_cand_exp, chain=_chain, dte=_cand_td,
+                momentum_score=getattr(_v2_res, "momentum_burst_score", None),
+                momentum_reasons=getattr(_v2_res, "momentum_burst_reasons", "") or "",
+            )
+        except Exception as _bb_err:
+            log.warning(f"[worker-{worker_id}] burst routing: build failed for "
+                        f"{ticker} {_cand_exp}: {_bb_err}")
+            continue
+
+        if _burst is None:
+            log.debug(f"[worker-{worker_id}] burst routing: no liquid call for "
+                      f"{ticker} {_cand_exp}: {_br_reason}; trying next expiry")
+            continue
+
+        # Built a viable burst card. Create its stable vehicle_id BEFORE
+        # posting, then run the same vehicle-aware repost gate used by credit.
+        try:
+            _strike_f = float(_burst.get("strike", 0) or 0)
+            _debit_f  = float(_burst.get("debit",  0) or 0)
+            _vid = f"{ticker}_{_strike_f}C_{_cand_exp}"
+        except Exception:
+            _strike_f, _debit_f = 0.0, 0.0
+            _vid = f"{ticker}_burst_{_cand_exp}"
+
+        try:
+            _conv = (webhook_data or {}).get("conviction_score")
+            _wave = (webhook_data or {}).get("pb_wave_label", "")
+            _cb = (webhook_data or {}).get("cb_side", "")
+            _sup, _reason, _debug = _should_suppress_scorer_repost(
+                ticker, bias, int(_conv or 0), _wave,
+                current_vehicle_kind="burst", current_vehicle_id=_vid,
+            )
+        except Exception as _gate_err:
+            log.warning(f"[worker-{worker_id}] burst repost-gate error for "
+                        f"{ticker}: {_gate_err}")
+            _sup, _reason, _debug = (False, "gate_error", {})
+            _conv = (webhook_data or {}).get("conviction_score")
+            _wave = (webhook_data or {}).get("pb_wave_label", "")
+            _cb = (webhook_data or {}).get("cb_side", "")
+
+        if _sup:
+            log.info(f"[worker-{worker_id}] LONG CALL BURST duplicate suppressed: "
+                     f"{ticker} vehicle={_vid} reason={_reason} debug={_debug}")
+            _log_scorer_repost_suppressed(ticker, bias, _reason, _debug)
+            return (False, "suppressed:" + str(_reason))
+        elif _reason not in ("gate_disabled", "first_post", "no_state", "no_prior_vehicle"):
+            log.info(f"[worker-{worker_id}] LONG CALL BURST repost allowed: "
+                     f"{ticker} vehicle={_vid} reason={_reason} debug={_debug}")
+
+        try:
+            _card_text = format_burst_card(_burst, conviction_score=_conv,
+                                            wave_label=_wave, cb_side=_cb)
+        except Exception as _fmt_err:
+            log.warning(f"[worker-{worker_id}] burst routing: format failed for "
+                        f"{ticker} {_cand_exp}: {_fmt_err}; falling through")
+            return (False, "")
+
+        try:
+            _tg_rate_limited_post(_card_text)
+            log.info(f"[worker-{worker_id}] LONG CALL BURST posted: {ticker} "
+                     f"${_burst['strike']:.2f}C {_cand_exp} "
+                     f"(debit ${_burst['debit']:.2f}, {_cand_td} trading-DTE)")
+        except Exception as _tg_err:
+            log.warning(f"[worker-{worker_id}] burst routing: Telegram post failed "
+                        f"for {ticker}: {_tg_err}; falling through to credit path")
+            return (False, "")
+
+        # v8.4 (Phase 2.5b — Patch P): record the posted burst card into the
+        # recommendation tracker as review-only so per-burst performance is
+        # auditable. Failure here MUST NOT block the post that just happened
+        # — we already shipped the card to Telegram. Tracker write is purely
+        # additive observability; treat exceptions as soft failures.
+        try:
+            _today_iso = datetime.utcnow().strftime("%Y-%m-%d")
+            _intraday_rows = _raw_intraday_to_rows(
+                get_intraday_bars(ticker, resolution=5, countback=60)
+            )
+            _prior_ctx = _build_prior_day_gap_context(ticker, _intraday_rows)
+            _record_recommendation_campaign(
+                source="v84_long_call_burst",
+                ticker=ticker,
+                direction="bull",
+                trade_type="immediate",
+                structure="long_call",
+                legs=[{"right": "call", "strike": _strike_f,
+                        "expiry": _cand_exp, "action": "buy"}],
+                entry_option_mark=_debit_f,
+                entry_underlying=spot,
+                confidence=int((webhook_data or {}).get("conviction_score") or 0),
+                regime=None,
+                extra_metadata={
+                    "review_only": True,
+                    "momentum_burst": True,
+                    "v2_model": True,
+                    "burst_score": getattr(_v2_res, "momentum_burst_score", None),
+                    "burst_reasons": getattr(_v2_res, "momentum_burst_reasons", "") or "",
+                    "trading_dte": _cand_td,
+                    "wave_label": (webhook_data or {}).get("pb_wave_label", ""),
+                    "cb_side": (webhook_data or {}).get("cb_side", ""),
+                },
+                pricing_mode="long_mark",
+                chain_rows=_rows,
+                intraday_rows=_intraday_rows,
+                prior_day_ctx=_prior_ctx,
+            )
+        except Exception as _rec_err:
+            log.warning(f"[worker-{worker_id}] burst routing: rec-tracker write "
+                        f"failed for {ticker} (post already shipped): {_rec_err}")
+
+        # vehicle_id is deterministic per (ticker, strike, expiry).
+        return (True, _vid)
+
+    log.info(f"[worker-{worker_id}] burst routing: no viable expiry built "
+             f"for {ticker}; falling through to credit path")
+    return (False, "")
+
+
 def _post_v84_credit_from_scorer(ticker: str, bias: str, webhook_data: dict,
-                                  worker_id: int = 0):
+                                  worker_id: int = 0) -> tuple[str, str]:
     """Fire v8.4 credit hook directly from the scorer-post path.
 
-    Called from _process_job right after _mark_scorer_posted. Fetches spot +
+    Called from _process_job right after the gate check. Fetches spot +
     nearest 3-7 DTE expiry itself (since check_ticker hasn't run yet). Delegates
     gate checking + spread building + Telegram post to _post_v84_credit_card.
 
-    Never raises — any failure logs and returns. Purely additive to the debit
-    card flow, which proceeds unchanged.
+    v8.4 (Phase 2.6): when BURST_FIRST_ROUTING_ENABLED is set and V2 says
+    momentum_burst=YES, this function tries to post a Long Call Burst card
+    INSTEAD of the credit card. If the burst path posts, this function
+    returns early — credit card is skipped. If burst doesn't apply or
+    can't build, the existing credit flow runs unchanged.
+
+    v8.4 (Phase 2.5b — Patch N): returns (vehicle_kind, vehicle_id).
+      ("burst",  "TICKER_STRIKEC_EXPIRY")  — burst card posted
+      ("credit", "TICKER_SHORT_LONG_EXP")  — credit card posted
+      ("none",   "")                       — nothing posted (env off, gate
+                                             rejected, no liquid expiry, etc)
+    Caller (_process_job) only marks _mark_scorer_posted when this returns
+    a real vehicle, so a "no vehicle posted" fire leaves the snapshot clean
+    and the next legitimate fire is allowed via the no_prior_vehicle path.
+
+    Never raises — any failure logs and returns ("none", "").
     """
     try:
         # Fast-path env check — avoid work if dual-post disabled
         try:
             from credit_card_builder import is_v84_dual_post_enabled
             if not is_v84_dual_post_enabled():
-                return
+                return ("none", "")
         except ImportError:
-            return
+            return ("none", "")
 
         log.info(f"[worker-{worker_id}] v8.4 scorer-path credit hook: "
                  f"{ticker} {bias}")
@@ -7877,12 +8790,12 @@ def _post_v84_credit_from_scorer(ticker: str, bias: str, webhook_data: dict,
             _spot = get_spot(ticker)
         except Exception as _spot_err:
             log.warning(f"v8.4 scorer-path: spot fetch failed for {ticker}: {_spot_err}")
-            return
+            return ("none", "")
         if not _spot or _spot <= 0:
             log.warning(f"v8.4 scorer-path: invalid spot for {ticker}: {_spot}")
-            return
+            return ("none", "")
 
-        # 2) Pick an expiry — target 3-7 DTE window per Phase 1 backtest edge
+        # 2) Pick an expiry — target 3-7 DTE window per Phase 1 backtest edge.
         # v8.4.7 (Patch 2E): prior logic had two bugs:
         #   (a) `get_expirations(ticker) if 'get_expirations' in dir() else []`
         #       — dir() inside a function returns only local names, so this
@@ -7894,6 +8807,13 @@ def _post_v84_credit_from_scorer(ticker: str, bias: str, webhook_data: dict,
         #       though 4/24 was live and fetched fine by the prefetch pipeline.
         # Fix: call get_expirations directly, build a ranked candidate list,
         # try chain fetch per candidate, stop at the first one that returns rows.
+        #
+        # v8.4 (Phase 2.6): when USE_TRADING_DAYS_FOR_CREDIT_DTE=1, the 3-7
+        # window is measured in TRADING days, not calendar days. Friday-with-
+        # weekend-attached used to pull a 1-trading-DTE candidate (e.g. 5/01
+        # → 5/04 = "3 calendar days") when 5/08 was the actual income window.
+        # MSFT 5/01: bot saw $0.32 credit / 7% RoC on calendar-3 (1 trading-DTE)
+        # when 5/08 (5 trading-DTE) had $1.05 credit / 26.6% RoC.
         from datetime import date as _date, timedelta as _td
         _today = _date.today()
         _candidates = []  # list of (exp_str, dte) tuples, ranked best-first
@@ -7903,13 +8823,46 @@ def _post_v84_credit_from_scorer(ticker: str, bias: str, webhook_data: dict,
             log.warning(f"v8.4 scorer-path: get_expirations failed for {ticker}: {_exp_err}")
             _exps = []
 
-        # Build ranked candidates — prefer 3-7 DTE window, then nearest ≥1 DTE
+        # v8.4 (Phase 2.6): Burst-first routing happens BEFORE the credit DTE
+        # picker. If V2 says momentum_burst=YES and a Long Call Burst card
+        # builds and posts, we skip the credit path entirely.
+        # v8.4 (Phase 2.5b — Patch N): burst path now returns
+        # (posted_bool, vehicle_id) so we propagate the vehicle_id up.
+        try:
+            _burst_posted, _burst_vid = _try_post_long_call_burst(
+                ticker, bias, _spot,
+                webhook_data or {}, _exps,
+                _today, worker_id)
+            if _burst_posted:
+                return ("burst", _burst_vid)
+            if isinstance(_burst_vid, str) and _burst_vid.startswith("suppressed:"):
+                return ("suppressed", _burst_vid.split(":", 1)[1] or "duplicate_within_cooldown")
+        except Exception as _burst_err:
+            # Defensive: any unexpected failure here must NOT block the
+            # credit path from running. Log and continue.
+            log.warning(f"[worker-{worker_id}] burst routing outer error for "
+                        f"{ticker}: {_burst_err}; continuing with credit path")
+
+        # Build ranked candidates — prefer 3-7 DTE window, then nearest ≥1 DTE.
+        # Trading-day vs calendar-day toggle controlled by env.
+        _use_trading_days = USE_TRADING_DAYS_FOR_CREDIT_DTE
+        if _use_trading_days:
+            try:
+                from market_clock import count_trading_days_between
+            except ImportError:
+                log.debug(f"v8.4 scorer-path: market_clock unavailable, "
+                          f"falling back to calendar days for {ticker}")
+                _use_trading_days = False
+
         _sweet_spot = []
         _other = []
         for _exp_str in _exps:
             try:
                 _exp_d = datetime.strptime(str(_exp_str)[:10], "%Y-%m-%d").date()
-                _dte_v = (_exp_d - _today).days
+                if _use_trading_days:
+                    _dte_v = count_trading_days_between(_today, _exp_d)
+                else:
+                    _dte_v = (_exp_d - _today).days
                 if _dte_v < 1:
                     continue
                 if 3 <= _dte_v <= 7:
@@ -7933,7 +8886,7 @@ def _post_v84_credit_from_scorer(ticker: str, bias: str, webhook_data: dict,
 
         if not _candidates:
             log.warning(f"v8.4 scorer-path: no valid expiry found for {ticker}")
-            return
+            return ("none", "")
 
         # 3) Try chain fetch per candidate — stop at first success.
         # credit_card_builder will fall back to its estimate only if ALL
@@ -7974,17 +8927,23 @@ def _post_v84_credit_from_scorer(ticker: str, bias: str, webhook_data: dict,
 
         # 4) Delegate to the existing helper. regime_trend from webhook_data
         # is already populated by the scorer path (market_regime field).
+        # v8.4 (Phase 2.5b — Patch N): the helper now returns
+        # (vehicle_kind, vehicle_id) so we forward that to the caller.
         _regime_trend = (webhook_data or {}).get("market_regime", "")
-        _post_v84_credit_card(
+        _kind_id = _post_v84_credit_card(
             ticker=ticker, direction=bias, spot=_spot,
             expiry=_chosen_exp, regime_trend=_regime_trend,
             webhook_data=webhook_data or {},
             chains=_chains_arg,
         )
+        if isinstance(_kind_id, tuple) and len(_kind_id) == 2:
+            return _kind_id
+        return ("none", "")
 
     except Exception as _hook_err:
         log.warning(f"[worker-{worker_id}] v8.4 scorer-path hook failed for "
                     f"{ticker} {bias}: {_hook_err}")
+        return ("none", "")
 
 
 # ─────────────────────────────────────────────────────────
