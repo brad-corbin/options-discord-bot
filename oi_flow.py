@@ -630,6 +630,19 @@ class FlowDetector:
         self._option_store = store
         log.info("FlowDetector: option streaming store connected")
 
+    def lookup_confirmation_for(self, ticker: str, strike: float, side: str, expiry: str) -> Optional[dict]:
+        """Lookup today's confirmed OI/stalk context for one exact contract.
+
+        Display-only helper: does not generate trades or change scoring.
+        """
+        try:
+            if not self._state or not hasattr(self._state, "get_oi_confirmation_for"):
+                return None
+            return self._state.get_oi_confirmation_for(ticker, strike, side, expiry)
+        except Exception as e:
+            log.debug(f"OI confirmation lookup failed for {ticker} {expiry} {strike} {side}: {e}")
+            return None
+
     def set_get_thesis_fn(self, fn):
         """Wire thesis lookup for EM alignment gate on conviction plays."""
         self._get_thesis_fn = fn
@@ -1363,6 +1376,12 @@ class FlowDetector:
                  f"{sum(1 for c in confirmed if c['flow_type'] == 'confirmed_unwinding')} unwinding, "
                  f"{sum(1 for c in confirmed if c['flow_type'] == 'churn')} churn)")
 
+        try:
+            if hasattr(self._state, "save_oi_confirmation_index"):
+                self._state.save_oi_confirmation_index(date.today().isoformat(), confirmations=confirmed)
+        except Exception as e:
+            log.debug(f"OI confirmation index save failed: {e}")
+
         return confirmed
 
     def _parse_oi_from_chain(self, chain_data: dict) -> Dict[str, int]:
@@ -1505,6 +1524,12 @@ class FlowDetector:
             stalks.append(stalk)
             self._state.save_stalk_alert(stalk["ticker"], stalk)
 
+        try:
+            if stalks and hasattr(self._state, "save_oi_confirmation_index"):
+                self._state.save_oi_confirmation_index(date.today().isoformat(), stalks=stalks)
+        except Exception as e:
+            log.debug(f"OI stalk index save failed: {e}")
+
         return stalks
 
     # ─────────────────────────────────────────────────────
@@ -1596,6 +1621,12 @@ class FlowDetector:
                             "signal": f"Still {'bullish' if unwind['side'] == 'call' else 'bearish'}, "
                                       f"{'raising' if direction == 'UP' else 'lowering'} target",
                         })
+
+        try:
+            if rolls and hasattr(self._state, "save_oi_confirmation_index"):
+                self._state.save_oi_confirmation_index(date.today().isoformat(), rolls=rolls)
+        except Exception as e:
+            log.debug(f"OI roll index save failed: {e}")
 
         return rolls
 
@@ -3207,8 +3238,9 @@ class FlowDetector:
             lines.append("")
             lines.append("🔄 ROLLS DETECTED:")
             for r in rolls[:3]:
+                _dte_n, _dte_label, _active = self._dte_label(r.get('expiry', ''))
                 lines.append(
-                    f"  {r['ticker']} {r['side'].upper()} "
+                    f"  {r['ticker']} {r['side'].upper()} exp {str(r.get('expiry', ''))[:10]} ({_dte_label}) "
                     f"${r['from_strike']:.0f} → ${r['to_strike']:.0f} "
                     f"(~{r['contracts']:,} contracts {r['direction']})"
                 )
