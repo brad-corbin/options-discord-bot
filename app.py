@@ -14140,6 +14140,12 @@ def _initialize_app():
             log.warning(f"dashboard: init failed (non-fatal, dashboard will be disabled): {_dash_init_err}")
 
         _flow_detector = FlowDetector(_persistent_state, post_fn=post_to_telegram)
+        try:
+            if _oi_tracker and hasattr(_oi_tracker, "set_confirmation_lookup"):
+                _oi_tracker.set_confirmation_lookup(_flow_detector.lookup_confirmation_for)
+                log.info("OI tracker: Morning OI/Stalk confirmation lookup wired")
+        except Exception as _oi_lookup_err:
+            log.warning(f"OI tracker confirmation lookup wiring failed (non-fatal): {_oi_lookup_err}")
         _potter_box = PotterBoxScanner(_persistent_state, flow_detector=_flow_detector,
                                            post_fn=post_to_telegram)
         log.info(f"OI cache + tracker + flow detector + Potter Box initialized (Redis: {_get_redis() is not None})")

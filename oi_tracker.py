@@ -9,6 +9,7 @@
 
 import json
 import logging
+import os
 import time
 from datetime import datetime, date, timedelta
 from typing import Dict, List, Optional, Callable
@@ -70,6 +71,46 @@ OI_UNUSUAL_MIN_CONTRACTS = 1000   # 1,000+ contracts at a single strike = notabl
 OI_UNUSUAL_PCT_THRESHOLD = 0.25   # 25%+ overnight change at a strike = unusual
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in ("1", "true", "yes", "on", "y")
+
+
+# Flow/OI contract-identity guardrails. Default behavior keeps main channel
+# actionable: do not show aggregate-expiration strike lines as if they were
+# contracts.
+UNUSUAL_FLOW_REQUIRE_PER_EXPIRY = _env_flag("UNUSUAL_FLOW_REQUIRE_PER_EXPIRY", True)
+UNUSUAL_FLOW_ALLOW_AGGREGATE_FALLBACK = _env_flag("UNUSUAL_FLOW_ALLOW_AGGREGATE_FALLBACK", False)
+UNUSUAL_FLOW_CONFIRMATION_TAGS_ENABLED = _env_flag("UNUSUAL_FLOW_CONFIRMATION_TAGS_ENABLED", True)
+UNUSUAL_FLOW_SHOW_SKIPPED_COUNT = _env_flag("UNUSUAL_FLOW_SHOW_SKIPPED_COUNT", True)
+
+
+def _safe_int(value, default: int = 0) -> int:
+    try:
+        return int(float(value))
+    except Exception:
+        return default
+
+
+def _expiry_dte(expiry: str) -> int:
+    try:
+        exp = datetime.strptime(str(expiry)[:10], "%Y-%m-%d").date()
+        return (exp - date.today()).days
+    except Exception:
+        return -1
+
+
+def _dte_label(expiry: str, fallback=None) -> tuple[int, str]:
+    dte = _expiry_dte(expiry)
+    if dte < 0 and fallback is not None:
+        dte = _safe_int(fallback, -1)
+    if dte < 0:
+        return dte, "DTE?"
+    return dte, "0DTE" if dte == 0 else f"{dte}DTE"
+
+
 class OITracker:
     def __init__(self, store_get_fn: Callable, store_set_fn: Callable):
         self._get = store_get_fn
@@ -78,6 +119,17 @@ class OITracker:
         self._today_date: str = ""
         self._last_summary_date: str = ""
         self._last_sweep_date: str = ""
+        self._confirmation_lookup: Optional[Callable] = None
+        self._last_unusual_flow_skips: List[dict] = []
+
+    def set_confirmation_lookup(self, lookup_fn: Callable):
+        """Wire display-only Morning OI/Stalk confirmation lookup.
+
+        The callback lets Unusual Flow append existing buildup/unwinding/stalk
+        labels to exact contract lines without importing oi_flow.py or changing
+        scanner/trade logic.
+        """
+        self._confirmation_lookup = lookup_fn
 
     def _daily_key(self, ticker: str, date_str: str) -> str:
         return f"oi_daily:{ticker.upper()}:{date_str}"
@@ -108,6 +160,36 @@ class OITracker:
             return "OTM" if strike > spot else "ITM"
         else:
             return "OTM" if strike < spot else "ITM"
+
+    def _confirmation_tag(self, ticker: str, strike: float, side: str, expiry: str) -> str:
+        """Return a compact display tag from the existing Morning OI/Stalk index."""
+        if not UNUSUAL_FLOW_CONFIRMATION_TAGS_ENABLED or not self._confirmation_lookup:
+            return ""
+        try:
+            ctx = self._confirmation_lookup(ticker, strike, side, expiry)
+        except Exception as e:
+            log.debug(f"OI confirmation tag lookup failed for {ticker} {expiry} {strike} {side}: {e}")
+            return ""
+        if not isinstance(ctx, dict):
+            return ""
+        tags = []
+        tag = str(ctx.get("tag") or ctx.get("flow_type") or "").replace("confirmed_", "")
+        if tag and tag != "churn":
+            tags.append(tag)
+        if ctx.get("roll"):
+            role = str(ctx.get("roll_role") or "roll").replace("_", " ")
+            tags.append(role)
+        stalk = str(ctx.get("stalk_type") or "").replace("_", " ")
+        if stalk:
+            tags.append(stalk)
+        if ctx.get("divergence"):
+            tags.append("divergence")
+        clean = []
+        for item in tags:
+            item = str(item).strip()
+            if item and item not in clean:
+                clean.append(item)
+        return f" [{', '.join(clean)}]" if clean else ""
 
     def _find_wall(self, strikes: dict, side: str) -> Optional[dict]:
         best = None
@@ -630,10 +712,17 @@ class OITracker:
         self._ensure_today()
         signals = []
 
+        self._last_unusual_flow_skips = []
+
         for ticker, data in self._today.items():
             spot   = data.get("spot", 0)
             per_exp = data.get("per_exp", {})
             if not per_exp or spot <= 0:
+                if spot > 0:
+                    self._last_unusual_flow_skips.append({
+                        "ticker": ticker,
+                        "reason": "missing per-expiration OI snapshot",
+                    })
                 continue
 
             # Get yesterday's per-expiration snapshot for comparison
@@ -655,7 +744,7 @@ class OITracker:
             if prior_by_exp and today_by_exp:
                 for exp_str, exp_strikes in today_by_exp.items():
                     exp_data = per_exp.get(exp_str, {})
-                    dte = exp_data.get("dte", -1)
+                    dte, _dte_txt = _dte_label(exp_str, exp_data.get("dte", -1))
                     prior_exp_strikes = prior_by_exp.get(exp_str, {})
                     for key, oi in exp_strikes.items():
                         prev = prior_exp_strikes.get(key, 0)
@@ -686,34 +775,52 @@ class OITracker:
                             "direction": "above" if strike_val > spot else "below",
                         })
             else:
-                for key, oi in today_strikes.items():
-                    prev = prior_strikes.get(key, 0)
-                    delta = oi - prev
-                    if delta < OI_UNUSUAL_MIN_CONTRACTS:
-                        continue
-                    pct_chg = delta / prev if prev > 0 else 1.0
-                    if pct_chg < OI_UNUSUAL_PCT_THRESHOLD and prev > 0:
-                        continue
-                    parts = key.split("|")
-                    if len(parts) != 2:
-                        continue
-                    strike_val = float(parts[0])
-                    side = parts[1]
-                    dist_pct = abs(strike_val - spot) / spot * 100 if spot > 0 else 0
-                    moneyness = self._classify_strike(strike_val, side, spot)
-                    large_additions.append({
-                        "strike": strike_val,
-                        "side": side,
-                        "expiry": "aggregate",
-                        "dte": -1,
-                        "delta": delta,
-                        "pct_change": round(pct_chg * 100, 1),
-                        "current_oi": oi,
-                        "prior_oi": prev,
-                        "moneyness": moneyness,
-                        "dist_from_spot_pct": round(dist_pct, 1),
-                        "direction": "above" if strike_val > spot else "below",
+                reason_parts = []
+                if not prior_by_exp:
+                    reason_parts.append("prior strikes_by_exp missing")
+                if not today_by_exp:
+                    reason_parts.append("today strikes_by_exp missing")
+                if UNUSUAL_FLOW_REQUIRE_PER_EXPIRY and not UNUSUAL_FLOW_ALLOW_AGGREGATE_FALLBACK:
+                    self._last_unusual_flow_skips.append({
+                        "ticker": ticker,
+                        "reason": ", ".join(reason_parts) or "per-expiry data missing",
+                        "aggregate_strikes": len(today_strikes or {}),
                     })
+                    log.info(
+                        "OI unusual flow skipped aggregate-only %s lines for %s: %s",
+                        len(today_strikes or {}), ticker,
+                        ", ".join(reason_parts) or "per-expiry data missing",
+                    )
+                else:
+                    for key, oi in today_strikes.items():
+                        prev = prior_strikes.get(key, 0)
+                        delta = oi - prev
+                        if delta < OI_UNUSUAL_MIN_CONTRACTS:
+                            continue
+                        pct_chg = delta / prev if prev > 0 else 1.0
+                        if pct_chg < OI_UNUSUAL_PCT_THRESHOLD and prev > 0:
+                            continue
+                        parts = key.split("|")
+                        if len(parts) != 2:
+                            continue
+                        strike_val = float(parts[0])
+                        side = parts[1]
+                        dist_pct = abs(strike_val - spot) / spot * 100 if spot > 0 else 0
+                        moneyness = self._classify_strike(strike_val, side, spot)
+                        large_additions.append({
+                            "strike": strike_val,
+                            "side": side,
+                            "expiry": "aggregate",
+                            "dte": -1,
+                            "delta": delta,
+                            "pct_change": round(pct_chg * 100, 1),
+                            "current_oi": oi,
+                            "prior_oi": prev,
+                            "moneyness": moneyness,
+                            "dist_from_spot_pct": round(dist_pct, 1),
+                            "direction": "above" if strike_val > spot else "below",
+                            "missing_expiry": True,
+                        })
 
             if not large_additions:
                 continue
@@ -776,7 +883,7 @@ class OITracker:
     @staticmethod
     def _flow_horizon(dte: int) -> str:
         if dte is None or dte < 0:
-            return "aggregate across expirations"
+            return "expiry missing — diagnosis only"
         if dte == 0:
             return "0DTE intraday pressure"
         if dte <= 3:
@@ -817,36 +924,50 @@ class OITracker:
                 f"Puts: +{s['put_contracts_added']:,}"
             )
 
-            # Top strike additions — include expiry/DTE when available.
-            for st in s["top_strikes"][:3]:
+            # Top strike additions — every main-channel line must identify the
+            # exact option contract: strike + side + expiry + DTE.
+            printed_strikes = 0
+            for st in s["top_strikes"]:
+                exp = str(st.get("expiry", ""))[:10]
+                if not exp or exp == "aggregate":
+                    continue
                 emoji = "📞" if st["side"] == "call" else "📉"
-                exp = st.get("expiry", "aggregate")
-                dte = st.get("dte", -1)
-                dte_label = "DTE?" if dte is None or dte < 0 else ("0DTE" if dte == 0 else f"{dte}DTE")
-                horizon = self._flow_horizon(dte if dte is not None else -1)
-                exp_part = f" exp {exp} ({dte_label})" if exp and exp != "aggregate" else " aggregate exp"
+                dte, dte_label = _dte_label(exp, st.get("dte", -1))
+                horizon = self._flow_horizon(dte)
+                tag = self._confirmation_tag(s.get("ticker"), st.get("strike"), st.get("side"), exp)
                 lines.append(
-                    f"   {emoji} ${st['strike']:.0f} {st['side'].upper()}{exp_part} "
-                    f"+{st['delta']:,} ({st['pct_change']:+.0f}%) "
+                    f"   {emoji} ${st['strike']:.0f} {st['side'].upper()} exp {exp} ({dte_label}) "
+                    f"+{st['delta']:,} ({st['pct_change']:+.0f}%){tag} "
                     f"— {st['moneyness']} {st['dist_from_spot_pct']:.1f}% "
                     f"{'above' if st['direction'] == 'above' else 'below'} spot | {horizon}"
                 )
+                printed_strikes += 1
+                if printed_strikes >= 3:
+                    break
 
             # Per-expiration breakdown — show WHERE they're positioning
             exp_parts = []
             for exp_str, ed in sorted(s["per_exp"].items()):
-                dte = ed.get("dte", -1)
+                dte, dte_txt = _dte_label(exp_str, ed.get("dte", -1))
                 total = ed.get("total", 0)
                 bias = ed.get("bias", "")
                 if total >= OI_UNUSUAL_MIN_CONTRACTS and dte >= OI_FORWARD_MIN_DTE:
                     exp_short = exp_str[5:] if len(exp_str) > 5 else exp_str
                     bias_tag = f" {bias}" if bias and bias != "NEUTRAL" else ""
-                    exp_parts.append(f"{exp_short} ({dte}DTE: {total:,}{bias_tag})")
+                    exp_parts.append(f"{exp_short} ({dte_txt}: {total:,}{bias_tag})")
             if exp_parts:
                 lines.append(f"   📅 {' | '.join(exp_parts[:4])}")
 
             lines.append("")
 
+        if UNUSUAL_FLOW_SHOW_SKIPPED_COUNT and self._last_unusual_flow_skips:
+            skipped_tickers = [str(x.get("ticker")) for x in self._last_unusual_flow_skips[:5] if x.get("ticker")]
+            extra = len(self._last_unusual_flow_skips) - len(skipped_tickers)
+            suffix = f" +{extra} more" if extra > 0 else ""
+            lines.append(
+                "⚠️ Skipped aggregate-only OI lines missing contract expiry: "
+                + (", ".join(skipped_tickers) + suffix if skipped_tickers else str(len(self._last_unusual_flow_skips)))
+            )
         lines.append(f"Sweep covers {len(OI_SWEEP_TICKERS)} tickers | "
                      f"Forward DTE window: {OI_FORWARD_MIN_DTE}-{OI_FORWARD_MAX_DTE}")
         return "\n".join(lines)

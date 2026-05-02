@@ -36,6 +36,7 @@ TTL_FLOW_COOLDOWN = 2 * 3600      # 2h — alert dedup
 TTL_VOLUME_SNAPSHOT = 20 * 3600   # 20h — intraday volume tracking
 TTL_VOLUME_FLAG = 48 * 3600       # 48h — yesterday's flags for morning confirmation
 TTL_OI_BASELINE = 50 * 3600       # 50h — survives overnight + missed morning
+TTL_OI_CONFIRMATION_INDEX = 48 * 3600  # 48h — today's confirmed buildup/unwind lookup
 
 
 class PersistentState:
@@ -398,6 +399,144 @@ class PersistentState:
         except Exception as e:
             log.warning(f"Failed to flush conviction cooldowns: {e}")
             return 0
+
+    # ═══════════════════════════════════════════════════════
+    # OI CONFIRMATION INDEX — contract identity lookup for flow cards
+    # ═══════════════════════════════════════════════════════
+
+    @staticmethod
+    def _contract_key(ticker: str, strike: float, side: str, expiry: str) -> str:
+        """Stable key for one option contract: ticker|expiry|strike|side."""
+        try:
+            strike_txt = f"{float(strike):.2f}"
+        except Exception:
+            strike_txt = str(strike or "").strip()
+        return "|".join([
+            str(ticker or "").upper().strip(),
+            str(expiry or "")[:10],
+            strike_txt,
+            str(side or "").lower().strip(),
+        ])
+
+    def _oi_confirmation_index_key(self, date_str: str) -> str:
+        return f"oi_confirmation_index:{date_str}"
+
+    def get_oi_confirmation_index(self, date_str: str = None) -> dict:
+        """Load today's per-contract OI confirmation lookup."""
+        if date_str is None:
+            date_str = date.today().isoformat()
+        return self._json_get(self._oi_confirmation_index_key(date_str)) or {}
+
+    def save_oi_confirmation_index(self, date_str: str = None, confirmations: list = None,
+                                   rolls: list = None, stalks: list = None) -> bool:
+        """
+        Persist the contracts already classified by Morning OI Confirmation.
+
+        This does not create new trade logic. It only lets display cards such as
+        Unusual Flow reuse the existing buildup/unwinding/stalk/roll labels.
+        """
+        if date_str is None:
+            date_str = date.today().isoformat()
+        index = self.get_oi_confirmation_index(date_str)
+
+        for c in confirmations or []:
+            ticker = c.get("ticker")
+            expiry = c.get("expiry")
+            side = c.get("side")
+            strike = c.get("strike")
+            if not ticker or not expiry or not side or strike in (None, ""):
+                continue
+            flow_type = str(c.get("flow_type", "")).replace("confirmed_", "")
+            key = self._contract_key(ticker, strike, side, expiry)
+            existing = index.get(key, {}) if isinstance(index.get(key), dict) else {}
+            existing.update({
+                "ticker": str(ticker).upper(),
+                "expiry": str(expiry)[:10],
+                "strike": strike,
+                "side": str(side).lower(),
+                "flow_type": c.get("flow_type"),
+                "tag": flow_type or c.get("flow_type"),
+                "oi_change": c.get("oi_change"),
+                "oi_change_pct": c.get("oi_change_pct"),
+                "today_oi": c.get("today_oi"),
+                "yesterday_oi": c.get("yesterday_oi"),
+                "today_spot": c.get("today_spot"),
+                "price_change_pct": c.get("price_change_pct"),
+                "divergence": bool(c.get("divergence")),
+                "date": date_str,
+                "source": "morning_oi_confirmation",
+            })
+            index[key] = existing
+
+        for r in rolls or []:
+            ticker = r.get("ticker")
+            expiry = r.get("expiry")
+            side = r.get("side")
+            if not ticker or not expiry or not side:
+                continue
+            for role, strike_field in (("roll_from", "from_strike"), ("roll_to", "to_strike")):
+                strike = r.get(strike_field)
+                if strike in (None, ""):
+                    continue
+                key = self._contract_key(ticker, strike, side, expiry)
+                existing = index.get(key, {}) if isinstance(index.get(key), dict) else {}
+                tags = set(existing.get("tags", []) or [])
+                tags.add(role)
+                existing.update({
+                    "ticker": str(ticker).upper(),
+                    "expiry": str(expiry)[:10],
+                    "strike": strike,
+                    "side": str(side).lower(),
+                    "tag": existing.get("tag") or "roll",
+                    "roll": True,
+                    "roll_role": role,
+                    "roll_direction": r.get("direction"),
+                    "roll_contracts": r.get("contracts"),
+                    "roll_signal": r.get("signal"),
+                    "tags": sorted(tags),
+                    "date": date_str,
+                    "source": "morning_oi_confirmation",
+                })
+                index[key] = existing
+
+        for s in stalks or []:
+            ticker = s.get("ticker")
+            expiry = s.get("expiry")
+            side = s.get("side")
+            strike = s.get("strike")
+            if not ticker or not expiry or not side or strike in (None, ""):
+                continue
+            key = self._contract_key(ticker, strike, side, expiry)
+            existing = index.get(key, {}) if isinstance(index.get(key), dict) else {}
+            existing.update({
+                "ticker": str(ticker).upper(),
+                "expiry": str(expiry)[:10],
+                "strike": strike,
+                "side": str(side).lower(),
+                "flow_type": s.get("flow_type", existing.get("flow_type")),
+                "tag": str(s.get("flow_type", existing.get("tag", ""))).replace("confirmed_", "") or existing.get("tag"),
+                "stalk_type": s.get("stalk_type"),
+                "expected_direction": s.get("expected_direction"),
+                "oi_change": s.get("oi_change", existing.get("oi_change")),
+                "oi_change_pct": s.get("oi_change_pct", existing.get("oi_change_pct")),
+                "price_change_pct": s.get("price_change_pct", existing.get("price_change_pct")),
+                "divergence": bool(s.get("divergence", existing.get("divergence", False))),
+                "campaign_days": s.get("campaign_days"),
+                "date": date_str,
+                "source": "stalk_digest",
+            })
+            index[key] = existing
+
+        return self._json_set(self._oi_confirmation_index_key(date_str), index,
+                              TTL_OI_CONFIRMATION_INDEX)
+
+    def get_oi_confirmation_for(self, ticker: str, strike: float, side: str,
+                                expiry: str, date_str: str = None) -> Optional[dict]:
+        """Return persisted Morning OI/Stalk context for one exact contract."""
+        if date_str is None:
+            date_str = date.today().isoformat()
+        index = self.get_oi_confirmation_index(date_str)
+        return index.get(self._contract_key(ticker, strike, side, expiry))
 
     # ═══════════════════════════════════════════════════════
     # STALK ALERTS — persistent watchlist from confirmed flow
