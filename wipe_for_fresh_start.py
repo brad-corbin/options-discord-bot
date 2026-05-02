@@ -39,23 +39,39 @@ KEY_PREFIX = "omega:rec_tracker:"
 DASHBOARD_KEY_PREFIX = "dashboard:close_245:"
 
 # Files in BOT_LOG_DIR to clear. Headers regenerate automatically.
+# One CSV per Omega 3000 tab. Verified against app.py _append_csv_row sites.
 CSV_FILES = [
     "conviction_plays.csv",
     "scorer_decisions.csv",
     "signal_decisions.csv",
     "v2_peer_signals.csv",
-    "position_tracking_swing.csv",
+    "em_predictions.csv",
+    "em_reconciliation.csv",
     "shadow_signals.csv",
+    "crisis_put_signals.csv",
+    "scorer_suppressed_reposts.csv",
+    "position_tracking_swing.csv",
+    "position_tracking_income.csv",
+    "position_tracking_conviction.csv",
+    "position_tracking_shadow.csv",
 ]
 
 # Sheets — tab names to clear (rows 2+, leave header alone).
-DASHBOARD_3000_TABS = ["Position PnL", "Signal Log", "Dashboard"]
+# Verified against actual sheet 2026-05-02 — all 3 + 12 tabs.
+DASHBOARD_3000_TABS = ["Dashboard", "Signal Log", "Position PnL"]
 OMEGA_3000_TABS = [
     "conviction_plays",
     "scorer_decisions",
     "signal_decisions",
     "v2_peer_signals",
+    "em_predictions",
+    "em_reconciliation",
+    "shadow_signals",
+    "crisis_put_signals",
     "position_tracking_swing",
+    "position_tracking_income",
+    "position_tracking_conviction",
+    "position_tracking_shadow",
 ]
 
 
@@ -128,6 +144,30 @@ def wipe_csvs(dry_run: bool, backup_dir: str) -> int:
     return deleted
 
 
+def _load_sa_inline() -> dict | None:
+    """Inline equivalent of app._load_google_service_account.
+    Importing app.py would trigger the bot's background threads to start —
+    very bad to do from a maintenance script. Mirror the loader here so the
+    wipe script is self-contained.
+    """
+    import json
+    raw = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+    if raw:
+        try:
+            return json.loads(raw)
+        except Exception as e:
+            print(f"  ! GOOGLE_SERVICE_ACCOUNT_JSON parse failed: {e}")
+    file_path = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "").strip()
+    for p in (file_path, "/mnt/data/corbin-bot-tracking-0249b119c63f.json"):
+        if p and os.path.exists(p):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception as e:
+                print(f"  ! Failed to read SA file {p}: {e}")
+    return None
+
+
 def wipe_sheets(dry_run: bool) -> int:
     """Clear data rows on the named tabs of both Sheets, keeping the header row."""
     enabled = os.getenv("GOOGLE_SHEETS_ENABLE", "0").strip().lower() in ("1", "true", "yes", "on")
@@ -139,19 +179,32 @@ def wipe_sheets(dry_run: bool) -> int:
     if not dash_id and not omega_id:
         print("  ! No DASHBOARD_SHEET_ID or GOOGLE_SHEET_ID set — skipping Sheets wipe")
         return 0
-    # Build a service-account token. Reuses the bot's existing credential path.
-    try:
-        from app import _load_google_service_account
-    except Exception as e:
-        print(f"  ! couldn't import _load_google_service_account: {e}")
+    sa = _load_sa_inline()
+
+    # Build the list of (sheet_id, tab, label) we'd touch — independent of auth
+    # so dry-run can print the plan even without valid creds.
+    pairs = []
+    if dash_id:
+        for tab in DASHBOARD_3000_TABS:
+            pairs.append((dash_id, tab, "Dashboard 3000"))
+    if omega_id:
+        for tab in OMEGA_3000_TABS:
+            pairs.append((omega_id, tab, "Omega 3000"))
+
+    if dry_run:
+        print(f"  [DRY] would clear rows 2+ on {len(pairs)} tabs:")
+        for _, tab, label in pairs:
+            print(f"    - {label} → '{tab}'")
+        if not sa:
+            print("    (no SA creds — would also fail in real run)")
+        return len(pairs)
+
+    if not sa:
+        print("  ! Google service account creds not loaded — skipping Sheets wipe")
         return 0
     try:
         import jwt
         import requests
-        sa = _load_google_service_account()
-        if not sa:
-            print("  ! Google service account creds not loaded — skipping Sheets wipe")
-            return 0
         now = int(time.time())
         claim = {
             "iss": sa["client_email"],
@@ -176,21 +229,9 @@ def wipe_sheets(dry_run: bool) -> int:
         return 0
 
     cleared = 0
-    pairs = []
-    if dash_id:
-        for tab in DASHBOARD_3000_TABS:
-            pairs.append((dash_id, tab, "Dashboard 3000"))
-    if omega_id:
-        for tab in OMEGA_3000_TABS:
-            pairs.append((omega_id, tab, "Omega 3000"))
-
     for sheet_id, tab, label in pairs:
         rng = requests.utils.quote(f"{tab}!A2:Z", safe="!:")
         url = f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{rng}:clear"
-        if dry_run:
-            print(f"  [DRY] would clear {label} → '{tab}' rows 2+")
-            cleared += 1
-            continue
         try:
             resp = requests.post(
                 url,
