@@ -1,0 +1,27 @@
+{% extends "dashboard/base.html" %}
+
+{% block title %}Ω OMEGA — Portfolio{% endblock %}
+{% block brand_sub %}Portfolio · {{ active_account.label }}{% endblock %}
+
+{% block content %}
+<div class="phase1-stub fade-in">
+  <svg class="phase1-watermark" viewBox="0 0 100 100" fill="none">
+    <path d="M50 8 L82 22 L82 56 L70 76 L60 88 L40 88 L30 76 L18 56 L18 22 Z"
+          stroke="currentColor" stroke-width="0.5" fill="none"/>
+    <text x="50" y="62" text-anchor="middle" font-family="Russo One, sans-serif"
+          font-size="38" font-weight="700" fill="currentColor">Ω</text>
+  </svg>
+
+  <div class="phase1-title">Portfolio</div>
+  <div class="phase1-msg">
+    Manual entry forms for holdings, options (CSP/CC/long/spread), rolls,
+    cash deposits, and Kyleigh transfers land here in <strong>Phase 4</strong> —
+    after data durability is in place so existing-position entry never gets wiped.
+    Includes the campaign rollup at assignment for accurate cost basis.
+  </div>
+
+  <div class="phase1-meta">
+    Auto-tagging by trade type · Wheel CSP / CC / Roll · Day Trade · Long Call/Put · Spread · Earnings · IC / IIC
+  </div>
+</div>
+{% endblock %}

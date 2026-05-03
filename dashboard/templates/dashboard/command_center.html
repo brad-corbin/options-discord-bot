@@ -1,0 +1,61 @@
+{% extends "dashboard/base.html" %}
+
+{% block title %}Ω OMEGA — Command{% endblock %}
+{% block brand_sub %}Command · {{ active_account.label }}{% endblock %}
+
+{% block content %}
+<div class="phase1-stub fade-in">
+  <svg class="phase1-watermark" viewBox="0 0 100 100" fill="none">
+    <path d="M50 8 L82 22 L82 56 L70 76 L60 88 L40 88 L30 76 L18 56 L18 22 Z"
+          stroke="currentColor" stroke-width="0.5" fill="none"/>
+    <text x="50" y="62" text-anchor="middle" font-family="Russo One, sans-serif"
+          font-size="38" font-weight="700" fill="currentColor">Ω</text>
+  </svg>
+
+  <div class="phase1-title">Command Center</div>
+  <div class="phase1-msg">
+    The income hero, capital progression bars, holdings sentiment panel,
+    open positions, and today's alerts feed land here in <strong>Phase 3</strong>.
+    Right now you're looking at the framework — auth works, the account switcher
+    above changes the accent color across the page, and every nav target is wired up.
+  </div>
+
+  <div class="phase1-roadmap">
+    <div class="phase1-roadmap-item current">
+      <div class="phase1-roadmap-num">Phase 1 · Now</div>
+      <div class="phase1-roadmap-name">Auth & Navigation</div>
+      <div class="phase1-roadmap-status">Shipped — you're using it</div>
+    </div>
+    <div class="phase1-roadmap-item">
+      <div class="phase1-roadmap-num">Phase 2 · Next</div>
+      <div class="phase1-roadmap-name">Data Durability</div>
+      <div class="phase1-roadmap-status">Snapshots · audit log · restore</div>
+    </div>
+    <div class="phase1-roadmap-item">
+      <div class="phase1-roadmap-num">Phase 3</div>
+      <div class="phase1-roadmap-name">Read-only Views</div>
+      <div class="phase1-roadmap-status">Command + Trading live data</div>
+    </div>
+    <div class="phase1-roadmap-item">
+      <div class="phase1-roadmap-num">Phase 4</div>
+      <div class="phase1-roadmap-name">Portfolio Writes</div>
+      <div class="phase1-roadmap-status">Manual entry forms</div>
+    </div>
+    <div class="phase1-roadmap-item">
+      <div class="phase1-roadmap-num">Phase 5</div>
+      <div class="phase1-roadmap-name">Holdings Digest</div>
+      <div class="phase1-roadmap-status">Telegram + dashboard mirror</div>
+    </div>
+    <div class="phase1-roadmap-item">
+      <div class="phase1-roadmap-num">Phase 6</div>
+      <div class="phase1-roadmap-name">Diagnostic</div>
+      <div class="phase1-roadmap-status">Edge discovery aggregations</div>
+    </div>
+  </div>
+
+  <div class="phase1-meta">
+    Active account · <span class="accent">{{ active_account.label }}</span>
+    &nbsp;·&nbsp; Click any account chip above to switch
+  </div>
+</div>
+{% endblock %}

@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ω OMEGA — Login</title>
+<link rel="stylesheet" href="{{ url_for('dashboard.static', filename='omega.css') }}">
+</head>
+<body data-account="combined">
+
+<div class="login-shell">
+  <div class="login-card">
+    <div class="login-mark">
+      <svg viewBox="0 0 100 100" fill="none">
+        <path d="M50 8 L82 22 L82 56 L70 76 L60 88 L40 88 L30 76 L18 56 L18 22 Z"
+              stroke="currentColor" stroke-width="2" fill="none" opacity="0.9"/>
+        <path d="M50 8 L82 22 L82 56 L70 76 L60 88 L40 88 L30 76 L18 56 L18 22 Z"
+              stroke="currentColor" stroke-width="0.5" fill="none" opacity="0.4"
+              transform="scale(0.88) translate(7,7)"/>
+        <text x="50" y="62" text-anchor="middle" font-family="Russo One, sans-serif"
+              font-size="38" font-weight="700" fill="currentColor">Ω</text>
+      </svg>
+      <div class="login-mark-name">THE OMEGA</div>
+      <div class="login-mark-sub">3000 · Command Console</div>
+    </div>
+
+    <form class="login-form" method="POST" action="{{ url_for('dashboard.login') }}">
+      <label class="login-label" for="password">Password</label>
+      <input
+        class="login-input"
+        type="password"
+        name="password"
+        id="password"
+        autofocus
+        autocomplete="current-password"
+        spellcheck="false">
+      <button class="login-button" type="submit">Enter</button>
+      {% if error %}
+        <div class="login-error">{{ error }}</div>
+      {% endif %}
+    </form>
+  </div>
+</div>
+
+</body>
+</html>
