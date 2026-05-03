@@ -738,16 +738,37 @@ def portfolio_transfer_add():
     from . import writes
     recipient = request.form.get("recipient", "kyleigh")
     src_acct = request.form.get("acct", "brad")
+
+    # Phase 4.5 — direction toggle replaces "negative amount = reverse" magic
+    direction = request.form.get("direction", "pay")  # "pay" or "receive"
+    raw_amount = (request.form.get("amount") or "").strip()
+
+    # Always strip any sign the user typed; we'll apply direction
+    # ourselves so the form is unambiguous.
+    raw_clean = raw_amount.replace("$", "").replace(",", "").replace(" ", "").lstrip("-+")
+    try:
+        magnitude = float(raw_clean) if raw_clean else 0
+    except Exception:
+        magnitude = 0
+
+    if magnitude <= 0:
+        _flash("Transfer failed: enter a positive amount", "error")
+        return _bounce("transfers", src_acct)
+
+    # pay = positive (mom paying recipient); receive = negative (recipient sending in)
+    signed = magnitude if direction == "pay" else -magnitude
+
     result = writes.add_transfer(
         recipient=recipient,
         account=src_acct,
-        amount=request.form.get("amount"),
+        amount=signed,
         subaccount=request.form.get("subaccount"),
         date=request.form.get("date"),
         note=request.form.get("note"),
     )
     if result.get("ok"):
-        _flash(f"Transfer to {recipient.title()} · their balance now ${result['recipient_balance']:,.2f}", "success")
+        verb = "Paid" if direction == "pay" else "Received from"
+        _flash(f"{verb} {recipient.title()} ${magnitude:,.2f} · their balance now ${result['recipient_balance']:,.2f}", "success")
     else:
         _flash(f"Transfer failed: {result.get('error')}", "error")
     return _bounce("transfers", src_acct)

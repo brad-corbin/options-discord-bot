@@ -507,19 +507,24 @@ def calc_income_live(ui_account: str) -> Dict:
 # ─────────────────────────────────────────────────────────
 
 def calc_partner_summary(ui_account: str) -> Dict:
-    """Summary metrics for a partner profit-sharing ledger.
+    """Simple ledger summary for a partner profit-sharing account.
 
-    Walks the partner's cash ledger and computes:
-      - capital_in:        sum of deposit events (her money invested)
-      - distributions_out: sum of |withdrawal| events (paid out to her)
-      - outstanding:       capital_in − distributions_out (clamped to ≥ 0)
-                           = how much she has currently invested
-      - lifetime_gain:     distributions_out − capital_in (when positive)
-                           = realized profit she's received above her capital
-      - net_position:      raw signed flow (positive = she's still owed; negative = profit booked)
+    Per Brad's spec: track initial deposit + weekly income/loss + withdrawals.
+    Show whether the partner's total is up or down vs what they put in.
 
-    For the 'fully settled' case (Brad pays out capital + gains in one transfer),
-    outstanding = 0 and lifetime_gain = the gain portion of the payout.
+    Event types:
+      - deposit (positive)     = capital contribution
+      - withdrawal (negative)  = paid out to partner
+      - pnl (signed)           = weekly gain/loss attributed to partner
+      - transfer_out (signed)  = legacy auto-mirror entries (treated as withdrawals)
+
+    Computed:
+      - total_deposits:   sum of positive deposits
+      - total_withdrawals: |sum of negative withdrawals + transfer_out|
+      - net_pnl:          sum of pnl entries (positive = up, negative = down)
+      - current_balance:  total_deposits + net_pnl - total_withdrawals
+                          = what's currently in the partner's name
+      - direction:        "up" if net_pnl > 0, "down" if net_pnl < 0, "flat" otherwise
     """
     from . import writes
 
@@ -527,8 +532,9 @@ def calc_partner_summary(ui_account: str) -> Dict:
     if not accounts:
         return {"available": False, "is_partner": False}
 
-    capital_in = 0.0
-    distributions_out = 0.0
+    total_deposits = 0.0
+    total_withdrawals = 0.0
+    net_pnl = 0.0
     event_count = 0
     last_event_date = None
 
@@ -549,29 +555,34 @@ def calc_partner_summary(ui_account: str) -> Dict:
             d = ev.get("date") or ""
             if d and (last_event_date is None or d > last_event_date):
                 last_event_date = d
-            if ev_type == "deposit" and amt > 0:
-                capital_in += amt
-            elif ev_type in ("withdrawal", "transfer_out") and amt < 0:
-                distributions_out += abs(amt)
-            elif ev_type in ("withdrawal", "transfer_out") and amt > 0:
-                # Defensive: some entries may have positive amounts for withdrawals
-                distributions_out += amt
-            elif ev_type == "deposit" and amt < 0:
-                # Negative deposit ≈ withdrawal correction
-                distributions_out += abs(amt)
 
-    net_flow = capital_in - distributions_out  # +ve = still owed, -ve = profit booked
-    outstanding = max(0.0, net_flow)
-    lifetime_gain = max(0.0, -net_flow)
+            if ev_type == "deposit":
+                if amt >= 0:
+                    total_deposits += amt
+                else:
+                    total_withdrawals += abs(amt)
+            elif ev_type in ("withdrawal", "transfer_out"):
+                total_withdrawals += abs(amt)
+            elif ev_type == "pnl":
+                net_pnl += amt
+            # All other types ignored (manual_set, etc.)
+
+    current_balance = total_deposits + net_pnl - total_withdrawals
+    if net_pnl > 0.001:
+        direction = "up"
+    elif net_pnl < -0.001:
+        direction = "down"
+    else:
+        direction = "flat"
 
     return {
         "available": True,
         "is_partner": True,
-        "capital_in": round(capital_in, 2),
-        "distributions_out": round(distributions_out, 2),
-        "outstanding": round(outstanding, 2),
-        "lifetime_gain": round(lifetime_gain, 2),
-        "net_position": round(net_flow, 2),
+        "total_deposits": round(total_deposits, 2),
+        "total_withdrawals": round(total_withdrawals, 2),
+        "net_pnl": round(net_pnl, 2),
+        "current_balance": round(current_balance, 2),
+        "direction": direction,
         "event_count": event_count,
         "last_event_date": last_event_date,
     }
@@ -695,7 +706,13 @@ def get_cash_live(ui_account: str) -> Dict:
 
 def calc_capital_progression(ui_account: str) -> Dict:
     """Total capital tracked = cash + lump-sums + open option premium value held + open shares at cost.
-    Compared to total_deposited to show growth."""
+    Compared to total_deposited to show growth.
+
+    Phase 4.5: For non-partner views, partner ledger balances are SUBTRACTED so
+    the displayed capital reflects what actually belongs to the account holder.
+    Example: mom's brokerage holds $125k total, but $6k of it is Kyleigh's
+    capital + accrued profit-share. Mom's "true" capital = $119k.
+    """
     from . import writes
     accounts = underlying_accounts(ui_account)
     if not accounts:
@@ -723,16 +740,38 @@ def calc_capital_progression(ui_account: str) -> Dict:
                 if opt.get("direction", "sell") == "sell":
                     open_premium_collected += float(opt.get("premium") or 0) * int(opt.get("contracts") or 1) * 100
 
-    total_capital = cash_total + lumpsum_total + holdings_at_cost
-    growth = total_capital - deposited
-    growth_pct = (growth / deposited * 100.0) if deposited > 0 else 0.0
+    # Partner exclusion (Phase 4.5):
+    # For mom/combined/mine views, subtract any partner outstanding balances
+    # so capital tracking reflects what genuinely belongs to the holder.
+    # Skip for partner views themselves.
+    partner_balance_total = 0.0
+    partner_deposit_total = 0.0
+    if not is_partner_account(ui_account):
+        for partner_ui in ("kyleigh", "clay"):
+            try:
+                ps = calc_partner_summary(partner_ui)
+                if ps.get("available"):
+                    partner_balance_total += float(ps.get("current_balance") or 0)
+                    partner_deposit_total += float(ps.get("total_deposits") or 0)
+            except Exception:
+                pass
+
+    total_capital_raw = cash_total + lumpsum_total + holdings_at_cost
+    total_capital = total_capital_raw - partner_balance_total
+    deposited_net = deposited - partner_deposit_total
+    growth = total_capital - deposited_net
+    growth_pct = (growth / deposited_net * 100.0) if deposited_net > 0 else 0.0
 
     return {
         "available": True,
         "total_capital": round(total_capital, 2),
-        "deposited": round(deposited, 2),
+        "total_capital_raw": round(total_capital_raw, 2),
+        "deposited": round(deposited_net, 2),
+        "deposited_raw": round(deposited, 2),
         "growth": round(growth, 2),
         "growth_pct": round(growth_pct, 1),
+        "partner_balance_excluded": round(partner_balance_total, 2),
+        "partner_deposits_excluded": round(partner_deposit_total, 2),
         "components": {
             "cash": round(cash_total, 2),
             "lumpsum": round(lumpsum_total, 2),

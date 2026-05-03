@@ -356,15 +356,14 @@ def add_cash_event(account: str, event_type: str, amount: float,
 
     # Phase 4.5 — sign normalization based on event type.
     # User may have typed "+$100" for a withdrawal; we coerce to the right sign.
-    # Skip normalization for manual_set (intentional sign control).
+    # Skip normalization for manual_set (intentional sign control) and
+    # transfer_out (handled by add_transfer's bi-directional logic).
     if event_type == "withdrawal" and amt > 0:
         amt = -amt
     elif event_type == "deposit" and amt < 0:
         amt = -amt
     elif event_type == "fee" and amt > 0:
         amt = -amt  # Fees are always expenses
-    elif event_type == "transfer_out" and amt > 0:
-        amt = -amt
 
     date_iso = _validate_date(date) or datetime.now(timezone.utc).strftime("%Y-%m-%d")
     sub = (subaccount or "").strip() or DEFAULT_SUBACCOUNT

@@ -53,6 +53,8 @@
      ═══════════════════════════════════════════════════════ -->
 {% if sec == "cash" %}
 
+{% set is_partner_acct = acct in ['kyleigh', 'clay'] %}
+
 <div class="entry-form-wrap">
   <div class="form-section-title">CASH EVENT · <span class="muted">Account:</span> <strong>{{ acct_label|upper }}</strong></div>
 
@@ -62,16 +64,28 @@
     <div class="form-row">
       <div class="form-field">
         <label>Type</label>
+        {% if is_partner_acct %}
+        <select name="event_type" required>
+          <option value="deposit">Deposit (capital contribution)</option>
+          <option value="withdrawal">Withdrawal (paid out)</option>
+          <option value="pnl">Weekly P&L (gain or loss)</option>
+        </select>
+        {% else %}
         <select name="event_type" required>
           <option value="deposit">Deposit (initial capital, contribution)</option>
           <option value="withdrawal">Withdrawal</option>
           <option value="fee">Fee / Expense (Schwab fees, commissions — counts as P&L expense)</option>
           <option value="manual_set">Manual adjustment (does NOT count as P&L)</option>
         </select>
+        {% endif %}
       </div>
       <div class="form-field">
         <label>Amount ($)</label>
+        {% if is_partner_acct %}
+        <input type="text" inputmode="decimal" name="amount" required placeholder="e.g. 500 (gain) or -200 (loss)">
+        {% else %}
         <input type="text" inputmode="decimal" name="amount" required placeholder="e.g. 5256.78 (or -100 for withdrawal)">
+        {% endif %}
       </div>
       <div class="form-field">
         <label>Sub-account</label>
@@ -1302,7 +1316,14 @@
       <input type="hidden" name="recipient" value="{{ recipient }}">
       <div class="form-row">
         <div class="form-field">
-          <label>From</label>
+          <label>Direction</label>
+          <select name="direction" required>
+            <option value="pay">Pay {{ recipient|capitalize }} (their distribution)</option>
+            <option value="receive">Receive from {{ recipient|capitalize }} (their contribution)</option>
+          </select>
+        </div>
+        <div class="form-field">
+          <label>From account</label>
           <select name="acct" required>
             {% for a in d.all_accounts %}
               <option value="{{ a }}" {% if a == acct %}selected{% endif %}>{{ d.underlying_labels.get(a, a|capitalize) }}</option>
@@ -1311,7 +1332,7 @@
         </div>
         <div class="form-field">
           <label>Amount ($)</label>
-          <input type="text" inputmode="decimal" name="amount" required placeholder="e.g. 5256.78 (negative reverses)">
+          <input type="text" inputmode="decimal" name="amount" required placeholder="e.g. 5256.78">
         </div>
       </div>
       <div class="form-row">
