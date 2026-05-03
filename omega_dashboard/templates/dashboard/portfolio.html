@@ -209,6 +209,69 @@
   </form>
 </div>
 
+<!-- Phase 4.5 — Active Wheel Campaigns -->
+{% if d.active_campaigns %}
+<div class="data-panel campaigns-panel">
+  <div class="data-panel-header">
+    <div class="data-panel-title">Active Wheels · {{ acct_label }}</div>
+    <div class="data-panel-meta">{{ d.active_campaigns|length }} active</div>
+  </div>
+  <div class="campaigns-list">
+    {% for c in d.active_campaigns %}
+    <div class="campaign-card">
+      <input type="checkbox" id="camp-toggle-{{ loop.index0 }}" class="campaign-toggle" hidden>
+      <label for="camp-toggle-{{ loop.index0 }}" class="campaign-card-header">
+        <div class="campaign-title-row">
+          <span class="campaign-ticker">{{ c.ticker }}</span>
+          <span class="campaign-sub">· {{ c.subaccount }}</span>
+          <span class="campaign-status status-{{ c.status }}">{{ c.status|replace('_', ' ') }}</span>
+          <span class="campaign-chevron">▾</span>
+        </div>
+        <div class="campaign-rollup-line">
+          {% if c.rollup.shares_held and c.rollup.shares_held > 0 %}
+            <span>{{ c.rollup.shares_held }} sh @ ${{ "%.2f"|format(c.rollup.weighted_cost_basis or 0) }} cost</span>
+            {% if c.rollup.effective_basis %}
+              <span class="muted">· effective ${{ "%.2f"|format(c.rollup.effective_basis) }}</span>
+            {% endif %}
+          {% else %}
+            <span class="muted">No shares yet · CSP-only phase</span>
+          {% endif %}
+        </div>
+        <div class="campaign-rollup-line muted">
+          Premium collected: <strong class="amount-positive">${{ "{:,.0f}".format(c.rollup.total_premium or 0) }}</strong>
+          · {{ c.rollup.duration_days or 0 }} days
+          {% if c.rollup.cc_open_count and c.rollup.cc_open_count > 0 %}
+            · {{ c.rollup.cc_open_count - c.rollup.cc_closed_count }} CC open
+          {% endif %}
+          {% if c.rollup.csp_open_count and (c.rollup.csp_open_count - c.rollup.csp_closed_count) > 0 %}
+            · {{ c.rollup.csp_open_count - c.rollup.csp_closed_count }} CSP open
+          {% endif %}
+        </div>
+      </label>
+      <div class="campaign-events">
+        <div class="campaign-events-title">Events ({{ (c.events or [])|length }})</div>
+        {% for ev in c.events %}
+        <div class="campaign-event-row">
+          <span class="campaign-event-date mono muted">{{ ev.date or ev.open_date or '—' }}</span>
+          <span class="campaign-event-type">{{ ev.type|replace('_', ' ') }}</span>
+          <span class="campaign-event-detail mono muted">
+            {% if ev.strike %}${{ ev.strike }}{% endif %}
+            {% if ev.contracts %} ×{{ ev.contracts }}{% endif %}
+            {% if ev.premium %} prem ${{ ev.premium }}{% endif %}
+            {% if ev.close_premium %} close ${{ ev.close_premium }}{% endif %}
+            {% if ev.shares_acquired %} +{{ ev.shares_acquired }} sh{% endif %}
+            {% if ev.shares_sold %} -{{ ev.shares_sold }} sh{% endif %}
+            {% if ev.net_credit %} net ${{ ev.net_credit }}{% endif %}
+          </span>
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+</div>
+{% endif %}
+
 <div class="data-panel">
   <div class="data-panel-header">
     <div class="data-panel-title">Share Holdings · {{ acct_label }}</div>
@@ -450,6 +513,49 @@
     <div class="data-empty">No sold lots match your filters.</div>
     {% endif %}
   </div>
+
+  <!-- Phase 4.5 — Closed wheel campaigns -->
+  {% if d.closed_campaigns %}
+  <div class="data-panel" style="margin-top: 24px;">
+    <div class="data-panel-header">
+      <div class="data-panel-title">Closed Wheel Campaigns · {{ acct_label }}</div>
+      <div class="data-panel-meta">{{ d.closed_campaigns|length }} closed</div>
+    </div>
+    <div class="campaigns-list">
+      {% for c in d.closed_campaigns %}
+      <div class="campaign-card campaign-closed">
+        <div class="campaign-card-header campaign-closed-header">
+          <div class="campaign-title-row">
+            <span class="campaign-ticker">{{ c.ticker }}</span>
+            <span class="campaign-sub">· {{ c.subaccount }}</span>
+            <span class="campaign-status status-closed">CLOSED</span>
+            <span class="muted" style="margin-left:auto; font-size:10px;">
+              {{ c.opened_at }} → {{ c.closed_at }} ({{ c.rollup.duration_days or 0 }} days)
+            </span>
+          </div>
+          <div class="campaign-rollup-line">
+            Total premium:
+            <strong class="amount-positive">${{ "{:,.0f}".format(c.rollup.total_premium or 0) }}</strong>
+            · Share P&L:
+            <strong class="{% if (c.rollup.total_share_pnl or 0) >= 0 %}amount-positive{% else %}amount-negative{% endif %}">
+              {% if (c.rollup.total_share_pnl or 0) >= 0 %}+{% endif %}${{ "{:,.0f}".format(c.rollup.total_share_pnl or 0) }}
+            </strong>
+            · TOTAL:
+            <strong class="{% if (c.rollup.total_pnl or 0) >= 0 %}amount-positive{% else %}amount-negative{% endif %}">
+              {% if (c.rollup.total_pnl or 0) >= 0 %}+{% endif %}${{ "{:,.0f}".format(c.rollup.total_pnl or 0) }}
+            </strong>
+          </div>
+          <div class="campaign-rollup-line muted">
+            Events: {{ (c.events or [])|length }}
+            ({{ c.rollup.csp_open_count or 0 }} CSPs, {{ c.rollup.cc_open_count or 0 }} CCs)
+          </div>
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+  {% endif %}
+
   {% endif %}
 </div>
 
@@ -598,6 +704,30 @@
             <button type="submit" class="btn-primary-sm">Confirm</button>
             <a href="{{ url_for('dashboard.portfolio_section', section='rolls') }}?acct={{ acct }}&opt_id={{ o.id }}"
                class="btn-mini-link">Or roll →</a>
+          {% if o.type in ['CSP', 'CC'] and o.direction == 'sell' %}
+            <!-- Phase 4.5 — auto-handle assignment fields (only relevant when status=assigned) -->
+            <div class="auto-handle-strip">
+              {% if o.type == 'CSP' %}
+                <span class="auto-handle-arrow">↳ if assigned:</span>
+                <span class="auto-handle-text">buy <strong>{{ 100 * o.contracts }} {{ o.ticker }}</strong>
+                  @ <strong>${{ o.strike }}</strong>
+                  for <strong>${{ "{:,.0f}".format(100 * o.contracts * o.strike) }}</strong> (debits cash)</span>
+              {% else %}
+                <span class="auto-handle-arrow">↳ if assigned (called away):</span>
+                <span class="auto-handle-text">sell <strong>{{ 100 * o.contracts }} {{ o.ticker }}</strong>
+                  @ <strong>${{ o.strike }}</strong>
+                  for <strong>${{ "{:,.0f}".format(100 * o.contracts * o.strike) }}</strong> (credits cash)</span>
+              {% endif %}
+              <label class="auto-handle-radio-label">
+                <input type="radio" name="auto_handle_shares" value="1" checked> Auto
+              </label>
+              <label class="auto-handle-radio-label">
+                <input type="radio" name="auto_handle_shares" value="0"> Skip
+              </label>
+              <label style="margin-left:8px; font-size:9px;">Override fill $</label>
+              <input type="number" name="actual_fill_price" step="0.01" placeholder="{{ o.strike }}" style="max-width:80px;">
+            </div>
+          {% endif %}
           </form>
         </td>
       </tr>
@@ -1257,9 +1387,26 @@
     </form>
   </div>
 
+  <!-- Phase 4.5 — Maintenance section (not destructive, but separated from danger) -->
+  <div class="entry-form-wrap maintenance-wrap">
+    <div class="form-section-title">MAINTENANCE</div>
+    <p class="maintenance-text">
+      Tools for cleaning up legacy data. None of these are destructive — each fix is
+      individually undoable from the audit log.
+    </p>
+    <div class="maintenance-actions">
+      <a href="{{ url_for('dashboard.portfolio_retrofix_preview') }}" class="btn-primary-sm">
+        Retro-fix wheel assignments →
+      </a>
+      <span class="muted" style="font-size: 10px; margin-left: 12px;">
+        Scans audit log for past assignments that didn't auto-create share lots, lets you backfill them.
+      </span>
+    </div>
+  </div>
+
 </div>
 
-<!-- Audit log + undo (full width, below the grid) -->
+<!-- Audit log + undo (full width, below the grid) — Phase 4.5 enriched -->
 <div class="data-panel" style="margin-top: 32px;">
   <div class="data-panel-header">
     <div class="data-panel-title">Recent Activity · Undo Last Action</div>
@@ -1269,39 +1416,45 @@
   <p class="audit-help-text">
     Made a mistake? Click <strong>Undo</strong> on any entry below to reverse it. Undo handles
     cash reversal automatically — for a "Wheel CSP added" entry, undoing will delete the option
-    AND remove the cash credit. For closes and rolls, the position is reopened.
+    AND remove the cash credit. For closes and rolls, the position is reopened. <strong>Click any
+    row</strong> to see the full event details.
   </p>
 
   {% if d.recent_audits %}
-  <table class="data-table">
+  <table class="data-table audit-table">
     <thead>
       <tr>
-        <th>When</th>
-        <th>Account</th>
-        <th>Action</th>
-        <th>Target</th>
-        <th></th>
+        <th style="width: 130px;">When</th>
+        <th style="width: 80px;">Account</th>
+        <th>Action / Target</th>
+        <th style="width: 90px;"></th>
       </tr>
     </thead>
     <tbody>
       {% for a in d.recent_audits %}
-      <tr>
+      <tr class="audit-row">
         <td class="mono muted" style="white-space: nowrap;">{{ a.timestamp[:19].replace('T', ' ') if a.timestamp else "—" }}</td>
         <td><span class="acct-pill-dot dot-{{ a.account }}"></span>{{ a.account or "system" }}</td>
-        <td><span class="audit-op {% if a.undoable %}audit-op-undoable{% endif %}">{{ a.op }}</span></td>
-        <td class="mono muted">
-          {% if a.new_value and a.new_value is mapping %}
-            {% if a.new_value.ticker %}{{ a.new_value.ticker }}{% endif %}
-            {% if a.new_value.type %} {{ a.new_value.type }}{% endif %}
-            {% if a.new_value.strike %} ${{ a.new_value.strike }}{% endif %}
-            {% if a.new_value.amount is defined %}{{ a.new_value.amount }}{% endif %}
-            {% if not a.new_value.ticker and not a.new_value.amount %}{{ a.target[:30] }}{% endif %}
-          {% else %}{{ a.target[:30] if a.target else "—" }}{% endif %}
+        <td>
+          <input type="checkbox" class="audit-expand-toggle" id="audit-toggle-{{ loop.index0 }}" hidden>
+          <label for="audit-toggle-{{ loop.index0 }}" class="audit-row-label">
+            <span class="audit-op {% if a.undoable %}audit-op-undoable{% endif %}">{{ a.op }}</span>
+            <div class="audit-target">
+              <div class="audit-target-headline">{{ a.enriched.headline if a.enriched else a.target[:50] }}</div>
+              {% if a.enriched and a.enriched.detail %}
+              <div class="audit-target-detail">{{ a.enriched.detail }}</div>
+              {% endif %}
+            </div>
+            <span class="audit-expand-chevron">▾</span>
+          </label>
+          <div class="audit-expand-content">
+            <pre class="audit-json">{{ a.full_json or "(no payload)" }}</pre>
+          </div>
         </td>
         <td>
           {% if a.undoable %}
           <form method="POST" action="{{ url_for('dashboard.portfolio_audit_undo') }}" style="display:inline;"
-                onsubmit="return confirm('Undo this action?\n\n{{ a.op }} on {{ a.target[:40] }}\n\nThis will reverse the action and any linked cash events.')">
+                onsubmit="return confirm('Undo this action?\n\n{{ (a.enriched.headline if a.enriched else a.op)|replace('\n','') }}\n{{ (a.enriched.detail if a.enriched else a.target[:60])|replace('\n','') }}\n\nThis will reverse the action and any linked cash events.')">
             <input type="hidden" name="timestamp" value="{{ a.timestamp }}">
             <input type="hidden" name="op" value="{{ a.op }}">
             <input type="hidden" name="account" value="{{ a.account }}">

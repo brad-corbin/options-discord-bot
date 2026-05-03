@@ -2276,3 +2276,272 @@ body[data-account="clay"] {
 .amount-positive { color: var(--positive) !important; }
 .amount-negative { color: var(--negative) !important; }
 
+
+
+/* ══════════════════════════════════════════════════════════
+   PHASE 4.5 — Campaign cards, audit enrichment, auto-handle
+   ══════════════════════════════════════════════════════════ */
+
+/* ─── Auto-handle strip in close form ─── */
+.auto-handle-strip {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 8px 14px;
+  background: var(--bg-elev);
+  border-left: 2px solid var(--accent);
+  font-family: 'Outfit', sans-serif;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.auto-handle-arrow {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  color: var(--accent);
+  text-transform: uppercase;
+}
+.auto-handle-text { color: var(--text); flex: 1 1 auto; min-width: 200px; }
+.auto-handle-text strong { color: var(--accent); font-weight: 600; }
+.auto-handle-radio-label {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  color: var(--text);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+}
+.auto-handle-radio-label input[type="radio"] {
+  accent-color: var(--accent);
+  margin: 0;
+}
+
+/* ─── Audit log enrichment ─── */
+.audit-table .audit-row td {
+  vertical-align: top;
+  padding-top: 10px;
+  padding-bottom: 10px;
+}
+.audit-expand-toggle { display: none; }
+.audit-row-label {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: start;
+  gap: 12px;
+  cursor: pointer;
+  padding: 0;
+}
+.audit-row-label .audit-op { padding-top: 1px; }
+.audit-target {
+  font-family: 'Outfit', sans-serif;
+  line-height: 1.35;
+}
+.audit-target-headline {
+  font-size: 13px;
+  color: var(--text);
+  font-weight: 500;
+}
+.audit-target-detail {
+  font-size: 10px;
+  color: var(--text-muted);
+  letter-spacing: 0.02em;
+  margin-top: 2px;
+}
+.audit-expand-chevron {
+  color: var(--text-muted);
+  font-size: 10px;
+  transition: transform 0.15s ease;
+  user-select: none;
+  margin-top: 2px;
+}
+.audit-expand-toggle:checked ~ .audit-row-label .audit-expand-chevron {
+  transform: rotate(180deg);
+}
+.audit-expand-content {
+  display: none;
+  margin-top: 10px;
+  padding: 10px 14px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-left: 2px solid var(--accent);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  color: var(--text-muted);
+  line-height: 1.4;
+  max-height: 320px;
+  overflow: auto;
+}
+.audit-expand-toggle:checked ~ .audit-expand-content {
+  display: block;
+}
+.audit-json {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+/* ─── Campaign cards ─── */
+.campaigns-panel { margin-bottom: 24px; }
+.campaigns-list {
+  display: flex;
+  flex-direction: column;
+}
+.campaign-card {
+  border-bottom: 1px solid var(--border);
+}
+.campaign-card:last-child { border-bottom: none; }
+
+.campaign-toggle { display: none; }
+
+.campaign-card-header {
+  display: block;
+  padding: 14px 22px;
+  cursor: pointer;
+  transition: background 0.12s ease;
+}
+.campaign-card-header:hover { background: var(--bg-elev); }
+.campaign-closed-header { cursor: default; }
+.campaign-closed-header:hover { background: transparent; }
+
+.campaign-title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.campaign-ticker {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text);
+  letter-spacing: 0.04em;
+}
+.campaign-sub {
+  font-family: 'Outfit', sans-serif;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.campaign-status {
+  display: inline-block;
+  padding: 1px 7px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  border: 1px solid var(--border);
+  margin-left: auto;
+}
+.campaign-status.status-active_csp_phase {
+  color: var(--neutral);
+  border-color: var(--neutral);
+}
+.campaign-status.status-active_holding {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.campaign-status.status-closed {
+  color: var(--text-muted);
+  border-color: var(--text-muted);
+}
+.campaign-chevron {
+  color: var(--text-muted);
+  font-size: 10px;
+  margin-left: 8px;
+  transition: transform 0.15s ease;
+}
+.campaign-toggle:checked ~ .campaign-card-header .campaign-chevron {
+  transform: rotate(180deg);
+}
+
+.campaign-rollup-line {
+  font-family: 'Outfit', sans-serif;
+  font-size: 11px;
+  color: var(--text);
+  line-height: 1.5;
+}
+.campaign-rollup-line.muted { color: var(--text-muted); }
+.campaign-rollup-line strong { font-weight: 600; }
+
+.campaign-events {
+  display: none;
+  padding: 10px 28px 14px;
+  background: var(--bg-elev);
+  border-top: 1px dashed var(--border);
+}
+.campaign-toggle:checked ~ .campaign-events {
+  display: block;
+}
+.campaign-events-title {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+.campaign-event-row {
+  display: grid;
+  grid-template-columns: 90px 140px 1fr;
+  gap: 10px;
+  padding: 4px 0;
+  font-size: 11px;
+  border-bottom: 1px dotted var(--border);
+}
+.campaign-event-row:last-child { border-bottom: none; }
+.campaign-event-date {
+  font-size: 10px;
+}
+.campaign-event-type {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  color: var(--accent);
+  text-transform: uppercase;
+}
+.campaign-event-detail {
+  font-size: 10px;
+}
+
+/* ─── Maintenance section on Settings ─── */
+.maintenance-wrap {
+  border-top: 2px solid var(--border);
+  padding-top: 22px;
+  margin-top: 22px;
+}
+.maintenance-text {
+  font-family: 'Outfit', sans-serif;
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.5;
+  margin-bottom: 12px;
+}
+.maintenance-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+/* ─── Page-section header for retrofix etc. ─── */
+.page-content {
+  padding: 24px;
+}
+.page-section-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+.page-section-header h1 {
+  font-family: 'Russo One', sans-serif;
+  font-size: 22px;
+  letter-spacing: 0.04em;
+  color: var(--text);
+  margin: 0;
+}

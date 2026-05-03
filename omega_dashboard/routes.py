@@ -472,6 +472,12 @@ def portfolio_option_add():
 def portfolio_option_close(opt_id):
     from . import writes
     acct = request.form.get("acct", "brad")
+    # Phase 4.5 — auto-handle assignment (defaults to ON)
+    auto_handle_raw = request.form.get("auto_handle_shares", "1")
+    auto_handle = (auto_handle_raw or "1").strip() not in ("0", "false", "no", "")
+    actual_fill_raw = request.form.get("actual_fill_price", "").strip()
+    actual_fill = actual_fill_raw if actual_fill_raw else None
+
     result = writes.close_option(
         account=acct,
         opt_id=opt_id,
@@ -480,14 +486,24 @@ def portfolio_option_close(opt_id):
         close_date=request.form.get("close_date"),
         note=request.form.get("note"),
         contracts_to_close=request.form.get("contracts_to_close"),
+        auto_handle_shares=auto_handle,
+        actual_fill_price=actual_fill,
     )
     if result.get("ok"):
         if result.get("partial"):
             n_closed = result["closed_portion"]["contracts"]
             n_remaining = result["remaining"]["contracts"]
-            _flash(f"Closed {n_closed} contracts ({n_remaining} still open)", "success")
+            msg = f"Closed {n_closed} contracts ({n_remaining} still open)"
         else:
-            _flash(f"Option marked {result['option']['status']}", "success")
+            msg = f"Option marked {result['option']['status']}"
+        # Phase 4.5 — note the auto-handle outcome if it ran
+        if result.get("auto_handled"):
+            ar = result["auto_handled"]
+            if ar.get("kind") == "csp_assignment":
+                msg += f" · bought {ar['shares_acquired']} {ar['ticker']} @ ${ar['fill_price']}"
+            elif ar.get("kind") == "cc_called_away":
+                msg += f" · sold {ar['shares_sold']} {ar['ticker']} @ ${ar['fill_price']}"
+        _flash(msg, "success")
     else:
         _flash(f"Close failed: {result.get('error')}", "error")
     return _bounce("options", acct)
@@ -759,6 +775,62 @@ def portfolio_wipe():
     else:
         _flash(f"Wipe failed: {result.get('error')}", "error")
     return _bounce("settings", acct if acct != "ALL" else None)
+
+
+# ─── PHASE 4.5: RETRO-FIX WHEEL ASSIGNMENTS ──────────────
+
+@dashboard_bp.route("/portfolio/retrofix/wheel-assignments", methods=["GET"])
+@login_required
+def portfolio_retrofix_preview():
+    """Preview page for retro-fixing legacy assignments without share lots."""
+    from . import writes
+    scan = writes.retrofix_scan_assignments()
+    return render_page(
+        "dashboard/retrofix.html",
+        page_key="portfolio",
+        scan=scan,
+        underlying_labels=writes.UNDERLYING_LABELS,
+    )
+
+
+@dashboard_bp.route("/portfolio/retrofix/wheel-assignments", methods=["POST"])
+@login_required
+def portfolio_retrofix_apply():
+    """Apply selected retrofix candidates."""
+    from . import writes
+
+    selections = []
+    # Form fields are named: select_{i}, account_{i}, ticker_{i}, etc.
+    # We iterate through indices until we run out.
+    i = 0
+    while True:
+        if request.form.get(f"select_{i}") is None and \
+           request.form.get(f"account_{i}") is None:
+            break
+        if request.form.get(f"select_{i}") == "1":
+            selections.append({
+                "account": request.form.get(f"account_{i}", ""),
+                "ticker": request.form.get(f"ticker_{i}", ""),
+                "strike": request.form.get(f"strike_{i}", "0"),
+                "contracts": request.form.get(f"contracts_{i}", "1"),
+                "subaccount": request.form.get(f"subaccount_{i}", ""),
+                "close_date": request.form.get(f"close_date_{i}", ""),
+                "opt_id": request.form.get(f"opt_id_{i}", ""),
+            })
+        i += 1
+        if i > 500:
+            break  # safety
+
+    if not selections:
+        _flash("No assignments selected — nothing applied.", "info")
+        return redirect(url_for("dashboard.portfolio_section", section="settings"))
+
+    result = writes.retrofix_apply(selections)
+    msg = f"Applied {result.get('applied', 0)} fix(es)"
+    if result.get("skipped"):
+        msg += f" · {result['skipped']} skipped"
+    _flash(msg, "success" if result.get("applied") else "info")
+    return redirect(url_for("dashboard.portfolio_section", section="settings"))
 
 
 @dashboard_bp.route("/portfolio/settings/subaccount/add", methods=["POST"])

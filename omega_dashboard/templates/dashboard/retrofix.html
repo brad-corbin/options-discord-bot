@@ -1,0 +1,99 @@
+{% extends "dashboard/base.html" %}
+
+{% block content %}
+<div class="page-content">
+  <div class="page-section-header">
+    <h1>Retro-fix Wheel Assignments</h1>
+    <a href="{{ url_for('dashboard.portfolio_section', section='settings') }}" class="btn-mini-link">← Back to Settings</a>
+  </div>
+
+  <div class="data-panel" style="margin-top: 16px;">
+    <div class="data-panel-header">
+      <div class="data-panel-title">Scan Results</div>
+      <div class="data-panel-meta">{{ scan.total_candidates }} candidate{% if scan.total_candidates != 1 %}s{% endif %} found</div>
+    </div>
+
+    <p class="audit-help-text">
+      This tool scans the audit log for past <code>option_assigned</code> entries (CSPs that
+      were marked assigned <em>before</em> Phase 4.5's auto-handle was available) and offers
+      to backfill the share lot that should have been created.
+      <br><br>
+      Each fix:
+      <ul style="margin: 8px 0 8px 20px;">
+        <li>Creates a 100×N share lot at the option's strike</li>
+        <li>Auto-debits cash for the buy</li>
+        <li>Wires up the wheel campaign so it shows on the Holdings tab</li>
+        <li>Logs as <code>retrofix_assignment</code> — individually undoable</li>
+      </ul>
+      Already-fixed assignments (with matching share lots within 7 days) are <strong>not</strong> shown.
+    </p>
+
+    {% if scan.total_candidates == 0 %}
+      <div class="data-empty">
+        No candidates found. Either there are no legacy assignments, or all assignments already
+        have matching share lots.
+      </div>
+    {% else %}
+      <form method="POST" action="{{ url_for('dashboard.portfolio_retrofix_apply') }}">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th style="width: 40px;"><input type="checkbox" id="select-all" onclick="document.querySelectorAll('.retrofix-cb').forEach(c=>c.checked=this.checked)"></th>
+              <th>Account</th>
+              <th>Assignment</th>
+              <th class="numeric">Shares</th>
+              <th class="numeric">Cash impact</th>
+              <th>Sub-account</th>
+              <th>Date</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% set total_cash = namespace(v=0) %}
+            {% set i = namespace(v=0) %}
+            {% for account, cands in scan.candidates_by_account.items() %}
+              {% for c in cands %}
+                {% set total_cash.v = total_cash.v + c.cash_impact %}
+                <tr>
+                  <td>
+                    <input type="checkbox" class="retrofix-cb" name="select_{{ i.v }}" value="1" checked>
+                    <input type="hidden" name="account_{{ i.v }}" value="{{ account }}">
+                    <input type="hidden" name="ticker_{{ i.v }}" value="{{ c.ticker }}">
+                    <input type="hidden" name="strike_{{ i.v }}" value="{{ c.strike }}">
+                    <input type="hidden" name="contracts_{{ i.v }}" value="{{ c.contracts }}">
+                    <input type="hidden" name="subaccount_{{ i.v }}" value="{{ c.subaccount }}">
+                    <input type="hidden" name="close_date_{{ i.v }}" value="{{ c.close_date }}">
+                    <input type="hidden" name="opt_id_{{ i.v }}" value="{{ c.opt_id }}">
+                  </td>
+                  <td>{{ underlying_labels.get(account, account|capitalize) }}</td>
+                  <td class="mono">
+                    <strong>{{ c.ticker }}</strong> CSP ${{ c.strike }}
+                    {% if c.contracts > 1 %}<span class="muted">×{{ c.contracts }}</span>{% endif %}
+                  </td>
+                  <td class="numeric mono">{{ c.shares_to_add }}</td>
+                  <td class="numeric mono amount-negative">−${{ "{:,.0f}".format(c.cash_impact) }}</td>
+                  <td>{{ c.subaccount }}</td>
+                  <td class="mono muted">{{ c.close_date or "—" }}</td>
+                </tr>
+                {% set i.v = i.v + 1 %}
+              {% endfor %}
+            {% endfor %}
+            <tr>
+              <td colspan="4" style="text-align:right;"><strong>Total cash impact (all selected):</strong></td>
+              <td class="numeric mono amount-negative"><strong>−${{ "{:,.0f}".format(total_cash.v) }}</strong></td>
+              <td colspan="2"></td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div style="display:flex; gap:12px; margin-top: 16px; padding: 0 22px 16px;">
+          <button type="submit" class="btn-primary"
+                  onclick="return confirm('Apply selected retro-fixes?\n\nEach selected assignment will create a share lot, debit cash, and wire up its wheel campaign. All operations are individually undoable from the audit log.')">
+            Apply Selected
+          </button>
+          <a href="{{ url_for('dashboard.portfolio_section', section='settings') }}" class="btn-mini">Cancel</a>
+        </div>
+      </form>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

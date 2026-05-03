@@ -152,6 +152,11 @@ def _key_subaccount_list() -> str:
     return "omega:subaccounts"
 
 
+def _key_wheel_campaigns(account: str) -> str:
+    """Phase 4.5 — wheel campaign tracking (additive, never affects cash)."""
+    return f"{account}:portfolio:wheel_campaigns"
+
+
 # ─────────────────────────────────────────────────────────
 # Helpers — load/save JSON values
 # ─────────────────────────────────────────────────────────
@@ -385,12 +390,17 @@ def get_holdings(account: str) -> Dict[str, Dict]:
 
 def add_holding(account: str, ticker: str, shares: float, cost_basis: float,
                 subaccount: str = None, tag: str = None,
-                date: str = None) -> Dict:
+                date: str = None,
+                _from_assignment: bool = False) -> Dict:
     """Add or merge a share lot.
 
     If ticker already exists, this CREATES a new lot (we don't mutate the
     existing position — phase 4.5 may add cost-basis-merge logic, but for
     now multiple buys at different prices stay distinct).
+
+    _from_assignment: internal flag set by close_option auto-handle. Used
+    to suppress the duplicate campaign event (the close_option hook already
+    records csp_assigned with shares).
     """
     if not _validate_account(account):
         return {"ok": False, "error": "Invalid account"}
@@ -449,6 +459,17 @@ def add_holding(account: str, ticker: str, shares: float, cost_basis: float,
     )
 
     _audit(account, op, t, existing, holdings[t])
+
+    # Phase 4.5 — campaign hook (best-effort)
+    try:
+        from . import campaigns as _campaigns
+        _campaigns.hook_holding_added(
+            account, t, sh, cb, sub,
+            is_assignment=_from_assignment,
+        )
+    except Exception as e:
+        log.warning(f"campaign hook (add_holding) failed: {e}")
+
     return {"ok": True, "ticker": t, "holding": holdings[t]}
 
 
@@ -492,10 +513,14 @@ def edit_holding(account: str, ticker: str,
 
 def sell_holding(account: str, ticker: str, shares: float,
                  sell_price: float, date: str = None,
-                 note: str = None) -> Dict:
+                 note: str = None,
+                 _from_call_away: bool = False) -> Dict:
     """Reduce or remove a holding; logs a sell cash event.
 
     If shares == current shares, removes entirely.
+
+    _from_call_away: internal flag set by close_option auto-handle when CC
+    is called away. Suppresses duplicate campaign event tracking.
     """
     if not _validate_account(account):
         return {"ok": False, "error": "Invalid account"}
@@ -565,6 +590,17 @@ def sell_holding(account: str, ticker: str, shares: float,
     _save(_key_sold_lots(account), sold_lots)
 
     _audit(account, "sell_holding", t, old, {"sold_shares": sh, "sell_price": sp, "remaining": result_holding})
+
+    # Phase 4.5 — campaign hook (best-effort)
+    try:
+        from . import campaigns as _campaigns
+        _campaigns.hook_holding_sold(
+            account, t, sh, sp, sub,
+            is_call_away=_from_call_away,
+        )
+    except Exception as e:
+        log.warning(f"campaign hook (sell_holding) failed: {e}")
+
     return {"ok": True, "ticker": t, "remaining": result_holding, "proceeds": cash_amount}
 def delete_holding(account: str, ticker: str, also_delete_cash: bool = False) -> Dict:
     """Hard-remove a ticker from holdings. Optionally undo linked cash events
@@ -973,12 +1009,22 @@ def add_option(account: str, ticker: str, opt_type: str,
     )
 
     _audit(account, "add_option", opt["id"], None, opt)
+
+    # Phase 4.5 — wheel campaign tracking (best-effort, never raises)
+    try:
+        from . import campaigns as _campaigns
+        _campaigns.hook_option_added(account, opt)
+    except Exception as e:
+        log.warning(f"campaign hook (add_option) failed: {e}")
+
     return {"ok": True, "option": opt}
 
 
 def close_option(account: str, opt_id: str, status: str,
                  close_premium: float = None, close_date: str = None,
-                 note: str = None, contracts_to_close: int = None) -> Dict:
+                 note: str = None, contracts_to_close: int = None,
+                 auto_handle_shares: bool = True,
+                 actual_fill_price: float = None) -> Dict:
     """Close an open option. status: closed | expired | assigned | rolled.
 
     contracts_to_close: if provided and < total contracts on the option,
@@ -988,6 +1034,18 @@ def close_option(account: str, opt_id: str, status: str,
 
     For 'rolled', use the dedicated roll_option() helper instead — this just
     marks status=rolled if you want to do it manually.
+
+    Phase 4.5 — auto-handle assignment:
+      - When status='assigned' on a sell-side CSP and auto_handle_shares=True:
+        automatically creates a share lot at strike (or actual_fill_price if
+        provided), which debits cash via the existing add_holding path.
+      - When status='assigned' on a sell-side CC and auto_handle_shares=True:
+        automatically sells shares (called away) at strike, which credits
+        cash via the existing sell_holding path.
+      - The auto-handle audit op is `option_assigned_with_shares` (or
+        `cc_called_away_with_shares` for CC) so retro-fix can distinguish
+        from legacy `option_assigned`.
+      - actual_fill_price overrides strike for both basis and cash math (rare).
     """
     if not _validate_account(account):
         return {"ok": False, "error": "Invalid account"}
@@ -1017,6 +1075,26 @@ def close_option(account: str, opt_id: str, status: str,
         cp = 0.0
     close_iso = _validate_date(close_date) or datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
+    # Resolve fill price for assignment (strike unless overridden)
+    fill_f = _to_float(actual_fill_price)
+    if fill_f is None or fill_f <= 0:
+        fill_f = float(target.get("strike") or 0)
+
+    # Snapshot fields needed after potential save
+    sub = target.get("subaccount") or DEFAULT_SUBACCOUNT
+    direction = target.get("direction", "sell")
+    ticker = target.get("ticker")
+    opt_type = target.get("type")
+    strike = float(target.get("strike") or 0)
+
+    # Determine whether to actually run auto-handle
+    do_auto_handle = (
+        bool(auto_handle_shares)
+        and status == "assigned"
+        and direction == "sell"
+        and opt_type in ("CSP", "CC")
+    )
+
     if is_partial:
         # Create a new "closed-portion" option record with n_to_close contracts
         closed_portion = dict(target)
@@ -1028,6 +1106,9 @@ def close_option(account: str, opt_id: str, status: str,
         closed_portion["close_note"] = (note or "").strip()
         closed_portion["closed_at"] = _now_iso()
         closed_portion["partial_of"] = opt_id  # Reference to original
+        if status == "assigned" and do_auto_handle:
+            closed_portion["actual_fill_price"] = fill_f
+            closed_portion["auto_handled_shares"] = True
         options.append(closed_portion)
 
         # Reduce original to remaining contracts
@@ -1037,9 +1118,7 @@ def close_option(account: str, opt_id: str, status: str,
         if not _save(_key_options(account), options):
             return {"ok": False, "error": "Save failed"}
 
-        # Cash event for the closed portion
-        sub = target.get("subaccount") or DEFAULT_SUBACCOUNT
-        direction = target.get("direction", "sell")
+        # Cash event for the closed portion (BTC-style close only)
         if status == "closed" and cp > 0:
             if direction == "sell":
                 cash_amount = -(cp * n_to_close * 100)
@@ -1048,23 +1127,52 @@ def close_option(account: str, opt_id: str, status: str,
             add_cash_event(
                 account, "option_close", cash_amount,
                 subaccount=sub, date=close_iso,
-                note=f"BTC {n_to_close}/{total_contracts} {target.get('type')} {target.get('ticker')} {target.get('strike')} @ {cp}",
+                note=f"BTC {n_to_close}/{total_contracts} {opt_type} {ticker} {strike} @ {cp}",
                 ref_id=closed_portion["id"],
             )
 
-        _audit(account, f"partial_close_option", opt_id, old, {
+        # Auto-handle for partial assignments
+        auto_result = None
+        if do_auto_handle:
+            auto_result = _execute_auto_handle(
+                account, closed_portion, n_to_close, fill_f, close_iso
+            )
+
+        audit_payload = {
             "original": old,
             "remaining_contracts": target["contracts"],
             "closed_portion_id": closed_portion["id"],
             "closed_contracts": n_to_close,
             "status": status,
             "close_premium": cp,
-        })
+        }
+        if auto_result:
+            audit_payload["auto_handled"] = True
+            audit_payload["auto_result"] = auto_result
+
+        _audit(account, f"partial_close_option", opt_id, old, audit_payload)
+
+        # Phase 4.5 — campaign hook for partial assignments
+        if status == "assigned" and do_auto_handle and auto_result:
+            try:
+                from . import campaigns as _campaigns
+                _campaigns.hook_option_closed(
+                    account, closed_portion, status,
+                    close_premium=cp, close_date=close_iso,
+                    auto_handled_shares=True,
+                    shares_acquired=auto_result.get("shares_acquired", 0),
+                    shares_sold=auto_result.get("shares_sold", 0),
+                    actual_fill_price=fill_f,
+                )
+            except Exception as e:
+                log.warning(f"campaign hook (partial close) failed: {e}")
+
         return {
             "ok": True,
             "partial": True,
             "remaining": target,
             "closed_portion": closed_portion,
+            "auto_handled": auto_result,
         }
 
     # Full close path
@@ -1073,13 +1181,14 @@ def close_option(account: str, opt_id: str, status: str,
     target["close_date"] = close_iso
     target["close_note"] = (note or "").strip()
     target["closed_at"] = _now_iso()
+    if status == "assigned" and do_auto_handle:
+        target["actual_fill_price"] = fill_f
+        target["auto_handled_shares"] = True
 
     if not _save(_key_options(account), options):
         return {"ok": False, "error": "Save failed"}
 
-    sub = target.get("subaccount") or DEFAULT_SUBACCOUNT
-    contracts = int(target.get("contracts") or 1)
-    direction = target.get("direction", "sell")
+    contracts = int(total_contracts)
 
     if status == "closed" and cp > 0:
         if direction == "sell":
@@ -1089,12 +1198,110 @@ def close_option(account: str, opt_id: str, status: str,
         add_cash_event(
             account, "option_close", cash_amount,
             subaccount=sub, date=close_iso,
-            note=f"BTC {target.get('type')} {target.get('ticker')} {target.get('strike')} @ {cp}",
+            note=f"BTC {opt_type} {ticker} {strike} @ {cp}",
             ref_id=opt_id,
         )
 
-    _audit(account, f"option_{status}", opt_id, old, target)
-    return {"ok": True, "option": target}
+    # Phase 4.5 — auto-handle assignment for full closes
+    auto_result = None
+    if do_auto_handle:
+        auto_result = _execute_auto_handle(
+            account, target, contracts, fill_f, close_iso
+        )
+
+    # Audit op: distinguish auto-handled from legacy for retro-fix
+    if status == "assigned" and do_auto_handle and auto_result:
+        if opt_type == "CSP":
+            audit_op = "option_assigned_with_shares"
+        else:  # CC
+            audit_op = "cc_called_away_with_shares"
+    else:
+        audit_op = f"option_{status}"
+
+    _audit(account, audit_op, opt_id, old, target)
+
+    # Phase 4.5 — campaign hook
+    try:
+        from . import campaigns as _campaigns
+        _campaigns.hook_option_closed(
+            account, target, status,
+            close_premium=cp, close_date=close_iso,
+            auto_handled_shares=do_auto_handle and (auto_result is not None),
+            shares_acquired=(auto_result or {}).get("shares_acquired", 0),
+            shares_sold=(auto_result or {}).get("shares_sold", 0),
+            actual_fill_price=fill_f if do_auto_handle else None,
+        )
+    except Exception as e:
+        log.warning(f"campaign hook (close_option) failed: {e}")
+
+    result = {"ok": True, "option": target}
+    if auto_result:
+        result["auto_handled"] = auto_result
+    return result
+
+
+def _execute_auto_handle(account: str, opt: Dict, contracts_closed: int,
+                           fill_price: float, close_date: str) -> Optional[Dict]:
+    """Execute the share creation/removal that goes with an assignment.
+
+    For CSP assigned: buy 100 × N shares at fill_price.
+    For CC called away: sell 100 × N shares at fill_price.
+
+    Returns a dict describing what happened, or None if nothing applicable.
+    Mistakes here are non-fatal — the option close already succeeded.
+    """
+    try:
+        opt_type = opt.get("type")
+        ticker = opt.get("ticker")
+        sub = opt.get("subaccount") or DEFAULT_SUBACCOUNT
+        shares = 100 * int(contracts_closed)
+
+        if opt_type == "CSP":
+            # Buy shares (debits cash via add_holding)
+            r = add_holding(
+                account, ticker,
+                shares=shares, cost_basis=fill_price,
+                subaccount=sub, tag="wheel",
+                date=close_date,
+                _from_assignment=True,
+            )
+            if r.get("ok"):
+                return {
+                    "kind": "csp_assignment",
+                    "shares_acquired": shares,
+                    "fill_price": fill_price,
+                    "cost": shares * fill_price,
+                    "ticker": ticker,
+                    "subaccount": sub,
+                }
+            log.warning(f"auto_handle add_holding failed: {r.get('error')}")
+            return None
+
+        elif opt_type == "CC":
+            # Called away: sell shares (credits cash via sell_holding)
+            r = sell_holding(
+                account, ticker,
+                shares=shares, sell_price=fill_price,
+                date=close_date,
+                note=f"Called away via CC (auto-handled)",
+                _from_call_away=True,
+            )
+            if r.get("ok"):
+                return {
+                    "kind": "cc_called_away",
+                    "shares_sold": shares,
+                    "fill_price": fill_price,
+                    "proceeds": shares * fill_price,
+                    "ticker": ticker,
+                    "subaccount": sub,
+                }
+            log.warning(f"auto_handle sell_holding failed: {r.get('error')}")
+            return None
+
+    except Exception as e:
+        log.warning(f"_execute_auto_handle failed: {e}")
+        return None
+    return None
 
 
 def edit_spread(account: str, spread_id: str, **fields) -> Dict:
@@ -1359,6 +1566,16 @@ def roll_option(account: str, opt_id: str,
     )
 
     _audit(account, "roll_option", opt_id, old, {"closed": target, "new": new_opt})
+
+    # Phase 4.5 — campaign hook
+    try:
+        from . import campaigns as _campaigns
+        _campaigns.hook_option_rolled(account, target, new_opt,
+                                       net_credit=round(net_credit, 2),
+                                       roll_date=roll_iso)
+    except Exception as e:
+        log.warning(f"campaign hook (roll_option) failed: {e}")
+
     return {"ok": True, "closed": target, "new_option": new_opt, "net_credit": round(net_credit, 2)}
 
 
@@ -1678,6 +1895,233 @@ def delete_transfer(recipient: str, transfer_id: str) -> Dict:
 # WIPE — Settings sub-tab
 # ═════════════════════════════════════════════════════════
 
+# ═════════════════════════════════════════════════════════
+# PHASE 4.5 — RETRO-FIX WHEEL ASSIGNMENTS
+# Scans audit log for legacy `option_assigned` entries (without auto-handled
+# shares) and offers to backfill the share lots.
+# ═════════════════════════════════════════════════════════
+
+def retrofix_scan_assignments() -> Dict:
+    """Scan all accounts for legacy `option_assigned` audit entries that
+    were never followed by a matching share lot.
+
+    Returns a dict with per-account candidate lists. Each candidate has the
+    info needed to create the missing share lot.
+    """
+    try:
+        from . import durability
+        # Pull a generous slice — assignments aren't super frequent
+        raw = durability.list_audit_entries(limit=500)
+    except Exception:
+        raw = []
+
+    # Build per-account list of subsequent share-buy events keyed by ticker
+    # (so we can verify whether a matching lot was added shortly after the
+    # assignment).
+    per_account_assignments = {}  # account → list of candidate dicts
+    per_account_share_buys = {}   # account → list of (ticker, date) tuples
+
+    for entry in raw:
+        try:
+            new_v = json.loads(entry["new_value"]) if entry.get("new_value") else None
+        except Exception:
+            new_v = None
+
+        op = entry.get("op", "")
+        account = entry.get("account", "")
+        target = entry.get("target", "")
+        ts = entry.get("timestamp", "")
+
+        if op == "option_assigned":
+            # Legacy: no auto-handled shares
+            if not isinstance(new_v, dict):
+                continue
+            opt_type = new_v.get("type")
+            if opt_type != "CSP":
+                continue  # CC assignments need different handling
+            direction = new_v.get("direction", "sell")
+            if direction != "sell":
+                continue
+            ticker = new_v.get("ticker")
+            strike = new_v.get("strike")
+            contracts = new_v.get("contracts") or 1
+            sub = new_v.get("subaccount") or DEFAULT_SUBACCOUNT
+            close_date = new_v.get("close_date") or ""
+            if not ticker or not strike:
+                continue
+            cand = {
+                "audit_timestamp": ts,
+                "audit_target": target,  # opt_id
+                "account": account,
+                "ticker": ticker,
+                "strike": float(strike),
+                "contracts": int(contracts),
+                "subaccount": sub,
+                "close_date": close_date,
+                "shares_to_add": 100 * int(contracts),
+                "cash_impact": 100 * int(contracts) * float(strike),
+                "opt_id": target,
+            }
+            per_account_assignments.setdefault(account, []).append(cand)
+
+        elif op in ("add_holding", "add_to_holding"):
+            if not isinstance(new_v, dict):
+                continue
+            ticker = target
+            date = (new_v.get("first_added")
+                     or new_v.get("last_updated", "")[:10]
+                     or ts[:10])
+            per_account_share_buys.setdefault(account, []).append((ticker, date))
+
+    # Filter out candidates that DO appear to have a matching share lot within
+    # 7 days of the assignment date.
+    from datetime import datetime as _dt, timedelta as _td
+
+    filtered = {}
+    for account, cands in per_account_assignments.items():
+        share_buys = per_account_share_buys.get(account, [])
+        keep = []
+        for c in cands:
+            # Try to parse close_date
+            cd = c.get("close_date") or c.get("audit_timestamp", "")[:10]
+            try:
+                ass_date = _dt.strptime(cd[:10], "%Y-%m-%d")
+            except Exception:
+                # If we can't parse, keep the candidate (better safe than sorry)
+                keep.append(c)
+                continue
+
+            # Look for a share buy of same ticker within 7 days after
+            matched = False
+            for (t, d) in share_buys:
+                if t != c["ticker"]:
+                    continue
+                try:
+                    bd = _dt.strptime(d[:10], "%Y-%m-%d")
+                except Exception:
+                    continue
+                delta = (bd - ass_date).days
+                if 0 <= delta <= 7:
+                    matched = True
+                    break
+            if not matched:
+                keep.append(c)
+        filtered[account] = keep
+
+    total = sum(len(v) for v in filtered.values())
+    return {
+        "candidates_by_account": filtered,
+        "total_candidates": total,
+    }
+
+
+def retrofix_apply(selections: List[Dict]) -> Dict:
+    """Apply selected retrofix candidates.
+
+    selections: list of dicts each containing:
+      account, ticker, strike, contracts, subaccount, close_date, opt_id
+
+    For each selection: creates the missing share lot via add_holding (which
+    auto-debits cash), wires up the campaign, and audits as `retrofix_assignment`
+    so it can be individually undone.
+    """
+    applied = 0
+    skipped = 0
+    errors = []
+
+    for sel in selections:
+        try:
+            account = sel.get("account")
+            ticker = sel.get("ticker")
+            strike = float(sel.get("strike") or 0)
+            contracts = int(sel.get("contracts") or 1)
+            sub = sel.get("subaccount") or DEFAULT_SUBACCOUNT
+            close_date = sel.get("close_date") or ""
+            opt_id = sel.get("opt_id") or ""
+
+            if not _validate_account(account) or not ticker or strike <= 0:
+                skipped += 1
+                errors.append(f"Skipped invalid: {sel}")
+                continue
+
+            shares = 100 * contracts
+
+            # Add the share lot (this auto-creates a cash debit via add_holding)
+            r = add_holding(
+                account, ticker,
+                shares=shares, cost_basis=strike,
+                subaccount=sub, tag="wheel",
+                date=close_date or None,
+                _from_assignment=True,  # suppress duplicate campaign event
+            )
+            if not r.get("ok"):
+                skipped += 1
+                errors.append(f"add_holding failed for {ticker}: {r.get('error')}")
+                continue
+
+            # Wire up the campaign manually (since _from_assignment suppressed the auto path).
+            # Mimic what hook_option_closed would have done:
+            try:
+                from . import campaigns as _campaigns
+                holding = _campaigns.get_active_holding_campaign(account, ticker, sub)
+                csp_camp = _campaigns.find_csp_only_campaign(account, ticker, sub, opt_id)
+                event = {
+                    "type": "csp_assigned",
+                    "id": opt_id,
+                    "contracts": contracts,
+                    "strike": strike,
+                    "shares_acquired": shares,
+                    "auto_handled": True,
+                    "retrofixed": True,
+                    "date": close_date or datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                }
+                if csp_camp and holding:
+                    _campaigns.attach_event(account, csp_camp["id"], event)
+                    _campaigns.merge_csp_into_holding(account, csp_camp["id"], holding["id"])
+                elif csp_camp and not holding:
+                    _campaigns.attach_event(account, csp_camp["id"], event)
+                    _campaigns.transition_to_holding(account, csp_camp["id"])
+                elif holding and not csp_camp:
+                    _campaigns.attach_event(account, holding["id"], event)
+                else:
+                    new_camp = _campaigns.start_campaign(account, ticker, sub, event)
+                    if new_camp:
+                        _campaigns.transition_to_holding(account, new_camp["id"])
+            except Exception as e:
+                log.warning(f"retrofix campaign wiring failed for {ticker}: {e}")
+
+            # Audit as a distinct, undoable operation
+            _audit(
+                account, "retrofix_assignment", opt_id or ticker, None,
+                {
+                    "ticker": ticker,
+                    "strike": strike,
+                    "contracts": contracts,
+                    "subaccount": sub,
+                    "close_date": close_date,
+                    "shares_added": shares,
+                    "cash_impact": -shares * strike,
+                    "opt_id": opt_id,
+                },
+            )
+            applied += 1
+
+        except Exception as e:
+            skipped += 1
+            errors.append(f"Exception: {e}")
+
+    return {
+        "ok": True,
+        "applied": applied,
+        "skipped": skipped,
+        "errors": errors,
+    }
+
+
+# ═════════════════════════════════════════════════════════
+# WIPE
+# ═════════════════════════════════════════════════════════
+
 def wipe_account(account: str, confirmation: str) -> Dict:
     """Wipe portfolio data for an account.
 
@@ -1706,11 +2150,14 @@ def wipe_account(account: str, confirmation: str) -> Dict:
         _key_cash(account),
         _key_cash_ledger(account),
         _key_lumpsum(account),
+        _key_sold_lots(account),
+        _key_wheel_campaigns(account),
     ]
 
     cleared = []
     for key in keys_to_clear:
-        if _save(key, [] if "ledger" in key or "options" in key or "spreads" in key or "lumpsum" in key else {}):
+        empty_val = "[]" if any(s in key for s in ("ledger", "options", "spreads", "lumpsum", "sold_lots", "campaigns")) else "{}"
+        if _store_set(key, empty_val):
             cleared.append(key)
 
     _audit(account, "WIPE_ACCOUNT", account, {"snapshot": snap_result.get("tab")}, {"keys_cleared": cleared})
@@ -1820,6 +2267,19 @@ def portfolio_page_data(active_underlying: str = None,
         out["closed_spreads"] = []
         out["sold_lots"] = []
 
+    # Phase 4.5 — wheel campaigns
+    try:
+        from . import campaigns as _campaigns
+        out["active_campaigns"] = _campaigns.get_active_campaigns(acc)
+        if show_closed:
+            out["closed_campaigns"] = _campaigns.get_closed_campaigns(acc)
+        else:
+            out["closed_campaigns"] = []
+    except Exception as e:
+        log.warning(f"campaigns load failed (non-fatal): {e}")
+        out["active_campaigns"] = []
+        out["closed_campaigns"] = []
+
     return out
 
 
@@ -1836,6 +2296,9 @@ UNDOABLE_OPS = {
     # Position closes → revert status, reverse close cash
     "option_closed", "option_expired", "option_assigned",
     "spread_closed", "spread_expired",
+    # Phase 4.5 — auto-handled assignments (CSP buy & CC called away)
+    "option_assigned_with_shares", "cc_called_away_with_shares",
+    "partial_close_option",
     # Cash events
     "cash_deposit", "cash_withdrawal", "cash_share_buy", "cash_share_sell",
     "cash_option_open", "cash_option_close", "cash_spread_open", "cash_spread_close",
@@ -1846,11 +2309,282 @@ UNDOABLE_OPS = {
     # Transfers
     "transfer_kyleigh", "transfer_clay",
     "roll_option",
+    # Phase 4.5 — retro-fix
+    "retrofix_assignment",
 }
 
 
+def _enrich_audit_target(entry: Dict) -> Dict:
+    """Phase 4.5 — Build a human-readable target description from audit entry.
+
+    Returns dict with:
+      headline: short string (e.g. "LMND CSP $80")
+      detail:   small muted line (e.g. "exp 2026-06-20 · ×2 · Volkman Wheel · opened 2026-04-15")
+      kind:     one of: option, holding, cash, spread, lumpsum, transfer, system, other
+
+    Falls back to the raw target if data is sparse.
+    """
+    op = entry.get("op", "") or ""
+    target = entry.get("target", "") or ""
+    nv = entry.get("new_value")
+    ov = entry.get("old_value")
+
+    # Use new_value when available, fall back to old_value
+    payload = nv if isinstance(nv, dict) else (ov if isinstance(ov, dict) else None)
+
+    # Helper to dollar-format
+    def _money(v):
+        try:
+            f = float(v)
+            return f"${int(f)}" if f == int(f) else f"${f:.2f}"
+        except Exception:
+            return f"${v}"
+
+    # ─── Options ───
+    if op in ("add_option", "edit_option", "option_closed", "option_expired",
+              "option_assigned", "option_assigned_with_shares",
+              "cc_called_away_with_shares",
+              "partial_close_option"):
+        # For partial_close_option, the original is in payload.original
+        opt = payload
+        if op == "partial_close_option" and isinstance(payload, dict):
+            opt = payload.get("original") or payload
+
+        if isinstance(opt, dict):
+            ticker = opt.get("ticker", "?")
+            opt_type = opt.get("type", "?")
+            strike = opt.get("strike", "?")
+            exp = opt.get("exp", "")
+            contracts = opt.get("contracts") or 1
+            sub = opt.get("subaccount", "")
+            opened = opt.get("open_date", "")
+
+            headline = f"{ticker} {opt_type} {_money(strike)}"
+            details = []
+            if exp:
+                details.append(f"exp {exp}")
+            try:
+                ic = int(contracts)
+                if ic > 0:
+                    details.append(f"×{ic}")
+            except Exception:
+                pass
+            if sub:
+                details.append(sub)
+            if opened:
+                details.append(f"opened {opened}")
+            # For closes, show what happened
+            if op in ("option_closed", "option_assigned", "option_expired",
+                      "option_assigned_with_shares", "cc_called_away_with_shares"):
+                cp = opt.get("close_premium")
+                cd = opt.get("close_date")
+                if cp is not None:
+                    details.append(f"closed @ ${cp}")
+                if cd:
+                    details.append(f"on {cd}")
+
+            return {
+                "headline": headline,
+                "detail": " · ".join(details),
+                "kind": "option",
+            }
+
+    # ─── Holdings ───
+    if op in ("add_holding", "add_to_holding", "edit_holding",
+              "delete_holding", "sell_holding"):
+        ticker = target
+        if isinstance(payload, dict):
+            shares = payload.get("shares") or payload.get("sold_shares")
+            cb = payload.get("cost_basis") or payload.get("sell_price")
+            sub = payload.get("subaccount", "")
+            details = []
+            if shares is not None:
+                try:
+                    sf = float(shares)
+                    details.append(f"{int(sf)} sh" if sf == int(sf) else f"{sf} sh")
+                except Exception:
+                    details.append(f"{shares} sh")
+            if cb is not None:
+                details.append(f"@ {_money(cb)}")
+            if sub:
+                details.append(sub)
+            verb_map = {
+                "add_holding": "Buy",
+                "add_to_holding": "Buy more",
+                "edit_holding": "Edit",
+                "delete_holding": "Delete",
+                "sell_holding": "Sell",
+            }
+            verb = verb_map.get(op, op)
+            return {
+                "headline": f"{verb} {ticker}",
+                "detail": " · ".join(details),
+                "kind": "holding",
+            }
+
+    # ─── Cash events ───
+    if op.startswith("cash_"):
+        if isinstance(payload, dict):
+            event_type = payload.get("type", "")
+            amount = payload.get("amount", 0)
+            sub = payload.get("subaccount", "")
+            note = payload.get("note", "")
+            date = payload.get("date", "")
+            try:
+                amt = float(amount)
+                amt_str = f"+{_money(abs(amt))}" if amt >= 0 else f"-{_money(abs(amt))}"
+            except Exception:
+                amt_str = str(amount)
+            details = []
+            if sub:
+                details.append(sub)
+            if date:
+                details.append(date)
+            if note:
+                details.append(note[:60])
+            return {
+                "headline": f"{event_type or 'cash'} {amt_str}",
+                "detail": " · ".join(details),
+                "kind": "cash",
+            }
+
+    # ─── Spreads ───
+    if op in ("add_spread", "edit_spread", "spread_closed", "spread_expired",
+              "delete_spread"):
+        if isinstance(payload, dict):
+            spr = payload
+            if "original" in spr and isinstance(spr["original"], dict):
+                spr = spr["original"]
+            ticker = spr.get("ticker", "?")
+            stype = spr.get("type", "spread")
+            strikes = spr.get("strikes") or [spr.get("short_strike"), spr.get("long_strike")]
+            strikes = [s for s in strikes if s is not None]
+            details = []
+            exp = spr.get("exp", "")
+            contracts = spr.get("contracts") or 1
+            sub = spr.get("subaccount", "")
+            if exp:
+                details.append(f"exp {exp}")
+            try:
+                ic = int(contracts)
+                if ic > 0:
+                    details.append(f"×{ic}")
+            except Exception:
+                pass
+            if sub:
+                details.append(sub)
+            strike_str = ""
+            if len(strikes) >= 2:
+                strike_str = f" {_money(strikes[0])}/{_money(strikes[1])}"
+            elif len(strikes) == 1:
+                strike_str = f" {_money(strikes[0])}"
+            return {
+                "headline": f"{ticker} {stype}{strike_str}",
+                "detail": " · ".join(details),
+                "kind": "spread",
+            }
+
+    # ─── Roll ───
+    if op == "roll_option":
+        if isinstance(payload, dict):
+            new_data = payload.get("new") if isinstance(payload.get("new"), dict) else None
+            closed_data = payload.get("closed") if isinstance(payload.get("closed"), dict) else None
+            ticker = (new_data or closed_data or {}).get("ticker", "?")
+            opt_type = (new_data or closed_data or {}).get("type", "")
+            old_strike = (closed_data or {}).get("strike")
+            new_strike = (new_data or {}).get("strike")
+            old_exp = (closed_data or {}).get("exp")
+            new_exp = (new_data or {}).get("exp")
+            sub = (new_data or {}).get("subaccount", "")
+            details = []
+            if old_exp and new_exp:
+                details.append(f"{old_exp} → {new_exp}")
+            elif new_exp:
+                details.append(f"new exp {new_exp}")
+            if sub:
+                details.append(sub)
+            strike_str = ""
+            if old_strike and new_strike:
+                strike_str = f" {_money(old_strike)} → {_money(new_strike)}"
+            elif new_strike:
+                strike_str = f" → {_money(new_strike)}"
+            return {
+                "headline": f"Roll {ticker} {opt_type}{strike_str}",
+                "detail": " · ".join(details),
+                "kind": "option",
+            }
+
+    # ─── Lumpsum ───
+    if op in ("add_lumpsum", "update_lumpsum", "delete_lumpsum"):
+        if isinstance(payload, dict):
+            label = payload.get("label", "lumpsum")
+            value = payload.get("value", 0)
+            details = [f"value {_money(value)}"]
+            sub = payload.get("subaccount", "")
+            if sub:
+                details.append(sub)
+            return {
+                "headline": f"Lumpsum: {label}",
+                "detail": " · ".join(details),
+                "kind": "lumpsum",
+            }
+
+    # ─── Transfers ───
+    if op in ("transfer_kyleigh", "transfer_clay"):
+        if isinstance(payload, dict):
+            recipient = "Kyleigh" if op.endswith("kyleigh") else "Clay"
+            amount = payload.get("amount", 0)
+            from_acct = payload.get("from_account", "")
+            details = []
+            if from_acct:
+                details.append(f"from {from_acct}")
+            return {
+                "headline": f"Transfer to {recipient} {_money(amount)}",
+                "detail": " · ".join(details),
+                "kind": "transfer",
+            }
+
+    # ─── Retro-fix (Phase 4.5) ───
+    if op == "retrofix_assignment":
+        if isinstance(payload, dict):
+            ticker = payload.get("ticker", "?")
+            strike = payload.get("strike", "?")
+            shares = payload.get("shares_added", 0)
+            sub = payload.get("subaccount", "")
+            details = [f"+{int(shares)} sh @ {_money(strike)}"]
+            if sub:
+                details.append(sub)
+            return {
+                "headline": f"Retro-fix: {ticker} CSP {_money(strike)}",
+                "detail": " · ".join(details),
+                "kind": "option",
+            }
+
+    # ─── Sub-account / system ───
+    if op in ("add_subaccount", "remove_subaccount"):
+        return {
+            "headline": f"{op}: {target}",
+            "detail": "",
+            "kind": "system",
+        }
+
+    if op == "WIPE_ACCOUNT":
+        return {
+            "headline": f"WIPED account {target}",
+            "detail": "snapshot taken first",
+            "kind": "system",
+        }
+
+    # Default fallback
+    return {
+        "headline": target[:50] if target else op,
+        "detail": "",
+        "kind": "other",
+    }
+
+
 def get_recent_audit_entries(limit: int = 20) -> List[Dict]:
-    """Return recent audit entries with parsed payloads, newest first."""
+    """Return recent audit entries with parsed payloads + enrichment, newest first."""
     try:
         from . import durability
         raw = durability.list_audit_entries(limit=limit)
@@ -1869,7 +2603,7 @@ def get_recent_audit_entries(limit: int = 20) -> List[Dict]:
         except Exception:
             new_v = None
 
-        parsed.append({
+        item = {
             "timestamp": entry.get("timestamp", ""),
             "account": entry.get("account", ""),
             "op": entry.get("op", ""),
@@ -1877,7 +2611,21 @@ def get_recent_audit_entries(limit: int = 20) -> List[Dict]:
             "old_value": old_v,
             "new_value": new_v,
             "undoable": entry.get("op", "") in UNDOABLE_OPS,
-        })
+        }
+        # Phase 4.5 — enriched display
+        item["enriched"] = _enrich_audit_target(item)
+        # Pretty-printed JSON for the click-to-expand panel
+        try:
+            item["full_json"] = json.dumps({
+                "op": item["op"],
+                "account": item["account"],
+                "target": item["target"],
+                "old_value": old_v,
+                "new_value": new_v,
+            }, indent=2, default=str)
+        except Exception:
+            item["full_json"] = ""
+        parsed.append(item)
     return parsed
 
 
@@ -1963,6 +2711,190 @@ def undo_audit_entry(timestamp: str, op: str, account: str, target: str) -> Dict
                 delete_cash_events_bulk(account, close_cash_ids)
             _audit(account, "UNDO_option_close", opt_id, None, {"reverted_status": "open"})
             return {"ok": True, "msg": f"Reverted: option re-opened + {len(close_cash_ids)} cash event(s) removed"}
+
+        # ─── Phase 4.5: auto-handled assignments — revert option AND remove the share lot/sell ───
+        if op == "option_assigned_with_shares":
+            opt_id = target
+            options = get_options(account)
+            opt = next((o for o in options if o.get("id") == opt_id), None)
+            if not opt:
+                return {"ok": False, "error": "Option not found"}
+
+            ticker = opt.get("ticker")
+            sub = opt.get("subaccount") or DEFAULT_SUBACCOUNT
+            contracts = int(opt.get("contracts") or 1)
+            fill = float(opt.get("actual_fill_price") or opt.get("strike") or 0)
+            shares = 100 * contracts
+
+            # 1. Reverse the auto-created share lot
+            holdings = get_holdings(account)
+            h = holdings.get(ticker)
+            if h:
+                # Remove the shares (this is best-effort — multiple buys may have averaged)
+                sell_holding(account, ticker, shares=shares, sell_price=fill)
+                # The sell_holding records a cash credit. We need to cancel it
+                # since the original auto-handle's debit is also being cancelled below.
+                # Use delete_cash_events to wash both.
+                linked = find_linked_cash_events_for_holding(account, ticker)
+                most_recent_buy = next((c["id"] for c in linked if c.get("type") == "share_buy"), None)
+                most_recent_sell = next((c["id"] for c in linked if c.get("type") == "share_sell"), None)
+                wash_ids = [i for i in (most_recent_buy, most_recent_sell) if i]
+                if wash_ids:
+                    delete_cash_events_bulk(account, wash_ids)
+
+            # 2. Revert the option to open
+            opt["status"] = "open"
+            for k in ("close_premium", "close_date", "closed_at", "close_note",
+                      "actual_fill_price", "auto_handled_shares"):
+                opt.pop(k, None)
+            _save(_key_options(account), options)
+
+            # 3. Best-effort campaign cleanup
+            try:
+                from . import campaigns as _campaigns
+                # Find the campaign that contains this assignment event
+                for camp in _campaigns.get_campaigns(account):
+                    for ev in camp.get("events", []):
+                        if ev.get("id") == opt_id and ev.get("type") == "csp_assigned":
+                            _campaigns.remove_event_from_campaign(
+                                account, camp["id"],
+                                {"id": opt_id, "type": "csp_assigned"}
+                            )
+                            # If status was active_holding, we may need to revert
+                            # Best-effort only — full recovery is hard
+                            break
+            except Exception as e:
+                log.warning(f"undo campaign cleanup failed: {e}")
+
+            _audit(account, "UNDO_option_assigned_with_shares", opt_id, None,
+                   {"reverted_status": "open", "shares_reversed": shares})
+            return {"ok": True, "msg": f"Reverted: option re-opened, {shares} shares + cash reversed"}
+
+        if op == "cc_called_away_with_shares":
+            opt_id = target
+            options = get_options(account)
+            opt = next((o for o in options if o.get("id") == opt_id), None)
+            if not opt:
+                return {"ok": False, "error": "Option not found"}
+
+            ticker = opt.get("ticker")
+            sub = opt.get("subaccount") or DEFAULT_SUBACCOUNT
+            contracts = int(opt.get("contracts") or 1)
+            fill = float(opt.get("actual_fill_price") or opt.get("strike") or 0)
+            shares = 100 * contracts
+
+            # 1. Re-add the shares that were called away
+            #    Use fill as cost basis since that's what the callaway sold at
+            #    (this is approximate — original basis is harder to recover)
+            r = add_holding(account, ticker, shares=shares, cost_basis=fill,
+                            subaccount=sub, tag="wheel")
+            # The add_holding records a buy debit; we need to wash both that
+            # and the original sell credit.
+            linked = find_linked_cash_events_for_holding(account, ticker)
+            most_recent_buy = next((c["id"] for c in linked if c.get("type") == "share_buy"), None)
+            most_recent_sell = next((c["id"] for c in linked if c.get("type") == "share_sell"), None)
+            wash_ids = [i for i in (most_recent_buy, most_recent_sell) if i]
+            if wash_ids:
+                delete_cash_events_bulk(account, wash_ids)
+
+            # 2. Revert the option to open
+            opt["status"] = "open"
+            for k in ("close_premium", "close_date", "closed_at", "close_note",
+                      "actual_fill_price", "auto_handled_shares"):
+                opt.pop(k, None)
+            _save(_key_options(account), options)
+
+            # 3. Campaign cleanup (best-effort)
+            try:
+                from . import campaigns as _campaigns
+                for camp in _campaigns.get_campaigns(account):
+                    for ev in camp.get("events", []):
+                        if ev.get("id") == opt_id and ev.get("type") == "cc_called_away":
+                            _campaigns.remove_event_from_campaign(
+                                account, camp["id"],
+                                {"id": opt_id, "type": "cc_called_away"}
+                            )
+                            # If campaign was closed, reopen
+                            if camp.get("status") == "closed":
+                                camps = _campaigns._load_campaigns(account)
+                                for c in camps:
+                                    if c.get("id") == camp["id"]:
+                                        c["status"] = "active_holding"
+                                        c["closed_at"] = None
+                                _campaigns._save_campaigns(account, camps)
+                            break
+            except Exception as e:
+                log.warning(f"undo campaign cleanup failed: {e}")
+
+            _audit(account, "UNDO_cc_called_away_with_shares", opt_id, None,
+                   {"reverted_status": "open", "shares_restored": shares})
+            return {"ok": True, "msg": f"Reverted: option re-opened, {shares} shares restored, cash reversed"}
+
+        # ─── Phase 4.5: partial_close_option — undo the closed-portion option ───
+        if op == "partial_close_option" and isinstance(new_v, dict):
+            closed_portion_id = new_v.get("closed_portion_id")
+            original_total_contracts = (new_v.get("original") or {}).get("contracts")
+            opt_id = target  # original option
+
+            # 1. Restore original option's contract count and remove the closed-portion record
+            options = get_options(account)
+            original = next((o for o in options if o.get("id") == opt_id), None)
+            if not original:
+                return {"ok": False, "error": "Original option not found"}
+            try:
+                original["contracts"] = int(original_total_contracts or original.get("contracts", 1))
+            except Exception:
+                pass
+            options = [o for o in options if o.get("id") != closed_portion_id]
+            _save(_key_options(account), options)
+
+            # 2. Reverse linked cash for the closed portion
+            if closed_portion_id:
+                linked = find_linked_cash_events(account, closed_portion_id)
+                if linked:
+                    delete_cash_events_bulk(account, [c["id"] for c in linked])
+
+            # 3. If auto-handled, also reverse the share creation/removal
+            if new_v.get("auto_handled") and isinstance(new_v.get("auto_result"), dict):
+                ar = new_v["auto_result"]
+                ticker = ar.get("ticker")
+                sub = ar.get("subaccount") or DEFAULT_SUBACCOUNT
+                if ar.get("kind") == "csp_assignment":
+                    n = int(ar.get("shares_acquired") or 0)
+                    fp = float(ar.get("fill_price") or 0)
+                    if ticker and n > 0:
+                        sell_holding(account, ticker, shares=n, sell_price=fp)
+                        linked = find_linked_cash_events_for_holding(account, ticker)
+                        wash = [c["id"] for c in linked if c.get("type") in ("share_buy", "share_sell")][:2]
+                        if wash:
+                            delete_cash_events_bulk(account, wash)
+                elif ar.get("kind") == "cc_called_away":
+                    n = int(ar.get("shares_sold") or 0)
+                    fp = float(ar.get("fill_price") or 0)
+                    if ticker and n > 0:
+                        add_holding(account, ticker, shares=n, cost_basis=fp,
+                                    subaccount=sub, tag="wheel")
+                        linked = find_linked_cash_events_for_holding(account, ticker)
+                        wash = [c["id"] for c in linked if c.get("type") in ("share_buy", "share_sell")][:2]
+                        if wash:
+                            delete_cash_events_bulk(account, wash)
+
+            _audit(account, "UNDO_partial_close", opt_id, None, {"closed_portion_id": closed_portion_id})
+            return {"ok": True, "msg": "Reverted: partial close undone, contracts restored"}
+
+        # ─── Phase 4.5: retrofix_assignment — undo the share lot creation ───
+        if op == "retrofix_assignment" and isinstance(new_v, dict):
+            ticker = new_v.get("ticker")
+            shares = int(new_v.get("shares_added") or 0)
+            fill = float(new_v.get("strike") or 0)
+            if ticker and shares > 0:
+                sell_holding(account, ticker, shares=shares, sell_price=fill)
+                linked = find_linked_cash_events_for_holding(account, ticker)
+                wash = [c["id"] for c in linked if c.get("type") in ("share_buy", "share_sell")][:2]
+                if wash:
+                    delete_cash_events_bulk(account, wash)
+            _audit(account, "UNDO_retrofix", target, None, {"ticker": ticker, "shares_reversed": shares})
+            return {"ok": True, "msg": f"Reverted: retro-fix undone, {shares} {ticker} shares reversed"}
 
         # ─── Spread closes ───
         if op in ("spread_closed", "spread_expired"):
