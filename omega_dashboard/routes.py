@@ -833,6 +833,29 @@ def portfolio_retrofix_apply():
     return redirect(url_for("dashboard.portfolio_section", section="settings"))
 
 
+@dashboard_bp.route("/portfolio/backfill-campaign-history", methods=["POST"])
+@login_required
+def portfolio_backfill_campaigns():
+    """Phase 4.5 — Reconstruct campaign event history from the audit log.
+
+    Walks the audit log and rebuilds csp_open / csp_rolled / csp_assigned /
+    cc_open / cc_closed / cc_called_away events for every campaign so the
+    rollup cards show accurate premium totals and timelines.
+
+    Idempotent — safe to run multiple times.
+    """
+    from . import writes
+    result = writes.backfill_campaign_history()
+    if result.get("ok"):
+        msg = (f"Backfilled {result.get('campaigns_modified', 0)} campaign(s) · "
+               f"+{result.get('events_added', 0)} events · "
+               f"+${result.get('premium_recovered', 0):,.2f} in premium history")
+        _flash(msg, "success" if result.get("campaigns_modified") else "info")
+    else:
+        _flash(f"Backfill failed: {result.get('error')}", "error")
+    return redirect(url_for("dashboard.portfolio_section", section="settings"))
+
+
 @dashboard_bp.route("/portfolio/settings/subaccount/add", methods=["POST"])
 @login_required
 def portfolio_sub_add():

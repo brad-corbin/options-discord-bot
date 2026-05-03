@@ -1402,6 +1402,18 @@
         Scans audit log for past assignments that didn't auto-create share lots, lets you backfill them.
       </span>
     </div>
+
+    <div class="maintenance-actions" style="margin-top: 14px;">
+      <form method="POST" action="{{ url_for('dashboard.portfolio_backfill_campaigns') }}" style="display:inline;"
+            onsubmit="return confirm('Walk the audit log and reconstruct every campaign\\'s event history?\\n\\nThis populates campaign cards with the original CSP premiums, rolls, and assignment events from your audit log.\\n\\nIdempotent and safe to run multiple times.')">
+        <button type="submit" class="btn-primary-sm">
+          Backfill campaign history →
+        </button>
+      </form>
+      <span class="muted" style="font-size: 10px; margin-left: 12px;">
+        Reconstructs campaign event timelines from the audit log so cards show accurate premium history. Run after retro-fix.
+      </span>
+    </div>
   </div>
 
 </div>

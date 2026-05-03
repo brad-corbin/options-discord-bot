@@ -2119,6 +2119,315 @@ def retrofix_apply(selections: List[Dict]) -> Dict:
 
 
 # ═════════════════════════════════════════════════════════
+# PHASE 4.5 — BACKFILL CAMPAIGN HISTORY FROM AUDIT LOG
+# Walks the audit log and reconstructs the full event history for each
+# wheel campaign (csp_open, csp_rolled, csp_assigned, cc_open, cc_closed,
+# cc_called_away, etc.). Useful after retro-fix to populate the campaign
+# cards with accurate premium totals and timelines.
+# ═════════════════════════════════════════════════════════
+
+def _walk_roll_chain(opt_id: str, roll_by_new_id: Dict, accumulated: set):
+    """Walk backwards through roll chain, accumulating opt_ids."""
+    if not opt_id or opt_id in accumulated:
+        return
+    accumulated.add(opt_id)
+    roll_entry = roll_by_new_id.get(opt_id)
+    if roll_entry:
+        rd = roll_entry.get("_parsed_new") or {}
+        if isinstance(rd, dict):
+            closed_data = rd.get("closed") or {}
+            if isinstance(closed_data, dict):
+                old_id = closed_data.get("id")
+                if old_id:
+                    _walk_roll_chain(old_id, roll_by_new_id, accumulated)
+
+
+def backfill_campaign_history(account: Optional[str] = None) -> Dict:
+    """Reconstruct full event history for all campaigns from the audit log.
+
+    For each campaign:
+      1. Find every opt_id referenced in its events.
+      2. Walk backwards through any roll_option audits to find predecessor opt_ids.
+      3. Rebuild the events list from the audit log for the entire chain:
+         - add_option   → csp_open / cc_open
+         - roll_option  → csp_rolled / cc_rolled (with computed net_credit)
+         - option_closed / option_expired / option_assigned[_with_shares]
+                        → csp_closed / csp_expired / csp_assigned / etc.
+      4. Preserve any non-option events (manual_share_add, etc.).
+      5. Recompute the rollup.
+
+    Idempotent — running multiple times produces the same result.
+    Audited as `backfill_campaign_history` (not undoable; rebuilds derived data).
+    """
+    from . import campaigns as _campaigns
+    from . import durability
+
+    accounts = [account] if account else list(ALL_UNDERLYING_ACCOUNTS)
+
+    # Pull a generous slice of the audit log
+    try:
+        raw = durability.list_audit_entries(limit=2000)
+    except Exception as e:
+        log.warning(f"audit log unavailable for backfill: {e}")
+        return {"ok": False, "error": "audit log unavailable"}
+
+    # Index audits by op + opt_id for fast lookup
+    add_option_by_target: Dict[str, Dict] = {}
+    roll_by_new_id: Dict[str, Dict] = {}
+    close_by_target: Dict[str, Dict] = {}
+
+    for entry in raw:
+        op = entry.get("op", "") or ""
+        try:
+            new_v = json.loads(entry["new_value"]) if entry.get("new_value") else None
+        except Exception:
+            new_v = None
+        # Cache parsed payload on the entry for re-use
+        entry["_parsed_new"] = new_v
+
+        if op == "add_option":
+            tgt = entry.get("target", "")
+            if tgt:
+                # Newest entry wins (later edit_option wouldn't, but add_option is one-shot)
+                if tgt not in add_option_by_target:
+                    add_option_by_target[tgt] = entry
+        elif op == "roll_option" and isinstance(new_v, dict):
+            new_data = new_v.get("new")
+            if isinstance(new_data, dict) and new_data.get("id"):
+                roll_by_new_id[new_data["id"]] = entry
+        elif op in ("option_closed", "option_expired", "option_assigned",
+                    "option_assigned_with_shares", "cc_called_away_with_shares"):
+            tgt = entry.get("target", "")
+            if tgt and tgt not in close_by_target:
+                close_by_target[tgt] = entry
+
+    summary = {
+        "ok": True,
+        "accounts_modified": 0,
+        "campaigns_modified": 0,
+        "events_added": 0,
+        "premium_recovered": 0.0,
+        "details": [],
+    }
+
+    for acc in accounts:
+        if not _validate_account(acc):
+            continue
+
+        camps = _campaigns._load_campaigns(acc)
+        if not camps:
+            continue
+
+        any_modified = False
+
+        for camp in camps:
+            old_events = camp.get("events", []) or []
+            old_premium = (camp.get("rollup") or {}).get("total_premium", 0)
+
+            # Collect opt_ids from current events
+            opt_ids_in_events: set = set()
+            non_option_events = []
+            for ev in old_events:
+                if ev.get("id"):
+                    opt_ids_in_events.add(ev.get("id"))
+                else:
+                    # Preserve manual_share_add and similar id-less events
+                    non_option_events.append(ev)
+
+            if not opt_ids_in_events:
+                continue  # No options to backfill for
+
+            # Walk back through the roll chain for each
+            chain_ids: set = set()
+            for oid in opt_ids_in_events:
+                _walk_roll_chain(oid, roll_by_new_id, chain_ids)
+
+            # Build the new events list
+            new_events: List[Dict] = []
+
+            for oid in chain_ids:
+                # 1. csp_open / cc_open from add_option audit
+                add_entry = add_option_by_target.get(oid)
+                if add_entry:
+                    od = add_entry.get("_parsed_new") or {}
+                    if isinstance(od, dict):
+                        opt_type = od.get("type", "")
+                        if opt_type == "CSP":
+                            new_events.append({
+                                "type": "csp_open",
+                                "id": oid,
+                                "strike": od.get("strike"),
+                                "exp": od.get("exp"),
+                                "contracts": od.get("contracts") or 1,
+                                "premium": od.get("premium"),
+                                "open_date": od.get("open_date") or add_entry.get("timestamp", "")[:10],
+                                "date": od.get("open_date") or add_entry.get("timestamp", "")[:10],
+                                "backfilled": True,
+                            })
+                        elif opt_type == "CC":
+                            new_events.append({
+                                "type": "cc_open",
+                                "id": oid,
+                                "strike": od.get("strike"),
+                                "exp": od.get("exp"),
+                                "contracts": od.get("contracts") or 1,
+                                "premium": od.get("premium"),
+                                "open_date": od.get("open_date") or add_entry.get("timestamp", "")[:10],
+                                "date": od.get("open_date") or add_entry.get("timestamp", "")[:10],
+                                "backfilled": True,
+                            })
+
+                # 2. csp_rolled / cc_rolled from roll_option audit (this opt_id was created by a roll)
+                roll_entry = roll_by_new_id.get(oid)
+                if roll_entry:
+                    rd = roll_entry.get("_parsed_new") or {}
+                    if isinstance(rd, dict):
+                        closed_data = rd.get("closed") or {}
+                        new_data = rd.get("new") or {}
+                        if isinstance(closed_data, dict) and isinstance(new_data, dict):
+                            opt_type = new_data.get("type") or closed_data.get("type") or "CSP"
+                            old_id = closed_data.get("id")
+                            close_p = float(closed_data.get("close_premium") or 0)
+                            new_p = float(new_data.get("premium") or 0)
+                            contracts = int(new_data.get("contracts") or closed_data.get("contracts") or 1)
+                            net_credit = (new_p - close_p) * contracts * 100
+                            roll_date = (new_data.get("open_date")
+                                         or roll_entry.get("timestamp", "")[:10])
+                            ev_kind = "csp_rolled" if opt_type == "CSP" else \
+                                      "cc_rolled" if opt_type == "CC" else None
+                            if ev_kind:
+                                new_events.append({
+                                    "type": ev_kind,
+                                    "id": oid,
+                                    "old_id": old_id,
+                                    "new_strike": new_data.get("strike"),
+                                    "new_exp": new_data.get("exp"),
+                                    "new_premium": new_p,
+                                    "close_premium": close_p,
+                                    "contracts": contracts,
+                                    "net_credit": net_credit,
+                                    "roll_date": roll_date,
+                                    "date": roll_date,
+                                    "backfilled": True,
+                                })
+
+                # 3. close event from option_closed / expired / assigned audit
+                close_entry = close_by_target.get(oid)
+                if close_entry:
+                    cd = close_entry.get("_parsed_new") or {}
+                    co_op = close_entry.get("op", "")
+                    if isinstance(cd, dict):
+                        opt_type = cd.get("type", "CSP")
+                        contracts = int(cd.get("contracts") or 1)
+                        cdate = cd.get("close_date") or close_entry.get("timestamp", "")[:10]
+
+                        if co_op in ("option_assigned", "option_assigned_with_shares"):
+                            if opt_type == "CSP":
+                                new_events.append({
+                                    "type": "csp_assigned",
+                                    "id": oid,
+                                    "contracts": contracts,
+                                    "strike": cd.get("strike"),
+                                    "shares_acquired": 100 * contracts,
+                                    "auto_handled": (co_op == "option_assigned_with_shares"),
+                                    "date": cdate,
+                                    "backfilled": True,
+                                })
+                            elif opt_type == "CC":
+                                # Legacy CC assignment without auto-handle
+                                new_events.append({
+                                    "type": "cc_called_away",
+                                    "id": oid,
+                                    "contracts": contracts,
+                                    "strike": cd.get("strike"),
+                                    "date": cdate,
+                                    "backfilled": True,
+                                })
+                        elif co_op == "cc_called_away_with_shares" and opt_type == "CC":
+                            new_events.append({
+                                "type": "cc_called_away",
+                                "id": oid,
+                                "contracts": contracts,
+                                "strike": cd.get("strike"),
+                                "shares_sold": 100 * contracts,
+                                "auto_handled": True,
+                                "date": cdate,
+                                "backfilled": True,
+                            })
+                        elif co_op == "option_closed":
+                            ev_kind = "csp_closed" if opt_type == "CSP" else \
+                                      "cc_closed" if opt_type == "CC" else None
+                            if ev_kind:
+                                new_events.append({
+                                    "type": ev_kind,
+                                    "id": oid,
+                                    "contracts": contracts,
+                                    "close_premium": cd.get("close_premium") or 0,
+                                    "date": cdate,
+                                    "backfilled": True,
+                                })
+                        elif co_op == "option_expired":
+                            ev_kind = "csp_expired" if opt_type == "CSP" else \
+                                      "cc_expired" if opt_type == "CC" else None
+                            if ev_kind:
+                                new_events.append({
+                                    "type": ev_kind,
+                                    "id": oid,
+                                    "contracts": contracts,
+                                    "close_premium": 0,
+                                    "date": cdate,
+                                    "backfilled": True,
+                                })
+
+            # Combine with non-option events and sort chronologically
+            def _ev_sort_key(e):
+                d = e.get("date") or e.get("open_date") or e.get("roll_date") or "0000-00-00"
+                # Tiebreak: open events before close events on same date
+                priority = {"csp_open": 0, "cc_open": 0, "csp_rolled": 1, "cc_rolled": 1,
+                            "csp_closed": 2, "cc_closed": 2, "csp_expired": 2, "cc_expired": 2,
+                            "csp_assigned": 3, "cc_called_away": 3,
+                            "manual_share_add": 0, "share_sold": 4}
+                return (d, priority.get(e.get("type", ""), 5))
+
+            all_events = new_events + non_option_events
+            all_events.sort(key=_ev_sort_key)
+
+            # Update campaign
+            camp["events"] = all_events
+            camp["rollup"] = _campaigns._compute_rollup(camp)
+
+            new_count = len(all_events)
+            old_count = len(old_events)
+            new_premium = camp["rollup"].get("total_premium", 0)
+
+            if new_count != old_count or new_premium != old_premium:
+                any_modified = True
+                summary["campaigns_modified"] += 1
+                summary["events_added"] += max(0, new_count - old_count)
+                summary["premium_recovered"] += max(0, new_premium - old_premium)
+                summary["details"].append({
+                    "account": acc,
+                    "ticker": camp.get("ticker"),
+                    "subaccount": camp.get("subaccount"),
+                    "events_before": old_count,
+                    "events_after": new_count,
+                    "premium_before": round(old_premium, 2),
+                    "premium_after": round(new_premium, 2),
+                })
+
+        if any_modified:
+            _campaigns._save_campaigns(acc, camps)
+            summary["accounts_modified"] += 1
+            _audit(
+                acc, "backfill_campaign_history", "all_campaigns", None,
+                {"campaigns_modified": summary["campaigns_modified"]},
+            )
+
+    summary["premium_recovered"] = round(summary["premium_recovered"], 2)
+    return summary
+
+
+# ═════════════════════════════════════════════════════════
 # WIPE
 # ═════════════════════════════════════════════════════════
 

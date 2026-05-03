@@ -60,6 +60,24 @@ You can uncheck individual rows. Each applied fix:
 
 Already-fixed assignments (with matching share lots) are excluded from the candidate list automatically.
 
+### 5. Backfill campaign history
+
+Right after the retro-fix button, there's a `Backfill campaign history →` button. The retro-fix only creates the share lot — the campaign card it produces shows `Premium collected: $0 · 0 days` because the campaign was just born this morning. Hitting **Backfill** walks the audit log for every existing campaign and reconstructs the full event timeline:
+
+- The original `csp_open` event (with the actual premium you collected)
+- Any `csp_rolled` events (with the correct net credit on each roll)
+- The `csp_assigned` event (already there from retro-fix)
+- For closed wheels, the full `cc_open` → `cc_called_away` chain
+
+After backfill, the LMND card shows "Premium collected: $900 · 47 days" instead of "$0 · 0 days", and the closed campaigns rollup actually has accurate P&L. The audit log entries themselves are unchanged — backfill only rebuilds the derived rollup data on the campaigns.
+
+The function is **idempotent** — running it twice produces no additional changes. Safe to re-run any time you suspect campaign data drifted.
+
+Recommended sequence:
+1. Run **Retro-fix wheel assignments** once to backfill the missing share lots.
+2. Run **Backfill campaign history** once after that to populate the timelines.
+3. Going forward, both run automatically on every assignment, so you shouldn't need either button again.
+
 ## Deploy steps
 
 1. Delete existing `omega_dashboard/` folder in the repo.
