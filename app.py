@@ -718,6 +718,12 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 app = Flask(__name__)
+# ─────────────────────────────────────────────────────────
+# OMEGA DASHBOARD (web command console)
+# ─────────────────────────────────────────────────────────
+from dashboard import dashboard_bp
+app.register_blueprint(dashboard_bp)
+app.secret_key = os.getenv("DASHBOARD_SECRET_KEY", "").strip() or os.urandom(32)
 
 # ─────────────────────────────────────────────────────────
 # ENV VARS

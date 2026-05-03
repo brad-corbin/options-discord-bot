@@ -1,0 +1,27 @@
+{% extends "dashboard/base.html" %}
+
+{% block title %}Ω OMEGA — Diagnostic{% endblock %}
+{% block brand_sub %}Diagnostic · {{ active_account.label }}{% endblock %}
+
+{% block content %}
+<div class="phase1-stub fade-in">
+  <svg class="phase1-watermark" viewBox="0 0 100 100" fill="none">
+    <path d="M50 8 L82 22 L82 56 L70 76 L60 88 L40 88 L30 76 L18 56 L18 22 Z"
+          stroke="currentColor" stroke-width="0.5" fill="none"/>
+    <text x="50" y="62" text-anchor="middle" font-family="Russo One, sans-serif"
+          font-size="38" font-weight="700" fill="currentColor">Ω</text>
+  </svg>
+
+  <div class="phase1-title">Diagnostic</div>
+  <div class="phase1-msg">
+    Shadow signals, filter performance, V1↔V2 disagreement, EM accuracy,
+    badge distribution, entry quality, per-regime P&amp;L, win rate by category,
+    and the raw firehose feeds for Potter Box / OI Confirmation / Unusual Flow
+    all land here in <strong>Phase 6</strong>. This is the edge-discovery layer.
+  </div>
+
+  <div class="phase1-meta">
+    Built last · most value compounds with accumulated data
+  </div>
+</div>
+{% endblock %}
