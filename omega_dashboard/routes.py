@@ -989,6 +989,26 @@ def portfolio_sub_remove():
     return _bounce("settings")
 
 
+@dashboard_bp.route("/portfolio/partner-host/set", methods=["POST"])
+@login_required
+def portfolio_partner_host_set():
+    """Set the host trading account for a partner (kyleigh, clay).
+    Pass empty host to disable exclusion."""
+    from . import writes
+    partner = (request.form.get("partner") or "").strip().lower()
+    host = (request.form.get("host") or "").strip().lower()
+    result = writes.set_partner_host(partner, host)
+    if result.get("ok"):
+        if host:
+            _flash(f"{partner.title()}'s capital is now hosted in {host.title()}'s account · their balance will be excluded from {host.title()}'s capital tracking", "success")
+        else:
+            _flash(f"{partner.title()}'s capital is no longer attributed to any host account", "success")
+    else:
+        _flash(f"Set host failed: {result.get('error')}", "error")
+    # Bounce back to the partner's portfolio cash page
+    return redirect(url_for("dashboard.portfolio_section", section="cash") + f"?acct={partner}")
+
+
 @dashboard_bp.route("/diagnostic", methods=["GET"])
 @login_required
 def diagnostic():

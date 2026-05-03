@@ -741,14 +741,20 @@ def calc_capital_progression(ui_account: str) -> Dict:
                     open_premium_collected += float(opt.get("premium") or 0) * int(opt.get("contracts") or 1) * 100
 
     # Partner exclusion (Phase 4.5):
-    # For mom/combined/mine views, subtract any partner outstanding balances
-    # so capital tracking reflects what genuinely belongs to the holder.
-    # Skip for partner views themselves.
+    # For each configured partner, only subtract their balance/deposits if their
+    # host trading account is one of the underlying accounts in this view.
+    # E.g., Kyleigh hosted at mom → excluded from mom & combined views, NOT from
+    # brad's view. Partner views themselves skip exclusion entirely.
     partner_balance_total = 0.0
     partner_deposit_total = 0.0
     if not is_partner_account(ui_account):
         for partner_ui in ("kyleigh", "clay"):
             try:
+                host = writes.get_partner_host(partner_ui)
+                if not host:
+                    continue  # no host configured → no exclusion
+                if host not in accounts:
+                    continue  # partner's capital lives elsewhere → don't subtract here
                 ps = calc_partner_summary(partner_ui)
                 if ps.get("available"):
                     partner_balance_total += float(ps.get("current_balance") or 0)
@@ -800,6 +806,7 @@ def command_center_data(ui_account: str) -> Dict:
     if is_partner_account(ui_account):
         from . import writes
         summary = calc_partner_summary(ui_account)
+        host = writes.get_partner_host(ui_account)
 
         # Pull the recent ledger for display
         recent_events = []
@@ -820,6 +827,9 @@ def command_center_data(ui_account: str) -> Dict:
             "portfolio_available": True,
             "snapshot_available": has_any_data,
             "is_partner": True,
+            "partner_host": host,
+            "host_options": ["", "brad", "mom", "partner"],
+            "host_labels": {"": "— None —", "brad": "Corbin", "mom": "Volkman", "partner": "Partnership"},
             "snapshot_meta": snap_meta,
             "partner_summary": summary,
             "recent_events": recent_events[:10],

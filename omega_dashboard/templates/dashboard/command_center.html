@@ -70,6 +70,29 @@
   </span>
 </div>
 
+<!-- ─── HOST ACCOUNT SELECTOR ──────────────────────────── -->
+<div class="data-panel fade-in" style="padding: 14px 22px; margin-bottom: 18px;">
+  <form method="POST" action="{{ url_for('dashboard.portfolio_partner_host_set') }}" style="display: flex; gap: 14px; align-items: center; flex-wrap: wrap;">
+    <input type="hidden" name="partner" value="{{ d.ui_account }}">
+    <span style="font-family: 'JetBrains Mono', monospace; font-size: 11px; letter-spacing: 0.14em; color: var(--text-muted); text-transform: uppercase;">
+      {{ active_account.label }}'s capital lives in:
+    </span>
+    <select name="host" style="padding: 6px 10px;">
+      {% for h in d.host_options %}
+        <option value="{{ h }}" {% if h == d.partner_host %}selected{% endif %}>{{ d.host_labels.get(h, h|capitalize) }}</option>
+      {% endfor %}
+    </select>
+    <button type="submit" class="btn-mini">Save</button>
+    <span class="muted" style="font-size: 11px;">
+      {% if d.partner_host %}
+        Their balance is excluded from {{ d.host_labels.get(d.partner_host, d.partner_host|capitalize) }}'s capital tracking
+      {% else %}
+        No host set — their balance is purely notional and won't affect any capital tracking
+      {% endif %}
+    </span>
+  </form>
+</div>
+
 <section class="cc-hero fade-in">
   <svg class="hero-watermark" viewBox="0 0 100 100" fill="none">
     <path d="M50 8 L82 22 L82 56 L70 76 L60 88 L40 88 L30 76 L18 56 L18 22 Z"

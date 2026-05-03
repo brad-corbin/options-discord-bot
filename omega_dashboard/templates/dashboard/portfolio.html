@@ -106,6 +106,16 @@
         <label>Note</label>
         <input type="text" name="note" placeholder="Initial capital, retirement contribution, etc.">
       </div>
+      {% if not is_partner_acct %}
+      <div class="form-field">
+        <label>Attribute to partner</label>
+        <select name="attributed_partner">
+          <option value="">— None (mine) —</option>
+          <option value="kyleigh">Kyleigh's capital</option>
+          <option value="clay">Clay's capital</option>
+        </select>
+      </div>
+      {% endif %}
       <div class="form-field">
         <label>&nbsp;</label>
         <button type="submit" class="btn-primary">Add Cash Event</button>

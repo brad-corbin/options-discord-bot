@@ -163,6 +163,12 @@ def _key_subaccount_list() -> str:
     return "omega:subaccounts"
 
 
+def _key_partner_host(partner: str) -> str:
+    """Phase 4.5 — which trading account a partner's capital currently lives in.
+    Stored value is "brad" / "mom" / "partner" / "" (no exclusion)."""
+    return f"{partner}:portfolio:host_account"
+
+
 def _key_wheel_campaigns(account: str) -> str:
     """Phase 4.5 — wheel campaign tracking (additive, never affects cash)."""
     return f"{account}:portfolio:wheel_campaigns"
@@ -304,6 +310,38 @@ def remove_subaccount(name: str) -> Dict:
     if _save(_key_subaccount_list(), current):
         _audit("system", "remove_subaccount", name, {"name": name}, None)
         return {"ok": True, "subaccounts": current}
+    return {"ok": False, "error": "Save failed"}
+
+
+# ─────────────────────────────────────────────────────────
+# Phase 4.5 — Partner host account (which trading account
+# the partner's capital currently lives in)
+# ─────────────────────────────────────────────────────────
+
+def get_partner_host(partner: str) -> str:
+    """Return which trading account this partner's capital sits in.
+    Empty string means 'no exclusion configured' — partner balance won't
+    be subtracted from any host's capital tracking."""
+    if partner not in PARTNER_LEDGER_ACCOUNTS:
+        return ""
+    saved = _load(_key_partner_host(partner), None)
+    if isinstance(saved, str) and saved in TRADING_ACCOUNTS:
+        return saved
+    return ""
+
+
+def set_partner_host(partner: str, host: str) -> Dict:
+    """Set which trading account a partner's capital lives in.
+    Pass empty string to disable exclusion (partner is just a notional ledger)."""
+    if partner not in PARTNER_LEDGER_ACCOUNTS:
+        return {"ok": False, "error": f"'{partner}' is not a partner account"}
+    host = (host or "").strip().lower()
+    if host and host not in TRADING_ACCOUNTS:
+        return {"ok": False, "error": f"Host must be empty or one of {TRADING_ACCOUNTS}"}
+    prev = get_partner_host(partner)
+    if _save(_key_partner_host(partner), host):
+        _audit("system", "set_partner_host", partner, {"host": prev}, {"host": host})
+        return {"ok": True, "partner": partner, "host": host}
     return {"ok": False, "error": "Save failed"}
 
 
