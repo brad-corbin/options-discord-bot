@@ -300,6 +300,40 @@ def portfolio_cash_add():
         _flash("Cash add failed: Please enter an amount before submitting.", "error")
         return _bounce("cash", acct)
 
+    # Phase 4.5 — "Set balance to" pseudo-type. The user enters a target
+    # balance; we compute the delta against the current sub-account balance
+    # and create a manual_set for that delta (so the user doesn't have to
+    # do the math). Only acts on the chosen sub-account, not the whole acct.
+    if event_type == "set_balance":
+        target_str = raw_amount.replace("$", "").replace(",", "").replace(" ", "")
+        try:
+            target = float(target_str) if target_str else None
+        except Exception:
+            target = None
+        if target is None:
+            _flash(f"Set balance failed: '{raw_amount}' isn't a valid number.", "error")
+            return _bounce("cash", acct)
+        sub = (request.form.get("subaccount") or "").strip() or "Brokerage"
+        breakdown = writes.calc_cash_breakdown(acct)
+        current_sub = float(breakdown.get(sub, 0.0))
+        delta = round(target - current_sub, 2)
+        if abs(delta) < 0.005:
+            _flash(f"Already at ${target:,.2f} in {sub} — no adjustment needed.", "info")
+            return _bounce("cash", acct)
+        result = writes.add_cash_event(
+            account=acct,
+            event_type="manual_set",
+            amount=delta,
+            subaccount=sub,
+            date=request.form.get("date"),
+            note=(request.form.get("note") or f"Set {sub} to ${target:,.2f}").strip(),
+        )
+        if result.get("ok"):
+            _flash(f"{sub} adjusted by ${delta:+,.2f} → balance now ${target:,.2f}", "success")
+        else:
+            _flash(f"Set balance failed: {result.get('error')}", "error")
+        return _bounce("cash", acct)
+
     result = writes.add_cash_event(
         account=acct,
         event_type=event_type,

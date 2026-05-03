@@ -74,7 +74,9 @@
         <select name="event_type" required>
           <option value="deposit">Deposit (initial capital, contribution)</option>
           <option value="withdrawal">Withdrawal</option>
+          <option value="pnl">Monthly P&L summary (net for period — counts as YTD income)</option>
           <option value="fee">Fee / Expense (Schwab fees, commissions — counts as P&L expense)</option>
+          <option value="set_balance">Set balance to $X (creates a Manual Adjustment for the diff)</option>
           <option value="manual_set">Manual adjustment (does NOT count as P&L)</option>
         </select>
         {% endif %}

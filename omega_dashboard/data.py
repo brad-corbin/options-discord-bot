@@ -428,7 +428,7 @@ def calc_income_live(ui_account: str) -> Dict:
     current_year = now.strftime("%Y")
 
     by_month: Dict[str, float] = {}
-    by_source: Dict[str, float] = {"options": 0.0, "spreads": 0.0, "shares": 0.0, "fees": 0.0}
+    by_source: Dict[str, float] = {"options": 0.0, "spreads": 0.0, "shares": 0.0, "fees": 0.0, "summary": 0.0}
     total_year = 0.0
     total_month = 0.0
 
@@ -442,6 +442,10 @@ def calc_income_live(ui_account: str) -> Dict:
         "spread_close": "spreads",
         # Phase 4.5 — fees count as P&L expenses (negative impact)
         "fee": "fees",
+        # Phase 4.5 — manual P&L summary entries (e.g., "January 2026 net" for
+        # high-frequency trading accounts that aren't worth logging trade-by-trade).
+        # Signed: positive = net gain, negative = net loss.
+        "pnl": "summary",
     }
 
     def add(month_key, amount, source):
