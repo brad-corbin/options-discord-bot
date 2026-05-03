@@ -2,9 +2,19 @@
 
 Deploy is the same as Phase 4: drag this `omega_dashboard/` folder into the repo, replacing the existing one. No `app.py` changes needed — the blueprint registration from Phase 4 still works.
 
+## Recommended deploy + run order
+
+After deploying the zip, on the dashboard:
+
+1. **Settings → Maintenance → Repair option data** — patches missing fields on legacy closed/assigned options so the YTD calculator counts them correctly.
+2. **Settings → Maintenance → Retro-fix wheel assignments** (only if you haven't already) — backfills share lots for past assignments that didn't auto-create them.
+3. **Settings → Maintenance → Backfill campaign history** — reconstructs campaign event timelines from the audit log so cards show accurate premium history.
+
+All three are idempotent. Run in order. If you've already done #2, skip it and go to #1 → #3.
+
 ## What's new in Phase 4.5
 
-Four user-visible changes plus the data layer that powers them.
+Everything user-visible from this release. Six things plus the data layer.
 
 ### 1. Audit log is no longer ambiguous
 
@@ -77,6 +87,41 @@ Recommended sequence:
 1. Run **Retro-fix wheel assignments** once to backfill the missing share lots.
 2. Run **Backfill campaign history** once after that to populate the timelines.
 3. Going forward, both run automatically on every assignment, so you shouldn't need either button again.
+
+### 6. YTD income calculator (rewritten)
+
+The Command page's "INCOME · ALL REALIZED" hero card now walks the **cash ledger** directly instead of iterating positions. This matches your stated rule: premium is income at collection, BTC without roll is expense at close, roll credits/debits are income/expense in the roll month.
+
+The previous calc had two bugs that were under-counting your YTD:
+
+- **Open positions contributed $0** — even though you'd already collected the premium in cash. Eight open wheel options × ~$700 average premium = ~$5,600 of real income that wasn't showing up.
+- **Rolls were being counted as losses** — when you roll a CSP up by closing the old at $X and opening the new at $Y > $X, the position-iteration calc booked the closed leg's `(open_premium − close_premium)` as a realized loss, even though the cash impact was a positive net credit. Your seven May rolls showed "This Month: −$2,163" when you'd actually netted a few hundred dollars.
+
+The new calc sums these cash event types month-by-month: `option_open`, `option_close`, `spread_open`, `spread_close`, `roll_credit`, `roll_debit`. Plus `realized_pnl` from sold share lots. It ignores deposits, withdrawals, share buys/sells (replaced by sold-lot P&L), and transfers — those aren't trading income.
+
+After deploy, your YTD figure will jump significantly upward to match what your cash ledger actually shows. Should land closer to your spreadsheet's $19,739 number.
+
+### 7. Repair option data
+
+On the Settings tab there's a `Repair option data →` button. The YTD calculator skips any option missing `close_date`, `premium`, or `contracts` — so if any of your legacy closed positions have those fields blank, they get dropped from the income total entirely.
+
+Repair walks every closed/expired/assigned/rolled option in your account and fills missing fields from the audit log:
+
+- **close_date** — falls back to `exp`, then audit's recorded close_date, then audit timestamp
+- **premium** — pulled from the original `add_option` audit
+- **contracts** — pulled from the original `add_option` audit
+- **close_premium** — defaulted to 0 for assigned/expired (the standard convention)
+- **direction** — inferred from option type (`sell` for CSP/CC, `buy` for LONG_PUT/LONG_CALL)
+
+Idempotent and per-option audited as `repair_option_data`.
+
+### 8. Edit closed positions
+
+You can now edit the **sub-account** and **note** on any closed option, closed spread, or sold share lot — without touching cash math or P&L. Open Portfolio, toggle "Show closed history" on the Options/Spreads/Holdings tab, and click the new `edit` link on any row.
+
+When you change a sub-account, the linked cash ledger entries are updated to match (so the cash-by-sub-account breakdown stays consistent). Cash totals don't change. P&L doesn't change.
+
+This was needed because the original Phase 4 spread form defaulted to "Brokerage" — if you accidentally added a Volkman wheel spread under Brokerage, there was no way to fix it after closing without doing the full delete-and-recreate dance. Now it's two clicks.
 
 ## Deploy steps
 

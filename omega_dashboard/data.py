@@ -391,12 +391,31 @@ def _spread_pnl(spr: Dict) -> float:
 
 
 def calc_income_live(ui_account: str) -> Dict:
-    """Sum ALL realized income by month from LIVE Redis.
+    """Sum ALL realized income by month from the LIVE cash ledger.
 
-    Includes:
-      - Closed/expired/assigned/rolled options (P&L = open - close premium × 100 × contracts)
-      - Closed/expired spreads (P&L from credit or debit math)
-      - Sold share lots (realized gain/loss vs cost basis)
+    Phase 4.5+ — rewritten to walk the cash ledger directly instead of
+    iterating positions. This matches Brad's accounting rule:
+
+      "Premium = income at the month it's collected.
+       BTC without roll = expense in the month closed.
+       Rolls net = income/expense in the roll month."
+
+    Cash event types counted:
+      - option_open   (credit positive = sell premium income;
+                       debit negative = long option purchase expense)
+      - option_close  (debit negative = BTC short closing expense;
+                       credit positive = STC long closing income)
+      - spread_open   (credit positive = credit spread opened;
+                       debit negative = debit spread opened)
+      - spread_close  (signed cash impact at close)
+      - roll_credit   (always positive — net credit from roll)
+      - roll_debit    (always negative — net debit from roll)
+
+    Plus share P&L: sum of `sold_lots[].realized_pnl` by sale date.
+
+    NOT counted as income (capital flow, not P&L):
+      deposit, withdrawal, share_buy, share_sell, transfer_out,
+      transfer_kyleigh, transfer_clay, lumpsum_*
     """
     from . import writes
 
@@ -413,32 +432,55 @@ def calc_income_live(ui_account: str) -> Dict:
     total_year = 0.0
     total_month = 0.0
 
-    def add(month_key, pnl, source):
+    # Income-bearing cash event types and their bucket
+    INCOME_EVENT_BUCKETS = {
+        "option_open": "options",
+        "option_close": "options",
+        "roll_credit": "options",
+        "roll_debit": "options",
+        "spread_open": "spreads",
+        "spread_close": "spreads",
+    }
+
+    def add(month_key, amount, source):
         nonlocal total_year, total_month
-        if not month_key or not pnl:
+        if not month_key or not amount:
             return
-        by_month[month_key] = by_month.get(month_key, 0.0) + pnl
-        by_source[source] = by_source.get(source, 0.0) + pnl
+        by_month[month_key] = by_month.get(month_key, 0.0) + amount
+        by_source[source] = by_source.get(source, 0.0) + amount
         if month_key.startswith(current_year):
-            total_year += pnl
+            total_year += amount
         if month_key == current_month:
-            total_month += pnl
+            total_month += amount
 
     for acc in accounts:
-        # Options (closed / expired / assigned / rolled)
-        for opt in writes.get_options(acc):
-            mk = _option_close_month_live(opt)
-            pnl = _option_pnl_live(opt)
-            add(mk, pnl, "options")
+        # ─── Walk the cash ledger ───
+        try:
+            ledger = writes.get_cash_ledger(acc)
+        except Exception:
+            ledger = []
 
-        # Spreads (closed / expired)
-        for spr in writes.get_spreads(acc):
-            mk = _spread_close_month(spr)
-            pnl = _spread_pnl(spr)
-            add(mk, pnl, "spreads")
+        for ev in ledger:
+            if not isinstance(ev, dict):
+                continue
+            ev_type = ev.get("type", "")
+            bucket = INCOME_EVENT_BUCKETS.get(ev_type)
+            if not bucket:
+                continue  # skip deposit, withdrawal, share_buy/sell, transfer_*
+            try:
+                amt = float(ev.get("amount") or 0)
+            except Exception:
+                continue
+            mk = _close_month_from_date(ev.get("date"))
+            add(mk, amt, bucket)
 
-        # Sold share lots
-        for lot in writes.get_sold_lots(acc):
+        # ─── Sold share lots (realized P&L) ───
+        try:
+            sold_lots = writes.get_sold_lots(acc)
+        except Exception:
+            sold_lots = []
+
+        for lot in sold_lots:
             if not isinstance(lot, dict):
                 continue
             mk = _close_month_from_date(lot.get("date"))
@@ -450,6 +492,7 @@ def calc_income_live(ui_account: str) -> Dict:
 
     return {
         "available": True,
+        "method": "cash_ledger",
         "month": round(total_month, 2),
         "year": round(total_year, 2),
         "by_month": {k: round(v, 2) for k, v in sorted(by_month.items())},

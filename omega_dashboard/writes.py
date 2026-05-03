@@ -2428,6 +2428,284 @@ def backfill_campaign_history(account: Optional[str] = None) -> Dict:
 
 
 # ═════════════════════════════════════════════════════════
+# PHASE 4.5 — REPAIR OPTION DATA
+# Scans closed/expired/assigned/rolled options for missing fields
+# (close_date, premium, contracts) and patches them from the audit log.
+# Idempotent. Safe to re-run.
+# ═════════════════════════════════════════════════════════
+
+def repair_option_data(account: Optional[str] = None) -> Dict:
+    """Walk every option and patch missing fields from the audit log.
+
+    For each option with status closed/expired/assigned/rolled, ensure:
+      - close_date is set (fall back to: close_at, exp, audit timestamp)
+      - premium is set (fall back to: add_option audit's new_value.premium)
+      - contracts is set (fall back to: add_option audit, default 1)
+
+    Idempotent — running multiple times yields the same result.
+    Audited as `repair_option_data` per fix.
+    """
+    from . import durability
+
+    accounts = [account] if account else list(ALL_UNDERLYING_ACCOUNTS)
+
+    try:
+        raw = durability.list_audit_entries(limit=2000)
+    except Exception as e:
+        log.warning(f"audit log unavailable: {e}")
+        return {"ok": False, "error": "audit log unavailable"}
+
+    # Index add_option audits by opt_id (target)
+    add_option_by_target: Dict[str, Dict] = {}
+    close_by_target: Dict[str, Dict] = {}
+    for entry in raw:
+        op = entry.get("op", "") or ""
+        try:
+            new_v = json.loads(entry["new_value"]) if entry.get("new_value") else None
+        except Exception:
+            new_v = None
+        entry["_parsed_new"] = new_v
+
+        if op == "add_option":
+            tgt = entry.get("target", "")
+            if tgt and tgt not in add_option_by_target:
+                add_option_by_target[tgt] = entry
+        elif op in ("option_closed", "option_expired", "option_assigned",
+                    "option_assigned_with_shares", "cc_called_away_with_shares"):
+            tgt = entry.get("target", "")
+            if tgt and tgt not in close_by_target:
+                close_by_target[tgt] = entry
+
+    summary = {
+        "ok": True,
+        "options_repaired": 0,
+        "fields_filled": 0,
+        "details": [],
+    }
+
+    for acc in accounts:
+        if not _validate_account(acc):
+            continue
+
+        options = get_options(acc)
+        if not options:
+            continue
+
+        any_changed = False
+
+        for opt in options:
+            if not isinstance(opt, dict):
+                continue
+            status = opt.get("status", "open")
+            # Only repair closed-state options
+            if status not in ("closed", "expired", "assigned", "rolled"):
+                continue
+
+            opt_id = opt.get("id", "")
+            patches = []
+
+            # 1. close_date
+            # Priority: exp (assignment/expiry usually = close date) →
+            #           audit payload's close_date →
+            #           closed_at field (truncated to date) →
+            #           audit timestamp (truncated to date)
+            if not opt.get("close_date"):
+                fallback = opt.get("exp") or ""
+                if not fallback:
+                    ce = close_by_target.get(opt_id)
+                    if ce:
+                        cd = ce.get("_parsed_new")
+                        if isinstance(cd, dict) and cd.get("close_date"):
+                            fallback = cd["close_date"]
+                if not fallback:
+                    fallback = (opt.get("closed_at") or "")[:10]
+                if not fallback:
+                    ce = close_by_target.get(opt_id)
+                    if ce:
+                        fallback = ce.get("timestamp", "")[:10]
+                if fallback:
+                    opt["close_date"] = fallback
+                    patches.append(f"close_date={fallback}")
+
+            # 2. premium
+            if opt.get("premium") in (None, 0, 0.0, ""):
+                ae = add_option_by_target.get(opt_id)
+                if ae:
+                    od = ae.get("_parsed_new") or {}
+                    if isinstance(od, dict) and od.get("premium") not in (None, ""):
+                        try:
+                            opt["premium"] = float(od["premium"])
+                            patches.append(f"premium={opt['premium']}")
+                        except Exception:
+                            pass
+
+            # 3. contracts
+            if opt.get("contracts") in (None, 0, ""):
+                ae = add_option_by_target.get(opt_id)
+                if ae:
+                    od = ae.get("_parsed_new") or {}
+                    if isinstance(od, dict) and od.get("contracts") not in (None, ""):
+                        try:
+                            opt["contracts"] = int(od["contracts"])
+                            patches.append(f"contracts={opt['contracts']}")
+                        except Exception:
+                            pass
+
+            # 4. close_premium (default 0 for assigned/expired, leave for closed)
+            if opt.get("close_premium") is None:
+                if status in ("expired", "assigned"):
+                    opt["close_premium"] = 0
+                    patches.append("close_premium=0")
+
+            # 5. direction (default sell for CSP/CC)
+            if not opt.get("direction"):
+                opt_type = opt.get("type", "")
+                if opt_type in ("CSP", "CC"):
+                    opt["direction"] = "sell"
+                    patches.append("direction=sell")
+                elif opt_type in ("LONG_PUT", "LONG_CALL"):
+                    opt["direction"] = "buy"
+                    patches.append("direction=buy")
+
+            if patches:
+                any_changed = True
+                summary["options_repaired"] += 1
+                summary["fields_filled"] += len(patches)
+                summary["details"].append({
+                    "account": acc,
+                    "opt_id": opt_id,
+                    "ticker": opt.get("ticker"),
+                    "status": status,
+                    "patches": patches,
+                })
+                _audit(acc, "repair_option_data", opt_id, None,
+                       {"patches": patches, "ticker": opt.get("ticker")})
+
+        if any_changed:
+            _save(_key_options(acc), options)
+
+    return summary
+
+
+# ═════════════════════════════════════════════════════════
+# PHASE 4.5 — EDIT CLOSED POSITION META
+# Allows editing sub-account / note on closed options, spreads, and
+# sold share lots without touching cash math. Pure metadata changes.
+# ═════════════════════════════════════════════════════════
+
+def edit_closed_option_meta(account: str, opt_id: str,
+                              subaccount: Optional[str] = None,
+                              note: Optional[str] = None) -> Dict:
+    """Update sub-account or note on a closed option (does not touch cash)."""
+    if not _validate_account(account):
+        return {"ok": False, "error": "Invalid account"}
+
+    options = get_options(account)
+    opt = next((o for o in options if isinstance(o, dict) and o.get("id") == opt_id), None)
+    if not opt:
+        return {"ok": False, "error": "Option not found"}
+    if opt.get("status") == "open":
+        return {"ok": False, "error": "Use the regular edit form for open options"}
+
+    old = {"subaccount": opt.get("subaccount"), "note": opt.get("note")}
+    if subaccount is not None:
+        opt["subaccount"] = subaccount.strip() or DEFAULT_SUBACCOUNT
+    if note is not None:
+        opt["note"] = note.strip()
+
+    if not _save(_key_options(account), options):
+        return {"ok": False, "error": "Save failed"}
+
+    # Update linked cash events' sub-account too so the cash ledger stays consistent
+    if subaccount is not None:
+        ledger = get_cash_ledger(account)
+        changed = False
+        for ev in ledger:
+            if isinstance(ev, dict) and ev.get("ref_id") == opt_id:
+                if ev.get("subaccount") != opt["subaccount"]:
+                    ev["subaccount"] = opt["subaccount"]
+                    changed = True
+        if changed:
+            _save(_key_cash_ledger(account), ledger)
+
+    _audit(account, "edit_closed_option_meta", opt_id, old, {
+        "subaccount": opt.get("subaccount"),
+        "note": opt.get("note"),
+    })
+    return {"ok": True, "option": opt}
+
+
+def edit_closed_spread_meta(account: str, spr_id: str,
+                              subaccount: Optional[str] = None,
+                              note: Optional[str] = None) -> Dict:
+    """Update sub-account or note on a closed spread (does not touch cash math)."""
+    if not _validate_account(account):
+        return {"ok": False, "error": "Invalid account"}
+
+    spreads = get_spreads(account)
+    spr = next((s for s in spreads if isinstance(s, dict) and s.get("id") == spr_id), None)
+    if not spr:
+        return {"ok": False, "error": "Spread not found"}
+    if spr.get("status") == "open":
+        return {"ok": False, "error": "Use the regular edit form for open spreads"}
+
+    old = {"subaccount": spr.get("subaccount"), "note": spr.get("note")}
+    if subaccount is not None:
+        spr["subaccount"] = subaccount.strip() or DEFAULT_SUBACCOUNT
+    if note is not None:
+        spr["note"] = note.strip()
+
+    if not _save(_key_spreads(account), spreads):
+        return {"ok": False, "error": "Save failed"}
+
+    # Update linked cash events' sub-account too
+    if subaccount is not None:
+        ledger = get_cash_ledger(account)
+        changed = False
+        for ev in ledger:
+            if isinstance(ev, dict) and ev.get("ref_id") == spr_id:
+                if ev.get("subaccount") != spr["subaccount"]:
+                    ev["subaccount"] = spr["subaccount"]
+                    changed = True
+        if changed:
+            _save(_key_cash_ledger(account), ledger)
+
+    _audit(account, "edit_closed_spread_meta", spr_id, old, {
+        "subaccount": spr.get("subaccount"),
+        "note": spr.get("note"),
+    })
+    return {"ok": True, "spread": spr}
+
+
+def edit_sold_lot_meta(account: str, lot_id: str,
+                         subaccount: Optional[str] = None,
+                         note: Optional[str] = None) -> Dict:
+    """Update sub-account or note on a sold share lot (does not touch P&L)."""
+    if not _validate_account(account):
+        return {"ok": False, "error": "Invalid account"}
+
+    lots = _load(_key_sold_lots(account), [])
+    lot = next((l for l in lots if isinstance(l, dict) and l.get("id") == lot_id), None)
+    if not lot:
+        return {"ok": False, "error": "Sold lot not found"}
+
+    old = {"subaccount": lot.get("subaccount"), "note": lot.get("note")}
+    if subaccount is not None:
+        lot["subaccount"] = subaccount.strip() or DEFAULT_SUBACCOUNT
+    if note is not None:
+        lot["note"] = note.strip()
+
+    if not _save(_key_sold_lots(account), lots):
+        return {"ok": False, "error": "Save failed"}
+
+    _audit(account, "edit_sold_lot_meta", lot_id, old, {
+        "subaccount": lot.get("subaccount"),
+        "note": lot.get("note"),
+    })
+    return {"ok": True, "lot": lot}
+
+
+# ═════════════════════════════════════════════════════════
 # WIPE
 # ═════════════════════════════════════════════════════════
 

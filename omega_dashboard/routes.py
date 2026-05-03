@@ -856,6 +856,84 @@ def portfolio_backfill_campaigns():
     return redirect(url_for("dashboard.portfolio_section", section="settings"))
 
 
+@dashboard_bp.route("/portfolio/repair-option-data", methods=["POST"])
+@login_required
+def portfolio_repair_option_data():
+    """Phase 4.5 — Patch missing fields on closed/expired/assigned options
+    from the audit log. Idempotent."""
+    from . import writes
+    result = writes.repair_option_data()
+    if result.get("ok"):
+        msg = (f"Repaired {result.get('options_repaired', 0)} option(s) · "
+               f"filled {result.get('fields_filled', 0)} missing field(s)")
+        _flash(msg, "success" if result.get("options_repaired") else "info")
+    else:
+        _flash(f"Repair failed: {result.get('error')}", "error")
+    return redirect(url_for("dashboard.portfolio_section", section="settings"))
+
+
+# ─── PHASE 4.5: EDIT CLOSED POSITION META ────────────────
+
+@dashboard_bp.route("/portfolio/options/edit-closed/<opt_id>", methods=["POST"])
+@login_required
+def portfolio_option_edit_closed(opt_id):
+    """Edit sub-account / note on a closed option (does not touch cash math)."""
+    from . import writes
+    acct = request.form.get("acct", "brad")
+    sub = request.form.get("subaccount")
+    note = request.form.get("note")
+    result = writes.edit_closed_option_meta(
+        acct, opt_id,
+        subaccount=sub if sub is not None else None,
+        note=note if note is not None else None,
+    )
+    if result.get("ok"):
+        _flash(f"Updated closed option metadata", "success")
+    else:
+        _flash(f"Edit failed: {result.get('error')}", "error")
+    return _bounce("options", acct)
+
+
+@dashboard_bp.route("/portfolio/spreads/edit-closed/<spr_id>", methods=["POST"])
+@login_required
+def portfolio_spread_edit_closed(spr_id):
+    """Edit sub-account / note on a closed spread (does not touch cash math)."""
+    from . import writes
+    acct = request.form.get("acct", "brad")
+    sub = request.form.get("subaccount")
+    note = request.form.get("note")
+    result = writes.edit_closed_spread_meta(
+        acct, spr_id,
+        subaccount=sub if sub is not None else None,
+        note=note if note is not None else None,
+    )
+    if result.get("ok"):
+        _flash(f"Updated closed spread metadata", "success")
+    else:
+        _flash(f"Edit failed: {result.get('error')}", "error")
+    return _bounce("spreads", acct)
+
+
+@dashboard_bp.route("/portfolio/holdings/edit-sold-lot/<lot_id>", methods=["POST"])
+@login_required
+def portfolio_sold_lot_edit(lot_id):
+    """Edit sub-account / note on a sold share lot (does not touch P&L)."""
+    from . import writes
+    acct = request.form.get("acct", "brad")
+    sub = request.form.get("subaccount")
+    note = request.form.get("note")
+    result = writes.edit_sold_lot_meta(
+        acct, lot_id,
+        subaccount=sub if sub is not None else None,
+        note=note if note is not None else None,
+    )
+    if result.get("ok"):
+        _flash(f"Updated sold lot metadata", "success")
+    else:
+        _flash(f"Edit failed: {result.get('error')}", "error")
+    return _bounce("holdings", acct)
+
+
 @dashboard_bp.route("/portfolio/settings/subaccount/add", methods=["POST"])
 @login_required
 def portfolio_sub_add():

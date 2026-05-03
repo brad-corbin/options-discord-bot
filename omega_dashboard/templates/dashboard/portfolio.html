@@ -489,6 +489,7 @@
           <th class="numeric">P&L</th>
           <th>Sub-account</th>
           <th>Note</th>
+          <th></th>
         </tr>
       </thead>
       <tbody>
@@ -505,7 +506,32 @@
           </td>
           <td class="muted">{{ l.subaccount or "—" }}</td>
           <td class="muted">{{ l.note or "—" }}</td>
+          <td>
+            {% if l.id %}
+            <a href="#edit-sl-{{ l.id }}" class="btn-mini-link">edit</a>
+            {% endif %}
+          </td>
         </tr>
+        {% if l.id %}
+        <tr id="edit-sl-{{ l.id }}" class="inline-form-row">
+          <td colspan="10">
+            <form method="POST" action="{{ url_for('dashboard.portfolio_sold_lot_edit', lot_id=l.id) }}" class="inline-form">
+              <input type="hidden" name="acct" value="{{ acct }}">
+              <span class="inline-label">EDIT {{ l.ticker }} sold lot</span>
+              <label>Sub-account</label>
+              <select name="subaccount">
+                {% for sub in d.subaccounts %}
+                  <option value="{{ sub }}" {% if sub == l.subaccount %}selected{% endif %}>{{ sub }}</option>
+                {% endfor %}
+              </select>
+              <label>Note</label>
+              <input type="text" name="note" value="{{ l.note or '' }}" placeholder="Optional note" style="min-width: 200px;">
+              <button type="submit" class="btn-primary-sm">Save</button>
+              <span class="muted" style="font-size: 10px; margin-left: 8px;">Updates metadata only — P&L unchanged.</span>
+            </form>
+          </td>
+        </tr>
+        {% endif %}
         {% endfor %}
       </tbody>
     </table>
@@ -834,6 +860,7 @@
           <th class="numeric">×</th>
           <th class="numeric">P&L</th>
           <th>Sub-account</th>
+          <th></th>
         </tr>
       </thead>
       <tbody>
@@ -853,6 +880,25 @@
             {% if o.realized_pnl >= 0 %}+{% endif %}${{ "{:,.2f}".format(o.realized_pnl) }}
           </td>
           <td class="muted">{{ o.subaccount or "—" }}</td>
+          <td><a href="#edit-closed-opt-{{ o.id }}" class="btn-mini-link">edit</a></td>
+        </tr>
+        <tr id="edit-closed-opt-{{ o.id }}" class="inline-form-row">
+          <td colspan="13">
+            <form method="POST" action="{{ url_for('dashboard.portfolio_option_edit_closed', opt_id=o.id) }}" class="inline-form">
+              <input type="hidden" name="acct" value="{{ acct }}">
+              <span class="inline-label">EDIT {{ o.ticker }} {{ o.type }}</span>
+              <label>Sub-account</label>
+              <select name="subaccount">
+                {% for sub in d.subaccounts %}
+                  <option value="{{ sub }}" {% if sub == o.subaccount %}selected{% endif %}>{{ sub }}</option>
+                {% endfor %}
+              </select>
+              <label>Note</label>
+              <input type="text" name="note" value="{{ o.note or '' }}" placeholder="Optional note" style="min-width: 200px;">
+              <button type="submit" class="btn-primary-sm">Save</button>
+              <span class="muted" style="font-size: 10px; margin-left: 8px;">Updates metadata only — cash math unchanged.</span>
+            </form>
+          </td>
         </tr>
         {% endfor %}
       </tbody>
@@ -1116,6 +1162,7 @@
           <th class="numeric">×</th>
           <th class="numeric">P&L</th>
           <th>Sub-account</th>
+          <th></th>
         </tr>
       </thead>
       <tbody>
@@ -1136,6 +1183,27 @@
             {% if s.realized_pnl >= 0 %}+{% endif %}${{ "{:,.2f}".format(s.realized_pnl) }}
           </td>
           <td class="muted">{{ s.subaccount or "—" }}</td>
+          <td>
+            <a href="#edit-closed-spr-{{ s.id }}" class="btn-mini-link">edit</a>
+          </td>
+        </tr>
+        <tr id="edit-closed-spr-{{ s.id }}" class="inline-form-row">
+          <td colspan="14">
+            <form method="POST" action="{{ url_for('dashboard.portfolio_spread_edit_closed', spr_id=s.id) }}" class="inline-form">
+              <input type="hidden" name="acct" value="{{ acct }}">
+              <span class="inline-label">EDIT {{ s.ticker }} {{ s.type }}</span>
+              <label>Sub-account</label>
+              <select name="subaccount">
+                {% for sub in d.subaccounts %}
+                  <option value="{{ sub }}" {% if sub == s.subaccount %}selected{% endif %}>{{ sub }}</option>
+                {% endfor %}
+              </select>
+              <label>Note</label>
+              <input type="text" name="note" value="{{ s.note or '' }}" placeholder="Optional note" style="min-width: 200px;">
+              <button type="submit" class="btn-primary-sm">Save</button>
+              <span class="muted" style="font-size: 10px; margin-left: 8px;">Updates metadata only — cash math unchanged.</span>
+            </form>
+          </td>
         </tr>
         {% endfor %}
       </tbody>
@@ -1412,6 +1480,18 @@
       </form>
       <span class="muted" style="font-size: 10px; margin-left: 12px;">
         Reconstructs campaign event timelines from the audit log so cards show accurate premium history. Run after retro-fix.
+      </span>
+    </div>
+
+    <div class="maintenance-actions" style="margin-top: 14px;">
+      <form method="POST" action="{{ url_for('dashboard.portfolio_repair_option_data') }}" style="display:inline;"
+            onsubmit="return confirm('Scan all closed/expired/assigned options for missing fields (close_date, premium, contracts) and patch them from the audit log?\\n\\nIdempotent and safe to run multiple times.')">
+        <button type="submit" class="btn-primary-sm">
+          Repair option data →
+        </button>
+      </form>
+      <span class="muted" style="font-size: 10px; margin-left: 12px;">
+        Patches missing fields on closed options so the YTD income calculator counts them correctly. Idempotent.
       </span>
     </div>
   </div>
