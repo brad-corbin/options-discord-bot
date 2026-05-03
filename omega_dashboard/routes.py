@@ -214,61 +214,7 @@ def command_center():
 @dashboard_bp.route("/trading", methods=["GET"])
 @login_required
 def trading():
-    from . import data
-    active_account = get_active_account()
-    # Pulled tickers: comma-separated cookie, e.g. "AMD,SOFI"
-    pulled_raw = request.cookies.get("omega_pulled", "").strip()
-    pulled = [t.strip().upper() for t in pulled_raw.split(",") if t.strip()] if pulled_raw else []
-    page_data = data.trading_data(active_account["key"], pulled_tickers=pulled)
-    return render_page(
-        "dashboard/trading.html",
-        page_key="trading",
-        page_data=page_data,
-    )
-
-
-@dashboard_bp.route("/trading/pull/<ticker>", methods=["POST"])
-@login_required
-def pull_ticker(ticker):
-    """Add a ticker to the pulled set (cookie-persisted for the session)."""
-    ticker = (ticker or "").strip().upper()
-    import re as _re
-    if not _re.match(r"^[A-Z][A-Z0-9.\-]{0,10}$", ticker):
-        return redirect(url_for("dashboard.trading"))
-
-    pulled_raw = request.cookies.get("omega_pulled", "").strip()
-    pulled = [t.strip().upper() for t in pulled_raw.split(",") if t.strip()] if pulled_raw else []
-    # Newest first, dedup
-    pulled = [ticker] + [t for t in pulled if t != ticker]
-    pulled = pulled[:12]  # cap
-
-    resp = make_response(redirect(url_for("dashboard.trading")))
-    resp.set_cookie("omega_pulled", ",".join(pulled),
-                    max_age=60 * 60 * 24, samesite="Lax")
-    return resp
-
-
-@dashboard_bp.route("/trading/dismiss/<ticker>", methods=["POST"])
-@login_required
-def dismiss_pulled(ticker):
-    """Remove a single ticker from the pulled set."""
-    ticker = (ticker or "").strip().upper()
-    pulled_raw = request.cookies.get("omega_pulled", "").strip()
-    pulled = [t.strip().upper() for t in pulled_raw.split(",") if t.strip()] if pulled_raw else []
-    pulled = [t for t in pulled if t != ticker]
-
-    resp = make_response(redirect(url_for("dashboard.trading")))
-    resp.set_cookie("omega_pulled", ",".join(pulled),
-                    max_age=60 * 60 * 24, samesite="Lax")
-    return resp
-
-
-@dashboard_bp.route("/trading/clear-pulls", methods=["POST"])
-@login_required
-def clear_pulls():
-    resp = make_response(redirect(url_for("dashboard.trading")))
-    resp.set_cookie("omega_pulled", "", max_age=0, samesite="Lax")
-    return resp
+    return render_page("dashboard/trading.html", page_key="trading")
 
 
 @dashboard_bp.route("/portfolio", methods=["GET"])

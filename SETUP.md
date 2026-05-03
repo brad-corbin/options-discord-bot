@@ -1,139 +1,154 @@
-# Phase 3 — Read-only Views
+# Phase 3 — Snapshot-Based Read-only Views
 
-Live data on Command Center and Trading view. Built on Phase 1 + Phase 2.
+This is a clean rebuild. **No bot internals reads. No live API calls. No hangs possible.**
 
-## What ships in this phase
+The Command Center reads from your most recent portfolio snapshot in Sheets.
+Data is "as of" your last snapshot (refreshes daily at 06:00 UTC, or click
+"Snapshot Now" on the Durability page for an immediate fresh capture).
+
+---
+
+## Step-by-step setup (designed for non-developers)
+
+### Step 1 — Replace the dashboard folder
+
+1. Open your `Documents/GitHub/options-discord-bot/` folder in File Explorer
+2. **Delete** the existing `omega_dashboard/` folder (right-click → Delete)
+3. Unzip this zip somewhere temporary
+4. Inside the unzip, you'll see an `omega_dashboard/` folder
+5. **Drag and drop** that `omega_dashboard/` folder into your project folder — replacing what was there
+
+### Step 2 — Update `app.py`
+
+Open `app.py` in any text editor. Find the section that looks something like this (around line 720):
+
+```python
+app = Flask(__name__)
+#
+# OMEGA DASHBOARD (web command console)
+#
+from omega_dashboard import dashboard_bp
+from werkzeug.middleware.proxy_fix import ProxyFix
+
+# Trust Render's reverse proxy — required for session cookies over HTTPS
+app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1, x_for=1)
+
+_dashboard_secret = os.getenv("DASHBOARD_SECRET_KEY", "").strip()
+if not _dashboard_secret:
+    raise RuntimeError(
+        "DASHBOARD_SECRET_KEY env var is empty. Set it on Render."
+    )
+app.secret_key = _dashboard_secret
+
+# Cookie settings appropriate for HTTPS deployment behind Render's proxy
+app.config.update(
+    SESSION_COOKIE_SECURE=True,
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+)
+
+app.register_blueprint(dashboard_bp)
+```
+
+**Replace that entire block with this simpler version:**
+
+```python
+app = Flask(__name__)
+#
+# OMEGA DASHBOARD (web command console)
+#
+from omega_dashboard import dashboard_bp
+app.register_blueprint(dashboard_bp)
+app.secret_key = os.getenv("DASHBOARD_SECRET_KEY", "").strip() or os.urandom(32)
+```
+
+That's it. Save the file.
+
+### Step 3 — Commit and push via GitHub Desktop
+
+1. Open GitHub Desktop
+2. You'll see "X changed files" in the left panel — confirming your changes are detected
+3. In the bottom-left, type a commit summary like: `Phase 3 — clean snapshot-based dashboard`
+4. Click **Commit to main**
+5. At the top, click **Push origin**
+
+Render will auto-deploy in about 60-90 seconds.
+
+### Step 4 — Verify it works
+
+After deploy completes:
+
+1. Visit `https://options-discord-bot.onrender.com/dashboard/health`
+
+   You should see:
+   ```json
+   {
+     "status":"ok",
+     "module":"omega-dashboard",
+     "phase":3,
+     "auth_configured":true,
+     "durability":{"sheets_available":true,...}
+   }
+   ```
+
+2. Visit `https://options-discord-bot.onrender.com/login` and log in
+
+3. You should land on the Command Center showing real data from your snapshot
+
+---
+
+## What you get
 
 **Command Center** (`/dashboard`):
-- Income hero — year + month realized income from closed/expired/assigned/rolled options
-- Goal pace bar — average of completed-month income, current month progress
-- Status strip (7 cells) — Open positions / Wheel / Spreads / Intraday / Holdings / API credits / Scanner
-- Open positions panel — grouped by Intraday → Wheel → Spreads → Shares; live spot + P/L on shares
-- Today's alerts feed — pulled from scanner's recent signals
-- Holdings sentiment panel — bullish/neutral/bearish buckets + 4-cell footer with portfolio P&L
-- Capital progression — placeholder until Phase 4 starts tracking starting balances
+- **Snapshot meta strip** at top — shows which snapshot you're viewing and when it was captured
+- **Income hero** — Year-to-date and Month-to-date realized option income (from closed/expired/assigned/rolled options in the snapshot)
+- **Goal pace bar** — once you have at least one completed month of income history
+- **Cash panel** — total cash with breakdown by underlying account
+- **Status strip** — open positions counts (wheel options / spreads / holdings)
+- **Open Positions panel** — your full open positions, grouped by type, color-coded by account
 
 **Trading View** (`/trading`):
-- Live alerts feed — full width, fresh row highlighted with accent border
-- Watch map grid (3 columns) — one card per active ticker (tier_a + active trades + pulled)
-- Each card: ticker / spot / bias / GEX / regime tags / above-spot levels / spot row / below-spot levels / triggers / active trade banner
-- Quick-pull form to add any ticker on demand
-- Pulled tickers persist via cookie, dismissible individually with `×`, "Clear pulls" when 3+
+- Placeholder for now. Live alerts feed and watch map require integration with bot internals that we deferred for stability.
 
-**System status header** (across all pages):
-- Scanner LIVE / PAUSED dot
-- VIX + ADX regime tag
-- API credit usage
-- Active account label
+**Durability** (`/restore`):
+- Unchanged from Phase 2. Snapshots, audit log, restore.
 
-## File drop
+**Portfolio + Diagnostic**:
+- Placeholders, scheduled for Phase 4 and Phase 6.
 
-Replace your existing `dashboard/` folder. Three new things vs Phase 2:
+---
 
-```
-your-bot/
-└── dashboard/
-    ├── __init__.py            (unchanged)
-    ├── routes.py              ← updated (live data routes + pull/dismiss/clear)
-    ├── durability.py          (unchanged)
-    ├── scheduler.py           (unchanged)
-    ├── data.py                ← NEW: read-only data layer
-    ├── templates/dashboard/
-    │   ├── base.html          ← updated (live system-status header)
-    │   ├── login.html         (unchanged)
-    │   ├── command_center.html  ← rewritten (live data)
-    │   ├── trading.html       ← rewritten (watch map + alerts)
-    │   ├── portfolio.html     (unchanged — Phase 4 territory)
-    │   ├── diagnostic.html    (unchanged — Phase 6 territory)
-    │   └── restore.html       (unchanged)
-    └── static/
-        └── omega.css          ← updated (Phase 3 panel/grid styles appended)
-```
+## What's deliberately NOT in this phase
 
-## No `app.py` changes needed
+- **Live spot prices on holdings** — would need a live API call per page render, which is what hung the old Phase 3
+- **Live alerts feed** — same reason
+- **Watch map cards with thesis levels** — required reading bot internals
+- **Scanner status / regime tag in header** — could hang
+- **Capital progression bars** — needs Phase 4 starting balance tracking
 
-Same as Phase 2 — the data layer late-binds to `app.py` internals. Drop and go.
+These are all valuable and will come back in later phases when they can be done safely.
 
-## What's reading from where
+---
 
-The data layer (`dashboard/data.py`) reads from:
+## How to refresh data
 
-- `portfolio.py` — holdings, options, spreads, cash; P/L calcs
-- `app._cached_md` — spot prices (with 30-second per-ticker cache to avoid hammering the API)
-- `app._scanner` — watchlist, regime label, recent signals
-- `app._thesis_engine` (or `_thesis_monitor_engine`) — ThesisContext + MonitorState for watch map cards
-- `options_map` — `build_watch_levels` / `build_watch_triggers` for the level structures on each card
-- `sentiment_report` — per-ticker sentiment for the holdings buckets (if loaded)
+The dashboard auto-pulls from the latest snapshot. New snapshots happen:
 
-If any of those modules aren't loaded yet (e.g. cold start), the page degrades cleanly — empty panels with helpful messages, never broken.
+1. **Automatic daily at 06:00 UTC** (1am Central) — every night
+2. **On demand** — go to **Durability** tab → click **Snapshot Now**
 
-## Account model
+After clicking Snapshot Now, refresh the Command Center page — new data appears.
 
-Same UI accounts as Phase 1, mapped to underlying portfolio keys:
+---
 
-| UI view | Underlying | Status today |
-|---|---|---|
-| Combined | brad + mom | Live data |
-| Mine | brad | Live data |
-| Mom | mom | Live data |
-| Partnership | (none yet) | Placeholder until Phase 4 |
-| Kyleigh | (none yet) | Placeholder until Phase 4 |
+## If anything goes wrong
 
-When you switch to Partnership or Kyleigh today, you'll see the "No data yet" placeholder with a note. Phase 4 introduces those account keys when you start entering Day Trades and Kyleigh transfers.
+If `/dashboard/health` doesn't return phase 3, or login breaks:
 
-## Spot price strategy
+1. Take a screenshot of the URL and what's shown
+2. Check Render logs for errors
+3. We can roll back to the Phase 2 working state in seconds via Render's deploy history
 
-Every page render needs spot prices for share P/L and watch map cards. To avoid 15-30 fresh API calls per page load:
-
-- Each ticker has a 30-second TTL in an in-memory cache in `data.py`
-- The first request per ticker hits `_cached_md.get_spot()` (which itself caches)
-- Subsequent requests within 30 seconds reuse the cached value
-- After 30 seconds, the next page render refreshes that ticker
-
-For a typical 10-ticker portfolio, refreshing the dashboard repeatedly costs 0 fresh API calls within the 30s window. The Command Center is safe to leave open and refresh at will.
-
-## What's not in this phase (deliberately)
-
-Held strictly to scope:
-
-- Charts — out of scope (you have TradingView)
-- Capital progression bars — needs starting balance tracking from Phase 4
-- True ROC / goal projections — needs starting balance from Phase 4
-- Position entry / edits / closes — Phase 4
-- Holdings digest Telegram — Phase 5
-- Diagnostic shadow signals / category P&L — Phase 6
-- Real-time auto-refresh — phase 7+ (page refresh is the model for now)
-- Time-travel through snapshots — out of scope
-
-## Verify after deploy
-
-Hit health:
-```
-https://options-discord-bot.onrender.com/dashboard/health
-```
-
-Should report `"phase": 3` and the durability flags from Phase 2 still all `true`.
-
-Then log in and check:
-
-1. **Header status** should show real values: scanner LIVE/PAUSED, regime tag with VIX/ADX, API credits used. If all show "—" or "OFFLINE", the bot's globals aren't populated yet (cold start) — give it a minute and refresh.
-
-2. **Command Center** for the Combined or Mine view: income year + month should show realized $$ from your closed wheel options. Open positions section shows your current open contracts.
-
-3. **Trading view**: watch map grid should populate from scanner's tier_a + any active trades. The quick-pull box accepts any ticker — try `SPY` and watch a card render with levels and triggers.
-
-4. **Account switching**: click any account chip, see the accent color shift and the data filter to that account.
-
-If something looks empty that you expected to have data, check the bot's logs — usually the answer is "scanner hasn't run yet" or "thesis monitor hasn't loaded that ticker yet". The dashboard reads what the bot already computes; it doesn't compute anything new.
-
-## What's next
-
-**Phase 4 — Portfolio Writes.** This is the big one. Manual entry forms for:
-- Cash deposits + withdrawals (starting balances per account)
-- Holdings (shares + cost basis with auto-tagging)
-- Options (CSP / CC / Long / Spread legs)
-- Rolls (single net-credit/debit event)
-- Kyleigh transfers (`/transfertokyleigh $X from {acct}`)
-- Campaign rollup at assignment (checkboxes for which CSPs fold into adjusted basis)
-
-Every write goes through the audit log built in Phase 2. Once Phase 4 ships, the dashboard becomes truly self-sufficient — no more manual spreadsheet entry, the bot's data model becomes the source of truth.
+The point of this rebuild is that there are NO complex moving parts. If something
+fails, it's a simple thing to find. No proxy fixes, no cookie magic, no bot
+internals — just read snapshot, render template, return.

@@ -8,7 +8,7 @@
 {% set d = page_data %}
 
 {% if not d.portfolio_available %}
-  <!-- Account doesn't have portfolio data wired up yet (Phase 4 territory) -->
+  <!-- Account doesn't have portfolio data yet (Phase 4 territory) -->
   <div class="phase1-stub fade-in">
     <svg class="phase1-watermark" viewBox="0 0 100 100" fill="none">
       <path d="M50 8 L82 22 L82 56 L70 76 L60 88 L40 88 L30 76 L18 56 L18 22 Z"
@@ -18,14 +18,41 @@
     </svg>
     <div class="phase1-title">{{ active_account.label }} — No data yet</div>
     <div class="phase1-msg">
-      This account has no portfolio data in the bot. Phase 4 will add the manual
-      entry forms to populate it. Switch to <strong>Combined</strong>, <strong>Mine</strong>,
-      or <strong>Mom</strong> above to see live data from the existing bot state.
+      This account isn't tracked in the bot yet. Phase 4 will add manual entry
+      forms to populate it. Switch to <strong>Combined</strong>,
+      <strong>Mine</strong>, or <strong>Mom</strong> above to see live data.
     </div>
   </div>
+
+{% elif not d.snapshot_available %}
+  <!-- No snapshot has been captured yet -->
+  <div class="phase1-stub fade-in">
+    <svg class="phase1-watermark" viewBox="0 0 100 100" fill="none">
+      <path d="M50 8 L82 22 L82 56 L70 76 L60 88 L40 88 L30 76 L18 56 L18 22 Z"
+            stroke="currentColor" stroke-width="0.5" fill="none"/>
+      <text x="50" y="62" text-anchor="middle" font-family="Russo One, sans-serif"
+            font-size="38" font-weight="700" fill="currentColor">Ω</text>
+    </svg>
+    <div class="phase1-title">No snapshot yet</div>
+    <div class="phase1-msg">
+      The Command Center reads from the most recent portfolio snapshot.
+      Visit the <strong>Durability</strong> tab and click "Snapshot Now" to
+      capture the current state, then come back here.
+    </div>
+  </div>
+
 {% else %}
 
-<!-- ─── HERO: Income + Capital Bars ───────────────────────── -->
+<!-- ─── SNAPSHOT META ─────────────────────────────────────── -->
+<div class="snapshot-meta-strip fade-in">
+  <span class="snap-label">Snapshot</span>
+  <span class="snap-value">{{ d.snapshot_meta.tab }}</span>
+  <span class="snap-sep">·</span>
+  <span class="snap-meta">Captured {{ d.snapshot_meta.captured_at[:19].replace('T', ' ') }} UTC</span>
+  <span class="snap-meta-right">Refreshed daily at 06:00 UTC · <a href="{{ url_for('dashboard.restore') }}" class="snap-link">Manage</a></span>
+</div>
+
+<!-- ─── INCOME HERO ───────────────────────────────────────── -->
 <section class="cc-hero fade-in">
   <svg class="hero-watermark" viewBox="0 0 100 100" fill="none">
     <path d="M50 8 L82 22 L82 56 L70 76 L60 88 L40 88 L30 76 L18 56 L18 22 Z"
@@ -36,45 +63,30 @@
 
   <div class="cc-hero-grid">
 
-    <!-- Capital progression bars -->
-    <div class="cc-capital">
-      <div class="section-eyebrow">Capital · Progression</div>
-      <div class="cc-bars-stub">
-        <div class="cc-bar-msg">
-          Capital starting balances aren't tracked yet. Phase 4 introduces cash deposit
-          and monthly balance tracking — once the first deposits are entered,
-          these bars start working.
-        </div>
-      </div>
-    </div>
-
-    <!-- Income hero -->
-    <div class="cc-income">
-      <div class="section-eyebrow">Income · Realized</div>
+    <!-- Income side -->
+    <div class="cc-income-box">
+      <div class="section-eyebrow">Income · Realized Options</div>
 
       <div class="income-pair">
         <div class="metric-card primary">
-          <div class="metric-label">Year</div>
-          <div class="metric-value accent">
-            {% if d.income.available %}${{ "{:,.0f}".format(d.income.year) }}{% else %}—{% endif %}
-          </div>
-          <div class="metric-meta">REALIZED · CLOSED OPTIONS</div>
+          <div class="metric-label">Year-to-Date</div>
+          <div class="metric-value accent">${{ "{:,.0f}".format(d.income.year) }}</div>
+          <div class="metric-meta">CLOSED · EXPIRED · ASSIGNED · ROLLED</div>
         </div>
         <div class="metric-card primary">
-          <div class="metric-label">Month</div>
-          <div class="metric-value {% if d.income.available and d.income.month >= 0 %}positive{% endif %}">
-            {% if d.income.available %}${{ "{:,.0f}".format(d.income.month) }}{% else %}—{% endif %}
+          <div class="metric-label">This Month</div>
+          <div class="metric-value {% if d.income.month >= 0 %}positive{% endif %}">
+            ${{ "{:,.0f}".format(d.income.month) }}
           </div>
           <div class="metric-meta">MONTH-TO-DATE</div>
         </div>
       </div>
 
-      <!-- Goal pace -->
       <div class="goal-bar-card">
-        {% if d.goal.available and d.goal.complete %}
+        {% if d.goal.complete %}
           <div class="goal-row">
-            <span class="cc-bar-label">Month Goal · Match Avg</span>
-            <span class="bar-pct">{{ d.goal.pct }}% complete</span>
+            <span class="cc-bar-label">Month vs Avg of Completed Months</span>
+            <span class="bar-pct">{{ d.goal.pct }}%</span>
           </div>
           <div class="goal-progress">
             {% set goal_width = d.goal.pct if d.goal.pct < 100 else 100 %}
@@ -86,22 +98,41 @@
           </div>
         {% else %}
           <div class="goal-meta-only">
-            {{ d.goal.reason if d.goal.available else "Goal pace requires income history" }}
+            {{ d.goal.reason if d.goal.available else "Goal pace requires completed-month income history" }}
           </div>
         {% endif %}
       </div>
     </div>
+
+    <!-- Cash side -->
+    <div class="cc-cash-box">
+      <div class="section-eyebrow">Cash · Tracked</div>
+      <div class="metric-card">
+        <div class="metric-label">Total Cash</div>
+        <div class="metric-value">${{ "{:,.0f}".format(d.cash.total) }}</div>
+        <div class="metric-meta">
+          {% for acc, bal in d.cash.by_account.items() %}
+            {{ acc }}: ${{ "{:,.0f}".format(bal) }}{% if not loop.last %} · {% endif %}
+          {% endfor %}
+        </div>
+      </div>
+      <div class="cc-note">
+        Capital progression bars require starting balance tracking — coming
+        in Phase 4 alongside cash deposit forms.
+      </div>
+    </div>
+
   </div>
 </section>
 
 <!-- ─── STATUS STRIP ──────────────────────────────────────── -->
-<section class="status-strip fade-in">
+<section class="status-strip-simple fade-in">
   <div class="status-cell">
     <div class="status-cell-label">Open Positions</div>
     <div class="status-cell-value">{{ d.open_total }}</div>
   </div>
   <div class="status-cell">
-    <div class="status-cell-label">Wheel</div>
+    <div class="status-cell-label">Wheel Options</div>
     <div class="status-cell-value">{{ d.positions.wheel_options|length }}</div>
   </div>
   <div class="status-cell">
@@ -109,248 +140,72 @@
     <div class="status-cell-value">{{ d.positions.spreads|length }}</div>
   </div>
   <div class="status-cell">
-    <div class="status-cell-label">Intraday</div>
-    <div class="status-cell-value">{{ d.positions.intraday|length }}</div>
-  </div>
-  <div class="status-cell">
     <div class="status-cell-label">Holdings</div>
     <div class="status-cell-value">{{ d.positions.shares|length }}</div>
   </div>
-  <div class="status-cell">
-    <div class="status-cell-label">API Credits</div>
-    {% if d.api_credits.available %}
-      {% set pct = d.api_credits.pct_used %}
-      <div class="status-cell-value {% if pct > 75 %}neg{% elif pct > 25 %}warn{% else %}ok{% endif %}">
-        {{ "%.1fK"|format(d.api_credits.credits / 1000) }} / {{ "%.0fK"|format(d.api_credits.budget / 1000) }}
-      </div>
-    {% else %}
-      <div class="status-cell-value">—</div>
-    {% endif %}
-  </div>
-  <div class="status-cell">
-    <div class="status-cell-label">Scanner</div>
-    {% if d.scanner.available and d.scanner.running %}
-      <div class="status-cell-value ok">Live · {{ d.scanner.watchlist_size or 0 }}</div>
-    {% else %}
-      <div class="status-cell-value">Offline</div>
-    {% endif %}
-  </div>
 </section>
 
-<!-- ─── MAIN GRID: positions + alerts ─────────────────────── -->
-<div class="main-grid fade-in">
-
-  <!-- Open Positions -->
-  <section class="panel">
-    <div class="panel-header">
-      <div class="panel-title">Open Positions</div>
-      <div class="panel-title-meta">{{ d.open_total }} total · {{ d.positions.shares|length }} share lots</div>
-    </div>
-
-    {% if d.open_total == 0 and d.positions.shares|length == 0 %}
-      <div class="panel-empty">
-        <p>No positions in this account yet.</p>
-        <p class="panel-empty-meta">Phase 4 portfolio entry forms will populate this.</p>
-      </div>
-    {% else %}
-
-      {% if d.positions.intraday %}
-        <div class="positions-group-label">Intraday Trades</div>
-        {% for pos in d.positions.intraday %}
-          <div class="position-row">
-            <span class="ticker-cell">{{ pos.ticker }}</span>
-            <span><span class="tag-pill {% if pos.direction == 'LONG' %}long{% else %}short{% endif %}">{{ pos.direction }}</span></span>
-            <span style="color: var(--text-muted);">{{ pos.entry_type }} · ${{ "%.2f"|format(pos.entry_price or 0) }}</span>
-            <span class="position-meta">stop ${{ "%.2f"|format(pos.stop_level or 0) }}</span>
-            <span style="text-align:right;">{% if pos.spot %}${{ "%.2f"|format(pos.spot) }}{% else %}—{% endif %}</span>
-            <span class="pnl {% if pos.underlying_pnl is not none and pos.underlying_pnl >= 0 %}pos{% elif pos.underlying_pnl is not none %}neg{% endif %}" style="text-align:right;">
-              {% if pos.underlying_pnl is not none %}{% if pos.underlying_pnl >= 0 %}+{% endif %}${{ "%.2f"|format(pos.underlying_pnl) }}{% else %}—{% endif %}
-            </span>
-            <span class="position-meta" style="text-align:right;">{{ pos.status }}</span>
-          </div>
-        {% endfor %}
-      {% endif %}
-
-      {% if d.positions.wheel_options %}
-        <div class="positions-group-label">Wheel Options ({{ d.positions.wheel_options|length }})</div>
-        {% for pos in d.positions.wheel_options %}
-          <div class="position-row">
-            <span class="ticker-cell">{{ pos.ticker }}</span>
-            <span><span class="tag-pill {% if pos.type == 'CSP' %}csp{% else %}cc{% endif %}">{{ pos.type }}</span></span>
-            <span style="color: var(--text-muted);">${{ pos.strike }} · {{ pos.exp }}</span>
-            <span class="position-meta"><span class="color-chip chip-{% if pos.account == 'mom' %}mom{% else %}mine{% endif %}"></span>{{ pos.account }}</span>
-            <span style="text-align:right;">${{ "%.2f"|format(pos.premium or 0) }}</span>
-            <span class="position-meta" style="text-align:right;">x{{ pos.contracts }}</span>
-            <span class="position-meta" style="text-align:right;">{{ pos.tag or '' }}</span>
-          </div>
-        {% endfor %}
-      {% endif %}
-
-      {% if d.positions.spreads %}
-        <div class="positions-group-label">Spreads ({{ d.positions.spreads|length }})</div>
-        {% for pos in d.positions.spreads %}
-          <div class="position-row">
-            <span class="ticker-cell">{{ pos.ticker }}</span>
-            <span><span class="tag-pill spread">{{ pos.type }}</span></span>
-            <span style="color: var(--text-muted);">{{ pos.long }}/{{ pos.short }} · {{ pos.exp }}</span>
-            <span class="position-meta"><span class="color-chip chip-{% if pos.account == 'mom' %}mom{% else %}mine{% endif %}"></span>{{ pos.account }}</span>
-            <span style="text-align:right;">{% if pos.debit %}${{ "%.2f"|format(pos.debit) }} dr{% elif pos.credit %}${{ "%.2f"|format(pos.credit) }} cr{% endif %}</span>
-            <span class="position-meta" style="text-align:right;">x{{ pos.contracts }}</span>
-            <span class="position-meta" style="text-align:right;"></span>
-          </div>
-        {% endfor %}
-      {% endif %}
-
-      {% if d.positions.shares %}
-        <div class="positions-group-label">Share Holdings ({{ d.positions.shares|length }})</div>
-        {% for pos in d.positions.shares %}
-          <div class="position-row">
-            <span class="ticker-cell">{{ pos.ticker }}</span>
-            <span class="position-meta">{{ pos.shares }} sh</span>
-            <span style="color: var(--text-muted);">${{ "%.2f"|format(pos.cost_basis or 0) }} basis</span>
-            <span class="position-meta"><span class="color-chip chip-{% if pos.account == 'mom' %}mom{% else %}mine{% endif %}"></span>{{ pos.account }}</span>
-            <span style="text-align:right;">{% if pos.spot %}${{ "%.2f"|format(pos.spot) }}{% else %}—{% endif %}</span>
-            <span class="pnl {% if pos.pnl_dollars is not none and pos.pnl_dollars >= 0 %}pos{% elif pos.pnl_dollars is not none %}neg{% endif %}" style="text-align:right;">
-              {% if pos.pnl_dollars is not none %}{% if pos.pnl_dollars >= 0 %}+{% endif %}${{ "{:,.0f}".format(pos.pnl_dollars) }}{% else %}—{% endif %}
-            </span>
-            <span class="pnl {% if pos.pnl_pct is not none and pos.pnl_pct >= 0 %}pos{% elif pos.pnl_pct is not none %}neg{% endif %} position-meta" style="text-align:right;">
-              {% if pos.pnl_pct is not none %}{{ "%.1f"|format(pos.pnl_pct) }}%{% else %}{% endif %}
-            </span>
-          </div>
-        {% endfor %}
-      {% endif %}
-
-    {% endif %}
-  </section>
-
-  <!-- Alerts feed -->
-  <section class="panel">
-    <div class="panel-header">
-      <div class="panel-title">Today's Alerts</div>
-      <div class="panel-title-meta">{{ d.alerts|length }} recent</div>
-    </div>
-    {% if d.alerts %}
-      <div class="alerts-feed">
-        {% for a in d.alerts %}
-          <div class="alert-row">
-            <span class="alert-time">{{ a.time }}</span>
-            <span class="alert-ticker">{{ a.ticker }}</span>
-            <span class="alert-msg"><span class="label">{{ a.type }}</span>{{ a.msg }}</span>
-            <span class="alert-pill pill-{{ a.status|lower }}">{{ a.status }}</span>
-          </div>
-        {% endfor %}
-      </div>
-    {% else %}
-      <div class="panel-empty">
-        <p>No recent alerts.</p>
-        <p class="panel-empty-meta">When the scanner fires signals, they appear here.</p>
-      </div>
-    {% endif %}
-  </section>
-
-</div>
-
-<!-- ─── HOLDINGS SENTIMENT ───────────────────────────────── -->
-{% if d.sentiment.available and not d.sentiment.is_empty %}
+<!-- ─── POSITIONS PANEL ───────────────────────────────────── -->
 <section class="panel fade-in" style="margin-bottom: 28px;">
   <div class="panel-header">
-    <div class="panel-title">Holdings Sentiment</div>
-    <div class="panel-title-meta">EMA · VWAP · VOL</div>
+    <div class="panel-title">Open Positions</div>
+    <div class="panel-title-meta">{{ d.open_total }} options · {{ d.positions.shares|length }} share lots</div>
   </div>
 
-  <div class="sentiment-grid">
+  {% if d.open_total == 0 and d.positions.shares|length == 0 %}
+    <div class="panel-empty">
+      <p>No positions tracked yet.</p>
+      <p class="panel-empty-meta">Phase 4 will add the entry forms to enter positions.</p>
+    </div>
+  {% else %}
 
-    <div class="sentiment-bucket">
-      <div class="bucket-header">
-        <span class="bucket-icon bull"></span>
-        <span class="bucket-label bull">Bullish</span>
-        <span class="bucket-count">{{ d.sentiment.bullish|length }}</span>
-      </div>
-      {% for h in d.sentiment.bullish %}
-        <div class="position-line">
-          <span class="pl-ticker">{{ h.ticker }}</span>
-          <span class="pl-price">${{ "%.2f"|format(h.spot) }}</span>
-          <span class="pl-signals">
-            <span class="signal {% if h.ema == '✓' %}ok{% elif h.ema == '✗' %}fail{% else %}warn{% endif %}">EMA{{ h.ema }}</span>
-            <span class="signal {% if h.vwap == '✓' %}ok{% elif h.vwap == '✗' %}fail{% else %}warn{% endif %}">VWAP{{ h.vwap }}</span>
-            <span class="signal">{{ h.vol }}</span>
-            {% if h.tag %}<span class="tag-wheel">{{ h.tag }}</span>{% endif %}
-          </span>
-          <span class="pl-pnl {% if h.pnl >= 0 %}pos{% else %}neg{% endif %}">{% if h.pnl >= 0 %}+{% endif %}${{ "{:,.0f}".format(h.pnl) }}</span>
+    {% if d.positions.wheel_options %}
+      <div class="positions-group-label">Wheel Options ({{ d.positions.wheel_options|length }})</div>
+      {% for pos in d.positions.wheel_options %}
+        <div class="position-row">
+          <span class="ticker-cell">{{ pos.ticker }}</span>
+          <span><span class="tag-pill {% if pos.type == 'CSP' %}csp{% else %}cc{% endif %}">{{ pos.type }}</span></span>
+          <span style="color: var(--text-muted);">${{ pos.strike }} · {{ pos.exp }}</span>
+          <span class="position-meta"><span class="color-chip chip-{% if pos.account == 'mom' %}mom{% else %}mine{% endif %}"></span>{{ pos.account }}</span>
+          <span style="text-align:right;">${{ "%.2f"|format(pos.premium or 0) }}</span>
+          <span class="position-meta" style="text-align:right;">x{{ pos.contracts }}</span>
+          <span class="position-meta" style="text-align:right;">{{ pos.tag or '' }}</span>
         </div>
       {% endfor %}
-    </div>
+    {% endif %}
 
-    <div class="sentiment-bucket">
-      <div class="bucket-header">
-        <span class="bucket-icon neutral"></span>
-        <span class="bucket-label neutral">Neutral</span>
-        <span class="bucket-count">{{ d.sentiment.neutral|length }}</span>
-      </div>
-      {% for h in d.sentiment.neutral %}
-        <div class="position-line">
-          <span class="pl-ticker">{{ h.ticker }}</span>
-          <span class="pl-price">${{ "%.2f"|format(h.spot) }}</span>
-          <span class="pl-signals">
-            <span class="signal {% if h.ema == '✓' %}ok{% elif h.ema == '✗' %}fail{% else %}warn{% endif %}">EMA{{ h.ema }}</span>
-            <span class="signal {% if h.vwap == '✓' %}ok{% elif h.vwap == '✗' %}fail{% else %}warn{% endif %}">VWAP{{ h.vwap }}</span>
-            <span class="signal">{{ h.vol }}</span>
-            {% if h.tag %}<span class="tag-wheel">{{ h.tag }}</span>{% endif %}
-          </span>
-          <span class="pl-pnl {% if h.pnl >= 0 %}pos{% else %}neg{% endif %}">{% if h.pnl >= 0 %}+{% endif %}${{ "{:,.0f}".format(h.pnl) }}</span>
+    {% if d.positions.spreads %}
+      <div class="positions-group-label">Spreads ({{ d.positions.spreads|length }})</div>
+      {% for pos in d.positions.spreads %}
+        <div class="position-row">
+          <span class="ticker-cell">{{ pos.ticker }}</span>
+          <span><span class="tag-pill spread">{{ pos.type }}</span></span>
+          <span style="color: var(--text-muted);">{{ pos.long }}/{{ pos.short }} · {{ pos.exp }}</span>
+          <span class="position-meta"><span class="color-chip chip-{% if pos.account == 'mom' %}mom{% else %}mine{% endif %}"></span>{{ pos.account }}</span>
+          <span style="text-align:right;">{% if pos.debit %}${{ "%.2f"|format(pos.debit) }} dr{% elif pos.credit %}${{ "%.2f"|format(pos.credit) }} cr{% endif %}</span>
+          <span class="position-meta" style="text-align:right;">x{{ pos.contracts }}</span>
+          <span class="position-meta" style="text-align:right;"></span>
         </div>
       {% endfor %}
-    </div>
+    {% endif %}
 
-    <div class="sentiment-bucket">
-      <div class="bucket-header">
-        <span class="bucket-icon bear"></span>
-        <span class="bucket-label bear">Bearish</span>
-        <span class="bucket-count">{{ d.sentiment.bearish|length }}</span>
-      </div>
-      {% for h in d.sentiment.bearish %}
-        <div class="position-line">
-          <span class="pl-ticker">{{ h.ticker }}</span>
-          <span class="pl-price">${{ "%.2f"|format(h.spot) }}</span>
-          <span class="pl-signals">
-            <span class="signal {% if h.ema == '✓' %}ok{% elif h.ema == '✗' %}fail{% else %}warn{% endif %}">EMA{{ h.ema }}</span>
-            <span class="signal {% if h.vwap == '✓' %}ok{% elif h.vwap == '✗' %}fail{% else %}warn{% endif %}">VWAP{{ h.vwap }}</span>
-            <span class="signal">{{ h.vol }}</span>
-            {% if h.tag %}<span class="tag-wheel">{{ h.tag }}</span>{% endif %}
-          </span>
-          <span class="pl-pnl {% if h.pnl >= 0 %}pos{% else %}neg{% endif %}">{% if h.pnl >= 0 %}+{% endif %}${{ "{:,.0f}".format(h.pnl) }}</span>
+    {% if d.positions.shares %}
+      <div class="positions-group-label">Share Holdings ({{ d.positions.shares|length }})</div>
+      {% for pos in d.positions.shares %}
+        <div class="position-row">
+          <span class="ticker-cell">{{ pos.ticker }}</span>
+          <span class="position-meta">{{ pos.shares }} sh</span>
+          <span style="color: var(--text-muted);">${{ "%.2f"|format(pos.cost_basis or 0) }} basis</span>
+          <span class="position-meta"><span class="color-chip chip-{% if pos.account == 'mom' %}mom{% else %}mine{% endif %}"></span>{{ pos.account }}</span>
+          <span style="text-align:right;">{{ pos.tag or '' }}</span>
+          <span class="position-meta" style="text-align:right;"></span>
+          <span class="position-meta" style="text-align:right;"></span>
         </div>
       {% endfor %}
-    </div>
+    {% endif %}
 
-  </div>
-
-  <div class="sentiment-footer">
-    <div class="footer-cell">
-      <div class="footer-label">Open Options</div>
-      <div class="footer-value">{{ d.sentiment.open_options }}</div>
-    </div>
-    <div class="footer-cell">
-      <div class="footer-label">Total Unrealized</div>
-      <div class="footer-value {% if d.sentiment.total_unrealized >= 0 %}pos{% else %}neg{% endif %}">
-        {% if d.sentiment.total_unrealized >= 0 %}+{% endif %}${{ "{:,.0f}".format(d.sentiment.total_unrealized) }}
-      </div>
-    </div>
-    <div class="footer-cell">
-      <div class="footer-label">Options Income</div>
-      <div class="footer-value {% if d.sentiment.total_opt_income >= 0 %}pos{% else %}neg{% endif %}">
-        {% if d.sentiment.total_opt_income >= 0 %}+{% endif %}${{ "{:,.0f}".format(d.sentiment.total_opt_income) }}
-      </div>
-    </div>
-    <div class="footer-cell">
-      <div class="footer-label">Portfolio P&L</div>
-      <div class="footer-value {% if d.sentiment.portfolio_pnl >= 0 %}pos{% else %}neg{% endif %}">
-        {% if d.sentiment.portfolio_pnl >= 0 %}+{% endif %}${{ "{:,.0f}".format(d.sentiment.portfolio_pnl) }}
-      </div>
-    </div>
-  </div>
+  {% endif %}
 </section>
-{% endif %}
 
 {% endif %}
 

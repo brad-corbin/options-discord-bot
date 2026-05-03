@@ -1,180 +1,31 @@
 {% extends "dashboard/base.html" %}
 
 {% block title %}Ω OMEGA — Trading{% endblock %}
-{% block brand_sub %}Trading · Live{% endblock %}
+{% block brand_sub %}Trading · {{ active_account.label }}{% endblock %}
 
 {% block content %}
-{% set d = page_data %}
+<div class="phase1-stub fade-in">
+  <svg class="phase1-watermark" viewBox="0 0 100 100" fill="none">
+    <path d="M50 8 L82 22 L82 56 L70 76 L60 88 L40 88 L30 76 L18 56 L18 22 Z"
+          stroke="currentColor" stroke-width="0.5" fill="none"/>
+    <text x="50" y="62" text-anchor="middle" font-family="Russo One, sans-serif"
+          font-size="38" font-weight="700" fill="currentColor">Ω</text>
+  </svg>
 
-<!-- ─── ALERTS FEED ──────────────────────────────────────── -->
-<section class="feed-section fade-in">
-  <div class="section-eyebrow">
-    Alerts · Live
-    <span style="margin-left:auto; font-family: 'JetBrains Mono', monospace; color: var(--text-dim);">
-      NEWEST FIRST · {{ d.alerts|length }} RECENT
-    </span>
+  <div class="phase1-title">Trading View</div>
+  <div class="phase1-msg">
+    The live alerts feed and watch map grid land here in a later phase.
+    Building this safely requires careful integration with the bot's
+    in-memory scanner and thesis monitor — that came after Phase 3.
+    <br><br>
+    For now, your existing Telegram alerts handle live trading. The Command
+    Center reflects your portfolio state as of the most recent snapshot.
   </div>
 
-  <div class="feed-panel">
-    {% if d.alerts %}
-      {% for a in d.alerts %}
-        <div class="feed-row {% if loop.first %}fresh{% endif %}">
-          <span class="feed-time">{{ a.time }}</span>
-          <span class="feed-ticker">{{ a.ticker }}</span>
-          <span class="feed-type {{ a.type|lower }}">{{ a.type }}</span>
-          <span class="feed-msg">{{ a.msg }}</span>
-          <span class="feed-pill pill-{{ a.status|lower }}">{{ a.status }}</span>
-        </div>
-      {% endfor %}
-    {% else %}
-      <div class="panel-empty">
-        <p>No recent alerts.</p>
-        <p class="panel-empty-meta">Alerts appear here as the scanner fires signals during market hours.</p>
-      </div>
-    {% endif %}
+  <div class="phase1-meta">
+    Live alerts source · <span class="accent">_scanner</span>
+    &nbsp;·&nbsp; Thesis levels · <span class="accent">_thesis_engine</span>
+    &nbsp;·&nbsp; Both already running in the bot · UI layer comes next
   </div>
-</section>
-
-<!-- ─── WATCH MAP GRID ──────────────────────────────────── -->
-<section class="watchmap-section fade-in">
-  <div class="eyebrow-with-search">
-    <div class="section-eyebrow">
-      Watch Map · Live
-      <span style="margin-left:auto; font-family: 'JetBrains Mono', monospace; color: var(--text-dim);">
-        {{ d.watchcards|length }} CARDS · SPOT POLLED 30s
-      </span>
-    </div>
-    <form method="POST" action="{{ url_for('dashboard.pull_ticker', ticker='__placeholder__') }}"
-          onsubmit="return omegaPullSubmit(event, this);" class="quick-pull">
-      <span class="quick-pull-prefix">Pull</span>
-      <input class="quick-pull-input" type="text" name="ticker"
-             placeholder="ticker..." autocomplete="off" maxlength="10"
-             autocapitalize="characters" spellcheck="false">
-      <button type="submit" class="quick-pull-go">→</button>
-    </form>
-    {% if d.pulled_tickers %}
-      <form method="POST" action="{{ url_for('dashboard.clear_pulls') }}" style="margin-left: 10px;">
-        <button type="submit" class="dur-restore-btn">Clear pulls ({{ d.pulled_tickers|length }})</button>
-      </form>
-    {% endif %}
-  </div>
-
-  {% if d.watchcards %}
-    <div class="watchmap-grid">
-      {% for card in d.watchcards %}
-        <div class="watchcard {% if card.active_trade %}has-trade {% if card.active_trade.direction == 'LONG' %}long-trade{% else %}short-trade{% endif %}{% endif %} {% if card.pulled %}pulled{% endif %}" style="position: relative;">
-          {% if card.pulled %}
-            <div class="pulled-flag">▶ Pulled</div>
-          {% endif %}
-
-          <div class="watchcard-header">
-            <div class="wc-ticker-row">
-              <span class="wc-ticker">{{ card.ticker }}</span>
-              {% if card.spot %}
-                <span class="wc-spot">${{ "%.2f"|format(card.spot) }}</span>
-              {% else %}
-                <span class="wc-spot" style="color: var(--text-dim);">—</span>
-              {% endif %}
-            </div>
-            {% if card.pulled %}
-              <form method="POST" action="{{ url_for('dashboard.dismiss_pulled', ticker=card.ticker) }}" style="display:inline;">
-                <button type="submit" class="wc-pin" title="Dismiss">×</button>
-              </form>
-            {% endif %}
-          </div>
-
-          <div class="wc-tags">
-            {% if card.bias_score >= 2 %}
-              <span class="wc-tag bullish">Bullish</span>
-            {% elif card.bias_score <= -2 %}
-              <span class="wc-tag bearish">Bearish</span>
-            {% else %}
-              <span class="wc-tag neutral">Neutral</span>
-            {% endif %}
-
-            {% if card.gex_sign == "negative" %}
-              <span class="wc-tag gex-neg">GEX Neg</span>
-            {% elif card.gex_sign == "positive" %}
-              <span class="wc-tag gex-pos">GEX Pos</span>
-            {% endif %}
-
-            {% if card.regime %}
-              <span class="wc-tag dte">{{ card.regime }}</span>
-            {% endif %}
-          </div>
-
-          {% if card.above or card.below or card.spot %}
-            <div class="wc-levels">
-              {% for lvl in card.above|reverse %}
-                <div class="level-row above">
-                  <span class="level-arrow">▲</span>
-                  <span class="level-price">${{ "%.2f"|format(lvl.price) }}</span>
-                  <span class="level-label">{{ lvl.label }}</span>
-                  <span class="level-dist">{% if lvl.dist %}+${{ "%.2f"|format(lvl.dist) }}{% endif %}</span>
-                </div>
-              {% endfor %}
-
-              {% if card.spot %}
-                <div class="spot-row">
-                  <span class="level-arrow">●</span>
-                  <span class="level-price">${{ "%.2f"|format(card.spot) }}</span>
-                  <span class="level-label">SPOT · LIVE</span>
-                  <span class="level-dist"></span>
-                </div>
-              {% endif %}
-
-              {% for lvl in card.below %}
-                <div class="level-row below">
-                  <span class="level-arrow">▼</span>
-                  <span class="level-price">${{ "%.2f"|format(lvl.price) }}</span>
-                  <span class="level-label">{{ lvl.label }}</span>
-                  <span class="level-dist">{% if lvl.dist %}−${{ "%.2f"|format(lvl.dist) }}{% endif %}</span>
-                </div>
-              {% endfor %}
-            </div>
-          {% endif %}
-
-          {% if card.triggers %}
-            <div class="wc-triggers">
-              {% for trigger in card.triggers %}
-                <div class="trigger-line">{{ trigger }}</div>
-              {% endfor %}
-            </div>
-          {% endif %}
-
-          {% if card.active_trade %}
-            <div class="wc-trade">
-              <span class="wc-trade-label">
-                {% if card.active_trade.direction == 'LONG' %}▲{% else %}▼{% endif %}
-                {{ card.active_trade.direction }}
-                {% if card.active_trade.entry_price %}· entry ${{ "%.2f"|format(card.active_trade.entry_price) }}{% endif %}
-              </span>
-              <span class="wc-trade-pnl">{{ card.active_trade.trade_id[:8] }}</span>
-            </div>
-          {% endif %}
-        </div>
-      {% endfor %}
-    </div>
-  {% else %}
-    <div class="panel-empty" style="background: var(--bg-panel); border: 1px solid var(--border); padding: 60px 30px;">
-      <p>No watch map cards available yet.</p>
-      <p class="panel-empty-meta">
-        Cards appear once the thesis monitor has computed levels for tickers
-        (typically after the morning EM card pass). Or pull a specific ticker
-        above to render it on demand.
-      </p>
-    </div>
-  {% endif %}
-</section>
-
-<script>
-  function omegaPullSubmit(e, form) {
-    var input = form.querySelector('input[name="ticker"]');
-    if (!input || !input.value) { e.preventDefault(); return false; }
-    var ticker = input.value.trim().toUpperCase();
-    if (!/^[A-Z][A-Z0-9.\-]{0,10}$/.test(ticker)) { e.preventDefault(); return false; }
-    form.action = '/trading/pull/' + encodeURIComponent(ticker);
-    return true;
-  }
-</script>
+</div>
 {% endblock %}

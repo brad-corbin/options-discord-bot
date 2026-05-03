@@ -36,28 +36,10 @@
     </nav>
 
     <div class="system-status">
-      {% set live = page_data.regime if page_data is defined and page_data is mapping else None %}
-      {% set scanner = page_data.scanner if page_data is defined and page_data is mapping else None %}
-      {% set api = page_data.api_credits if page_data is defined and page_data is mapping else None %}
-
-      {% if scanner and scanner.available and scanner.running %}
-        <span class="status-item"><span class="status-dot"></span>SCANNER LIVE</span>
-      {% elif scanner and scanner.available %}
-        <span class="status-item"><span class="status-dot" style="background: var(--text-dim); box-shadow: 0 0 8px var(--text-dim);"></span>SCANNER PAUSED</span>
-      {% else %}
-        <span class="status-item"><span class="status-dot" style="background: var(--text-dim); box-shadow: 0 0 8px var(--text-dim);"></span>SCAFFOLDING</span>
-      {% endif %}
-
-      {% if live and live.available %}
-        <span class="regime-tag">REGIME · {{ live.label }}{% if live.vix %} · VIX {{ "%.1f"|format(live.vix) }}{% endif %}{% if live.adx %} · ADX {{ "%.0f"|format(live.adx) }}{% endif %}</span>
-      {% else %}
-        <span class="regime-tag">PHASE 3</span>
-      {% endif %}
-
-      {% if api and api.available %}
-        <span class="status-item">API · {{ "%.1fK"|format(api.credits / 1000) }} / {{ "%.0fK"|format(api.budget / 1000) }}</span>
-      {% endif %}
-
+      <span class="status-item">
+        <span class="status-dot"></span>SNAPSHOT MODE
+      </span>
+      <span class="regime-tag">PHASE 3</span>
       <span class="status-item">{% block clock %}{{ active_account.label|upper }}{% endblock %}</span>
     </div>
   </header>

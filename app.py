@@ -719,29 +719,12 @@ log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# ── Omega dashboard ─────────────────────────────────────
-# ProxyFix MUST be applied before anything else touches the app
-from werkzeug.middleware.proxy_fix import ProxyFix
-app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1, x_for=1, x_prefix=1)
-
-_dashboard_secret = os.getenv("DASHBOARD_SECRET_KEY", "").strip()
-if not _dashboard_secret:
-    raise RuntimeError(
-        "DASHBOARD_SECRET_KEY env var is empty. Set it on Render."
-    )
-app.secret_key = _dashboard_secret
-
-# Cookie settings — deliberately NOT setting SESSION_COOKIE_SECURE
-# because Render's proxy can confuse Flask into thinking HTTPS is HTTP,
-# which causes secure cookies to be silently dropped. SameSite=Lax is
-# enough protection given we're already serving over HTTPS.
-app.config.update(
-    SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SAMESITE="Lax",
-)
-
+#
+# OMEGA DASHBOARD (web command console)
+#
 from omega_dashboard import dashboard_bp
 app.register_blueprint(dashboard_bp)
+app.secret_key = os.getenv("DASHBOARD_SECRET_KEY", "").strip() or os.urandom(32)
 
 # ─────────────────────────────────────────────────────────
 # ENV VARS
