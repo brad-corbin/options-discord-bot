@@ -1,147 +1,139 @@
-# Phase 2 — Data Durability
+# Phase 3 — Read-only Views
 
-Snapshots, audit log, and restore. Built on the Phase 1 framework.
+Live data on Command Center and Trading view. Built on Phase 1 + Phase 2.
 
 ## What ships in this phase
 
-- **Daily snapshot job** — full portfolio state captured to a dated Sheets tab nightly
-- **Manual snapshot** — "Snapshot Now" button on the Durability page for on-demand
-- **Restore page** — `/restore` (linked as "Durability" in the nav)
-- **Restore action** — overwrite Redis from any historical snapshot, with confirmation modal
-- **Audit log** — Phase 4 portfolio writes will append here automatically; Phase 2 already logs all restores
-- **30-day rolling retention** — snapshots older than 30 days auto-pruned
+**Command Center** (`/dashboard`):
+- Income hero — year + month realized income from closed/expired/assigned/rolled options
+- Goal pace bar — average of completed-month income, current month progress
+- Status strip (7 cells) — Open positions / Wheel / Spreads / Intraday / Holdings / API credits / Scanner
+- Open positions panel — grouped by Intraday → Wheel → Spreads → Shares; live spot + P/L on shares
+- Today's alerts feed — pulled from scanner's recent signals
+- Holdings sentiment panel — bullish/neutral/bearish buckets + 4-cell footer with portfolio P&L
+- Capital progression — placeholder until Phase 4 starts tracking starting balances
+
+**Trading View** (`/trading`):
+- Live alerts feed — full width, fresh row highlighted with accent border
+- Watch map grid (3 columns) — one card per active ticker (tier_a + active trades + pulled)
+- Each card: ticker / spot / bias / GEX / regime tags / above-spot levels / spot row / below-spot levels / triggers / active trade banner
+- Quick-pull form to add any ticker on demand
+- Pulled tickers persist via cookie, dismissible individually with `×`, "Clear pulls" when 3+
+
+**System status header** (across all pages):
+- Scanner LIVE / PAUSED dot
+- VIX + ADX regime tag
+- API credit usage
+- Active account label
 
 ## File drop
 
-Same pattern as Phase 1 — replace your existing `dashboard/` folder with this one,
-or merge the new files into it:
+Replace your existing `dashboard/` folder. Three new things vs Phase 2:
 
 ```
 your-bot/
-├── app.py
 └── dashboard/
-    ├── __init__.py            ← updated
-    ├── routes.py              ← updated
-    ├── durability.py          ← new
-    ├── scheduler.py           ← new
+    ├── __init__.py            (unchanged)
+    ├── routes.py              ← updated (live data routes + pull/dismiss/clear)
+    ├── durability.py          (unchanged)
+    ├── scheduler.py           (unchanged)
+    ├── data.py                ← NEW: read-only data layer
     ├── templates/dashboard/
-    │   ├── base.html          (unchanged)
+    │   ├── base.html          ← updated (live system-status header)
     │   ├── login.html         (unchanged)
-    │   ├── command_center.html  ← updated (roadmap reflects Phase 2)
-    │   ├── trading.html       (unchanged)
-    │   ├── portfolio.html     (unchanged)
-    │   ├── diagnostic.html    (unchanged)
-    │   └── restore.html       ← new
+    │   ├── command_center.html  ← rewritten (live data)
+    │   ├── trading.html       ← rewritten (watch map + alerts)
+    │   ├── portfolio.html     (unchanged — Phase 4 territory)
+    │   ├── diagnostic.html    (unchanged — Phase 6 territory)
+    │   └── restore.html       (unchanged)
     └── static/
-        └── omega.css          ← updated (Phase 2 styles appended)
+        └── omega.css          ← updated (Phase 3 panel/grid styles appended)
 ```
 
 ## No `app.py` changes needed
 
-The 3 lines you added in Phase 1 still do the right thing. The new `durability`
-and `scheduler` modules late-bind to `app.py` helpers at function-call time, so
-nothing extra needed.
+Same as Phase 2 — the data layer late-binds to `app.py` internals. Drop and go.
 
-## Optional new env vars
+## What's reading from where
 
-Three new env vars, all optional. Defaults are sensible.
+The data layer (`dashboard/data.py`) reads from:
 
-| Key | Default | What it does |
+- `portfolio.py` — holdings, options, spreads, cash; P/L calcs
+- `app._cached_md` — spot prices (with 30-second per-ticker cache to avoid hammering the API)
+- `app._scanner` — watchlist, regime label, recent signals
+- `app._thesis_engine` (or `_thesis_monitor_engine`) — ThesisContext + MonitorState for watch map cards
+- `options_map` — `build_watch_levels` / `build_watch_triggers` for the level structures on each card
+- `sentiment_report` — per-ticker sentiment for the holdings buckets (if loaded)
+
+If any of those modules aren't loaded yet (e.g. cold start), the page degrades cleanly — empty panels with helpful messages, never broken.
+
+## Account model
+
+Same UI accounts as Phase 1, mapped to underlying portfolio keys:
+
+| UI view | Underlying | Status today |
 |---|---|---|
-| `OMEGA_SNAPSHOT_TIME_UTC` | `06:00` | UTC time the daily snapshot fires (default ≈ 1am Central) |
-| `OMEGA_SNAPSHOT_RETENTION_DAYS` | `30` | How many daily snapshot tabs to keep before auto-pruning |
-| `OMEGA_SNAPSHOT_SCHEDULER_ENABLED` | `1` | Set to `0` if you want to drive snapshots externally (cron, manual only) |
+| Combined | brad + mom | Live data |
+| Mine | brad | Live data |
+| Mom | mom | Live data |
+| Partnership | (none yet) | Placeholder until Phase 4 |
+| Kyleigh | (none yet) | Placeholder until Phase 4 |
 
-The defaults work for everyone. Skip these unless you want to change something specific.
+When you switch to Partnership or Kyleigh today, you'll see the "No data yet" placeholder with a note. Phase 4 introduces those account keys when you start entering Day Trades and Kyleigh transfers.
 
-## How it uses the existing Sheets infrastructure
+## Spot price strategy
 
-This phase reuses the bot's existing Google Sheets auth. No new credentials.
-Specifically it uses:
+Every page render needs spot prices for share P/L and watch map cards. To avoid 15-30 fresh API calls per page load:
 
-- `GOOGLE_SHEET_ID` — already set
-- `GOOGLE_SHEETS_ENABLE` — already set
-- `GOOGLE_SERVICE_ACCOUNT_JSON` — already set
+- Each ticker has a 30-second TTL in an in-memory cache in `data.py`
+- The first request per ticker hits `_cached_md.get_spot()` (which itself caches)
+- Subsequent requests within 30 seconds reuse the cached value
+- After 30 seconds, the next page render refreshes that ticker
 
-If those work for your existing flow (signal_decisions, em_predictions tabs etc),
-they work for snapshots too.
+For a typical 10-ticker portfolio, refreshing the dashboard repeatedly costs 0 fresh API calls within the 30s window. The Command Center is safe to leave open and refresh at will.
 
-## What gets snapshotted
+## What's not in this phase (deliberately)
 
-For each known account (`brad` and `mom` currently — Phase 4 will add more):
+Held strictly to scope:
 
-- **Holdings** — every share position with cost basis and tags
-- **Options** — every CSP, CC, long, spread leg with current status
-- **Spreads** — all open and closed spread positions
-- **Cash** — running cash balance and any deposits/withdrawals tracked
+- Charts — out of scope (you have TradingView)
+- Capital progression bars — needs starting balance tracking from Phase 4
+- True ROC / goal projections — needs starting balance from Phase 4
+- Position entry / edits / closes — Phase 4
+- Holdings digest Telegram — Phase 5
+- Diagnostic shadow signals / category P&L — Phase 6
+- Real-time auto-refresh — phase 7+ (page refresh is the model for now)
+- Time-travel through snapshots — out of scope
 
-Format in the snapshot tab is one row per data record:
-```
-section    | account | key       | value_json                        | captured_at
-holdings   | brad    | AAPL      | {"shares":100,"cost_basis":175}   | 2026-05-03T06:00:00Z
-options    | brad    | opt_1     | {"id":"opt_1","ticker":"AAPL"...} | 2026-05-03T06:00:00Z
-cash       | brad    | data      | {"balance":50000}                 | 2026-05-03T06:00:00Z
-```
+## Verify after deploy
 
-This format is human-readable — you can open the snapshot tab in Sheets and see
-exactly what your portfolio looked like at that point in time.
-
-## Restore flow
-
-1. Visit `/restore` (or click "Durability" in the top nav)
-2. See the list of available snapshots, newest first
-3. Click "Restore →" on any snapshot
-4. Modal opens — type `RESTORE` to confirm
-5. Click Restore — overwrites Redis from that snapshot, logs the event to audit
-
-The current state is **not** automatically backed up before a restore. The
-expectation is: you don't restore unless something is wrong. If you want a
-safety net before restoring, click "Snapshot Now" first — that captures the
-current (broken) state to a tab you can restore back to if needed.
-
-## Verifying after deploy
-
-Hit the health endpoint:
+Hit health:
 ```
 https://options-discord-bot.onrender.com/dashboard/health
 ```
 
-Should return:
-```json
-{
-  "status": "ok",
-  "module": "omega-dashboard",
-  "phase": 2,
-  "auth_configured": true,
-  "durability": {
-    "sheets_available": true,
-    "portfolio_available": true,
-    "store_initialized": true,
-    "snapshot_count": 0,
-    "retention_days": 30
-  }
-}
-```
+Should report `"phase": 3` and the durability flags from Phase 2 still all `true`.
 
-All four `durability` flags should be `true`. If `sheets_available` is `false`,
-check that your existing `GOOGLE_SHEETS_ENABLE=1` is set. If `store_initialized`
-is `false`, the bot hasn't called `portfolio.init_store()` yet — wait a minute
-for full startup.
+Then log in and check:
 
-After confirming health, log into the dashboard, click **Durability** in the nav,
-click **Snapshot Now** — you should see a green flash message and a new entry in
-the Available Snapshots list.
+1. **Header status** should show real values: scanner LIVE/PAUSED, regime tag with VIX/ADX, API credits used. If all show "—" or "OFFLINE", the bot's globals aren't populated yet (cold start) — give it a minute and refresh.
 
-## What this protects
+2. **Command Center** for the Combined or Mine view: income year + month should show realized $$ from your closed wheel options. Open positions section shows your current open contracts.
 
-The data wipe scenario: a bad deploy overwrites or zeroes Redis. Without
-Phase 2, that data is gone. With Phase 2, the most recent snapshot is at most
-24 hours old — and you can restore from any of the last 30. Worst case loss: one
-day of activity.
+3. **Trading view**: watch map grid should populate from scanner's tier_a + any active trades. The quick-pull box accepts any ticker — try `SPY` and watch a card render with levels and triggers.
+
+4. **Account switching**: click any account chip, see the accent color shift and the data filter to that account.
+
+If something looks empty that you expected to have data, check the bot's logs — usually the answer is "scanner hasn't run yet" or "thesis monitor hasn't loaded that ticker yet". The dashboard reads what the bot already computes; it doesn't compute anything new.
 
 ## What's next
 
-**Phase 3 — Read-only Views.** Command Center and Trading view both light up
-with live data from Redis and the bot's existing background processes. No writes
-yet (those are Phase 4). The plumbing built in Phase 2 (late-binding to
-`portfolio` and `app`) is the same pattern Phase 3 will use to read.
+**Phase 4 — Portfolio Writes.** This is the big one. Manual entry forms for:
+- Cash deposits + withdrawals (starting balances per account)
+- Holdings (shares + cost basis with auto-tagging)
+- Options (CSP / CC / Long / Spread legs)
+- Rolls (single net-credit/debit event)
+- Kyleigh transfers (`/transfertokyleigh $X from {acct}`)
+- Campaign rollup at assignment (checkboxes for which CSPs fold into adjusted basis)
+
+Every write goes through the audit log built in Phase 2. Once Phase 4 ships, the dashboard becomes truly self-sufficient — no more manual spreadsheet entry, the bot's data model becomes the source of truth.
