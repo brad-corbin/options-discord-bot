@@ -4,58 +4,354 @@
 {% block brand_sub %}Command · {{ active_account.label }}{% endblock %}
 
 {% block content %}
-<div class="phase1-stub fade-in">
-  <svg class="phase1-watermark" viewBox="0 0 100 100" fill="none">
+
+{% set d = page_data %}
+
+{% if not d.portfolio_available %}
+  <!-- Account doesn't have portfolio data wired up yet (Phase 4 territory) -->
+  <div class="phase1-stub fade-in">
+    <svg class="phase1-watermark" viewBox="0 0 100 100" fill="none">
+      <path d="M50 8 L82 22 L82 56 L70 76 L60 88 L40 88 L30 76 L18 56 L18 22 Z"
+            stroke="currentColor" stroke-width="0.5" fill="none"/>
+      <text x="50" y="62" text-anchor="middle" font-family="Russo One, sans-serif"
+            font-size="38" font-weight="700" fill="currentColor">Ω</text>
+    </svg>
+    <div class="phase1-title">{{ active_account.label }} — No data yet</div>
+    <div class="phase1-msg">
+      This account has no portfolio data in the bot. Phase 4 will add the manual
+      entry forms to populate it. Switch to <strong>Combined</strong>, <strong>Mine</strong>,
+      or <strong>Mom</strong> above to see live data from the existing bot state.
+    </div>
+  </div>
+{% else %}
+
+<!-- ─── HERO: Income + Capital Bars ───────────────────────── -->
+<section class="cc-hero fade-in">
+  <svg class="hero-watermark" viewBox="0 0 100 100" fill="none">
     <path d="M50 8 L82 22 L82 56 L70 76 L60 88 L40 88 L30 76 L18 56 L18 22 Z"
           stroke="currentColor" stroke-width="0.5" fill="none"/>
     <text x="50" y="62" text-anchor="middle" font-family="Russo One, sans-serif"
           font-size="38" font-weight="700" fill="currentColor">Ω</text>
   </svg>
 
-  <div class="phase1-title">Command Center</div>
-  <div class="phase1-msg">
-    The income hero, capital progression bars, holdings sentiment panel,
-    open positions, and today's alerts feed land here in <strong>Phase 3</strong>.
-    Right now you're looking at the framework — auth works, the account switcher
-    above changes the accent color across the page, and every nav target is wired up.
-  </div>
+  <div class="cc-hero-grid">
 
-  <div class="phase1-roadmap">
-    <div class="phase1-roadmap-item">
-      <div class="phase1-roadmap-num">Phase 1</div>
-      <div class="phase1-roadmap-name">Auth & Navigation</div>
-      <div class="phase1-roadmap-status">Shipped</div>
+    <!-- Capital progression bars -->
+    <div class="cc-capital">
+      <div class="section-eyebrow">Capital · Progression</div>
+      <div class="cc-bars-stub">
+        <div class="cc-bar-msg">
+          Capital starting balances aren't tracked yet. Phase 4 introduces cash deposit
+          and monthly balance tracking — once the first deposits are entered,
+          these bars start working.
+        </div>
+      </div>
     </div>
-    <div class="phase1-roadmap-item current">
-      <div class="phase1-roadmap-num">Phase 2 · Now</div>
-      <div class="phase1-roadmap-name">Data Durability</div>
-      <div class="phase1-roadmap-status">Shipped — see Durability tab</div>
-    </div>
-    <div class="phase1-roadmap-item">
-      <div class="phase1-roadmap-num">Phase 3 · Next</div>
-      <div class="phase1-roadmap-name">Read-only Views</div>
-      <div class="phase1-roadmap-status">Command + Trading live data</div>
-    </div>
-    <div class="phase1-roadmap-item">
-      <div class="phase1-roadmap-num">Phase 4</div>
-      <div class="phase1-roadmap-name">Portfolio Writes</div>
-      <div class="phase1-roadmap-status">Manual entry forms</div>
-    </div>
-    <div class="phase1-roadmap-item">
-      <div class="phase1-roadmap-num">Phase 5</div>
-      <div class="phase1-roadmap-name">Holdings Digest</div>
-      <div class="phase1-roadmap-status">Telegram + dashboard mirror</div>
-    </div>
-    <div class="phase1-roadmap-item">
-      <div class="phase1-roadmap-num">Phase 6</div>
-      <div class="phase1-roadmap-name">Diagnostic</div>
-      <div class="phase1-roadmap-status">Edge discovery aggregations</div>
-    </div>
-  </div>
 
-  <div class="phase1-meta">
-    Active account · <span class="accent">{{ active_account.label }}</span>
-    &nbsp;·&nbsp; Click any account chip above to switch
+    <!-- Income hero -->
+    <div class="cc-income">
+      <div class="section-eyebrow">Income · Realized</div>
+
+      <div class="income-pair">
+        <div class="metric-card primary">
+          <div class="metric-label">Year</div>
+          <div class="metric-value accent">
+            {% if d.income.available %}${{ "{:,.0f}".format(d.income.year) }}{% else %}—{% endif %}
+          </div>
+          <div class="metric-meta">REALIZED · CLOSED OPTIONS</div>
+        </div>
+        <div class="metric-card primary">
+          <div class="metric-label">Month</div>
+          <div class="metric-value {% if d.income.available and d.income.month >= 0 %}positive{% endif %}">
+            {% if d.income.available %}${{ "{:,.0f}".format(d.income.month) }}{% else %}—{% endif %}
+          </div>
+          <div class="metric-meta">MONTH-TO-DATE</div>
+        </div>
+      </div>
+
+      <!-- Goal pace -->
+      <div class="goal-bar-card">
+        {% if d.goal.available and d.goal.complete %}
+          <div class="goal-row">
+            <span class="cc-bar-label">Month Goal · Match Avg</span>
+            <span class="bar-pct">{{ d.goal.pct }}% complete</span>
+          </div>
+          <div class="goal-progress">
+            {% set goal_width = d.goal.pct if d.goal.pct < 100 else 100 %}
+            <div class="goal-fill" style="width: {{ goal_width }}%;"></div>
+          </div>
+          <div class="goal-meta">
+            <span>${{ "{:,.0f}".format(d.goal.actual) }} / ${{ "{:,.0f}".format(d.goal.goal) }}</span>
+            <span>AVG OF {{ d.goal.completed_months }} COMPLETED MO</span>
+          </div>
+        {% else %}
+          <div class="goal-meta-only">
+            {{ d.goal.reason if d.goal.available else "Goal pace requires income history" }}
+          </div>
+        {% endif %}
+      </div>
+    </div>
   </div>
+</section>
+
+<!-- ─── STATUS STRIP ──────────────────────────────────────── -->
+<section class="status-strip fade-in">
+  <div class="status-cell">
+    <div class="status-cell-label">Open Positions</div>
+    <div class="status-cell-value">{{ d.open_total }}</div>
+  </div>
+  <div class="status-cell">
+    <div class="status-cell-label">Wheel</div>
+    <div class="status-cell-value">{{ d.positions.wheel_options|length }}</div>
+  </div>
+  <div class="status-cell">
+    <div class="status-cell-label">Spreads</div>
+    <div class="status-cell-value">{{ d.positions.spreads|length }}</div>
+  </div>
+  <div class="status-cell">
+    <div class="status-cell-label">Intraday</div>
+    <div class="status-cell-value">{{ d.positions.intraday|length }}</div>
+  </div>
+  <div class="status-cell">
+    <div class="status-cell-label">Holdings</div>
+    <div class="status-cell-value">{{ d.positions.shares|length }}</div>
+  </div>
+  <div class="status-cell">
+    <div class="status-cell-label">API Credits</div>
+    {% if d.api_credits.available %}
+      {% set pct = d.api_credits.pct_used %}
+      <div class="status-cell-value {% if pct > 75 %}neg{% elif pct > 25 %}warn{% else %}ok{% endif %}">
+        {{ "%.1fK"|format(d.api_credits.credits / 1000) }} / {{ "%.0fK"|format(d.api_credits.budget / 1000) }}
+      </div>
+    {% else %}
+      <div class="status-cell-value">—</div>
+    {% endif %}
+  </div>
+  <div class="status-cell">
+    <div class="status-cell-label">Scanner</div>
+    {% if d.scanner.available and d.scanner.running %}
+      <div class="status-cell-value ok">Live · {{ d.scanner.watchlist_size or 0 }}</div>
+    {% else %}
+      <div class="status-cell-value">Offline</div>
+    {% endif %}
+  </div>
+</section>
+
+<!-- ─── MAIN GRID: positions + alerts ─────────────────────── -->
+<div class="main-grid fade-in">
+
+  <!-- Open Positions -->
+  <section class="panel">
+    <div class="panel-header">
+      <div class="panel-title">Open Positions</div>
+      <div class="panel-title-meta">{{ d.open_total }} total · {{ d.positions.shares|length }} share lots</div>
+    </div>
+
+    {% if d.open_total == 0 and d.positions.shares|length == 0 %}
+      <div class="panel-empty">
+        <p>No positions in this account yet.</p>
+        <p class="panel-empty-meta">Phase 4 portfolio entry forms will populate this.</p>
+      </div>
+    {% else %}
+
+      {% if d.positions.intraday %}
+        <div class="positions-group-label">Intraday Trades</div>
+        {% for pos in d.positions.intraday %}
+          <div class="position-row">
+            <span class="ticker-cell">{{ pos.ticker }}</span>
+            <span><span class="tag-pill {% if pos.direction == 'LONG' %}long{% else %}short{% endif %}">{{ pos.direction }}</span></span>
+            <span style="color: var(--text-muted);">{{ pos.entry_type }} · ${{ "%.2f"|format(pos.entry_price or 0) }}</span>
+            <span class="position-meta">stop ${{ "%.2f"|format(pos.stop_level or 0) }}</span>
+            <span style="text-align:right;">{% if pos.spot %}${{ "%.2f"|format(pos.spot) }}{% else %}—{% endif %}</span>
+            <span class="pnl {% if pos.underlying_pnl is not none and pos.underlying_pnl >= 0 %}pos{% elif pos.underlying_pnl is not none %}neg{% endif %}" style="text-align:right;">
+              {% if pos.underlying_pnl is not none %}{% if pos.underlying_pnl >= 0 %}+{% endif %}${{ "%.2f"|format(pos.underlying_pnl) }}{% else %}—{% endif %}
+            </span>
+            <span class="position-meta" style="text-align:right;">{{ pos.status }}</span>
+          </div>
+        {% endfor %}
+      {% endif %}
+
+      {% if d.positions.wheel_options %}
+        <div class="positions-group-label">Wheel Options ({{ d.positions.wheel_options|length }})</div>
+        {% for pos in d.positions.wheel_options %}
+          <div class="position-row">
+            <span class="ticker-cell">{{ pos.ticker }}</span>
+            <span><span class="tag-pill {% if pos.type == 'CSP' %}csp{% else %}cc{% endif %}">{{ pos.type }}</span></span>
+            <span style="color: var(--text-muted);">${{ pos.strike }} · {{ pos.exp }}</span>
+            <span class="position-meta"><span class="color-chip chip-{% if pos.account == 'mom' %}mom{% else %}mine{% endif %}"></span>{{ pos.account }}</span>
+            <span style="text-align:right;">${{ "%.2f"|format(pos.premium or 0) }}</span>
+            <span class="position-meta" style="text-align:right;">x{{ pos.contracts }}</span>
+            <span class="position-meta" style="text-align:right;">{{ pos.tag or '' }}</span>
+          </div>
+        {% endfor %}
+      {% endif %}
+
+      {% if d.positions.spreads %}
+        <div class="positions-group-label">Spreads ({{ d.positions.spreads|length }})</div>
+        {% for pos in d.positions.spreads %}
+          <div class="position-row">
+            <span class="ticker-cell">{{ pos.ticker }}</span>
+            <span><span class="tag-pill spread">{{ pos.type }}</span></span>
+            <span style="color: var(--text-muted);">{{ pos.long }}/{{ pos.short }} · {{ pos.exp }}</span>
+            <span class="position-meta"><span class="color-chip chip-{% if pos.account == 'mom' %}mom{% else %}mine{% endif %}"></span>{{ pos.account }}</span>
+            <span style="text-align:right;">{% if pos.debit %}${{ "%.2f"|format(pos.debit) }} dr{% elif pos.credit %}${{ "%.2f"|format(pos.credit) }} cr{% endif %}</span>
+            <span class="position-meta" style="text-align:right;">x{{ pos.contracts }}</span>
+            <span class="position-meta" style="text-align:right;"></span>
+          </div>
+        {% endfor %}
+      {% endif %}
+
+      {% if d.positions.shares %}
+        <div class="positions-group-label">Share Holdings ({{ d.positions.shares|length }})</div>
+        {% for pos in d.positions.shares %}
+          <div class="position-row">
+            <span class="ticker-cell">{{ pos.ticker }}</span>
+            <span class="position-meta">{{ pos.shares }} sh</span>
+            <span style="color: var(--text-muted);">${{ "%.2f"|format(pos.cost_basis or 0) }} basis</span>
+            <span class="position-meta"><span class="color-chip chip-{% if pos.account == 'mom' %}mom{% else %}mine{% endif %}"></span>{{ pos.account }}</span>
+            <span style="text-align:right;">{% if pos.spot %}${{ "%.2f"|format(pos.spot) }}{% else %}—{% endif %}</span>
+            <span class="pnl {% if pos.pnl_dollars is not none and pos.pnl_dollars >= 0 %}pos{% elif pos.pnl_dollars is not none %}neg{% endif %}" style="text-align:right;">
+              {% if pos.pnl_dollars is not none %}{% if pos.pnl_dollars >= 0 %}+{% endif %}${{ "{:,.0f}".format(pos.pnl_dollars) }}{% else %}—{% endif %}
+            </span>
+            <span class="pnl {% if pos.pnl_pct is not none and pos.pnl_pct >= 0 %}pos{% elif pos.pnl_pct is not none %}neg{% endif %} position-meta" style="text-align:right;">
+              {% if pos.pnl_pct is not none %}{{ "%.1f"|format(pos.pnl_pct) }}%{% else %}{% endif %}
+            </span>
+          </div>
+        {% endfor %}
+      {% endif %}
+
+    {% endif %}
+  </section>
+
+  <!-- Alerts feed -->
+  <section class="panel">
+    <div class="panel-header">
+      <div class="panel-title">Today's Alerts</div>
+      <div class="panel-title-meta">{{ d.alerts|length }} recent</div>
+    </div>
+    {% if d.alerts %}
+      <div class="alerts-feed">
+        {% for a in d.alerts %}
+          <div class="alert-row">
+            <span class="alert-time">{{ a.time }}</span>
+            <span class="alert-ticker">{{ a.ticker }}</span>
+            <span class="alert-msg"><span class="label">{{ a.type }}</span>{{ a.msg }}</span>
+            <span class="alert-pill pill-{{ a.status|lower }}">{{ a.status }}</span>
+          </div>
+        {% endfor %}
+      </div>
+    {% else %}
+      <div class="panel-empty">
+        <p>No recent alerts.</p>
+        <p class="panel-empty-meta">When the scanner fires signals, they appear here.</p>
+      </div>
+    {% endif %}
+  </section>
+
 </div>
+
+<!-- ─── HOLDINGS SENTIMENT ───────────────────────────────── -->
+{% if d.sentiment.available and not d.sentiment.is_empty %}
+<section class="panel fade-in" style="margin-bottom: 28px;">
+  <div class="panel-header">
+    <div class="panel-title">Holdings Sentiment</div>
+    <div class="panel-title-meta">EMA · VWAP · VOL</div>
+  </div>
+
+  <div class="sentiment-grid">
+
+    <div class="sentiment-bucket">
+      <div class="bucket-header">
+        <span class="bucket-icon bull"></span>
+        <span class="bucket-label bull">Bullish</span>
+        <span class="bucket-count">{{ d.sentiment.bullish|length }}</span>
+      </div>
+      {% for h in d.sentiment.bullish %}
+        <div class="position-line">
+          <span class="pl-ticker">{{ h.ticker }}</span>
+          <span class="pl-price">${{ "%.2f"|format(h.spot) }}</span>
+          <span class="pl-signals">
+            <span class="signal {% if h.ema == '✓' %}ok{% elif h.ema == '✗' %}fail{% else %}warn{% endif %}">EMA{{ h.ema }}</span>
+            <span class="signal {% if h.vwap == '✓' %}ok{% elif h.vwap == '✗' %}fail{% else %}warn{% endif %}">VWAP{{ h.vwap }}</span>
+            <span class="signal">{{ h.vol }}</span>
+            {% if h.tag %}<span class="tag-wheel">{{ h.tag }}</span>{% endif %}
+          </span>
+          <span class="pl-pnl {% if h.pnl >= 0 %}pos{% else %}neg{% endif %}">{% if h.pnl >= 0 %}+{% endif %}${{ "{:,.0f}".format(h.pnl) }}</span>
+        </div>
+      {% endfor %}
+    </div>
+
+    <div class="sentiment-bucket">
+      <div class="bucket-header">
+        <span class="bucket-icon neutral"></span>
+        <span class="bucket-label neutral">Neutral</span>
+        <span class="bucket-count">{{ d.sentiment.neutral|length }}</span>
+      </div>
+      {% for h in d.sentiment.neutral %}
+        <div class="position-line">
+          <span class="pl-ticker">{{ h.ticker }}</span>
+          <span class="pl-price">${{ "%.2f"|format(h.spot) }}</span>
+          <span class="pl-signals">
+            <span class="signal {% if h.ema == '✓' %}ok{% elif h.ema == '✗' %}fail{% else %}warn{% endif %}">EMA{{ h.ema }}</span>
+            <span class="signal {% if h.vwap == '✓' %}ok{% elif h.vwap == '✗' %}fail{% else %}warn{% endif %}">VWAP{{ h.vwap }}</span>
+            <span class="signal">{{ h.vol }}</span>
+            {% if h.tag %}<span class="tag-wheel">{{ h.tag }}</span>{% endif %}
+          </span>
+          <span class="pl-pnl {% if h.pnl >= 0 %}pos{% else %}neg{% endif %}">{% if h.pnl >= 0 %}+{% endif %}${{ "{:,.0f}".format(h.pnl) }}</span>
+        </div>
+      {% endfor %}
+    </div>
+
+    <div class="sentiment-bucket">
+      <div class="bucket-header">
+        <span class="bucket-icon bear"></span>
+        <span class="bucket-label bear">Bearish</span>
+        <span class="bucket-count">{{ d.sentiment.bearish|length }}</span>
+      </div>
+      {% for h in d.sentiment.bearish %}
+        <div class="position-line">
+          <span class="pl-ticker">{{ h.ticker }}</span>
+          <span class="pl-price">${{ "%.2f"|format(h.spot) }}</span>
+          <span class="pl-signals">
+            <span class="signal {% if h.ema == '✓' %}ok{% elif h.ema == '✗' %}fail{% else %}warn{% endif %}">EMA{{ h.ema }}</span>
+            <span class="signal {% if h.vwap == '✓' %}ok{% elif h.vwap == '✗' %}fail{% else %}warn{% endif %}">VWAP{{ h.vwap }}</span>
+            <span class="signal">{{ h.vol }}</span>
+            {% if h.tag %}<span class="tag-wheel">{{ h.tag }}</span>{% endif %}
+          </span>
+          <span class="pl-pnl {% if h.pnl >= 0 %}pos{% else %}neg{% endif %}">{% if h.pnl >= 0 %}+{% endif %}${{ "{:,.0f}".format(h.pnl) }}</span>
+        </div>
+      {% endfor %}
+    </div>
+
+  </div>
+
+  <div class="sentiment-footer">
+    <div class="footer-cell">
+      <div class="footer-label">Open Options</div>
+      <div class="footer-value">{{ d.sentiment.open_options }}</div>
+    </div>
+    <div class="footer-cell">
+      <div class="footer-label">Total Unrealized</div>
+      <div class="footer-value {% if d.sentiment.total_unrealized >= 0 %}pos{% else %}neg{% endif %}">
+        {% if d.sentiment.total_unrealized >= 0 %}+{% endif %}${{ "{:,.0f}".format(d.sentiment.total_unrealized) }}
+      </div>
+    </div>
+    <div class="footer-cell">
+      <div class="footer-label">Options Income</div>
+      <div class="footer-value {% if d.sentiment.total_opt_income >= 0 %}pos{% else %}neg{% endif %}">
+        {% if d.sentiment.total_opt_income >= 0 %}+{% endif %}${{ "{:,.0f}".format(d.sentiment.total_opt_income) }}
+      </div>
+    </div>
+    <div class="footer-cell">
+      <div class="footer-label">Portfolio P&L</div>
+      <div class="footer-value {% if d.sentiment.portfolio_pnl >= 0 %}pos{% else %}neg{% endif %}">
+        {% if d.sentiment.portfolio_pnl >= 0 %}+{% endif %}${{ "{:,.0f}".format(d.sentiment.portfolio_pnl) }}
+      </div>
+    </div>
+  </div>
+</section>
+{% endif %}
+
+{% endif %}
+
 {% endblock %}
