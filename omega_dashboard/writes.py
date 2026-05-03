@@ -37,6 +37,23 @@ UI_TO_PORTFOLIO = {
 # All underlying account keys we know about
 ALL_UNDERLYING_ACCOUNTS = ["brad", "mom", "partner"]
 
+# Display labels for the right-pill on Portfolio entry pages.
+# Underlying Redis keys stay "brad" / "mom" / "partner" — only the
+# UI label changes.
+UNDERLYING_LABELS = {
+    "brad":    "Corbin",
+    "mom":     "Volkman",
+    "partner": "Partner",
+}
+
+# Map underlying account → which top-chip color theme that account "belongs" to.
+# Used by Portfolio template to switch theme when right-pill is clicked.
+UNDERLYING_TO_THEME = {
+    "brad":    "mine",
+    "mom":     "mom",
+    "partner": "partner",
+}
+
 # Sub-account tag list (UI dropdown seed). User can add more.
 DEFAULT_SUBACCOUNTS = [
     "Brokerage",
@@ -1443,6 +1460,8 @@ def portfolio_page_data(active_underlying: str = None) -> Dict:
     return {
         "active_underlying": acc,
         "all_accounts": ALL_UNDERLYING_ACCOUNTS,
+        "underlying_labels": UNDERLYING_LABELS,
+        "underlying_themes": UNDERLYING_TO_THEME,
         "subaccounts": get_subaccounts(),
         "default_subaccount": DEFAULT_SUBACCOUNT,
         "holdings": holdings,

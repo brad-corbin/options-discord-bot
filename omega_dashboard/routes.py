@@ -30,8 +30,8 @@ DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "").strip()
 # Phase 1 uses these as labels only; real account-keyed reads come in phase 3.
 ACCOUNTS = [
     {"key": "combined",  "label": "Combined",    "color": "combined"},
-    {"key": "mine",      "label": "Mine",        "color": "mine"},
-    {"key": "mom",       "label": "Mom",         "color": "mom"},
+    {"key": "mine",      "label": "Corbin",      "color": "mine"},
+    {"key": "mom",       "label": "Volkman",     "color": "mom"},
     {"key": "partner",   "label": "Partnership", "color": "partner"},
     {"key": "kyleigh",   "label": "Kyleigh",     "color": "kyleigh"},
     {"key": "clay",      "label": "Clay",        "color": "clay"},

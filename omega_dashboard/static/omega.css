@@ -29,6 +29,8 @@
   --partner-glow: rgba(6, 212, 245, 0.18);
   --kyleigh: #b794f4;
   --kyleigh-glow: rgba(183, 148, 244, 0.18);
+  --clay: #3b82f6;
+  --clay-glow: rgba(59, 130, 246, 0.22);
 
   /* Semantic */
   --positive: #00e89c;
@@ -47,6 +49,7 @@ body[data-account="mine"]     { --accent: var(--mine);     --accent-glow: var(--
 body[data-account="mom"]      { --accent: var(--mom);      --accent-glow: var(--mom-glow); }
 body[data-account="partner"]  { --accent: var(--partner);  --accent-glow: var(--partner-glow); }
 body[data-account="kyleigh"]  { --accent: var(--kyleigh);  --accent-glow: var(--kyleigh-glow); }
+body[data-account="clay"]     { --accent: var(--clay);     --accent-glow: var(--clay-glow); }
 
 /* ─── RESET + BASE ────────────────────────────────────── */
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -255,6 +258,7 @@ header.top {
 .chip-mom      { background: var(--mom);      box-shadow: 0 0 6px var(--mom); }
 .chip-partner  { background: var(--partner);  box-shadow: 0 0 6px var(--partner); }
 .chip-kyleigh  { background: var(--kyleigh);  box-shadow: 0 0 6px var(--kyleigh); }
+.chip-clay     { background: var(--clay);     box-shadow: 0 0 6px var(--clay); }
 
 .session-info {
   display: flex;
@@ -1244,10 +1248,8 @@ header.top {
    PHASE 4 — PORTFOLIO ENTRY UI
    ════════════════════════════════════════════════════════ */
 
-/* Clay account color (sky blue) */
+/* Clay account — soft accent for form areas */
 body[data-account="clay"] {
-  --accent: #3b82f6;
-  --accent-glow: rgba(59, 130, 246, 0.3);
   --accent-soft: rgba(59, 130, 246, 0.1);
 }
 
@@ -1934,4 +1936,163 @@ body[data-account="clay"] {
   color: var(--text-muted);
 }
 .audit-op-undoable { color: var(--text); }
+
+
+
+/* ════════════════════════════════════════════════════════
+   FAMILY TAGLINES & TRIBUTE
+   ════════════════════════════════════════════════════════ */
+
+/* Login page — small tagline under "Command Console" */
+.login-tagline {
+  font-family: 'Outfit', sans-serif;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  color: var(--text-muted);
+  margin-top: 8px;
+  text-transform: uppercase;
+  font-weight: 300;
+  text-align: center;
+  font-style: italic;
+}
+
+/* Command Center — three-name family tribute */
+.family-tribute {
+  position: relative;
+  text-align: center;
+  padding: 18px 22px 22px;
+  margin: 0 0 22px;
+  background:
+    linear-gradient(180deg, rgba(255,255,255,0.012), transparent),
+    var(--bg-panel);
+  border: 1px solid var(--border);
+  border-top: 2px solid var(--accent);
+  overflow: hidden;
+}
+
+.family-tribute::before,
+.family-tribute::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  width: 80px;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--accent), transparent);
+  opacity: 0.5;
+}
+.family-tribute::before { left: 0; }
+.family-tribute::after  { right: 0; }
+
+.tribute-line-primary {
+  display: flex;
+  justify-content: center;
+  align-items: baseline;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+.tribute-name {
+  font-family: 'Russo One', sans-serif;
+  font-size: 13px;
+  letter-spacing: 0.32em;
+  color: var(--accent);
+  text-transform: uppercase;
+  text-shadow: 0 0 14px var(--accent-glow);
+}
+
+.tribute-sep {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  color: var(--text-dim);
+  letter-spacing: 0;
+}
+
+.tribute-line-secondary {
+  font-family: 'Outfit', sans-serif;
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  color: var(--text-muted);
+  margin-top: 8px;
+  text-transform: uppercase;
+  font-weight: 300;
+  font-style: italic;
+}
+
+/* Trading page tagline — bigger, more declarative */
+.trading-tagline {
+  text-align: center;
+  padding: 26px 22px 28px;
+  margin: 0 0 28px;
+  background:
+    radial-gradient(ellipse at center, var(--accent-glow) 0%, transparent 60%),
+    var(--bg-panel);
+  border: 1px solid var(--border);
+  border-left: 2px solid var(--accent);
+  border-right: 2px solid var(--accent);
+}
+
+.tagline-primary {
+  font-family: 'Russo One', sans-serif;
+  font-size: 18px;
+  letter-spacing: 0.18em;
+  color: var(--accent-bright, var(--accent));
+  text-transform: uppercase;
+  text-shadow: 0 0 18px var(--accent-glow);
+  line-height: 1.4;
+}
+
+.tagline-secondary {
+  font-family: 'Outfit', sans-serif;
+  font-size: 12px;
+  letter-spacing: 0.18em;
+  color: var(--text-muted);
+  margin-top: 12px;
+  text-transform: uppercase;
+  font-weight: 300;
+}
+
+@media (max-width: 700px) {
+  .tribute-line-primary { gap: 8px; }
+  .tribute-name { font-size: 11px; letter-spacing: 0.22em; }
+  .family-tribute::before, .family-tribute::after { display: none; }
+  .tagline-primary { font-size: 14px; letter-spacing: 0.12em; }
+}
+
+
+
+/* ════════════════════════════════════════════════════════
+   POLISH ROUND 3
+   ════════════════════════════════════════════════════════ */
+
+/* Dropdown options — fix readability on dark theme.
+   Browsers default <option> to system colors which often render
+   as light gray on white (terrible on dark UI). Force dark bg + light text. */
+.form-field select option,
+.inline-form select option {
+  background: #14141a;
+  color: #e8e9ed;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 13px;
+  padding: 6px 10px;
+}
+.form-field select option:checked,
+.inline-form select option:checked {
+  background: #1f1f28;
+  color: var(--accent-bright, var(--accent));
+}
+.form-field select option:hover,
+.inline-form select option:hover {
+  background: #22222d;
+}
+
+/* Pill-theme classes — let right-pill carry its own dot color
+   regardless of the global accent. Used on Portfolio entry pills. */
+.acct-pill.pill-theme-mine .acct-pill-dot,
+.acct-pill .dot-mine    { background: #500000; }
+.acct-pill.pill-theme-mom .acct-pill-dot,
+.acct-pill .dot-mom     { background: #ec4899; }
+.acct-pill.pill-theme-partner .acct-pill-dot,
+.acct-pill .dot-partner { background: #06d4f5; }
+.acct-pill.pill-theme-combined .acct-pill-dot,
+.acct-pill .dot-combined { background: #00e89c; }
 

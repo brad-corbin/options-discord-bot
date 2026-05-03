@@ -1,11 +1,13 @@
 {% extends "dashboard/base.html" %}
 
 {% block title %}Ω OMEGA — Portfolio{% endblock %}
-{% block brand_sub %}Portfolio · {{ active_account.label }}{% endblock %}
+{% block body_account %}{{ page_data.underlying_themes.get(page_data.active_underlying, active_account.color) }}{% endblock %}
+{% block brand_sub %}Portfolio · {{ page_data.underlying_labels.get(page_data.active_underlying, page_data.active_underlying|capitalize) }}{% endblock %}
 
 {% block content %}
 {% set d = page_data %}
 {% set acct = d.active_underlying %}
+{% set acct_label = d.underlying_labels.get(acct, acct|capitalize) %}
 {% set sec = d.active_section %}
 {% set today = "" %}{% set _x = today %}
 
@@ -20,9 +22,10 @@
     <div class="portfolio-title">PORTFOLIO ENTRY</div>
     <div class="portfolio-acct-pills">
       {% for a in d.all_accounts %}
+        {% set theme = d.underlying_themes.get(a, "combined") %}
         <a href="{{ url_for('dashboard.portfolio_section', section=sec) }}?acct={{ a }}"
-           class="acct-pill {% if a == acct %}active{% endif %}" data-acct="{{ a }}">
-          <span class="acct-pill-dot dot-{{ a }}"></span>{{ a|capitalize }}
+           class="acct-pill pill-theme-{{ theme }} {% if a == acct %}active{% endif %}" data-acct="{{ a }}">
+          <span class="acct-pill-dot dot-{{ theme }}"></span>{{ d.underlying_labels.get(a, a|capitalize) }}
         </a>
       {% endfor %}
     </div>
@@ -51,7 +54,7 @@
 {% if sec == "cash" %}
 
 <div class="entry-form-wrap">
-  <div class="form-section-title">CASH EVENT · <span class="muted">Account:</span> {{ acct }}</div>
+  <div class="form-section-title">CASH EVENT · <span class="muted">Account:</span> <strong>{{ acct_label|upper }}</strong></div>
 
   <form method="POST" action="{{ url_for('dashboard.portfolio_cash_add') }}" class="entry-form">
     <input type="hidden" name="acct" value="{{ acct }}">
@@ -98,7 +101,7 @@
 
 <div class="data-panel">
   <div class="data-panel-header">
-    <div class="data-panel-title">Cash Ledger · {{ acct }}</div>
+    <div class="data-panel-title">Cash Ledger · {{ acct_label }}</div>
     <div class="data-panel-meta">
       Balance: <span class="amount-positive">${{ "{:,.2f}".format(d.cash_balance) }}</span>
       &nbsp;·&nbsp; {{ d.cash_ledger|length }} recent events
@@ -148,7 +151,7 @@
     </tbody>
   </table>
   {% else %}
-  <div class="data-empty">No cash events yet for {{ acct }}. Use the form above to add an initial deposit.</div>
+  <div class="data-empty">No cash events yet for {{ acct_label }}. Use the form above to add an initial deposit.</div>
   {% endif %}
 </div>
 
@@ -158,7 +161,7 @@
 {% elif sec == "holdings" %}
 
 <div class="entry-form-wrap">
-  <div class="form-section-title">ADD SHARE LOT · <span class="muted">Account:</span> {{ acct }}</div>
+  <div class="form-section-title">ADD SHARE LOT · <span class="muted">Account:</span> <strong>{{ acct_label|upper }}</strong></div>
 
   <form method="POST" action="{{ url_for('dashboard.portfolio_holding_add') }}" class="entry-form">
     <input type="hidden" name="acct" value="{{ acct }}">
@@ -208,7 +211,7 @@
 
 <div class="data-panel">
   <div class="data-panel-header">
-    <div class="data-panel-title">Share Holdings · {{ acct }}</div>
+    <div class="data-panel-title">Share Holdings · {{ acct_label }}</div>
     <div class="data-panel-meta">{{ d.holdings_count }} ticker{% if d.holdings_count != 1 %}s{% endif %}</div>
   </div>
 
@@ -262,7 +265,7 @@
     </tbody>
   </table>
   {% else %}
-  <div class="data-empty">No share holdings yet for {{ acct }}.</div>
+  <div class="data-empty">No share holdings yet for {{ acct_label }}.</div>
   {% endif %}
 </div>
 
@@ -303,7 +306,7 @@
 
 <div class="data-panel">
   <div class="data-panel-header">
-    <div class="data-panel-title">Lump-Sum Holdings · {{ acct }}</div>
+    <div class="data-panel-title">Lump-Sum Holdings · {{ acct_label }}</div>
     <div class="data-panel-meta">{{ d.lumpsum_count }} item{% if d.lumpsum_count != 1 %}s{% endif %}</div>
   </div>
 
@@ -353,7 +356,7 @@
     </tbody>
   </table>
   {% else %}
-  <div class="data-empty">No lump-sum holdings tracked yet for {{ acct }}.</div>
+  <div class="data-empty">No lump-sum holdings tracked yet for {{ acct_label }}.</div>
   {% endif %}
 </div>
 
@@ -363,7 +366,7 @@
 {% elif sec == "options" %}
 
 <div class="entry-form-wrap">
-  <div class="form-section-title">ADD OPTION · <span class="muted">Account:</span> {{ acct }}</div>
+  <div class="form-section-title">ADD OPTION · <span class="muted">Account:</span> <strong>{{ acct_label|upper }}</strong></div>
 
   <form method="POST" action="{{ url_for('dashboard.portfolio_option_add') }}" class="entry-form">
     <input type="hidden" name="acct" value="{{ acct }}">
@@ -443,7 +446,7 @@
 
 <div class="data-panel">
   <div class="data-panel-header">
-    <div class="data-panel-title">Open Options · {{ acct }}</div>
+    <div class="data-panel-title">Open Options · {{ acct_label }}</div>
     <div class="data-panel-meta">{{ d.open_options_count }} open</div>
   </div>
 
@@ -531,7 +534,7 @@
     </tbody>
   </table>
   {% else %}
-  <div class="data-empty">No open options for {{ acct }}.</div>
+  <div class="data-empty">No open options for {{ acct_label }}.</div>
   {% endif %}
 </div>
 
@@ -541,7 +544,7 @@
 {% elif sec == "spreads" %}
 
 <div class="entry-form-wrap">
-  <div class="form-section-title">ADD SPREAD · <span class="muted">Account:</span> {{ acct }}</div>
+  <div class="form-section-title">ADD SPREAD · <span class="muted">Account:</span> <strong>{{ acct_label|upper }}</strong></div>
 
   <form method="POST" action="{{ url_for('dashboard.portfolio_spread_add') }}" class="entry-form">
     <input type="hidden" name="acct" value="{{ acct }}">
@@ -619,7 +622,7 @@
 
 <div class="data-panel">
   <div class="data-panel-header">
-    <div class="data-panel-title">Open Spreads · {{ acct }}</div>
+    <div class="data-panel-title">Open Spreads · {{ acct_label }}</div>
     <div class="data-panel-meta">{{ d.open_spreads_count }} open</div>
   </div>
 
@@ -677,7 +680,7 @@
     </tbody>
   </table>
   {% else %}
-  <div class="data-empty">No open spreads for {{ acct }}.</div>
+  <div class="data-empty">No open spreads for {{ acct_label }}.</div>
   {% endif %}
 </div>
 
@@ -770,7 +773,7 @@
           <label>From</label>
           <select name="acct" required>
             {% for a in d.all_accounts %}
-              <option value="{{ a }}" {% if a == acct %}selected{% endif %}>{{ a|capitalize }}</option>
+              <option value="{{ a }}" {% if a == acct %}selected{% endif %}>{{ d.underlying_labels.get(a, a|capitalize) }}</option>
             {% endfor %}
           </select>
         </div>
@@ -904,7 +907,7 @@
           <label>Account</label>
           <select name="acct" required>
             {% for a in d.all_accounts %}
-              <option value="{{ a }}">{{ a|capitalize }}</option>
+              <option value="{{ a }}">{{ d.underlying_labels.get(a, a|capitalize) }}</option>
             {% endfor %}
             <option value="ALL">— ALL ACCOUNTS —</option>
           </select>
