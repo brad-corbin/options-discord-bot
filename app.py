@@ -719,7 +719,7 @@ log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 # ── Omega dashboard ─────────────────────────────────────
-from dashboard import dashboard_bp
+from omega_dashboard import dashboard_bp
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 # Trust Render's reverse proxy — required for session cookies over HTTPS
