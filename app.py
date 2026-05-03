@@ -718,13 +718,28 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 app = Flask(__name__)
-# ─────────────────────────────────────────────────────────
-# OMEGA DASHBOARD (web command console)
-# ─────────────────────────────────────────────────────────
+# ── Omega dashboard ─────────────────────────────────────
 from dashboard import dashboard_bp
-app.register_blueprint(dashboard_bp)
-app.secret_key = os.getenv("DASHBOARD_SECRET_KEY", "").strip() or os.urandom(32)
+from werkzeug.middleware.proxy_fix import ProxyFix
 
+# Trust Render's reverse proxy — required for session cookies over HTTPS
+app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1, x_for=1)
+
+_dashboard_secret = os.getenv("DASHBOARD_SECRET_KEY", "").strip()
+if not _dashboard_secret:
+    raise RuntimeError(
+        "DASHBOARD_SECRET_KEY env var is empty. Set it on Render."
+    )
+app.secret_key = _dashboard_secret
+
+# Cookie settings appropriate for HTTPS deployment behind Render's proxy
+app.config.update(
+    SESSION_COOKIE_SECURE=True,
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+)
+
+app.register_blueprint(dashboard_bp)
 # ─────────────────────────────────────────────────────────
 # ENV VARS
 # ─────────────────────────────────────────────────────────
