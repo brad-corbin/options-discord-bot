@@ -20,9 +20,10 @@ log = logging.getLogger(__name__)
 UI_TO_PORTFOLIO = {
     "mine":     ["brad"],
     "mom":      ["mom"],
-    "partner":  [],   # added in Phase 4
-    "kyleigh":  [],   # added in Phase 4
-    "combined": ["brad", "mom"],
+    "partner":  ["partner"],   # Phase 4 — Day Trades
+    "kyleigh":  [],            # notional only
+    "clay":     [],            # notional only
+    "combined": ["brad", "mom", "partner"],
 }
 
 

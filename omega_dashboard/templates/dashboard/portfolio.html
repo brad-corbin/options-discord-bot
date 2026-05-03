@@ -4,24 +4,1105 @@
 {% block brand_sub %}Portfolio · {{ active_account.label }}{% endblock %}
 
 {% block content %}
-<div class="phase1-stub fade-in">
-  <svg class="phase1-watermark" viewBox="0 0 100 100" fill="none">
-    <path d="M50 8 L82 22 L82 56 L70 76 L60 88 L40 88 L30 76 L18 56 L18 22 Z"
-          stroke="currentColor" stroke-width="0.5" fill="none"/>
-    <text x="50" y="62" text-anchor="middle" font-family="Russo One, sans-serif"
-          font-size="38" font-weight="700" fill="currentColor">Ω</text>
-  </svg>
+{% set d = page_data %}
+{% set acct = d.active_underlying %}
+{% set sec = d.active_section %}
+{% set today = "" %}{% set _x = today %}
 
-  <div class="phase1-title">Portfolio</div>
-  <div class="phase1-msg">
-    Manual entry forms for holdings, options (CSP/CC/long/spread), rolls,
-    cash deposits, and Kyleigh transfers land here in <strong>Phase 4</strong> —
-    after data durability is in place so existing-position entry never gets wiped.
-    Includes the campaign rollup at assignment for accurate cost basis.
+<!-- Flash message -->
+{% if flash_msg %}
+<div class="flash flash-{{ flash_kind }}">{{ flash_msg }}</div>
+{% endif %}
+
+<!-- Section meta header -->
+<div class="portfolio-header">
+  <div class="portfolio-title-row">
+    <div class="portfolio-title">PORTFOLIO ENTRY</div>
+    <div class="portfolio-acct-pills">
+      {% for a in d.all_accounts %}
+        <a href="{{ url_for('dashboard.portfolio_section', section=sec) }}?acct={{ a }}"
+           class="acct-pill {% if a == acct %}active{% endif %}" data-acct="{{ a }}">
+          <span class="acct-pill-dot dot-{{ a }}"></span>{{ a|capitalize }}
+        </a>
+      {% endfor %}
+    </div>
   </div>
 
-  <div class="phase1-meta">
-    Auto-tagging by trade type · Wheel CSP / CC / Roll · Day Trade · Long Call/Put · Spread · Earnings · IC / IIC
+  <nav class="portfolio-subnav">
+    {% set sections = [
+      ("cash", "Cash"),
+      ("holdings", "Holdings"),
+      ("options", "Options"),
+      ("spreads", "Spreads"),
+      ("rolls", "Rolls"),
+      ("transfers", "Transfers"),
+      ("settings", "Settings"),
+    ] %}
+    {% for skey, slabel in sections %}
+      <a href="{{ url_for('dashboard.portfolio_section', section=skey) }}?acct={{ acct }}"
+         class="subnav-tab {% if skey == sec %}active{% endif %}">{{ slabel }}</a>
+    {% endfor %}
+  </nav>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════
+     SECTION: CASH
+     ═══════════════════════════════════════════════════════ -->
+{% if sec == "cash" %}
+
+<div class="entry-form-wrap">
+  <div class="form-section-title">CASH EVENT · <span class="muted">Account:</span> {{ acct }}</div>
+
+  <form method="POST" action="{{ url_for('dashboard.portfolio_cash_add') }}" class="entry-form">
+    <input type="hidden" name="acct" value="{{ acct }}">
+
+    <div class="form-row">
+      <div class="form-field">
+        <label>Type</label>
+        <select name="event_type" required>
+          <option value="deposit">Deposit (initial capital, contribution)</option>
+          <option value="withdrawal">Withdrawal</option>
+          <option value="manual_set">Manual adjustment</option>
+        </select>
+      </div>
+      <div class="form-field">
+        <label>Amount ($)</label>
+        <input type="number" name="amount" step="0.01" required placeholder="Negative for withdrawal">
+      </div>
+      <div class="form-field">
+        <label>Sub-account</label>
+        <select name="subaccount">
+          {% for s in d.subaccounts %}
+            <option value="{{ s }}" {% if s == d.default_subaccount %}selected{% endif %}>{{ s }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="form-field">
+        <label>Date</label>
+        <input type="date" name="date">
+      </div>
+    </div>
+
+    <div class="form-row">
+      <div class="form-field flex-grow">
+        <label>Note</label>
+        <input type="text" name="note" placeholder="Initial capital, retirement contribution, etc.">
+      </div>
+      <div class="form-field">
+        <label>&nbsp;</label>
+        <button type="submit" class="btn-primary">Add Cash Event</button>
+      </div>
+    </div>
+  </form>
+</div>
+
+<div class="data-panel">
+  <div class="data-panel-header">
+    <div class="data-panel-title">Cash Ledger · {{ acct }}</div>
+    <div class="data-panel-meta">
+      Balance: <span class="amount-positive">${{ "{:,.2f}".format(d.cash_balance) }}</span>
+      &nbsp;·&nbsp; {{ d.cash_ledger|length }} recent events
+    </div>
+  </div>
+
+  {% if d.cash_breakdown %}
+  <div class="breakdown-strip">
+    <span class="breakdown-label">By sub-account:</span>
+    {% for sub, bal in d.cash_breakdown.items() %}
+      <span class="breakdown-pill">{{ sub }}: <strong>${{ "{:,.0f}".format(bal) }}</strong></span>
+    {% endfor %}
+  </div>
+  {% endif %}
+
+  {% if d.cash_ledger %}
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>Date</th>
+        <th>Type</th>
+        <th class="numeric">Amount</th>
+        <th>Sub-account</th>
+        <th>Note</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for e in d.cash_ledger %}
+      <tr>
+        <td class="mono">{{ e.date }}</td>
+        <td><span class="type-pill type-{{ e.type }}">{{ e.type }}</span></td>
+        <td class="numeric mono {% if e.amount >= 0 %}amount-positive{% else %}amount-negative{% endif %}">
+          ${{ "{:+,.2f}".format(e.amount) }}
+        </td>
+        <td>{{ e.subaccount }}</td>
+        <td class="muted">{{ e.note or "—" }}</td>
+        <td>
+          <form method="POST" action="{{ url_for('dashboard.portfolio_cash_delete', entry_id=e.id) }}"
+                onsubmit="return confirm('Delete this cash event? This does NOT auto-reverse linked option/holding positions.')">
+            <input type="hidden" name="acct" value="{{ acct }}">
+            <button type="submit" class="btn-icon-delete" title="Delete">×</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="data-empty">No cash events yet for {{ acct }}. Use the form above to add an initial deposit.</div>
+  {% endif %}
+</div>
+
+<!-- ═══════════════════════════════════════════════════════
+     SECTION: HOLDINGS
+     ═══════════════════════════════════════════════════════ -->
+{% elif sec == "holdings" %}
+
+<div class="entry-form-wrap">
+  <div class="form-section-title">ADD SHARE LOT · <span class="muted">Account:</span> {{ acct }}</div>
+
+  <form method="POST" action="{{ url_for('dashboard.portfolio_holding_add') }}" class="entry-form">
+    <input type="hidden" name="acct" value="{{ acct }}">
+
+    <div class="form-row">
+      <div class="form-field">
+        <label>Ticker</label>
+        <input type="text" name="ticker" required maxlength="10" placeholder="AAPL" style="text-transform: uppercase;">
+      </div>
+      <div class="form-field">
+        <label>Shares</label>
+        <input type="number" name="shares" step="0.0001" required>
+      </div>
+      <div class="form-field">
+        <label>Cost basis ($/share)</label>
+        <input type="number" name="cost_basis" step="0.01" required>
+      </div>
+      <div class="form-field">
+        <label>Sub-account</label>
+        <select name="subaccount">
+          {% for s in d.subaccounts %}
+            <option value="{{ s }}" {% if s == d.default_subaccount %}selected{% endif %}>{{ s }}</option>
+          {% endfor %}
+        </select>
+      </div>
+    </div>
+    <div class="form-row">
+      <div class="form-field">
+        <label>Tag (optional)</label>
+        <input type="text" name="tag" placeholder="wheel, hold, savings">
+      </div>
+      <div class="form-field">
+        <label>Date acquired</label>
+        <input type="date" name="date">
+      </div>
+      <div class="form-field flex-grow"></div>
+      <div class="form-field">
+        <label>&nbsp;</label>
+        <button type="submit" class="btn-primary">Add Holding</button>
+      </div>
+    </div>
+    <div class="form-meta">
+      Adding to an existing ticker averages the cost basis. Buying debits cash automatically.
+    </div>
+  </form>
+</div>
+
+<div class="data-panel">
+  <div class="data-panel-header">
+    <div class="data-panel-title">Share Holdings · {{ acct }}</div>
+    <div class="data-panel-meta">{{ d.holdings_count }} ticker{% if d.holdings_count != 1 %}s{% endif %}</div>
+  </div>
+
+  {% if d.holdings %}
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>Ticker</th>
+        <th class="numeric">Shares</th>
+        <th class="numeric">Cost basis</th>
+        <th class="numeric">Lot value</th>
+        <th>Sub-account</th>
+        <th>Tag</th>
+        <th>Acquired</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for ticker, h in d.holdings.items() %}
+      <tr>
+        <td class="mono ticker-cell"><strong>{{ ticker }}</strong></td>
+        <td class="numeric mono">{{ h.shares }}</td>
+        <td class="numeric mono">${{ "%.2f"|format(h.cost_basis or 0) }}</td>
+        <td class="numeric mono">${{ "{:,.2f}".format((h.shares or 0) * (h.cost_basis or 0)) }}</td>
+        <td>{{ h.subaccount or "—" }}</td>
+        <td class="muted">{{ h.tag or "—" }}</td>
+        <td class="mono muted">{{ h.first_added or "—" }}</td>
+        <td class="row-actions">
+          <button class="btn-mini" onclick="document.getElementById('sell-{{ ticker }}').classList.toggle('open')">Sell</button>
+          <button class="btn-mini btn-mini-danger"
+                  onclick="confirmDeleteHolding('{{ ticker }}', {{ h.shares }}, {{ h.cost_basis }}, '{{ acct }}')">Delete</button>
+        </td>
+      </tr>
+      <tr id="sell-{{ ticker }}" class="inline-form-row">
+        <td colspan="8">
+          <form method="POST" action="{{ url_for('dashboard.portfolio_holding_sell') }}" class="inline-form">
+            <input type="hidden" name="acct" value="{{ acct }}">
+            <input type="hidden" name="ticker" value="{{ ticker }}">
+            <span class="inline-label">SELL {{ ticker }}</span>
+            <label>Shares</label>
+            <input type="number" name="shares" step="0.0001" max="{{ h.shares }}" required>
+            <label>@ price</label>
+            <input type="number" name="sell_price" step="0.01" required>
+            <label>Date</label>
+            <input type="date" name="date">
+            <button type="submit" class="btn-primary-sm">Confirm Sell</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="data-empty">No share holdings yet for {{ acct }}.</div>
+  {% endif %}
+</div>
+
+<!-- LUMP-SUM section -->
+<div class="entry-form-wrap" style="margin-top: 32px;">
+  <div class="form-section-title">ADD LUMP-SUM HOLDING · <span class="muted">For ETFs / mutual funds tracked as a single value</span></div>
+
+  <form method="POST" action="{{ url_for('dashboard.portfolio_lumpsum_add') }}" class="entry-form">
+    <input type="hidden" name="acct" value="{{ acct }}">
+    <div class="form-row">
+      <div class="form-field flex-grow">
+        <label>Label</label>
+        <input type="text" name="label" required placeholder="VTI in BC Rollover">
+      </div>
+      <div class="form-field">
+        <label>Current value ($)</label>
+        <input type="number" name="value" step="0.01" required>
+      </div>
+      <div class="form-field">
+        <label>Sub-account</label>
+        <select name="subaccount">
+          {% for s in d.subaccounts %}
+            <option value="{{ s }}" {% if s == d.default_subaccount %}selected{% endif %}>{{ s }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="form-field">
+        <label>As of</label>
+        <input type="date" name="as_of">
+      </div>
+      <div class="form-field">
+        <label>&nbsp;</label>
+        <button type="submit" class="btn-primary">Add</button>
+      </div>
+    </div>
+  </form>
+</div>
+
+<div class="data-panel">
+  <div class="data-panel-header">
+    <div class="data-panel-title">Lump-Sum Holdings · {{ acct }}</div>
+    <div class="data-panel-meta">{{ d.lumpsum_count }} item{% if d.lumpsum_count != 1 %}s{% endif %}</div>
+  </div>
+
+  {% if d.lumpsum %}
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>Label</th>
+        <th class="numeric">Value</th>
+        <th>Sub-account</th>
+        <th>As of</th>
+        <th>Updated</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for ls in d.lumpsum %}
+      <tr>
+        <td><strong>{{ ls.label }}</strong></td>
+        <td class="numeric mono">${{ "{:,.2f}".format(ls.value) }}</td>
+        <td>{{ ls.subaccount }}</td>
+        <td class="mono muted">{{ ls.as_of }}</td>
+        <td class="mono muted">{{ ls.last_updated[:10] if ls.last_updated else "—" }}</td>
+        <td class="row-actions">
+          <button class="btn-mini" onclick="document.getElementById('upd-{{ ls.id }}').classList.toggle('open')">Update</button>
+          <form method="POST" action="{{ url_for('dashboard.portfolio_lumpsum_delete', entry_id=ls.id) }}"
+                style="display: inline;" onsubmit="return confirm('Delete this lump-sum entry?')">
+            <input type="hidden" name="acct" value="{{ acct }}">
+            <button type="submit" class="btn-icon-delete" title="Delete">×</button>
+          </form>
+        </td>
+      </tr>
+      <tr id="upd-{{ ls.id }}" class="inline-form-row">
+        <td colspan="6">
+          <form method="POST" action="{{ url_for('dashboard.portfolio_lumpsum_update', entry_id=ls.id) }}" class="inline-form">
+            <input type="hidden" name="acct" value="{{ acct }}">
+            <span class="inline-label">UPDATE {{ ls.label }}</span>
+            <label>New value</label>
+            <input type="number" name="value" step="0.01" value="{{ ls.value }}">
+            <label>As of</label>
+            <input type="date" name="as_of">
+            <button type="submit" class="btn-primary-sm">Save</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="data-empty">No lump-sum holdings tracked yet for {{ acct }}.</div>
+  {% endif %}
+</div>
+
+<!-- ═══════════════════════════════════════════════════════
+     SECTION: OPTIONS
+     ═══════════════════════════════════════════════════════ -->
+{% elif sec == "options" %}
+
+<div class="entry-form-wrap">
+  <div class="form-section-title">ADD OPTION · <span class="muted">Account:</span> {{ acct }}</div>
+
+  <form method="POST" action="{{ url_for('dashboard.portfolio_option_add') }}" class="entry-form">
+    <input type="hidden" name="acct" value="{{ acct }}">
+
+    <div class="form-row">
+      <div class="form-field">
+        <label>Type</label>
+        <select name="opt_type" required>
+          <option value="CSP">CSP — Cash-Secured Put</option>
+          <option value="CC">CC — Covered Call</option>
+          <option value="LONG_CALL">Long Call</option>
+          <option value="LONG_PUT">Long Put</option>
+        </select>
+      </div>
+      <div class="form-field">
+        <label>Ticker</label>
+        <input type="text" name="ticker" required maxlength="10" style="text-transform: uppercase;">
+      </div>
+      <div class="form-field">
+        <label>Strike</label>
+        <input type="number" name="strike" step="0.5" required>
+      </div>
+      <div class="form-field">
+        <label>Expiration</label>
+        <input type="date" name="exp" required>
+      </div>
+    </div>
+    <div class="form-row">
+      <div class="form-field">
+        <label>Premium ($/share)</label>
+        <input type="number" name="premium" step="0.01" required>
+      </div>
+      <div class="form-field">
+        <label>Contracts</label>
+        <input type="number" name="contracts" min="1" value="1" required>
+      </div>
+      <div class="form-field">
+        <label>Category</label>
+        <select name="category">
+          <option value="">— auto-detect —</option>
+          <option value="Wheel CSP">Wheel CSP</option>
+          <option value="Wheel CC">Wheel CC</option>
+          <option value="Day Trade">Day Trade</option>
+          <option value="Earnings">Earnings</option>
+          <option value="Long Call">Long Call</option>
+          <option value="Long Put">Long Put</option>
+        </select>
+      </div>
+      <div class="form-field">
+        <label>Sub-account</label>
+        <select name="subaccount">
+          {% for s in d.subaccounts %}
+            <option value="{{ s }}" {% if s == d.default_subaccount %}selected{% endif %}>{{ s }}</option>
+          {% endfor %}
+        </select>
+      </div>
+    </div>
+    <div class="form-row">
+      <div class="form-field">
+        <label>Open date</label>
+        <input type="date" name="open_date">
+      </div>
+      <div class="form-field flex-grow">
+        <label>Note</label>
+        <input type="text" name="note">
+      </div>
+      <div class="form-field">
+        <label>&nbsp;</label>
+        <button type="submit" class="btn-primary">Open Position</button>
+      </div>
+    </div>
+    <div class="form-meta">
+      Sell-to-open (CSP/CC) credits cash automatically. Buy-to-open (Long) debits cash.
+    </div>
+  </form>
+</div>
+
+<div class="data-panel">
+  <div class="data-panel-header">
+    <div class="data-panel-title">Open Options · {{ acct }}</div>
+    <div class="data-panel-meta">{{ d.open_options_count }} open</div>
+  </div>
+
+  {% if d.open_options %}
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>Ticker</th>
+        <th>Type</th>
+        <th class="numeric">Strike</th>
+        <th>Exp</th>
+        <th class="numeric">Premium</th>
+        <th class="numeric">×</th>
+        <th>Sub-account</th>
+        <th>Category</th>
+        <th>Opened</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for o in d.open_options %}
+      <tr>
+        <td class="mono ticker-cell"><strong>{{ o.ticker }}</strong></td>
+        <td><span class="type-pill type-{{ o.type|lower }}">{{ o.type }}</span></td>
+        <td class="numeric mono">${{ o.strike }}</td>
+        <td class="mono">{{ o.exp }}</td>
+        <td class="numeric mono">${{ "%.2f"|format(o.premium or 0) }}</td>
+        <td class="numeric mono">{{ o.contracts }}</td>
+        <td class="muted">{{ o.subaccount or "—" }}</td>
+        <td class="muted">{{ o.category or "—" }}</td>
+        <td class="mono muted">{{ o.open_date or "—" }}</td>
+        <td class="row-actions">
+          <button class="btn-mini" onclick="document.getElementById('close-{{ o.id }}').classList.toggle('open')">Close</button>
+          <button class="btn-mini" onclick="document.getElementById('edit-{{ o.id }}').classList.toggle('open')">Edit</button>
+          <button class="btn-mini btn-mini-danger"
+                  onclick="confirmDeleteOption('{{ o.id }}', '{{ o.ticker }}', '{{ o.type }}', {{ o.strike }}, '{{ o.exp }}', '{{ acct }}')">Delete</button>
+        </td>
+      </tr>
+      <tr id="close-{{ o.id }}" class="inline-form-row">
+        <td colspan="10">
+          <form method="POST" action="{{ url_for('dashboard.portfolio_option_close', opt_id=o.id) }}" class="inline-form">
+            <input type="hidden" name="acct" value="{{ acct }}">
+            <span class="inline-label">CLOSE {{ o.ticker }} {{ o.type }}</span>
+            <label>Status</label>
+            <select name="status" required>
+              <option value="closed">Closed (BTC)</option>
+              <option value="expired">Expired worthless</option>
+              <option value="assigned">Assigned</option>
+            </select>
+            <label>Close $</label>
+            <input type="number" name="close_premium" step="0.01" placeholder="0 if expired">
+            <label>Date</label>
+            <input type="date" name="close_date">
+            <button type="submit" class="btn-primary-sm">Confirm</button>
+            <a href="{{ url_for('dashboard.portfolio_section', section='rolls') }}?acct={{ acct }}&opt_id={{ o.id }}"
+               class="btn-mini-link">Or roll →</a>
+          </form>
+        </td>
+      </tr>
+      <tr id="edit-{{ o.id }}" class="inline-form-row">
+        <td colspan="10">
+          <form method="POST" action="{{ url_for('dashboard.portfolio_option_edit', opt_id=o.id) }}" class="inline-form">
+            <input type="hidden" name="acct" value="{{ acct }}">
+            <span class="inline-label">EDIT {{ o.ticker }} {{ o.type }}</span>
+            <label>Strike</label>
+            <input type="number" name="strike" step="0.5" value="{{ o.strike }}">
+            <label>Exp</label>
+            <input type="date" name="exp" value="{{ o.exp }}">
+            <label>Premium</label>
+            <input type="number" name="premium" step="0.01" value="{{ o.premium }}">
+            <label>×</label>
+            <input type="number" name="contracts" min="1" value="{{ o.contracts }}">
+            <label>Sub-acct</label>
+            <select name="subaccount">
+              {% for s in d.subaccounts %}
+                <option value="{{ s }}" {% if s == o.subaccount %}selected{% endif %}>{{ s }}</option>
+              {% endfor %}
+            </select>
+            <button type="submit" class="btn-primary-sm">Save</button>
+            <span class="inline-meta">Note: edits do NOT auto-adjust cash. Use undo on Settings if you need to redo from scratch.</span>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="data-empty">No open options for {{ acct }}.</div>
+  {% endif %}
+</div>
+
+<!-- ═══════════════════════════════════════════════════════
+     SECTION: SPREADS
+     ═══════════════════════════════════════════════════════ -->
+{% elif sec == "spreads" %}
+
+<div class="entry-form-wrap">
+  <div class="form-section-title">ADD SPREAD · <span class="muted">Account:</span> {{ acct }}</div>
+
+  <form method="POST" action="{{ url_for('dashboard.portfolio_spread_add') }}" class="entry-form">
+    <input type="hidden" name="acct" value="{{ acct }}">
+
+    <div class="form-row">
+      <div class="form-field">
+        <label>Spread type</label>
+        <select name="spread_type" required>
+          <option value="BULL_PUT">Bull Put (credit)</option>
+          <option value="BEAR_CALL">Bear Call (credit)</option>
+          <option value="BULL_CALL">Bull Call (debit)</option>
+          <option value="BEAR_PUT">Bear Put (debit)</option>
+          <option value="IRON_CONDOR">Iron Condor</option>
+          <option value="INVERSE_CONDOR">Inverse Condor</option>
+        </select>
+      </div>
+      <div class="form-field">
+        <label>Ticker</label>
+        <input type="text" name="ticker" required style="text-transform: uppercase;">
+      </div>
+      <div class="form-field">
+        <label>Long strike</label>
+        <input type="number" name="long_strike" step="0.5" required>
+      </div>
+      <div class="form-field">
+        <label>Short strike</label>
+        <input type="number" name="short_strike" step="0.5" required>
+      </div>
+      <div class="form-field">
+        <label>Exp</label>
+        <input type="date" name="exp" required>
+      </div>
+    </div>
+    <div class="form-row">
+      <div class="form-field">
+        <label>Net price ($)</label>
+        <input type="number" name="net" step="0.01" required>
+      </div>
+      <div class="form-field">
+        <label>Credit / Debit</label>
+        <select name="is_credit">
+          <option value="true">Credit (received)</option>
+          <option value="false">Debit (paid)</option>
+        </select>
+      </div>
+      <div class="form-field">
+        <label>Contracts</label>
+        <input type="number" name="contracts" min="1" value="1">
+      </div>
+      <div class="form-field">
+        <label>Sub-account</label>
+        <select name="subaccount">
+          {% for s in d.subaccounts %}
+            <option value="{{ s }}" {% if s == d.default_subaccount %}selected{% endif %}>{{ s }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="form-field">
+        <label>Open date</label>
+        <input type="date" name="open_date">
+      </div>
+    </div>
+    <div class="form-row">
+      <div class="form-field flex-grow">
+        <label>Note</label>
+        <input type="text" name="note">
+      </div>
+      <div class="form-field">
+        <label>&nbsp;</label>
+        <button type="submit" class="btn-primary">Add Spread</button>
+      </div>
+    </div>
+  </form>
+</div>
+
+<div class="data-panel">
+  <div class="data-panel-header">
+    <div class="data-panel-title">Open Spreads · {{ acct }}</div>
+    <div class="data-panel-meta">{{ d.open_spreads_count }} open</div>
+  </div>
+
+  {% if d.open_spreads %}
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>Ticker</th>
+        <th>Type</th>
+        <th class="numeric">Long</th>
+        <th class="numeric">Short</th>
+        <th>Exp</th>
+        <th class="numeric">Net</th>
+        <th class="numeric">×</th>
+        <th>Sub-account</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for s in d.open_spreads %}
+      <tr>
+        <td class="mono ticker-cell"><strong>{{ s.ticker }}</strong></td>
+        <td><span class="type-pill spread">{{ s.type }}</span></td>
+        <td class="numeric mono">{{ s.long_strike }}</td>
+        <td class="numeric mono">{{ s.short_strike }}</td>
+        <td class="mono">{{ s.exp }}</td>
+        <td class="numeric mono">{% if s.credit %}${{ "%.2f"|format(s.credit) }} cr{% else %}${{ "%.2f"|format(s.debit) }} dr{% endif %}</td>
+        <td class="numeric mono">{{ s.contracts }}</td>
+        <td class="muted">{{ s.subaccount or "—" }}</td>
+        <td class="row-actions">
+          <button class="btn-mini" onclick="document.getElementById('close-spr-{{ s.id }}').classList.toggle('open')">Close</button>
+          <button class="btn-mini btn-mini-danger"
+                  onclick="confirmDeleteSpread('{{ s.id }}', '{{ s.ticker }}', '{{ s.type }}', '{{ acct }}')">Delete</button>
+        </td>
+      </tr>
+      <tr id="close-spr-{{ s.id }}" class="inline-form-row">
+        <td colspan="9">
+          <form method="POST" action="{{ url_for('dashboard.portfolio_spread_close', spread_id=s.id) }}" class="inline-form">
+            <input type="hidden" name="acct" value="{{ acct }}">
+            <span class="inline-label">CLOSE SPREAD</span>
+            <label>Status</label>
+            <select name="status" required>
+              <option value="closed">Closed</option>
+              <option value="expired">Expired</option>
+            </select>
+            <label>Close value ($)</label>
+            <input type="number" name="close_value" step="0.01" placeholder="0 if expired">
+            <label>Date</label>
+            <input type="date" name="close_date">
+            <button type="submit" class="btn-primary-sm">Confirm</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="data-empty">No open spreads for {{ acct }}.</div>
+  {% endif %}
+</div>
+
+<!-- ═══════════════════════════════════════════════════════
+     SECTION: ROLLS
+     ═══════════════════════════════════════════════════════ -->
+{% elif sec == "rolls" %}
+
+<div class="entry-form-wrap">
+  <div class="form-section-title">ROLL OPTION · <span class="muted">One step: close existing + open new with single net cash event</span></div>
+
+  {% if d.open_options %}
+  <form method="POST" action="{{ url_for('dashboard.portfolio_roll_execute') }}" class="entry-form">
+    <input type="hidden" name="acct" value="{{ acct }}">
+
+    <div class="form-row">
+      <div class="form-field flex-grow">
+        <label>Existing position</label>
+        <select name="opt_id" required>
+          {% for o in d.open_options %}
+            <option value="{{ o.id }}">
+              {{ o.ticker }} {{ o.type }} ${{ o.strike }} {{ o.exp }} · ${{ "%.2f"|format(o.premium or 0) }}/c × {{ o.contracts }}
+            </option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="form-field">
+        <label>Close premium ($)</label>
+        <input type="number" name="close_premium" step="0.01" required placeholder="What you pay to close">
+      </div>
+    </div>
+    <div class="form-row">
+      <div class="form-field">
+        <label>New strike</label>
+        <input type="number" name="new_strike" step="0.5" required>
+      </div>
+      <div class="form-field">
+        <label>New expiration</label>
+        <input type="date" name="new_exp" required>
+      </div>
+      <div class="form-field">
+        <label>New premium ($)</label>
+        <input type="number" name="new_premium" step="0.01" required>
+      </div>
+      <div class="form-field">
+        <label>Roll date</label>
+        <input type="date" name="roll_date">
+      </div>
+    </div>
+    <div class="form-row">
+      <div class="form-field flex-grow">
+        <label>Note</label>
+        <input type="text" name="note" placeholder="Down 10 strikes, out 30 days">
+      </div>
+      <div class="form-field">
+        <label>&nbsp;</label>
+        <button type="submit" class="btn-primary">Execute Roll</button>
+      </div>
+    </div>
+    <div class="form-meta">
+      Net cash = (new premium − close premium) × contracts × 100 · logged as single Wheel Roll event
+    </div>
+  </form>
+  {% else %}
+  <div class="data-empty">No open options to roll. <a href="{{ url_for('dashboard.portfolio_section', section='options') }}?acct={{ acct }}">Open one →</a></div>
+  {% endif %}
+</div>
+
+<!-- ═══════════════════════════════════════════════════════
+     SECTION: TRANSFERS — Kyleigh + Clay parallel ledgers
+     ═══════════════════════════════════════════════════════ -->
+{% elif sec == "transfers" %}
+
+<div class="transfers-grid">
+  {% for recipient in ["kyleigh", "clay"] %}
+  {% set bal = d.kyleigh_balance if recipient == "kyleigh" else d.clay_balance %}
+  {% set ledger = d.kyleigh_ledger if recipient == "kyleigh" else d.clay_ledger %}
+
+  <div class="transfer-panel">
+    <div class="transfer-panel-header">
+      <span class="transfer-name dot-{{ recipient }}"></span>
+      <span class="transfer-title">{{ recipient|capitalize }}</span>
+      <span class="transfer-balance">${{ "{:,.2f}".format(bal) }}</span>
+    </div>
+
+    <form method="POST" action="{{ url_for('dashboard.portfolio_transfer_add') }}" class="entry-form-compact">
+      <input type="hidden" name="recipient" value="{{ recipient }}">
+      <div class="form-row">
+        <div class="form-field">
+          <label>From</label>
+          <select name="acct" required>
+            {% for a in d.all_accounts %}
+              <option value="{{ a }}" {% if a == acct %}selected{% endif %}>{{ a|capitalize }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="form-field">
+          <label>Amount ($)</label>
+          <input type="number" name="amount" step="0.01" required placeholder="Negative reverses">
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-field">
+          <label>Sub-account</label>
+          <select name="subaccount">
+            {% for s in d.subaccounts %}
+              <option value="{{ s }}" {% if s == d.default_subaccount %}selected{% endif %}>{{ s }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="form-field">
+          <label>Date</label>
+          <input type="date" name="date">
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-field flex-grow">
+          <label>Note</label>
+          <input type="text" name="note">
+        </div>
+        <div class="form-field">
+          <label>&nbsp;</label>
+          <button type="submit" class="btn-primary">Transfer</button>
+        </div>
+      </div>
+    </form>
+
+    <div class="transfer-ledger">
+      {% if ledger %}
+      <table class="data-table compact">
+        <thead>
+          <tr>
+            <th>Date</th>
+            <th>From</th>
+            <th class="numeric">Amount</th>
+            <th>Note</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for e in ledger %}
+          <tr>
+            <td class="mono">{{ e.date }}</td>
+            <td>{{ e.from_account }} / {{ e.from_subaccount }}</td>
+            <td class="numeric mono {% if e.amount >= 0 %}amount-positive{% else %}amount-negative{% endif %}">
+              ${{ "{:+,.2f}".format(e.amount) }}
+            </td>
+            <td class="muted">{{ e.note or "—" }}</td>
+            <td>
+              <form method="POST" action="{{ url_for('dashboard.portfolio_transfer_delete', recipient=recipient, transfer_id=e.id) }}"
+                    onsubmit="return confirm('Delete this transfer? Cash event is NOT auto-reversed.')">
+                <input type="hidden" name="acct" value="{{ acct }}">
+                <button type="submit" class="btn-icon-delete">×</button>
+              </form>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% else %}
+      <div class="data-empty">No transfers to {{ recipient|capitalize }} yet.</div>
+      {% endif %}
+    </div>
+  </div>
+  {% endfor %}
+</div>
+
+<!-- ═══════════════════════════════════════════════════════
+     SECTION: SETTINGS
+     ═══════════════════════════════════════════════════════ -->
+{% elif sec == "settings" %}
+
+<div class="settings-grid">
+
+  <div class="entry-form-wrap">
+    <div class="form-section-title">SUB-ACCOUNT TAGS</div>
+
+    <form method="POST" action="{{ url_for('dashboard.portfolio_sub_add') }}" class="entry-form-compact">
+      <div class="form-row">
+        <div class="form-field flex-grow">
+          <label>New sub-account name</label>
+          <input type="text" name="name" required maxlength="40" placeholder="My Custom Tag">
+        </div>
+        <div class="form-field">
+          <label>&nbsp;</label>
+          <button type="submit" class="btn-primary">Add</button>
+        </div>
+      </div>
+    </form>
+
+    <div class="data-panel">
+      <table class="data-table compact">
+        <tbody>
+          {% for s in d.subaccounts %}
+          <tr>
+            <td><strong>{{ s }}</strong>{% if s == d.default_subaccount %} <span class="muted">(default)</span>{% endif %}</td>
+            <td class="row-actions">
+              {% if s != d.default_subaccount %}
+              <form method="POST" action="{{ url_for('dashboard.portfolio_sub_remove') }}" style="display: inline;"
+                    onsubmit="return confirm('Remove this sub-account? Existing positions tagged with it keep the tag.')">
+                <input type="hidden" name="name" value="{{ s }}">
+                <button type="submit" class="btn-icon-delete">×</button>
+              </form>
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="entry-form-wrap danger-wrap">
+    <div class="form-section-title danger">DANGER · WIPE PORTFOLIO DATA</div>
+    <p class="danger-text">
+      This clears all holdings, options, spreads, cash ledger, and lump-sums for the
+      selected account. A snapshot is taken FIRST so this is recoverable via the
+      <strong>Durability</strong> tab. You must type the confirmation phrase exactly.
+    </p>
+
+    <form method="POST" action="{{ url_for('dashboard.portfolio_wipe') }}" class="entry-form-compact">
+      <div class="form-row">
+        <div class="form-field">
+          <label>Account</label>
+          <select name="acct" required>
+            {% for a in d.all_accounts %}
+              <option value="{{ a }}">{{ a|capitalize }}</option>
+            {% endfor %}
+            <option value="ALL">— ALL ACCOUNTS —</option>
+          </select>
+        </div>
+        <div class="form-field flex-grow">
+          <label>Confirmation (e.g. "WIPE BRAD" or "WIPE ALL ACCOUNTS")</label>
+          <input type="text" name="confirm" required placeholder='Type WIPE {ACCOUNT}' style="font-family: monospace;">
+        </div>
+        <div class="form-field">
+          <label>&nbsp;</label>
+          <button type="submit" class="btn-danger">Wipe</button>
+        </div>
+      </div>
+    </form>
+  </div>
+
+</div>
+
+<!-- Audit log + undo (full width, below the grid) -->
+<div class="data-panel" style="margin-top: 32px;">
+  <div class="data-panel-header">
+    <div class="data-panel-title">Recent Activity · Undo Last Action</div>
+    <div class="data-panel-meta">{{ (d.recent_audits or [])|length }} recent events</div>
+  </div>
+
+  <p class="audit-help-text">
+    Made a mistake? Click <strong>Undo</strong> on any entry below to reverse it. Undo handles
+    cash reversal automatically — for a "Wheel CSP added" entry, undoing will delete the option
+    AND remove the cash credit. For closes and rolls, the position is reopened.
+  </p>
+
+  {% if d.recent_audits %}
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>When</th>
+        <th>Account</th>
+        <th>Action</th>
+        <th>Target</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for a in d.recent_audits %}
+      <tr>
+        <td class="mono muted" style="white-space: nowrap;">{{ a.timestamp[:19].replace('T', ' ') if a.timestamp else "—" }}</td>
+        <td><span class="acct-pill-dot dot-{{ a.account }}"></span>{{ a.account or "system" }}</td>
+        <td><span class="audit-op {% if a.undoable %}audit-op-undoable{% endif %}">{{ a.op }}</span></td>
+        <td class="mono muted">
+          {% if a.new_value and a.new_value is mapping %}
+            {% if a.new_value.ticker %}{{ a.new_value.ticker }}{% endif %}
+            {% if a.new_value.type %} {{ a.new_value.type }}{% endif %}
+            {% if a.new_value.strike %} ${{ a.new_value.strike }}{% endif %}
+            {% if a.new_value.amount is defined %}{{ a.new_value.amount }}{% endif %}
+            {% if not a.new_value.ticker and not a.new_value.amount %}{{ a.target[:30] }}{% endif %}
+          {% else %}{{ a.target[:30] if a.target else "—" }}{% endif %}
+        </td>
+        <td>
+          {% if a.undoable %}
+          <form method="POST" action="{{ url_for('dashboard.portfolio_audit_undo') }}" style="display:inline;"
+                onsubmit="return confirm('Undo this action?\n\n{{ a.op }} on {{ a.target[:40] }}\n\nThis will reverse the action and any linked cash events.')">
+            <input type="hidden" name="timestamp" value="{{ a.timestamp }}">
+            <input type="hidden" name="op" value="{{ a.op }}">
+            <input type="hidden" name="account" value="{{ a.account }}">
+            <input type="hidden" name="target" value="{{ a.target }}">
+            <button type="submit" class="btn-mini btn-mini-warn">Undo</button>
+          </form>
+          {% else %}
+          <span class="muted" style="font-size: 10px;">—</span>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="data-empty">No activity yet. Make a position entry to see it appear here.</div>
+  {% endif %}
+</div>
+
+{% endif %}
+
+<!-- ═══════════════════════════════════════════════════════
+     DELETE CONFIRMATION MODAL — for smart deletes
+     ═══════════════════════════════════════════════════════ -->
+<div id="delete-modal" class="modal-backdrop" onclick="if(event.target===this)closeDeleteModal()">
+  <div class="modal">
+    <div class="modal-header">
+      <span id="modal-title">Confirm Delete</span>
+      <button class="modal-close" onclick="closeDeleteModal()">×</button>
+    </div>
+    <div id="modal-body" class="modal-body">
+      <p id="modal-summary"></p>
+      <div id="modal-cash-section" style="display: none;">
+        <div class="modal-section-title">Linked cash events:</div>
+        <div id="modal-cash-list"></div>
+        <label class="modal-checkbox">
+          <input type="checkbox" id="modal-also-cash" checked>
+          Also reverse these cash events <span class="muted">(recommended for typo correction)</span>
+        </label>
+      </div>
+      <div id="modal-no-cash" class="modal-meta" style="display: none;">
+        No linked cash events found.
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-mini" onclick="closeDeleteModal()">Cancel</button>
+      <form id="modal-delete-form" method="POST" style="display: inline;">
+        <input type="hidden" name="acct" id="modal-form-acct">
+        <input type="hidden" name="also_cash" id="modal-form-also-cash" value="1">
+        <button type="submit" class="btn-danger" id="modal-delete-btn">Delete</button>
+      </form>
+    </div>
   </div>
 </div>
+
+<script>
+function openDeleteModal({title, summary, formAction, account, kind, itemId}) {
+  document.getElementById('modal-title').textContent = title;
+  document.getElementById('modal-summary').textContent = summary;
+  document.getElementById('modal-form-acct').value = account;
+  document.getElementById('modal-delete-form').action = formAction;
+  document.getElementById('modal-cash-section').style.display = 'none';
+  document.getElementById('modal-no-cash').style.display = 'none';
+  document.getElementById('modal-cash-list').innerHTML = '';
+
+  // Fetch linked cash events
+  const inspectUrl = `/portfolio/inspect/${kind}/${itemId}?acct=${account}`;
+  fetch(inspectUrl)
+    .then(r => r.json())
+    .then(info => {
+      const linked = info.linked_cash || [];
+      if (linked.length > 0) {
+        let html = '<ul class="modal-cash-ul">';
+        linked.forEach(c => {
+          const sign = c.amount >= 0 ? '+' : '';
+          const amtClass = c.amount >= 0 ? 'amount-positive' : 'amount-negative';
+          html += `<li><span class="mono ${amtClass}">${sign}$${Math.abs(c.amount).toFixed(2)}</span> · ${c.type} · ${c.date}${c.note ? ' · ' + c.note : ''}</li>`;
+        });
+        html += '</ul>';
+        document.getElementById('modal-cash-list').innerHTML = html;
+        document.getElementById('modal-cash-section').style.display = 'block';
+      } else {
+        document.getElementById('modal-no-cash').style.display = 'block';
+      }
+    })
+    .catch(err => {
+      console.error(err);
+      document.getElementById('modal-no-cash').style.display = 'block';
+    });
+
+  // Sync checkbox to hidden input
+  const cb = document.getElementById('modal-also-cash');
+  cb.onchange = () => {
+    document.getElementById('modal-form-also-cash').value = cb.checked ? '1' : '0';
+  };
+  cb.checked = true;
+  document.getElementById('modal-form-also-cash').value = '1';
+
+  document.getElementById('delete-modal').classList.add('open');
+}
+
+function closeDeleteModal() {
+  document.getElementById('delete-modal').classList.remove('open');
+}
+
+function confirmDeleteOption(optId, ticker, type, strike, exp, account) {
+  openDeleteModal({
+    title: 'Delete Option',
+    summary: `${ticker} ${type} $${strike} expiring ${exp}`,
+    formAction: `/portfolio/options/delete/${optId}`,
+    account: account,
+    kind: 'option',
+    itemId: optId,
+  });
+}
+
+function confirmDeleteSpread(spreadId, ticker, type, account) {
+  openDeleteModal({
+    title: 'Delete Spread',
+    summary: `${ticker} ${type}`,
+    formAction: `/portfolio/spreads/delete/${spreadId}`,
+    account: account,
+    kind: 'spread',
+    itemId: spreadId,
+  });
+}
+
+function confirmDeleteHolding(ticker, shares, costBasis, account) {
+  openDeleteModal({
+    title: 'Delete Holding',
+    summary: `${ticker} · ${shares} shares @ $${costBasis} cost basis`,
+    formAction: `/portfolio/holdings/delete/${ticker}`,
+    account: account,
+    kind: 'holding',
+    itemId: ticker,
+  });
+}
+</script>
+
 {% endblock %}
