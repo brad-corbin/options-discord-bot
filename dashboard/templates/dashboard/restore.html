@@ -1,0 +1,172 @@
+{% extends "dashboard/base.html" %}
+
+{% block title %}Ω OMEGA — Restore{% endblock %}
+{% block brand_sub %}Durability · {{ active_account.label }}{% endblock %}
+
+{% block content %}
+<section class="durability-page fade-in">
+
+  {% if flash_msg %}
+    <div class="durability-flash flash-{{ flash_kind }}">{{ flash_msg }}</div>
+  {% endif %}
+
+  <div class="section-eyebrow">Durability · Status</div>
+
+  <div class="durability-status">
+    <div class="dur-status-cell">
+      <div class="dur-status-label">Sheets</div>
+      <div class="dur-status-value {% if durability_status.sheets_available %}ok{% else %}fail{% endif %}">
+        {% if durability_status.sheets_available %}Connected{% else %}Unavailable{% endif %}
+      </div>
+    </div>
+    <div class="dur-status-cell">
+      <div class="dur-status-label">Portfolio Store</div>
+      <div class="dur-status-value {% if durability_status.store_initialized %}ok{% else %}warn{% endif %}">
+        {% if durability_status.store_initialized %}Initialized{% elif durability_status.portfolio_available %}Loaded · uninitialized{% else %}Unavailable{% endif %}
+      </div>
+    </div>
+    <div class="dur-status-cell">
+      <div class="dur-status-label">Snapshots</div>
+      <div class="dur-status-value">
+        {{ durability_status.snapshot_count }}
+        <span class="dur-status-meta">· {{ durability_status.retention_days }}d retention</span>
+      </div>
+    </div>
+    <div class="dur-status-cell">
+      <div class="dur-status-label">Latest</div>
+      <div class="dur-status-value">
+        {% if durability_status.latest_snapshot %}
+          {{ durability_status.latest_snapshot.date }}
+        {% else %}
+          <span class="dur-status-dim">None yet</span>
+        {% endif %}
+      </div>
+    </div>
+    <div class="dur-status-cell">
+      <div class="dur-status-label">Accounts Tracked</div>
+      <div class="dur-status-value">
+        {% if durability_status.known_accounts %}
+          {{ durability_status.known_accounts|join(' · ') }}
+        {% else %}
+          <span class="dur-status-dim">None</span>
+        {% endif %}
+      </div>
+    </div>
+    <div class="dur-status-cell action-cell">
+      <form method="POST" action="{{ url_for('dashboard.snapshot_now') }}">
+        <button type="submit" class="dur-action-btn">Snapshot Now</button>
+      </form>
+    </div>
+  </div>
+
+  <div class="durability-grid">
+
+    <!-- Snapshots List -->
+    <div class="dur-panel">
+      <div class="dur-panel-header">
+        <span class="dur-panel-title">Available Snapshots</span>
+        <span class="dur-panel-meta">Newest first · prefix portfolio_snapshot_</span>
+      </div>
+      {% if snapshots %}
+        <div class="dur-snapshot-list">
+          {% for snap in snapshots %}
+            <div class="dur-snapshot-row">
+              <div class="dur-snap-info">
+                <div class="dur-snap-date">{{ snap.date }}</div>
+                <div class="dur-snap-tab">{{ snap.tab }}</div>
+              </div>
+              <button type="button" class="dur-restore-btn"
+                      onclick="omegaRestore('{{ snap.date }}')">
+                Restore →
+              </button>
+            </div>
+          {% endfor %}
+        </div>
+      {% else %}
+        <div class="dur-empty">
+          <p>No snapshots yet.</p>
+          <p class="dur-empty-meta">
+            The first snapshot will be taken automatically at the configured time
+            (default 06:00 UTC), or click "Snapshot Now" above.
+          </p>
+        </div>
+      {% endif %}
+    </div>
+
+    <!-- Audit Log -->
+    <div class="dur-panel">
+      <div class="dur-panel-header">
+        <span class="dur-panel-title">Recent Writes</span>
+        <span class="dur-panel-meta">Audit log · last 25</span>
+      </div>
+      {% if audit_entries %}
+        <div class="dur-audit-list">
+          {% for entry in audit_entries %}
+            <div class="dur-audit-row">
+              <span class="dur-audit-time">{{ entry.timestamp[:19].replace('T', ' ') }}</span>
+              <span class="dur-audit-acct">{{ entry.account or '—' }}</span>
+              <span class="dur-audit-op {% if entry.op == 'restore' %}restore{% endif %}">{{ entry.op }}</span>
+              <span class="dur-audit-target">{{ entry.target }}</span>
+            </div>
+          {% endfor %}
+        </div>
+      {% else %}
+        <div class="dur-empty">
+          <p>No write events logged yet.</p>
+          <p class="dur-empty-meta">
+            Audit entries appear here when phase 4 portfolio writes start firing.
+            Restore events log immediately.
+          </p>
+        </div>
+      {% endif %}
+    </div>
+
+  </div>
+</section>
+
+<!-- Hidden restore confirmation modal -->
+<div id="restore-modal" class="dur-modal-backdrop" style="display:none;">
+  <div class="dur-modal">
+    <div class="dur-modal-title">Confirm Restore</div>
+    <div class="dur-modal-body">
+      This will <strong>OVERWRITE</strong> all current portfolio data with the
+      snapshot from <span id="restore-date" class="dur-modal-date"></span>.
+      <br><br>
+      The current state isn't backed up by this action — but the next nightly
+      snapshot will capture the restored state, and the snapshot you're restoring
+      from stays intact.
+      <br><br>
+      Type <strong>RESTORE</strong> below to confirm.
+    </div>
+    <form id="restore-form" method="POST" action="">
+      <input type="text"
+             name="confirm"
+             class="dur-modal-input"
+             placeholder="Type RESTORE"
+             autocomplete="off"
+             autocapitalize="characters"
+             spellcheck="false">
+      <div class="dur-modal-actions">
+        <button type="button" class="dur-modal-cancel" onclick="omegaRestoreCancel()">Cancel</button>
+        <button type="submit" class="dur-modal-confirm">Restore</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<script>
+  function omegaRestore(dateIso) {
+    document.getElementById('restore-date').textContent = dateIso;
+    document.getElementById('restore-form').action = '/restore/' + dateIso;
+    document.getElementById('restore-modal').style.display = 'flex';
+    var input = document.querySelector('.dur-modal-input');
+    if (input) { input.value = ''; setTimeout(function(){ input.focus(); }, 50); }
+  }
+  function omegaRestoreCancel() {
+    document.getElementById('restore-modal').style.display = 'none';
+  }
+  document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape') { omegaRestoreCancel(); }
+  });
+</script>
+{% endblock %}

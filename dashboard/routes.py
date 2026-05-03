@@ -43,6 +43,7 @@ PAGE_TABS = [
     {"key": "trading",    "label": "Trading",    "endpoint": "dashboard.trading"},
     {"key": "portfolio",  "label": "Portfolio",  "endpoint": "dashboard.portfolio"},
     {"key": "diagnostic", "label": "Diagnostic", "endpoint": "dashboard.diagnostic"},
+    {"key": "restore",    "label": "Durability", "endpoint": "dashboard.restore"},
 ]
 
 # Session lifetime — 30 days, matching the spec
@@ -63,13 +64,22 @@ dashboard_bp = Blueprint(
 
 @dashboard_bp.before_app_request
 def _make_session_permanent():
-    """Apply session lifetime once per app request."""
+    """Apply session lifetime once per app request, and start the snapshot
+    scheduler the first time a request lands."""
     session.permanent = True
-    # Set the lifetime on the app config the first time we're called.
     from flask import current_app
     if "_omega_session_set" not in current_app.config:
         current_app.permanent_session_lifetime = timedelta(days=SESSION_LIFETIME_DAYS)
         current_app.config["_omega_session_set"] = True
+
+    # Phase 2: start the daily snapshot scheduler on first request
+    if "_omega_scheduler_started" not in current_app.config:
+        try:
+            from .scheduler import start_snapshot_scheduler
+            start_snapshot_scheduler()
+        except Exception as e:
+            log.warning(f"Snapshot scheduler start failed: {e}")
+        current_app.config["_omega_scheduler_started"] = True
 
 
 # ──────────────────────────────────────────────────────────
@@ -213,15 +223,104 @@ def diagnostic():
 
 
 # ──────────────────────────────────────────────────────────
+# Phase 2 — Durability routes
+# ──────────────────────────────────────────────────────────
+
+@dashboard_bp.route("/restore", methods=["GET"])
+@login_required
+def restore():
+    """Restore page — list snapshots, recent audit log entries, manual snapshot."""
+    from . import durability
+    snapshots = durability.list_snapshots()
+    audit_entries = durability.list_audit_entries(limit=25)
+    status = durability.get_status()
+    flash_msg = session.pop("_durability_flash", None)
+    flash_kind = session.pop("_durability_flash_kind", "info")
+    return render_page(
+        "dashboard/restore.html",
+        page_key="restore",
+        snapshots=snapshots,
+        audit_entries=audit_entries,
+        durability_status=status,
+        flash_msg=flash_msg,
+        flash_kind=flash_kind,
+    )
+
+
+@dashboard_bp.route("/restore/<date_iso>", methods=["POST"])
+@login_required
+def do_restore(date_iso):
+    """Perform a restore. Requires confirmation token in form post."""
+    import re as _re
+    if not _re.match(r"^\d{4}-\d{2}-\d{2}$", date_iso or ""):
+        session["_durability_flash"] = "Invalid snapshot date format"
+        session["_durability_flash_kind"] = "error"
+        return redirect(url_for("dashboard.restore"))
+
+    confirm = (request.form.get("confirm") or "").strip().upper()
+    if confirm != "RESTORE":
+        session["_durability_flash"] = "Restore requires typing RESTORE in the confirmation field"
+        session["_durability_flash_kind"] = "error"
+        return redirect(url_for("dashboard.restore"))
+
+    from . import durability
+    result = durability.restore_from_snapshot(date_iso)
+
+    if result.get("ok"):
+        accounts = list((result.get("restored") or {}).keys())
+        session["_durability_flash"] = (
+            f"Restored from {date_iso} · accounts: {', '.join(accounts) or 'none'}"
+        )
+        session["_durability_flash_kind"] = "success"
+    else:
+        session["_durability_flash"] = f"Restore failed: {result.get('error', 'unknown')}"
+        session["_durability_flash_kind"] = "error"
+
+    return redirect(url_for("dashboard.restore"))
+
+
+@dashboard_bp.route("/snapshot/now", methods=["POST"])
+@login_required
+def snapshot_now():
+    """Manually trigger a snapshot."""
+    from . import durability
+    result = durability.take_snapshot()
+
+    if result.get("ok"):
+        session["_durability_flash"] = (
+            f"Snapshot saved to {result.get('tab')} · {result.get('rows')} rows"
+        )
+        session["_durability_flash_kind"] = "success"
+    else:
+        session["_durability_flash"] = f"Snapshot failed: {result.get('error', 'unknown')}"
+        session["_durability_flash_kind"] = "error"
+
+    return redirect(url_for("dashboard.restore"))
+
+
+# ──────────────────────────────────────────────────────────
 # Health
 # ──────────────────────────────────────────────────────────
 
 @dashboard_bp.route("/dashboard/health", methods=["GET"])
 def health():
     """Used to verify the Blueprint is registered."""
+    try:
+        from . import durability
+        dstatus = durability.get_status()
+    except Exception:
+        dstatus = {}
+
     return {
         "status": "ok",
         "module": "omega-dashboard",
-        "phase": 1,
+        "phase": 2,
         "auth_configured": bool(DASHBOARD_PASSWORD),
+        "durability": {
+            "sheets_available": dstatus.get("sheets_available", False),
+            "portfolio_available": dstatus.get("portfolio_available", False),
+            "store_initialized": dstatus.get("store_initialized", False),
+            "snapshot_count": dstatus.get("snapshot_count", 0),
+            "retention_days": dstatus.get("retention_days"),
+        },
     }
