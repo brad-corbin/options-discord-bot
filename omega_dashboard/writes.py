@@ -354,6 +354,18 @@ def add_cash_event(account: str, event_type: str, amount: float,
     if amt is None:
         return {"ok": False, "error": "Amount required"}
 
+    # Phase 4.5 — sign normalization based on event type.
+    # User may have typed "+$100" for a withdrawal; we coerce to the right sign.
+    # Skip normalization for manual_set (intentional sign control).
+    if event_type == "withdrawal" and amt > 0:
+        amt = -amt
+    elif event_type == "deposit" and amt < 0:
+        amt = -amt
+    elif event_type == "fee" and amt > 0:
+        amt = -amt  # Fees are always expenses
+    elif event_type == "transfer_out" and amt > 0:
+        amt = -amt
+
     date_iso = _validate_date(date) or datetime.now(timezone.utc).strftime("%Y-%m-%d")
     sub = (subaccount or "").strip() or DEFAULT_SUBACCOUNT
 
@@ -1887,15 +1899,29 @@ def add_transfer(recipient: str, account: str, amount: float,
     )
 
     # Phase 4.5 — auto-mirror to partner cash ledger so their command-center
-    # view reflects the distribution without manual double-entry.
+    # view reflects the transaction without manual double-entry.
     if recipient in PARTNER_LEDGER_ACCOUNTS:
         try:
-            add_cash_event(
-                recipient, "withdrawal", -amt,
-                subaccount=sub, date=date_iso,
-                note=f"Distribution from {account.title()}: {note or ''}".strip(),
-                ref_id=transfer_id,
-            )
+            if amt > 0:
+                # Source paying OUT to partner (e.g. Brad pays Kyleigh).
+                # On her ledger: a withdrawal (negative) — she's pulling
+                # capital + gains out.
+                add_cash_event(
+                    recipient, "withdrawal", -amt,
+                    subaccount=sub, date=date_iso,
+                    note=f"Distribution from {account.title()}: {note or ''}".strip(),
+                    ref_id=transfer_id,
+                )
+            else:
+                # Source receiving from partner (e.g. Kyleigh sending money in,
+                # logged as a NEGATIVE transfer). On her ledger: a deposit (positive)
+                # — she's contributing capital.
+                add_cash_event(
+                    recipient, "deposit", -amt,  # -amt is positive since amt < 0
+                    subaccount=sub, date=date_iso,
+                    note=f"Contribution to {account.title()}: {note or ''}".strip(),
+                    ref_id=transfer_id,
+                )
         except Exception as e:
             log.warning(f"partner ledger mirror failed (non-fatal): {e}")
 
