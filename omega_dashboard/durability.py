@@ -31,10 +31,10 @@ AUDIT_TAB = "portfolio_writes"
 # The bot currently only has brad + mom. Phase 4 will add new keys when the
 # user enters Partnership / Kyleigh balances. Until then those are empty.
 UI_TO_PORTFOLIO_ACCOUNTS = {
-    "mine": ["brad"],
-    "mom":  ["mom"],
-    # "partner": [...],   # added in phase 4
-    # "kyleigh": [...],   # added in phase 4
+    "mine":    ["brad"],
+    "mom":     ["mom"],
+    "partner": ["partner"],   # Phase 4 — Day Trades
+    # kyleigh, clay are notional-only, no positions to snapshot
 }
 
 # All underlying accounts we know about. Phase 2 snapshots whatever is here.
@@ -126,7 +126,31 @@ def gather_snapshot() -> Dict:
         except Exception as e:
             log.warning(f"snapshot[{acc}] cash failed: {e}")
 
+        # Phase 4 additions — read directly from store (these keys aren't
+        # exposed via portfolio.py's API yet)
+        try:
+            from . import writes
+            acct_data["cash_ledger"] = writes.get_cash_ledger(acc) or []
+        except Exception as e:
+            log.warning(f"snapshot[{acc}] cash_ledger failed: {e}")
+        try:
+            from . import writes
+            acct_data["lumpsum"] = writes.get_lumpsum(acc) or []
+        except Exception as e:
+            log.warning(f"snapshot[{acc}] lumpsum failed: {e}")
+
         snapshot["accounts"][acc] = acct_data
+
+    # Phase 4 — also snapshot transfer ledgers (recipient-keyed, not account-keyed)
+    try:
+        from . import writes
+        snapshot["transfers"] = {
+            "kyleigh": writes.get_transfer_ledger("kyleigh"),
+            "clay":    writes.get_transfer_ledger("clay"),
+        }
+    except Exception as e:
+        log.warning(f"snapshot transfers failed: {e}")
+        snapshot["transfers"] = {"kyleigh": [], "clay": []}
 
     return snapshot
 
@@ -411,10 +435,29 @@ def restore_from_snapshot(date_iso: str) -> Dict:
             # Cash (dict)
             pf._store_set(pf._key_cash(account), json.dumps(data.get("cash") or {}))
 
+            # Phase 4 ledgers — store via writes module key helpers
+            try:
+                from . import writes
+                pf._store_set(writes._key_cash_ledger(account), json.dumps(data.get("cash_ledger") or []))
+                pf._store_set(writes._key_lumpsum(account), json.dumps(data.get("lumpsum") or []))
+            except Exception as e:
+                log.warning(f"Phase 4 ledger restore for {account}: {e}")
+
             restored[account] = summarize_account(data)
         except Exception as e:
             log.exception(f"Restore failed for account {account}: {e}")
             restored[account] = {"error": str(e)}
+
+    # Phase 4 — restore transfer ledgers (recipient-keyed)
+    try:
+        from . import writes
+        transfers = snapshot.get("transfers") or {}
+        if transfers.get("kyleigh") is not None:
+            pf._store_set(writes._key_transfers("kyleigh"), json.dumps(transfers.get("kyleigh") or []))
+        if transfers.get("clay") is not None:
+            pf._store_set(writes._key_transfers("clay"), json.dumps(transfers.get("clay") or []))
+    except Exception as e:
+        log.warning(f"Restore transfers failed: {e}")
 
     # Audit-log the restore itself
     audit_write(

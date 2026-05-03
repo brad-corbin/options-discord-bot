@@ -2096,3 +2096,183 @@ body[data-account="clay"] {
 .acct-pill.pill-theme-combined .acct-pill-dot,
 .acct-pill .dot-combined { background: #00e89c; }
 
+
+
+/* ════════════════════════════════════════════════════════
+   PHASE 4.5 — CAPITAL PROGRESSION + CASH BREAKDOWN
+   ════════════════════════════════════════════════════════ */
+
+/* "Live" indicator on snapshot meta strip */
+.snapshot-meta-strip.live .snap-label { color: var(--positive); }
+.snapshot-meta-strip.live .snap-label::before {
+  content: "● ";
+  color: var(--positive);
+  animation: pulse 2s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+/* Cash breakdown card — sub-account list */
+.cash-breakdown-card {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  padding: 14px 18px;
+}
+
+.cash-breakdown-title {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px;
+  letter-spacing: 0.22em;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  margin-bottom: 10px;
+}
+
+.cash-breakdown-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.cash-breakdown-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  padding: 5px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+}
+.cash-breakdown-row:last-child { border-bottom: none; }
+
+.cash-breakdown-label {
+  color: var(--text);
+  letter-spacing: 0.04em;
+}
+.cash-breakdown-label .muted {
+  color: var(--text-dim);
+  font-size: 10px;
+}
+
+.cash-breakdown-value {
+  color: var(--text);
+  font-weight: 600;
+}
+
+/* Capital progression bar — has a baseline marker at 50% (deposited line) */
+.goal-progress {
+  position: relative;
+}
+
+.goal-baseline-marker {
+  position: absolute;
+  left: 50%;
+  top: -2px;
+  bottom: -2px;
+  width: 1px;
+  background: var(--text-muted);
+  opacity: 0.6;
+}
+.goal-baseline-marker::before {
+  content: "deposited";
+  position: absolute;
+  left: 4px;
+  top: -14px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 8px;
+  color: var(--text-muted);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+
+
+/* ════════════════════════════════════════════════════════
+   PHASE 4.5 — CLOSED HISTORY TOGGLE & FILTER
+   ════════════════════════════════════════════════════════ */
+
+.history-toggle-wrap {
+  margin-top: 28px;
+}
+
+.history-toggle-header {
+  padding: 10px 0 14px;
+  border-top: 1px dashed var(--border);
+}
+
+.history-toggle-link {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  text-decoration: none;
+  padding: 6px 12px;
+  border: 1px solid transparent;
+  transition: color 0.15s, border-color 0.15s;
+  display: inline-block;
+}
+.history-toggle-link:hover {
+  color: var(--accent);
+  border-color: var(--border);
+}
+.history-toggle-link.active {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--accent-glow);
+}
+
+.history-filter-bar {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  padding: 12px 16px;
+  margin-bottom: 0;
+}
+
+.history-filter-form {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.history-filter-form label {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px;
+  letter-spacing: 0.18em;
+  color: var(--text-muted);
+  text-transform: uppercase;
+}
+
+.history-filter-form select,
+.history-filter-form input[type="text"] {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 5px 10px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+}
+
+/* Status pills for closed positions */
+.status-pill {
+  display: inline-block;
+  padding: 2px 8px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  border: 1px solid var(--border);
+}
+.status-pill.status-closed   { color: var(--text); border-color: var(--text-muted); }
+.status-pill.status-expired  { color: var(--positive); border-color: var(--positive); }
+.status-pill.status-assigned { color: var(--neutral); border-color: var(--neutral); }
+.status-pill.status-rolled   { color: var(--accent); border-color: var(--accent); }
+
+/* Amount pos/neg colors for P&L cells */
+.amount-positive { color: var(--positive) !important; }
+.amount-negative { color: var(--negative) !important; }
+

@@ -139,6 +139,10 @@ def _key_lumpsum(account: str) -> str:
     """Phase 4 — ETF lump-sum tracking (separate from share holdings)."""
     return f"{account}:portfolio:lumpsum"
 
+def _key_sold_lots(account: str) -> str:
+    """Phase 4.5 — historical record of share sells with realized P&L."""
+    return f"{account}:portfolio:sold_lots"
+
 def _key_transfers(recipient: str) -> str:
     """Phase 4 — Kyleigh + Clay notional balance ledgers."""
     return f"transfers:{recipient}:ledger"
@@ -542,6 +546,24 @@ def sell_holding(account: str, ticker: str, shares: float,
         ref_id=t,
     )
 
+    # Phase 4.5 — record the sold lot for history view
+    cost_basis = float(old.get("cost_basis") or 0)
+    realized_pnl = round((sp - cost_basis) * sh, 2)
+    sold_lots = get_sold_lots(account)
+    sold_lots.append({
+        "id": _gen_id("sl"),
+        "ticker": t,
+        "shares": sh,
+        "sell_price": sp,
+        "cost_basis_at_sale": cost_basis,
+        "realized_pnl": realized_pnl,
+        "date": date_iso,
+        "subaccount": sub,
+        "note": note or "",
+        "logged_at": _now_iso(),
+    })
+    _save(_key_sold_lots(account), sold_lots)
+
     _audit(account, "sell_holding", t, old, {"sold_shares": sh, "sell_price": sp, "remaining": result_holding})
     return {"ok": True, "ticker": t, "remaining": result_holding, "proceeds": cash_amount}
 def delete_holding(account: str, ticker: str, also_delete_cash: bool = False) -> Dict:
@@ -654,6 +676,112 @@ def get_lumpsum(account: str) -> List[Dict]:
     if not _validate_account(account):
         return []
     return _load(_key_lumpsum(account), [])
+
+
+def get_sold_lots(account: str) -> List[Dict]:
+    """Historical record of share sells (closed share lots)."""
+    if not _validate_account(account):
+        return []
+    return _load(_key_sold_lots(account), [])
+
+
+def get_closed_options(account: str, since_date: str = None,
+                        ticker_filter: str = None) -> List[Dict]:
+    """Closed/expired/assigned/rolled options for history view.
+
+    since_date: 'YYYY-MM-DD' — only return options with close_date >= this date
+    ticker_filter: substring (case-insensitive) match on ticker
+    """
+    if not _validate_account(account):
+        return []
+    opts = _load(_key_options(account), [])
+    closed_statuses = {"closed", "expired", "assigned", "rolled"}
+    out = []
+    for o in opts:
+        if not isinstance(o, dict) or o.get("status") not in closed_statuses:
+            continue
+        if since_date:
+            cd = o.get("close_date") or o.get("exp") or ""
+            if cd < since_date:
+                continue
+        if ticker_filter:
+            t = (o.get("ticker") or "").upper()
+            if ticker_filter.upper() not in t:
+                continue
+        # Compute realized P&L
+        try:
+            premium = float(o.get("premium") or 0)
+            close_premium = float(o.get("close_premium") or 0)
+            contracts = int(o.get("contracts") or 1)
+            direction = o.get("direction", "sell")
+            if direction == "sell":
+                pnl = round((premium - close_premium) * contracts * 100, 2)
+            else:
+                pnl = round((close_premium - premium) * contracts * 100, 2)
+        except Exception:
+            pnl = 0.0
+        out.append({**o, "realized_pnl": pnl})
+    # Newest first
+    out.sort(key=lambda x: x.get("close_date") or x.get("exp") or "", reverse=True)
+    return out
+
+
+def get_closed_spreads(account: str, since_date: str = None,
+                        ticker_filter: str = None) -> List[Dict]:
+    """Closed/expired spreads for history view."""
+    if not _validate_account(account):
+        return []
+    spreads = _load(_key_spreads(account), [])
+    closed_statuses = {"closed", "expired"}
+    out = []
+    for s in spreads:
+        if not isinstance(s, dict) or s.get("status") not in closed_statuses:
+            continue
+        if since_date:
+            cd = s.get("close_date") or s.get("exp") or ""
+            if cd < since_date:
+                continue
+        if ticker_filter:
+            t = (s.get("ticker") or "").upper()
+            if ticker_filter.upper() not in t:
+                continue
+        # Compute realized P&L
+        try:
+            contracts = int(s.get("contracts") or 1)
+            net_open = float(s.get("credit") or 0) - float(s.get("debit") or 0)
+            close_value = float(s.get("close_value") or 0)
+            # If opened as credit: pnl = (open_credit - close_value) * contracts * 100
+            # If opened as debit:  pnl = (close_value - open_debit) * contracts * 100
+            if s.get("credit"):
+                pnl = round((float(s.get("credit")) - close_value) * contracts * 100, 2)
+            else:
+                pnl = round((close_value - float(s.get("debit") or 0)) * contracts * 100, 2)
+        except Exception:
+            pnl = 0.0
+        out.append({**s, "realized_pnl": pnl})
+    out.sort(key=lambda x: x.get("close_date") or x.get("exp") or "", reverse=True)
+    return out
+
+
+def get_sold_lots_filtered(account: str, since_date: str = None,
+                             ticker_filter: str = None) -> List[Dict]:
+    """Sold lots history, filtered by date range and ticker."""
+    lots = get_sold_lots(account)
+    out = []
+    for l in lots:
+        if not isinstance(l, dict):
+            continue
+        if since_date:
+            d = l.get("date") or ""
+            if d < since_date:
+                continue
+        if ticker_filter:
+            t = (l.get("ticker") or "").upper()
+            if ticker_filter.upper() not in t:
+                continue
+        out.append(l)
+    out.sort(key=lambda x: x.get("date") or "", reverse=True)
+    return out
 
 
 def add_lumpsum(account: str, label: str, value: float,
@@ -909,6 +1037,76 @@ def close_option(account: str, opt_id: str, status: str,
 
     _audit(account, f"option_{status}", opt_id, old, target)
     return {"ok": True, "option": target}
+
+
+def edit_spread(account: str, spread_id: str, **fields) -> Dict:
+    """Edit fields on an existing spread (correction, not state change).
+
+    Editable: long_strike, short_strike, exp, net (price), is_credit,
+    contracts, subaccount, open_date, note.
+
+    Note: changing is_credit between credit/debit will recompute the
+    credit/debit fields but does NOT auto-adjust linked cash events.
+    Use undo on Settings if you need to fully redo.
+    """
+    if not _validate_account(account):
+        return {"ok": False, "error": "Invalid account"}
+    spreads = get_spreads(account)
+    target = next((s for s in spreads if isinstance(s, dict) and s.get("id") == spread_id), None)
+    if not target:
+        return {"ok": False, "error": "Spread not found"}
+    old = dict(target)
+
+    editable = {"long_strike", "short_strike", "exp", "net", "is_credit",
+                "contracts", "subaccount", "tag", "open_date", "note"}
+
+    for k, v in fields.items():
+        if k not in editable or v is None or v == "":
+            continue
+        if k in ("long_strike", "short_strike", "net"):
+            f = _to_float(v)
+            if f is None:
+                continue
+            if k == "net":
+                # Update credit/debit based on is_credit value (current or just-edited)
+                is_credit_now = fields.get("is_credit")
+                if is_credit_now is None:
+                    is_credit_now = "true" if target.get("credit") else "false"
+                if str(is_credit_now).lower() == "true":
+                    target["credit"] = round(f, 4)
+                    target["debit"] = None
+                else:
+                    target["debit"] = round(f, 4)
+                    target["credit"] = None
+            else:
+                target[k] = round(f, 4)
+        elif k == "is_credit":
+            # Already handled inside "net" block — but if net not in fields, flip without changing value
+            if "net" not in fields:
+                if str(v).lower() == "true":
+                    if target.get("debit"):
+                        target["credit"] = target["debit"]
+                        target["debit"] = None
+                else:
+                    if target.get("credit"):
+                        target["debit"] = target["credit"]
+                        target["credit"] = None
+        elif k == "contracts":
+            i = _to_int(v)
+            if i is not None and i > 0:
+                target[k] = i
+        elif k in ("exp", "open_date"):
+            d = _validate_date(v)
+            if d:
+                target[k] = d
+        else:
+            target[k] = str(v).strip()
+
+    target["last_updated"] = _now_iso()
+    if not _save(_key_spreads(account), spreads):
+        return {"ok": False, "error": "Save failed"}
+    _audit(account, "edit_spread", spread_id, old, target)
+    return {"ok": True, "spread": target}
 
 
 def edit_option(account: str, opt_id: str, **fields) -> Dict:
@@ -1435,11 +1633,18 @@ def wipe_all(confirmation: str) -> Dict:
 # SUMMARY for Portfolio page (live, reads Redis directly)
 # ═════════════════════════════════════════════════════════
 
-def portfolio_page_data(active_underlying: str = None) -> Dict:
+def portfolio_page_data(active_underlying: str = None,
+                          show_closed: bool = False,
+                          since_date: str = None,
+                          ticker_filter: str = None) -> Dict:
     """Aggregated data for the Portfolio entry page.
 
     Returns live counts and recent entries for each underlying account so
     the entry forms can show what's already there.
+
+    show_closed: if True, also include closed_options/closed_spreads/sold_lots
+    since_date: 'YYYY-MM-DD' to filter closed history (only those closed after)
+    ticker_filter: substring match on ticker for closed history
     """
     # Default to brad if not specified
     if not active_underlying or active_underlying not in ALL_UNDERLYING_ACCOUNTS:
@@ -1457,7 +1662,7 @@ def portfolio_page_data(active_underlying: str = None) -> Dict:
     cash_breakdown = calc_cash_breakdown(acc)
     cash_ledger = get_cash_ledger(acc)
 
-    return {
+    out = {
         "active_underlying": acc,
         "all_accounts": ALL_UNDERLYING_ACCOUNTS,
         "underlying_labels": UNDERLYING_LABELS,
@@ -1481,7 +1686,22 @@ def portfolio_page_data(active_underlying: str = None) -> Dict:
         "clay_balance": calc_transfer_balance("clay"),
         "kyleigh_ledger": get_transfer_ledger("kyleigh")[-50:][::-1],
         "clay_ledger": get_transfer_ledger("clay")[-50:][::-1],
+        "show_closed": show_closed,
+        "since_date_filter": since_date or "",
+        "ticker_filter": ticker_filter or "",
     }
+
+    # Closed history — only fetch when toggle is on (saves a Redis read)
+    if show_closed:
+        out["closed_options"] = get_closed_options(acc, since_date=since_date, ticker_filter=ticker_filter)
+        out["closed_spreads"] = get_closed_spreads(acc, since_date=since_date, ticker_filter=ticker_filter)
+        out["sold_lots"] = get_sold_lots_filtered(acc, since_date=since_date, ticker_filter=ticker_filter)
+    else:
+        out["closed_options"] = []
+        out["closed_spreads"] = []
+        out["sold_lots"] = []
+
+    return out
 
 
 # ═════════════════════════════════════════════════════════
@@ -1503,7 +1723,7 @@ UNDOABLE_OPS = {
     "cash_transfer_out", "cash_roll_credit", "cash_roll_debit",
     # Sells / sub-account changes
     "sell_holding",
-    "edit_holding", "edit_option", "update_lumpsum",
+    "edit_holding", "edit_option", "edit_spread", "update_lumpsum",
     # Transfers
     "transfer_kyleigh", "transfer_clay",
     "roll_option",
@@ -1730,6 +1950,16 @@ def undo_audit_entry(timestamp: str, op: str, account: str, target: str) -> Dict
                     _save(_key_options(account), options)
                     return {"ok": True, "msg": "Reverted: option restored to previous values"}
             return {"ok": False, "error": "Option not found"}
+
+        if op == "edit_spread" and isinstance(old_v, dict):
+            spread_id = target
+            spreads = get_spreads(account)
+            for i, s in enumerate(spreads):
+                if s.get("id") == spread_id:
+                    spreads[i] = old_v
+                    _save(_key_spreads(account), spreads)
+                    return {"ok": True, "msg": "Reverted: spread restored to previous values"}
+            return {"ok": False, "error": "Spread not found"}
 
         if op == "update_lumpsum" and isinstance(old_v, dict):
             entry_id = target

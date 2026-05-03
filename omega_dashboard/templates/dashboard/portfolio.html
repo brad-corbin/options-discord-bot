@@ -360,6 +360,99 @@
   {% endif %}
 </div>
 
+<!-- Sold lots history toggle + table -->
+<div class="history-toggle-wrap">
+  <div class="history-toggle-header">
+    {% if not d.show_closed %}
+    <a class="history-toggle-link"
+       href="{{ url_for('dashboard.portfolio_section', section='holdings') }}?acct={{ acct }}&show_closed=1">
+      ▸ Show sold lots history
+    </a>
+    {% else %}
+    <a class="history-toggle-link active"
+       href="{{ url_for('dashboard.portfolio_section', section='holdings') }}?acct={{ acct }}">
+      ▾ Hide sold lots
+    </a>
+    {% endif %}
+  </div>
+
+  {% if d.show_closed %}
+  <div class="history-filter-bar">
+    <form method="GET" action="{{ url_for('dashboard.portfolio_section', section='holdings') }}" class="history-filter-form">
+      <input type="hidden" name="acct" value="{{ acct }}">
+      <input type="hidden" name="show_closed" value="1">
+
+      <label>Since</label>
+      <select name="since" onchange="this.form.submit()">
+        <option value="" {% if not d.since_date_filter %}selected{% endif %}>Any time</option>
+        <option value="{{ d.today_30 }}" {% if d.since_date_filter == d.today_30 %}selected{% endif %}>Last 30 days</option>
+        <option value="{{ d.today_90 }}" {% if d.since_date_filter == d.today_90 %}selected{% endif %}>Last 90 days</option>
+        <option value="{{ d.year_start }}" {% if d.since_date_filter == d.year_start %}selected{% endif %}>Year-to-date</option>
+      </select>
+
+      <label>Ticker</label>
+      <input type="text" name="ticker" value="{{ d.ticker_filter }}" placeholder="e.g. AAPL" style="text-transform: uppercase; max-width: 100px;">
+
+      <button type="submit" class="btn-primary-sm">Filter</button>
+      {% if d.since_date_filter or d.ticker_filter %}
+      <a href="{{ url_for('dashboard.portfolio_section', section='holdings') }}?acct={{ acct }}&show_closed=1" class="btn-mini-link">Clear</a>
+      {% endif %}
+    </form>
+  </div>
+
+  <div class="data-panel">
+    <div class="data-panel-header">
+      <div class="data-panel-title">Sold Lots · {{ acct_label }}</div>
+      <div class="data-panel-meta">
+        {{ d.sold_lots|length }} lots
+        {% set lot_pnl = namespace(v=0) %}
+        {% for l in d.sold_lots %}{% set lot_pnl.v = lot_pnl.v + l.realized_pnl %}{% endfor %}
+        {% if d.sold_lots %}
+        · Realized P&L: <span class="{% if lot_pnl.v >= 0 %}amount-positive{% else %}amount-negative{% endif %}">${{ "{:,.2f}".format(lot_pnl.v) }}</span>
+        {% endif %}
+      </div>
+    </div>
+
+    {% if d.sold_lots %}
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Date</th>
+          <th>Ticker</th>
+          <th class="numeric">Shares</th>
+          <th class="numeric">Cost basis</th>
+          <th class="numeric">Sold @</th>
+          <th class="numeric">Proceeds</th>
+          <th class="numeric">P&L</th>
+          <th>Sub-account</th>
+          <th>Note</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for l in d.sold_lots %}
+        <tr>
+          <td class="mono">{{ l.date }}</td>
+          <td class="mono ticker-cell"><strong>{{ l.ticker }}</strong></td>
+          <td class="numeric mono">{{ l.shares }}</td>
+          <td class="numeric mono">${{ "%.2f"|format(l.cost_basis_at_sale or 0) }}</td>
+          <td class="numeric mono">${{ "%.2f"|format(l.sell_price or 0) }}</td>
+          <td class="numeric mono">${{ "{:,.2f}".format(l.shares * l.sell_price) }}</td>
+          <td class="numeric mono {% if l.realized_pnl >= 0 %}amount-positive{% else %}amount-negative{% endif %}">
+            {% if l.realized_pnl >= 0 %}+{% endif %}${{ "{:,.2f}".format(l.realized_pnl) }}
+          </td>
+          <td class="muted">{{ l.subaccount or "—" }}</td>
+          <td class="muted">{{ l.note or "—" }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <div class="data-empty">No sold lots match your filters.</div>
+    {% endif %}
+  </div>
+  {% endif %}
+</div>
+
 <!-- ═══════════════════════════════════════════════════════
      SECTION: OPTIONS
      ═══════════════════════════════════════════════════════ -->
@@ -519,6 +612,8 @@
             <input type="number" name="premium" step="0.01" value="{{ o.premium }}">
             <label>×</label>
             <input type="number" name="contracts" min="1" value="{{ o.contracts }}">
+            <label>Open date</label>
+            <input type="date" name="open_date" value="{{ o.open_date or '' }}">
             <label>Sub-acct</label>
             <select name="subaccount">
               {% for s in d.subaccounts %}
@@ -538,6 +633,105 @@
   {% endif %}
 </div>
 
+<!-- Closed options history toggle + table -->
+<div class="history-toggle-wrap">
+  <div class="history-toggle-header">
+    {% if not d.show_closed %}
+    <a class="history-toggle-link"
+       href="{{ url_for('dashboard.portfolio_section', section='options') }}?acct={{ acct }}&show_closed=1">
+      ▸ Show closed/expired/assigned options
+    </a>
+    {% else %}
+    <a class="history-toggle-link active"
+       href="{{ url_for('dashboard.portfolio_section', section='options') }}?acct={{ acct }}">
+      ▾ Hide closed history
+    </a>
+    {% endif %}
+  </div>
+
+  {% if d.show_closed %}
+  <div class="history-filter-bar">
+    <form method="GET" action="{{ url_for('dashboard.portfolio_section', section='options') }}" class="history-filter-form">
+      <input type="hidden" name="acct" value="{{ acct }}">
+      <input type="hidden" name="show_closed" value="1">
+
+      <label>Since</label>
+      <select name="since" onchange="this.form.submit()">
+        <option value="" {% if not d.since_date_filter %}selected{% endif %}>Any time</option>
+        <option value="{{ d.today_30 }}" {% if d.since_date_filter == d.today_30 %}selected{% endif %}>Last 30 days</option>
+        <option value="{{ d.today_90 }}" {% if d.since_date_filter == d.today_90 %}selected{% endif %}>Last 90 days</option>
+        <option value="{{ d.year_start }}" {% if d.since_date_filter == d.year_start %}selected{% endif %}>Year-to-date</option>
+      </select>
+
+      <label>Ticker</label>
+      <input type="text" name="ticker" value="{{ d.ticker_filter }}" placeholder="e.g. NVDA" style="text-transform: uppercase; max-width: 100px;">
+
+      <button type="submit" class="btn-primary-sm">Filter</button>
+      {% if d.since_date_filter or d.ticker_filter %}
+      <a href="{{ url_for('dashboard.portfolio_section', section='options') }}?acct={{ acct }}&show_closed=1" class="btn-mini-link">Clear</a>
+      {% endif %}
+    </form>
+  </div>
+
+  <div class="data-panel">
+    <div class="data-panel-header">
+      <div class="data-panel-title">Closed Options · {{ acct_label }}</div>
+      <div class="data-panel-meta">
+        {{ d.closed_options|length }} entries
+        {% set total_pnl = namespace(v=0) %}
+        {% for o in d.closed_options %}{% set total_pnl.v = total_pnl.v + o.realized_pnl %}{% endfor %}
+        {% if d.closed_options %}
+        · Total P&L: <span class="{% if total_pnl.v >= 0 %}amount-positive{% else %}amount-negative{% endif %}">${{ "{:,.2f}".format(total_pnl.v) }}</span>
+        {% endif %}
+      </div>
+    </div>
+
+    {% if d.closed_options %}
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Ticker</th>
+          <th>Type</th>
+          <th class="numeric">Strike</th>
+          <th>Exp</th>
+          <th>Opened</th>
+          <th>Closed</th>
+          <th>Status</th>
+          <th class="numeric">Open $</th>
+          <th class="numeric">Close $</th>
+          <th class="numeric">×</th>
+          <th class="numeric">P&L</th>
+          <th>Sub-account</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for o in d.closed_options %}
+        <tr>
+          <td class="mono ticker-cell"><strong>{{ o.ticker }}</strong></td>
+          <td><span class="type-pill type-{{ o.type|lower }}">{{ o.type }}</span></td>
+          <td class="numeric mono">${{ o.strike }}</td>
+          <td class="mono muted">{{ o.exp }}</td>
+          <td class="mono muted">{{ o.open_date or "—" }}</td>
+          <td class="mono">{{ o.close_date or o.exp or "—" }}</td>
+          <td><span class="status-pill status-{{ o.status }}">{{ o.status }}</span></td>
+          <td class="numeric mono">${{ "%.2f"|format(o.premium or 0) }}</td>
+          <td class="numeric mono">${{ "%.2f"|format(o.close_premium or 0) }}</td>
+          <td class="numeric mono">{{ o.contracts }}</td>
+          <td class="numeric mono {% if o.realized_pnl >= 0 %}amount-positive{% else %}amount-negative{% endif %}">
+            {% if o.realized_pnl >= 0 %}+{% endif %}${{ "{:,.2f}".format(o.realized_pnl) }}
+          </td>
+          <td class="muted">{{ o.subaccount or "—" }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <div class="data-empty">No closed options match your filters.</div>
+    {% endif %}
+  </div>
+  {% endif %}
+</div>
+
 <!-- ═══════════════════════════════════════════════════════
      SECTION: SPREADS
      ═══════════════════════════════════════════════════════ -->
@@ -552,13 +746,13 @@
     <div class="form-row">
       <div class="form-field">
         <label>Spread type</label>
-        <select name="spread_type" required>
+        <select name="spread_type" id="spread-type-select" required onchange="syncSpreadCreditDebit()">
           <option value="BULL_PUT">Bull Put (credit)</option>
           <option value="BEAR_CALL">Bear Call (credit)</option>
           <option value="BULL_CALL">Bull Call (debit)</option>
           <option value="BEAR_PUT">Bear Put (debit)</option>
-          <option value="IRON_CONDOR">Iron Condor</option>
-          <option value="INVERSE_CONDOR">Inverse Condor</option>
+          <option value="IRON_CONDOR">Iron Condor (credit)</option>
+          <option value="INVERSE_CONDOR">Inverse Condor (debit)</option>
         </select>
       </div>
       <div class="form-field">
@@ -585,7 +779,7 @@
       </div>
       <div class="form-field">
         <label>Credit / Debit</label>
-        <select name="is_credit">
+        <select name="is_credit" id="spread-credit-select">
           <option value="true">Credit (received)</option>
           <option value="false">Debit (paid)</option>
         </select>
@@ -654,6 +848,7 @@
         <td class="muted">{{ s.subaccount or "—" }}</td>
         <td class="row-actions">
           <button class="btn-mini" onclick="document.getElementById('close-spr-{{ s.id }}').classList.toggle('open')">Close</button>
+          <button class="btn-mini" onclick="document.getElementById('edit-spr-{{ s.id }}').classList.toggle('open')">Edit</button>
           <button class="btn-mini btn-mini-danger"
                   onclick="confirmDeleteSpread('{{ s.id }}', '{{ s.ticker }}', '{{ s.type }}', '{{ acct }}')">Delete</button>
         </td>
@@ -676,11 +871,145 @@
           </form>
         </td>
       </tr>
+      <tr id="edit-spr-{{ s.id }}" class="inline-form-row">
+        <td colspan="9">
+          <form method="POST" action="{{ url_for('dashboard.portfolio_spread_edit', spread_id=s.id) }}" class="inline-form">
+            <input type="hidden" name="acct" value="{{ acct }}">
+            <span class="inline-label">EDIT {{ s.ticker }} {{ s.type }}</span>
+            <label>Long</label>
+            <input type="number" name="long_strike" step="0.5" value="{{ s.long_strike }}">
+            <label>Short</label>
+            <input type="number" name="short_strike" step="0.5" value="{{ s.short_strike }}">
+            <label>Exp</label>
+            <input type="date" name="exp" value="{{ s.exp }}">
+            <label>Net $</label>
+            <input type="number" name="net" step="0.01" value="{% if s.credit %}{{ s.credit }}{% else %}{{ s.debit }}{% endif %}">
+            <label>Cr/Dr</label>
+            <select name="is_credit">
+              <option value="true" {% if s.credit %}selected{% endif %}>Credit</option>
+              <option value="false" {% if s.debit %}selected{% endif %}>Debit</option>
+            </select>
+            <label>×</label>
+            <input type="number" name="contracts" min="1" value="{{ s.contracts }}">
+            <label>Open date</label>
+            <input type="date" name="open_date" value="{{ s.open_date or '' }}">
+            <label>Sub-acct</label>
+            <select name="subaccount">
+              {% for sub in d.subaccounts %}
+                <option value="{{ sub }}" {% if sub == s.subaccount %}selected{% endif %}>{{ sub }}</option>
+              {% endfor %}
+            </select>
+            <button type="submit" class="btn-primary-sm">Save</button>
+            <span class="inline-meta">Note: edits don't auto-adjust cash. Use Settings → Recent Activity → Undo to fully revert.</span>
+          </form>
+        </td>
+      </tr>
       {% endfor %}
     </tbody>
   </table>
   {% else %}
   <div class="data-empty">No open spreads for {{ acct_label }}.</div>
+  {% endif %}
+</div>
+
+<!-- Closed spreads history toggle + table -->
+<div class="history-toggle-wrap">
+  <div class="history-toggle-header">
+    {% if not d.show_closed %}
+    <a class="history-toggle-link"
+       href="{{ url_for('dashboard.portfolio_section', section='spreads') }}?acct={{ acct }}&show_closed=1">
+      ▸ Show closed/expired spreads
+    </a>
+    {% else %}
+    <a class="history-toggle-link active"
+       href="{{ url_for('dashboard.portfolio_section', section='spreads') }}?acct={{ acct }}">
+      ▾ Hide closed history
+    </a>
+    {% endif %}
+  </div>
+
+  {% if d.show_closed %}
+  <div class="history-filter-bar">
+    <form method="GET" action="{{ url_for('dashboard.portfolio_section', section='spreads') }}" class="history-filter-form">
+      <input type="hidden" name="acct" value="{{ acct }}">
+      <input type="hidden" name="show_closed" value="1">
+
+      <label>Since</label>
+      <select name="since" onchange="this.form.submit()">
+        <option value="" {% if not d.since_date_filter %}selected{% endif %}>Any time</option>
+        <option value="{{ d.today_30 }}" {% if d.since_date_filter == d.today_30 %}selected{% endif %}>Last 30 days</option>
+        <option value="{{ d.today_90 }}" {% if d.since_date_filter == d.today_90 %}selected{% endif %}>Last 90 days</option>
+        <option value="{{ d.year_start }}" {% if d.since_date_filter == d.year_start %}selected{% endif %}>Year-to-date</option>
+      </select>
+
+      <label>Ticker</label>
+      <input type="text" name="ticker" value="{{ d.ticker_filter }}" placeholder="e.g. SPY" style="text-transform: uppercase; max-width: 100px;">
+
+      <button type="submit" class="btn-primary-sm">Filter</button>
+      {% if d.since_date_filter or d.ticker_filter %}
+      <a href="{{ url_for('dashboard.portfolio_section', section='spreads') }}?acct={{ acct }}&show_closed=1" class="btn-mini-link">Clear</a>
+      {% endif %}
+    </form>
+  </div>
+
+  <div class="data-panel">
+    <div class="data-panel-header">
+      <div class="data-panel-title">Closed Spreads · {{ acct_label }}</div>
+      <div class="data-panel-meta">
+        {{ d.closed_spreads|length }} entries
+        {% set spread_pnl = namespace(v=0) %}
+        {% for s in d.closed_spreads %}{% set spread_pnl.v = spread_pnl.v + s.realized_pnl %}{% endfor %}
+        {% if d.closed_spreads %}
+        · Total P&L: <span class="{% if spread_pnl.v >= 0 %}amount-positive{% else %}amount-negative{% endif %}">${{ "{:,.2f}".format(spread_pnl.v) }}</span>
+        {% endif %}
+      </div>
+    </div>
+
+    {% if d.closed_spreads %}
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Ticker</th>
+          <th>Type</th>
+          <th class="numeric">Long</th>
+          <th class="numeric">Short</th>
+          <th>Exp</th>
+          <th>Opened</th>
+          <th>Closed</th>
+          <th>Status</th>
+          <th class="numeric">Open $</th>
+          <th class="numeric">Close $</th>
+          <th class="numeric">×</th>
+          <th class="numeric">P&L</th>
+          <th>Sub-account</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for s in d.closed_spreads %}
+        <tr>
+          <td class="mono ticker-cell"><strong>{{ s.ticker }}</strong></td>
+          <td><span class="type-pill spread">{{ s.type }}</span></td>
+          <td class="numeric mono">{{ s.long_strike }}</td>
+          <td class="numeric mono">{{ s.short_strike }}</td>
+          <td class="mono muted">{{ s.exp }}</td>
+          <td class="mono muted">{{ s.open_date or "—" }}</td>
+          <td class="mono">{{ s.close_date or s.exp or "—" }}</td>
+          <td><span class="status-pill status-{{ s.status }}">{{ s.status }}</span></td>
+          <td class="numeric mono">{% if s.credit %}${{ "%.2f"|format(s.credit) }} cr{% else %}${{ "%.2f"|format(s.debit or 0) }} dr{% endif %}</td>
+          <td class="numeric mono">${{ "%.2f"|format(s.close_value or 0) }}</td>
+          <td class="numeric mono">{{ s.contracts }}</td>
+          <td class="numeric mono {% if s.realized_pnl >= 0 %}amount-positive{% else %}amount-negative{% endif %}">
+            {% if s.realized_pnl >= 0 %}+{% endif %}${{ "{:,.2f}".format(s.realized_pnl) }}
+          </td>
+          <td class="muted">{{ s.subaccount or "—" }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <div class="data-empty">No closed spreads match your filters.</div>
+    {% endif %}
+  </div>
   {% endif %}
 </div>
 
@@ -1106,6 +1435,129 @@ function confirmDeleteHolding(ticker, shares, costBasis, account) {
     itemId: ticker,
   });
 }
+
+// Sync the Credit/Debit dropdown when spread type changes
+const SPREAD_DEFAULTS = {
+  BULL_PUT:       'true',   // credit
+  BEAR_CALL:      'true',   // credit
+  BULL_CALL:      'false',  // debit
+  BEAR_PUT:       'false',  // debit
+  IRON_CONDOR:    'true',   // credit
+  INVERSE_CONDOR: 'false',  // debit
+};
+function syncSpreadCreditDebit() {
+  const typeSelect = document.getElementById('spread-type-select');
+  const creditSelect = document.getElementById('spread-credit-select');
+  if (!typeSelect || !creditSelect) return;
+  const want = SPREAD_DEFAULTS[typeSelect.value];
+  if (want) creditSelect.value = want;
+}
+// Run on initial load too — fixes the default Credit when "Bull Call" is the
+// initially-shown option but credit/debit is "Credit"
+document.addEventListener('DOMContentLoaded', syncSpreadCreditDebit);
+
+// ─────────────────────────────────────────────────────────
+// Form data carry-over across pill switches and sub-tab nav
+//
+// When user has typed entries in a form and clicks a different account pill
+// or sub-tab, we capture all form data into sessionStorage, let the
+// navigation happen, then re-fill the form on the destination page.
+// This means typed work is never lost — just retargeted to the new pill.
+// ─────────────────────────────────────────────────────────
+const FORM_CARRY_KEY = 'omega_form_carry';
+
+function captureFormState() {
+  const state = {};
+  const forms = document.querySelectorAll('.entry-form-wrap form');
+  forms.forEach((form, formIdx) => {
+    const formData = {};
+    let hasData = false;
+    for (const el of form.elements) {
+      if (!el.name || el.type === 'hidden' || el.type === 'submit' || el.type === 'button') continue;
+      // Only capture if user has actually typed/changed
+      if (el.tagName === 'SELECT') {
+        let originallySelected = '';
+        for (const opt of el.options) {
+          if (opt.defaultSelected) { originallySelected = opt.value; break; }
+        }
+        if (el.value !== originallySelected) {
+          formData[el.name] = el.value;
+          hasData = true;
+        }
+      } else if (el.type === 'checkbox' || el.type === 'radio') {
+        if (el.checked !== el.defaultChecked) {
+          formData[el.name] = el.checked;
+          hasData = true;
+        }
+      } else {
+        if ((el.value || '') !== (el.defaultValue || '')) {
+          formData[el.name] = el.value;
+          hasData = true;
+        }
+      }
+    }
+    if (hasData) {
+      // Use form's action URL path as the key — same form on different
+      // pill will have a different acct in URL but same path-prefix.
+      const formKey = form.getAttribute('action') || `form_${formIdx}`;
+      // Strip query string and account-specific parts from key for matching
+      // across pills. Use just the section signature (e.g. /portfolio/cash/add).
+      state[formKey] = formData;
+    }
+  });
+  return state;
+}
+
+function restoreFormState() {
+  let raw;
+  try {
+    raw = sessionStorage.getItem(FORM_CARRY_KEY);
+  } catch (e) { return; }
+  if (!raw) return;
+  let state;
+  try { state = JSON.parse(raw); } catch (e) { return; }
+
+  const forms = document.querySelectorAll('.entry-form-wrap form');
+  forms.forEach(form => {
+    const formKey = form.getAttribute('action') || '';
+    const data = state[formKey];
+    if (!data) return;
+    for (const el of form.elements) {
+      if (!el.name || !(el.name in data)) continue;
+      if (el.type === 'checkbox' || el.type === 'radio') {
+        el.checked = !!data[el.name];
+      } else {
+        el.value = data[el.name];
+      }
+      // Trigger change event so dependent fields (like spread credit/debit) sync
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+  });
+
+  // Clear the carry so it doesn't re-fill on subsequent loads
+  try { sessionStorage.removeItem(FORM_CARRY_KEY); } catch (e) {}
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+  // Restore any carried-over form state from a previous pill switch
+  restoreFormState();
+
+  // Intercept clicks on account pills + sub-nav tabs to capture state first
+  const watchedLinks = document.querySelectorAll('.acct-pill, .subnav-tab');
+  watchedLinks.forEach(link => {
+    link.addEventListener('click', function(e) {
+      const state = captureFormState();
+      if (Object.keys(state).length > 0) {
+        try {
+          sessionStorage.setItem(FORM_CARRY_KEY, JSON.stringify(state));
+        } catch (err) {
+          // sessionStorage might be unavailable in private mode — just let navigation happen
+        }
+      }
+      // Allow navigation — do NOT preventDefault. Data will rehydrate on the new page.
+    });
+  });
+});
 </script>
 
 {% endblock %}

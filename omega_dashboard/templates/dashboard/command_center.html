@@ -39,7 +39,7 @@
   </div>
 
 {% elif not d.snapshot_available %}
-  <!-- No snapshot has been captured yet -->
+  <!-- No data yet — point user to portfolio entry forms -->
   <div class="phase1-stub fade-in">
     <svg class="phase1-watermark" viewBox="0 0 100 100" fill="none">
       <path d="M50 8 L82 22 L82 56 L70 76 L60 88 L40 88 L30 76 L18 56 L18 22 Z"
@@ -47,23 +47,23 @@
       <text x="50" y="62" text-anchor="middle" font-family="Russo One, sans-serif"
             font-size="38" font-weight="700" fill="currentColor">Ω</text>
     </svg>
-    <div class="phase1-title">No snapshot yet</div>
+    <div class="phase1-title">No data yet for {{ active_account.label }}</div>
     <div class="phase1-msg">
-      The Command Center reads from the most recent portfolio snapshot.
-      Visit the <strong>Durability</strong> tab and click "Snapshot Now" to
-      capture the current state, then come back here.
+      Head to the <strong><a href="{{ url_for('dashboard.portfolio') }}">Portfolio</a></strong> tab
+      to enter cash deposits, holdings, and options. As soon as you submit
+      anything, it'll show up here in real time.
     </div>
   </div>
 
 {% else %}
 
-<!-- ─── SNAPSHOT META ─────────────────────────────────────── -->
-<div class="snapshot-meta-strip fade-in">
-  <span class="snap-label">Snapshot</span>
-  <span class="snap-value">{{ d.snapshot_meta.tab }}</span>
+<!-- ─── LIVE DATA META STRIP ─────────────────────────────── -->
+<div class="snapshot-meta-strip live fade-in">
+  <span class="snap-label">Live</span>
+  <span class="snap-value">Real-time from your portfolio</span>
   <span class="snap-sep">·</span>
-  <span class="snap-meta">Captured {{ d.snapshot_meta.captured_at[:19].replace('T', ' ') }} UTC</span>
-  <span class="snap-meta-right">Refreshed daily at 06:00 UTC · <a href="{{ url_for('dashboard.restore') }}" class="snap-link">Manage</a></span>
+  <span class="snap-meta">Last snapshot: {% if d.snapshot_meta and d.snapshot_meta.tab %}{{ d.snapshot_meta.tab }} ({{ d.snapshot_meta.captured_at[:10] if d.snapshot_meta.captured_at else "—" }}){% else %}none yet{% endif %}</span>
+  <span class="snap-meta-right">Snapshot daily at 06:00 UTC · <a href="{{ url_for('dashboard.restore') }}" class="snap-link">Manage</a></span>
 </div>
 
 <!-- ─── INCOME HERO ───────────────────────────────────────── -->
@@ -120,20 +120,69 @@
 
     <!-- Cash side -->
     <div class="cc-cash-box">
-      <div class="section-eyebrow">Cash · Tracked</div>
-      <div class="metric-card">
-        <div class="metric-label">Total Cash</div>
-        <div class="metric-value">${{ "{:,.0f}".format(d.cash.total) }}</div>
+      <div class="section-eyebrow">Capital · Tracked</div>
+      <div class="metric-card primary">
+        <div class="metric-label">Total Capital</div>
+        <div class="metric-value accent">${{ "{:,.0f}".format(d.capital.total_capital if d.capital and d.capital.available else d.cash.total) }}</div>
         <div class="metric-meta">
-          {% for acc, bal in d.cash.by_account.items() %}
-            {{ acc }}: ${{ "{:,.0f}".format(bal) }}{% if not loop.last %} · {% endif %}
+          {% if d.capital and d.capital.available %}
+            cash ${{ "{:,.0f}".format(d.capital.components.cash) }}
+            {% if d.capital.components.lumpsum > 0 %}· lump-sum ${{ "{:,.0f}".format(d.capital.components.lumpsum) }}{% endif %}
+            {% if d.capital.components.holdings_at_cost > 0 %}· shares ${{ "{:,.0f}".format(d.capital.components.holdings_at_cost) }}{% endif %}
+          {% else %}
+            CASH-ONLY VIEW
+          {% endif %}
+        </div>
+      </div>
+
+      {% if d.capital and d.capital.available and d.capital.deposited > 0 %}
+      <div class="goal-bar-card">
+        <div class="goal-row">
+          <span class="cc-bar-label">Capital Growth vs Deposited</span>
+          <span class="bar-pct {% if d.capital.growth >= 0 %}amount-positive{% else %}amount-negative{% endif %}">
+            {% if d.capital.growth >= 0 %}+{% endif %}{{ d.capital.growth_pct }}%
+          </span>
+        </div>
+        <div class="goal-progress">
+          {% set growth_width = ((d.capital.total_capital / d.capital.deposited) * 100.0) if d.capital.deposited > 0 else 0 %}
+          {% set bar_width = growth_width if growth_width < 200 else 200 %}
+          <div class="goal-fill" style="width: {{ bar_width / 2 }}%;"></div>
+          <div class="goal-baseline-marker"></div>
+        </div>
+        <div class="goal-meta">
+          <span>${{ "{:,.0f}".format(d.capital.total_capital) }} / ${{ "{:,.0f}".format(d.capital.deposited) }} deposited</span>
+          <span>{% if d.capital.growth >= 0 %}+{% endif %}${{ "{:,.0f}".format(d.capital.growth) }}</span>
+        </div>
+      </div>
+      {% endif %}
+
+      {% if d.cash.by_subaccount %}
+      <div class="cash-breakdown-card">
+        <div class="cash-breakdown-title">Cash by sub-account</div>
+        <div class="cash-breakdown-list">
+          {% for sub, bal in d.cash.by_subaccount.items() %}
+          <div class="cash-breakdown-row">
+            <span class="cash-breakdown-label">{{ sub }}</span>
+            <span class="cash-breakdown-value">${{ "{:,.0f}".format(bal) }}</span>
+          </div>
           {% endfor %}
         </div>
       </div>
-      <div class="cc-note">
-        Capital progression bars require starting balance tracking — coming
-        in Phase 4 alongside cash deposit forms.
+      {% endif %}
+
+      {% if d.cash.lumpsum_items %}
+      <div class="cash-breakdown-card">
+        <div class="cash-breakdown-title">Lump-sum holdings</div>
+        <div class="cash-breakdown-list">
+          {% for ls in d.cash.lumpsum_items %}
+          <div class="cash-breakdown-row">
+            <span class="cash-breakdown-label">{{ ls.label }} <span class="muted">· {{ ls.subaccount }}</span></span>
+            <span class="cash-breakdown-value">${{ "{:,.0f}".format(ls.value) }}</span>
+          </div>
+          {% endfor %}
+        </div>
       </div>
+      {% endif %}
     </div>
 
   </div>

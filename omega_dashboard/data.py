@@ -307,11 +307,247 @@ def get_cash_from_snapshot(snap: Dict, ui_account: str) -> Dict:
 # Aggregator for the Command Center page
 # ─────────────────────────────────────────────────────────
 
+def _option_close_month_live(opt: Dict) -> Optional[str]:
+    """Same as _option_close_month but for live data — accepts open_date too."""
+    if not isinstance(opt, dict):
+        return None
+    status = opt.get("status")
+    if status not in ("closed", "expired", "assigned", "rolled"):
+        return None
+    close_date = opt.get("close_date") or opt.get("exp")
+    if not close_date:
+        return None
+    try:
+        s = str(close_date).split("+")[0].split(".")[0]
+        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+            try:
+                dt = datetime.strptime(s, fmt)
+                return dt.strftime("%Y-%m")
+            except Exception:
+                continue
+    except Exception:
+        return None
+    return None
+
+
+def _option_pnl_live(opt: Dict) -> float:
+    if not isinstance(opt, dict) or opt.get("status") == "open":
+        return 0.0
+    try:
+        premium = float(opt.get("premium") or 0)
+        close_premium = float(opt.get("close_premium") or 0)
+        contracts = int(opt.get("contracts") or 1)
+        direction = opt.get("direction", "sell")
+        if direction == "sell":
+            return round((premium - close_premium) * contracts * 100, 2)
+        return round((close_premium - premium) * contracts * 100, 2)
+    except Exception:
+        return 0.0
+
+
+def calc_income_live(ui_account: str) -> Dict:
+    """Sum realized option income by month from LIVE Redis (not snapshot)."""
+    from . import writes
+
+    accounts = underlying_accounts(ui_account)
+    if not accounts:
+        return {"available": False}
+
+    now = datetime.now(timezone.utc)
+    current_month = now.strftime("%Y-%m")
+    current_year = now.strftime("%Y")
+
+    by_month: Dict[str, float] = {}
+    total_year = 0.0
+    total_month = 0.0
+
+    for acc in accounts:
+        for opt in writes.get_options(acc):
+            month_key = _option_close_month_live(opt)
+            if not month_key:
+                continue
+            pnl = _option_pnl_live(opt)
+            by_month[month_key] = by_month.get(month_key, 0.0) + pnl
+            if month_key.startswith(current_year):
+                total_year += pnl
+            if month_key == current_month:
+                total_month += pnl
+
+    return {
+        "available": True,
+        "month": round(total_month, 2),
+        "year": round(total_year, 2),
+        "by_month": {k: round(v, 2) for k, v in sorted(by_month.items())},
+    }
+
+
+def get_open_positions_live(ui_account: str) -> Dict[str, List[Dict]]:
+    """Open positions from LIVE Redis."""
+    from . import writes
+    accounts = underlying_accounts(ui_account)
+    out = {"wheel_options": [], "shares": [], "spreads": []}
+
+    for acc in accounts:
+        for opt in writes.get_options(acc):
+            if not isinstance(opt, dict) or opt.get("status") != "open":
+                continue
+            out["wheel_options"].append({
+                "ticker": (opt.get("ticker") or "").upper(),
+                "type": (opt.get("type") or "").upper(),
+                "strike": opt.get("strike"),
+                "exp": opt.get("exp"),
+                "premium": opt.get("premium"),
+                "contracts": opt.get("contracts", 1),
+                "direction": opt.get("direction", "sell"),
+                "tag": opt.get("tag"),
+                "subaccount": opt.get("subaccount"),
+                "category": opt.get("category"),
+                "account": acc,
+            })
+
+        holdings = writes.get_holdings(acc)
+        for ticker, h in holdings.items():
+            if not isinstance(h, dict):
+                continue
+            out["shares"].append({
+                "ticker": ticker.upper(),
+                "shares": h.get("shares"),
+                "cost_basis": h.get("cost_basis"),
+                "tag": h.get("tag"),
+                "subaccount": h.get("subaccount"),
+                "account": acc,
+            })
+
+        for spr in writes.get_spreads(acc):
+            if not isinstance(spr, dict) or spr.get("status") != "open":
+                continue
+            out["spreads"].append({
+                "ticker": (spr.get("ticker") or "").upper(),
+                "type": (spr.get("type") or "").upper(),
+                "long": spr.get("long_strike"),
+                "short": spr.get("short_strike"),
+                "exp": spr.get("exp"),
+                "debit": spr.get("debit"),
+                "credit": spr.get("credit"),
+                "contracts": spr.get("contracts", 1),
+                "subaccount": spr.get("subaccount"),
+                "account": acc,
+            })
+
+    return out
+
+
+def get_cash_live(ui_account: str) -> Dict:
+    """Cash totals + per-sub-account breakdown + lump-sum total from LIVE Redis."""
+    from . import writes
+    accounts = underlying_accounts(ui_account)
+    if not accounts:
+        return {"available": False, "total": 0, "by_account": {}, "by_subaccount": {}, "lumpsum_total": 0}
+
+    by_account = {}
+    by_subaccount: Dict[str, float] = {}
+    lumpsum_items = []
+    total = 0.0
+    lumpsum_total = 0.0
+    total_deposited = 0.0
+
+    for acc in accounts:
+        balance = writes.calc_cash_balance(acc)
+        by_account[acc] = balance
+        total += balance
+
+        # Sub-account breakdown — sum cash events by sub-account tag
+        ledger = writes.get_cash_ledger(acc)
+        for entry in ledger:
+            if not isinstance(entry, dict):
+                continue
+            sub = entry.get("subaccount") or "Brokerage"
+            amt = float(entry.get("amount") or 0)
+            by_subaccount[sub] = by_subaccount.get(sub, 0.0) + amt
+            # Track total deposits ever (positive deposit-type events) for capital progression
+            if entry.get("type") == "deposit" and amt > 0:
+                total_deposited += amt
+
+        # Lump-sum holdings
+        for ls in writes.get_lumpsum(acc):
+            if isinstance(ls, dict):
+                v = float(ls.get("value") or 0)
+                lumpsum_total += v
+                lumpsum_items.append({
+                    "label": ls.get("label"),
+                    "value": v,
+                    "subaccount": ls.get("subaccount"),
+                    "as_of": ls.get("as_of"),
+                    "account": acc,
+                })
+
+    return {
+        "available": True,
+        "total": round(total, 2),
+        "by_account": {k: round(v, 2) for k, v in by_account.items()},
+        "by_subaccount": {k: round(v, 2) for k, v in by_subaccount.items()},
+        "lumpsum_total": round(lumpsum_total, 2),
+        "lumpsum_items": lumpsum_items,
+        "total_deposited": round(total_deposited, 2),
+    }
+
+
+def calc_capital_progression(ui_account: str) -> Dict:
+    """Total capital tracked = cash + lump-sums + open option premium value held + open shares at cost.
+    Compared to total_deposited to show growth."""
+    from . import writes
+    accounts = underlying_accounts(ui_account)
+    if not accounts:
+        return {"available": False}
+
+    cash_total = 0.0
+    deposited = 0.0
+    lumpsum_total = 0.0
+    holdings_at_cost = 0.0
+    open_premium_collected = 0.0  # premium currently held against open CSPs/CCs
+
+    for acc in accounts:
+        cash_total += writes.calc_cash_balance(acc)
+        for entry in writes.get_cash_ledger(acc):
+            if isinstance(entry, dict) and entry.get("type") == "deposit" and float(entry.get("amount") or 0) > 0:
+                deposited += float(entry.get("amount") or 0)
+        for ls in writes.get_lumpsum(acc):
+            if isinstance(ls, dict):
+                lumpsum_total += float(ls.get("value") or 0)
+        for ticker, h in writes.get_holdings(acc).items():
+            if isinstance(h, dict):
+                holdings_at_cost += float(h.get("shares") or 0) * float(h.get("cost_basis") or 0)
+        for opt in writes.get_options(acc):
+            if isinstance(opt, dict) and opt.get("status") == "open":
+                if opt.get("direction", "sell") == "sell":
+                    open_premium_collected += float(opt.get("premium") or 0) * int(opt.get("contracts") or 1) * 100
+
+    total_capital = cash_total + lumpsum_total + holdings_at_cost
+    growth = total_capital - deposited
+    growth_pct = (growth / deposited * 100.0) if deposited > 0 else 0.0
+
+    return {
+        "available": True,
+        "total_capital": round(total_capital, 2),
+        "deposited": round(deposited, 2),
+        "growth": round(growth, 2),
+        "growth_pct": round(growth_pct, 1),
+        "components": {
+            "cash": round(cash_total, 2),
+            "lumpsum": round(lumpsum_total, 2),
+            "holdings_at_cost": round(holdings_at_cost, 2),
+            "open_premium": round(open_premium_collected, 2),
+        },
+    }
+
+
 def command_center_data(ui_account: str) -> Dict:
-    """Everything needed to render Command Center for the given UI account."""
+    """Live data for Command Center — reads Redis directly via writes layer.
+
+    Snapshot meta is included for freshness display only — not used for data.
+    """
     pf_available = portfolio_data_available(ui_account)
     snap_meta = get_snapshot_meta()
-    snap = get_latest_snapshot() if pf_available else None
 
     if not pf_available:
         return {
@@ -320,32 +556,35 @@ def command_center_data(ui_account: str) -> Dict:
             "snapshot_meta": snap_meta,
         }
 
-    if not snap:
-        return {
-            "ui_account": ui_account,
-            "portfolio_available": True,
-            "snapshot_available": False,
-            "snapshot_meta": snap_meta,
-        }
-
-    income = calc_income_from_snapshot(snap, ui_account)
+    income = calc_income_live(ui_account)
     goal = calc_goal_pace(income)
-    positions = get_open_positions_from_snapshot(snap, ui_account)
-    cash = get_cash_from_snapshot(snap, ui_account)
+    positions = get_open_positions_live(ui_account)
+    cash = get_cash_live(ui_account)
+    capital = calc_capital_progression(ui_account)
 
     open_total = (
         len(positions["wheel_options"])
         + len(positions["spreads"])
     )
 
+    # Has any data at all?
+    has_any_data = (
+        cash.get("total", 0) != 0
+        or open_total > 0
+        or len(positions["shares"]) > 0
+        or cash.get("lumpsum_total", 0) > 0
+    )
+
     return {
         "ui_account": ui_account,
         "portfolio_available": True,
-        "snapshot_available": True,
+        "snapshot_available": has_any_data,  # name kept for template compat
         "snapshot_meta": snap_meta,
         "income": income,
         "goal": goal,
         "positions": positions,
         "cash": cash,
+        "capital": capital,
         "open_total": open_total,
+        "live_mode": True,  # flag for template if it wants to indicate "live"
     }

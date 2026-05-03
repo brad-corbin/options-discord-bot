@@ -239,8 +239,20 @@ def portfolio_section(section):
     if active_underlying not in writes.ALL_UNDERLYING_ACCOUNTS:
         active_underlying = "brad"
 
-    page_data = writes.portfolio_page_data(active_underlying)
+    page_data = writes.portfolio_page_data(
+        active_underlying,
+        show_closed=(request.args.get("show_closed") == "1"),
+        since_date=(request.args.get("since") or "").strip() or None,
+        ticker_filter=(request.args.get("ticker") or "").strip() or None,
+    )
     page_data["active_section"] = section
+
+    # Date helpers for history filter dropdowns
+    from datetime import datetime, timezone, timedelta
+    now = datetime.now(timezone.utc)
+    page_data["today_30"] = (now - timedelta(days=30)).strftime("%Y-%m-%d")
+    page_data["today_90"] = (now - timedelta(days=90)).strftime("%Y-%m-%d")
+    page_data["year_start"] = f"{now.year}-01-01"
 
     # Settings tab needs audit log for undo UI
     if section == "settings":
@@ -582,6 +594,25 @@ def portfolio_spread_close(spread_id):
         _flash(f"Spread {result['spread']['status']}", "success")
     else:
         _flash(f"Close failed: {result.get('error')}", "error")
+    return _bounce("spreads", acct)
+
+
+@dashboard_bp.route("/portfolio/spreads/edit/<spread_id>", methods=["POST"])
+@login_required
+def portfolio_spread_edit(spread_id):
+    from . import writes
+    acct = request.form.get("acct", "brad")
+    fields = {}
+    for k in ("long_strike", "short_strike", "exp", "net", "is_credit",
+              "contracts", "subaccount", "open_date", "note"):
+        v = request.form.get(k)
+        if v not in (None, ""):
+            fields[k] = v
+    result = writes.edit_spread(acct, spread_id, **fields)
+    if result.get("ok"):
+        _flash("Spread edited", "success")
+    else:
+        _flash(f"Edit failed: {result.get('error')}", "error")
     return _bounce("spreads", acct)
 
 
