@@ -978,8 +978,13 @@ def add_option(account: str, ticker: str, opt_type: str,
 
 def close_option(account: str, opt_id: str, status: str,
                  close_premium: float = None, close_date: str = None,
-                 note: str = None) -> Dict:
+                 note: str = None, contracts_to_close: int = None) -> Dict:
     """Close an open option. status: closed | expired | assigned | rolled.
+
+    contracts_to_close: if provided and < total contracts on the option,
+    performs a PARTIAL close. Splits the position: the closed portion gets
+    a new id with the close fields, and the remaining contracts stay open
+    on the original id.
 
     For 'rolled', use the dedicated roll_option() helper instead — this just
     marks status=rolled if you want to do it manually.
@@ -997,14 +1002,72 @@ def close_option(account: str, opt_id: str, status: str,
     if target.get("status") != "open":
         return {"ok": False, "error": f"Option already {target.get('status')}"}
 
-    old = dict(target)
+    total_contracts = int(target.get("contracts") or 1)
+    n_to_close = _to_int(contracts_to_close)
+    if n_to_close is None or n_to_close <= 0 or n_to_close >= total_contracts:
+        # Full close — use existing all-or-nothing path
+        n_to_close = total_contracts
+        is_partial = False
+    else:
+        is_partial = True
 
+    old = dict(target)
     cp = _to_float(close_premium, default=0.0)
     if cp is None or cp < 0:
         cp = 0.0
-
     close_iso = _validate_date(close_date) or datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
+    if is_partial:
+        # Create a new "closed-portion" option record with n_to_close contracts
+        closed_portion = dict(target)
+        closed_portion["id"] = _gen_id("opt")
+        closed_portion["contracts"] = n_to_close
+        closed_portion["status"] = status
+        closed_portion["close_premium"] = round(cp, 4)
+        closed_portion["close_date"] = close_iso
+        closed_portion["close_note"] = (note or "").strip()
+        closed_portion["closed_at"] = _now_iso()
+        closed_portion["partial_of"] = opt_id  # Reference to original
+        options.append(closed_portion)
+
+        # Reduce original to remaining contracts
+        target["contracts"] = total_contracts - n_to_close
+        target["last_updated"] = _now_iso()
+
+        if not _save(_key_options(account), options):
+            return {"ok": False, "error": "Save failed"}
+
+        # Cash event for the closed portion
+        sub = target.get("subaccount") or DEFAULT_SUBACCOUNT
+        direction = target.get("direction", "sell")
+        if status == "closed" and cp > 0:
+            if direction == "sell":
+                cash_amount = -(cp * n_to_close * 100)
+            else:
+                cash_amount = cp * n_to_close * 100
+            add_cash_event(
+                account, "option_close", cash_amount,
+                subaccount=sub, date=close_iso,
+                note=f"BTC {n_to_close}/{total_contracts} {target.get('type')} {target.get('ticker')} {target.get('strike')} @ {cp}",
+                ref_id=closed_portion["id"],
+            )
+
+        _audit(account, f"partial_close_option", opt_id, old, {
+            "original": old,
+            "remaining_contracts": target["contracts"],
+            "closed_portion_id": closed_portion["id"],
+            "closed_contracts": n_to_close,
+            "status": status,
+            "close_premium": cp,
+        })
+        return {
+            "ok": True,
+            "partial": True,
+            "remaining": target,
+            "closed_portion": closed_portion,
+        }
+
+    # Full close path
     target["status"] = status
     target["close_premium"] = round(cp, 4)
     target["close_date"] = close_iso
@@ -1014,17 +1077,14 @@ def close_option(account: str, opt_id: str, status: str,
     if not _save(_key_options(account), options):
         return {"ok": False, "error": "Save failed"}
 
-    # Cash event for buy-to-close (only if status='closed' with non-zero cp)
     sub = target.get("subaccount") or DEFAULT_SUBACCOUNT
     contracts = int(target.get("contracts") or 1)
     direction = target.get("direction", "sell")
 
     if status == "closed" and cp > 0:
-        # Sold-to-open being closed: buy-to-close debits cash by cp*contracts*100
         if direction == "sell":
             cash_amount = -(cp * contracts * 100)
         else:
-            # Bought-to-open being closed: sell-to-close credits cash
             cash_amount = cp * contracts * 100
         add_cash_event(
             account, "option_close", cash_amount,
@@ -1032,8 +1092,6 @@ def close_option(account: str, opt_id: str, status: str,
             note=f"BTC {target.get('type')} {target.get('ticker')} {target.get('strike')} @ {cp}",
             ref_id=opt_id,
         )
-    # expired/assigned/rolled — no extra cash event for the close itself
-    # (assignment will be handled separately in handle_assignment if user chooses)
 
     _audit(account, f"option_{status}", opt_id, old, target)
     return {"ok": True, "option": target}
@@ -1393,8 +1451,12 @@ def add_spread(account: str, ticker: str, spread_type: str,
 
 def close_spread(account: str, spread_id: str, status: str,
                  close_value: float = None, close_date: str = None,
-                 note: str = None) -> Dict:
-    """Close a spread. status: closed | expired."""
+                 note: str = None, contracts_to_close: int = None) -> Dict:
+    """Close a spread. status: closed | expired.
+
+    contracts_to_close: if provided and < total contracts, performs a
+    PARTIAL close. Splits position into closed-N + open-(M-N).
+    """
     if not _validate_account(account):
         return {"ok": False, "error": "Invalid account"}
     status = (status or "").strip().lower()
@@ -1408,10 +1470,67 @@ def close_spread(account: str, spread_id: str, status: str,
     if target.get("status") != "open":
         return {"ok": False, "error": f"Spread already {target.get('status')}"}
 
+    total_contracts = int(target.get("contracts") or 1)
+    n_to_close = _to_int(contracts_to_close)
+    if n_to_close is None or n_to_close <= 0 or n_to_close >= total_contracts:
+        n_to_close = total_contracts
+        is_partial = False
+    else:
+        is_partial = True
+
     old = dict(target)
     cv = _to_float(close_value, default=0.0) or 0.0
     close_iso = _validate_date(close_date) or datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
+    if is_partial:
+        # Split: create closed-portion record, reduce original
+        closed_portion = dict(target)
+        closed_portion["id"] = _gen_id("spr")
+        closed_portion["contracts"] = n_to_close
+        closed_portion["status"] = status
+        closed_portion["close_value"] = round(cv, 4)
+        closed_portion["close_date"] = close_iso
+        closed_portion["close_note"] = (note or "").strip()
+        closed_portion["closed_at"] = _now_iso()
+        closed_portion["partial_of"] = spread_id
+        spreads.append(closed_portion)
+
+        target["contracts"] = total_contracts - n_to_close
+        target["last_updated"] = _now_iso()
+
+        if not _save(_key_spreads(account), spreads):
+            return {"ok": False, "error": "Save failed"}
+
+        sub = target.get("subaccount") or DEFAULT_SUBACCOUNT
+        is_credit = bool(target.get("credit"))
+        if status == "closed" and cv > 0:
+            if is_credit:
+                cash_amount = -(cv * n_to_close * 100)
+            else:
+                cash_amount = cv * n_to_close * 100
+            add_cash_event(
+                account, "spread_close", cash_amount,
+                subaccount=sub, date=close_iso,
+                note=f"Close {n_to_close}/{total_contracts} {target.get('type')} {target.get('ticker')}",
+                ref_id=closed_portion["id"],
+            )
+
+        _audit(account, "partial_close_spread", spread_id, old, {
+            "original": old,
+            "remaining_contracts": target["contracts"],
+            "closed_portion_id": closed_portion["id"],
+            "closed_contracts": n_to_close,
+            "status": status,
+            "close_value": cv,
+        })
+        return {
+            "ok": True,
+            "partial": True,
+            "remaining": target,
+            "closed_portion": closed_portion,
+        }
+
+    # Full close
     target["status"] = status
     target["close_value"] = round(cv, 4)
     target["close_date"] = close_iso

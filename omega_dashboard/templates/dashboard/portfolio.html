@@ -590,7 +590,9 @@
               <option value="assigned">Assigned</option>
             </select>
             <label>Close $</label>
-            <input type="number" name="close_premium" step="0.01" placeholder="0 if expired">
+            <input type="number" name="close_premium" step="0.01" placeholder="0 if expired" class="math-eval">
+            <label>× to close</label>
+            <input type="number" name="contracts_to_close" min="1" max="{{ o.contracts }}" value="{{ o.contracts }}" style="max-width: 70px;" title="How many contracts to close (default = all {{ o.contracts }})">
             <label>Date</label>
             <input type="date" name="close_date">
             <button type="submit" class="btn-primary-sm">Confirm</button>
@@ -864,7 +866,9 @@
               <option value="expired">Expired</option>
             </select>
             <label>Close value ($)</label>
-            <input type="number" name="close_value" step="0.01" placeholder="0 if expired">
+            <input type="number" name="close_value" step="0.01" placeholder="0 if expired" class="math-eval">
+            <label>× to close</label>
+            <input type="number" name="contracts_to_close" min="1" max="{{ s.contracts }}" value="{{ s.contracts }}" style="max-width: 70px;" title="How many contracts to close (default = all {{ s.contracts }})">
             <label>Date</label>
             <input type="date" name="close_date">
             <button type="submit" class="btn-primary-sm">Confirm</button>
@@ -1436,7 +1440,75 @@ function confirmDeleteHolding(ticker, shares, costBasis, account) {
   });
 }
 
-// Sync the Credit/Debit dropdown when spread type changes
+// ─────────────────────────────────────────────────────────
+// Math evaluation in number fields
+// Allows entries like "4.66-3.72" which evaluates to 0.94 on blur.
+// Only +, -, *, /, parens, decimals, and digits allowed (safe regex check).
+// If invalid, restores the original value so user can fix.
+// ─────────────────────────────────────────────────────────
+function evalSafeMath(expr) {
+  if (typeof expr !== 'string' || !expr.trim()) return null;
+  const trimmed = expr.trim();
+  // If it's already a plain number, no need to evaluate
+  if (/^-?\d+(\.\d+)?$/.test(trimmed)) return null;
+  // Reject anything with letters, semicolons, etc — only allow safe chars
+  if (!/^[\d+\-*/().\s]+$/.test(trimmed)) return null;
+  // Reject suspicious patterns (multiple operators in a row except for negative numbers)
+  if (/[+*/]{2,}/.test(trimmed)) return null;
+  try {
+    // Use Function constructor — much safer than eval, scoped, no access to outer
+    const result = (new Function('return (' + trimmed + ')'))();
+    if (typeof result === 'number' && isFinite(result)) {
+      // Round to 4 decimal places to avoid floating-point cruft
+      return Math.round(result * 10000) / 10000;
+    }
+  } catch (e) {
+    // Invalid expression — fall through and return null
+  }
+  return null;
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+  // Apply math evaluation to all number-style inputs
+  // (use type="text" for inputs that need expressions, but also catch type="number"
+  // by intercepting before native validation rejects the typed expression)
+  function applyMathEval(input) {
+    input.addEventListener('blur', function() {
+      const result = evalSafeMath(input.value);
+      if (result !== null) {
+        input.value = result;
+        // Trigger change event so dependent fields can update
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+    });
+    input.addEventListener('keydown', function(e) {
+      // Press Enter to evaluate without leaving the field
+      if (e.key === 'Enter') {
+        const result = evalSafeMath(input.value);
+        if (result !== null) {
+          e.preventDefault();
+          input.value = result;
+          input.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+      }
+    });
+  }
+
+  // Apply to number inputs and any input explicitly marked .math-eval
+  // For type="number", we need to either change the type during typing
+  // or use type="text" with input-mode="decimal" for math expressions to work.
+  // Simpler: just transform type=number inputs to text with inputmode=decimal
+  // when they have step="0.01" or similar (suggesting price/premium fields).
+  document.querySelectorAll('input[type="number"], input.math-eval').forEach(input => {
+    // Promote to text so user can type expressions like "1.65*7"
+    // Keep step/min/max as data attributes for validation later if we want.
+    input.setAttribute('type', 'text');
+    input.setAttribute('inputmode', 'decimal');
+    applyMathEval(input);
+  });
+});
+
+
 const SPREAD_DEFAULTS = {
   BULL_PUT:       'true',   // credit
   BEAR_CALL:      'true',   // credit

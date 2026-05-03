@@ -345,8 +345,59 @@ def _option_pnl_live(opt: Dict) -> float:
         return 0.0
 
 
+def _close_month_from_date(date_str: Optional[str]) -> Optional[str]:
+    """Parse any YYYY-MM-DD-ish date string into 'YYYY-MM'. None if unparseable."""
+    if not date_str:
+        return None
+    try:
+        s = str(date_str).split("+")[0].split(".")[0].split("T")[0]
+        for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+            try:
+                dt = datetime.strptime(s, fmt)
+                return dt.strftime("%Y-%m")
+            except Exception:
+                continue
+    except Exception:
+        return None
+    return None
+
+
+def _spread_close_month(spr: Dict) -> Optional[str]:
+    """Month-bucket key for a closed/expired spread."""
+    if not isinstance(spr, dict):
+        return None
+    if spr.get("status") not in ("closed", "expired"):
+        return None
+    return _close_month_from_date(spr.get("close_date") or spr.get("exp"))
+
+
+def _spread_pnl(spr: Dict) -> float:
+    """Realized P&L on a closed spread.
+
+    Credit spreads: open_credit - close_value (positive when expired worthless)
+    Debit spreads:  close_value - open_debit
+    """
+    if not isinstance(spr, dict) or spr.get("status") not in ("closed", "expired"):
+        return 0.0
+    try:
+        contracts = int(spr.get("contracts") or 1)
+        close_val = float(spr.get("close_value") or 0)
+        if spr.get("credit") is not None and spr.get("credit") != 0:
+            return round((float(spr.get("credit") or 0) - close_val) * contracts * 100, 2)
+        else:
+            return round((close_val - float(spr.get("debit") or 0)) * contracts * 100, 2)
+    except Exception:
+        return 0.0
+
+
 def calc_income_live(ui_account: str) -> Dict:
-    """Sum realized option income by month from LIVE Redis (not snapshot)."""
+    """Sum ALL realized income by month from LIVE Redis.
+
+    Includes:
+      - Closed/expired/assigned/rolled options (P&L = open - close premium × 100 × contracts)
+      - Closed/expired spreads (P&L from credit or debit math)
+      - Sold share lots (realized gain/loss vs cost basis)
+    """
     from . import writes
 
     accounts = underlying_accounts(ui_account)
@@ -358,26 +409,51 @@ def calc_income_live(ui_account: str) -> Dict:
     current_year = now.strftime("%Y")
 
     by_month: Dict[str, float] = {}
+    by_source: Dict[str, float] = {"options": 0.0, "spreads": 0.0, "shares": 0.0}
     total_year = 0.0
     total_month = 0.0
 
+    def add(month_key, pnl, source):
+        nonlocal total_year, total_month
+        if not month_key or not pnl:
+            return
+        by_month[month_key] = by_month.get(month_key, 0.0) + pnl
+        by_source[source] = by_source.get(source, 0.0) + pnl
+        if month_key.startswith(current_year):
+            total_year += pnl
+        if month_key == current_month:
+            total_month += pnl
+
     for acc in accounts:
+        # Options (closed / expired / assigned / rolled)
         for opt in writes.get_options(acc):
-            month_key = _option_close_month_live(opt)
-            if not month_key:
-                continue
+            mk = _option_close_month_live(opt)
             pnl = _option_pnl_live(opt)
-            by_month[month_key] = by_month.get(month_key, 0.0) + pnl
-            if month_key.startswith(current_year):
-                total_year += pnl
-            if month_key == current_month:
-                total_month += pnl
+            add(mk, pnl, "options")
+
+        # Spreads (closed / expired)
+        for spr in writes.get_spreads(acc):
+            mk = _spread_close_month(spr)
+            pnl = _spread_pnl(spr)
+            add(mk, pnl, "spreads")
+
+        # Sold share lots
+        for lot in writes.get_sold_lots(acc):
+            if not isinstance(lot, dict):
+                continue
+            mk = _close_month_from_date(lot.get("date"))
+            try:
+                pnl = float(lot.get("realized_pnl") or 0)
+            except Exception:
+                pnl = 0.0
+            add(mk, pnl, "shares")
 
     return {
         "available": True,
         "month": round(total_month, 2),
         "year": round(total_year, 2),
         "by_month": {k: round(v, 2) for k, v in sorted(by_month.items())},
+        "by_source": {k: round(v, 2) for k, v in by_source.items()},
     }
 
 

@@ -79,13 +79,23 @@
 
     <!-- Income side -->
     <div class="cc-income-box">
-      <div class="section-eyebrow">Income · Realized Options</div>
+      <div class="section-eyebrow">Income · All Realized</div>
 
       <div class="income-pair">
         <div class="metric-card primary">
           <div class="metric-label">Year-to-Date</div>
           <div class="metric-value accent">${{ "{:,.0f}".format(d.income.year) }}</div>
-          <div class="metric-meta">CLOSED · EXPIRED · ASSIGNED · ROLLED</div>
+          <div class="metric-meta">
+            {% if d.income.by_source %}
+              {% set parts = [] %}
+              {% if d.income.by_source.options %}{% set _ = parts.append("opt $" ~ "{:,.0f}".format(d.income.by_source.options)) %}{% endif %}
+              {% if d.income.by_source.spreads %}{% set _ = parts.append("spr $" ~ "{:,.0f}".format(d.income.by_source.spreads)) %}{% endif %}
+              {% if d.income.by_source.shares %}{% set _ = parts.append("sh $" ~ "{:,.0f}".format(d.income.by_source.shares)) %}{% endif %}
+              {% if parts %}{{ parts|join(" · ") }}{% else %}OPTIONS · SPREADS · ROLLS · SHARES{% endif %}
+            {% else %}
+              OPTIONS · SPREADS · ROLLS · SHARES
+            {% endif %}
+          </div>
         </div>
         <div class="metric-card primary">
           <div class="metric-label">This Month</div>

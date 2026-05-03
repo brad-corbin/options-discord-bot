@@ -479,9 +479,15 @@ def portfolio_option_close(opt_id):
         close_premium=request.form.get("close_premium"),
         close_date=request.form.get("close_date"),
         note=request.form.get("note"),
+        contracts_to_close=request.form.get("contracts_to_close"),
     )
     if result.get("ok"):
-        _flash(f"Option marked {result['option']['status']}", "success")
+        if result.get("partial"):
+            n_closed = result["closed_portion"]["contracts"]
+            n_remaining = result["remaining"]["contracts"]
+            _flash(f"Closed {n_closed} contracts ({n_remaining} still open)", "success")
+        else:
+            _flash(f"Option marked {result['option']['status']}", "success")
     else:
         _flash(f"Close failed: {result.get('error')}", "error")
     return _bounce("options", acct)
@@ -589,9 +595,15 @@ def portfolio_spread_close(spread_id):
         close_value=request.form.get("close_value"),
         close_date=request.form.get("close_date"),
         note=request.form.get("note"),
+        contracts_to_close=request.form.get("contracts_to_close"),
     )
     if result.get("ok"):
-        _flash(f"Spread {result['spread']['status']}", "success")
+        if result.get("partial"):
+            n_closed = result["closed_portion"]["contracts"]
+            n_remaining = result["remaining"]["contracts"]
+            _flash(f"Closed {n_closed} contracts ({n_remaining} still open)", "success")
+        else:
+            _flash(f"Spread {result['spread']['status']}", "success")
     else:
         _flash(f"Close failed: {result.get('error')}", "error")
     return _bounce("spreads", acct)
