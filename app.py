@@ -718,12 +718,11 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 app = Flask(__name__)
-# ── Omega dashboard ─────────────────────────────────────
-from omega_dashboard import dashboard_bp
-from werkzeug.middleware.proxy_fix import ProxyFix
 
-# Trust Render's reverse proxy — required for session cookies over HTTPS
-app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1, x_for=1)
+# ── Omega dashboard ─────────────────────────────────────
+# ProxyFix MUST be applied before anything else touches the app
+from werkzeug.middleware.proxy_fix import ProxyFix
+app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1, x_for=1, x_prefix=1)
 
 _dashboard_secret = os.getenv("DASHBOARD_SECRET_KEY", "").strip()
 if not _dashboard_secret:
@@ -732,14 +731,18 @@ if not _dashboard_secret:
     )
 app.secret_key = _dashboard_secret
 
-# Cookie settings appropriate for HTTPS deployment behind Render's proxy
+# Cookie settings — deliberately NOT setting SESSION_COOKIE_SECURE
+# because Render's proxy can confuse Flask into thinking HTTPS is HTTP,
+# which causes secure cookies to be silently dropped. SameSite=Lax is
+# enough protection given we're already serving over HTTPS.
 app.config.update(
-    SESSION_COOKIE_SECURE=True,
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
 )
 
+from omega_dashboard import dashboard_bp
 app.register_blueprint(dashboard_bp)
+
 # ─────────────────────────────────────────────────────────
 # ENV VARS
 # ─────────────────────────────────────────────────────────
