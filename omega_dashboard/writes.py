@@ -217,6 +217,12 @@ def _to_float(v, default=None) -> Optional[float]:
     try:
         if v is None or v == "":
             return default
+        # Phase 4.5 — be forgiving: accept "$5,256.78" or "5,256.78" or " 100 "
+        if isinstance(v, str):
+            cleaned = v.strip().replace("$", "").replace(",", "").replace(" ", "")
+            if cleaned == "" or cleaned == "-":
+                return default
+            return float(cleaned)
         return float(v)
     except Exception:
         return default
@@ -226,6 +232,11 @@ def _to_int(v, default=None) -> Optional[int]:
     try:
         if v is None or v == "":
             return default
+        if isinstance(v, str):
+            cleaned = v.strip().replace(",", "").replace(" ", "")
+            if cleaned == "":
+                return default
+            return int(float(cleaned))  # Allow "100.0" → 100
         return int(v)
     except Exception:
         return default

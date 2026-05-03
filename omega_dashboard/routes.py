@@ -293,10 +293,17 @@ def portfolio_cash_add():
     from . import writes
     acct = request.form.get("acct", "brad")
     event_type = request.form.get("event_type", "deposit")
+    raw_amount = (request.form.get("amount") or "").strip()
+
+    # Sanity check before calling writes
+    if not raw_amount:
+        _flash("Cash add failed: Please enter an amount before submitting.", "error")
+        return _bounce("cash", acct)
+
     result = writes.add_cash_event(
         account=acct,
         event_type=event_type,
-        amount=request.form.get("amount"),
+        amount=raw_amount,
         subaccount=request.form.get("subaccount"),
         date=request.form.get("date"),
         note=request.form.get("note"),
@@ -304,7 +311,8 @@ def portfolio_cash_add():
     if result.get("ok"):
         _flash(f"Cash {event_type}: ${result['entry']['amount']:.2f} · balance now ${result['new_balance']:,.2f}", "success")
     else:
-        _flash(f"Cash add failed: {result.get('error')}", "error")
+        err = result.get("error", "unknown error")
+        _flash(f"Cash add failed: {err} (you entered: '{raw_amount}')", "error")
     return _bounce("cash", acct)
 
 
