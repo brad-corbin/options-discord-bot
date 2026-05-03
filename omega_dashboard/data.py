@@ -21,9 +21,9 @@ UI_TO_PORTFOLIO = {
     "mine":     ["brad"],
     "mom":      ["mom"],
     "partner":  ["partner"],   # Phase 4 — Day Trades
-    "kyleigh":  [],            # notional only
-    "clay":     [],            # notional only
-    "combined": ["brad", "mom", "partner"],
+    "kyleigh":  ["kyleigh"],   # Phase 4.5 — partner ledger
+    "clay":     ["clay"],      # Phase 4.5 — partner ledger
+    "combined": ["brad", "mom", "partner"],  # Excludes kyleigh/clay (notional partners)
 }
 
 
@@ -428,7 +428,7 @@ def calc_income_live(ui_account: str) -> Dict:
     current_year = now.strftime("%Y")
 
     by_month: Dict[str, float] = {}
-    by_source: Dict[str, float] = {"options": 0.0, "spreads": 0.0, "shares": 0.0}
+    by_source: Dict[str, float] = {"options": 0.0, "spreads": 0.0, "shares": 0.0, "fees": 0.0}
     total_year = 0.0
     total_month = 0.0
 
@@ -440,6 +440,8 @@ def calc_income_live(ui_account: str) -> Dict:
         "roll_debit": "options",
         "spread_open": "spreads",
         "spread_close": "spreads",
+        # Phase 4.5 — fees count as P&L expenses (negative impact)
+        "fee": "fees",
     }
 
     def add(month_key, amount, source):
@@ -498,6 +500,86 @@ def calc_income_live(ui_account: str) -> Dict:
         "by_month": {k: round(v, 2) for k, v in sorted(by_month.items())},
         "by_source": {k: round(v, 2) for k, v in by_source.items()},
     }
+
+
+# ─────────────────────────────────────────────────────────
+# Phase 4.5 — Partner ledger summaries (Kyleigh, Clay)
+# ─────────────────────────────────────────────────────────
+
+def calc_partner_summary(ui_account: str) -> Dict:
+    """Summary metrics for a partner profit-sharing ledger.
+
+    Walks the partner's cash ledger and computes:
+      - capital_in:        sum of deposit events (her money invested)
+      - distributions_out: sum of |withdrawal| events (paid out to her)
+      - outstanding:       capital_in − distributions_out (clamped to ≥ 0)
+                           = how much she has currently invested
+      - lifetime_gain:     distributions_out − capital_in (when positive)
+                           = realized profit she's received above her capital
+      - net_position:      raw signed flow (positive = she's still owed; negative = profit booked)
+
+    For the 'fully settled' case (Brad pays out capital + gains in one transfer),
+    outstanding = 0 and lifetime_gain = the gain portion of the payout.
+    """
+    from . import writes
+
+    accounts = underlying_accounts(ui_account)
+    if not accounts:
+        return {"available": False, "is_partner": False}
+
+    capital_in = 0.0
+    distributions_out = 0.0
+    event_count = 0
+    last_event_date = None
+
+    for acc in accounts:
+        try:
+            ledger = writes.get_cash_ledger(acc)
+        except Exception:
+            ledger = []
+        for ev in ledger:
+            if not isinstance(ev, dict):
+                continue
+            try:
+                amt = float(ev.get("amount") or 0)
+            except Exception:
+                continue
+            ev_type = ev.get("type", "")
+            event_count += 1
+            d = ev.get("date") or ""
+            if d and (last_event_date is None or d > last_event_date):
+                last_event_date = d
+            if ev_type == "deposit" and amt > 0:
+                capital_in += amt
+            elif ev_type in ("withdrawal", "transfer_out") and amt < 0:
+                distributions_out += abs(amt)
+            elif ev_type in ("withdrawal", "transfer_out") and amt > 0:
+                # Defensive: some entries may have positive amounts for withdrawals
+                distributions_out += amt
+            elif ev_type == "deposit" and amt < 0:
+                # Negative deposit ≈ withdrawal correction
+                distributions_out += abs(amt)
+
+    net_flow = capital_in - distributions_out  # +ve = still owed, -ve = profit booked
+    outstanding = max(0.0, net_flow)
+    lifetime_gain = max(0.0, -net_flow)
+
+    return {
+        "available": True,
+        "is_partner": True,
+        "capital_in": round(capital_in, 2),
+        "distributions_out": round(distributions_out, 2),
+        "outstanding": round(outstanding, 2),
+        "lifetime_gain": round(lifetime_gain, 2),
+        "net_position": round(net_flow, 2),
+        "event_count": event_count,
+        "last_event_date": last_event_date,
+    }
+
+
+def is_partner_account(ui_account: str) -> bool:
+    """Check if a UI account is a partner-ledger-only account."""
+    return ui_account in ("kyleigh", "clay")
 
 
 def get_open_positions_live(ui_account: str) -> Dict[str, List[Dict]]:
@@ -675,6 +757,36 @@ def command_center_data(ui_account: str) -> Dict:
             "snapshot_meta": snap_meta,
         }
 
+    # Phase 4.5 — partner ledger accounts (Kyleigh, Clay) get a different view
+    if is_partner_account(ui_account):
+        from . import writes
+        summary = calc_partner_summary(ui_account)
+
+        # Pull the recent ledger for display
+        recent_events = []
+        for acc in underlying_accounts(ui_account):
+            try:
+                ledger = writes.get_cash_ledger(acc)
+            except Exception:
+                ledger = []
+            for ev in ledger:
+                if isinstance(ev, dict):
+                    recent_events.append(ev)
+        recent_events.sort(key=lambda e: e.get("date", ""), reverse=True)
+
+        has_any_data = summary.get("event_count", 0) > 0
+
+        return {
+            "ui_account": ui_account,
+            "portfolio_available": True,
+            "snapshot_available": has_any_data,
+            "is_partner": True,
+            "snapshot_meta": snap_meta,
+            "partner_summary": summary,
+            "recent_events": recent_events[:10],
+            "live_mode": True,
+        }
+
     income = calc_income_live(ui_account)
     goal = calc_goal_pace(income)
     positions = get_open_positions_live(ui_account)
@@ -698,6 +810,7 @@ def command_center_data(ui_account: str) -> Dict:
         "ui_account": ui_account,
         "portfolio_available": True,
         "snapshot_available": has_any_data,  # name kept for template compat
+        "is_partner": False,
         "snapshot_meta": snap_meta,
         "income": income,
         "goal": goal,

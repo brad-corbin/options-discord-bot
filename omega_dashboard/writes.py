@@ -35,23 +35,34 @@ UI_TO_PORTFOLIO = {
 }
 
 # All underlying account keys we know about
-ALL_UNDERLYING_ACCOUNTS = ["brad", "mom", "partner"]
+# Phase 4.5+ — kyleigh and clay are "partner ledger" accounts. They have
+# their own cash ledger but no holdings/options/spreads. They are NOT included
+# in the Combined view (their cash isn't Brad's net worth).
+ALL_UNDERLYING_ACCOUNTS = ["brad", "mom", "partner", "kyleigh", "clay"]
+
+# Subset that holds real positions (used by Combined and the trading-focused
+# parts of the dashboard).
+TRADING_ACCOUNTS = ["brad", "mom", "partner"]
+
+# Subset that's ledger-only — partner profit-sharing accounts.
+PARTNER_LEDGER_ACCOUNTS = ["kyleigh", "clay"]
 
 # Display labels for the right-pill on Portfolio entry pages.
-# Underlying Redis keys stay "brad" / "mom" / "partner" — only the
-# UI label changes.
 UNDERLYING_LABELS = {
     "brad":    "Corbin",
     "mom":     "Volkman",
     "partner": "Partner",
+    "kyleigh": "Kyleigh",
+    "clay":    "Clay",
 }
 
 # Map underlying account → which top-chip color theme that account "belongs" to.
-# Used by Portfolio template to switch theme when right-pill is clicked.
 UNDERLYING_TO_THEME = {
     "brad":    "mine",
     "mom":     "mom",
     "partner": "partner",
+    "kyleigh": "kyleigh",
+    "clay":    "clay",
 }
 
 # Sub-account tag list (UI dropdown seed). User can add more.
@@ -1863,6 +1874,19 @@ def add_transfer(recipient: str, account: str, amount: float,
         note=f"Transfer to {recipient.title()}: {note or ''}".strip(),
         ref_id=transfer_id,
     )
+
+    # Phase 4.5 — auto-mirror to partner cash ledger so their command-center
+    # view reflects the distribution without manual double-entry.
+    if recipient in PARTNER_LEDGER_ACCOUNTS:
+        try:
+            add_cash_event(
+                recipient, "withdrawal", -amt,
+                subaccount=sub, date=date_iso,
+                note=f"Distribution from {account.title()}: {note or ''}".strip(),
+                ref_id=transfer_id,
+            )
+        except Exception as e:
+            log.warning(f"partner ledger mirror failed (non-fatal): {e}")
 
     _audit("system", f"transfer_{recipient}", transfer_id, None, {
         "recipient": recipient, "from_account": account, "amount": amt, "date": date_iso,

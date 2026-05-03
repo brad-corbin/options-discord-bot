@@ -55,6 +55,123 @@
     </div>
   </div>
 
+{% elif d.is_partner %}
+
+<!-- ─── PARTNER LEDGER VIEW (Kyleigh / Clay) ─────────────── -->
+<div class="snapshot-meta-strip live fade-in">
+  <span class="snap-label">Live</span>
+  <span class="snap-value">Partner ledger · Profit-sharing tracking</span>
+  <span class="snap-sep">·</span>
+  <span class="snap-meta">{{ d.partner_summary.event_count }} events
+    {% if d.partner_summary.last_event_date %}· last activity {{ d.partner_summary.last_event_date }}{% endif %}
+  </span>
+  <span class="snap-meta-right">
+    <a href="{{ url_for('dashboard.portfolio_section', section='cash') }}?acct={{ d.ui_account }}" class="snap-link">Log a transaction</a>
+  </span>
+</div>
+
+<section class="cc-hero fade-in">
+  <svg class="hero-watermark" viewBox="0 0 100 100" fill="none">
+    <path d="M50 8 L82 22 L82 56 L70 76 L60 88 L40 88 L30 76 L18 56 L18 22 Z"
+          stroke="currentColor" stroke-width="0.5" fill="none"/>
+    <text x="50" y="62" text-anchor="middle" font-family="Russo One, sans-serif"
+          font-size="38" font-weight="700" fill="currentColor">Ω</text>
+  </svg>
+
+  <div class="cc-hero-grid">
+    <!-- Lifetime gain (the headline) -->
+    <div class="hero-block income">
+      <div class="hero-block-label">LIFETIME GAIN</div>
+      <div class="hero-card primary">
+        <div class="hero-card-label">{{ active_account.label|upper }}'S PROFIT</div>
+        <div class="hero-card-value">+${{ "{:,.0f}".format(d.partner_summary.lifetime_gain) }}</div>
+        <div class="hero-card-sub">
+          ${{ "{:,.0f}".format(d.partner_summary.distributions_out) }} distributed ·
+          ${{ "{:,.0f}".format(d.partner_summary.capital_in) }} contributed
+        </div>
+      </div>
+      {% if d.partner_summary.outstanding > 0 %}
+      <div class="cc-progress-card">
+        <div class="cc-progress-header">
+          <span class="cc-progress-label">Currently invested</span>
+          <span class="cc-progress-pct">${{ "{:,.0f}".format(d.partner_summary.outstanding) }}</span>
+        </div>
+        <div class="cc-progress-meta">
+          <span>Awaiting next distribution</span>
+        </div>
+      </div>
+      {% else %}
+      <div class="cc-progress-card">
+        <div class="cc-progress-header">
+          <span class="cc-progress-label">Status</span>
+          <span class="cc-progress-pct" style="color: var(--accent);">Fully settled</span>
+        </div>
+        <div class="cc-progress-meta">
+          <span>Capital + gains paid out — ready for next cycle</span>
+        </div>
+      </div>
+      {% endif %}
+    </div>
+
+    <!-- Capital flow side -->
+    <div class="hero-block capital">
+      <div class="hero-block-label">CAPITAL FLOW</div>
+      <div class="hero-card secondary">
+        <div class="hero-card-label">CONTRIBUTED</div>
+        <div class="hero-card-value">${{ "{:,.0f}".format(d.partner_summary.capital_in) }}</div>
+        <div class="hero-card-sub">money in</div>
+      </div>
+      <div class="hero-card secondary" style="margin-top: 12px;">
+        <div class="hero-card-label">DISTRIBUTED</div>
+        <div class="hero-card-value">${{ "{:,.0f}".format(d.partner_summary.distributions_out) }}</div>
+        <div class="hero-card-sub">paid out</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ─── RECENT EVENTS ─────────────────────────────────────── -->
+{% if d.recent_events %}
+<section class="cc-section fade-in">
+  <div class="cc-section-header">
+    <div class="cc-section-title">RECENT ACTIVITY</div>
+    <a href="{{ url_for('dashboard.portfolio_section', section='cash') }}?acct={{ d.ui_account }}" class="cc-section-link">Full ledger →</a>
+  </div>
+  <div class="data-panel">
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Date</th>
+          <th>Type</th>
+          <th class="numeric">Amount</th>
+          <th>Note</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for ev in d.recent_events %}
+        <tr>
+          <td class="mono">{{ ev.date }}</td>
+          <td>
+            {% if ev.type == 'deposit' %}
+              <span class="type-pill type-csp">DEPOSIT</span>
+            {% elif ev.type in ('withdrawal', 'transfer_out') %}
+              <span class="type-pill type-cc">PAYOUT</span>
+            {% else %}
+              <span class="type-pill">{{ ev.type }}</span>
+            {% endif %}
+          </td>
+          <td class="numeric mono {% if ev.amount >= 0 %}amount-positive{% else %}amount-negative{% endif %}">
+            {% if ev.amount >= 0 %}+{% endif %}${{ "{:,.2f}".format(ev.amount) }}
+          </td>
+          <td class="muted">{{ ev.note or "—" }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endif %}
+
 {% else %}
 
 <!-- ─── LIVE DATA META STRIP ─────────────────────────────── -->

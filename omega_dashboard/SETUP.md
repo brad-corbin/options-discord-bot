@@ -97,9 +97,15 @@ The previous calc had two bugs that were under-counting your YTD:
 - **Open positions contributed $0** — even though you'd already collected the premium in cash. Eight open wheel options × ~$700 average premium = ~$5,600 of real income that wasn't showing up.
 - **Rolls were being counted as losses** — when you roll a CSP up by closing the old at $X and opening the new at $Y > $X, the position-iteration calc booked the closed leg's `(open_premium − close_premium)` as a realized loss, even though the cash impact was a positive net credit. Your seven May rolls showed "This Month: −$2,163" when you'd actually netted a few hundred dollars.
 
-The new calc sums these cash event types month-by-month: `option_open`, `option_close`, `spread_open`, `spread_close`, `roll_credit`, `roll_debit`. Plus `realized_pnl` from sold share lots. It ignores deposits, withdrawals, share buys/sells (replaced by sold-lot P&L), and transfers — those aren't trading income.
+The new calc sums these cash event types month-by-month: `option_open`, `option_close`, `spread_open`, `spread_close`, `roll_credit`, `roll_debit`, **`fee`** (new — Phase 4.5). Plus `realized_pnl` from sold share lots. It ignores deposits, withdrawals, share buys/sells (replaced by sold-lot P&L), transfers, and `manual_set` adjustments — those aren't trading income.
 
-After deploy, your YTD figure will jump significantly upward to match what your cash ledger actually shows. Should land closer to your spreadsheet's $19,739 number.
+After deploy, your YTD figure will jump significantly upward to match what your cash ledger actually shows.
+
+**About fees.** There's a new `Fee / Expense` option in the Cash entry form's Type dropdown. Use this for Schwab fees, commissions, anything that's a real trading expense (negative amount). They flow into the income calc as expenses (showing in the new `fees` bucket of `by_source`). 
+
+If you've already logged fees as `Manual adjustment`: those don't currently count toward P&L (manual_set is excluded by design — it's for balance corrections that aren't real expenses). To get your existing Schwab Fees into the income totals, click the × on the manual_set entry in the cash ledger and re-add it as type `Fee / Expense`. Same amount, same date, same note.
+
+`manual_set` continues to be the right type for things like the Kyleigh-side reconciliations — they affect your real cash balance but aren't trading income/expense, so they stay out of P&L.
 
 ### 7. Repair option data
 
@@ -122,6 +128,32 @@ You can now edit the **sub-account** and **note** on any closed option, closed s
 When you change a sub-account, the linked cash ledger entries are updated to match (so the cash-by-sub-account breakdown stays consistent). Cash totals don't change. P&L doesn't change.
 
 This was needed because the original Phase 4 spread form defaulted to "Brokerage" — if you accidentally added a Volkman wheel spread under Brokerage, there was no way to fix it after closing without doing the full delete-and-recreate dance. Now it's two clicks.
+
+### 9. Partner ledgers (Kyleigh / Clay)
+
+Kyleigh and Clay are now real accounts with their own cash ledger and command-center view. The "no data yet" placeholder on those pages is gone.
+
+The partner command-center hero shows three things at a glance:
+
+- **Lifetime gain** — distributions received above their contributed capital
+- **Currently invested** — capital contributed minus distributions paid out (only shown when > 0; says "Fully settled" when at 0)
+- **Capital flow** — total contributed and total distributed, side by side
+
+Recent activity from their ledger appears underneath as a mini-table. The "Full ledger →" link drops you on the Cash sub-tab of their portfolio entry, where you can log new events.
+
+**Auto-mirror.** When you do a "Transfer to Kyleigh" from your Volkman/Corbin transfers tab, the matching `withdrawal` event auto-creates on Kyleigh's ledger. No double-entry needed.
+
+For incoming capital (Kyleigh sending you money), log it manually in Kyleigh's Cash tab as a `deposit`. That's the only side that needs duplicate entry — once on your account (so your cash balance is right) and once on hers (so her contribution shows up).
+
+**Backfill for Brad's existing data.** Your existing Volkman ledger has the +$5,256.78 inbound and -$5,944.87 transfer-out, but Kyleigh's ledger is empty until you log them on her side. Quick fix:
+
+1. Switch to Kyleigh's account (top chip).
+2. Portfolio → Cash → log a deposit for $5,256.78 on 2026-03-15 with note "Initial capital".
+3. Same form, log a withdrawal for −$5,944.87 on 2026-05-01 with note "Balance Through May 1".
+
+Going back to her command center, lifetime gain will show $688.09. Same drill for Clay if you've had any activity with him.
+
+**Combined view is unaffected.** Kyleigh and Clay are explicitly excluded from the Combined account (their cash isn't your net worth — it's their share of your trading). YTD income calc, capital tracking, and position counts all still aggregate brad+mom+partner only.
 
 ## Deploy steps
 

@@ -65,7 +65,8 @@
         <select name="event_type" required>
           <option value="deposit">Deposit (initial capital, contribution)</option>
           <option value="withdrawal">Withdrawal</option>
-          <option value="manual_set">Manual adjustment</option>
+          <option value="fee">Fee / Expense (Schwab fees, commissions — counts as P&L expense)</option>
+          <option value="manual_set">Manual adjustment (does NOT count as P&L)</option>
         </select>
       </div>
       <div class="form-field">
@@ -508,7 +509,7 @@
           <td class="muted">{{ l.note or "—" }}</td>
           <td>
             {% if l.id %}
-            <a href="#edit-sl-{{ l.id }}" class="btn-mini-link">edit</a>
+            <button class="btn-mini" onclick="document.getElementById(&#39;edit-sl-{{ l.id }}&#39;).classList.toggle(&#39;open&#39;)">Edit</button>
             {% endif %}
           </td>
         </tr>
@@ -880,7 +881,7 @@
             {% if o.realized_pnl >= 0 %}+{% endif %}${{ "{:,.2f}".format(o.realized_pnl) }}
           </td>
           <td class="muted">{{ o.subaccount or "—" }}</td>
-          <td><a href="#edit-closed-opt-{{ o.id }}" class="btn-mini-link">edit</a></td>
+          <td><button class="btn-mini" onclick="document.getElementById(&#39;edit-closed-opt-{{ o.id }}&#39;).classList.toggle(&#39;open&#39;)">Edit</button></td>
         </tr>
         <tr id="edit-closed-opt-{{ o.id }}" class="inline-form-row">
           <td colspan="13">
@@ -1184,7 +1185,7 @@
           </td>
           <td class="muted">{{ s.subaccount or "—" }}</td>
           <td>
-            <a href="#edit-closed-spr-{{ s.id }}" class="btn-mini-link">edit</a>
+            <button class="btn-mini" onclick="document.getElementById(&#39;edit-closed-spr-{{ s.id }}&#39;).classList.toggle(&#39;open&#39;)">Edit</button>
           </td>
         </tr>
         <tr id="edit-closed-spr-{{ s.id }}" class="inline-form-row">
