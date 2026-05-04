@@ -245,15 +245,17 @@ def get_open_positions_from_snapshot(snap: Dict, ui_account: str) -> Dict[str, L
 
         # Holdings (always open)
         holdings = acct_data.get("holdings") or {}
-        for ticker, h in holdings.items():
+        for key, h in holdings.items():
             if not isinstance(h, dict):
                 continue
+            ticker = h.get("ticker") or (key.split("@")[0] if "@" in key else key)
             out["shares"].append({
                 "ticker": ticker.upper(),
                 "shares": h.get("shares"),
                 "cost_basis": h.get("cost_basis"),
                 "tag": h.get("tag"),
                 "account": acc,
+                "subaccount": h.get("subaccount"),
             })
 
         # Open spreads only
@@ -703,12 +705,14 @@ def get_watchlist_for_account(ui_account: str, max_tickers: int = 12) -> List[Di
                 if opt.get("subaccount"):
                     b["subaccounts"].add(opt["subaccount"])
 
-            for ticker, h in writes.get_holdings(acc).items():
+            for key, h in writes.get_holdings(acc).items():
                 if not isinstance(h, dict):
                     continue
                 shares = float(h.get("shares") or 0)
                 if shares <= 0:
                     continue
+                # Resolve real ticker — value field, or strip composite suffix from key
+                ticker = h.get("ticker") or (key.split("@")[0] if "@" in key else key)
                 t = ticker.upper()
                 b = _b(t)
                 b["has_shares"] = True
@@ -956,9 +960,10 @@ def get_open_positions_live(ui_account: str) -> Dict[str, List[Dict]]:
             })
 
         holdings = writes.get_holdings(acc)
-        for ticker, h in holdings.items():
+        for key, h in holdings.items():
             if not isinstance(h, dict):
                 continue
+            ticker = h.get("ticker") or (key.split("@")[0] if "@" in key else key)
             out["shares"].append({
                 "ticker": ticker.upper(),
                 "shares": h.get("shares"),
