@@ -2299,6 +2299,21 @@ def backfill_campaign_history(account: Optional[str] = None) -> Dict:
             if tgt and tgt not in close_by_target:
                 close_by_target[tgt] = entry
 
+    # Phase 4.5+ — Live option index. When the user has edited a closed
+    # option (premium/contracts/close_premium correction), the audit log still
+    # has the original add_option values. Prefer current option records so
+    # backfill respects user edits.
+    live_options_by_id: Dict[str, Dict[str, Dict]] = {}  # account → opt_id → opt
+    for acc in accounts:
+        try:
+            live_options_by_id[acc] = {
+                o["id"]: o
+                for o in get_options(acc)
+                if isinstance(o, dict) and o.get("id")
+            }
+        except Exception:
+            live_options_by_id[acc] = {}
+
     summary = {
         "ok": True,
         "accounts_modified": 0,
@@ -2456,34 +2471,41 @@ def backfill_campaign_history(account: Optional[str] = None) -> Dict:
             new_events: List[Dict] = []
 
             for oid in chain_ids:
+                # Live option (current state) — preferred source for premium/contracts
+                live_opt = live_options_by_id.get(acc, {}).get(oid) or {}
+
                 # 1. csp_open / cc_open from add_option audit
                 add_entry = add_option_by_target.get(oid)
                 if add_entry:
                     od = add_entry.get("_parsed_new") or {}
                     if isinstance(od, dict):
-                        opt_type = od.get("type", "")
+                        opt_type = (live_opt.get("type") or od.get("type", ""))
                         if opt_type == "CSP":
                             new_events.append({
                                 "type": "csp_open",
                                 "id": oid,
-                                "strike": od.get("strike"),
-                                "exp": od.get("exp"),
-                                "contracts": od.get("contracts") or 1,
-                                "premium": od.get("premium"),
-                                "open_date": od.get("open_date") or add_entry.get("timestamp", "")[:10],
-                                "date": od.get("open_date") or add_entry.get("timestamp", "")[:10],
+                                "strike": live_opt.get("strike") or od.get("strike"),
+                                "exp": live_opt.get("exp") or od.get("exp"),
+                                "contracts": live_opt.get("contracts") or od.get("contracts") or 1,
+                                "premium": live_opt.get("premium") if live_opt else od.get("premium"),
+                                "open_date": (live_opt.get("open_date") or od.get("open_date")
+                                              or add_entry.get("timestamp", "")[:10]),
+                                "date": (live_opt.get("open_date") or od.get("open_date")
+                                         or add_entry.get("timestamp", "")[:10]),
                                 "backfilled": True,
                             })
                         elif opt_type == "CC":
                             new_events.append({
                                 "type": "cc_open",
                                 "id": oid,
-                                "strike": od.get("strike"),
-                                "exp": od.get("exp"),
-                                "contracts": od.get("contracts") or 1,
-                                "premium": od.get("premium"),
-                                "open_date": od.get("open_date") or add_entry.get("timestamp", "")[:10],
-                                "date": od.get("open_date") or add_entry.get("timestamp", "")[:10],
+                                "strike": live_opt.get("strike") or od.get("strike"),
+                                "exp": live_opt.get("exp") or od.get("exp"),
+                                "contracts": live_opt.get("contracts") or od.get("contracts") or 1,
+                                "premium": live_opt.get("premium") if live_opt else od.get("premium"),
+                                "open_date": (live_opt.get("open_date") or od.get("open_date")
+                                              or add_entry.get("timestamp", "")[:10]),
+                                "date": (live_opt.get("open_date") or od.get("open_date")
+                                         or add_entry.get("timestamp", "")[:10]),
                                 "backfilled": True,
                             })
 
@@ -2610,7 +2632,21 @@ def backfill_campaign_history(account: Optional[str] = None) -> Dict:
             old_count = len(old_events)
             new_premium = camp["rollup"].get("total_premium", 0)
 
-            if new_count != old_count or new_premium != old_premium:
+            # Phase 4.5+ — also detect changes in individual event premiums/contracts
+            # (not just count/total). This catches the case where an option was
+            # edited (e.g., 7.65 → 3.82) and the rebuilt events differ from the
+            # stored ones even though total premium happens to be the same.
+            events_differ = False
+            if old_count == new_count:
+                for old_ev, new_ev in zip(old_events, all_events):
+                    for k in ("premium", "contracts", "close_premium", "strike", "exp"):
+                        if old_ev.get(k) != new_ev.get(k):
+                            events_differ = True
+                            break
+                    if events_differ:
+                        break
+
+            if new_count != old_count or new_premium != old_premium or events_differ:
                 any_modified = True
                 summary["campaigns_modified"] += 1
                 summary["events_added"] += max(0, new_count - old_count)
@@ -2623,6 +2659,7 @@ def backfill_campaign_history(account: Optional[str] = None) -> Dict:
                     "events_after": new_count,
                     "premium_before": round(old_premium, 2),
                     "premium_after": round(new_premium, 2),
+                    "events_changed": events_differ and new_count == old_count,
                 })
 
         if any_modified:

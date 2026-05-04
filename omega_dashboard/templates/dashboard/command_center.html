@@ -196,6 +196,45 @@
   <span class="snap-meta-right">Snapshot daily at 06:00 UTC · <a href="{{ url_for('dashboard.restore') }}" class="snap-link">Manage</a></span>
 </div>
 
+<!-- ─── WATCHLIST · live spot prices on open positions ─── -->
+{% if d.watchlist %}
+<section class="watchlist-section fade-in">
+  <div class="watchlist-header">
+    <span class="section-eyebrow">Watchlist · Open Positions</span>
+    <span class="watchlist-meta muted">Quotes refresh on page load · cached 60s</span>
+  </div>
+  <div class="watchlist-grid">
+    {% for w in d.watchlist %}
+    <div class="watchlist-card{% if w.quote and w.quote.change_pct >= 0 %} positive{% elif w.quote and w.quote.change_pct < 0 %} negative{% endif %}">
+      <div class="watch-ticker-row">
+        <span class="watch-ticker">{{ w.ticker }}</span>
+        <span class="watch-pills">
+          {% if w.has_csp %}<span class="watch-pill csp">CSP</span>{% endif %}
+          {% if w.has_cc %}<span class="watch-pill cc">CC</span>{% endif %}
+          {% if w.has_shares %}<span class="watch-pill sh">SH</span>{% endif %}
+        </span>
+      </div>
+      {% if w.quote %}
+      <div class="watch-price">${{ "{:,.2f}".format(w.quote.price) }}</div>
+      <div class="watch-change">
+        {% if w.quote.change_pct >= 0 %}▲{% else %}▼{% endif %}
+        ${{ "{:,.2f}".format(w.quote.change|abs) }}
+        ({{ w.quote.change_pct }}%)
+      </div>
+      {% else %}
+      <div class="watch-price muted">—</div>
+      <div class="watch-change muted">no quote</div>
+      {% endif %}
+      <div class="watch-meta">
+        {% if w.shares > 0 %}{{ "{:,.0f}".format(w.shares) }} sh @ ${{ "%.2f"|format(w.cost_basis) }}{% endif %}
+        {% if w.contracts > 0 %}{% if w.shares > 0 %} · {% endif %}{{ w.contracts }} contract{% if w.contracts > 1 %}s{% endif %}{% endif %}
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+</section>
+{% endif %}
+
 <!-- ─── INCOME HERO ───────────────────────────────────────── -->
 <section class="cc-hero fade-in">
   <svg class="hero-watermark" viewBox="0 0 100 100" fill="none">
@@ -341,7 +380,7 @@
           </tbody>
         </table>
         <div class="sub-breakdown-legend muted">
-          Total Value = cash + shares (at cost) + lump-sums · ROI = YTD income / starting deposits ·
+          Total Value = cash + shares (at cost) + lump-sums · ROI = YTD income / (deposits − withdrawals) ·
           Open = options · spreads · shares
         </div>
       </div>
@@ -409,7 +448,7 @@
           <span class="position-meta"><span class="color-chip chip-{% if pos.account == 'mom' %}mom{% else %}mine{% endif %}"></span>{{ pos.account }}</span>
           <span style="text-align:right;">${{ "%.2f"|format(pos.premium or 0) }}</span>
           <span class="position-meta" style="text-align:right;">x{{ pos.contracts }}</span>
-          <span class="position-meta" style="text-align:right;">{{ pos.tag or '' }}</span>
+          <span class="position-spot mono" data-ticker="{{ pos.ticker }}" data-strike="{{ pos.strike }}" data-type="{{ pos.type }}" style="text-align:right;"><span class="muted">…</span></span>
         </div>
       {% endfor %}
     {% endif %}
@@ -448,5 +487,47 @@
 </section>
 
 {% endif %}
+
+<script>
+// ─── Live spot prices on wheel option rows ─────────────
+(function loadCommandSpotPrices() {
+  const cells = document.querySelectorAll('.position-spot[data-ticker]');
+  if (!cells.length) return;
+  const tickers = [...new Set([...cells].map(el => el.dataset.ticker))].join(',');
+  if (!tickers) return;
+
+  fetch('/api/spot-prices?tickers=' + encodeURIComponent(tickers))
+    .then(r => r.ok ? r.json() : Promise.reject(r.status))
+    .then(data => {
+      const prices = (data && data.prices) || {};
+      cells.forEach(el => {
+        const t = el.dataset.ticker;
+        const p = prices[t];
+        if (!p) {
+          el.innerHTML = '<span class="muted">—</span>';
+          return;
+        }
+        const strike = parseFloat(el.dataset.strike) || 0;
+        const optType = el.dataset.type || '';
+        let posClass = '';
+        if (strike) {
+          if (optType === 'CSP') {
+            posClass = p.price > strike ? 'amount-positive' : 'amount-negative';
+          } else if (optType === 'CC') {
+            posClass = p.price < strike ? 'amount-positive' : 'amount-negative';
+          }
+        }
+        const arrow = p.change >= 0 ? '▲' : '▼';
+        const dirClass = p.change >= 0 ? 'amount-positive' : 'amount-negative';
+        el.innerHTML = `<span class="${posClass}">$${p.price.toFixed(2)}</span> <span class="${dirClass}" style="font-size: 9px;">${arrow}${Math.abs(p.change_pct).toFixed(1)}%</span>`;
+      });
+    })
+    .catch(() => {
+      cells.forEach(el => {
+        el.innerHTML = '<span class="muted">—</span>';
+      });
+    });
+})();
+</script>
 
 {% endblock %}

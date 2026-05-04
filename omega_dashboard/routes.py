@@ -15,7 +15,7 @@ from functools import wraps
 
 from flask import (
     Blueprint, render_template, request, redirect, url_for,
-    session, make_response, flash
+    session, make_response, flash, jsonify
 )
 
 log = logging.getLogger(__name__)
@@ -1170,3 +1170,24 @@ def health():
             "retention_days": dstatus.get("retention_days"),
         },
     }
+
+
+# ─── PHASE 4.5+ — LIVE SPOT PRICES ─────────────────────────
+@dashboard_bp.route("/api/spot-prices", methods=["GET"])
+@login_required
+def api_spot_prices():
+    """Return current spot prices for the requested tickers.
+
+    GET /api/spot-prices?tickers=AAPL,MSFT,SPY
+
+    Cached server-side for 60 seconds. Returns whatever it can fetch; tickers
+    that error are simply omitted from the response (the frontend then shows
+    "—" for them, no error noise).
+    """
+    from . import spot_prices
+    raw = (request.args.get("tickers") or "").strip()
+    if not raw:
+        return jsonify({"prices": {}})
+    tickers = [t.strip().upper() for t in raw.split(",") if t.strip()]
+    prices = spot_prices.get_spot_prices(tickers)
+    return jsonify({"prices": prices, "count": len(prices)})

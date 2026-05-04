@@ -243,40 +243,55 @@
     <div class="data-panel-title">Active Wheels · {{ acct_label }}</div>
     <div class="data-panel-meta">{{ d.active_campaigns|length }} active</div>
   </div>
-  <div class="campaigns-list">
+  <div class="wheels-grid">
     {% for c in d.active_campaigns %}
-    <div class="campaign-card">
+    {% set csp_open = (c.rollup.csp_open_count or 0) - (c.rollup.csp_closed_count or 0) %}
+    {% set cc_open = (c.rollup.cc_open_count or 0) - (c.rollup.cc_closed_count or 0) %}
+    {% set has_shares = (c.rollup.shares_held or 0) > 0 %}
+    <div class="wheel-card phase-{{ c.status }}">
+      <div class="wheel-card-head">
+        <div class="wheel-card-ticker">{{ c.ticker }}</div>
+        <div class="wheel-card-spot" data-ticker="{{ c.ticker }}">
+          <span class="spot-price muted">…</span>
+        </div>
+      </div>
+      <div class="wheel-card-sub">{{ c.subaccount }}</div>
+
+      <div class="wheel-card-stat-grid">
+        <div class="wheel-stat">
+          <div class="wheel-stat-label">Premium</div>
+          <div class="wheel-stat-value amount-positive">${{ "{:,.0f}".format(c.rollup.total_premium or 0) }}</div>
+        </div>
+        {% if has_shares %}
+        <div class="wheel-stat">
+          <div class="wheel-stat-label">{{ c.rollup.shares_held }} sh @</div>
+          <div class="wheel-stat-value">${{ "%.2f"|format(c.rollup.weighted_cost_basis or 0) }}</div>
+          {% if c.rollup.effective_basis %}
+            <div class="wheel-stat-sub muted">eff. ${{ "%.2f"|format(c.rollup.effective_basis) }}</div>
+          {% endif %}
+        </div>
+        {% else %}
+        <div class="wheel-stat">
+          <div class="wheel-stat-label">Phase</div>
+          <div class="wheel-stat-value">CSP-only</div>
+          <div class="wheel-stat-sub muted">no shares yet</div>
+        </div>
+        {% endif %}
+      </div>
+
+      <div class="wheel-card-foot">
+        <span class="wheel-pill {% if csp_open %}csp-pill{% endif %}">{{ csp_open }} CSP</span>
+        <span class="wheel-pill {% if cc_open %}cc-pill{% endif %}">{{ cc_open }} CC</span>
+        <span class="wheel-pill muted">{{ c.rollup.duration_days or 0 }}d</span>
+        <span class="wheel-card-status">{{ c.status|replace('_', ' ') }}</span>
+      </div>
+
+      {# Collapsible event timeline #}
       <input type="checkbox" id="camp-toggle-{{ loop.index0 }}" class="campaign-toggle" hidden>
-      <label for="camp-toggle-{{ loop.index0 }}" class="campaign-card-header">
-        <div class="campaign-title-row">
-          <span class="campaign-ticker">{{ c.ticker }}</span>
-          <span class="campaign-sub">· {{ c.subaccount }}</span>
-          <span class="campaign-status status-{{ c.status }}">{{ c.status|replace('_', ' ') }}</span>
-          <span class="campaign-chevron">▾</span>
-        </div>
-        <div class="campaign-rollup-line">
-          {% if c.rollup.shares_held and c.rollup.shares_held > 0 %}
-            <span>{{ c.rollup.shares_held }} sh @ ${{ "%.2f"|format(c.rollup.weighted_cost_basis or 0) }} cost</span>
-            {% if c.rollup.effective_basis %}
-              <span class="muted">· effective ${{ "%.2f"|format(c.rollup.effective_basis) }}</span>
-            {% endif %}
-          {% else %}
-            <span class="muted">No shares yet · CSP-only phase</span>
-          {% endif %}
-        </div>
-        <div class="campaign-rollup-line muted">
-          Premium collected: <strong class="amount-positive">${{ "{:,.0f}".format(c.rollup.total_premium or 0) }}</strong>
-          · {{ c.rollup.duration_days or 0 }} days
-          {% if c.rollup.cc_open_count and c.rollup.cc_open_count > 0 %}
-            · {{ c.rollup.cc_open_count - c.rollup.cc_closed_count }} CC open
-          {% endif %}
-          {% if c.rollup.csp_open_count and (c.rollup.csp_open_count - c.rollup.csp_closed_count) > 0 %}
-            · {{ c.rollup.csp_open_count - c.rollup.csp_closed_count }} CSP open
-          {% endif %}
-        </div>
+      <label for="camp-toggle-{{ loop.index0 }}" class="wheel-card-events-toggle">
+        Events ({{ (c.events or [])|length }}) ▾
       </label>
-      <div class="campaign-events">
-        <div class="campaign-events-title">Events ({{ (c.events or [])|length }})</div>
+      <div class="wheel-card-events">
         {% for ev in c.events %}
         <div class="campaign-event-row">
           <span class="campaign-event-date mono muted">{{ ev.date or ev.open_date or '—' }}</span>
@@ -1915,6 +1930,40 @@ document.addEventListener('DOMContentLoaded', function() {
     });
   });
 });
+
+// ─── Phase 4.5+ — Live spot prices on wheel cards ──────
+(function loadSpotPrices() {
+  const cards = document.querySelectorAll('.wheel-card-spot[data-ticker]');
+  if (!cards.length) return;
+  const tickers = [...new Set([...cards].map(el => el.dataset.ticker))].join(',');
+  if (!tickers) return;
+
+  fetch('/api/spot-prices?tickers=' + encodeURIComponent(tickers))
+    .then(r => r.ok ? r.json() : Promise.reject(r.status))
+    .then(data => {
+      const prices = (data && data.prices) || {};
+      cards.forEach(el => {
+        const t = el.dataset.ticker;
+        const p = prices[t];
+        if (!p) {
+          el.querySelector('.spot-price').textContent = '—';
+          el.querySelector('.spot-price').classList.remove('muted');
+          return;
+        }
+        const dir = p.change >= 0 ? 'up' : 'down';
+        const arrow = p.change >= 0 ? '▲' : '▼';
+        el.innerHTML = `
+          <span class="spot-price">$${p.price.toFixed(2)}</span>
+          <span class="spot-change ${dir}">${arrow} ${Math.abs(p.change).toFixed(2)} (${Math.abs(p.change_pct).toFixed(2)}%)</span>
+        `;
+      });
+    })
+    .catch(() => {
+      cards.forEach(el => {
+        el.querySelector('.spot-price').textContent = '—';
+      });
+    });
+})();
 </script>
 
 {% endblock %}

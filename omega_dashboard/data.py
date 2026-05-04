@@ -10,9 +10,10 @@ For Phase 3 (read-only views) this is fine. Phase 5+ can add live updates.
 """
 import json
 import logging
+import os
 import time
 from datetime import datetime, timezone
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, Tuple
 
 log = logging.getLogger(__name__)
 
@@ -598,6 +599,141 @@ def is_partner_account(ui_account: str) -> bool:
 
 
 # ─────────────────────────────────────────────────────────
+# Phase 4.5+ — Live quote fetcher (Finnhub) with cache
+# ─────────────────────────────────────────────────────────
+
+_QUOTE_CACHE: Dict[str, Tuple[float, Dict]] = {}  # ticker → (timestamp, data)
+_QUOTE_TTL_SECONDS = 60.0  # cache for 1 minute (Finnhub free tier rate-limited)
+
+
+def fetch_live_quote(ticker: str) -> Optional[Dict]:
+    """Fetch a live quote from Finnhub. Returns:
+        {ticker, price, change, change_pct, prev_close, day_high, day_low}
+    Or None on failure. Cached for 60s per ticker.
+    """
+    if not ticker:
+        return None
+    t = ticker.upper().strip()
+    now = time.time()
+    cached = _QUOTE_CACHE.get(t)
+    if cached and (now - cached[0]) < _QUOTE_TTL_SECONDS:
+        return cached[1]
+
+    token = os.getenv("FINNHUB_TOKEN", "").strip()
+    if not token:
+        return None
+
+    try:
+        import requests
+        resp = requests.get(
+            "https://finnhub.io/api/v1/quote",
+            params={"symbol": t, "token": token},
+            timeout=4,
+        )
+        if resp.status_code != 200:
+            return None
+        d = resp.json() or {}
+        # Finnhub returns: c=current, d=change, dp=change_pct, h=high, l=low, pc=prev_close
+        price = float(d.get("c") or 0)
+        if price <= 0:
+            return None  # bad symbol or zero quote
+        result = {
+            "ticker": t,
+            "price": round(price, 2),
+            "change": round(float(d.get("d") or 0), 2),
+            "change_pct": round(float(d.get("dp") or 0), 2),
+            "prev_close": round(float(d.get("pc") or 0), 2),
+            "day_high": round(float(d.get("h") or 0), 2),
+            "day_low": round(float(d.get("l") or 0), 2),
+        }
+        _QUOTE_CACHE[t] = (now, result)
+        return result
+    except Exception:
+        return None
+
+
+def get_watchlist_for_account(ui_account: str, max_tickers: int = 12) -> List[Dict]:
+    """Build a watchlist from open positions in this account.
+
+    Returns one entry per unique ticker, sorted by capital exposure (largest first):
+        [{ticker, has_csp, has_cc, has_shares, capital_at_risk, contracts, shares,
+          quote: {price, change, change_pct} or None}]
+    """
+    from . import writes
+    accounts = underlying_accounts(ui_account)
+    if not accounts:
+        return []
+
+    by_ticker: Dict[str, Dict] = {}
+
+    def _b(t: str) -> Dict:
+        if t not in by_ticker:
+            by_ticker[t] = {
+                "ticker": t,
+                "has_csp": False,
+                "has_cc": False,
+                "has_shares": False,
+                "capital_at_risk": 0.0,
+                "contracts": 0,
+                "shares": 0.0,
+                "cost_basis": 0.0,
+                "subaccounts": set(),
+            }
+        return by_ticker[t]
+
+    for acc in accounts:
+        try:
+            for opt in writes.get_options(acc):
+                if not isinstance(opt, dict) or opt.get("status") != "open":
+                    continue
+                t = (opt.get("ticker") or "").upper()
+                if not t:
+                    continue
+                b = _b(t)
+                ot = opt.get("type", "")
+                if ot == "CSP":
+                    b["has_csp"] = True
+                    b["capital_at_risk"] += (
+                        float(opt.get("strike") or 0)
+                        * int(opt.get("contracts") or 1) * 100
+                    )
+                elif ot == "CC":
+                    b["has_cc"] = True
+                b["contracts"] += int(opt.get("contracts") or 1)
+                if opt.get("subaccount"):
+                    b["subaccounts"].add(opt["subaccount"])
+
+            for ticker, h in writes.get_holdings(acc).items():
+                if not isinstance(h, dict):
+                    continue
+                shares = float(h.get("shares") or 0)
+                if shares <= 0:
+                    continue
+                t = ticker.upper()
+                b = _b(t)
+                b["has_shares"] = True
+                b["shares"] += shares
+                b["cost_basis"] = float(h.get("cost_basis") or 0)
+                b["capital_at_risk"] += shares * b["cost_basis"]
+                if h.get("subaccount"):
+                    b["subaccounts"].add(h["subaccount"])
+        except Exception:
+            pass
+
+    # Sort by capital_at_risk descending
+    rows = list(by_ticker.values())
+    rows.sort(key=lambda r: r["capital_at_risk"], reverse=True)
+    rows = rows[:max_tickers]
+
+    # Attach live quotes (cached)
+    for r in rows:
+        r["subaccounts"] = sorted(r["subaccounts"])
+        r["quote"] = fetch_live_quote(r["ticker"])
+
+    return rows
+
+
+# ─────────────────────────────────────────────────────────
 # Phase 4.5 — Per-sub-account breakdown
 # Replicates Brad's spreadsheet layout: each sub-account shows
 # its own cash, holdings value, income YTD/this-month, and ROI.
@@ -643,7 +779,9 @@ def calc_subaccount_breakdown(ui_account: str) -> Dict:
                 "income_ytd": 0.0,
                 "income_month": 0.0,
                 "by_source": {"options": 0.0, "spreads": 0.0, "fees": 0.0, "summary": 0.0, "shares": 0.0},
-                "starting_balance": 0.0,
+                "total_deposits": 0.0,
+                "total_withdrawals": 0.0,
+                "net_capital": 0.0,  # deposits - withdrawals (Brad's "adjusted starting balance")
                 "open_options": 0,
                 "open_spreads": 0,
                 "open_shares": 0.0,
@@ -686,9 +824,15 @@ def calc_subaccount_breakdown(ui_account: str) -> Dict:
             # Cash always
             b["cash"] += amt
 
-            # Starting balance = positive deposits
-            if ev_type == "deposit" and amt > 0:
-                b["starting_balance"] += amt
+            # Capital tracking (Brad's mental model): deposits add to invested
+            # capital, withdrawals subtract from it. ROI uses the running net.
+            if ev_type == "deposit":
+                if amt > 0:
+                    b["total_deposits"] += amt
+                else:
+                    b["total_withdrawals"] += abs(amt)
+            elif ev_type == "withdrawal":
+                b["total_withdrawals"] += abs(amt)
 
             # Income classification
             bucket_name = INCOME_BUCKET.get(ev_type)
@@ -768,10 +912,17 @@ def calc_subaccount_breakdown(ui_account: str) -> Dict:
         b["capital_reserved"] = round(b["capital_reserved"], 2)
         b["income_ytd"] = round(b["income_ytd"], 2)
         b["income_month"] = round(b["income_month"], 2)
-        b["starting_balance"] = round(b["starting_balance"], 2)
+        b["total_deposits"] = round(b["total_deposits"], 2)
+        b["total_withdrawals"] = round(b["total_withdrawals"], 2)
+        # Net capital = what's actually invested (deposits − withdrawals).
+        # Brad's spreadsheet-equivalent: "adjusted starting balance" reflecting
+        # mid-year cash movements. ROI denominator uses this.
+        b["net_capital"] = round(b["total_deposits"] - b["total_withdrawals"], 2)
+        # Keep `starting_balance` as alias for back-compat with template
+        b["starting_balance"] = b["net_capital"]
         b["roi_ytd"] = round(
-            (b["income_ytd"] / b["starting_balance"]) * 100.0, 2
-        ) if b["starting_balance"] > 0 else 0.0
+            (b["income_ytd"] / b["net_capital"]) * 100.0, 2
+        ) if b["net_capital"] > 0 else 0.0
         b["by_source"] = {k: round(v, 2) for k, v in b["by_source"].items()}
 
     return {
@@ -1029,6 +1180,7 @@ def command_center_data(ui_account: str) -> Dict:
     cash = get_cash_live(ui_account)
     capital = calc_capital_progression(ui_account)
     sub_breakdown = calc_subaccount_breakdown(ui_account)
+    watchlist = get_watchlist_for_account(ui_account)
 
     open_total = (
         len(positions["wheel_options"])
@@ -1055,6 +1207,7 @@ def command_center_data(ui_account: str) -> Dict:
         "cash": cash,
         "capital": capital,
         "sub_breakdown": sub_breakdown,
+        "watchlist": watchlist,
         "open_total": open_total,
         "live_mode": True,  # flag for template if it wants to indicate "live"
     }

@@ -2126,6 +2126,236 @@ body[data-account="clay"] {
   padding: 14px 18px;
 }
 
+/* ─── Phase 4.5+ — Active Wheels card grid ─── */
+.wheels-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(290px, 1fr));
+  gap: 14px;
+  padding: 14px;
+}
+
+.wheel-card {
+  background: linear-gradient(180deg, var(--bg-elev) 0%, var(--bg-panel) 100%);
+  border: 1px solid var(--border-bright);
+  border-left: 3px solid var(--accent);
+  padding: 16px 18px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  position: relative;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+.wheel-card:hover {
+  border-left-color: var(--accent);
+  box-shadow: 0 0 24px rgba(255, 255, 255, 0.04);
+}
+.wheel-card.phase-active_csp_phase {
+  border-left-color: var(--neutral);
+}
+.wheel-card.phase-active_holding {
+  border-left-color: var(--accent);
+}
+
+.wheel-card-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+}
+.wheel-card-ticker {
+  font-family: 'Russo One', sans-serif;
+  font-size: 24px;
+  letter-spacing: 0.04em;
+  color: var(--text);
+  line-height: 1;
+}
+.wheel-card-spot {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 13px;
+  text-align: right;
+  line-height: 1.1;
+}
+.wheel-card-spot .spot-price {
+  font-weight: 600;
+}
+.wheel-card-spot .spot-change {
+  display: block;
+  font-size: 10px;
+  opacity: 0.85;
+}
+.wheel-card-spot .spot-change.up { color: var(--positive); }
+.wheel-card-spot .spot-change.down { color: var(--negative); }
+
+.wheel-card-sub {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin-top: -6px;
+}
+
+.wheel-card-stat-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-top: 6px;
+}
+.wheel-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.wheel-stat-label {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+.wheel-stat-value {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 17px;
+  font-weight: 600;
+  color: var(--text);
+}
+.wheel-stat-sub {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+}
+
+.wheel-card-foot {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 4px;
+}
+.wheel-pill {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  padding: 3px 8px;
+  border: 1px solid var(--border-bright);
+  color: var(--text-muted);
+  border-radius: 2px;
+}
+.wheel-pill.csp-pill {
+  border-color: rgba(0, 232, 156, 0.4);
+  color: var(--positive);
+}
+.wheel-pill.cc-pill {
+  border-color: rgba(246, 195, 68, 0.4);
+  color: var(--neutral);
+}
+.wheel-card-status {
+  margin-left: auto;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.wheel-card-events-toggle {
+  display: block;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  cursor: pointer;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+  user-select: none;
+}
+.wheel-card-events-toggle:hover { color: var(--text); }
+
+.wheel-card-events {
+  display: none;
+  flex-direction: column;
+  gap: 4px;
+  padding-top: 6px;
+}
+.campaign-toggle:checked ~ .wheel-card-events { display: flex; }
+
+/* ═══════════════════════════════════════════════════════
+   WATCHLIST · live spot prices on Command tab
+   ═══════════════════════════════════════════════════════ */
+.watchlist-section { margin: 18px 0 24px 0; }
+.watchlist-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 12px;
+  padding: 0 4px;
+}
+.watchlist-header .section-eyebrow { margin: 0; }
+.watchlist-meta { font-size: 10px; font-style: italic; }
+.watchlist-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
+  gap: 10px;
+}
+.watchlist-card {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--border-bright);
+  padding: 12px 14px;
+  transition: all 0.15s;
+}
+.watchlist-card:hover {
+  border-color: var(--border-bright);
+  background: var(--bg-elev);
+}
+.watchlist-card.positive { border-left-color: var(--positive); }
+.watchlist-card.negative { border-left-color: var(--negative); }
+.watch-ticker-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+.watch-ticker {
+  font-family: 'Russo One', sans-serif;
+  font-size: 16px;
+  letter-spacing: 0.06em;
+  color: var(--text);
+}
+.watch-pills { display: flex; gap: 4px; }
+.watch-pill {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 8px;
+  letter-spacing: 0.08em;
+  padding: 1px 5px;
+  border: 1px solid var(--border-bright);
+  color: var(--text-muted);
+  text-transform: uppercase;
+}
+.watch-pill.csp { color: #06d4f5; border-color: rgba(6, 212, 245, 0.4); }
+.watch-pill.cc  { color: #ec4899; border-color: rgba(236, 72, 153, 0.4); }
+.watch-pill.sh  { color: var(--positive); border-color: rgba(0, 232, 156, 0.4); }
+.watch-price {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--text);
+  letter-spacing: -0.02em;
+}
+.watch-change {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  margin-top: 2px;
+}
+.watchlist-card.positive .watch-change { color: var(--positive); }
+.watchlist-card.negative .watch-change { color: var(--negative); }
+.watch-meta {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px;
+  color: var(--text-dim);
+  margin-top: 8px;
+  letter-spacing: 0.04em;
+}
+
 .sub-breakdown-card {
   padding: 16px 20px;
   margin-top: 14px;
