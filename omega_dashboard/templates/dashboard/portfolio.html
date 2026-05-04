@@ -1549,6 +1549,35 @@
         Patches missing fields on closed options so the YTD income calculator counts them correctly. Idempotent.
       </span>
     </div>
+
+    <!-- Phase 4.5+ — Data exports for reconciliation -->
+    <div class="maintenance-actions" style="margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--border);">
+      <div class="form-section-title" style="font-size: 11px; margin-bottom: 8px;">DOWNLOAD DATA · {{ acct_label.upper() }}</div>
+      <p class="muted" style="font-size: 11px; margin-bottom: 14px; max-width: 720px;">
+        Export everything the dashboard has stored for this account as CSV.
+        Use these to reconcile against your broker statements or share with Claude.
+      </p>
+      <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+        <a href="{{ url_for('dashboard.portfolio_export_all', account=acct) }}" class="btn-primary-sm">
+          ⬇ Full account (.zip)
+        </a>
+        <a href="{{ url_for('dashboard.portfolio_export_cash', account=acct) }}" class="btn-mini">
+          Cash ledger
+        </a>
+        <a href="{{ url_for('dashboard.portfolio_export_options', account=acct) }}" class="btn-mini">
+          Options
+        </a>
+        <a href="{{ url_for('dashboard.portfolio_export_holdings', account=acct) }}" class="btn-mini">
+          Holdings
+        </a>
+        <a href="{{ url_for('dashboard.portfolio_export_spreads', account=acct) }}" class="btn-mini">
+          Spreads
+        </a>
+      </div>
+      <p class="muted" style="font-size: 10px; margin-top: 10px;">
+        Full-account zip includes cash ledger, options (open + closed), holdings, spreads, and active wheels in 5 separate CSVs.
+      </p>
+    </div>
   </div>
 
 </div>

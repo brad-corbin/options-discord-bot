@@ -944,6 +944,279 @@ def portfolio_repair_option_data():
     return redirect(url_for("dashboard.portfolio_section", section="settings"))
 
 
+# ─── PHASE 4.5+: CSV EXPORTS ────────────────
+# So Brad can pull down the actual stored data for reconciliation against
+# his Schwab statements and spreadsheets.
+
+def _csv_response(filename: str, rows: list) -> "Response":
+    """Build a CSV download response. rows = list of lists (first row = header)."""
+    import csv, io
+    buf = io.StringIO()
+    writer = csv.writer(buf, quoting=csv.QUOTE_MINIMAL)
+    for r in rows:
+        writer.writerow(r)
+    resp = make_response(buf.getvalue())
+    resp.headers["Content-Type"] = "text/csv; charset=utf-8"
+    resp.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+    return resp
+
+
+@dashboard_bp.route("/portfolio/export/cash/<account>.csv", methods=["GET"])
+@login_required
+def portfolio_export_cash(account):
+    """Export cash ledger for an account as CSV."""
+    from . import writes
+    if account not in ("brad", "mom", "partner", "kyleigh", "clay"):
+        return "Invalid account", 400
+    ledger = writes.get_cash_ledger(account)
+    rows = [["date", "type", "amount", "subaccount", "note", "ref_id", "ref_type", "id"]]
+    for ev in sorted(ledger, key=lambda e: (e.get("date", ""), e.get("id", ""))):
+        if not isinstance(ev, dict):
+            continue
+        rows.append([
+            ev.get("date", ""),
+            ev.get("type", ""),
+            f"{float(ev.get('amount') or 0):.2f}",
+            ev.get("subaccount", ""),
+            ev.get("note", ""),
+            ev.get("ref_id", ""),
+            ev.get("ref_type", ""),
+            ev.get("id", ""),
+        ])
+    from datetime import date as _date
+    return _csv_response(
+        f"omega_cash_ledger_{account}_{_date.today().isoformat()}.csv", rows
+    )
+
+
+@dashboard_bp.route("/portfolio/export/options/<account>.csv", methods=["GET"])
+@login_required
+def portfolio_export_options(account):
+    """Export all options (open + closed) for an account as CSV."""
+    from . import writes
+    if account not in ("brad", "mom", "partner", "kyleigh", "clay"):
+        return "Invalid account", 400
+    options = writes.get_options(account)
+    rows = [["id", "ticker", "type", "direction", "strike", "exp", "premium",
+             "contracts", "subaccount", "category", "tag", "open_date",
+             "status", "close_date", "close_premium", "note"]]
+    for o in sorted(options, key=lambda x: (x.get("open_date", ""), x.get("id", ""))):
+        if not isinstance(o, dict):
+            continue
+        rows.append([
+            o.get("id", ""),
+            o.get("ticker", ""),
+            o.get("type", ""),
+            o.get("direction", ""),
+            o.get("strike", ""),
+            o.get("exp", ""),
+            o.get("premium", ""),
+            o.get("contracts", ""),
+            o.get("subaccount", ""),
+            o.get("category", ""),
+            o.get("tag", ""),
+            o.get("open_date", ""),
+            o.get("status", ""),
+            o.get("close_date", ""),
+            o.get("close_premium", ""),
+            o.get("note", ""),
+        ])
+    from datetime import date as _date
+    return _csv_response(
+        f"omega_options_{account}_{_date.today().isoformat()}.csv", rows
+    )
+
+
+@dashboard_bp.route("/portfolio/export/holdings/<account>.csv", methods=["GET"])
+@login_required
+def portfolio_export_holdings(account):
+    """Export share holdings for an account as CSV."""
+    from . import writes
+    if account not in ("brad", "mom", "partner", "kyleigh", "clay"):
+        return "Invalid account", 400
+    holdings = writes.get_holdings(account)
+    rows = [["ticker", "shares", "cost_basis", "lot_value", "subaccount",
+             "tag", "first_added", "last_updated"]]
+    for ticker, h in sorted(holdings.items()):
+        if not isinstance(h, dict):
+            continue
+        shares = float(h.get("shares") or 0)
+        cb = float(h.get("cost_basis") or 0)
+        rows.append([
+            ticker,
+            shares,
+            f"{cb:.4f}",
+            f"{shares * cb:.2f}",
+            h.get("subaccount", ""),
+            h.get("tag", ""),
+            h.get("first_added", ""),
+            h.get("last_updated", ""),
+        ])
+    from datetime import date as _date
+    return _csv_response(
+        f"omega_holdings_{account}_{_date.today().isoformat()}.csv", rows
+    )
+
+
+@dashboard_bp.route("/portfolio/export/spreads/<account>.csv", methods=["GET"])
+@login_required
+def portfolio_export_spreads(account):
+    """Export spreads for an account as CSV."""
+    from . import writes
+    if account not in ("brad", "mom", "partner", "kyleigh", "clay"):
+        return "Invalid account", 400
+    spreads = writes.get_spreads(account)
+    rows = [["id", "ticker", "spread_type", "long_strike", "short_strike",
+             "exp", "net", "contracts", "is_credit", "subaccount", "tag",
+             "open_date", "status", "close_date", "close_value", "note"]]
+    for s in sorted(spreads, key=lambda x: (x.get("open_date", ""), x.get("id", ""))):
+        if not isinstance(s, dict):
+            continue
+        rows.append([
+            s.get("id", ""),
+            s.get("ticker", ""),
+            s.get("spread_type", ""),
+            s.get("long_strike", ""),
+            s.get("short_strike", ""),
+            s.get("exp", ""),
+            s.get("net", ""),
+            s.get("contracts", ""),
+            s.get("is_credit", ""),
+            s.get("subaccount", ""),
+            s.get("tag", ""),
+            s.get("open_date", ""),
+            s.get("status", ""),
+            s.get("close_date", ""),
+            s.get("close_value", ""),
+            s.get("note", ""),
+        ])
+    from datetime import date as _date
+    return _csv_response(
+        f"omega_spreads_{account}_{_date.today().isoformat()}.csv", rows
+    )
+
+
+@dashboard_bp.route("/portfolio/export/all/<account>.zip", methods=["GET"])
+@login_required
+def portfolio_export_all(account):
+    """Export everything for an account as a single ZIP."""
+    import io, zipfile, csv
+    from datetime import date as _date
+    from . import writes
+    if account not in ("brad", "mom", "partner", "kyleigh", "clay"):
+        return "Invalid account", 400
+
+    def _write_csv(rows: list) -> bytes:
+        buf = io.StringIO()
+        w = csv.writer(buf, quoting=csv.QUOTE_MINIMAL)
+        for r in rows:
+            w.writerow(r)
+        return buf.getvalue().encode("utf-8")
+
+    today = _date.today().isoformat()
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        # Cash ledger
+        ledger = writes.get_cash_ledger(account)
+        rows = [["date", "type", "amount", "subaccount", "note", "ref_id", "ref_type", "id"]]
+        for ev in sorted(ledger, key=lambda e: (e.get("date", ""), e.get("id", ""))):
+            if isinstance(ev, dict):
+                rows.append([
+                    ev.get("date", ""), ev.get("type", ""),
+                    f"{float(ev.get('amount') or 0):.2f}",
+                    ev.get("subaccount", ""), ev.get("note", ""),
+                    ev.get("ref_id", ""), ev.get("ref_type", ""),
+                    ev.get("id", ""),
+                ])
+        zf.writestr(f"cash_ledger_{account}.csv", _write_csv(rows))
+
+        # Options
+        options = writes.get_options(account)
+        rows = [["id", "ticker", "type", "direction", "strike", "exp", "premium",
+                 "contracts", "subaccount", "category", "tag", "open_date",
+                 "status", "close_date", "close_premium", "note"]]
+        for o in sorted(options, key=lambda x: (x.get("open_date", ""), x.get("id", ""))):
+            if isinstance(o, dict):
+                rows.append([
+                    o.get("id", ""), o.get("ticker", ""), o.get("type", ""),
+                    o.get("direction", ""), o.get("strike", ""), o.get("exp", ""),
+                    o.get("premium", ""), o.get("contracts", ""),
+                    o.get("subaccount", ""), o.get("category", ""), o.get("tag", ""),
+                    o.get("open_date", ""), o.get("status", ""),
+                    o.get("close_date", ""), o.get("close_premium", ""),
+                    o.get("note", ""),
+                ])
+        zf.writestr(f"options_{account}.csv", _write_csv(rows))
+
+        # Holdings
+        holdings = writes.get_holdings(account)
+        rows = [["ticker", "shares", "cost_basis", "lot_value", "subaccount",
+                 "tag", "first_added", "last_updated"]]
+        for ticker, h in sorted(holdings.items()):
+            if isinstance(h, dict):
+                shares = float(h.get("shares") or 0)
+                cb = float(h.get("cost_basis") or 0)
+                rows.append([
+                    ticker, shares, f"{cb:.4f}", f"{shares * cb:.2f}",
+                    h.get("subaccount", ""), h.get("tag", ""),
+                    h.get("first_added", ""), h.get("last_updated", ""),
+                ])
+        zf.writestr(f"holdings_{account}.csv", _write_csv(rows))
+
+        # Spreads
+        spreads = writes.get_spreads(account)
+        rows = [["id", "ticker", "spread_type", "long_strike", "short_strike",
+                 "exp", "net", "contracts", "is_credit", "subaccount", "tag",
+                 "open_date", "status", "close_date", "close_value", "note"]]
+        for s in sorted(spreads, key=lambda x: (x.get("open_date", ""), x.get("id", ""))):
+            if isinstance(s, dict):
+                rows.append([
+                    s.get("id", ""), s.get("ticker", ""), s.get("spread_type", ""),
+                    s.get("long_strike", ""), s.get("short_strike", ""),
+                    s.get("exp", ""), s.get("net", ""), s.get("contracts", ""),
+                    s.get("is_credit", ""), s.get("subaccount", ""), s.get("tag", ""),
+                    s.get("open_date", ""), s.get("status", ""),
+                    s.get("close_date", ""), s.get("close_value", ""),
+                    s.get("note", ""),
+                ])
+        zf.writestr(f"spreads_{account}.csv", _write_csv(rows))
+
+        # Active campaigns (wheels) summary
+        try:
+            from . import campaigns as _campaigns
+            camps = _campaigns.get_campaigns(account)
+            rows = [["ticker", "subaccount", "status", "opened_at", "closed_at",
+                     "total_premium", "shares_held", "weighted_cost_basis",
+                     "effective_basis", "csp_open_count", "cc_open_count",
+                     "duration_days", "events_count"]]
+            for c in camps:
+                rollup = c.get("rollup") or {}
+                rows.append([
+                    c.get("ticker", ""), c.get("subaccount", ""),
+                    c.get("status", ""), c.get("opened_at", ""),
+                    c.get("closed_at", ""),
+                    rollup.get("total_premium", 0),
+                    rollup.get("shares_held", 0),
+                    rollup.get("weighted_cost_basis", 0),
+                    rollup.get("effective_basis", 0),
+                    rollup.get("csp_open_count", 0),
+                    rollup.get("cc_open_count", 0),
+                    rollup.get("duration_days", 0),
+                    len(c.get("events", []) or []),
+                ])
+            zf.writestr(f"campaigns_{account}.csv", _write_csv(rows))
+        except Exception as e:
+            log.warning(f"campaigns export skipped: {e}")
+
+    zip_buf.seek(0)
+    resp = make_response(zip_buf.getvalue())
+    resp.headers["Content-Type"] = "application/zip"
+    resp.headers["Content-Disposition"] = (
+        f'attachment; filename="omega_{account}_full_{today}.zip"'
+    )
+    return resp
+
+
 # ─── PHASE 4.5: EDIT CLOSED POSITION META ────────────────
 
 @dashboard_bp.route("/portfolio/options/edit-closed/<opt_id>", methods=["POST"])
