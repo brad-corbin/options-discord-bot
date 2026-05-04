@@ -1120,12 +1120,17 @@ def update_lumpsum(account: str, entry_id: str, value: float = None,
 
 
 def delete_lumpsum(account: str, entry_id: str,
-                   credit_cash: bool = False) -> Dict:
+                   credit_cash: bool = False,
+                   reverse_purchase: bool = False) -> Dict:
     """Delete a lump-sum entry.
 
-    Phase 4.5+: if `credit_cash` is True, also creates a `lumpsum_sell`
-    cash event for the entry's current value (treating delete as a full
-    sell-out of the position).
+    Phase 4.5+ cash impact options (mutually exclusive):
+      - `credit_cash=True`: SOLD the position. Credits cash by current value
+        via a new `lumpsum_sell` event.
+      - `reverse_purchase=True`: MISTAKE / undo. Removes the matching
+        `lumpsum_buy` event(s) for this entry — reversing the original
+        cost-basis cash debit. Use this for duplicate entries.
+      - Both False (default): just remove the entry, no cash impact.
     """
     if not _validate_account(account):
         return {"ok": False, "error": "Invalid account"}
@@ -1133,12 +1138,28 @@ def delete_lumpsum(account: str, entry_id: str,
     target = next((e for e in items if e.get("id") == entry_id), None)
     if not target:
         return {"ok": False, "error": "Not found"}
+
+    reversed_amount = 0.0
+    if reverse_purchase:
+        # Find any cash events of type lumpsum_buy that reference this entry
+        ledger = get_cash_ledger(account)
+        buy_events = [
+            e for e in ledger
+            if isinstance(e, dict)
+            and e.get("type") == "lumpsum_buy"
+            and e.get("ref_id") == entry_id
+        ]
+        if buy_events:
+            ids = [e["id"] for e in buy_events]
+            cr = delete_cash_events_bulk(account, ids)
+            reversed_amount = sum(abs(float(e.get("amount") or 0)) for e in buy_events)
+
     items = [e for e in items if e.get("id") != entry_id]
     if not _save(_key_lumpsum(account), items):
         return {"ok": False, "error": "Save failed"}
     _audit(account, "delete_lumpsum", entry_id, target, None)
 
-    if credit_cash:
+    if credit_cash and not reverse_purchase:
         val = float(target.get("value") or 0)
         sub = target.get("subaccount") or DEFAULT_SUBACCOUNT
         label_now = target.get("label", "")
@@ -1150,7 +1171,7 @@ def delete_lumpsum(account: str, entry_id: str,
                 note=f"Liquidate {label_now} (${val:,.2f})",
                 ref_id=entry_id, ref_type="lumpsum",
             )
-    return {"ok": True}
+    return {"ok": True, "reversed_amount": reversed_amount}
 
 
 # ═════════════════════════════════════════════════════════

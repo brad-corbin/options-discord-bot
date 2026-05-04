@@ -1209,7 +1209,9 @@ def command_center_data(ui_account: str) -> Dict:
     cash = get_cash_live(ui_account)
     capital = calc_capital_progression(ui_account)
     sub_breakdown = calc_subaccount_breakdown(ui_account)
-    watchlist = get_watchlist_for_account(ui_account)
+    # Phase 4.5+ — combined view aggregates across all accounts; show more tickers
+    wl_max = 30 if ui_account == "combined" else 12
+    watchlist = get_watchlist_for_account(ui_account, max_tickers=wl_max)
 
     open_total = (
         len(positions["wheel_options"])
