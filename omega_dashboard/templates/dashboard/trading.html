@@ -13,22 +13,29 @@
   </div>
 </div>
 
-<div class="phase1-stub fade-in">
-  <svg class="phase1-watermark" viewBox="0 0 100 100" fill="none">
-    <path d="M50 8 L82 22 L82 56 L70 76 L60 88 L40 88 L30 76 L18 56 L18 22 Z"
-          stroke="currentColor" stroke-width="0.5" fill="none"/>
-    <text x="50" y="62" text-anchor="middle" font-family="Russo One, sans-serif"
-          font-size="38" font-weight="700" fill="currentColor">Ω</text>
-  </svg>
+<!-- ─── TRADING ROW TABLE ──────────────────────────────────
+  Day 1 ship — 15 column situation row, 5-second polling.
+  Best MFE column intentionally omitted (broken grader; do not show
+  misleading data).
+─────────────────────────────────────────────────────────── -->
 
-  <div class="phase1-title">Trading View</div>
-  <div class="phase1-msg">
-    The live alerts feed and watch map grid land here in a later phase.
-    Building this safely requires careful integration with the bot's
-    in-memory scanner and thesis monitor.
-    <br><br>
-    For now, your existing Telegram alerts handle live trading. The Command
-    Center reflects your portfolio state as of the most recent snapshot.
+<div class="trading-row-section fade-in">
+  <div class="trading-row-header">
+    <div class="trading-row-eyebrow">— SITUATION · {{ page_data.tickers_total }} TICKERS</div>
+    <div class="trading-row-meta">
+      <span class="trading-status-dot"
+            id="trading-status-dot"
+            data-state="{% if page_data.available %}live{% else %}stale{% endif %}"></span>
+      <span class="trading-meta-text" id="trading-meta-text">
+        {% if page_data.available %}
+          Last update <span class="num" id="trading-last-update">{{ page_data.fetched_at_ct }}</span>
+          · {{ page_data.tickers_with_data }} of {{ page_data.tickers_total }} populated
+          · refresh 5s
+        {% else %}
+          Trading data layer unavailable
+        {% endif %}
+      </span>
+    </div>
   </div>
 
   {% if page_data.error %}
