@@ -920,10 +920,16 @@
                   <option value="{{ sub }}" {% if sub == o.subaccount %}selected{% endif %}>{{ sub }}</option>
                 {% endfor %}
               </select>
+              <label>Open prem $</label>
+              <input type="text" inputmode="decimal" name="premium" value="{{ o.premium }}" style="width: 75px;">
+              <label>×</label>
+              <input type="text" inputmode="numeric" name="contracts" value="{{ o.contracts }}" style="width: 50px;">
+              <label>Close $</label>
+              <input type="text" inputmode="decimal" name="close_premium" value="{{ o.close_premium or 0 }}" style="width: 75px;">
               <label>Note</label>
-              <input type="text" name="note" value="{{ o.note or '' }}" placeholder="Optional note" style="min-width: 200px;">
+              <input type="text" name="note" value="{{ o.note or '' }}" placeholder="Optional note" style="min-width: 160px;">
               <button type="submit" class="btn-primary-sm">Save</button>
-              <span class="muted" style="font-size: 10px; margin-left: 8px;">Updates metadata only — cash math unchanged.</span>
+              <span class="muted" style="font-size: 10px; margin-left: 8px;">Premium/contracts changes adjust the linked cash event automatically.</span>
             </form>
           </td>
         </tr>

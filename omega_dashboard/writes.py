@@ -2313,10 +2313,122 @@ def backfill_campaign_history(account: Optional[str] = None) -> Dict:
             continue
 
         camps = _campaigns._load_campaigns(acc)
-        if not camps:
-            continue
 
-        any_modified = False
+        # ── Phase 4.5+ — Orphan discovery ──
+        # Scan the audit log for option events on this account whose opt_ids
+        # don't appear in any existing campaign. Create campaigns for each
+        # orphan group (by ticker+subaccount). This recovers wheels that were
+        # missed when the campaign system was added mid-flight, OR when CCs
+        # were opened against manually-added shares (older code paths).
+        existing_opt_ids: set = set()
+        for camp in camps:
+            for ev in camp.get("events", []) or []:
+                if ev.get("id"):
+                    existing_opt_ids.add(ev["id"])
+                if ev.get("old_id"):
+                    existing_opt_ids.add(ev["old_id"])
+
+        orphan_groups: Dict[tuple, List[Dict]] = {}  # (ticker, sub) → [audit entries]
+        for entry in raw:
+            if entry.get("account") != acc:
+                continue
+            op = entry.get("op", "") or ""
+            if op != "add_option":
+                continue
+            tgt = entry.get("target", "")
+            if not tgt or tgt in existing_opt_ids:
+                continue
+            od = entry.get("_parsed_new") or {}
+            if not isinstance(od, dict):
+                continue
+            opt_type = od.get("type", "")
+            direction = od.get("direction", "sell")
+            if opt_type not in ("CSP", "CC") or direction != "sell":
+                continue
+            ticker = od.get("ticker") or ""
+            sub = od.get("subaccount") or ""
+            if not ticker:
+                continue
+            orphan_groups.setdefault((ticker, sub), []).append(entry)
+
+        for (ticker, sub), entries in orphan_groups.items():
+            # Sort by open_date / timestamp so the earliest open is the seed
+            entries.sort(key=lambda e: (
+                (e.get("_parsed_new") or {}).get("open_date") or e.get("timestamp", "")
+            ))
+            seed_entry = entries[0]
+            seed_data = seed_entry.get("_parsed_new") or {}
+            seed_opt_type = seed_data.get("type", "")
+
+            # Build initial event from seed
+            def _build_open_event(entry, data):
+                ot = data.get("type", "")
+                ev_type = "csp_open" if ot == "CSP" else "cc_open" if ot == "CC" else None
+                if not ev_type:
+                    return None
+                return {
+                    "type": ev_type,
+                    "id": entry.get("target"),
+                    "premium": data.get("premium"),
+                    "contracts": data.get("contracts") or 1,
+                    "strike": data.get("strike"),
+                    "exp": data.get("exp"),
+                    "open_date": data.get("open_date") or entry.get("timestamp", "")[:10],
+                    "date": data.get("open_date") or entry.get("timestamp", "")[:10],
+                    "backfilled": True,
+                }
+
+            seed_event = _build_open_event(seed_entry, seed_data)
+            if not seed_event:
+                continue
+
+            new_camp = _campaigns.start_campaign(acc, ticker, sub, seed_event)
+            if not new_camp:
+                continue
+
+            # If seed was a CC, the campaign starts in holding phase (CCs require shares).
+            if seed_opt_type == "CC":
+                _campaigns.transition_to_holding(acc, new_camp["id"])
+
+            # Add the rest of the orphan options as events on the same campaign
+            # (these are independent CSPs/CCs on the same ticker+sub that weren't
+            # rolled from the seed; the existing roll-chain walk below handles
+            # their close/expire events).
+            for entry in entries[1:]:
+                data = entry.get("_parsed_new") or {}
+                ev = _build_open_event(entry, data)
+                if ev:
+                    _campaigns.attach_event(acc, new_camp["id"], ev)
+
+            any_modified = True
+            summary["campaigns_modified"] += 1
+            seed_premium = float(seed_event.get("premium") or 0) * int(seed_event.get("contracts") or 1) * 100
+            extra_premium = sum(
+                float((e.get("_parsed_new") or {}).get("premium") or 0)
+                * int((e.get("_parsed_new") or {}).get("contracts") or 1) * 100
+                for e in entries[1:]
+            )
+            summary["details"].append({
+                "account": acc,
+                "ticker": ticker,
+                "subaccount": sub,
+                "events_before": 0,
+                "events_after": len(entries),
+                "premium_before": 0.0,
+                "premium_after": round(seed_premium + extra_premium, 2),
+                "discovery": True,
+            })
+
+        # Reload campaigns after discovery so subsequent walks include the new ones
+        if orphan_groups:
+            camps = _campaigns._load_campaigns(acc)
+
+        any_modified = bool(orphan_groups)
+        if not camps:
+            if any_modified:
+                # Edge case: orphans were created but immediately persisted by start_campaign
+                summary["accounts_modified"] += 1
+            continue
 
         for camp in camps:
             old_events = camp.get("events", []) or []
@@ -2693,8 +2805,16 @@ def repair_option_data(account: Optional[str] = None) -> Dict:
 
 def edit_closed_option_meta(account: str, opt_id: str,
                               subaccount: Optional[str] = None,
-                              note: Optional[str] = None) -> Dict:
-    """Update sub-account or note on a closed option (does not touch cash)."""
+                              note: Optional[str] = None,
+                              premium: Optional[float] = None,
+                              contracts: Optional[int] = None,
+                              close_premium: Optional[float] = None) -> Dict:
+    """Update fields on a closed option.
+
+    Phase 4.5+: now also supports correcting the open premium, contracts, and
+    close premium. When those change, the linked cash events are adjusted so
+    cash totals stay correct.
+    """
     if not _validate_account(account):
         return {"ok": False, "error": "Invalid account"}
 
@@ -2705,32 +2825,81 @@ def edit_closed_option_meta(account: str, opt_id: str,
     if opt.get("status") == "open":
         return {"ok": False, "error": "Use the regular edit form for open options"}
 
-    old = {"subaccount": opt.get("subaccount"), "note": opt.get("note")}
+    old = {
+        "subaccount": opt.get("subaccount"),
+        "note": opt.get("note"),
+        "premium": opt.get("premium"),
+        "contracts": opt.get("contracts"),
+        "close_premium": opt.get("close_premium"),
+    }
     if subaccount is not None:
         opt["subaccount"] = subaccount.strip() or DEFAULT_SUBACCOUNT
     if note is not None:
         opt["note"] = note.strip()
 
+    # Phase 4.5 — premium / contracts / close_premium edits with cash propagation
+    new_premium = _to_float(premium) if premium is not None else None
+    new_contracts = _to_int(contracts) if contracts is not None else None
+    new_close_premium = _to_float(close_premium) if close_premium is not None else None
+
+    if new_premium is not None and new_premium >= 0:
+        opt["premium"] = round(new_premium, 4)
+    if new_contracts is not None and new_contracts > 0:
+        opt["contracts"] = new_contracts
+    if new_close_premium is not None and new_close_premium >= 0:
+        opt["close_premium"] = round(new_close_premium, 4)
+
     if not _save(_key_options(account), options):
         return {"ok": False, "error": "Save failed"}
 
-    # Update linked cash events' sub-account too so the cash ledger stays consistent
-    if subaccount is not None:
-        ledger = get_cash_ledger(account)
-        changed = False
-        for ev in ledger:
-            if isinstance(ev, dict) and ev.get("ref_id") == opt_id:
-                if ev.get("subaccount") != opt["subaccount"]:
-                    ev["subaccount"] = opt["subaccount"]
-                    changed = True
-        if changed:
-            _save(_key_cash_ledger(account), ledger)
+    # Now reconcile cash events linked to this option
+    ledger = get_cash_ledger(account)
+    cash_changed = False
+    direction = opt.get("direction", "sell")
+    final_contracts = int(opt.get("contracts") or 1)
+    final_premium = float(opt.get("premium") or 0)
+    final_close = float(opt.get("close_premium") or 0)
 
-    _audit(account, "edit_closed_option_meta", opt_id, old, {
+    # Sell-to-open credits cash; buy-to-open debits.
+    sign_open = 1.0 if direction == "sell" else -1.0
+    sign_close = -1.0 if direction == "sell" else 1.0  # closing sell = pay back, closing buy = receive
+
+    target_open_amount = round(sign_open * final_premium * final_contracts * 100, 2)
+    target_close_amount = round(sign_close * final_close * final_contracts * 100, 2)
+
+    for ev in ledger:
+        if not isinstance(ev, dict) or ev.get("ref_id") != opt_id:
+            continue
+        ev_type = ev.get("type", "")
+        if ev_type == "option_open":
+            if subaccount is not None and ev.get("subaccount") != opt["subaccount"]:
+                ev["subaccount"] = opt["subaccount"]
+                cash_changed = True
+            if abs(float(ev.get("amount") or 0) - target_open_amount) > 0.005:
+                ev["amount"] = target_open_amount
+                ev["note"] = (ev.get("note") or "") + " [edited]"
+                cash_changed = True
+        elif ev_type == "option_close":
+            if subaccount is not None and ev.get("subaccount") != opt["subaccount"]:
+                ev["subaccount"] = opt["subaccount"]
+                cash_changed = True
+            if abs(float(ev.get("amount") or 0) - target_close_amount) > 0.005:
+                ev["amount"] = target_close_amount
+                ev["note"] = (ev.get("note") or "") + " [edited]"
+                cash_changed = True
+
+    if cash_changed:
+        _save(_key_cash_ledger(account), ledger)
+
+    new_meta = {
         "subaccount": opt.get("subaccount"),
         "note": opt.get("note"),
-    })
-    return {"ok": True, "option": opt}
+        "premium": opt.get("premium"),
+        "contracts": opt.get("contracts"),
+        "close_premium": opt.get("close_premium"),
+    }
+    _audit(account, "edit_closed_option_meta", opt_id, old, new_meta)
+    return {"ok": True, "option": opt, "cash_adjusted": cash_changed}
 
 
 def edit_closed_spread_meta(account: str, spr_id: str,

@@ -466,12 +466,45 @@ def hook_option_added(account: str, opt: Dict) -> None:
                 start_campaign(account, ticker, sub, event)
 
         elif opt_type == "CC":
-            # CCs always attach to the active holding campaign
+            # CCs attach to the active holding campaign. If none exists but
+            # shares DO exist (e.g., shares were added manually, not via CSP
+            # auto-assignment), create a holding-phase campaign on the fly so
+            # the CC is tracked.
             holding = get_active_holding_campaign(account, ticker, sub)
             if not holding:
-                # CC without shares is unusual — skip campaign tracking
-                # (could be a naked call, not a wheel)
-                return
+                # Check if shares exist for this ticker+sub
+                from . import writes
+                try:
+                    holdings_dict = writes.get_holdings(account)
+                    h = holdings_dict.get(ticker)
+                    has_shares = (
+                        isinstance(h, dict)
+                        and (h.get("subaccount") == sub or not sub)
+                        and float(h.get("shares") or 0) > 0
+                    )
+                except Exception:
+                    has_shares = False
+
+                if not has_shares:
+                    # CC without shares is unusual — skip campaign tracking
+                    # (could be a naked call, not a wheel)
+                    return
+
+                # Auto-create holding-phase campaign for these orphan shares
+                seed_event = {
+                    "type": "shares_seeded",
+                    "ticker": ticker,
+                    "shares": float(h.get("shares") or 0),
+                    "cost_basis": float(h.get("cost_basis") or 0),
+                    "date": h.get("acquired") or _today_iso(),
+                    "note": "Auto-created when CC opened against existing shares",
+                }
+                holding = start_campaign(account, ticker, sub, seed_event)
+                if not holding:
+                    return
+                # Mark as already in holding phase (no CSP precedes it)
+                transition_to_holding(account, holding["id"])
+
             event = {
                 "type": "cc_open",
                 "id": opt.get("id"),

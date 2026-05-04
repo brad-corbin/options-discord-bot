@@ -940,18 +940,28 @@ def portfolio_repair_option_data():
 @dashboard_bp.route("/portfolio/options/edit-closed/<opt_id>", methods=["POST"])
 @login_required
 def portfolio_option_edit_closed(opt_id):
-    """Edit sub-account / note on a closed option (does not touch cash math)."""
+    """Edit metadata on a closed option. Supports sub-account, note, and
+    (Phase 4.5+) premium / contracts / close_premium with cash-event reconciliation."""
     from . import writes
     acct = request.form.get("acct", "brad")
     sub = request.form.get("subaccount")
     note = request.form.get("note")
+    premium = request.form.get("premium")
+    contracts = request.form.get("contracts")
+    close_premium = request.form.get("close_premium")
     result = writes.edit_closed_option_meta(
         acct, opt_id,
         subaccount=sub if sub is not None else None,
         note=note if note is not None else None,
+        premium=premium if premium not in (None, "") else None,
+        contracts=contracts if contracts not in (None, "") else None,
+        close_premium=close_premium if close_premium not in (None, "") else None,
     )
     if result.get("ok"):
-        _flash(f"Updated closed option metadata", "success")
+        msg = "Updated closed option"
+        if result.get("cash_adjusted"):
+            msg += " (cash events adjusted to match new values)"
+        _flash(msg, "success")
     else:
         _flash(f"Edit failed: {result.get('error')}", "error")
     return _bounce("options", acct)

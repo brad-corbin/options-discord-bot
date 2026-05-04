@@ -14,15 +14,15 @@
   --border: #1c1c2a;
   --border-bright: #2a2a3d;
   --text: #e8e8f0;
-  --text-muted: #7a7a8e;
-  --text-dim: #4a4a5a;
+  --text-muted: #9999b0;
+  --text-dim: #6a6a7c;
 
   /* Account palette */
   --combined: #00e89c;
   --combined-glow: rgba(0, 232, 156, 0.15);
-  --mine: #500000;
-  --mine-glow: rgba(80, 0, 0, 0.4);
-  --mine-bright: #8b1818;
+  --mine: #d63333;
+  --mine-glow: rgba(214, 51, 51, 0.32);
+  --mine-bright: #e85555;
   --mom: #ec4899;
   --mom-glow: rgba(236, 72, 153, 0.18);
   --partner: #06d4f5;
@@ -1756,21 +1756,25 @@ body[data-account="clay"] {
 
 /* Mini button variants */
 .btn-mini-danger {
-  border-color: rgba(255, 71, 87, 0.4);
-  color: #ff6b7a;
+  border-color: #ff6b7a;
+  color: #ff8b9a;
+  background: rgba(255, 71, 87, 0.08);
 }
 .btn-mini-danger:hover {
   border-color: var(--negative);
-  color: var(--negative);
+  color: white;
+  background: var(--negative);
 }
 
 .btn-mini-warn {
-  border-color: rgba(246, 195, 68, 0.4);
-  color: #f6c344;
+  border-color: #f6c344;
+  color: #ffd45e;
+  background: rgba(246, 195, 68, 0.08);
 }
 .btn-mini-warn:hover {
   border-color: #f6c344;
-  color: #ffd45e;
+  color: var(--bg);
+  background: #f6c344;
 }
 
 /* Inline form metadata text */
