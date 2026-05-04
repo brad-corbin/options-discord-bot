@@ -1242,3 +1242,149 @@ def command_center_data(ui_account: str) -> Dict:
         "open_total": open_total,
         "live_mode": True,  # flag for template if it wants to indicate "live"
     }
+
+"""
+Trading tab data layer — Day 1 ship.
+
+Phase 5a Day 1 — visible row first.
+
+Strategy: this function calls dashboard.get_ticker_snapshot(ticker) for each
+ticker in oi_flow.FLOW_TICKERS. The bot's existing dashboard.py already builds
+a complete row dict per ticker — same data that writes to the Sheets dashboard
+tab. We import that function and call it in a loop. No new data plumbing.
+
+Best MFE column is intentionally NOT included in the returned snapshot. The
+underlying tracker has known correctness issues (RT-1 init bias, RT-4 UTC vs
+CT date) that bias the metric. Brad's preference is to omit broken metrics
+rather than show misleading data. When the grader is rebuilt to match how
+trades are actually closed (option-mid polling for longs, expiration close
+for spreads), the column will reappear with real data.
+
+Open Campaigns column IS included even though Brad isn't sure it's correct.
+The column serves as its own diagnostic — if it's always 0 when there should
+be active campaigns, that's a bug surfaced. If it's correctly 0 because
+nothing's fired, that's useful too.
+
+Failure mode: if the bot's dashboard module isn't importable (DASHBOARD_ENABLED
+not set, init failed), every row is skipped silently and the function returns
+an empty list. The route handler renders "no data" rather than crashing the
+page. Trading tab can't take down the rest of the dashboard.
+"""
+
+import logging
+import time
+from typing import Dict, List, Optional
+
+log = logging.getLogger(__name__)
+
+# Cache the trading_data response for 1.0 second. Polling at 5s on the client
+# means up to ~5 concurrent dashboard users would hit this function 5x/sec.
+# A 1s cache flattens that to ~1/sec while keeping the row visibly fresh.
+_TRADING_CACHE: Dict[str, tuple] = {}
+_TRADING_CACHE_TTL_SEC = 1.0
+
+
+def trading_data(ui_account: str) -> Dict:
+    """Build trading-tab row data.
+
+    Returns:
+        {
+            "ui_account": str,
+            "rows": [<ticker_snapshot>, ...],   # ordered alphabetically
+            "tickers_total": int,
+            "tickers_with_data": int,           # rows with at least one
+                                                  # populated cell beyond ticker
+            "fetched_at_ts": float,             # epoch
+            "fetched_at_ct": str,               # "HH:MM:SS"
+            "available": bool,                  # False if dashboard unavailable
+            "error": Optional[str],
+        }
+    """
+    cache_key = f"{ui_account}"
+    cached = _TRADING_CACHE.get(cache_key)
+    now = time.time()
+    if cached and (now - cached[0]) < _TRADING_CACHE_TTL_SEC:
+        return cached[1]
+
+    try:
+        import dashboard as bot_dashboard
+        from oi_flow import FLOW_TICKERS
+    except Exception as e:
+        log.warning(f"trading_data: bot module import failed: {e}")
+        result = {
+            "ui_account": ui_account,
+            "rows": [],
+            "tickers_total": 0,
+            "tickers_with_data": 0,
+            "fetched_at_ts": now,
+            "fetched_at_ct": _ct_time_str(now),
+            "available": False,
+            "error": "Trading data layer is initializing or unavailable.",
+        }
+        _TRADING_CACHE[cache_key] = (now, result)
+        return result
+
+    rows: List[Dict] = []
+    tickers_with_data = 0
+    tickers = sorted(FLOW_TICKERS)
+
+    for ticker in tickers:
+        try:
+            snap = bot_dashboard.get_ticker_snapshot(ticker)
+        except Exception as e:
+            log.debug(f"trading_data: snapshot failed for {ticker}: {e}")
+            snap = {"ticker": ticker, "spot": None}
+
+        # Strip Best MFE — broken grader, omit rather than mislead
+        snap.pop("best_mfe", None)
+        snap.pop("best_peak_pct_lifetime", None)
+        snap.pop("best_245_pct", None)
+        snap.pop("best_hold_peak_pct", None)
+
+        if _row_has_data(snap):
+            tickers_with_data += 1
+
+        rows.append(snap)
+
+    result = {
+        "ui_account": ui_account,
+        "rows": rows,
+        "tickers_total": len(tickers),
+        "tickers_with_data": tickers_with_data,
+        "fetched_at_ts": now,
+        "fetched_at_ct": _ct_time_str(now),
+        "available": True,
+        "error": None,
+    }
+    _TRADING_CACHE[cache_key] = (now, result)
+    return result
+
+
+def _row_has_data(snap: Dict) -> bool:
+    """A row 'has data' if any column beyond ticker is populated."""
+    if snap.get("spot"):
+        return True
+    if snap.get("pb_floor") or snap.get("pb_roof"):
+        return True
+    if snap.get("oi_time") or snap.get("flow_time"):
+        return True
+    if snap.get("active_scanner"):
+        return True
+    if snap.get("thesis_bias") and snap.get("thesis_bias") != "":
+        return True
+    if snap.get("gamma_flip"):
+        return True
+    if snap.get("open_campaigns"):
+        return True
+    return False
+
+
+def _ct_time_str(ts: float) -> str:
+    """Return HH:MM:SS in Central Time."""
+    try:
+        from zoneinfo import ZoneInfo
+        from datetime import datetime
+        return datetime.fromtimestamp(ts, ZoneInfo("America/Chicago")).strftime("%H:%M:%S")
+    except Exception:
+        from datetime import datetime
+        return datetime.fromtimestamp(ts).strftime("%H:%M:%S")
