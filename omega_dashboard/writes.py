@@ -986,15 +986,20 @@ def get_sold_lots_filtered(account: str, since_date: str = None,
 def add_lumpsum(account: str, label: str, value: float,
                 subaccount: str = None, as_of: str = None,
                 note: str = None,
-                funded_from_cash: bool = False) -> Dict:
+                funded_from_cash: bool = False,
+                cost_basis: float = None) -> Dict:
     """Add a lump-sum holding (e.g. ETF, mutual fund).
 
     Phase 4.5+: if `funded_from_cash` is True, also creates an offsetting
-    cash event of type `lumpsum_buy` that debits the account's cash balance
-    by `value`. This event is excluded from both YTD income calculations and
-    the ROI denominator (deposits − withdrawals), so it just transfers value
-    from the cash bucket to the lump-sum bucket without affecting realized
-    P&L or capital deployed.
+    cash event of type `lumpsum_buy` that debits the account's cash balance.
+    The amount debited is `cost_basis` if provided (the amount actually
+    spent on the holding originally), otherwise `value` (current display
+    value, treated as if just-purchased). The difference between current
+    `value` and `cost_basis` represents unrealized appreciation.
+
+    This event is excluded from both YTD income calculations and the ROI
+    denominator, so it just transfers value from the cash bucket to the
+    lump-sum bucket without affecting realized P&L or capital deployed.
     """
     if not _validate_account(account):
         return {"ok": False, "error": "Invalid account"}
@@ -1004,13 +1009,20 @@ def add_lumpsum(account: str, label: str, value: float,
     val = _to_float(value)
     if val is None or val < 0:
         return {"ok": False, "error": "Value required"}
+    cb = _to_float(cost_basis) if cost_basis is not None else None
+    if cb is not None and cb < 0:
+        return {"ok": False, "error": "Cost basis cannot be negative"}
     date_iso = _validate_date(as_of) or datetime.now(timezone.utc).strftime("%Y-%m-%d")
     sub = (subaccount or "").strip() or DEFAULT_SUBACCOUNT
+
+    # Effective cash debit = cost_basis if given, else current value
+    effective_cb = cb if cb is not None else val
 
     entry = {
         "id": _gen_id("lump"),
         "label": label,
         "value": round(val, 2),
+        "cost_basis": round(effective_cb, 2) if funded_from_cash else None,
         "subaccount": sub,
         "as_of": date_iso,
         "note": (note or "").strip(),
@@ -1025,11 +1037,15 @@ def add_lumpsum(account: str, label: str, value: float,
     _audit(account, "add_lumpsum", entry["id"], None, entry)
 
     # Phase 4.5+ — cash-funded lump-sums debit cash via lumpsum_buy event
-    if funded_from_cash and val > 0:
+    # using cost basis (not current value)
+    if funded_from_cash and effective_cb > 0:
+        cb_note = f"Buy lump-sum: {label}"
+        if cb is not None and abs(cb - val) > 0.01:
+            cb_note += f" (cost ${effective_cb:,.2f}, current value ${val:,.2f})"
         add_cash_event(
-            account, "lumpsum_buy", -val,
+            account, "lumpsum_buy", -effective_cb,
             subaccount=sub, date=date_iso,
-            note=f"Buy lump-sum: {label}",
+            note=cb_note,
             ref_id=entry["id"],
             ref_type="lumpsum",
         )

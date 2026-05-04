@@ -658,8 +658,8 @@ def get_watchlist_for_account(ui_account: str, max_tickers: int = 12) -> List[Di
     """Build a watchlist from open positions in this account.
 
     Returns one entry per unique ticker, sorted by capital exposure (largest first):
-        [{ticker, has_csp, has_cc, has_shares, capital_at_risk, contracts, shares,
-          quote: {price, change, change_pct} or None}]
+        [{ticker, has_csp, has_cc, has_shares, has_spread, capital_at_risk,
+          contracts, shares, quote: {price, change, change_pct} or None}]
     """
     from . import writes
     accounts = underlying_accounts(ui_account)
@@ -675,6 +675,7 @@ def get_watchlist_for_account(ui_account: str, max_tickers: int = 12) -> List[Di
                 "has_csp": False,
                 "has_cc": False,
                 "has_shares": False,
+                "has_spread": False,
                 "capital_at_risk": 0.0,
                 "contracts": 0,
                 "shares": 0.0,
@@ -721,6 +722,29 @@ def get_watchlist_for_account(ui_account: str, max_tickers: int = 12) -> List[Di
                 b["capital_at_risk"] += shares * b["cost_basis"]
                 if h.get("subaccount"):
                     b["subaccounts"].add(h["subaccount"])
+
+            # Phase 4.5+ — include open spreads
+            for spr in writes.get_spreads(acc):
+                if not isinstance(spr, dict) or spr.get("status") != "open":
+                    continue
+                t = (spr.get("ticker") or "").upper()
+                if not t:
+                    continue
+                b = _b(t)
+                b["has_spread"] = True
+                # Capital risk for a vertical spread = (strike width) * contracts * 100
+                # for debit spreads, or max loss for credit spreads.
+                try:
+                    long_k = float(spr.get("long_strike") or 0)
+                    short_k = float(spr.get("short_strike") or 0)
+                    width = abs(short_k - long_k)
+                    contracts = int(spr.get("contracts") or 1)
+                    b["capital_at_risk"] += width * contracts * 100
+                    b["contracts"] += contracts
+                except Exception:
+                    pass
+                if spr.get("subaccount"):
+                    b["subaccounts"].add(spr["subaccount"])
         except Exception:
             pass
 

@@ -433,6 +433,8 @@ def portfolio_lumpsum_add():
     from . import writes
     acct = request.form.get("acct", "brad")
     funded = request.form.get("funded_from_cash") == "1"
+    cb_raw = (request.form.get("cost_basis") or "").strip()
+    cost_basis = cb_raw if cb_raw else None
     result = writes.add_lumpsum(
         account=acct,
         label=request.form.get("label"),
@@ -441,11 +443,17 @@ def portfolio_lumpsum_add():
         as_of=request.form.get("as_of"),
         note=request.form.get("note"),
         funded_from_cash=funded,
+        cost_basis=cost_basis,
     )
     if result.get("ok"):
-        msg = f"Added lump-sum '{result['entry']['label']}' = ${result['entry']['value']:,.2f}"
+        e = result["entry"]
+        msg = f"Added lump-sum '{e['label']}' = ${e['value']:,.2f}"
         if funded:
-            msg += f" · cash debited ${result['entry']['value']:,.2f}"
+            cb_used = e.get("cost_basis") or e["value"]
+            msg += f" · cash debited ${cb_used:,.2f}"
+            if abs(cb_used - e["value"]) > 0.01:
+                gain = e["value"] - cb_used
+                msg += f" (unrealized gain ${gain:,.2f})"
         _flash(msg, "success")
     else:
         _flash(f"Add failed: {result.get('error')}", "error")

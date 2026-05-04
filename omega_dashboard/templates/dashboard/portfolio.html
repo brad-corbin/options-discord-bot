@@ -393,6 +393,10 @@
         <input type="number" name="value" step="0.01" required>
       </div>
       <div class="form-field">
+        <label>Cost basis ($) <span class="muted" style="font-weight: normal;">— optional</span></label>
+        <input type="number" name="cost_basis" step="0.01" placeholder="defaults to current value">
+      </div>
+      <div class="form-field">
         <label>Sub-account</label>
         <select name="subaccount">
           {% for s in d.subaccounts %}
@@ -414,14 +418,14 @@
         <input type="checkbox" name="funded_from_cash" value="1" id="lump-funded-cash" checked
                style="width: 16px; height: 16px; margin: 0;">
         <label for="lump-funded-cash" style="margin: 0; cursor: pointer; user-select: none;">
-          <strong>Funded from cash</strong> — debit ${{ '' }}<span class="muted">value from this sub-account's cash balance</span>
+          <strong>Funded from cash</strong> <span class="muted">— debit cost basis (or current value if blank) from this sub-account's cash</span>
         </label>
       </div>
     </div>
     <p class="muted" style="font-size: 10px; margin-top: 6px; max-width: 720px;">
-      Check this when buying the ETF/fund using cash already in this account
-      (the typical case). Uncheck only if you're tracking a holding that wasn't
-      funded from this account's cash (e.g. external transfer-in of shares).
+      <strong>Cost basis</strong> is what you originally spent. If the holding has appreciated, current value &gt; cost basis,
+      and the difference is unrealized gain (no cash impact). Leave cost basis blank if you're recording a fresh buy
+      (cost basis = current value). Uncheck "Funded from cash" only for externally-acquired holdings (e.g. transfer-in of shares).
     </p>
   </form>
 </div>
