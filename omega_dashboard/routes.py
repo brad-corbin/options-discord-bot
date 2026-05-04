@@ -910,9 +910,18 @@ def portfolio_backfill_campaigns():
     from . import writes
     result = writes.backfill_campaign_history()
     if result.get("ok"):
-        msg = (f"Backfilled {result.get('campaigns_modified', 0)} campaign(s) · "
-               f"+{result.get('events_added', 0)} events · "
-               f"+${result.get('premium_recovered', 0):,.2f} in premium history")
+        per_acc = result.get("per_account", {}) or {}
+        if per_acc:
+            parts = []
+            for acc, info in per_acc.items():
+                bit = f"{acc}: {info['campaigns']} camp"
+                if info.get("discovered"):
+                    bit += f" ({info['discovered']} new)"
+                parts.append(bit)
+            breakdown = " · ".join(parts)
+            msg = (f"Backfill complete · {breakdown} · +${result.get('premium_recovered', 0):,.2f} premium history")
+        else:
+            msg = "Backfill complete — nothing to update (all campaigns already up-to-date)"
         _flash(msg, "success" if result.get("campaigns_modified") else "info")
     else:
         _flash(f"Backfill failed: {result.get('error')}", "error")

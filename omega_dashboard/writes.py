@@ -2633,6 +2633,19 @@ def backfill_campaign_history(account: Optional[str] = None) -> Dict:
                 {"campaigns_modified": summary["campaigns_modified"]},
             )
 
+    # Build per-account summary for clearer flash messages
+    summary["per_account"] = {}
+    for d in summary["details"]:
+        acc = d.get("account") or "?"
+        bucket = summary["per_account"].setdefault(acc, {
+            "campaigns": 0, "events": 0, "premium": 0.0, "discovered": 0,
+        })
+        bucket["campaigns"] += 1
+        bucket["events"] += max(0, d.get("events_after", 0) - d.get("events_before", 0))
+        bucket["premium"] += max(0, d.get("premium_after", 0) - d.get("premium_before", 0))
+        if d.get("discovery"):
+            bucket["discovered"] += 1
+
     summary["premium_recovered"] = round(summary["premium_recovered"], 2)
     return summary
 
