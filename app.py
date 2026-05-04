@@ -623,6 +623,11 @@ from card_formatters import (
     resolve_unified_regime,
     regime_gate,
 )
+from options_map import (
+    build_contract_ladders,
+    calc_calendar_dte,
+    format_options_map_card,
+)
 from unified_models import (
     build_canonical_vol_regime as _um_build_canonical_vol_regime,
     format_canonical_vol_line as _um_format_canonical_vol_line,
@@ -714,6 +719,13 @@ log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
+#
+# OMEGA DASHBOARD (web command console)
+#
+from omega_dashboard import dashboard_bp
+app.register_blueprint(dashboard_bp)
+app.secret_key = os.getenv("DASHBOARD_SECRET_KEY", "").strip() or os.urandom(32)
+
 # ─────────────────────────────────────────────────────────
 # ENV VARS
 # ─────────────────────────────────────────────────────────
@@ -740,6 +752,15 @@ UNUSUAL_FLOW_SUMMARY_MAIN_ENABLED = os.getenv("UNUSUAL_FLOW_SUMMARY_MAIN_ENABLED
 # matches Phase 2.8's intent for the rest of the rec-tracker reports.
 CONVICTION_RESULTS_MAIN_ENABLED = os.getenv("CONVICTION_RESULTS_MAIN_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
 EM_SCORECARD_MAIN_ENABLED = os.getenv("EM_SCORECARD_MAIN_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+
+# Phase 3.0-B/C: Watch Map sidecar. Manual-command first; default route
+# is intraday/diagnosis only, never main unless explicitly allowed.
+# WATCH_MAP_* names are preferred; OPTIONS_MAP_* aliases are kept for backward compatibility.
+OPTIONS_MAP_ENABLED = os.getenv("WATCH_MAP_ENABLED", os.getenv("OPTIONS_MAP_ENABLED", "1")).strip().lower() not in ("0", "false", "no", "off")
+OPTIONS_MAP_ROUTE = os.getenv("WATCH_MAP_ROUTE", os.getenv("OPTIONS_MAP_ROUTE", "intraday")).strip().lower()  # intraday | diagnosis | both | main
+OPTIONS_MAP_ALLOW_MAIN = os.getenv("WATCH_MAP_ALLOW_MAIN", os.getenv("OPTIONS_MAP_ALLOW_MAIN", "0")).strip().lower() in ("1", "true", "yes", "on")
+OPTIONS_MAP_TOP_N = int(os.getenv("WATCH_MAP_TOP_N", os.getenv("OPTIONS_MAP_TOP_N", "3")) or 3)
+WATCH_MAP_SHOW_TRIGGERS = os.getenv("WATCH_MAP_SHOW_TRIGGERS", "1").strip().lower() not in ("0", "false", "no", "off")
 
 TV_WEBHOOK_SECRET   = os.getenv("TV_WEBHOOK_SECRET",   "").strip()
 MARKETDATA_TOKEN    = os.getenv("MARKETDATA_TOKEN",    "").strip()
@@ -770,6 +791,24 @@ V2_5D_EDGE_POST_UNDER_V1 = os.getenv("V2_5D_EDGE_POST_UNDER_V1", "1").strip().lo
 #       fully trusted.
 V2_5D_EDGE_FOLLOW_V84_CREDIT = os.getenv("V2_5D_EDGE_FOLLOW_V84_CREDIT", "1").strip().lower() not in ("0", "false", "no", "off")
 V2_5D_EDGE_INCLUDE_SIGNAL_ONLY = os.getenv("V2_5D_EDGE_INCLUDE_SIGNAL_ONLY", "1").strip().lower() not in ("0", "false", "no", "off")
+# v8.5 (V2 PEER restore): Phase 2.5 peer-mode env vars. Restored from Apr 27
+# baseline. Brad runs production with V2_PEER_MODE_ENABLED=1 and
+# V2_ORPHAN_POST_MIN_GRADE=B; default stays "0" / "A" so the new behavior is
+# strictly opt-in and a forgotten env var deploy keeps legacy behavior.
+#   V2_PEER_MODE_ENABLED — master switch. When 1, V2 classifies once in the
+#       worker (alongside the conviction scorer) and:
+#         * Inlines as a footer when V1 fires (debit and/or credit cards).
+#         * Posts a standalone orphan card when V1 stays silent AND V2 grade
+#           meets the V2_ORPHAN_POST_MIN_GRADE threshold.
+#         * Always CSV-logs to model_comparison_peer_signals.csv with
+#           v1_status and card_mode columns so silent disagreements are
+#           auditable.
+#       When 0 (default), the legacy follow-up-card path is used unchanged.
+#   V2_ORPHAN_POST_MIN_GRADE — orphan threshold. Accepts "A+", "A", "B",
+#       "SHADOW", "BLOCK", or "NONE" (disable orphans entirely while still
+#       inlining and logging). Default "A".
+V2_PEER_MODE_ENABLED = os.getenv("V2_PEER_MODE_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+V2_ORPHAN_POST_MIN_GRADE = (os.getenv("V2_ORPHAN_POST_MIN_GRADE", "A") or "A").strip().upper()
 LEGACY_TV_WEBHOOK_ENABLED = os.getenv("LEGACY_TV_WEBHOOK_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
 REVIEW_CARDS_AUTO_OPEN_ENABLED = os.getenv("REVIEW_CARDS_AUTO_OPEN_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
 SHADOW_POSITION_TRACKING_ENABLED = os.getenv("SHADOW_POSITION_TRACKING_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
@@ -4240,20 +4279,64 @@ def _flush_wave_digest():
         _tg_rate_limited_post("\n".join(lines))
 
     for card_text, result in immediate_cards:
-        _tg_rate_limited_post(card_text)
-        # Phase 2.3: V2 review card posts immediately under V1.
-        # It is review-only and logs separately; it never opens/manages a trade.
-        # Phase 2.4: signal_only cards (scanner posted but no clean spread)
-        # are now V2-eligible by default — they are exactly the cards where
-        # a setup grade is most informative. Opt out via
-        # V2_5D_EDGE_INCLUDE_SIGNAL_ONLY=0.
-        try:
-            if result:
-                _signal_only = bool(result.get("signal_only"))
-                if (not _signal_only) or V2_5D_EDGE_INCLUDE_SIGNAL_ONLY:
-                    _post_v2_review_card_under_v1(result)
-        except Exception as _v2_flush_err:
-            log.warning(f"V2 post-under-V1 failed in digest flush: {_v2_flush_err}")
+        # v8.5 (V2 PEER restore): peer mode inlines V2 as a footer; legacy
+        # mode posts V2 as a separate follow-up card. Both branches keep V1
+        # untouched. When V2_PEER_MODE_ENABLED is off, behavior is byte-for-
+        # byte identical to current main.
+        if V2_PEER_MODE_ENABLED:
+            _v2_res = (result or {}).get("v2_result")
+            _signal_only = bool((result or {}).get("signal_only"))
+            _gate_eligible = (not _signal_only) or V2_5D_EDGE_INCLUDE_SIGNAL_ONLY
+
+            _v2_inline_text = ""
+            _v2_best_spread = None
+            if _v2_res is not None and _gate_eligible:
+                try:
+                    _best_rec = (result or {}).get("best_rec") or {}
+                    _cands = _best_rec.get("candidate_spreads") if isinstance(_best_rec, dict) else None
+                    _v2_inline_text, _v2_best_spread = _v2_build_inline_for_candidates(_v2_res, _cands)
+                except Exception as _v2_inline_err:
+                    log.warning(f"V2 inline build failed in wave digest: {_v2_inline_err}")
+                    _v2_inline_text, _v2_best_spread = "", None
+
+            # Combined-message char budget guard. Telegram caps at 4096; we
+            # leave a margin and fall back to two posts on the rare overflow.
+            if _v2_inline_text and (len(card_text) + len(_v2_inline_text) + 4) < 4000:
+                _tg_rate_limited_post(card_text + "\n\n" + _v2_inline_text)
+            else:
+                _tg_rate_limited_post(card_text)
+                if _v2_inline_text:
+                    log.warning("V2 inline footer split into separate post — combined size exceeded 4000 chars")
+                    _tg_rate_limited_post(_v2_inline_text)
+
+            # CSV log peer-mode either way (so silent disagreements stay auditable).
+            if _v2_res is not None:
+                _spot_for_log = None
+                _v2c = (result or {}).get("v2_context")
+                if isinstance(_v2c, dict):
+                    _spot_for_log = _v2c.get("spot") or _v2c.get("close")
+                if _spot_for_log is None:
+                    _wd_for_log = (result or {}).get("webhook_data")
+                    if isinstance(_wd_for_log, dict):
+                        _spot_for_log = _wd_for_log.get("close")
+                _log_v2_peer_csv(
+                    _v2_res, (result or {}).get("ticker"),
+                    _spot_for_log,
+                    v1_status="v1_inline_debit",
+                    card_mode=("v1_inline_debit" if _gate_eligible else "v1_card_signal_only_skip"),
+                    best_spread=_v2_best_spread,
+                    bias=(result or {}).get("bias"),
+                )
+        else:
+            # Legacy follow-up-card path (Phase 2.3/2.4 behavior).
+            _tg_rate_limited_post(card_text)
+            try:
+                if result:
+                    _signal_only = bool(result.get("signal_only"))
+                    if (not _signal_only) or V2_5D_EDGE_INCLUDE_SIGNAL_ONLY:
+                        _post_v2_review_card_under_v1(result)
+            except Exception as _v2_flush_err:
+                log.warning(f"V2 post-under-V1 failed in digest flush: {_v2_flush_err}")
 
 
 def _digest_poster_thread():
@@ -4372,6 +4455,187 @@ def _flow_date_str() -> str:
         return datetime.now(_pytz.timezone("America/Chicago")).strftime("%Y-%m-%d")
     except Exception:
         return datetime.utcnow().strftime("%Y-%m-%d")
+
+
+# ══════════════════════════════════════════════════════════════════
+# v8.5 (V2 PEER restore): Phase 2.5 peer-mode V2 helpers
+# ══════════════════════════════════════════════════════════════════
+# Restored from Apr 27 baseline. These were silently deleted between
+# Apr 30 → current main while Brad's prod env still had
+# V2_PEER_MODE_ENABLED=1, leaving the call sites referencing dead code.
+#
+# Peer mode treats V2 as a sibling model that runs in parallel with the
+# v8.3 conviction scorer rather than as a follow-up footer. V2 classifies
+# once per signal in the worker, then:
+#   * Inlines as a footer when V1 actually posts a card (debit or credit).
+#   * Posts a standalone "V1 SILENT" orphan card when V1 short-circuits
+#     for vehicle reasons (DISCARD, LOG_ONLY, pre-chain gate, check_ticker
+#     rejected, timeout) AND V2 grade meets V2_ORPHAN_POST_MIN_GRADE.
+#   * Always CSV-logs to model_comparison_peer_signals.csv with v1_status
+#     and card_mode columns so silent disagreements are auditable.
+#
+# All helpers no-op when V2_PEER_MODE_ENABLED is off, so legacy follow-up
+# behavior is preserved bit-for-bit.
+# ══════════════════════════════════════════════════════════════════
+
+_V2_GRADE_RANK = {"A+": 4, "A": 3, "B": 2, "SHADOW": 1, "BLOCK": 0}
+
+
+def _classify_v2_for_signal(ticker, bias, webhook_data, snapshot_context):
+    """Run V2 classification once per signal. Merge webhook_data and snapshot
+    context so V2 sees both Potter Box fields and MTF alignment fields.
+    Returns V2SetupResult or None on failure."""
+    if not V2_5D_EDGE_ENABLED:
+        return None
+    try:
+        from v2_5d_edge_model import classify_v2_setup
+        ctx = {}
+        if isinstance(webhook_data, dict):
+            ctx.update(webhook_data)
+        if isinstance(snapshot_context, dict):
+            ctx.update(snapshot_context)
+        ctx["ticker"] = ticker
+        ctx["bias"] = bias
+        ctx["direction"] = bias
+        return classify_v2_setup(ctx)
+    except Exception as e:
+        log.warning(f"V2 classify failed for {ticker} {bias}: {e}")
+        return None
+
+
+def _v2_meets_orphan_threshold(grade: str) -> bool:
+    minimum = (V2_ORPHAN_POST_MIN_GRADE or "A").upper()
+    if minimum == "NONE":
+        return False
+    return _V2_GRADE_RANK.get((grade or "").upper(), 0) >= _V2_GRADE_RANK.get(minimum, 3)
+
+
+def _mark_v2_orphan_posted(ticker: str, bias: str) -> None:
+    if not _persistent_state:
+        return
+    try:
+        _persistent_state._json_set(
+            f"v2_orphan_posted:{(ticker or '').upper()}:{(bias or '').lower()}:{_flow_date_str()}",
+            {"posted_at": datetime.utcnow().isoformat() + "Z"},
+            ttl=86400,
+        )
+    except Exception as e:
+        log.debug(f"_mark_v2_orphan_posted failed for {ticker}: {e}")
+
+
+def _check_v2_orphan_posted(ticker: str, bias: str) -> bool:
+    if not _persistent_state:
+        return False
+    try:
+        return _persistent_state._json_get(
+            f"v2_orphan_posted:{(ticker or '').upper()}:{(bias or '').lower()}:{_flow_date_str()}"
+        ) is not None
+    except Exception:
+        return False
+
+
+def _v2_build_inline_for_candidates(v2_result, candidates):
+    """Rank candidates with V2 historical_proxy_wr and build the inline footer.
+    Returns (inline_text, best_ranked_dict_or_None). Empty string + None on any failure."""
+    if v2_result is None:
+        return "", None
+    try:
+        from v2_5d_edge_model import build_v2_inline_block, rank_spread_candidates
+        ranked = []
+        if candidates:
+            ranked = rank_spread_candidates(candidates, getattr(v2_result, "historical_proxy_wr", 0.0) or 0.0)
+        best = ranked[0] if ranked else None
+        return build_v2_inline_block(v2_result, best_spread=best), best
+    except Exception as e:
+        log.debug(f"V2 inline helper failed: {e}")
+        return "", None
+
+
+def _log_v2_peer_csv(v2_result, ticker, spot, v1_status, card_mode,
+                     best_spread=None, bias=None):
+    """Single CSV writer for peer-mode V2 events. Always called; covers both
+    posted cards (inline + orphan) and skipped cases (below threshold, dedup)."""
+    if v2_result is None or not AUTO_LOG_ENABLE:
+        return
+    try:
+        from v2_5d_edge_model import build_v2_audit_row
+        bs = best_spread or {}
+        is_credit = bool(bs.get("v2_is_credit")) if "v2_is_credit" in bs else ""
+        premium = bs.get("v2_premium")
+        width = bs.get("width") or bs.get("spread_width")
+        extra = {
+            "bias": bias or getattr(v2_result, "bias", "") or "",
+            "v1_status": str(v1_status or "")[:200],
+            "card_mode": str(card_mode or "")[:60],
+            "best_width": width if width is not None else "",
+            "best_is_credit": is_credit,
+            "best_premium": premium if premium is not None else "",
+            "best_breakeven_wr": bs.get("v2_breakeven_wr", ""),
+            "best_edge_cushion": bs.get("v2_edge_cushion", ""),
+            "best_ev_proxy": bs.get("v2_ev_proxy", ""),
+        }
+        fields = [
+            "logged_at_utc", "model_version", "ticker", "spot", "bias",
+            "action", "setup_grade", "setup_archetype", "mtf_alignment",
+            "historical_proxy_wr", "preferred_structure", "short_strike_target",
+            "width_guidance", "reason", "block_reason", "review_only_note",
+            "v1_status", "card_mode",
+            "best_width", "best_is_credit", "best_premium",
+            "best_breakeven_wr", "best_edge_cushion", "best_ev_proxy",
+        ]
+        row = build_v2_audit_row(v2_result, ticker or "", spot=spot, extra=extra)
+        _append_csv_row("model_comparison_peer_signals.csv", fields, row)
+    except Exception as e:
+        log.debug(f"V2 peer CSV log failed for {ticker}: {e}")
+
+
+def _maybe_post_v2_orphan(ticker, bias, v2_result, v1_status,
+                          spot=None, webhook_data=None):
+    """Post a standalone V2 card when V1 stays silent. Always CSV-logs.
+
+    Returns True if a Telegram card was posted, False otherwise.
+    No-op when V2_PEER_MODE_ENABLED is off — legacy mode never orphans.
+    """
+    if not V2_PEER_MODE_ENABLED or v2_result is None:
+        return False
+
+    grade = (getattr(v2_result, "setup_grade", "") or "").upper()
+
+    # Below threshold → CSV-log only, no Telegram.
+    if not _v2_meets_orphan_threshold(grade):
+        _log_v2_peer_csv(v2_result, ticker, spot, v1_status,
+                         card_mode="orphan_eval_below_threshold", bias=bias)
+        return False
+
+    # Dedup: one orphan per ticker/bias/day.
+    if _check_v2_orphan_posted(ticker, bias):
+        log.debug(f"V2 orphan dedup hit: {ticker} {bias} already orphaned today")
+        _log_v2_peer_csv(v2_result, ticker, spot, v1_status,
+                         card_mode="orphan_dedup_skip", bias=bias)
+        return False
+
+    try:
+        from v2_5d_edge_model import build_v2_orphan_card
+        # Best-effort spot fetch when caller didn't have it cheaply available.
+        if spot is None:
+            try:
+                spot = get_spot(ticker)
+            except Exception:
+                spot = (webhook_data or {}).get("close")
+        card_text = build_v2_orphan_card(v2_result, ticker=ticker,
+                                         spot=spot, v1_status=v1_status)
+        if not card_text:
+            return False
+        _tg_rate_limited_post(card_text)
+        _mark_v2_orphan_posted(ticker, bias)
+        _log_v2_peer_csv(v2_result, ticker, spot, v1_status,
+                         card_mode="orphan_posted", bias=bias)
+        log.info(f"V2 ORPHAN POSTED: {ticker} {bias} grade={grade} "
+                 f"(V1 silent: {v1_status})")
+        return True
+    except Exception as e:
+        log.warning(f"V2 orphan post failed for {ticker} {bias}: {e}")
+        return False
 
 
 def _flow_key(ticker: str, direction: str, kind: str) -> str:
@@ -5389,145 +5653,34 @@ def _process_job(worker_id: int, job: dict):
                 except Exception as _sl_err:
                     log.warning(f"[worker-{worker_id}] scorer_decisions audit write failed for {ticker}: {_sl_err}")
 
-                # ── v8.5 (V2 PEER restore): regression fix ──────────────
-                # The V2 peer-classification path (writes to
-                # model_comparison_peer_signals.csv → v2_peer_signals tab,
-                # logs "V2 PEER: <ticker> <bias> grade=<X> archetype=<Y>")
-                # was active 4/30 then silently dropped from the codebase
-                # before v8.4 baseline. Restored here at the same site as the
-                # V1 scorer audit write so V2 sees every signal V1 sees.
-                #
-                # Runs regardless of V1 decision (post / log_only / discard)
-                # so we can compare V1-vs-V2 disagreement in real time.
-                # Wrapped fully — V2 failure must never break V1.
-                try:
-                    from v2_5d_edge_model import classify_v2_setup as _classify_v2_peer
-                    from v2_5d_edge_model import build_v2_audit_row as _build_v2_peer_row
-
-                    _v2p_ctx = dict(_sc_ctx or {})
-                    _v2p_ctx["ticker"] = ticker
-                    _v2p_ctx["bias"] = bias
-                    _v2p_ctx["direction"] = bias
-                    _v2p_spot = (webhook_data or {}).get("close") or _v2p_ctx.get("spot")
-                    if _v2p_spot:
-                        _v2p_ctx["spot"] = _v2p_spot
-
-                    _v2p_res = _classify_v2_peer(_v2p_ctx)
-
-                    # v1_status mirrors the V1 scorer outcome for this same
-                    # signal so the row records both models' verdicts.
-                    if _scorer_decision == "discard":
-                        _v1_status = f"scorer discard: {_sc_gate}" if _sc_gate else "scorer discard"
-                    elif _scorer_decision == "log_only":
-                        _v1_status = "below_threshold"
-                    elif _scorer_decision == "post":
-                        _v1_status = "inline"
-                    else:
-                        _v1_status = "unknown"
-
-                    if _scorer_decision == "post":
-                        _card_mode = "v1_inline_card"
-                    else:
-                        _card_mode = ""
-
-                    log.info(f"[worker-{worker_id}] V2 PEER: {ticker} {bias} "
-                             f"grade={_v2p_res.setup_grade} "
-                             f"archetype={_v2p_res.setup_archetype}")
-
-                    _v2p_extra = {
-                        "v1_status": _v1_status,
-                        "card_mode": _card_mode,
-                        "best_width": "",
-                        "best_is_credit": "",
-                        "best_premium": "",
-                        "best_breakeven_wr": "",
-                        "best_edge_cushion": "",
-                        "best_ev_proxy": "",
-                    }
-                    _v2p_row = _build_v2_peer_row(
-                        _v2p_res, ticker,
-                        spot=float(_v2p_spot) if _v2p_spot else None,
-                        extra=_v2p_extra,
-                    )
-                    _append_csv_row(
-                        "model_comparison_peer_signals.csv",
-                        ["logged_at_utc", "model_version", "ticker", "spot",
-                         "bias", "action", "setup_grade", "setup_archetype",
-                         "mtf_alignment", "historical_proxy_wr",
-                         "preferred_structure", "short_strike_target",
-                         "width_guidance", "reason", "block_reason",
-                         "review_only_note",
-                         "v1_status", "card_mode",
-                         "best_width", "best_is_credit", "best_premium",
-                         "best_breakeven_wr", "best_edge_cushion", "best_ev_proxy"],
-                        _v2p_row,
-                    )
-
-                    # v8.5 V2 standalone card fire — second regression fix.
-                    # The pre-baseline codebase posted a V2 MOMENTUM BURST /
-                    # V2 5D EDGE MODEL card to Telegram from this very site,
-                    # independent of V1's decision (logs from 5/01 prove it).
-                    # Current main only fires V2 cards from inside the wave
-                    # digest flush AFTER a V1 immediate card posts. With
-                    # Phase 2.5+ gates suppressing most V1 conviction posts,
-                    # V2 effectively never fires either — even on obvious
-                    # MSFT/AMZN/GOOGL morning bursts.
-                    #
-                    # Fire criteria:
-                    #   - momentum_burst_label == "YES" (the ⚡ MOMENTUM BURST
-                    #     card is exactly what catches MSFT-style early breaks)
-                    #   - OR action == "REVIEW" with grade A+/A on a fresh
-                    #     setup the scorer didn't already post
-                    #
-                    # Routing: TELEGRAM_CHAT_INTRADAY (review-only diagnostic
-                    # surface) — NOT main, since V1 already owns main routing.
-                    # Set V2_STANDALONE_CARDS_ENABLED=0 to disable.
-                    try:
-                        _v2_standalone_enabled = os.getenv(
-                            "V2_STANDALONE_CARDS_ENABLED", "1"
-                        ).strip().lower() not in ("0", "false", "no", "off")
-                        if _v2_standalone_enabled and V2_5D_EDGE_ENABLED:
-                            _v2_should_card = (
-                                _v2p_res.momentum_burst_label == "YES"
-                                or (
-                                    _v2p_res.action == "REVIEW"
-                                    and _v2p_res.setup_grade in ("A+", "A")
-                                    and _scorer_decision != "post"
-                                )
-                            )
-                            if _v2_should_card:
-                                from v2_5d_edge_model import build_v2_card as _build_v2_card
-                                _v2_card_text = _build_v2_card(
-                                    _v2p_res,
-                                    ticker=ticker,
-                                    spot=float(_v2p_spot) if _v2p_spot else None,
-                                    best_spread=None,
-                                    alternatives=[],
-                                )
-                                _v2_card_chat = (
-                                    TELEGRAM_CHAT_INTRADAY
-                                    or TELEGRAM_CHAT_DIAGNOSIS
-                                    or TELEGRAM_CHAT_ID
-                                )
-                                _tg_rate_limited_post(_v2_card_text, chat_id=_v2_card_chat)
-                                log.info(
-                                    f"[worker-{worker_id}] V2 STANDALONE CARD posted: "
-                                    f"{ticker} {bias} grade={_v2p_res.setup_grade} "
-                                    f"burst={_v2p_res.momentum_burst_label} "
-                                    f"(v1_decision={_scorer_decision or 'n/a'})"
-                                )
-                    except Exception as _v2_card_err:
-                        log.warning(
-                            f"[worker-{worker_id}] V2 standalone card post failed "
-                            f"for {ticker} {bias}: {_v2_card_err}"
-                        )
-                except Exception as _v2p_err:
-                    log.warning(f"[worker-{worker_id}] V2 PEER classification "
-                                f"failed for {ticker} {bias}: {_v2p_err}")
-                # ──────────────────────────────────────────────────────────
+                # ── v8.5 (V2 PEER restore): Phase 2.5 peer-mode classify ──
+                # V2 classifies once, alongside the scorer, while the snapshot
+                # context is fresh. Result is attached to webhook_data so the
+                # v8.4 credit hook can read it, and to `base` so the wave
+                # digest can inline it under the v8.3 debit card. No-op when
+                # V2_PEER_MODE_ENABLED is off (legacy follow-up path stays).
+                _v2_result = None
+                if V2_PEER_MODE_ENABLED:
+                    _v2_result = _classify_v2_for_signal(ticker, bias, webhook_data, _sc_ctx)
+                    if _v2_result is not None:
+                        if webhook_data is None:
+                            webhook_data = {}
+                        webhook_data["_v2_result"] = _v2_result
+                        base["v2_result"] = _v2_result
+                        log.info(f"[worker-{worker_id}] V2 PEER: {ticker} {bias} "
+                                 f"grade={_v2_result.setup_grade} "
+                                 f"archetype={_v2_result.setup_archetype}")
 
                 # DISCARD: hard gate fired (e.g., G1 CB-misalignment). Drop silently.
                 if _scorer_decision == "discard":
+                    # v8.5 (V2 PEER restore): V2 may disagree with the gate —
+                    # orphan-post if grade meets threshold (default A).
+                    _maybe_post_v2_orphan(
+                        ticker, bias, _v2_result,
+                        v1_status=f"scorer discard: {_sc_gate or 'hard_gate'}",
+                        spot=(webhook_data or {}).get("close"),
+                        webhook_data=webhook_data,
+                    )
                     base["reason"] = f"scorer discard: {_sc_gate or 'hard_gate'}"
                     base["outcome"] = "scorer_discarded"
                     _record_wave_result(base)
@@ -5535,6 +5688,14 @@ def _process_job(worker_id: int, job: dict):
 
                 # LOG_ONLY: recorded above. Skip Telegram post and any chain fetch work.
                 if _scorer_decision == "log_only":
+                    # v8.5 (V2 PEER restore): V2 may disagree on score 60-72
+                    # signals that V1 quietly dropped — orphan-post if eligible.
+                    _maybe_post_v2_orphan(
+                        ticker, bias, _v2_result,
+                        v1_status=f"scorer log_only (score={_sc_score})",
+                        spot=(webhook_data or {}).get("close"),
+                        webhook_data=webhook_data,
+                    )
                     base["reason"] = f"scorer log_only (score={_sc_score})"
                     base["outcome"] = "scorer_log_only"
                     base["confidence"] = _sc_score
@@ -8952,8 +9113,41 @@ def _post_v84_credit_card(ticker: str, direction: str, spot: float,
         spread, conviction_score=conv_score,
         wave_label=wave_label, cb_side=cb_side,
     )
+
+    # v8.5 (V2 PEER restore): peer mode — inline V2 footer into card_text BEFORE
+    # posting. Compute candidate ranking from the live spread so the footer
+    # shows real BE WR / cushion / EV. Only consumed in peer mode; legacy mode
+    # below still posts V2 as a separate follow-up card.
+    _v2_inline_text = ""
+    _v2_best_spread = None
+    _v2_res_for_log = None
+    if V2_PEER_MODE_ENABLED:
+        _v2_res_for_log = wd.get("_v2_result")
+        if _v2_res_for_log is not None:
+            try:
+                _v84_cands = [{
+                    "width": spread.get("width"),
+                    "credit": spread.get("credit"),
+                    "long_strike": spread.get("long_strike"),
+                    "short_strike": spread.get("short_strike"),
+                    "trade_type": spread.get("trade_type"),
+                    "is_credit": True,
+                }]
+                _v2_inline_text, _v2_best_spread = _v2_build_inline_for_candidates(
+                    _v2_res_for_log, _v84_cands,
+                )
+            except Exception as _v2_inline_err:
+                log.warning(f"V2 inline build failed for v8.4 {ticker}: {_v2_inline_err}")
+                _v2_inline_text, _v2_best_spread = "", None
+
     try:
-        _tg_rate_limited_post(card_text)
+        if _v2_inline_text and (len(card_text) + len(_v2_inline_text) + 4) < 4000:
+            _tg_rate_limited_post(card_text + "\n\n" + _v2_inline_text)
+        else:
+            _tg_rate_limited_post(card_text)
+            if _v2_inline_text:
+                log.warning(f"V2 inline footer split into separate post for {ticker} v8.4 — combined too large")
+                _tg_rate_limited_post(_v2_inline_text)
         log.info(f"v8.4 CREDIT posted: {ticker} {spread['trade_type']} "
                  f"${spread['short_strike']}/${spread['long_strike']} "
                  f"(RoC {spread['roc_pct']:.0f}%)")
@@ -8961,52 +9155,63 @@ def _post_v84_credit_card(ticker: str, direction: str, spot: float,
         log.warning(f"v8.4 credit Telegram post failed for {ticker}: {_tg_err}")
         return ("none", "")
 
-    # Phase 2.4: V2 review card posts immediately under v8.4 credit card.
-    # Mirrors the wave-digest behavior but for the credit-only path. Gated
-    # by V2_5D_EDGE_FOLLOW_V84_CREDIT (default on). Review-only — never
-    # opens/manages a trade. Any failure is swallowed so the credit-card
-    # path is unaffected.
-    try:
-        if V2_5D_EDGE_FOLLOW_V84_CREDIT and V2_5D_EDGE_ENABLED:
-            _v84_v2_result = {
-                "ticker": ticker,
-                "bias": direction,
-                "direction": direction,
-                "webhook_data": wd,
-                # Pass the live credit spread as a single candidate so the
-                # V2 ranker can show width/credit context on the card. The
-                # v2_5d_edge_model auto-detects credit vs debit per
-                # candidate via trade_type / is_credit flag and applies the
-                # correct breakeven + EV math.
-                "best_rec": {
-                    "spot": spot,
-                    "candidate_spreads": [{
-                        "width": spread.get("width"),
-                        "credit": spread.get("credit"),
-                        "long_strike": spread.get("long_strike"),
-                        "short_strike": spread.get("short_strike"),
-                        "trade_type": spread.get("trade_type"),
-                        "is_credit": True,
-                    }],
-                },
-                "v2_context": {
+    if V2_PEER_MODE_ENABLED:
+        # Peer-mode CSV log. Logs even when no inline text rendered (e.g. if
+        # the V2 result was None for some reason) so we can audit gaps.
+        if _v2_res_for_log is not None:
+            try:
+                _log_v2_peer_csv(
+                    _v2_res_for_log, ticker, spot,
+                    v1_status="v1_inline_credit",
+                    card_mode="v1_inline_credit",
+                    best_spread=_v2_best_spread,
+                    bias=direction,
+                )
+            except Exception as _csv_err:
+                log.debug(f"V2 peer CSV log failed for v8.4 {ticker}: {_csv_err}")
+    else:
+        # Legacy follow-up-card path (Phase 2.4 behavior).
+        try:
+            if V2_5D_EDGE_FOLLOW_V84_CREDIT and V2_5D_EDGE_ENABLED:
+                _v84_v2_result = {
                     "ticker": ticker,
                     "bias": direction,
                     "direction": direction,
-                    "source": "v84_credit",
-                    "spot": spot,
-                    "close": wd.get("close"),
-                    "expiry": expiry,
-                    "dte": dte_hint,
-                    "pb_state": pb_state,
-                    "cb_side": cb_side,
-                    "pb_wave_label": wave_label,
-                    "market_regime": regime_trend,
-                },
-            }
-            _post_v2_review_card_under_v1(_v84_v2_result)
-    except Exception as _v2_v84_err:
-        log.warning(f"V2 follow-up under v8.4 credit failed for {ticker}: {_v2_v84_err}")
+                    "webhook_data": wd,
+                    # Pass the live credit spread as a single candidate so the
+                    # V2 ranker can show width/credit context on the card. The
+                    # v2_5d_edge_model auto-detects credit vs debit per
+                    # candidate via trade_type / is_credit flag and applies the
+                    # correct breakeven + EV math.
+                    "best_rec": {
+                        "spot": spot,
+                        "candidate_spreads": [{
+                            "width": spread.get("width"),
+                            "credit": spread.get("credit"),
+                            "long_strike": spread.get("long_strike"),
+                            "short_strike": spread.get("short_strike"),
+                            "trade_type": spread.get("trade_type"),
+                            "is_credit": True,
+                        }],
+                    },
+                    "v2_context": {
+                        "ticker": ticker,
+                        "bias": direction,
+                        "direction": direction,
+                        "source": "v84_credit",
+                        "spot": spot,
+                        "close": wd.get("close"),
+                        "expiry": expiry,
+                        "dte": dte_hint,
+                        "pb_state": pb_state,
+                        "cb_side": cb_side,
+                        "pb_wave_label": wave_label,
+                        "market_regime": regime_trend,
+                    },
+                }
+                _post_v2_review_card_under_v1(_v84_v2_result)
+        except Exception as _v2_v84_err:
+            log.warning(f"V2 follow-up under v8.4 credit failed for {ticker}: {_v2_v84_err}")
 
     # Register spread tracking for 50% TP / 2x credit SL alerts only if Brad
     # explicitly opts into auto-registration. Review cards must not start exit
@@ -9586,6 +9791,7 @@ def telegram_webhook(secret):
             thesis_engine=get_thesis_engine(),
             post_income_scan_fn=_income_scan_fn,
             post_income_score_fn=_income_score_fn,
+            post_options_map_fn=_post_options_map_card,
         )
 
     threading.Thread(target=run_command, daemon=True).start()
@@ -11539,6 +11745,180 @@ def _extract_atm_option_data(chain_data: dict, spot: float) -> dict:
 # Now shows confidence, downgrades, trade sign, vol regime from v4 engine.
 # _calc_bias 14-signal scoring preserved exactly.
 # ─────────────────────────────────────────────────────────────────────
+
+
+def _hours_remaining_for_options_map(now_ct) -> tuple[str, float, str]:
+    """Return target expiration date, EM hours, and session label for /optionsmap."""
+    market_open_ct = now_ct.replace(hour=8, minute=30, second=0, microsecond=0)
+    market_close_ct = now_ct.replace(hour=15, minute=0, second=0, microsecond=0)
+    if now_ct > market_close_ct or now_ct < market_open_ct:
+        target_date_str = _get_next_trading_day(now_ct.date())
+        return target_date_str, 6.5, "Next Day Preview"
+    target_date_str = now_ct.date().strftime("%Y-%m-%d")
+    hours_for_em = max((market_close_ct - now_ct).total_seconds() / 3600, 0.25)
+    return target_date_str, hours_for_em, "Today Live"
+
+
+def _build_options_map_card(ticker: str, compact: bool = False) -> str:
+    """Build the Phase 3.0-B/C Watch Map sidecar card.
+
+    Display/context only. This intentionally avoids _get_0dte_iv() because that
+    path can trigger intraday flow detection and conviction routing side effects.
+    """
+    import pytz
+    from datetime import date as _date
+
+    ticker = (ticker or "SPY").upper().strip()
+    ct = pytz.timezone("America/Chicago")
+    now_ct = datetime.now(ct)
+    target_date_str, hours_for_em, session_label = _hours_remaining_for_options_map(now_ct)
+
+    data, spot, expiration = _get_0dte_chain(ticker, target_date_str)
+    if data is None or spot is None or not expiration:
+        return f"⚠️ {ticker} Watch Map: could not fetch a valid chain for {target_date_str}."
+
+    try:
+        dte = calc_calendar_dte(expiration, as_of=now_ct.date())
+    except Exception:
+        dte = None
+    if dte is None:
+        return f"⚠️ {ticker} Watch Map: chain returned missing/invalid expiration ({expiration})."
+
+    # Add OI deltas if prior snapshot exists, but do not save a new snapshot and
+    # do not trigger flow detector. This card is observational only.
+    try:
+        if _oi_cache:
+            _oi_cache.apply_oi_changes_to_chain(ticker, expiration, data)
+    except Exception as _oi_err:
+        log.debug(f"Watch map OI-change overlay failed for {ticker}: {_oi_err}")
+
+    rows = build_chain_dicts(data) or []
+
+    try:
+        bars = _get_ohlc_bars(ticker, days=65)
+    except Exception:
+        bars = []
+    try:
+        adv, spread = _estimate_liquidity(ticker, spot)
+    except Exception:
+        adv, spread = None, None
+
+    try:
+        v4 = run_institutional_snapshot(
+            chain_data=data,
+            spot=spot,
+            dte=max(dte, 0.5),
+            recent_bars=bars,
+            is_0dte=(dte == 0),
+            avg_daily_dollar_volume=adv,
+            bid_ask_spread_pct=spread,
+            liquid_index=_is_liquid(ticker),
+        ) or {}
+    except Exception as _snap_err:
+        log.warning(f"Watch map snapshot failed for {ticker}: {_snap_err}")
+        v4 = {}
+
+    eng = v4.get("engine_result", {}) if isinstance(v4, dict) else {}
+    raw_walls = v4.get("walls", {}) if isinstance(v4, dict) else {}
+    skew = v4.get("skew", {}) if isinstance(v4, dict) else {}
+    pcr = v4.get("pcr", {}) if isinstance(v4, dict) else {}
+    vix = _discover_vix_market_snapshot()
+
+    walls = _derive_structure_levels_from_chain(data, spot, raw_walls or {}, eng or {})
+    price_struct = _compute_price_structure_levels(ticker, spot, days=90)
+    structure = _merge_price_structure_with_walls(price_struct, walls, spot, None)
+
+    # IV: use v4 result if present, otherwise reuse the existing fallback logic.
+    iv = v4.get("iv") if isinstance(v4, dict) else None
+    if iv is None:
+        try:
+            iv_meta = _infer_expiry_iv_with_fallbacks(ticker, expiration, max(dte, 0.5), data, spot)
+            iv = iv_meta.get("iv")
+        except Exception:
+            iv = None
+    if iv is None:
+        return f"⚠️ {ticker} Watch Map: could not infer IV for {expiration}."
+
+    em = _calc_intraday_em(spot, iv, hours_for_em)
+    if not em:
+        return f"⚠️ {ticker} Watch Map: could not calculate EM range."
+
+    try:
+        # Re-merge with EM-aware sanity checks now that EM exists.
+        structure = _merge_price_structure_with_walls(price_struct, walls, spot, em)
+    except Exception:
+        pass
+
+    try:
+        if not vix or not vix.get("vix"):
+            vix = {"vix": round(float(iv) * 100, 1), "source": "iv_proxy"}
+    except Exception:
+        pass
+
+    try:
+        bias = _calc_bias(spot, em, structure or {}, skew or {}, eng or {}, pcr or {}, vix or {})
+    except Exception as _bias_err:
+        log.debug(f"Watch map bias failed for {ticker}: {_bias_err}")
+        bias = {"score": 0, "direction": "NEUTRAL"}
+
+    def _lookup_contract_confirmation(_ticker, _strike, _side, _expiry):
+        try:
+            if _flow_detector and hasattr(_flow_detector, "lookup_confirmation_for"):
+                return _flow_detector.lookup_confirmation_for(_ticker, _strike, _side, _expiry)
+        except Exception:
+            return None
+        return None
+
+    ladders = build_contract_ladders(
+        rows,
+        ticker=ticker,
+        spot=float(spot),
+        expiry=expiration,
+        dte=dte,
+        lookup_fn=_lookup_contract_confirmation,
+        top_n=max(1, OPTIONS_MAP_TOP_N),
+    )
+
+    context = {
+        "ticker": ticker,
+        "spot": spot,
+        "expiry": expiration,
+        "dte": dte,
+        "em": em,
+        "structure": structure or {},
+        "eng": eng or {},
+        "bias": bias or {},
+        "v4_result": v4 or {},
+        "ladders": ladders,
+        "generated_at": f"{now_ct.strftime('%Y-%m-%d %H:%M CT')} ({session_label})",
+        "compact": bool(compact),
+        "show_triggers": WATCH_MAP_SHOW_TRIGGERS,
+    }
+    return format_options_map_card(context)
+
+
+def _post_options_map_card(ticker: str, route: str = None, compact: bool = False):
+    """Post /watchmap output to intraday/diagnosis only by default."""
+    if not OPTIONS_MAP_ENABLED:
+        post_to_diagnosis(f"⚠️ Watch Map disabled by WATCH_MAP_ENABLED/OPTIONS_MAP_ENABLED=0 ({ticker}).")
+        return
+    route = (route or OPTIONS_MAP_ROUTE or "intraday").strip().lower()
+    if route not in ("intraday", "diagnosis", "diag", "both", "main"):
+        route = OPTIONS_MAP_ROUTE or "intraday"
+    msg = _build_options_map_card(ticker, compact=compact)
+    if route == "both":
+        post_to_intraday(msg)
+        post_to_diagnosis(msg)
+    elif route in ("diagnosis", "diag"):
+        post_to_diagnosis(msg)
+    elif route == "main":
+        if OPTIONS_MAP_ALLOW_MAIN:
+            post_to_telegram(msg)
+        else:
+            post_to_diagnosis("⚠️ /watchmap main route blocked because WATCH_MAP_ALLOW_MAIN/OPTIONS_MAP_ALLOW_MAIN=0. Posting to diagnosis instead.\n\n" + msg)
+    else:
+        post_to_intraday(msg)
+
 
 def _post_em_card(ticker: str, session: str):
     try:

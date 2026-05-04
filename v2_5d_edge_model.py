@@ -510,6 +510,137 @@ def build_v2_card(result: V2SetupResult, ticker: str = "", spot: Optional[float]
     return "\n".join(lines)
 
 
+# ── v8.5 (V2 PEER restore): functions restored from Apr 27 baseline ────────
+# Deleted between Apr 30 → current main while peer-mode call sites in app.py
+# were also stripped. Restoring verbatim. The momentum_burst additions in
+# build_v2_card above and classify_v2_setup remain unchanged.
+def _format_premium_label(best_spread: Dict[str, Any]) -> Tuple[bool, float, str]:
+    """Returns (is_credit, premium, label_word)."""
+    is_credit = bool(best_spread.get("v2_is_credit")) if "v2_is_credit" in best_spread \
+                else _is_credit_candidate(best_spread)
+    premium_raw = best_spread.get("v2_premium")
+    if premium_raw is None or premium_raw == 0:
+        premium_raw = _candidate_premium(best_spread, is_credit)
+    try:
+        premium = float(premium_raw or 0)
+    except Exception:
+        premium = 0.0
+    label = "collected" if is_credit else "paid"
+    return is_credit, premium, label
+
+
+def build_v2_inline_block(result: Optional[V2SetupResult],
+                          best_spread: Optional[Dict[str, Any]] = None) -> str:
+    """Compact V2 footer for inline use under a V1 card.
+
+    Designed for ~4-7 lines, ~250-500 chars. Skips ticker/spot/bias because
+    the V1 card above already shows them.
+    """
+    if result is None:
+        return ""
+
+    grade = (result.setup_grade or "").upper()
+    grade_emoji = {"A+": "🟢", "A": "🟢", "B": "🟡", "SHADOW": "🧪", "BLOCK": "⛔"}.get(grade, "⚪")
+
+    lines = ["─── V2 5D EDGE MODEL ───"]
+
+    # Block / NO TRADE: keep it tight.
+    if (result.action or "").upper() == "NO TRADE":
+        lines.append(f"{grade_emoji} {grade}  {result.setup_archetype}")
+        block_msg = result.block_reason or result.reason
+        if block_msg:
+            if len(block_msg) > 160:
+                block_msg = block_msg[:157] + "..."
+            lines.append(f"Reason: {block_msg}")
+        lines.append("REVIEW ONLY.")
+        return "\n".join(lines)
+
+    # REVIEW / STALK header line
+    hold = result.hold_window or "5 trading days"
+    hold_short = hold.replace(" trading days", "d").replace(" trading day", "d")
+    lines.append(
+        f"{grade_emoji} {grade}  {result.setup_archetype} · MTF {result.mtf_alignment} · {hold_short} hold"
+    )
+
+    # WR + best spread on one line where possible
+    wr_line = (
+        f"Hist WR proxy: {result.historical_proxy_wr:.0%}"
+        if result.historical_proxy_wr else "Hist WR: n/a"
+    )
+    if best_spread:
+        is_credit, premium, label = _format_premium_label(best_spread)
+        width = _field(best_spread, "width", "spread_width", default=None)
+        long_s = _field(best_spread, "long_strike", "long", default=None)
+        short_s = _field(best_spread, "short_strike", "short", default=None)
+        try:
+            if width is not None and premium > 0 and long_s is not None and short_s is not None:
+                wr_line += (
+                    f" · Best ${float(width):.0f}w {long_s}/{short_s}: ${premium:.2f} {label}"
+                )
+        except Exception:
+            pass
+    lines.append(wr_line)
+
+    if best_spread:
+        be = best_spread.get("v2_breakeven_wr")
+        cushion = best_spread.get("v2_edge_cushion")
+        ev = best_spread.get("v2_ev_proxy")
+        metrics: List[str] = []
+        if be is not None:
+            metrics.append(f"BE WR {float(be):.0%}")
+        if cushion is not None:
+            metrics.append(f"Cushion {float(cushion):+.0%}")
+        if ev is not None:
+            metrics.append(f"EV ${float(ev):+.2f}/spread")
+        if metrics:
+            lines.append(" · ".join(metrics))
+
+    if result.reason:
+        r = result.reason
+        if len(r) > 130:
+            r = r[:127] + "..."
+        lines.append(f"Why: {r}")
+
+    lines.append(result.review_only_note)
+    return "\n".join(lines)
+
+
+def build_v2_orphan_card(result: Optional[V2SetupResult],
+                         ticker: str = "",
+                         spot: Optional[float] = None,
+                         v1_status: str = "V1 silent") -> str:
+    """Standalone V2 card for cases where V1 stays silent but V2 has a strong read.
+
+    The header explicitly says (V1 SILENT) so it never gets confused with a
+    regular V2-under-V1 followup card. Used by `_maybe_post_v2_orphan` in
+    app.py at every V1 short-circuit point.
+    """
+    if result is None:
+        return ""
+
+    grade = (result.setup_grade or "").upper()
+    # Distinct emoji from the inline block — orange = "V1 didn't see this"
+    grade_emoji = {"A+": "🟡", "A": "🟡", "B": "🟡", "SHADOW": "🧪", "BLOCK": "⛔"}.get(grade, "⚪")
+    title = ticker.upper() if ticker else "SIGNAL"
+    spot_part = f" @ ${float(spot):.2f}" if spot else ""
+
+    lines = [
+        f"{grade_emoji} V2 5D EDGE MODEL — {grade} (V1 SILENT)",
+        f"{title}{spot_part} · {(result.bias or '').upper()} · {result.setup_archetype}",
+        f"MTF: {result.mtf_alignment} · Hold: {result.hold_window}",
+        f"V1 status: {v1_status}",
+    ]
+    if result.historical_proxy_wr:
+        lines.append(f"V2 historical proxy WR: {result.historical_proxy_wr:.0%}")
+    if result.reason:
+        r = result.reason
+        if len(r) > 200:
+            r = r[:197] + "..."
+        lines.append(f"Why V2 sees it: {r}")
+    lines.append("REVIEW ONLY — V1 didn't fire. This is V2's standalone read.")
+    return "\n".join(line for line in lines if line)
+
+
 def build_v2_audit_row(result: V2SetupResult, ticker: str, spot: Optional[float] = None,
                        extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     row = result.to_dict()
