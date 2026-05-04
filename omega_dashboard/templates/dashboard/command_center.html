@@ -301,16 +301,48 @@
       </div>
       {% endif %}
 
-      {% if d.cash.by_subaccount %}
-      <div class="cash-breakdown-card">
-        <div class="cash-breakdown-title">Cash by sub-account</div>
-        <div class="cash-breakdown-list">
-          {% for sub, bal in d.cash.by_subaccount.items() %}
-          <div class="cash-breakdown-row">
-            <span class="cash-breakdown-label">{{ sub }}</span>
-            <span class="cash-breakdown-value">${{ "{:,.0f}".format(bal) }}</span>
-          </div>
-          {% endfor %}
+      {% if d.sub_breakdown and d.sub_breakdown.available and d.sub_breakdown.by_subaccount %}
+      <div class="data-panel sub-breakdown-card">
+        <div class="cash-breakdown-title">Sub-account breakdown</div>
+        <table class="data-table compact">
+          <thead>
+            <tr>
+              <th>Sub</th>
+              <th class="numeric">Total Value</th>
+              <th class="numeric">Cash</th>
+              <th class="numeric">Shares</th>
+              <th class="numeric">YTD Income</th>
+              <th class="numeric">This Mo</th>
+              <th class="numeric">ROI YTD</th>
+              <th class="numeric">Open</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for sub, b in d.sub_breakdown.by_subaccount.items()|sort %}
+            <tr>
+              <td><strong>{{ sub }}</strong></td>
+              <td class="numeric mono">${{ "{:,.0f}".format(b.total_value) }}</td>
+              <td class="numeric mono muted">${{ "{:,.0f}".format(b.cash) }}</td>
+              <td class="numeric mono muted">${{ "{:,.0f}".format(b.holdings_at_cost) }}</td>
+              <td class="numeric mono {% if b.income_ytd >= 0 %}amount-positive{% else %}amount-negative{% endif %}">
+                {% if b.income_ytd >= 0 %}+{% endif %}${{ "{:,.0f}".format(b.income_ytd) }}
+              </td>
+              <td class="numeric mono {% if b.income_month >= 0 %}amount-positive{% else %}amount-negative{% endif %}">
+                {% if b.income_month >= 0 %}+{% endif %}${{ "{:,.0f}".format(b.income_month) }}
+              </td>
+              <td class="numeric mono {% if b.roi_ytd >= 0 %}amount-positive{% else %}amount-negative{% endif %}">
+                {% if b.roi_ytd >= 0 %}+{% endif %}{{ b.roi_ytd }}%
+              </td>
+              <td class="numeric mono muted">
+                {{ b.open_options }}o · {{ b.open_spreads }}s · {% if b.open_shares > 0 %}{{ "{:,.0f}".format(b.open_shares) }}sh{% else %}—{% endif %}
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+        <div class="sub-breakdown-legend muted">
+          Total Value = cash + shares (at cost) + lump-sums · ROI = YTD income / starting deposits ·
+          Open = options · spreads · shares
         </div>
       </div>
       {% endif %}

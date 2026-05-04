@@ -2126,6 +2126,37 @@ body[data-account="clay"] {
   padding: 14px 18px;
 }
 
+.sub-breakdown-card {
+  padding: 16px 20px;
+  margin-top: 14px;
+}
+.sub-breakdown-card .data-table {
+  width: 100%;
+  font-size: 11px;
+}
+.sub-breakdown-card .data-table th {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px;
+  letter-spacing: 0.18em;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border-bright);
+  text-align: left;
+}
+.sub-breakdown-card .data-table th.numeric { text-align: right; }
+.sub-breakdown-card .data-table td {
+  padding: 7px 8px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+}
+.sub-breakdown-card .data-table td.numeric { text-align: right; }
+.sub-breakdown-card .data-table tr:last-child td { border-bottom: none; }
+.sub-breakdown-legend {
+  font-size: 10px;
+  margin-top: 10px;
+  font-style: italic;
+}
+
 .cash-breakdown-title {
   font-family: 'JetBrains Mono', monospace;
   font-size: 9px;

@@ -2904,6 +2904,32 @@ def edit_closed_option_meta(account: str, opt_id: str,
     if cash_changed:
         _save(_key_cash_ledger(account), ledger)
 
+    # Phase 4.5+ — also update any campaign event that mirrors this option
+    # so the Active Wheels display reflects the corrected values.
+    try:
+        from . import campaigns as _campaigns
+        camps = _campaigns._load_campaigns(account)
+        camp_changed = False
+        for camp in camps:
+            for ev in camp.get("events", []) or []:
+                if ev.get("id") != opt_id and ev.get("old_id") != opt_id:
+                    continue
+                if new_premium is not None and "premium" in ev:
+                    ev["premium"] = round(new_premium, 4)
+                    camp_changed = True
+                if new_contracts is not None and "contracts" in ev:
+                    ev["contracts"] = new_contracts
+                    camp_changed = True
+                if new_close_premium is not None and "close_premium" in ev:
+                    ev["close_premium"] = round(new_close_premium, 4)
+                    camp_changed = True
+            if camp_changed:
+                camp["rollup"] = _campaigns._compute_rollup(camp)
+        if camp_changed:
+            _campaigns._save_campaigns(account, camps)
+    except Exception as e:
+        log.warning(f"campaign mirror update failed (non-fatal): {e}")
+
     new_meta = {
         "subaccount": opt.get("subaccount"),
         "note": opt.get("note"),

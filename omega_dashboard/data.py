@@ -597,6 +597,189 @@ def is_partner_account(ui_account: str) -> bool:
     return ui_account in ("kyleigh", "clay")
 
 
+# ─────────────────────────────────────────────────────────
+# Phase 4.5 — Per-sub-account breakdown
+# Replicates Brad's spreadsheet layout: each sub-account shows
+# its own cash, holdings value, income YTD/this-month, and ROI.
+# ─────────────────────────────────────────────────────────
+
+def calc_subaccount_breakdown(ui_account: str) -> Dict:
+    """Return per-sub-account financial breakdown.
+
+    For each sub-account, returns:
+      - cash:              current cash balance
+      - holdings_at_cost:  shares × cost basis (cost basis tied up)
+      - lumpsum:           lump-sum tracked value
+      - total_value:       cash + holdings_at_cost + lumpsum
+      - capital_reserved:  cash backing open CSPs (strike × contracts × 100)
+      - income_ytd:        realized income YTD (option_open + spread_open + roll_credit
+                            - roll_debit + option_close + spread_close + fees + pnl-summary)
+      - income_month:      same metrics for current month
+      - by_source:         {options, spreads, fees, summary, shares}
+      - starting_balance:  earliest deposit-side balance (heuristic from cash ledger)
+      - roi_ytd:           income_ytd / starting_balance × 100 (if starting > 0)
+      - open_options:      count of open CSP/CC in this sub
+      - open_spreads:      count of open spreads
+      - open_shares:       sum of share lot sizes
+    """
+    from . import writes
+    accounts = underlying_accounts(ui_account)
+    if not accounts:
+        return {"available": False, "by_subaccount": {}}
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    current_month = today[:7]
+
+    # Initialize buckets (sub-account name → metrics)
+    by_sub: Dict[str, Dict] = {}
+
+    def _bucket(sub: str) -> Dict:
+        if sub not in by_sub:
+            by_sub[sub] = {
+                "cash": 0.0,
+                "holdings_at_cost": 0.0,
+                "lumpsum": 0.0,
+                "capital_reserved": 0.0,
+                "income_ytd": 0.0,
+                "income_month": 0.0,
+                "by_source": {"options": 0.0, "spreads": 0.0, "fees": 0.0, "summary": 0.0, "shares": 0.0},
+                "starting_balance": 0.0,
+                "open_options": 0,
+                "open_spreads": 0,
+                "open_shares": 0.0,
+            }
+        return by_sub[sub]
+
+    INCOME_BUCKET = {
+        "option_open": "options",
+        "option_close": "options",
+        "roll_credit": "options",
+        "roll_debit": "options",
+        "spread_open": "spreads",
+        "spread_close": "spreads",
+        "fee": "fees",
+        "pnl": "summary",
+    }
+
+    for acc in accounts:
+        # Cash + income from cash ledger
+        try:
+            ledger = writes.get_cash_ledger(acc)
+        except Exception:
+            ledger = []
+
+        # Starting balance: sum of all deposits (initial capital). This is the
+        # per-sub-account version of the "Account Start Balance" cell in Brad's
+        # spreadsheet.
+        for ev in ledger:
+            if not isinstance(ev, dict):
+                continue
+            sub = ev.get("subaccount") or DEFAULT_SUBACCOUNT
+            b = _bucket(sub)
+            ev_type = ev.get("type", "")
+            try:
+                amt = float(ev.get("amount") or 0)
+            except Exception:
+                continue
+            ev_date = ev.get("date", "")
+
+            # Cash always
+            b["cash"] += amt
+
+            # Starting balance = positive deposits
+            if ev_type == "deposit" and amt > 0:
+                b["starting_balance"] += amt
+
+            # Income classification
+            bucket_name = INCOME_BUCKET.get(ev_type)
+            if bucket_name:
+                month = ev_date[:7] if ev_date else ""
+                ev_year = ev_date[:4] if ev_date else ""
+                this_year = today[:4]
+                if ev_year == this_year:
+                    b["income_ytd"] += amt
+                    b["by_source"][bucket_name] += amt
+                    if month == current_month:
+                        b["income_month"] += amt
+
+        # Lumpsum per sub
+        try:
+            for ls in writes.get_lumpsum(acc):
+                if isinstance(ls, dict):
+                    sub = ls.get("subaccount") or DEFAULT_SUBACCOUNT
+                    _bucket(sub)["lumpsum"] += float(ls.get("value") or 0)
+        except Exception:
+            pass
+
+        # Holdings per sub (cost basis × shares)
+        try:
+            for ticker, h in writes.get_holdings(acc).items():
+                if isinstance(h, dict):
+                    sub = h.get("subaccount") or DEFAULT_SUBACCOUNT
+                    b = _bucket(sub)
+                    shares = float(h.get("shares") or 0)
+                    cost = float(h.get("cost_basis") or 0)
+                    b["holdings_at_cost"] += shares * cost
+                    b["open_shares"] += shares
+        except Exception:
+            pass
+
+        # Open options per sub (and reserved capital for CSPs)
+        try:
+            for opt in writes.get_options(acc):
+                if isinstance(opt, dict) and opt.get("status") == "open":
+                    sub = opt.get("subaccount") or DEFAULT_SUBACCOUNT
+                    b = _bucket(sub)
+                    b["open_options"] += 1
+                    if opt.get("type") == "CSP" and opt.get("direction", "sell") == "sell":
+                        b["capital_reserved"] += (
+                            float(opt.get("strike") or 0)
+                            * int(opt.get("contracts") or 1)
+                            * 100
+                        )
+
+            for spr in writes.get_spreads(acc):
+                if isinstance(spr, dict) and spr.get("status") == "open":
+                    sub = spr.get("subaccount") or DEFAULT_SUBACCOUNT
+                    _bucket(sub)["open_spreads"] += 1
+
+            # Sold lots — realized share P&L per sub (YTD)
+            for lot in writes.get_sold_lots(acc):
+                if not isinstance(lot, dict):
+                    continue
+                sub = lot.get("subaccount") or DEFAULT_SUBACCOUNT
+                b = _bucket(sub)
+                sold_date = lot.get("sold_date") or ""
+                if sold_date[:4] == today[:4]:
+                    pnl = float(lot.get("realized_pnl") or 0)
+                    b["income_ytd"] += pnl
+                    b["by_source"]["shares"] += pnl
+                    if sold_date[:7] == current_month:
+                        b["income_month"] += pnl
+        except Exception:
+            pass
+
+    # Final pass: compute total_value, ROI
+    for sub, b in by_sub.items():
+        b["total_value"] = round(b["cash"] + b["holdings_at_cost"] + b["lumpsum"], 2)
+        b["cash"] = round(b["cash"], 2)
+        b["holdings_at_cost"] = round(b["holdings_at_cost"], 2)
+        b["lumpsum"] = round(b["lumpsum"], 2)
+        b["capital_reserved"] = round(b["capital_reserved"], 2)
+        b["income_ytd"] = round(b["income_ytd"], 2)
+        b["income_month"] = round(b["income_month"], 2)
+        b["starting_balance"] = round(b["starting_balance"], 2)
+        b["roi_ytd"] = round(
+            (b["income_ytd"] / b["starting_balance"]) * 100.0, 2
+        ) if b["starting_balance"] > 0 else 0.0
+        b["by_source"] = {k: round(v, 2) for k, v in b["by_source"].items()}
+
+    return {
+        "available": True,
+        "by_subaccount": by_sub,
+    }
+
+
 def get_open_positions_live(ui_account: str) -> Dict[str, List[Dict]]:
     """Open positions from LIVE Redis."""
     from . import writes
@@ -845,6 +1028,7 @@ def command_center_data(ui_account: str) -> Dict:
     positions = get_open_positions_live(ui_account)
     cash = get_cash_live(ui_account)
     capital = calc_capital_progression(ui_account)
+    sub_breakdown = calc_subaccount_breakdown(ui_account)
 
     open_total = (
         len(positions["wheel_options"])
@@ -870,6 +1054,7 @@ def command_center_data(ui_account: str) -> Dict:
         "positions": positions,
         "cash": cash,
         "capital": capital,
+        "sub_breakdown": sub_breakdown,
         "open_total": open_total,
         "live_mode": True,  # flag for template if it wants to indicate "live"
     }
