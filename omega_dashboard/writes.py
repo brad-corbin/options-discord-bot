@@ -383,7 +383,8 @@ def calc_cash_breakdown(account: str) -> Dict[str, float]:
 
 def add_cash_event(account: str, event_type: str, amount: float,
                    subaccount: str = None, date: str = None,
-                   note: str = None, ref_id: str = None) -> Dict:
+                   note: str = None, ref_id: str = None,
+                   ref_type: str = None) -> Dict:
     """Append a cash event to the ledger."""
     if not _validate_account(account):
         return {"ok": False, "error": f"Invalid account '{account}'"}
@@ -414,6 +415,7 @@ def add_cash_event(account: str, event_type: str, amount: float,
         "date": date_iso,
         "note": (note or "").strip(),
         "ref_id": ref_id,
+        "ref_type": ref_type or "",
         "created_at": _now_iso(),
     }
 
@@ -983,7 +985,17 @@ def get_sold_lots_filtered(account: str, since_date: str = None,
 
 def add_lumpsum(account: str, label: str, value: float,
                 subaccount: str = None, as_of: str = None,
-                note: str = None) -> Dict:
+                note: str = None,
+                funded_from_cash: bool = False) -> Dict:
+    """Add a lump-sum holding (e.g. ETF, mutual fund).
+
+    Phase 4.5+: if `funded_from_cash` is True, also creates an offsetting
+    cash event of type `lumpsum_buy` that debits the account's cash balance
+    by `value`. This event is excluded from both YTD income calculations and
+    the ROI denominator (deposits − withdrawals), so it just transfers value
+    from the cash bucket to the lump-sum bucket without affecting realized
+    P&L or capital deployed.
+    """
     if not _validate_account(account):
         return {"ok": False, "error": "Invalid account"}
     label = (label or "").strip()
@@ -1002,6 +1014,7 @@ def add_lumpsum(account: str, label: str, value: float,
         "subaccount": sub,
         "as_of": date_iso,
         "note": (note or "").strip(),
+        "funded_from_cash": bool(funded_from_cash),
         "created_at": _now_iso(),
         "last_updated": _now_iso(),
     }
@@ -1010,12 +1023,31 @@ def add_lumpsum(account: str, label: str, value: float,
     if not _save(_key_lumpsum(account), items):
         return {"ok": False, "error": "Save failed"}
     _audit(account, "add_lumpsum", entry["id"], None, entry)
+
+    # Phase 4.5+ — cash-funded lump-sums debit cash via lumpsum_buy event
+    if funded_from_cash and val > 0:
+        add_cash_event(
+            account, "lumpsum_buy", -val,
+            subaccount=sub, date=date_iso,
+            note=f"Buy lump-sum: {label}",
+            ref_id=entry["id"],
+            ref_type="lumpsum",
+        )
+
     return {"ok": True, "entry": entry}
 
 
 def update_lumpsum(account: str, entry_id: str, value: float = None,
                    as_of: str = None, label: str = None,
-                   note: str = None) -> Dict:
+                   note: str = None,
+                   cash_impact: str = "market") -> Dict:
+    """Update a lump-sum entry.
+
+    Phase 4.5+: `cash_impact` controls how cash reacts to a value change:
+      - "market" (default): pure market value drift, no cash impact
+      - "buy": value went up because you bought MORE — debit cash by the delta
+      - "sell": value went down because you sold some — credit cash by the delta
+    """
     if not _validate_account(account):
         return {"ok": False, "error": "Invalid account"}
     items = get_lumpsum(account)
@@ -1024,11 +1056,14 @@ def update_lumpsum(account: str, entry_id: str, value: float = None,
         return {"ok": False, "error": "Lump-sum entry not found"}
 
     old = dict(target)
+    old_value = float(target.get("value") or 0)
+    new_value = old_value
     if value is not None:
         v = _to_float(value)
         if v is None or v < 0:
             return {"ok": False, "error": "Invalid value"}
-        target["value"] = round(v, 2)
+        new_value = round(v, 2)
+        target["value"] = new_value
     if as_of is not None:
         d = _validate_date(as_of)
         if not d:
@@ -1043,10 +1078,39 @@ def update_lumpsum(account: str, entry_id: str, value: float = None,
     if not _save(_key_lumpsum(account), items):
         return {"ok": False, "error": "Save failed"}
     _audit(account, "update_lumpsum", entry_id, old, target)
+
+    # Phase 4.5+ — optional cash impact on value change
+    delta = new_value - old_value
+    sub = target.get("subaccount") or DEFAULT_SUBACCOUNT
+    label_now = target.get("label", "")
+    today_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    if cash_impact == "buy" and delta > 0:
+        add_cash_event(
+            account, "lumpsum_buy", -delta,
+            subaccount=sub, date=today_iso,
+            note=f"Buy more {label_now} (+${delta:,.2f})",
+            ref_id=entry_id, ref_type="lumpsum",
+        )
+    elif cash_impact == "sell" and delta < 0:
+        add_cash_event(
+            account, "lumpsum_sell", -delta,  # delta is negative, so -delta is positive credit
+            subaccount=sub, date=today_iso,
+            note=f"Sell {label_now} (-${abs(delta):,.2f})",
+            ref_id=entry_id, ref_type="lumpsum",
+        )
+
     return {"ok": True, "entry": target}
 
 
-def delete_lumpsum(account: str, entry_id: str) -> Dict:
+def delete_lumpsum(account: str, entry_id: str,
+                   credit_cash: bool = False) -> Dict:
+    """Delete a lump-sum entry.
+
+    Phase 4.5+: if `credit_cash` is True, also creates a `lumpsum_sell`
+    cash event for the entry's current value (treating delete as a full
+    sell-out of the position).
+    """
     if not _validate_account(account):
         return {"ok": False, "error": "Invalid account"}
     items = get_lumpsum(account)
@@ -1057,6 +1121,19 @@ def delete_lumpsum(account: str, entry_id: str) -> Dict:
     if not _save(_key_lumpsum(account), items):
         return {"ok": False, "error": "Save failed"}
     _audit(account, "delete_lumpsum", entry_id, target, None)
+
+    if credit_cash:
+        val = float(target.get("value") or 0)
+        sub = target.get("subaccount") or DEFAULT_SUBACCOUNT
+        label_now = target.get("label", "")
+        if val > 0:
+            add_cash_event(
+                account, "lumpsum_sell", val,
+                subaccount=sub,
+                date=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                note=f"Liquidate {label_now} (${val:,.2f})",
+                ref_id=entry_id, ref_type="lumpsum",
+            )
     return {"ok": True}
 
 

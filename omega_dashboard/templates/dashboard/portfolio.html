@@ -409,6 +409,20 @@
         <button type="submit" class="btn-primary">Add</button>
       </div>
     </div>
+    <div class="form-row" style="margin-top: 8px;">
+      <div class="form-field" style="display: flex; align-items: center; gap: 8px;">
+        <input type="checkbox" name="funded_from_cash" value="1" id="lump-funded-cash" checked
+               style="width: 16px; height: 16px; margin: 0;">
+        <label for="lump-funded-cash" style="margin: 0; cursor: pointer; user-select: none;">
+          <strong>Funded from cash</strong> — debit ${{ '' }}<span class="muted">value from this sub-account's cash balance</span>
+        </label>
+      </div>
+    </div>
+    <p class="muted" style="font-size: 10px; margin-top: 6px; max-width: 720px;">
+      Check this when buying the ETF/fund using cash already in this account
+      (the typical case). Uncheck only if you're tracking a holding that wasn't
+      funded from this account's cash (e.g. external transfer-in of shares).
+    </p>
   </form>
 </div>
 
@@ -441,8 +455,10 @@
         <td class="row-actions">
           <button class="btn-mini" onclick="document.getElementById('upd-{{ ls.id }}').classList.toggle('open')">Update</button>
           <form method="POST" action="{{ url_for('dashboard.portfolio_lumpsum_delete', entry_id=ls.id) }}"
-                style="display: inline;" onsubmit="return confirm('Delete this lump-sum entry?')">
+                style="display: inline;"
+                onsubmit="return handleLumpsumDelete(event, this, '{{ ls.label|e }}', {{ ls.value }})">
             <input type="hidden" name="acct" value="{{ acct }}">
+            <input type="hidden" name="credit_cash" value="0" id="credit-{{ ls.id }}">
             <button type="submit" class="btn-icon-delete" title="Delete">×</button>
           </form>
         </td>
@@ -456,6 +472,12 @@
             <input type="number" name="value" step="0.01" value="{{ ls.value }}">
             <label>As of</label>
             <input type="date" name="as_of">
+            <label>Type of change</label>
+            <select name="cash_impact">
+              <option value="market" selected>Market drift (no cash impact)</option>
+              <option value="buy">Bought more — debit cash by delta</option>
+              <option value="sell">Sold some — credit cash by delta</option>
+            </select>
             <button type="submit" class="btn-primary-sm">Save</button>
           </form>
         </td>
@@ -1773,6 +1795,33 @@ function confirmDeleteSpread(spreadId, ticker, type, account) {
     kind: 'spread',
     itemId: spreadId,
   });
+}
+
+// Phase 4.5+ — Lump-sum delete with cash-credit choice
+function handleLumpsumDelete(event, formEl, label, value) {
+  event.preventDefault();
+  const fmtVal = '$' + value.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const msg =
+    `Delete lump-sum "${label}"?\n\n` +
+    `Click OK to delete AND credit ${fmtVal} back to cash (you sold the position).\n` +
+    `Click Cancel, then re-trigger and choose differently if you only want to remove the entry without cash impact.\n\n` +
+    `OK = delete + cash credited\n` +
+    `Cancel = abort`;
+  // Two-step: first ask about cash credit, then confirm.
+  const creditCash = window.confirm(
+    `Delete "${label}"?\n\nCredit ${fmtVal} back to cash? (You sold the position.)\n\n` +
+    `OK = yes, credit cash · Cancel = no, just remove entry`
+  );
+  // Set the hidden input
+  const inp = formEl.querySelector('input[name="credit_cash"]');
+  inp.value = creditCash ? '1' : '0';
+  // Final confirm
+  const finalMsg = creditCash
+    ? `Confirm: delete "${label}" and credit ${fmtVal} to cash?`
+    : `Confirm: delete "${label}" without affecting cash?`;
+  if (!window.confirm(finalMsg)) return false;
+  formEl.submit();
+  return false;
 }
 
 function confirmDeleteHolding(ticker, shares, costBasis, account, subaccount) {

@@ -432,6 +432,7 @@ def portfolio_holding_edit():
 def portfolio_lumpsum_add():
     from . import writes
     acct = request.form.get("acct", "brad")
+    funded = request.form.get("funded_from_cash") == "1"
     result = writes.add_lumpsum(
         account=acct,
         label=request.form.get("label"),
@@ -439,9 +440,13 @@ def portfolio_lumpsum_add():
         subaccount=request.form.get("subaccount"),
         as_of=request.form.get("as_of"),
         note=request.form.get("note"),
+        funded_from_cash=funded,
     )
     if result.get("ok"):
-        _flash(f"Added lump-sum '{result['entry']['label']}' = ${result['entry']['value']:,.2f}", "success")
+        msg = f"Added lump-sum '{result['entry']['label']}' = ${result['entry']['value']:,.2f}"
+        if funded:
+            msg += f" · cash debited ${result['entry']['value']:,.2f}"
+        _flash(msg, "success")
     else:
         _flash(f"Add failed: {result.get('error')}", "error")
     return _bounce("holdings", acct)
@@ -452,6 +457,7 @@ def portfolio_lumpsum_add():
 def portfolio_lumpsum_update(entry_id):
     from . import writes
     acct = request.form.get("acct", "brad")
+    cash_impact = request.form.get("cash_impact") or "market"
     result = writes.update_lumpsum(
         account=acct,
         entry_id=entry_id,
@@ -459,9 +465,15 @@ def portfolio_lumpsum_update(entry_id):
         as_of=request.form.get("as_of") or None,
         label=request.form.get("label") or None,
         note=request.form.get("note") or None,
+        cash_impact=cash_impact,
     )
     if result.get("ok"):
-        _flash(f"Updated '{result['entry']['label']}'", "success")
+        msg = f"Updated '{result['entry']['label']}'"
+        if cash_impact == "buy":
+            msg += " · cash debited"
+        elif cash_impact == "sell":
+            msg += " · cash credited"
+        _flash(msg, "success")
     else:
         _flash(f"Update failed: {result.get('error')}", "error")
     return _bounce("holdings", acct)
@@ -472,9 +484,13 @@ def portfolio_lumpsum_update(entry_id):
 def portfolio_lumpsum_delete(entry_id):
     from . import writes
     acct = request.form.get("acct", "brad")
-    result = writes.delete_lumpsum(acct, entry_id)
+    credit_cash = request.form.get("credit_cash") == "1"
+    result = writes.delete_lumpsum(acct, entry_id, credit_cash=credit_cash)
     if result.get("ok"):
-        _flash("Lump-sum deleted", "success")
+        msg = "Lump-sum deleted"
+        if credit_cash:
+            msg += " · cash credited"
+        _flash(msg, "success")
     else:
         _flash(f"Delete failed: {result.get('error')}", "error")
     return _bounce("holdings", acct)
