@@ -253,7 +253,7 @@
       <div class="income-pair">
         <div class="metric-card primary">
           <div class="metric-label">Year-to-Date</div>
-          <div class="metric-value accent">${{ "{:,.0f}".format(d.income.year) }}</div>
+          <div class="metric-value {% if d.income.year > 0 %}positive{% elif d.income.year < 0 %}amount-negative{% endif %}">${{ "{:,.0f}".format(d.income.year) }}</div>
           <div class="metric-meta">
             {% if d.income.by_source %}
               {% set parts = [] %}
@@ -302,7 +302,7 @@
       <div class="section-eyebrow">Capital · Tracked</div>
       <div class="metric-card primary">
         <div class="metric-label">Total Capital</div>
-        <div class="metric-value accent">${{ "{:,.0f}".format(d.capital.total_capital if d.capital and d.capital.available else d.cash.total) }}</div>
+        <div class="metric-value">${{ "{:,.0f}".format(d.capital.total_capital if d.capital and d.capital.available else d.cash.total) }}</div>
         <div class="metric-meta">
           {% if d.capital and d.capital.available %}
             cash ${{ "{:,.0f}".format(d.capital.components.cash) }}
