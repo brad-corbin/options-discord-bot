@@ -1225,6 +1225,33 @@ class FlowDetector:
                     "timestamp": datetime.now().isoformat(),
                 })
 
+                # v8.5 (Phase 5a): append to flow event history for the
+                # Trading dashboard's per-ticker flow ledger.
+                # Pure additive: parallel sink to flow_dir, daemon-safe.
+                # Cap 50 events/ticker/day, 48hr TTL (covers post-market
+                # review window).
+                try:
+                    _hist_key = f"flow_history:{ticker.upper()}:{today_str}"
+                    _history = self._state._json_get(_hist_key) or []
+                    _history.append({
+                        "ts": datetime.now().isoformat(),
+                        "direction": flow_dir_str,
+                        "side": p["side"],
+                        "strike": p["strike"],
+                        "expiry": expiry,
+                        "notional": _flow_notional,
+                        "vol_oi": round(vol_oi, 1),
+                        "volume": vol,
+                        "flow_level": flow_level,
+                        "spot": spot,
+                    })
+                    if len(_history) > 50:
+                        _history = _history[-50:]
+                    self._state._json_set(_hist_key, _history, ttl=172800)
+                except Exception as _hist_err:
+                    log.debug(f"Flow history append failed for "
+                              f"{ticker}: {_hist_err}")
+
         # Sort by vol_oi_ratio descending
         alerts.sort(key=lambda a: a["vol_oi_ratio"], reverse=True)
 
