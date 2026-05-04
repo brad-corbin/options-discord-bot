@@ -2224,11 +2224,20 @@ def retrofix_apply(selections: List[Dict]) -> Dict:
 # cards with accurate premium totals and timelines.
 # ═════════════════════════════════════════════════════════
 
-def _walk_roll_chain(opt_id: str, roll_by_new_id: Dict, accumulated: set):
-    """Walk backwards through roll chain, accumulating opt_ids."""
+def _walk_roll_chain(opt_id: str, roll_by_new_id: Dict, accumulated: set,
+                      roll_by_old_id: Dict = None):
+    """Walk through roll chain in BOTH directions, accumulating opt_ids.
+
+    - Backward: given opt_id (new leg), find what it was rolled FROM
+    - Forward:  given opt_id (old leg), find what it was rolled TO
+
+    This ensures the chain is complete regardless of which opt_id we start from.
+    """
     if not opt_id or opt_id in accumulated:
         return
     accumulated.add(opt_id)
+
+    # Backward: this opt_id was created by a roll → find old_id
     roll_entry = roll_by_new_id.get(opt_id)
     if roll_entry:
         rd = roll_entry.get("_parsed_new") or {}
@@ -2237,7 +2246,19 @@ def _walk_roll_chain(opt_id: str, roll_by_new_id: Dict, accumulated: set):
             if isinstance(closed_data, dict):
                 old_id = closed_data.get("id")
                 if old_id:
-                    _walk_roll_chain(old_id, roll_by_new_id, accumulated)
+                    _walk_roll_chain(old_id, roll_by_new_id, accumulated, roll_by_old_id)
+
+    # Forward: this opt_id was rolled TO something → find new_id
+    if roll_by_old_id is not None:
+        forward_entry = roll_by_old_id.get(opt_id)
+        if forward_entry:
+            rd = forward_entry.get("_parsed_new") or {}
+            if isinstance(rd, dict):
+                new_data = rd.get("new") or {}
+                if isinstance(new_data, dict):
+                    new_id = new_data.get("id")
+                    if new_id:
+                        _walk_roll_chain(new_id, roll_by_new_id, accumulated, roll_by_old_id)
 
 
 def backfill_campaign_history(account: Optional[str] = None) -> Dict:
@@ -2272,6 +2293,7 @@ def backfill_campaign_history(account: Optional[str] = None) -> Dict:
     # Index audits by op + opt_id for fast lookup
     add_option_by_target: Dict[str, Dict] = {}
     roll_by_new_id: Dict[str, Dict] = {}
+    roll_by_old_id: Dict[str, Dict] = {}  # Phase 4.5+ — forward index for chain walking
     close_by_target: Dict[str, Dict] = {}
 
     for entry in raw:
@@ -2291,8 +2313,11 @@ def backfill_campaign_history(account: Optional[str] = None) -> Dict:
                     add_option_by_target[tgt] = entry
         elif op == "roll_option" and isinstance(new_v, dict):
             new_data = new_v.get("new")
+            closed_data = new_v.get("closed")
             if isinstance(new_data, dict) and new_data.get("id"):
                 roll_by_new_id[new_data["id"]] = entry
+            if isinstance(closed_data, dict) and closed_data.get("id"):
+                roll_by_old_id[closed_data["id"]] = entry
         elif op in ("option_closed", "option_expired", "option_assigned",
                     "option_assigned_with_shares", "cc_called_away_with_shares"):
             tgt = entry.get("target", "")
@@ -2453,10 +2478,16 @@ def backfill_campaign_history(account: Optional[str] = None) -> Dict:
             opt_ids_in_events: set = set()
             non_option_events = []
             for ev in old_events:
+                # Phase 4.5+ — opt_id can be in id, old_id, or new_id (rolls store
+                # both old/new). Treat the event as option-related if any are set.
                 if ev.get("id"):
                     opt_ids_in_events.add(ev.get("id"))
-                else:
-                    # Preserve manual_share_add and similar id-less events
+                if ev.get("old_id"):
+                    opt_ids_in_events.add(ev.get("old_id"))
+                if ev.get("new_id"):
+                    opt_ids_in_events.add(ev.get("new_id"))
+                # Truly id-less events (manual_share_add, shares_seeded, etc.) get preserved
+                if not ev.get("id") and not ev.get("old_id") and not ev.get("new_id"):
                     non_option_events.append(ev)
 
             if not opt_ids_in_events:
@@ -2465,7 +2496,7 @@ def backfill_campaign_history(account: Optional[str] = None) -> Dict:
             # Walk back through the roll chain for each
             chain_ids: set = set()
             for oid in opt_ids_in_events:
-                _walk_roll_chain(oid, roll_by_new_id, chain_ids)
+                _walk_roll_chain(oid, roll_by_new_id, chain_ids, roll_by_old_id)
 
             # Build the new events list
             new_events: List[Dict] = []

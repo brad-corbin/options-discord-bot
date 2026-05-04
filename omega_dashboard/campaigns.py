@@ -114,8 +114,10 @@ def find_csp_only_campaign(account: str, ticker: str, subaccount: str,
                             opt_id: str) -> Optional[Dict]:
     """Find the CSP-phase campaign that contains a specific open CSP.
 
-    Returns the campaign whose events list contains a csp_open with id=opt_id
-    AND has not yet transitioned to active_holding.
+    Phase 4.5+: matches an opt_id as the current "head" of the chain — either:
+      - csp_open event with id=opt_id (initial open), OR
+      - csp_rolled event with new_id=opt_id (the new leg of a previous roll)
+    The campaign must still be in active_csp_phase status (not yet assigned).
     """
     for c in _load_campaigns(account):
         if c.get("status") != "active_csp_phase":
@@ -123,7 +125,10 @@ def find_csp_only_campaign(account: str, ticker: str, subaccount: str,
         if c.get("ticker") != ticker or c.get("subaccount") != subaccount:
             continue
         for ev in c.get("events", []):
-            if ev.get("type") == "csp_open" and ev.get("id") == opt_id:
+            ev_type = ev.get("type", "")
+            if ev_type == "csp_open" and ev.get("id") == opt_id:
+                return c
+            if ev_type == "csp_rolled" and ev.get("new_id") == opt_id:
                 return c
     return None
 
