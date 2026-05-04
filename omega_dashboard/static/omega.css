@@ -2953,3 +2953,341 @@ body[data-account="clay"] {
 .trading-row-table .col-sign { color: var(--text-muted); }
 .trading-row-table .sign-positive { color: var(--positive); }
 .trading-row-table .sign-negative { color: var(--negative); }
+
+/* ──────────────────────────────────────────────────────────
+   TRADING CARD GRID — Day 2 ship
+   Replaces the trading-row-table block from Day 1.
+   Reuses existing design tokens. No new colors introduced.
+   ────────────────────────────────────────────────────────── */
+
+.trading-cards-section {
+  margin: 18px 0 24px 0;
+}
+
+.trading-cards-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 12px;
+  padding: 0 4px;
+}
+
+.trading-cards-eyebrow {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  color: var(--text-muted);
+  text-transform: uppercase;
+}
+
+.trading-cards-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  color: var(--text-dim);
+}
+
+.trading-cards-error {
+  background: rgba(255, 77, 109, 0.05);
+  border: 1px solid rgba(255, 77, 109, 0.2);
+  color: var(--negative);
+  padding: 10px 14px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  margin-bottom: 12px;
+}
+
+/* Status dot — same as Day 1 */
+.trading-status-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--positive);
+  box-shadow: 0 0 6px var(--positive);
+  transition: all 0.2s;
+}
+.trading-status-dot[data-state="stale"] {
+  background: #f0b400;
+  box-shadow: 0 0 6px rgba(240, 180, 0, 0.5);
+}
+.trading-status-dot[data-state="dead"] {
+  background: var(--negative);
+  box-shadow: 0 0 6px var(--negative);
+}
+
+/* ─── Card grid ────────────────────────────────────────── */
+.trading-cards-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+@media (max-width: 1100px) {
+  .trading-cards-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+@media (max-width: 700px) {
+  .trading-cards-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ─── Single card ─────────────────────────────────────── */
+.tcard {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--border-bright);
+  padding: 12px 14px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  transition: border-color 0.15s;
+}
+.tcard:hover {
+  border-color: var(--border-bright);
+}
+
+/* Bias stripe — left-edge color encoding */
+.tcard.stripe-bullish-strong { border-left-color: var(--positive); }
+.tcard.stripe-bullish        { border-left-color: var(--positive); opacity: 1; }
+.tcard.stripe-bullish-faint  { border-left-color: var(--positive); opacity: 0.7; }
+.tcard.stripe-neutral        { border-left-color: var(--border-bright); }
+.tcard.stripe-bearish-faint  { border-left-color: var(--negative); opacity: 0.7; }
+.tcard.stripe-bearish        { border-left-color: var(--negative); }
+.tcard.stripe-bearish-strong { border-left-color: var(--negative); }
+
+/* Card opacity faint variants — use a softer text instead of card opacity
+   so the bias stripe alone doesn't fade the entire card. */
+.tcard.stripe-bullish-faint,
+.tcard.stripe-bearish-faint {
+  opacity: 1;
+}
+
+/* ─── Header ──────────────────────────────────────────── */
+.tcard-header {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.tcard-title-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.tcard-ticker {
+  font-family: 'Russo One', sans-serif;
+  font-size: 16px;
+  letter-spacing: 0.04em;
+  color: var(--text);
+}
+
+.tcard-spot {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 13px;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.tcard-pct {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.tcard-pct.positive { color: var(--positive); }
+.tcard-pct.negative { color: var(--negative); }
+.tcard-pct.muted    { color: var(--text-dim); }
+
+.tcard-time {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px;
+  color: var(--text-dim);
+  text-align: right;
+  margin-top: -16px;
+  align-self: flex-end;
+}
+
+/* ─── Pills row ───────────────────────────────────────── */
+.tcard-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.tpill {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  padding: 2px 6px;
+  border: 1px solid var(--border-bright);
+  color: var(--text-muted);
+  background: transparent;
+  text-transform: uppercase;
+  border-radius: 0;
+  white-space: nowrap;
+}
+
+.tpill-thesis.tpill-bullish-strong,
+.tpill-thesis.tpill-bullish {
+  color: var(--positive);
+  border-color: rgba(0, 232, 156, 0.4);
+  font-weight: 500;
+}
+.tpill-thesis.tpill-bullish-faint {
+  color: var(--positive);
+  border-color: rgba(0, 232, 156, 0.25);
+  opacity: 0.75;
+}
+.tpill-thesis.tpill-bearish-strong,
+.tpill-thesis.tpill-bearish {
+  color: var(--negative);
+  border-color: rgba(255, 77, 109, 0.4);
+  font-weight: 500;
+}
+.tpill-thesis.tpill-bearish-faint {
+  color: var(--negative);
+  border-color: rgba(255, 77, 109, 0.25);
+  opacity: 0.75;
+}
+.tpill-thesis.tpill-neutral {
+  color: var(--text-muted);
+}
+
+.tpill-pb { color: var(--text-muted); }
+.tpill-gex { color: #06d4f5; border-color: rgba(6, 212, 245, 0.4); }
+.tpill-as { color: #f0b400; border-color: rgba(240, 180, 0, 0.4); }
+
+/* ─── Section blocks ──────────────────────────────────── */
+.tcard-section {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.tcard-eyebrow {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  color: var(--text-dim);
+  text-transform: uppercase;
+}
+
+.tcard-empty {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  color: var(--text-dim);
+  font-style: italic;
+  padding: 2px 0;
+}
+
+/* ─── Levels ──────────────────────────────────────────── */
+.tcard-levels {
+  display: flex;
+  flex-direction: column;
+}
+
+.tcard-level-row,
+.tcard-level-spot {
+  display: grid;
+  grid-template-columns: 80px 1fr;
+  gap: 10px;
+  font-size: 11px;
+  padding: 1px 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.tcard-level-row {
+  color: var(--text-dim);
+}
+
+.tcard-level-spot {
+  color: var(--text);
+  font-weight: 500;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  padding: 3px 0;
+  margin: 3px 0;
+}
+
+.tcard-level-price {
+  text-align: right;
+  font-family: 'JetBrains Mono', monospace;
+}
+
+.tcard-level-label {
+  color: var(--text-dim);
+  font-size: 10px;
+  align-self: center;
+  font-family: 'JetBrains Mono', monospace;
+}
+
+.tcard-level-spot .tcard-level-label {
+  color: var(--text-dim);
+}
+
+/* ─── OI ledger ───────────────────────────────────────── */
+.tcard-oi-row {
+  display: grid;
+  grid-template-columns: 38px 1fr auto;
+  gap: 8px;
+  padding: 1px 0;
+  font-size: 11px;
+}
+
+.tcard-oi-time { color: var(--text-dim); }
+.tcard-oi-label { color: var(--text-muted); }
+.tcard-oi-strike {
+  color: var(--text-dim);
+  font-size: 10px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.tcard-oi-row.tcard-bias-bullish .tcard-oi-label { color: var(--positive); }
+.tcard-oi-row.tcard-bias-bearish .tcard-oi-label { color: var(--negative); }
+.tcard-oi-row.tcard-bias-neutral .tcard-oi-label { color: var(--text-muted); }
+
+.tcard-oi-row.is-latest .tcard-oi-label { font-weight: 500; }
+
+/* ─── Flow ledger ─────────────────────────────────────── */
+.tcard-flow-row {
+  display: grid;
+  grid-template-columns: 38px 1fr 56px 32px;
+  gap: 8px;
+  padding: 1px 0;
+  font-size: 11px;
+  align-items: center;
+}
+
+.tcard-flow-time { color: var(--text-dim); }
+.tcard-flow-strike { color: var(--text-muted); }
+.tcard-flow-notional {
+  color: var(--text-dim);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.tcard-flow-dte {
+  font-size: 9px;
+  text-align: right;
+  font-family: 'JetBrains Mono', monospace;
+}
+
+.tcard-flow-row.tcard-bias-bullish .tcard-flow-strike { color: var(--positive); }
+.tcard-flow-row.tcard-bias-bearish .tcard-flow-strike { color: var(--negative); }
+
+.tcard-flow-row.is-latest .tcard-flow-strike { font-weight: 500; }
+.tcard-flow-row.is-latest .tcard-flow-notional {
+  color: var(--text);
+  font-weight: 500;
+}
+
+.tcard-dte-short  { color: #f0b400; }   /* 0DTE — yellow warning */
+.tcard-dte-mid    { color: var(--text-muted); }  /* 1-6DTE — neutral */
+.tcard-dte-long   { color: var(--positive); font-weight: 500; }  /* 7+DTE — green */
+.tcard-dte-unknown { color: var(--text-dim); }

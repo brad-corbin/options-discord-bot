@@ -1244,63 +1244,108 @@ def command_center_data(ui_account: str) -> Dict:
     }
 
 """
-Trading tab data layer — Day 1 ship.
+─────────────────────────────────────────────────────────────────────────────
+Trading tab data layer — Day 2 ship (card grid).
 
-Phase 5a Day 1 — visible row first.
+Phase 5a Day 2 — replaces the row table with a per-ticker card view.
 
-Strategy: this function calls dashboard.get_ticker_snapshot(ticker) for each
-ticker in oi_flow.FLOW_TICKERS. The bot's existing dashboard.py already builds
-a complete row dict per ticker — same data that writes to the Sheets dashboard
-tab. We import that function and call it in a loop. No new data plumbing.
+Strategy: each card needs four sections of data:
+  1. Header context (ticker, spot, %day, time, signal pills)
+  2. Watch Map levels (from em_log:{date}:{ticker}:silent + gex:{ticker})
+  3. OI today ledger (from volume_flags:{date} filtered to ticker)
+  4. Flow today ledger (from flow_history:{ticker}:{date})
 
-Best MFE column is intentionally NOT included in the returned snapshot. The
-underlying tracker has known correctness issues (RT-1 init bias, RT-4 UTC vs
-CT date) that bias the metric. Brad's preference is to omit broken metrics
-rather than show misleading data. When the grader is rebuilt to match how
-trades are actually closed (option-mid polling for longs, expiration close
-for spreads), the column will reappear with real data.
+This module replaces the v1 trading_data() function (15-column row data)
+with v2 trading_data() that returns enriched per-ticker card payloads.
 
-Open Campaigns column IS included even though Brad isn't sure it's correct.
-The column serves as its own diagnostic — if it's always 0 when there should
-be active campaigns, that's a bug surfaced. If it's correctly 0 because
-nothing's fired, that's useful too.
+Stage 1 upstream patch (oi_flow.py) writes flow_history:* keys. If that
+patch isn't deployed, the Flow ledger renders empty — same behavior as a
+ticker with no flow events. Defensive readers throughout.
 
-Failure mode: if the bot's dashboard module isn't importable (DASHBOARD_ENABLED
-not set, init failed), every row is skipped silently and the function returns
-an empty list. The route handler renders "no data" rather than crashing the
-page. Trading tab can't take down the rest of the dashboard.
+Failure mode: if any reader fails, the offending section renders empty for
+that ticker. Other sections still populate. One bad ticker doesn't break
+the page. Trading dashboard never crashes the server.
+─────────────────────────────────────────────────────────────────────────────
 """
 
 import logging
 import time
-from typing import Dict, List, Optional
+from datetime import datetime, date as _date_cls
+from typing import Dict, List, Optional, Tuple
 
 log = logging.getLogger(__name__)
 
-# Cache the trading_data response for 1.0 second. Polling at 5s on the client
-# means up to ~5 concurrent dashboard users would hit this function 5x/sec.
-# A 1s cache flattens that to ~1/sec while keeping the row visibly fresh.
 _TRADING_CACHE: Dict[str, tuple] = {}
 _TRADING_CACHE_TTL_SEC = 1.0
 
+# Top N levels above and below spot rendered per card. Matches the
+# Watch Map mockup (4 above, 4 below).
+_LEVELS_PER_SIDE = 4
+
+# Top N events per ledger. Trading screenshot example shows 4 flow rows;
+# more than 8 gets visually noisy and pushes the card too tall.
+_LEDGER_MAX_EVENTS = 6
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PUBLIC ENTRY POINT
+# ═════════════════════════════════════════════════════════════════════════════
 
 def trading_data(ui_account: str) -> Dict:
-    """Build trading-tab row data.
+    """Build the trading tab card payload.
 
     Returns:
         {
             "ui_account": str,
-            "rows": [<ticker_snapshot>, ...],   # ordered alphabetically
+            "cards": [<per-ticker card dict>, ...],   # alphabetical
             "tickers_total": int,
-            "tickers_with_data": int,           # rows with at least one
-                                                  # populated cell beyond ticker
-            "fetched_at_ts": float,             # epoch
-            "fetched_at_ct": str,               # "HH:MM:SS"
-            "available": bool,                  # False if dashboard unavailable
+            "tickers_with_data": int,
+            "fetched_at_ts": float,
+            "fetched_at_ct": str,
+            "available": bool,
             "error": Optional[str],
         }
+
+    Each card dict shape:
+        {
+            "ticker": "PLTR",
+            "spot": 146.75,
+            "pct_day": 0.34,
+            "as_of_time_ct": "16:13",
+
+            "thesis": {"bias": "STRONG BULLISH", "score": 7,
+                       "stripe_class": "bullish-strong"},
+            "pb": {"floor": 128.50, "roof": 145.20, "location": "in",
+                   "label": "PB IN $128–$145"},
+            "gex": {"sign": "positive", "label": "GEX +"},
+            "as_signal": "T2 BULL" or None,
+
+            "levels": {
+                "above": [(152.40, "call wall"), ...],   # nearest first
+                "below": [(144.80, "key hold"), ...],    # nearest first
+                "available": True,
+            },
+            "oi_ledger": {
+                "events": [
+                    {"time": "15:08", "label": "bull buildup · calls",
+                     "side": "call", "direction": "buildup", "bias": "bull",
+                     "strike_dte_label": "$148 · 7DTE"},
+                    ...
+                ],
+                "available": True,
+            },
+            "flow_ledger": {
+                "events": [
+                    {"time": "14:33", "bias": "bull", "side": "call",
+                     "strike_label": "bull · $147C", "notional_label": "$221K",
+                     "dte_label": "0D", "dte_class": "short", "is_latest": False},
+                    {..., "is_latest": True},
+                ],
+                "available": True,
+            },
+        }
     """
-    cache_key = f"{ui_account}"
+    cache_key = f"v2:{ui_account}"
     cached = _TRADING_CACHE.get(cache_key)
     now = time.time()
     if cached and (now - cached[0]) < _TRADING_CACHE_TTL_SEC:
@@ -1311,45 +1356,38 @@ def trading_data(ui_account: str) -> Dict:
         from oi_flow import FLOW_TICKERS
     except Exception as e:
         log.warning(f"trading_data: bot module import failed: {e}")
-        result = {
-            "ui_account": ui_account,
-            "rows": [],
-            "tickers_total": 0,
-            "tickers_with_data": 0,
-            "fetched_at_ts": now,
-            "fetched_at_ct": _ct_time_str(now),
-            "available": False,
-            "error": "Trading data layer is initializing or unavailable.",
-        }
-        _TRADING_CACHE[cache_key] = (now, result)
-        return result
+        empty = _empty_response(ui_account, now,
+                                "Trading data layer is initializing or unavailable.")
+        _TRADING_CACHE[cache_key] = (now, empty)
+        return empty
 
-    rows: List[Dict] = []
+    bot_state = getattr(bot_dashboard, "_persistent_state", None)
+    bot_get_spot = getattr(bot_dashboard, "_get_spot_fn", None)
+
+    cards: List[Dict] = []
     tickers_with_data = 0
-    tickers = sorted(FLOW_TICKERS)
+    today_ct = _ct_today_str()
+    today_utc = _utc_today_str()
 
-    for ticker in tickers:
+    for ticker in sorted(FLOW_TICKERS):
         try:
-            snap = bot_dashboard.get_ticker_snapshot(ticker)
+            card = _build_card(ticker, bot_dashboard, bot_state,
+                               bot_get_spot, today_ct, today_utc)
         except Exception as e:
-            log.debug(f"trading_data: snapshot failed for {ticker}: {e}")
-            snap = {"ticker": ticker, "spot": None}
+            log.debug(f"trading_data: card build failed for {ticker}: {e}")
+            card = _empty_card(ticker)
 
-        # Strip Best MFE — broken grader, omit rather than mislead
-        snap.pop("best_mfe", None)
-        snap.pop("best_peak_pct_lifetime", None)
-        snap.pop("best_245_pct", None)
-        snap.pop("best_hold_peak_pct", None)
-
-        if _row_has_data(snap):
+        if _card_has_signal(card):
             tickers_with_data += 1
 
-        rows.append(snap)
+        cards.append(card)
+
+    cards.sort(key=_card_sort_key)
 
     result = {
         "ui_account": ui_account,
-        "rows": rows,
-        "tickers_total": len(tickers),
+        "cards": cards,
+        "tickers_total": len(cards),
         "tickers_with_data": tickers_with_data,
         "fetched_at_ts": now,
         "fetched_at_ct": _ct_time_str(now),
@@ -1360,31 +1398,603 @@ def trading_data(ui_account: str) -> Dict:
     return result
 
 
-def _row_has_data(snap: Dict) -> bool:
-    """A row 'has data' if any column beyond ticker is populated."""
-    if snap.get("spot"):
+# ═════════════════════════════════════════════════════════════════════════════
+# CARD BUILDER
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _build_card(ticker: str, bot_dashboard, bot_state, bot_get_spot,
+                today_ct: str, today_utc: str) -> Dict:
+    """Build one ticker card from existing bot state. Reads only —
+    never writes back to the bot."""
+    snap = bot_dashboard.get_ticker_snapshot(ticker)
+
+    spot = snap.get("spot")
+    pct_day = snap.get("pct_day")
+
+    # Header pills
+    thesis = _build_thesis_pill(snap)
+    pb = _build_pb_pill(snap)
+    gex = _build_gex_pill(snap)
+    as_signal = (snap.get("active_scanner") or "").strip() or None
+
+    # Levels (Watch Map data — em_log + gex + thesis + spot)
+    levels = _build_levels(ticker, spot, bot_state, today_utc)
+
+    # OI ledger (today's volume flags filtered to ticker)
+    oi_ledger = _build_oi_ledger(ticker, bot_state, today_ct)
+
+    # Flow ledger (flow_history:{ticker}:{date} from Stage 1 patch)
+    flow_ledger = _build_flow_ledger(ticker, bot_state, today_ct, today_utc)
+
+    return {
+        "ticker": ticker,
+        "spot": spot,
+        "pct_day": pct_day,
+        "as_of_time_ct": snap.get("updated", "") or "",
+        "thesis": thesis,
+        "pb": pb,
+        "gex": gex,
+        "as_signal": as_signal,
+        "levels": levels,
+        "oi_ledger": oi_ledger,
+        "flow_ledger": flow_ledger,
+    }
+
+
+def _empty_card(ticker: str) -> Dict:
+    """Default card when reader fails — no data, no crash."""
+    return {
+        "ticker": ticker,
+        "spot": None,
+        "pct_day": None,
+        "as_of_time_ct": "",
+        "thesis": {"bias": "", "score": None, "stripe_class": "neutral"},
+        "pb": {"floor": None, "roof": None, "location": "none", "label": ""},
+        "gex": {"sign": "", "label": ""},
+        "as_signal": None,
+        "levels": {"above": [], "below": [], "available": False},
+        "oi_ledger": {"events": [], "available": False},
+        "flow_ledger": {"events": [], "available": False},
+    }
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# HEADER PILLS
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _build_thesis_pill(snap: Dict) -> Dict:
+    bias = (snap.get("thesis_bias") or "").strip()
+    score = snap.get("thesis_score")
+
+    bias_lc = bias.lower()
+    if "strong bull" in bias_lc:
+        stripe_class = "bullish-strong"
+    elif "bull" in bias_lc:
+        stripe_class = "bullish" if "slight" not in bias_lc else "bullish-faint"
+    elif "strong bear" in bias_lc:
+        stripe_class = "bearish-strong"
+    elif "bear" in bias_lc:
+        stripe_class = "bearish" if "slight" not in bias_lc else "bearish-faint"
+    else:
+        stripe_class = "neutral"
+
+    return {
+        "bias": bias,
+        "score": score,
+        "stripe_class": stripe_class,
+    }
+
+
+def _build_pb_pill(snap: Dict) -> Dict:
+    floor = snap.get("pb_floor")
+    roof = snap.get("pb_roof")
+    location = (snap.get("pb_location") or "none").strip().lower()
+
+    label_parts = []
+    if location and location != "none":
+        label_parts.append(f"PB {location.upper()}")
+    else:
+        label_parts.append("PB NONE")
+
+    if floor and roof:
+        try:
+            label_parts.append(f"${float(floor):.0f}–${float(roof):.0f}")
+        except (TypeError, ValueError):
+            pass
+
+    return {
+        "floor": floor,
+        "roof": roof,
+        "location": location,
+        "label": " ".join(label_parts),
+    }
+
+
+def _build_gex_pill(snap: Dict) -> Dict:
+    sign = (snap.get("gex_sign") or "").strip().lower()
+    if sign == "positive":
+        label = "GEX +"
+    elif sign == "negative":
+        label = "GEX −"
+    else:
+        label = ""
+    return {"sign": sign, "label": label}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# WATCH MAP LEVELS
+# ═════════════════════════════════════════════════════════════════════════════
+# Reads em_log:{utc_date}:{ticker}:silent (written 8:30 AM CT by the bot's
+# silent thesis daemon) plus gex:{ticker} for the live gamma/walls. Sorts
+# all candidate levels above/below spot. The label per level is the most
+# meaningful name from a priority order.
+
+# Priority order — when the same price has multiple labels, prefer the more
+# specific one. This is the visual hierarchy that matters most when
+# scanning the levels list.
+_LEVEL_LABEL_PRIORITY = [
+    "EM high", "EM low", "call wall", "put wall", "gamma flip",
+    "max pain", "next target", "primary", "key hold",
+    "pivot", "R1", "S1", "R2", "S2",
+    "fib resistance", "fib support",
+    "VPOC", "vp resistance", "vp support",
+    "local resistance", "local support",
+    "pin",
+]
+
+
+def _build_levels(ticker: str, spot: Optional[float], bot_state,
+                  today_utc: str) -> Dict:
+    if not bot_state or not spot or spot <= 0:
+        return {"above": [], "below": [], "available": False}
+
+    em_log = _read_em_log(bot_state, ticker, today_utc)
+    gex = _read_gex(bot_state, ticker)
+
+    if not em_log and not gex:
+        return {"above": [], "below": [], "available": False}
+
+    # Build the candidate (level, label) list from all available sources.
+    # Pre-merge by price: if two sources contribute the same price, the
+    # higher-priority label wins.
+    candidates: List[Tuple[float, str]] = []
+
+    def add(level, label):
+        try:
+            v = float(level)
+            if v > 0:
+                candidates.append((round(v, 2), label))
+        except (TypeError, ValueError):
+            pass
+
+    # GEX live takes precedence over em_log static for gamma_flip + walls
+    if gex:
+        add(gex.get("gamma_flip"), "gamma flip")
+        add(gex.get("call_wall"), "call wall")
+        add(gex.get("put_wall"), "put wall")
+        add(gex.get("max_pain"), "max pain")
+
+    if em_log:
+        add(em_log.get("bull_1sd"), "EM high")
+        add(em_log.get("bear_1sd"), "EM low")
+        # gamma_flip/walls — only if gex didn't already provide them
+        if not gex or not gex.get("gamma_flip"):
+            add(em_log.get("gamma_flip"), "gamma flip")
+        if not gex or not gex.get("call_wall"):
+            add(em_log.get("call_wall"), "call wall")
+        if not gex or not gex.get("put_wall"):
+            add(em_log.get("put_wall"), "put wall")
+        if not gex or not gex.get("max_pain"):
+            add(em_log.get("max_pain"), "max pain")
+
+        add(em_log.get("pin_zone_high"), "pin zone hi")
+        add(em_log.get("pin_zone_low"), "pin zone lo")
+        add(em_log.get("pivot"), "pivot")
+        add(em_log.get("r1"), "R1")
+        add(em_log.get("s1"), "S1")
+        add(em_log.get("r2"), "R2")
+        add(em_log.get("s2"), "S2")
+        add(em_log.get("fib_resistance"), "fib resistance")
+        add(em_log.get("fib_support"), "fib support")
+        add(em_log.get("vp_resistance"), "vp resistance")
+        add(em_log.get("vp_support"), "vp support")
+        add(em_log.get("vpoc"), "VPOC")
+        add(em_log.get("local_resistance_1"), "local resistance")
+        add(em_log.get("local_support_1"), "local support")
+
+    # De-dup by price, keep highest-priority label
+    by_price: Dict[float, str] = {}
+    priority_idx = {label: i for i, label in enumerate(_LEVEL_LABEL_PRIORITY)}
+    for price, label in candidates:
+        existing = by_price.get(price)
+        if existing is None:
+            by_price[price] = label
+        else:
+            old_p = priority_idx.get(existing, 999)
+            new_p = priority_idx.get(label, 999)
+            if new_p < old_p:
+                by_price[price] = label
+
+    # Split above and below spot
+    above = sorted(((p, lbl) for p, lbl in by_price.items() if p > spot),
+                    key=lambda x: x[0])
+    below = sorted(((p, lbl) for p, lbl in by_price.items() if p < spot),
+                    key=lambda x: x[0], reverse=True)
+
+    # Trim to N per side. "Nearest first" = lowest price above-spot at top,
+    # highest price below-spot at top of the below list.
+    above = above[:_LEVELS_PER_SIDE]
+    below = below[:_LEVELS_PER_SIDE]
+
+    # Mark the closest level above spot as "next target" if it doesn't
+    # already have a more-specific label
+    if above:
+        first_price, first_label = above[0]
+        if first_label not in ("call wall", "put wall", "gamma flip",
+                                "EM high", "EM low", "max pain"):
+            above[0] = (first_price, "next target")
+
+    return {
+        "above": above,   # list of (price, label) tuples, nearest first
+        "below": below,
+        "available": True,
+    }
+
+
+def _read_em_log(bot_state, ticker: str, today_utc: str) -> Optional[Dict]:
+    """em_log:{utc_date}:{ticker}:silent — written 8:30 AM CT for all 35
+    flow tickers."""
+    try:
+        key = f"em_log:{today_utc}:{ticker.upper()}:silent"
+        return bot_state._json_get(key)
+    except Exception as e:
+        log.debug(f"em_log read failed for {ticker}: {e}")
+        return None
+
+
+def _read_gex(bot_state, ticker: str) -> Optional[Dict]:
+    """gex:{ticker} — written by oi_flow on every chain pull, 2h TTL."""
+    try:
+        return bot_state._json_get(f"gex:{ticker.upper()}")
+    except Exception as e:
+        log.debug(f"gex read failed for {ticker}: {e}")
+        return None
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# OI LEDGER
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _build_oi_ledger(ticker: str, bot_state, today_ct: str) -> Dict:
+    if not bot_state:
+        return {"events": [], "available": False}
+
+    try:
+        flags = bot_state.get_volume_flags(today_ct) or []
+    except Exception as e:
+        log.debug(f"oi flags read failed for {ticker}: {e}")
+        return {"events": [], "available": False}
+
+    t_flags = [f for f in flags if (f.get("ticker") or "").upper() == ticker.upper()]
+    if not t_flags:
+        return {"events": [], "available": True}
+
+    # Sort by timestamp ascending (oldest first → latest last)
+    def _ts_of(f):
+        return f.get("timestamp") or f.get("time") or f.get("ts") or ""
+    t_flags.sort(key=_ts_of)
+
+    events: List[Dict] = []
+    for f in t_flags[-_LEDGER_MAX_EVENTS:]:
+        time_str = _fmt_hhmm_ct(_ts_of(f))
+        side = (f.get("side") or "").lower()  # call | put
+        side_label = "calls" if side == "call" else "puts" if side == "put" else side
+
+        # Direction inference (matches dashboard.py:_get_oi_snapshot logic)
+        flow_type = (f.get("flow_type") or f.get("type") or "").lower()
+        directional_bias = (f.get("directional_bias") or "").upper()
+
+        if "buildup" in flow_type:
+            direction = "buildup"
+        elif "unwind" in flow_type:
+            direction = "unwind"
+        else:
+            # Same-day flags don't have flow_type yet; infer from
+            # directional_bias + side
+            if "BULLISH" in directional_bias:
+                direction = "buildup" if side == "call" else "unwind"
+            elif "BEARISH" in directional_bias:
+                direction = "buildup" if side == "put" else "unwind"
+            else:
+                direction = ""
+
+        # Bias of the event for color: bull buildup on calls = bullish,
+        # bear buildup on puts = bearish, unwinds are neutral
+        if direction == "buildup":
+            if side == "call":
+                bias = "bullish"
+            elif side == "put":
+                bias = "bearish"
+            else:
+                bias = "neutral"
+        elif direction == "unwind":
+            bias = "neutral"  # unwinds always render in neutral color
+        else:
+            bias = "neutral"
+
+        # Display label: e.g. "bull buildup · calls" or "unwind · calls"
+        if direction == "buildup" and bias == "bullish":
+            label = f"bull buildup · {side_label}"
+        elif direction == "buildup" and bias == "bearish":
+            label = f"bear buildup · {side_label}"
+        elif direction == "unwind":
+            label = f"unwind · {side_label}"
+        elif direction:
+            label = f"{direction} · {side_label}"
+        else:
+            label = side_label
+
+        # strike + DTE label
+        strike = f.get("strike")
+        expiry = f.get("expiry") or ""
+        dte = _calc_dte(expiry)
+        if strike and expiry:
+            try:
+                strike_label = f"${float(strike):.0f} · {dte}DTE"
+            except (TypeError, ValueError):
+                strike_label = f"{strike} · {dte}DTE"
+        elif strike:
+            try:
+                strike_label = f"${float(strike):.0f}"
+            except (TypeError, ValueError):
+                strike_label = str(strike)
+        else:
+            strike_label = ""
+
+        events.append({
+            "time": time_str,
+            "label": label,
+            "bias": bias,
+            "side": side,
+            "direction": direction,
+            "strike_dte_label": strike_label,
+        })
+
+    if events:
+        events[-1]["is_latest"] = True
+    for e in events[:-1]:
+        e["is_latest"] = False
+
+    return {"events": events, "available": True}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# FLOW LEDGER
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _build_flow_ledger(ticker: str, bot_state, today_ct: str,
+                       today_utc: str) -> Dict:
+    if not bot_state:
+        return {"events": [], "available": False}
+
+    # Stage 1 patch writes flow_history:{TICKER}:{today}. The "today" used
+    # at write time comes from the bot's existing today_str (UTC). We try
+    # both UTC and CT just in case the bot's clock semantics differ.
+    history = None
+    for date_str in (today_utc, today_ct):
+        try:
+            key = f"flow_history:{ticker.upper()}:{date_str}"
+            history = bot_state._json_get(key)
+            if history:
+                break
+        except Exception as e:
+            log.debug(f"flow_history read failed for {ticker} {date_str}: {e}")
+
+    if not history:
+        return {"events": [], "available": True}
+
+    history = history[-_LEDGER_MAX_EVENTS:]
+
+    events: List[Dict] = []
+    for h in history:
+        time_str = _fmt_hhmm_ct(h.get("ts"))
+        direction = (h.get("direction") or "").lower()  # bullish | bearish
+        side = (h.get("side") or "").lower()  # call | put
+        bias = "bullish" if direction == "bullish" else "bearish" if direction == "bearish" else "neutral"
+
+        # Strike label: "bull · $147C" or "bear · $382P"
+        side_letter = "C" if side == "call" else "P" if side == "put" else "?"
+        strike = h.get("strike")
+        bias_short = "bull" if bias == "bullish" else "bear" if bias == "bearish" else ""
+        if strike is not None:
+            try:
+                strike_label = f"{bias_short} · ${float(strike):.0f}{side_letter}".strip(" ·")
+            except (TypeError, ValueError):
+                strike_label = f"{bias_short} · {strike}{side_letter}".strip(" ·")
+        else:
+            strike_label = bias_short
+
+        # Notional formatting: $221K, $1.4M
+        notional = h.get("notional") or 0
+        notional_label = _fmt_notional(notional)
+
+        # DTE pill
+        expiry = h.get("expiry") or ""
+        dte = _calc_dte(expiry)
+        if dte is None:
+            dte_label = ""
+            dte_class = "unknown"
+        else:
+            dte_label = f"{dte}D"
+            # Color: 0DTE = warning (hedging/scalping), 7+DTE = success
+            # (positioning), 1-6DTE = neutral
+            if dte == 0:
+                dte_class = "short"
+            elif dte >= 7:
+                dte_class = "long"
+            else:
+                dte_class = "mid"
+
+        events.append({
+            "time": time_str,
+            "bias": bias,
+            "side": side,
+            "strike_label": strike_label,
+            "notional_label": notional_label,
+            "notional_value": int(notional or 0),
+            "dte_label": dte_label,
+            "dte_class": dte_class,
+            "flow_level": (h.get("flow_level") or "").lower(),
+        })
+
+    if events:
+        events[-1]["is_latest"] = True
+    for e in events[:-1]:
+        e["is_latest"] = False
+
+    return {"events": events, "available": True}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SORTING / DENSITY
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _card_has_signal(card: Dict) -> bool:
+    if card.get("spot"):
         return True
-    if snap.get("pb_floor") or snap.get("pb_roof"):
+    if card["thesis"].get("bias"):
         return True
-    if snap.get("oi_time") or snap.get("flow_time"):
+    if card["pb"].get("floor"):
         return True
-    if snap.get("active_scanner"):
+    if card["oi_ledger"]["events"]:
         return True
-    if snap.get("thesis_bias") and snap.get("thesis_bias") != "":
-        return True
-    if snap.get("gamma_flip"):
-        return True
-    if snap.get("open_campaigns"):
+    if card["flow_ledger"]["events"]:
         return True
     return False
 
 
-def _ct_time_str(ts: float) -> str:
-    """Return HH:MM:SS in Central Time."""
+def _card_sort_key(card: Dict):
+    """Sort cards by signal density desc, then alphabetical ticker.
+
+    Density rule:
+      - Each flow event: +1
+      - Each OI event: +1
+      - Extreme flow_level: +2 bonus
+      - Multi-day DTE flow event: +1 bonus
+      - Conflicting bull/bear in same ledger: -1 penalty (mixed signal noise)
+
+    The (negative density, ticker) tuple sorts highest density first,
+    alphabetical for ties.
+    """
+    score = 0
+    flow_events = card["flow_ledger"]["events"]
+    oi_events = card["oi_ledger"]["events"]
+
+    score += len(flow_events)
+    score += len(oi_events)
+
+    flow_levels = [e.get("flow_level") for e in flow_events]
+    score += 2 * sum(1 for fl in flow_levels if fl == "extreme")
+
+    flow_dtes = [e.get("dte_class") for e in flow_events]
+    score += sum(1 for d in flow_dtes if d in ("mid", "long"))
+
+    biases = [e.get("bias") for e in flow_events]
+    if "bullish" in biases and "bearish" in biases:
+        score -= 1
+
+    return (-score, card["ticker"])
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# FORMATTING HELPERS
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _fmt_notional(n) -> str:
+    try:
+        v = float(n)
+    except (TypeError, ValueError):
+        return ""
+    if v <= 0:
+        return ""
+    if v >= 1_000_000:
+        return f"${v / 1_000_000:.1f}M"
+    if v >= 1_000:
+        return f"${v / 1_000:.0f}K"
+    return f"${int(v)}"
+
+
+def _fmt_hhmm_ct(ts) -> str:
+    """Convert ISO timestamp to HH:MM Central Time."""
+    if not ts:
+        return ""
     try:
         from zoneinfo import ZoneInfo
-        from datetime import datetime
+    except ImportError:
+        return str(ts)[11:16] if len(str(ts)) >= 16 else ""
+    try:
+        # Handle ISO with or without TZ
+        s = str(ts)
+        if s.endswith("Z"):
+            s = s.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            # Treat naive as UTC (the bot writes datetime.now().isoformat()
+            # which is server-local; on Render that's typically UTC)
+            from datetime import timezone
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(ZoneInfo("America/Chicago")).strftime("%H:%M")
+    except Exception:
+        return ""
+
+
+def _calc_dte(expiry: str) -> Optional[int]:
+    if not expiry:
+        return None
+    try:
+        exp = _date_cls.fromisoformat(str(expiry)[:10])
+        today = _ct_today_date()
+        return max(0, (exp - today).days)
+    except Exception:
+        return None
+
+
+def _ct_today_date() -> _date_cls:
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("America/Chicago")).date()
+    except Exception:
+        return _date_cls.today()
+
+
+def _ct_today_str() -> str:
+    return _ct_today_date().isoformat()
+
+
+def _utc_today_str() -> str:
+    try:
+        from datetime import timezone
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    except Exception:
+        return _date_cls.today().isoformat()
+
+
+def _ct_time_str(ts: float) -> str:
+    try:
+        from zoneinfo import ZoneInfo
         return datetime.fromtimestamp(ts, ZoneInfo("America/Chicago")).strftime("%H:%M:%S")
     except Exception:
-        from datetime import datetime
         return datetime.fromtimestamp(ts).strftime("%H:%M:%S")
+
+
+def _empty_response(ui_account: str, now: float, error: str) -> Dict:
+    return {
+        "ui_account": ui_account,
+        "cards": [],
+        "tickers_total": 0,
+        "tickers_with_data": 0,
+        "fetched_at_ts": now,
+        "fetched_at_ct": _ct_time_str(now),
+        "available": False,
+        "error": error,
+    }

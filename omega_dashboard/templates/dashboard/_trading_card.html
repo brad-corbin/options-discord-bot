@@ -1,0 +1,93 @@
+{# Single-card partial — renders one card from a `card` context dict.
+   Mirrors the JS renderCard() output so server-side initial paint
+   matches what polling produces. #}
+<div class="tcard stripe-{{ card.thesis.stripe_class }}" data-ticker="{{ card.ticker }}">
+  <div class="tcard-header">
+    <div class="tcard-title-row">
+      <span class="tcard-ticker">{{ card.ticker }}</span>
+      <span class="tcard-spot">{% if card.spot %}${{ "%.2f"|format(card.spot) }}{% endif %}</span>
+      {% if card.pct_day is not none %}
+        <span class="tcard-pct {% if card.pct_day > 0 %}positive{% elif card.pct_day < 0 %}negative{% endif %}">
+          {{ "%.2f"|format(card.pct_day) }}%
+        </span>
+      {% else %}
+        <span class="tcard-pct muted">—</span>
+      {% endif %}
+    </div>
+    <div class="tcard-time">{{ card.as_of_time_ct or '' }}</div>
+  </div>
+
+  <div class="tcard-pills">
+    {% if card.thesis.bias %}
+      <span class="tpill tpill-thesis tpill-{{ card.thesis.stripe_class }}">
+        {{ card.thesis.bias }}{% if card.thesis.score is not none %} {{ card.thesis.score }}{% endif %}
+      </span>
+    {% endif %}
+    {% if card.pb.label %}
+      <span class="tpill tpill-pb">{{ card.pb.label }}</span>
+    {% endif %}
+    {% if card.gex.label %}
+      <span class="tpill tpill-gex">{{ card.gex.label }}</span>
+    {% endif %}
+    {% if card.as_signal %}
+      <span class="tpill tpill-as">{{ card.as_signal }}</span>
+    {% endif %}
+  </div>
+
+  <div class="tcard-section">
+    <div class="tcard-eyebrow">Levels</div>
+    {% if card.levels.available and (card.levels.above or card.levels.below) %}
+      <div class="tcard-levels">
+        {% for price, label in card.levels.above|reverse %}
+          <div class="tcard-level-row">
+            <span class="tcard-level-price">${{ "%.2f"|format(price) }}</span>
+            <span class="tcard-level-label">{{ label }}</span>
+          </div>
+        {% endfor %}
+        <div class="tcard-level-spot">
+          <span class="tcard-level-price">{% if card.spot %}${{ "%.2f"|format(card.spot) }}{% endif %}</span>
+          <span class="tcard-level-label">spot</span>
+        </div>
+        {% for price, label in card.levels.below %}
+          <div class="tcard-level-row">
+            <span class="tcard-level-price">${{ "%.2f"|format(price) }}</span>
+            <span class="tcard-level-label">{{ label }}</span>
+          </div>
+        {% endfor %}
+      </div>
+    {% else %}
+      <div class="tcard-empty">No level data captured.</div>
+    {% endif %}
+  </div>
+
+  <div class="tcard-section">
+    <div class="tcard-eyebrow">OI today</div>
+    {% if card.oi_ledger.events %}
+      {% for e in card.oi_ledger.events %}
+        <div class="tcard-oi-row tcard-bias-{{ e.bias or 'neutral' }}{% if e.is_latest %} is-latest{% endif %}">
+          <span class="tcard-oi-time">{{ e.time or '' }}</span>
+          <span class="tcard-oi-label">{{ e.label or '' }}</span>
+          <span class="tcard-oi-strike">{{ e.strike_dte_label or '' }}</span>
+        </div>
+      {% endfor %}
+    {% else %}
+      <div class="tcard-empty">No OI events captured today.</div>
+    {% endif %}
+  </div>
+
+  <div class="tcard-section">
+    <div class="tcard-eyebrow">Flow today</div>
+    {% if card.flow_ledger.events %}
+      {% for e in card.flow_ledger.events %}
+        <div class="tcard-flow-row tcard-bias-{{ e.bias or 'neutral' }}{% if e.is_latest %} is-latest{% endif %}">
+          <span class="tcard-flow-time">{{ e.time or '' }}</span>
+          <span class="tcard-flow-strike">{{ e.strike_label or '' }}</span>
+          <span class="tcard-flow-notional">{{ e.notional_label or '' }}</span>
+          <span class="tcard-flow-dte tcard-dte-{{ e.dte_class or 'unknown' }}">{{ e.dte_label or '' }}</span>
+        </div>
+      {% endfor %}
+    {% else %}
+      <div class="tcard-empty">No flow events captured today.</div>
+    {% endif %}
+  </div>
+</div>
