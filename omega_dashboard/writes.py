@@ -459,19 +459,57 @@ def get_holdings(account: str) -> Dict[str, Dict]:
     return _load(_key_holdings(account), {})
 
 
+def _holding_key(ticker: str, sub: str) -> str:
+    """Build a composite holdings key. Used when same ticker has lots in different sub-accounts."""
+    sub_clean = (sub or "").strip() or DEFAULT_SUBACCOUNT
+    return f"{ticker}@{sub_clean}"
+
+
+def _find_holding_lot(holdings: Dict, ticker: str, sub: str):
+    """Find a holdings lot by (ticker, sub). Returns (key, dict) or (None, None).
+
+    Checks both the composite key (`TICKER@SUB`) and the legacy bare-ticker key.
+    """
+    sub_clean = (sub or "").strip() or DEFAULT_SUBACCOUNT
+    composite = f"{ticker}@{sub_clean}"
+    if composite in holdings:
+        h = holdings[composite]
+        if isinstance(h, dict):
+            return composite, h
+    # Legacy: bare ticker key, as long as the stored sub matches
+    if ticker in holdings:
+        h = holdings[ticker]
+        if isinstance(h, dict) and (h.get("subaccount") == sub_clean):
+            return ticker, h
+    return None, None
+
+
+def _all_lots_for_ticker(holdings: Dict, ticker: str):
+    """Return [(key, lot), ...] for all lots matching this ticker (any sub)."""
+    out = []
+    for k, h in holdings.items():
+        if not isinstance(h, dict):
+            continue
+        if h.get("ticker") == ticker:
+            out.append((k, h))
+        elif k == ticker:
+            # Legacy: bare-ticker key, no explicit ticker field
+            out.append((k, h))
+        elif "@" in k and k.split("@", 1)[0] == ticker:
+            out.append((k, h))
+    return out
+
+
 def add_holding(account: str, ticker: str, shares: float, cost_basis: float,
                 subaccount: str = None, tag: str = None,
                 date: str = None,
                 _from_assignment: bool = False) -> Dict:
     """Add or merge a share lot.
 
-    If ticker already exists, this CREATES a new lot (we don't mutate the
-    existing position — phase 4.5 may add cost-basis-merge logic, but for
-    now multiple buys at different prices stay distinct).
-
-    _from_assignment: internal flag set by close_option auto-handle. Used
-    to suppress the duplicate campaign event (the close_option hook already
-    records csp_assigned with shares).
+    Phase 4.5+: multi-sub-account aware. If a lot exists for the SAME
+    (ticker, sub-account), merge into it (averaging cost basis). If lots
+    exist for the same ticker in DIFFERENT sub-accounts, store as a separate
+    lot keyed by `TICKER@SUB`. Legacy bare-ticker entries continue to work.
     """
     if not _validate_account(account):
         return {"ok": False, "error": "Invalid account"}
@@ -489,25 +527,50 @@ def add_holding(account: str, ticker: str, shares: float, cost_basis: float,
     date_iso = _validate_date(date) or datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     holdings = get_holdings(account)
-    existing = holdings.get(t)
+
+    # Find an existing lot for the SAME (ticker, sub). If found, merge.
+    existing_key, existing = _find_holding_lot(holdings, t, sub)
 
     if existing:
-        # Add to existing position — average cost basis
         old_shares = float(existing.get("shares") or 0)
         old_cb = float(existing.get("cost_basis") or 0)
         new_shares = old_shares + sh
         new_cb = ((old_shares * old_cb) + (sh * cb)) / new_shares if new_shares else cb
-        holdings[t] = {
+        holdings[existing_key] = {
+            "ticker": t,  # Phase 4.5+ — explicit ticker (was implicit in legacy bare key)
             "shares": new_shares,
             "cost_basis": round(new_cb, 4),
-            "subaccount": existing.get("subaccount", sub),
+            "subaccount": sub,  # Same as existing — we matched on it
             "tag": existing.get("tag") or (tag or ""),
             "first_added": existing.get("first_added", date_iso),
             "last_updated": _now_iso(),
         }
         op = "add_to_holding"
+        new_h = holdings[existing_key]
     else:
-        holdings[t] = {
+        # No matching (ticker, sub) lot. If other lots exist for this ticker,
+        # use composite key so they coexist. Otherwise use the bare ticker key
+        # for backward compatibility with any legacy code paths.
+        all_lots = _all_lots_for_ticker(holdings, t)
+        if all_lots:
+            # Other-sub lots exist — promote any legacy bare-ticker entries to
+            # composite keys so storage is consistent
+            for k, lot in list(all_lots):
+                if k == t:  # legacy bare key
+                    legacy_sub = lot.get("subaccount") or DEFAULT_SUBACCOUNT
+                    new_key = f"{t}@{legacy_sub}"
+                    if new_key != k and new_key not in holdings:
+                        # Move the lot, ensuring ticker field is set
+                        lot_with_ticker = dict(lot)
+                        lot_with_ticker["ticker"] = t
+                        holdings[new_key] = lot_with_ticker
+                        del holdings[t]
+            new_key = f"{t}@{sub}"
+        else:
+            new_key = t  # First-ever lot of this ticker, keep bare key
+
+        holdings[new_key] = {
+            "ticker": t,
             "shares": sh,
             "cost_basis": round(cb, 4),
             "subaccount": sub,
@@ -516,6 +579,7 @@ def add_holding(account: str, ticker: str, shares: float, cost_basis: float,
             "last_updated": _now_iso(),
         }
         op = "add_holding"
+        new_h = holdings[new_key]
 
     if not _save(_key_holdings(account), holdings):
         return {"ok": False, "error": "Save failed"}
@@ -529,7 +593,7 @@ def add_holding(account: str, ticker: str, shares: float, cost_basis: float,
         ref_id=t,
     )
 
-    _audit(account, op, t, existing, holdings[t])
+    _audit(account, op, t, existing, new_h)
 
     # Phase 4.5 — campaign hook (best-effort)
     try:
@@ -541,7 +605,7 @@ def add_holding(account: str, ticker: str, shares: float, cost_basis: float,
     except Exception as e:
         log.warning(f"campaign hook (add_holding) failed: {e}")
 
-    return {"ok": True, "ticker": t, "holding": holdings[t]}
+    return {"ok": True, "ticker": t, "holding": new_h}
 
 
 def edit_holding(account: str, ticker: str,
@@ -673,27 +737,53 @@ def sell_holding(account: str, ticker: str, shares: float,
         log.warning(f"campaign hook (sell_holding) failed: {e}")
 
     return {"ok": True, "ticker": t, "remaining": result_holding, "proceeds": cash_amount}
-def delete_holding(account: str, ticker: str, also_delete_cash: bool = False) -> Dict:
+def delete_holding(account: str, ticker: str, also_delete_cash: bool = False,
+                   subaccount: str = None) -> Dict:
     """Hard-remove a ticker from holdings. Optionally undo linked cash events
-    (the buy event from add_holding)."""
+    (the buy event from add_holding).
+
+    Phase 4.5+: if `subaccount` is provided, deletes the lot in that specific
+    sub-account. Otherwise deletes by bare ticker key (legacy behavior).
+    """
     if not _validate_account(account):
         return {"ok": False, "error": "Invalid account"}
     t = _validate_ticker(ticker)
     if not t:
         return {"ok": False, "error": "Invalid ticker"}
     holdings = get_holdings(account)
-    if t not in holdings:
+
+    # Find the target lot
+    if subaccount:
+        target_key, target_h = _find_holding_lot(holdings, t, subaccount)
+    else:
+        # No sub specified — find by bare ticker (legacy) or first composite match
+        if t in holdings:
+            target_key, target_h = t, holdings[t]
+        else:
+            lots = _all_lots_for_ticker(holdings, t)
+            if len(lots) == 1:
+                target_key, target_h = lots[0]
+            elif len(lots) > 1:
+                return {"ok": False, "error": f"{t} has multiple lots — specify sub-account"}
+            else:
+                target_key, target_h = None, None
+
+    if not target_h:
         return {"ok": False, "error": "Holding not found"}
 
-    target = dict(holdings[t])
+    target = dict(target_h)
     linked = find_linked_cash_events_for_holding(account, t)
+    # Filter to only this lot's sub-account if multi-sub
+    if subaccount:
+        linked = [e for e in linked if e.get("subaccount") == subaccount]
+
     cash_deleted_count = 0
     if also_delete_cash and linked:
         ids = [e["id"] for e in linked]
         cr = delete_cash_events_bulk(account, ids)
         cash_deleted_count = cr.get("deleted", 0)
 
-    del holdings[t]
+    del holdings[target_key]
     if not _save(_key_holdings(account), holdings):
         return {"ok": False, "error": "Save failed"}
     _audit(account, "delete_holding", t, target, {"linked_cash_deleted": cash_deleted_count})

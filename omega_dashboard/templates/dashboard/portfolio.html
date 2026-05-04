@@ -335,9 +335,11 @@
       </tr>
     </thead>
     <tbody>
-      {% for ticker, h in d.holdings.items() %}
+      {% for key, h in d.holdings.items() %}
+      {% set t = h.ticker or key.split('@')[0] if '@' in key else key %}
+      {% set sub_safe = h.subaccount or '' %}
       <tr>
-        <td class="mono ticker-cell"><strong>{{ ticker }}</strong></td>
+        <td class="mono ticker-cell"><strong>{{ t }}</strong></td>
         <td class="numeric mono">{{ h.shares }}</td>
         <td class="numeric mono">${{ "%.2f"|format(h.cost_basis or 0) }}</td>
         <td class="numeric mono">${{ "{:,.2f}".format((h.shares or 0) * (h.cost_basis or 0)) }}</td>
@@ -345,17 +347,18 @@
         <td class="muted">{{ h.tag or "—" }}</td>
         <td class="mono muted">{{ h.first_added or "—" }}</td>
         <td class="row-actions">
-          <button class="btn-mini" onclick="document.getElementById('sell-{{ ticker }}').classList.toggle('open')">Sell</button>
+          <button class="btn-mini" onclick="document.getElementById('sell-{{ key|replace('@', '_at_') }}').classList.toggle('open')">Sell</button>
           <button class="btn-mini btn-mini-danger"
-                  onclick="confirmDeleteHolding('{{ ticker }}', {{ h.shares }}, {{ h.cost_basis }}, '{{ acct }}')">Delete</button>
+                  onclick="confirmDeleteHolding('{{ t }}', {{ h.shares }}, {{ h.cost_basis }}, '{{ acct }}', '{{ sub_safe }}')">Delete</button>
         </td>
       </tr>
-      <tr id="sell-{{ ticker }}" class="inline-form-row">
+      <tr id="sell-{{ key|replace('@', '_at_') }}" class="inline-form-row">
         <td colspan="8">
           <form method="POST" action="{{ url_for('dashboard.portfolio_holding_sell') }}" class="inline-form">
             <input type="hidden" name="acct" value="{{ acct }}">
-            <input type="hidden" name="ticker" value="{{ ticker }}">
-            <span class="inline-label">SELL {{ ticker }}</span>
+            <input type="hidden" name="ticker" value="{{ t }}">
+            <input type="hidden" name="subaccount" value="{{ sub_safe }}">
+            <span class="inline-label">SELL {{ t }} <span class="muted">· {{ h.subaccount }}</span></span>
             <label>Shares</label>
             <input type="number" name="shares" step="0.0001" max="{{ h.shares }}" required>
             <label>@ price</label>
@@ -1687,7 +1690,7 @@
 </div>
 
 <script>
-function openDeleteModal({title, summary, formAction, account, kind, itemId}) {
+function openDeleteModal({title, summary, formAction, account, kind, itemId, extraFields}) {
   document.getElementById('modal-title').textContent = title;
   document.getElementById('modal-summary').textContent = summary;
   document.getElementById('modal-form-acct').value = account;
@@ -1695,6 +1698,20 @@ function openDeleteModal({title, summary, formAction, account, kind, itemId}) {
   document.getElementById('modal-cash-section').style.display = 'none';
   document.getElementById('modal-no-cash').style.display = 'none';
   document.getElementById('modal-cash-list').innerHTML = '';
+
+  // Phase 4.5+ — clear and re-add any extra hidden fields (e.g. subaccount)
+  const form = document.getElementById('modal-delete-form');
+  form.querySelectorAll('input[data-extra="1"]').forEach(el => el.remove());
+  if (extraFields) {
+    Object.entries(extraFields).forEach(([name, value]) => {
+      const inp = document.createElement('input');
+      inp.type = 'hidden';
+      inp.name = name;
+      inp.value = value;
+      inp.dataset.extra = '1';
+      form.appendChild(inp);
+    });
+  }
 
   // Fetch linked cash events
   const inspectUrl = `/portfolio/inspect/${kind}/${itemId}?acct=${account}`;
@@ -1758,14 +1775,16 @@ function confirmDeleteSpread(spreadId, ticker, type, account) {
   });
 }
 
-function confirmDeleteHolding(ticker, shares, costBasis, account) {
+function confirmDeleteHolding(ticker, shares, costBasis, account, subaccount) {
+  const subPart = subaccount ? ` · ${subaccount}` : '';
   openDeleteModal({
     title: 'Delete Holding',
-    summary: `${ticker} · ${shares} shares @ $${costBasis} cost basis`,
+    summary: `${ticker}${subPart} · ${shares} shares @ $${costBasis} cost basis`,
     formAction: `/portfolio/holdings/delete/${ticker}`,
     account: account,
     kind: 'holding',
     itemId: ticker,
+    extraFields: subaccount ? { subaccount: subaccount } : {},
   });
 }
 

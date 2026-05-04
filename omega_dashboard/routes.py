@@ -709,9 +709,12 @@ def portfolio_holding_delete(ticker):
     from . import writes
     acct = request.form.get("acct", "brad")
     also_cash = request.form.get("also_cash") == "1"
-    result = writes.delete_holding(acct, ticker, also_delete_cash=also_cash)
+    sub = request.form.get("subaccount") or None
+    result = writes.delete_holding(acct, ticker, also_delete_cash=also_cash, subaccount=sub)
     if result.get("ok"):
         msg = f"{ticker.upper()} removed"
+        if sub:
+            msg += f" from {sub}"
         if result.get("linked_cash_deleted"):
             msg += f" + {result['linked_cash_deleted']} cash event(s) reversed"
         _flash(msg, "success")
