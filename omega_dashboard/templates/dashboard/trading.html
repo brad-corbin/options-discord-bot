@@ -31,10 +31,252 @@
     Center reflects your portfolio state as of the most recent snapshot.
   </div>
 
-  <div class="phase1-meta">
-    Live alerts source · <span class="accent">_scanner</span>
-    &nbsp;·&nbsp; Thesis levels · <span class="accent">_thesis_engine</span>
-    &nbsp;·&nbsp; Both already running in the bot · UI layer comes next
+  {% if page_data.error %}
+    <div class="trading-row-error">{{ page_data.error }}</div>
+  {% endif %}
+
+  <div class="trading-row-table-wrap">
+    <table class="trading-row-table" id="trading-row-table">
+      <thead>
+        <tr>
+          <th class="col-ticker">Ticker</th>
+          <th class="col-num">Spot</th>
+          <th class="col-num">%Day</th>
+          <th class="col-num">PB Floor</th>
+          <th class="col-num">PB Roof</th>
+          <th class="col-loc">PB Location</th>
+          <th class="col-time">OI Time</th>
+          <th class="col-side">OI Side</th>
+          <th class="col-dir">OI Direction</th>
+          <th class="col-time">Flow Time</th>
+          <th class="col-dir">Flow Direction</th>
+          <th class="col-num">Flow Notional</th>
+          <th class="col-as">AS Signal</th>
+          <th class="col-bias">Thesis Bias</th>
+          <th class="col-num">Thesis Score</th>
+          <th class="col-sign">GEX Sign</th>
+          <th class="col-num">Gamma Flip</th>
+          <th class="col-num">Open Campaigns</th>
+        </tr>
+      </thead>
+      <tbody id="trading-row-tbody">
+        {% for row in page_data.rows %}
+          <tr data-ticker="{{ row.ticker }}">
+            <td class="col-ticker">{{ row.ticker }}</td>
+            <td class="col-num cell-spot">
+              {% if row.spot %}${{ "%.2f"|format(row.spot) }}{% endif %}
+            </td>
+            <td class="col-num cell-pct {% if row.pct_day and row.pct_day > 0 %}positive{% elif row.pct_day and row.pct_day < 0 %}negative{% endif %}">
+              {% if row.pct_day is not none %}{{ "%.2f"|format(row.pct_day) }}%{% endif %}
+            </td>
+            <td class="col-num">
+              {% if row.pb_floor %}${{ "%.2f"|format(row.pb_floor) }}{% endif %}
+            </td>
+            <td class="col-num">
+              {% if row.pb_roof %}${{ "%.2f"|format(row.pb_roof) }}{% endif %}
+            </td>
+            <td class="col-loc loc-{{ row.pb_location|default('none') }}">
+              {{ row.pb_location|default('') }}
+            </td>
+            <td class="col-time">{{ row.oi_time|default('') }}</td>
+            <td class="col-side">{{ row.oi_side|default('') }}</td>
+            <td class="col-dir">{{ row.oi_direction|default('') }}</td>
+            <td class="col-time">{{ row.flow_time|default('') }}</td>
+            <td class="col-dir dir-{{ row.flow_direction|default('') }}">
+              {{ row.flow_direction|default('') }}
+            </td>
+            <td class="col-num">
+              {% if row.flow_notional and row.flow_notional > 0 %}
+                {% if row.flow_notional >= 1000000 %}
+                  ${{ "%.1f"|format(row.flow_notional / 1000000) }}M
+                {% elif row.flow_notional >= 1000 %}
+                  ${{ "%.0f"|format(row.flow_notional / 1000) }}K
+                {% else %}
+                  ${{ row.flow_notional }}
+                {% endif %}
+              {% endif %}
+            </td>
+            <td class="col-as">{{ row.active_scanner|default('') }}</td>
+            <td class="col-bias bias-{{ (row.thesis_bias|default('')|lower)|replace(' ', '-') }}">
+              {{ row.thesis_bias|default('') }}
+            </td>
+            <td class="col-num">
+              {% if row.thesis_score is not none %}{{ row.thesis_score }}{% endif %}
+            </td>
+            <td class="col-sign sign-{{ row.gex_sign|default('') }}">
+              {{ row.gex_sign|default('') }}
+            </td>
+            <td class="col-num">
+              {% if row.gamma_flip %}${{ "%.2f"|format(row.gamma_flip) }}{% endif %}
+            </td>
+            <td class="col-num">
+              {% if row.open_campaigns %}{{ row.open_campaigns }}{% else %}0{% endif %}
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
   </div>
 </div>
+
+<!-- ─── 5-SECOND POLLING JS ────────────────────────────────
+  Hits /trading/data every 5s. Re-renders the tbody in place. No
+  full-page reload. Status dot turns red if a poll fails; comes
+  back to green when the next poll succeeds.
+─────────────────────────────────────────────────────────── -->
+
+<script>
+(function () {
+  'use strict';
+
+  const POLL_INTERVAL_MS = 5000;
+  const ENDPOINT = "{{ url_for('dashboard.trading_data_json') }}";
+
+  const tbody = document.getElementById('trading-row-tbody');
+  const statusDot = document.getElementById('trading-status-dot');
+  const lastUpdateEl = document.getElementById('trading-last-update');
+  const metaTextEl = document.getElementById('trading-meta-text');
+
+  if (!tbody) return;
+
+  function fmtPrice(v) {
+    if (v === null || v === undefined || v === '') return '';
+    const n = parseFloat(v);
+    if (isNaN(n)) return '';
+    return '$' + n.toFixed(2);
+  }
+
+  function fmtPct(v) {
+    if (v === null || v === undefined || v === '') return '';
+    const n = parseFloat(v);
+    if (isNaN(n)) return '';
+    return n.toFixed(2) + '%';
+  }
+
+  function fmtNotional(v) {
+    if (!v || v <= 0) return '';
+    const n = parseFloat(v);
+    if (isNaN(n)) return '';
+    if (n >= 1_000_000) return '$' + (n / 1_000_000).toFixed(1) + 'M';
+    if (n >= 1_000) return '$' + Math.round(n / 1_000) + 'K';
+    return '$' + n;
+  }
+
+  function biasClass(bias) {
+    if (!bias) return '';
+    return 'bias-' + bias.toLowerCase().replace(/ /g, '-');
+  }
+
+  function renderRows(rows) {
+    const frag = document.createDocumentFragment();
+    rows.forEach(function (r) {
+      const tr = document.createElement('tr');
+      tr.setAttribute('data-ticker', r.ticker);
+
+      // 1. Ticker
+      addCell(tr, 'col-ticker', r.ticker || '');
+      // 2. Spot
+      addCell(tr, 'col-num cell-spot', fmtPrice(r.spot));
+      // 3. %Day
+      const pctClass = (r.pct_day > 0) ? 'positive' :
+                       (r.pct_day < 0) ? 'negative' : '';
+      addCell(tr, 'col-num cell-pct ' + pctClass,
+              (r.pct_day !== null && r.pct_day !== undefined) ? fmtPct(r.pct_day) : '');
+      // 4. PB Floor
+      addCell(tr, 'col-num', fmtPrice(r.pb_floor));
+      // 5. PB Roof
+      addCell(tr, 'col-num', fmtPrice(r.pb_roof));
+      // 6. PB Location
+      addCell(tr, 'col-loc loc-' + (r.pb_location || 'none'), r.pb_location || '');
+      // 7. OI Time
+      addCell(tr, 'col-time', r.oi_time || '');
+      // 8. OI Side
+      addCell(tr, 'col-side', r.oi_side || '');
+      // 9. OI Direction
+      addCell(tr, 'col-dir', r.oi_direction || '');
+      // 10. Flow Time
+      addCell(tr, 'col-time', r.flow_time || '');
+      // 11. Flow Direction
+      addCell(tr, 'col-dir dir-' + (r.flow_direction || ''), r.flow_direction || '');
+      // 12. Flow Notional
+      addCell(tr, 'col-num', fmtNotional(r.flow_notional));
+      // 13. AS Signal
+      addCell(tr, 'col-as', r.active_scanner || '');
+      // 14. Thesis Bias
+      addCell(tr, 'col-bias ' + biasClass(r.thesis_bias), r.thesis_bias || '');
+      // 15. Thesis Score
+      addCell(tr, 'col-num',
+              (r.thesis_score !== null && r.thesis_score !== undefined) ? String(r.thesis_score) : '');
+      // 16. GEX Sign
+      addCell(tr, 'col-sign sign-' + (r.gex_sign || ''), r.gex_sign || '');
+      // 17. Gamma Flip
+      addCell(tr, 'col-num', fmtPrice(r.gamma_flip));
+      // 18. Open Campaigns
+      addCell(tr, 'col-num', String(r.open_campaigns || 0));
+
+      frag.appendChild(tr);
+    });
+    tbody.replaceChildren(frag);
+  }
+
+  function addCell(tr, klass, text) {
+    const td = document.createElement('td');
+    td.className = klass;
+    td.textContent = text;
+    tr.appendChild(td);
+  }
+
+  function setStatus(state) {
+    if (statusDot) statusDot.setAttribute('data-state', state);
+  }
+
+  function updateMeta(payload) {
+    if (lastUpdateEl && payload.fetched_at_ct) {
+      lastUpdateEl.textContent = payload.fetched_at_ct;
+    }
+    if (metaTextEl && payload.tickers_total !== undefined) {
+      metaTextEl.innerHTML =
+        'Last update <span class="num" id="trading-last-update">' +
+        (payload.fetched_at_ct || '') + '</span> · ' +
+        (payload.tickers_with_data || 0) + ' of ' +
+        (payload.tickers_total || 0) + ' populated · refresh 5s';
+    }
+  }
+
+  let consecutiveFailures = 0;
+
+  function poll() {
+    fetch(ENDPOINT, {
+      method: 'GET',
+      credentials: 'same-origin',
+      headers: { 'Accept': 'application/json' },
+    })
+      .then(function (resp) {
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        return resp.json();
+      })
+      .then(function (payload) {
+        consecutiveFailures = 0;
+        if (payload.available && payload.rows) {
+          renderRows(payload.rows);
+          updateMeta(payload);
+          setStatus('live');
+        } else {
+          setStatus('stale');
+        }
+      })
+      .catch(function (err) {
+        consecutiveFailures += 1;
+        // First failure: stale (yellow). 3+ consecutive: dead (red).
+        setStatus(consecutiveFailures >= 3 ? 'dead' : 'stale');
+        console.warn('[trading] poll failed:', err);
+      });
+  }
+
+  // Start polling. First poll fires after the interval — initial render
+  // came from server-side {% raw %}{{ page_data.rows }}{% endraw %}.
+  setInterval(poll, POLL_INTERVAL_MS);
+})();
+</script>
+
 {% endblock %}

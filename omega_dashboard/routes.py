@@ -215,7 +215,32 @@ def command_center():
 @dashboard_bp.route("/trading", methods=["GET"])
 @login_required
 def trading():
-    return render_page("dashboard/trading.html", page_key="trading")
+    """Trading tab — live row table. Initial render carries the first
+    snapshot so the page is useful on first paint; the JS layer then
+    polls /trading/data every 5s for updates."""
+    from . import data
+    active_account = get_active_account()
+    page_data = data.trading_data(active_account["key"])
+    return render_page(
+        "dashboard/trading.html",
+        page_key="trading",
+        page_data=page_data,
+    )
+
+@dashboard_bp.route("/trading/data", methods=["GET"])
+@login_required
+def trading_data_json():
+    """JSON-only feed for the Trading tab's polling JS. Same payload as
+    /trading's initial render but as application/json."""
+    from . import data
+    from flask import jsonify
+    active_account = get_active_account()
+    payload = data.trading_data(active_account["key"])
+    resp = jsonify(payload)
+    # No caching at the HTTP layer — the data layer caches for 1s, which
+    # is the right place. Browsers and CDNs should always re-fetch.
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @dashboard_bp.route("/portfolio", methods=["GET"])

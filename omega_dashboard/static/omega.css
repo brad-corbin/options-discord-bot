@@ -2811,3 +2811,145 @@ body[data-account="clay"] {
   color: var(--text);
   margin: 0;
 }
+
+.trading-row-section {
+  margin: 18px 0 24px 0;
+}
+
+.trading-row-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 12px;
+  padding: 0 4px;
+}
+
+.trading-row-eyebrow {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  color: var(--text-muted);
+  text-transform: uppercase;
+}
+
+.trading-row-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  color: var(--text-dim);
+}
+
+.trading-status-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--positive);
+  box-shadow: 0 0 6px var(--positive);
+  transition: all 0.2s;
+}
+.trading-status-dot[data-state="stale"] {
+  background: #f0b400;
+  box-shadow: 0 0 6px rgba(240, 180, 0, 0.5);
+}
+.trading-status-dot[data-state="dead"] {
+  background: var(--negative);
+  box-shadow: 0 0 6px var(--negative);
+}
+
+.trading-row-error {
+  background: rgba(255, 77, 109, 0.05);
+  border: 1px solid rgba(255, 77, 109, 0.2);
+  color: var(--negative);
+  padding: 10px 14px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  margin-bottom: 12px;
+}
+
+.trading-row-table-wrap {
+  overflow-x: auto;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+}
+
+.trading-row-table {
+  width: 100%;
+  min-width: 1900px;
+  border-collapse: collapse;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+}
+
+.trading-row-table thead th {
+  text-align: left;
+  padding: 10px 10px;
+  background: var(--bg-elev);
+  color: var(--text-muted);
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  font-weight: 500;
+  border-bottom: 1px solid var(--border-bright);
+  white-space: nowrap;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+
+.trading-row-table tbody td {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+  white-space: nowrap;
+}
+
+.trading-row-table tbody tr:hover {
+  background: var(--bg-elev);
+}
+
+/* Column-specific styles */
+.trading-row-table .col-ticker {
+  font-family: 'Russo One', sans-serif;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  color: var(--text);
+}
+
+.trading-row-table .col-num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.trading-row-table .cell-pct.positive { color: var(--positive); }
+.trading-row-table .cell-pct.negative { color: var(--negative); }
+
+.trading-row-table .col-loc { color: var(--text-muted); }
+.trading-row-table .loc-in     { color: var(--text); }
+.trading-row-table .loc-above  { color: #f0b400; }   /* warning yellow — above box */
+.trading-row-table .loc-below  { color: var(--negative); }
+.trading-row-table .loc-none   { color: var(--text-dim); }
+
+.trading-row-table .col-time { color: var(--text-muted); }
+.trading-row-table .col-side { color: var(--text-muted); }
+
+.trading-row-table .col-dir { color: var(--text-muted); }
+.trading-row-table .dir-bullish  { color: var(--positive); }
+.trading-row-table .dir-bearish  { color: var(--negative); }
+
+.trading-row-table .col-as { color: var(--text); }
+
+.trading-row-table .col-bias { color: var(--text-muted); font-size: 10px; }
+.trading-row-table .bias-strong-bullish { color: var(--positive); font-weight: 600; }
+.trading-row-table .bias-bullish        { color: var(--positive); }
+.trading-row-table .bias-slight-bullish { color: var(--positive); opacity: 0.7; }
+.trading-row-table .bias-neutral        { color: var(--text-muted); }
+.trading-row-table .bias-slight-bearish { color: var(--negative); opacity: 0.7; }
+.trading-row-table .bias-bearish        { color: var(--negative); }
+.trading-row-table .bias-strong-bearish { color: var(--negative); font-weight: 600; }
+
+.trading-row-table .col-sign { color: var(--text-muted); }
+.trading-row-table .sign-positive { color: var(--positive); }
+.trading-row-table .sign-negative { color: var(--negative); }
