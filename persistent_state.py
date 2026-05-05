@@ -669,13 +669,101 @@ class PersistentState:
         return ""
 
     def get_gex_data(self, ticker: str) -> dict:
-        """Get full GEX data including call/put walls and max pain."""
+        """
+        Get full GEX data including call/put walls and max pain.
+
+        v9 (Patch 2b rev1): added thesis fallback chain to mirror the pattern
+        used by get_gamma_flip_level / get_gex_sign. Previously this read
+        gex:{ticker} directly with no fallback, which meant consumers
+        (omega_dashboard/data.py:1658, any other direct caller) silently got
+        empty data when the lightweight writer hadn't run, AND silently got
+        wrong-but-fresh data when it had (max_pain mislabeled, OI-only walls,
+        regime-convention gex_sign — see Patch 2a notes in oi_flow.py).
+
+        rev1 corrections after pre-deploy review (2026-05-05):
+          - Original Patch 2b called self.get_thesis(ticker), which reads
+            from "thesis:{ticker}". Production verification (redis EXISTS)
+            confirmed that key is empty for AAPL — the actual writer is
+            thesis_monitor._persist_thesis() which writes "thesis_monitor:
+            {ticker}". The original patch would have been a silent no-op,
+            falling through to gex:{ticker} which Patch 2a is killing,
+            ultimately returning {} for every ticker.
+          - Now reads BOTH possible thesis keys for forward compatibility:
+            Source 1a = "thesis:{ticker}" via get_thesis() — currently dead
+            code in production but harmless and forward-compatible if
+            save_thesis() ever gets wired up.
+            Source 1b = "thesis_monitor:{ticker}" — the actually-live key.
+          - All numeric reads now float-coerce BEFORE comparing > 0, to
+            avoid TypeError-then-silent-fallthrough on stringy values.
+
+        Sources, in priority order:
+          1a. thesis:{ticker} (forward-compat; PersistentState.get_thesis API)
+          1b. thesis_monitor:{ticker} (institutional, written by thesis_monitor
+              ._persist_thesis at 8:30 AM CT for all 35 flow tickers + on
+              force-runs — this is the live key in 2026-05-04 production)
+          2.  gex:{ticker} (lightweight, deprecated by Patch 2a, kept readable
+              during the 2-hour TTL transition window)
+
+        Returns shape:
+            {gamma_flip, gex_sign, call_wall, put_wall, max_pain}
+        Empty dict if no source has data.
+        """
+        def _pos_float(v):
+            """Coerce to float ≥ 0; return 0.0 on TypeError/ValueError/None."""
+            try:
+                f = float(v) if v not in (None, "") else 0.0
+                return f if f > 0 else 0.0
+            except (TypeError, ValueError):
+                return 0.0
+
+        def _build_from_thesis(thesis):
+            """Extract the 5-field GEX dict from a thesis blob."""
+            levels = thesis.get("levels") or {}
+            gf = _pos_float(levels.get("gamma_flip"))
+            if gf <= 0:
+                return None  # signal "no usable thesis data"
+            return {
+                "gamma_flip": gf,
+                "gex_sign":   thesis.get("gex_sign", ""),
+                "call_wall":  _pos_float(levels.get("call_wall")),
+                "put_wall":   _pos_float(levels.get("put_wall")),
+                "max_pain":   _pos_float(levels.get("max_pain")),
+            }
+
+        # Source 1a: PersistentState.get_thesis() → "thesis:{ticker}"
+        # Currently dead path in production (verified 2026-05-04 — no AAPL
+        # blob at that key) but harmless forward-compat in case save_thesis
+        # ever gets wired up by a future patch.
+        try:
+            t1 = self.get_thesis(ticker)
+            if t1:
+                out = _build_from_thesis(t1)
+                if out is not None:
+                    return out
+        except Exception:
+            pass
+
+        # Source 1b: read thesis_monitor:{ticker} directly — this is the
+        # live key written by thesis_monitor._persist_thesis().
+        try:
+            t2 = self._json_get(f"thesis_monitor:{ticker.upper()}")
+            if t2:
+                out = _build_from_thesis(t2)
+                if out is not None:
+                    return out
+        except Exception:
+            pass
+
+        # Source 2: lightweight gex blob (Patch 2a writer is disabled, but
+        # any pre-deploy keys that haven't yet expired will still be served
+        # for the 2-hour TTL transition).
         try:
             gex = self._json_get(f"gex:{ticker.upper()}")
             if gex:
                 return gex
         except Exception:
             pass
+
         return {}
 
     def get_flow_conviction_boost(self, ticker: str, direction: str) -> float:

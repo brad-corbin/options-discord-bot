@@ -963,14 +963,33 @@ class FlowDetector:
                     p["live_delta"] = overlay.get("delta", 0)
                     p["live_iv"] = overlay.get("iv", 0)
 
-        # Compute and store lightweight GEX for this ticker
-        # Enables GEX convergence for conviction plays on ALL tickers
-        try:
-            gex = estimate_gex_from_chain(chain_data, spot)
-            if gex and gex.get("gamma_flip", 0) > 0:
-                self._state._json_set(f"gex:{ticker}", gex, ttl=7200)
-        except Exception:
-            pass
+        # v9 (Patch 2a): lightweight GEX writer disabled.
+        # estimate_gex_from_chain() produces values that conflict with the
+        # institutional engine in three concrete ways:
+        #   1. max_pain is computed as "highest combined OI strike" — that's a
+        #      magnet strike, not max pain. Standard max pain minimizes total
+        #      ITM option dollar value at expiration.
+        #   2. call_wall / put_wall are highest-OI strikes (raw OI), not
+        #      gamma-weighted. The institutional engine uses gamma-weighted
+        #      walls. Different definitions, same field name.
+        #   3. gex_sign uses regime convention (above-flip → "positive") while
+        #      em_predictions and app.py:11568/14040 use literal-sign convention.
+        # AAPL 2026-05-04 visible bug: card showed gamma flip $260, put wall
+        # $285, call wall $282.50 (put wall above call wall — structurally
+        # impossible for spot $276.53). All three came from this writer.
+        # omega_dashboard/data.py:_build_levels was preferring these (wrong,
+        # fresh) values over institutional (right, aged) values via an explicit
+        # "GEX live takes precedence" rule. After this patch, gex:{ticker}
+        # keys age out within 2hr (existing TTL) and _build_levels falls
+        # through to em_log automatically — no rendering code change needed.
+        # Function estimate_gex_from_chain() is retained in the module in case
+        # anything calls it inline; only the Redis write is disabled.
+        # try:
+        #     gex = estimate_gex_from_chain(chain_data, spot)
+        #     if gex and gex.get("gamma_flip", 0) > 0:
+        #         self._state._json_set(f"gex:{ticker}", gex, ttl=7200)
+        # except Exception:
+        #     pass
 
         # Compute and store IV skew
         try:
