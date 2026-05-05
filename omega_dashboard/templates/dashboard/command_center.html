@@ -1,34 +1,40 @@
 {% extends "dashboard/base.html" %}
 
-{% block title %}Ω OMEGA — Command{% endblock %}
-{% block brand_sub %}Command · {{ active_account.label }}{% endblock %}
+{% block title %}The Legacy Desk &mdash; Desk{% endblock %}
+{% block brand_sub %}Perry &middot; Volkman &middot; Corbin{% endblock %}
 
 {% block content %}
 
 {% set d = page_data %}
 
-<!-- ─── FAMILY TRIBUTE (always shown) ────────────────────── -->
+{# legacy-v1: family tribute — same structure, restyled in CSS #}
 <div class="family-tribute fade-in">
   <div class="tribute-line-primary">
     <span class="tribute-name">PERRY ROOTS</span>
-    <span class="tribute-sep">·</span>
+    <span class="tribute-sep">&#9670;</span>
     <span class="tribute-name">VOLKMAN STRENGTH</span>
-    <span class="tribute-sep">·</span>
+    <span class="tribute-sep">&#9670;</span>
     <span class="tribute-name">CORBIN FUTURE</span>
   </div>
   <div class="tribute-line-secondary">
-    What they started · What I continue · What my kids will carry
+    What they started &middot; What I continue &middot; What my kids will carry
   </div>
 </div>
+
+{# legacy-v1: The Family rotating roster panel #}
+{% include "dashboard/_the_family.html" %}
 
 {% if not d.portfolio_available %}
   <!-- Account doesn't have portfolio data yet (Phase 4 territory) -->
   <div class="phase1-stub fade-in">
     <svg class="phase1-watermark" viewBox="0 0 100 100" fill="none">
-      <path d="M50 8 L82 22 L82 56 L70 76 L60 88 L40 88 L30 76 L18 56 L18 22 Z"
+      <path d="M50 5 L92 17 L92 56 Q92 84 50 100 Q8 84 8 56 L8 17 Z"
             stroke="currentColor" stroke-width="0.5" fill="none"/>
-      <text x="50" y="62" text-anchor="middle" font-family="Russo One, sans-serif"
-            font-size="38" font-weight="700" fill="currentColor">Ω</text>
+      <text x="50" y="60" text-anchor="middle" font-family="Cormorant Garamond, serif"
+            font-size="40" font-weight="500" fill="currentColor">L</text>
+      <circle cx="38" cy="76" r="1.5" fill="currentColor"/>
+      <circle cx="50" cy="76" r="1.5" fill="currentColor"/>
+      <circle cx="62" cy="76" r="1.5" fill="currentColor"/>
     </svg>
     <div class="phase1-title">{{ active_account.label }} — No data yet</div>
     <div class="phase1-msg">
@@ -42,10 +48,13 @@
   <!-- No data yet — point user to portfolio entry forms -->
   <div class="phase1-stub fade-in">
     <svg class="phase1-watermark" viewBox="0 0 100 100" fill="none">
-      <path d="M50 8 L82 22 L82 56 L70 76 L60 88 L40 88 L30 76 L18 56 L18 22 Z"
+      <path d="M50 5 L92 17 L92 56 Q92 84 50 100 Q8 84 8 56 L8 17 Z"
             stroke="currentColor" stroke-width="0.5" fill="none"/>
-      <text x="50" y="62" text-anchor="middle" font-family="Russo One, sans-serif"
-            font-size="38" font-weight="700" fill="currentColor">Ω</text>
+      <text x="50" y="60" text-anchor="middle" font-family="Cormorant Garamond, serif"
+            font-size="40" font-weight="500" fill="currentColor">L</text>
+      <circle cx="38" cy="76" r="1.5" fill="currentColor"/>
+      <circle cx="50" cy="76" r="1.5" fill="currentColor"/>
+      <circle cx="62" cy="76" r="1.5" fill="currentColor"/>
     </svg>
     <div class="phase1-title">No data yet for {{ active_account.label }}</div>
     <div class="phase1-msg">
@@ -95,10 +104,13 @@
 
 <section class="cc-hero fade-in">
   <svg class="hero-watermark" viewBox="0 0 100 100" fill="none">
-    <path d="M50 8 L82 22 L82 56 L70 76 L60 88 L40 88 L30 76 L18 56 L18 22 Z"
-          stroke="currentColor" stroke-width="0.5" fill="none"/>
-    <text x="50" y="62" text-anchor="middle" font-family="Russo One, sans-serif"
-          font-size="38" font-weight="700" fill="currentColor">Ω</text>
+    <path d="M50 5 L92 17 L92 56 Q92 84 50 100 Q8 84 8 56 L8 17 Z"
+        stroke="currentColor" stroke-width="0.5" fill="none"/>
+    <text x="50" y="60" text-anchor="middle" font-family="Cormorant Garamond, serif"
+        font-size="40" font-weight="500" fill="currentColor">L</text>
+    <circle cx="38" cy="76" r="1.5" fill="currentColor"/>
+    <circle cx="50" cy="76" r="1.5" fill="currentColor"/>
+    <circle cx="62" cy="76" r="1.5" fill="currentColor"/>
   </svg>
 
   <div class="cc-hero-grid">
@@ -239,10 +251,13 @@
 <!-- ─── INCOME HERO ───────────────────────────────────────── -->
 <section class="cc-hero fade-in">
   <svg class="hero-watermark" viewBox="0 0 100 100" fill="none">
-    <path d="M50 8 L82 22 L82 56 L70 76 L60 88 L40 88 L30 76 L18 56 L18 22 Z"
-          stroke="currentColor" stroke-width="0.5" fill="none"/>
-    <text x="50" y="62" text-anchor="middle" font-family="Russo One, sans-serif"
-          font-size="38" font-weight="700" fill="currentColor">Ω</text>
+    <path d="M50 5 L92 17 L92 56 Q92 84 50 100 Q8 84 8 56 L8 17 Z"
+        stroke="currentColor" stroke-width="0.5" fill="none"/>
+    <text x="50" y="60" text-anchor="middle" font-family="Cormorant Garamond, serif"
+        font-size="40" font-weight="500" fill="currentColor">L</text>
+    <circle cx="38" cy="76" r="1.5" fill="currentColor"/>
+    <circle cx="50" cy="76" r="1.5" fill="currentColor"/>
+    <circle cx="62" cy="76" r="1.5" fill="currentColor"/>
   </svg>
 
   <div class="cc-hero-grid">

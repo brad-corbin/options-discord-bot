@@ -7,16 +7,34 @@ Phase 1 scope:
   - Account context: cookie-persisted across navigation
 
 No data layer yet. No Redis/Sheets reads. No writes. Just the framework.
+
+────────────────────────────────────────────────────────────────────
+Patches applied:
+  legacy-v1: Visual rebrand to The Legacy Desk
+    - PAGE_TABS: rename Command → Desk, Trading → Market View
+    - load_family_roster() loads data/family_roster.yaml on demand
+    - render_page() now passes family_roster context to all templates
+────────────────────────────────────────────────────────────────────
 """
 import os
 import logging
 from datetime import timedelta
 from functools import wraps
+from pathlib import Path
 
 from flask import (
     Blueprint, render_template, request, redirect, url_for,
     session, make_response, flash, jsonify
 )
+
+# legacy-v1: YAML for family roster. Optional — falls back to empty list if
+# either pyyaml or the file is missing, so The Family panel just doesn't render.
+try:
+    import yaml as _yaml  # noqa: F401
+    _HAS_YAML = True
+except ImportError:
+    _HAS_YAML = False
+    _yaml = None
 
 log = logging.getLogger(__name__)
 
@@ -39,12 +57,13 @@ ACCOUNTS = [
 ACCOUNT_KEYS = {a["key"] for a in ACCOUNTS}
 
 # Top-nav page tabs
+# legacy-v1: renamed Command → Desk, Trading → Market View (endpoints unchanged)
 PAGE_TABS = [
-    {"key": "dashboard",  "label": "Command",    "endpoint": "dashboard.command_center"},
-    {"key": "trading",    "label": "Trading",    "endpoint": "dashboard.trading"},
-    {"key": "portfolio",  "label": "Portfolio",  "endpoint": "dashboard.portfolio"},
-    {"key": "diagnostic", "label": "Diagnostic", "endpoint": "dashboard.diagnostic"},
-    {"key": "restore",    "label": "Durability", "endpoint": "dashboard.restore"},
+    {"key": "dashboard",  "label": "Desk",         "endpoint": "dashboard.command_center"},
+    {"key": "trading",    "label": "Market View",  "endpoint": "dashboard.trading"},
+    {"key": "portfolio",  "label": "Portfolio",    "endpoint": "dashboard.portfolio"},
+    {"key": "diagnostic", "label": "Diagnostic",   "endpoint": "dashboard.diagnostic"},
+    {"key": "restore",    "label": "Durability",   "endpoint": "dashboard.restore"},
 ]
 
 # Session lifetime — 30 days, matching the spec
@@ -108,6 +127,48 @@ def get_active_account():
     return ACCOUNTS[0]
 
 
+# legacy-v1: family roster loader
+_FAMILY_ROSTER_PATH = Path(__file__).parent / "data" / "family_roster.yaml"
+_FAMILY_ROSTER_CACHE = {"mtime": None, "data": None}
+
+def load_family_roster():
+    """Load the family roster from data/family_roster.yaml.
+
+    Cached by file mtime so editing the YAML picks up on the next request
+    without a restart. Any failure (missing pyyaml, missing file, parse error)
+    is logged and returns [] — The Family panel will just not render.
+    """
+    if not _HAS_YAML:
+        return []
+    try:
+        if not _FAMILY_ROSTER_PATH.exists():
+            return []
+        mtime = _FAMILY_ROSTER_PATH.stat().st_mtime
+        if _FAMILY_ROSTER_CACHE["mtime"] == mtime and _FAMILY_ROSTER_CACHE["data"] is not None:
+            return _FAMILY_ROSTER_CACHE["data"]
+        with open(_FAMILY_ROSTER_PATH, "r", encoding="utf-8") as f:
+            doc = _yaml.safe_load(f) or {}
+        roster = doc.get("family", []) or []
+        # Normalize: ensure each entry is a dict with at least name + relation
+        clean = []
+        for entry in roster:
+            if not isinstance(entry, dict):
+                continue
+            if not entry.get("name") or not entry.get("relation"):
+                continue
+            clean.append({
+                "name":     str(entry["name"]),
+                "relation": str(entry["relation"]),
+                "nickname": str(entry["nickname"]) if entry.get("nickname") else None,
+            })
+        _FAMILY_ROSTER_CACHE["mtime"] = mtime
+        _FAMILY_ROSTER_CACHE["data"]  = clean
+        return clean
+    except Exception:
+        log.warning("legacy-v1: failed to load family_roster.yaml", exc_info=True)
+        return []
+
+
 def render_page(template_name, page_key, **context):
     """Centralized render with all the bits every page needs."""
     active_account = get_active_account()
@@ -117,6 +178,7 @@ def render_page(template_name, page_key, **context):
         active_account=active_account,
         accounts=ACCOUNTS,
         page_tabs=PAGE_TABS,
+        family_roster=load_family_roster(),  # legacy-v1
         **context,
     )
 

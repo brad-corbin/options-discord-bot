@@ -3,26 +3,30 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Ω OMEGA — Login</title>
+<title>The Legacy Desk &mdash; Sign in</title>
 <link rel="stylesheet" href="{{ url_for('dashboard.static', filename='omega.css') }}">
 </head>
 <body data-account="combined">
 
 <div class="login-shell">
   <div class="login-card">
+    {# legacy-v1: shield + L mark, rebranded copy #}
     <div class="login-mark">
-      <svg viewBox="0 0 100 100" fill="none">
-        <path d="M50 8 L82 22 L82 56 L70 76 L60 88 L40 88 L30 76 L18 56 L18 22 Z"
-              stroke="currentColor" stroke-width="2" fill="none" opacity="0.9"/>
-        <path d="M50 8 L82 22 L82 56 L70 76 L60 88 L40 88 L30 76 L18 56 L18 22 Z"
-              stroke="currentColor" stroke-width="0.5" fill="none" opacity="0.4"
-              transform="scale(0.88) translate(7,7)"/>
-        <text x="50" y="62" text-anchor="middle" font-family="Russo One, sans-serif"
-              font-size="38" font-weight="700" fill="currentColor">Ω</text>
+      <svg viewBox="0 0 100 110" fill="none">
+        <path d="M50 5 L92 17 L92 58 Q92 86 50 104 Q8 86 8 58 L8 17 Z"
+              stroke="currentColor" stroke-width="1.6" fill="none"/>
+        <path d="M50 12 L86 22 L86 58 Q86 80 50 95 Q14 80 14 58 L14 22 Z"
+              stroke="currentColor" stroke-width="0.5" fill="none" opacity="0.45"/>
+        <text x="50" y="64" text-anchor="middle"
+              font-family="Cormorant Garamond, serif"
+              font-size="40" font-weight="500" fill="currentColor">L</text>
+        <circle cx="38" cy="80" r="1.6" fill="currentColor"/>
+        <circle cx="50" cy="80" r="1.6" fill="currentColor"/>
+        <circle cx="62" cy="80" r="1.6" fill="currentColor"/>
       </svg>
-      <div class="login-mark-name">THE OMEGA</div>
-      <div class="login-mark-sub">3000 · Command Console</div>
-      <div class="login-tagline">Where Family Legacy Meets Market Precision.</div>
+      <div class="login-mark-name">THE LEGACY DESK</div>
+      <div class="login-mark-sub">Perry &middot; Volkman &middot; Corbin</div>
+      <div class="login-tagline">Because family deserves more than guesswork.</div>
     </div>
 
     <form class="login-form" method="POST" action="{{ url_for('dashboard.login') }}">

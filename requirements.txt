@@ -7,3 +7,4 @@ PyJWT[crypto]>=2.8.0
 yfinance
 schwab-py
 pandas>=2.0
+PyYAML

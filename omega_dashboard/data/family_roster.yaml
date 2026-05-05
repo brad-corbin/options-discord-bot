@@ -1,0 +1,53 @@
+# ════════════════════════════════════════════════════════════
+# legacy-v1 — The Family roster
+#
+# This is the single source of truth for The Family panel that
+# rotates through names on the dashboard. Add, remove, or edit
+# entries here — no code changes required. Restart the dashboard
+# (or wait for the next request, since this loads per-request)
+# to pick up changes.
+#
+# Each entry needs:
+#   name      — what shows in big serif (proper case)
+#   relation  — small-caps line below (e.g. "Daughter", "Grandparents")
+#   nickname  — optional, shows after the relation in quotes
+# ════════════════════════════════════════════════════════════
+
+family:
+  - name: "John L. & Polly Perry"
+    relation: "Great Grandparents"
+    nickname: "Big John and Nana"
+
+  - name: "Verl & Alma Evans"
+    relation: "Great Grandparents"
+
+  - name: "Bill & Joann Perry"
+    relation: "Grandparents"
+    nickname: "Paw Paw and MiMi"
+
+  - name: "Donald & Donna Volkman"
+    relation: "Grandparents"
+
+  - name: "John Volkman"
+    relation: "Dad"
+
+  - name: "Kathy Volkman"
+    relation: "Mom"
+
+  - name: "Brad Corbin"
+    relation: "Builder of the Desk"
+
+  - name: "Chelsea Corbin"
+    relation: "Wife"
+
+  - name: "Ashlyn Corbin"
+    relation: "Daughter"
+
+  - name: "Kyleigh Corbin"
+    relation: "Daughter"
+
+  - name: "Lilah Corbin"
+    relation: "Daughter"
+
+  - name: "Cash Corbin"
+    relation: "Son"

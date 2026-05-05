@@ -1,0 +1,57 @@
+{# ════════════════════════════════════════════════════════════
+   legacy-v1 — The Family panel partial
+   Rotates through family roster (loaded from data/family_roster.yaml)
+   Crossfade transition, 6.5s per name, click dots to jump
+   Expects context: family_roster (list of dicts with name/relation/[nickname])
+   ══════════════════════════════════════════════════════════════ #}
+
+{% if family_roster %}
+<div class="family-panel">
+  <div class="family-panel-label">The Family</div>
+
+  <div class="family-track" id="familyTrack">
+    {% for member in family_roster %}
+      <div class="family-card{% if loop.first %} active{% endif %}">
+        <div class="family-name">{{ member.name }}</div>
+        <div class="family-relation">
+          {{ member.relation }}{% if member.nickname %} &middot; "{{ member.nickname }}"{% endif %}
+        </div>
+      </div>
+    {% endfor %}
+  </div>
+
+  <div class="family-dots">
+    {% for member in family_roster %}
+      <span class="family-dot{% if loop.first %} active{% endif %}"
+            data-idx="{{ loop.index0 }}"></span>
+    {% endfor %}
+  </div>
+</div>
+
+<script>
+(function() {
+  // legacy-v1: family roster auto-rotation
+  var cards = document.querySelectorAll('.family-card');
+  var dots  = document.querySelectorAll('.family-dot');
+  if (!cards.length) return;
+
+  var i = 0;
+  var ROTATE_MS = 6500;
+
+  function show(idx) {
+    cards.forEach(function(c, k) { c.classList.toggle('active', k === idx); });
+    dots.forEach(function(d, k)  { d.classList.toggle('active', k === idx); });
+  }
+
+  // click-to-jump on dots
+  dots.forEach(function(d, k) {
+    d.addEventListener('click', function() { i = k; show(i); });
+  });
+
+  setInterval(function() {
+    i = (i + 1) % cards.length;
+    show(i);
+  }, ROTATE_MS);
+})();
+</script>
+{% endif %}

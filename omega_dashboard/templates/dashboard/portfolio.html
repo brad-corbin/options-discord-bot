@@ -1,6 +1,6 @@
 {% extends "dashboard/base.html" %}
 
-{% block title %}Ω OMEGA — Portfolio{% endblock %}
+{% block title %}The Legacy Desk &mdash; Portfolio{% endblock %}
 {% block body_account %}{{ page_data.underlying_themes.get(page_data.active_underlying, active_account.color) }}{% endblock %}
 {% block brand_sub %}Portfolio · {{ page_data.underlying_labels.get(page_data.active_underlying, page_data.active_underlying|capitalize) }}{% endblock %}
 

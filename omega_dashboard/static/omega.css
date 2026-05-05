@@ -1,42 +1,61 @@
 /* ════════════════════════════════════════════════════════
-   Ω OMEGA · Visual System
-   Phase 1 — auth, nav, scaffolding
+   THE LEGACY DESK — Visual System
+
+   ────────────────────────────────────────────────────────
+   Patches applied:
+     legacy-v1: Visual rebrand from Ω Omega → The Legacy Desk
+       - Palette: warm cyan/neon → charcoal + brass
+       - Type:    Russo One → Cinzel + Cormorant Garamond
+       - Glow:    removed text-shadow / box-shadow neons
+       - New:     The Family panel (rotating roster)
    ──────────────────────────────────────────────────────── */
 
-@import url('https://fonts.googleapis.com/css2?family=Russo+One&family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Cinzel:wght@400;500;600&family=Cormorant+Garamond:ital,wght@0,300;0,400;0,500;0,600;1,400;1,500&family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
 
 /* ─── TOKENS ──────────────────────────────────────────── */
+/* legacy-v1: charcoal foundation + Legacy Gold accent */
 :root {
-  /* Base palette */
-  --bg-void: #08080d;
-  --bg-panel: #0e0e16;
-  --bg-elev: #14141f;
-  --border: #1c1c2a;
-  --border-bright: #2a2a3d;
-  --text: #e8e8f0;
-  --text-muted: #9999b0;
-  --text-dim: #6a6a7c;
+  /* Backgrounds — neutral charcoal, not warm */
+  --bg-void: #0D0F10;          /* Obsidian */
+  --bg-panel: #171A1D;         /* Panel charcoal */
+  --bg-elev: #1C2023;          /* Surface charcoal */
+  --bg-elevated: #22272B;
+  --border: #2A2E33;           /* Dim divider */
+  --border-bright: #6D5A36;    /* Soft brass border */
 
-  /* Account palette */
-  --combined: #00e89c;
-  --combined-glow: rgba(0, 232, 156, 0.15);
-  --mine: #d63333;
-  --mine-glow: rgba(214, 51, 51, 0.32);
-  --mine-bright: #e85555;
-  --mom: #ec4899;
-  --mom-glow: rgba(236, 72, 153, 0.18);
-  --partner: #06d4f5;
-  --partner-glow: rgba(6, 212, 245, 0.18);
-  --kyleigh: #b794f4;
-  --kyleigh-glow: rgba(183, 148, 244, 0.18);
-  --clay: #3b82f6;
-  --clay-glow: rgba(59, 130, 246, 0.22);
+  /* Text */
+  --text: #E8DFC9;
+  --text-muted: #B8AF9A;
+  --text-dim: #8A8377;
 
-  /* Semantic */
-  --positive: #00e89c;
-  --negative: #ff4d6d;
-  --neutral: #f6c344;
-  --warn: #ff8c42;
+  /* Brass accent — slightly aged Legacy Gold */
+  --brass: #B7924E;
+  --brass-bright: #D5B06B;
+  --brass-deep: #6D5A36;
+  --brass-glow: rgba(183, 146, 78, 0.12);
+
+  /* Account palette — gem tones, restrained */
+  --combined: #B7924E;         /* Legacy gold */
+  --combined-glow: rgba(183, 146, 78, 0.14);
+  --mine: #8B3A30;             /* Deeper oxblood (Brad / Corbin) */
+  --mine-glow: rgba(139, 58, 48, 0.20);
+  --mine-bright: #A85045;
+  --mom: #B86F75;              /* Dusty rose (Volkman) */
+  --mom-glow: rgba(184, 111, 117, 0.16);
+  --partner: #4A8580;          /* Teal-bronze */
+  --partner-glow: rgba(74, 133, 128, 0.16);
+  --kyleigh: #8C72AB;          /* Muted heather */
+  --kyleigh-glow: rgba(140, 114, 171, 0.16);
+  --clay: #4F6E96;             /* Muted slate blue */
+  --clay-glow: rgba(79, 110, 150, 0.18);
+
+  /* Semantic — restrained per style guide */
+  --positive: #4F8A57;         /* Bull green */
+  --positive-bright: #73B27B;
+  --negative: #A14F4F;         /* Bear red */
+  --negative-soft: #C86A6A;
+  --neutral: #D5B06B;          /* Gold highlight (replaces bright amber) */
+  --warn: #C68A50;             /* Burnt brass */
 
   /* Active account theme — overridden per account on <body> */
   --accent: var(--combined);
@@ -124,19 +143,21 @@ header.top {
 .brand-text { display: flex; flex-direction: column; line-height: 1; }
 
 .brand-name {
-  font-family: 'Russo One', sans-serif;
-  font-size: 16px;
-  letter-spacing: 0.08em;
-  color: var(--accent);
-  text-shadow: 0 0 12px var(--accent-glow);
+  /* legacy-v1: stable brass identity, doesn't shift per-account */
+  font-family: 'Cinzel', serif;
+  font-size: 17px;
+  font-weight: 500;
+  letter-spacing: 0.16em;
+  color: var(--text);
 }
 
 .brand-sub {
-  font-family: 'JetBrains Mono', monospace;
-  font-size: 9px;
-  letter-spacing: 0.25em;
-  color: var(--text-muted);
-  margin-top: 4px;
+  /* legacy-v1: brass tone, sentence-friendly spacing */
+  font-family: 'Outfit', sans-serif;
+  font-size: 9.5px;
+  letter-spacing: 0.32em;
+  color: var(--brass-deep);
+  margin-top: 5px;
   text-transform: uppercase;
 }
 
@@ -253,12 +274,13 @@ header.top {
   border-radius: 50%;
   display: inline-block;
 }
-.chip-combined { background: var(--combined); box-shadow: 0 0 6px var(--combined); }
-.chip-mine     { background: var(--mine);     box-shadow: 0 0 6px var(--mine); }
-.chip-mom      { background: var(--mom);      box-shadow: 0 0 6px var(--mom); }
-.chip-partner  { background: var(--partner);  box-shadow: 0 0 6px var(--partner); }
-.chip-kyleigh  { background: var(--kyleigh);  box-shadow: 0 0 6px var(--kyleigh); }
-.chip-clay     { background: var(--clay);     box-shadow: 0 0 6px var(--clay); }
+/* legacy-v1: chips use solid fill, no glow per style guide */
+.chip-combined { background: var(--combined); }
+.chip-mine     { background: var(--mine); }
+.chip-mom      { background: var(--mom); }
+.chip-partner  { background: var(--partner); }
+.chip-kyleigh  { background: var(--kyleigh); }
+.chip-clay     { background: var(--clay); }
 
 .session-info {
   display: flex;
@@ -304,7 +326,7 @@ header.top {
 }
 
 .panel-title {
-  font-family: 'Russo One', sans-serif;
+  font-family: 'Cinzel', serif;
   font-size: 13px;
   letter-spacing: 0.14em;
   color: var(--text);
@@ -369,7 +391,7 @@ header.top {
 }
 
 .phase1-title {
-  font-family: 'Russo One', sans-serif;
+  font-family: 'Cinzel', serif;
   font-size: 22px;
   letter-spacing: 0.12em;
   color: var(--text);
@@ -499,7 +521,7 @@ header.top {
 }
 
 .login-mark-name {
-  font-family: 'Russo One', sans-serif;
+  font-family: 'Cinzel', serif;
   font-size: 22px;
   letter-spacing: 0.14em;
   color: var(--text);
@@ -553,7 +575,7 @@ header.top {
   background: var(--accent);
   color: var(--bg-void);
   border: none;
-  font-family: 'Russo One', sans-serif;
+  font-family: 'Cinzel', serif;
   font-size: 12px;
   letter-spacing: 0.18em;
   text-transform: uppercase;
@@ -686,7 +708,7 @@ header.top {
   background: var(--accent);
   color: var(--bg-void);
   border: none;
-  font-family: 'Russo One', sans-serif;
+  font-family: 'Cinzel', serif;
   font-size: 11px;
   letter-spacing: 0.16em;
   text-transform: uppercase;
@@ -721,7 +743,7 @@ header.top {
 }
 
 .dur-panel-title {
-  font-family: 'Russo One', sans-serif;
+  font-family: 'Cinzel', serif;
   font-size: 12px;
   letter-spacing: 0.14em;
   color: var(--text);
@@ -750,7 +772,7 @@ header.top {
 .dur-snap-info { display: flex; flex-direction: column; gap: 4px; }
 
 .dur-snap-date {
-  font-family: 'Russo One', sans-serif;
+  font-family: 'Cinzel', serif;
   font-size: 13px;
   letter-spacing: 0.04em;
   color: var(--text);
@@ -848,7 +870,7 @@ header.top {
 }
 
 .dur-modal-title {
-  font-family: 'Russo One', sans-serif;
+  font-family: 'Cinzel', serif;
   font-size: 18px;
   letter-spacing: 0.12em;
   color: var(--negative);
@@ -896,7 +918,7 @@ header.top {
 
 .dur-modal-cancel,
 .dur-modal-confirm {
-  font-family: 'Russo One', sans-serif;
+  font-family: 'Cinzel', serif;
   font-size: 11px;
   letter-spacing: 0.16em;
   text-transform: uppercase;
@@ -1199,7 +1221,7 @@ header.top {
 .position-row:last-child { border-bottom: none; }
 
 .ticker-cell {
-  font-family: 'Russo One', sans-serif;
+  font-family: 'Cinzel', serif;
   font-size: 12px;
   color: var(--text);
   letter-spacing: 0.04em;
@@ -1226,9 +1248,9 @@ header.top {
   color: var(--text-muted);
   border-radius: 2px;
 }
-.tag-pill.csp    { color: #06d4f5; border-color: rgba(6,212,245,0.3); }
-.tag-pill.cc     { color: #b794f4; border-color: rgba(183,148,244,0.3); }
-.tag-pill.spread { color: #f6c344; border-color: rgba(246,195,68,0.3); }
+.tag-pill.csp    { color: #4A8580; border-color: rgba(74,133,128,0.3); }
+.tag-pill.cc     { color: #8C72AB; border-color: rgba(140,114,171,0.3); }
+.tag-pill.spread { color: #D5B06B; border-color: rgba(213,176,107,0.3); }
 
 @media (max-width: 1100px) {
   .cc-hero-grid       { grid-template-columns: 1fr; }
@@ -1254,11 +1276,11 @@ body[data-account="clay"] {
 }
 
 /* Account dot colors used in pills */
-.dot-brad, .acct-pill-dot.dot-brad { background: #500000; }
-.dot-mom, .acct-pill-dot.dot-mom { background: #ec4899; }
-.dot-partner, .acct-pill-dot.dot-partner { background: #06d4f5; }
-.dot-kyleigh, .acct-pill-dot.dot-kyleigh { background: #b794f4; }
-.dot-clay, .acct-pill-dot.dot-clay { background: #3b82f6; }
+.dot-brad, .acct-pill-dot.dot-brad { background: #5A2520; }
+.dot-mom, .acct-pill-dot.dot-mom { background: #B86F75; }
+.dot-partner, .acct-pill-dot.dot-partner { background: #4A8580; }
+.dot-kyleigh, .acct-pill-dot.dot-kyleigh { background: #8C72AB; }
+.dot-clay, .acct-pill-dot.dot-clay { background: #4F6E96; }
 
 .acct-pill-dot {
   display: inline-block;
@@ -1297,7 +1319,7 @@ body[data-account="clay"] {
 }
 
 .portfolio-title {
-  font-family: 'Russo One', sans-serif;
+  font-family: 'Cinzel', serif;
   font-size: 13px;
   letter-spacing: 0.3em;
   color: var(--text-muted);
@@ -1338,7 +1360,7 @@ body[data-account="clay"] {
 
 .subnav-tab {
   padding: 12px 22px;
-  font-family: 'Russo One', sans-serif;
+  font-family: 'Cinzel', serif;
   font-size: 11px;
   letter-spacing: 0.18em;
   color: var(--text-muted);
@@ -1364,7 +1386,7 @@ body[data-account="clay"] {
 }
 
 .form-section-title {
-  font-family: 'Russo One', sans-serif;
+  font-family: 'Cinzel', serif;
   font-size: 11px;
   letter-spacing: 0.22em;
   color: var(--text);
@@ -1436,7 +1458,7 @@ body[data-account="clay"] {
 .btn-primary,
 .btn-primary-sm,
 .btn-danger {
-  font-family: 'Russo One', sans-serif;
+  font-family: 'Cinzel', serif;
   font-size: 11px;
   letter-spacing: 0.16em;
   padding: 9px 22px;
@@ -1502,7 +1524,7 @@ body[data-account="clay"] {
 }
 
 .data-panel-title {
-  font-family: 'Russo One', sans-serif;
+  font-family: 'Cinzel', serif;
   font-size: 11px;
   letter-spacing: 0.22em;
   color: var(--text);
@@ -1634,7 +1656,7 @@ body[data-account="clay"] {
 }
 .inline-form input:focus, .inline-form select:focus { border-color: var(--accent); }
 .inline-label {
-  font-family: 'Russo One', sans-serif;
+  font-family: 'Cinzel', serif;
   font-size: 10px;
   letter-spacing: 0.2em;
   color: var(--accent);
@@ -1659,17 +1681,17 @@ body[data-account="clay"] {
   border: 1px solid;
   border-radius: 2px;
 }
-.type-pill.type-csp, .type-pill.csp { color: #06d4f5; border-color: rgba(6,212,245,0.3); }
-.type-pill.type-cc, .type-pill.cc { color: #b794f4; border-color: rgba(183,148,244,0.3); }
-.type-pill.type-long_call { color: #34d399; border-color: rgba(52,211,153,0.3); }
-.type-pill.type-long_put { color: #f87171; border-color: rgba(248,113,113,0.3); }
+.type-pill.type-csp, .type-pill.csp { color: #4A8580; border-color: rgba(74,133,128,0.3); }
+.type-pill.type-cc, .type-pill.cc { color: #8C72AB; border-color: rgba(140,114,171,0.3); }
+.type-pill.type-long_call { color: #73B27B; border-color: rgba(115,178,123,0.3); }
+.type-pill.type-long_put { color: #C86A6A; border-color: rgba(200,106,106,0.3); }
 .type-pill.type-deposit, .type-pill.type-roll_credit { color: var(--positive); border-color: rgba(0,232,156,0.3); }
 .type-pill.type-withdrawal, .type-pill.type-transfer_out, .type-pill.type-roll_debit { color: var(--negative); border-color: rgba(255,107,107,0.3); }
-.type-pill.type-option_open { color: #06d4f5; border-color: rgba(6,212,245,0.3); }
-.type-pill.type-option_close, .type-pill.type-spread_close { color: #b794f4; border-color: rgba(183,148,244,0.3); }
-.type-pill.type-share_buy { color: #f87171; border-color: rgba(248,113,113,0.3); }
-.type-pill.type-share_sell { color: #34d399; border-color: rgba(52,211,153,0.3); }
-.type-pill.type-spread_open, .type-pill.spread { color: #f6c344; border-color: rgba(246,195,68,0.3); }
+.type-pill.type-option_open { color: #4A8580; border-color: rgba(74,133,128,0.3); }
+.type-pill.type-option_close, .type-pill.type-spread_close { color: #8C72AB; border-color: rgba(140,114,171,0.3); }
+.type-pill.type-share_buy { color: #C86A6A; border-color: rgba(200,106,106,0.3); }
+.type-pill.type-share_sell { color: #73B27B; border-color: rgba(115,178,123,0.3); }
+.type-pill.type-spread_open, .type-pill.spread { color: #D5B06B; border-color: rgba(213,176,107,0.3); }
 .type-pill.type-manual_set { color: var(--text-muted); border-color: var(--border-bright); }
 
 /* ─── Transfers grid (Kyleigh + Clay side by side) ─── */
@@ -1701,7 +1723,7 @@ body[data-account="clay"] {
 }
 
 .transfer-title {
-  font-family: 'Russo One', sans-serif;
+  font-family: 'Cinzel', serif;
   font-size: 14px;
   letter-spacing: 0.18em;
   color: var(--text);
@@ -1756,8 +1778,8 @@ body[data-account="clay"] {
 
 /* Mini button variants */
 .btn-mini-danger {
-  border-color: #ff6b7a;
-  color: #ff8b9a;
+  border-color: #A14F4F;
+  color: #C86A6A;
   background: rgba(255, 71, 87, 0.08);
 }
 .btn-mini-danger:hover {
@@ -1767,14 +1789,14 @@ body[data-account="clay"] {
 }
 
 .btn-mini-warn {
-  border-color: #f6c344;
-  color: #ffd45e;
-  background: rgba(246, 195, 68, 0.08);
+  border-color: #D5B06B;
+  color: #E2C282;
+  background: rgba(213, 176, 107, 0.08);
 }
 .btn-mini-warn:hover {
-  border-color: #f6c344;
+  border-color: #D5B06B;
   color: var(--bg);
-  background: #f6c344;
+  background: #D5B06B;
 }
 
 /* Inline form metadata text */
@@ -1825,7 +1847,7 @@ body[data-account="clay"] {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  font-family: 'Russo One', sans-serif;
+  font-family: 'Cinzel', serif;
   font-size: 13px;
   letter-spacing: 0.16em;
   color: var(--negative);
@@ -1960,17 +1982,16 @@ body[data-account="clay"] {
   font-style: italic;
 }
 
-/* Command Center — three-name family tribute */
+/* legacy-v1: Command Center / Desk — family tribute with brass framing */
 .family-tribute {
   position: relative;
   text-align: center;
-  padding: 18px 22px 22px;
-  margin: 0 0 22px;
-  background:
-    linear-gradient(180deg, rgba(255,255,255,0.012), transparent),
-    var(--bg-panel);
+  padding: 30px 22px 26px;
+  margin: 24px 0 22px;
+  background: var(--bg-panel);
   border: 1px solid var(--border);
-  border-top: 2px solid var(--accent);
+  border-top: 1px solid var(--brass-deep);
+  border-bottom: 1px solid var(--brass-deep);
   overflow: hidden;
 }
 
@@ -1979,47 +2000,50 @@ body[data-account="clay"] {
   content: "";
   position: absolute;
   top: 50%;
-  width: 80px;
+  width: 110px;
   height: 1px;
-  background: linear-gradient(90deg, transparent, var(--accent), transparent);
-  opacity: 0.5;
+  background: linear-gradient(90deg, transparent, var(--brass-deep), transparent);
+  opacity: 0.7;
 }
-.family-tribute::before { left: 0; }
-.family-tribute::after  { right: 0; }
+.family-tribute::before { left: 18px; }
+.family-tribute::after  { right: 18px; }
 
 .tribute-line-primary {
   display: flex;
   justify-content: center;
   align-items: baseline;
-  gap: 14px;
+  gap: 22px;
   flex-wrap: wrap;
 }
 
 .tribute-name {
-  font-family: 'Russo One', sans-serif;
-  font-size: 13px;
-  letter-spacing: 0.32em;
-  color: var(--accent);
+  /* legacy-v1: stable brass identity, no per-account glow shift */
+  font-family: 'Cinzel', serif;
+  font-size: 17px;
+  font-weight: 500;
+  letter-spacing: 0.34em;
+  color: var(--brass);
   text-transform: uppercase;
-  text-shadow: 0 0 14px var(--accent-glow);
 }
 
 .tribute-sep {
-  font-family: 'JetBrains Mono', monospace;
-  font-size: 12px;
-  color: var(--text-dim);
+  /* legacy-v1: brass diamond ornament */
+  font-family: 'Cormorant Garamond', serif;
+  font-size: 14px;
+  color: var(--brass-deep);
   letter-spacing: 0;
 }
 
 .tribute-line-secondary {
-  font-family: 'Outfit', sans-serif;
-  font-size: 11px;
-  letter-spacing: 0.14em;
-  color: var(--text-muted);
-  margin-top: 8px;
-  text-transform: uppercase;
-  font-weight: 300;
+  /* legacy-v1: italic Cormorant — quiet, not all-caps */
+  font-family: 'Cormorant Garamond', serif;
+  font-size: 14px;
   font-style: italic;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  margin-top: 14px;
+  text-transform: none;
+  font-weight: 400;
 }
 
 /* Trading page tagline — bigger, more declarative */
@@ -2036,7 +2060,7 @@ body[data-account="clay"] {
 }
 
 .tagline-primary {
-  font-family: 'Russo One', sans-serif;
+  font-family: 'Cinzel', serif;
   font-size: 18px;
   letter-spacing: 0.18em;
   color: var(--accent-bright, var(--accent));
@@ -2073,32 +2097,32 @@ body[data-account="clay"] {
    as light gray on white (terrible on dark UI). Force dark bg + light text. */
 .form-field select option,
 .inline-form select option {
-  background: #14141a;
-  color: #e8e9ed;
+  background: #171A1D;
+  color: #E8DFC9;
   font-family: 'JetBrains Mono', monospace;
   font-size: 13px;
   padding: 6px 10px;
 }
 .form-field select option:checked,
 .inline-form select option:checked {
-  background: #1f1f28;
+  background: #22272B;
   color: var(--accent-bright, var(--accent));
 }
 .form-field select option:hover,
 .inline-form select option:hover {
-  background: #22222d;
+  background: #22272B;
 }
 
 /* Pill-theme classes — let right-pill carry its own dot color
    regardless of the global accent. Used on Portfolio entry pills. */
 .acct-pill.pill-theme-mine .acct-pill-dot,
-.acct-pill .dot-mine    { background: #500000; }
+.acct-pill .dot-mine    { background: #5A2520; }
 .acct-pill.pill-theme-mom .acct-pill-dot,
-.acct-pill .dot-mom     { background: #ec4899; }
+.acct-pill .dot-mom     { background: #B86F75; }
 .acct-pill.pill-theme-partner .acct-pill-dot,
-.acct-pill .dot-partner { background: #06d4f5; }
+.acct-pill .dot-partner { background: #4A8580; }
 .acct-pill.pill-theme-combined .acct-pill-dot,
-.acct-pill .dot-combined { background: #00e89c; }
+.acct-pill .dot-combined { background: #4F8A57; }
 
 
 
@@ -2162,7 +2186,7 @@ body[data-account="clay"] {
   justify-content: space-between;
 }
 .wheel-card-ticker {
-  font-family: 'Russo One', sans-serif;
+  font-family: 'Cinzel', serif;
   font-size: 24px;
   letter-spacing: 0.04em;
   color: var(--text);
@@ -2244,7 +2268,7 @@ body[data-account="clay"] {
   color: var(--positive);
 }
 .wheel-pill.cc-pill {
-  border-color: rgba(246, 195, 68, 0.4);
+  border-color: rgba(213, 176, 107, 0.4);
   color: var(--neutral);
 }
 .wheel-card-status {
@@ -2316,7 +2340,7 @@ body[data-account="clay"] {
   margin-bottom: 8px;
 }
 .watch-ticker {
-  font-family: 'Russo One', sans-serif;
+  font-family: 'Cinzel', serif;
   font-size: 16px;
   letter-spacing: 0.06em;
   color: var(--text);
@@ -2331,10 +2355,10 @@ body[data-account="clay"] {
   color: var(--text-muted);
   text-transform: uppercase;
 }
-.watch-pill.csp { color: #06d4f5; border-color: rgba(6, 212, 245, 0.4); }
-.watch-pill.cc  { color: #ec4899; border-color: rgba(236, 72, 153, 0.4); }
+.watch-pill.csp { color: #4A8580; border-color: rgba(74, 133, 128, 0.4); }
+.watch-pill.cc  { color: #B86F75; border-color: rgba(184, 111, 117, 0.4); }
 .watch-pill.sh  { color: var(--positive); border-color: rgba(0, 232, 156, 0.4); }
-.watch-pill.spr { color: #f59e0b; border-color: rgba(245, 158, 11, 0.4); }
+.watch-pill.spr { color: #D5B06B; border-color: rgba(213, 176, 107, 0.4); }
 .watch-price {
   font-family: 'JetBrains Mono', monospace;
   font-size: 18px;
@@ -2805,7 +2829,7 @@ body[data-account="clay"] {
   margin-bottom: 12px;
 }
 .page-section-header h1 {
-  font-family: 'Russo One', sans-serif;
+  font-family: 'Cinzel', serif;
   font-size: 22px;
   letter-spacing: 0.04em;
   color: var(--text);
@@ -2851,8 +2875,8 @@ body[data-account="clay"] {
   transition: all 0.2s;
 }
 .trading-status-dot[data-state="stale"] {
-  background: #f0b400;
-  box-shadow: 0 0 6px rgba(240, 180, 0, 0.5);
+  background: #B7924E;
+  box-shadow: 0 0 6px rgba(183, 146, 78, 0.5);
 }
 .trading-status-dot[data-state="dead"] {
   background: var(--negative);
@@ -2912,7 +2936,7 @@ body[data-account="clay"] {
 
 /* Column-specific styles */
 .trading-row-table .col-ticker {
-  font-family: 'Russo One', sans-serif;
+  font-family: 'Cinzel', serif;
   font-size: 12px;
   letter-spacing: 0.04em;
   color: var(--text);
@@ -2928,7 +2952,7 @@ body[data-account="clay"] {
 
 .trading-row-table .col-loc { color: var(--text-muted); }
 .trading-row-table .loc-in     { color: var(--text); }
-.trading-row-table .loc-above  { color: #f0b400; }   /* warning yellow — above box */
+.trading-row-table .loc-above  { color: #B7924E; }   /* warning yellow — above box */
 .trading-row-table .loc-below  { color: var(--negative); }
 .trading-row-table .loc-none   { color: var(--text-dim); }
 
@@ -3010,8 +3034,8 @@ body[data-account="clay"] {
   transition: all 0.2s;
 }
 .trading-status-dot[data-state="stale"] {
-  background: #f0b400;
-  box-shadow: 0 0 6px rgba(240, 180, 0, 0.5);
+  background: #B7924E;
+  box-shadow: 0 0 6px rgba(183, 146, 78, 0.5);
 }
 .trading-status-dot[data-state="dead"] {
   background: var(--negative);
@@ -3082,7 +3106,7 @@ body[data-account="clay"] {
 }
 
 .tcard-ticker {
-  font-family: 'Russo One', sans-serif;
+  font-family: 'Cinzel', serif;
   font-size: 16px;
   letter-spacing: 0.04em;
   color: var(--text);
@@ -3160,8 +3184,8 @@ body[data-account="clay"] {
 }
 
 .tpill-pb { color: var(--text-muted); }
-.tpill-gex { color: #06d4f5; border-color: rgba(6, 212, 245, 0.4); }
-.tpill-as { color: #f0b400; border-color: rgba(240, 180, 0, 0.4); }
+.tpill-gex { color: #4A8580; border-color: rgba(74, 133, 128, 0.4); }
+.tpill-as { color: #B7924E; border-color: rgba(183, 146, 78, 0.4); }
 
 /* ─── Section blocks ──────────────────────────────────── */
 .tcard-section {
@@ -3287,7 +3311,121 @@ body[data-account="clay"] {
   font-weight: 500;
 }
 
-.tcard-dte-short  { color: #f0b400; }   /* 0DTE — yellow warning */
+.tcard-dte-short  { color: #B7924E; }   /* 0DTE — yellow warning */
 .tcard-dte-mid    { color: var(--text-muted); }  /* 1-6DTE — neutral */
 .tcard-dte-long   { color: var(--positive); font-weight: 500; }  /* 7+DTE — green */
 .tcard-dte-unknown { color: var(--text-dim); }
+
+/* ════════════════════════════════════════════════════════
+   legacy-v1: The Family — rotating roster panel
+   Sits below the family-tribute. Loaded from family_roster.yaml.
+   Names rotate every 6.5s with crossfade; click dots to jump.
+   ──────────────────────────────────────────────────────── */
+
+.family-panel {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-top: 1px solid var(--brass-deep);
+  padding: 26px 22px 24px;
+  margin: 0 0 22px;
+  position: relative;
+  min-height: 200px;
+}
+
+.family-panel-label {
+  font-family: 'Cinzel', serif;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.36em;
+  text-transform: uppercase;
+  color: var(--brass);
+  margin-bottom: 22px;
+  text-align: center;
+  position: relative;
+}
+
+.family-panel-label::before,
+.family-panel-label::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  width: 56px;
+  height: 1px;
+  background: var(--brass-deep);
+  opacity: 0.6;
+}
+.family-panel-label::before { left: 50%; margin-left: -130px; }
+.family-panel-label::after  { left: 50%; margin-left: 75px; }
+
+.family-track {
+  position: relative;
+  min-height: 110px;
+}
+
+.family-card {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  opacity: 0;
+  transition: opacity 1.2s ease-in-out;
+  pointer-events: none;
+}
+
+.family-card.active {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.family-name {
+  font-family: 'Cormorant Garamond', serif;
+  font-size: 26px;
+  font-weight: 500;
+  color: var(--brass);
+  letter-spacing: 0.03em;
+  text-align: center;
+  line-height: 1.2;
+  margin-bottom: 14px;
+}
+
+.family-relation {
+  font-family: 'Outfit', sans-serif;
+  font-size: 10px;
+  font-weight: 400;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  text-align: center;
+}
+
+.family-dots {
+  display: flex;
+  justify-content: center;
+  gap: 7px;
+  margin-top: 18px;
+  flex-wrap: wrap;
+}
+
+.family-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--border-bright);
+  cursor: pointer;
+  transition: background 250ms;
+  opacity: 0.5;
+}
+
+.family-dot:hover { opacity: 0.85; }
+
+.family-dot.active {
+  background: var(--brass);
+  opacity: 1;
+}
+
+@media (max-width: 980px) {
+  .family-name { font-size: 21px; }
+  .family-panel-label::before,
+  .family-panel-label::after { display: none; }
+}
