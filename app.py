@@ -12391,7 +12391,7 @@ def _post_em_card(ticker: str, session: str):
         log.error(f"EM card error for {ticker} ({session}): {e}", exc_info=True)
 
 
-def _generate_silent_thesis(ticker: str):
+def _generate_silent_thesis(ticker: str, refresh_only: bool = False):
     """Generate and store thesis from EM card data WITHOUT posting to Telegram.
 
     Used for flow alignment gate: conviction plays check if flow direction
@@ -12400,6 +12400,11 @@ def _generate_silent_thesis(ticker: str):
 
     Stores: ThesisContext with bias, gex_sign, regime, levels, vol regime.
     Does NOT post: no EM card, no guidance, no action block to Telegram.
+
+    v8.6 (Patch 1): refresh_only=True skips the em_predictions Sheet write
+    so intraday refreshes (every ~60 min during market hours) don't pollute
+    the EM reconciler dataset. The morning fire (refresh_only=False) remains
+    the single prediction-of-record scored against the closing price.
     """
     try:
         import pytz
@@ -12480,12 +12485,16 @@ def _generate_silent_thesis(ticker: str):
         )
         get_thesis_engine().store_thesis(ticker, _thesis)
 
-        # Log to em_predictions sheet so all 35 tickers are reviewable
-        try:
-            _log_em_prediction(ticker, "silent", spot, em, bias, v4_result,
-                               walls=walls, eng=eng, cagf=cagf, vol_regime=vol_regime)
-        except Exception:
-            pass
+        # Log to em_predictions sheet so all 35 tickers are reviewable.
+        # v8.6 (Patch 1): skip on intraday refresh fires — preserves the
+        # morning prediction-of-record as the lone row scored by the EM
+        # reconciler at 16:15 CT against the closing price.
+        if not refresh_only:
+            try:
+                _log_em_prediction(ticker, "silent", spot, em, bias, v4_result,
+                                   walls=walls, eng=eng, cagf=cagf, vol_regime=vol_regime)
+            except Exception:
+                pass
 
         log.info(f"Silent thesis stored: {ticker} | bias={bias.get('direction','?')} "
                  f"score={bias.get('score',0):+d}/14 | gex={_thesis.gex_sign} | "
@@ -12527,6 +12536,34 @@ def _generate_all_silent_theses():
             # outside the inner try/except. Now visible at WARN.
             log.warning(f"Silent thesis loop exception for {ticker}: {_ste}")
     log.info(f"Silent thesis generation complete: {count} generated, {skipped} already had EM cards")
+
+
+# v8.6 (Patch 1): Intraday silent thesis refresh.
+# Runs on a configurable cadence during market hours so dashboard cards have
+# fresher walls / gamma_flip / EM bounds than the 8:30 AM morning snapshot.
+# Updates Redis thesis state ONLY — does NOT write to em_predictions Sheet
+# (preserves the morning prediction-of-record for EM reconciler at 16:15 CT).
+# Refreshes ALL flow tickers regardless of existing bias — that's the point;
+# we WANT the latest structural data, not the morning's.
+# Default OFF; gated by EM_INTRADAY_REFRESH_ENABLED env var.
+def _refresh_all_silent_theses():
+    """Intraday refresh of silent theses — Redis-only, no Sheet writes."""
+    from oi_flow import FLOW_TICKERS
+    count = 0
+    failed = 0
+    started = time.time()
+    for ticker in FLOW_TICKERS:
+        try:
+            if _generate_silent_thesis(ticker, refresh_only=True):
+                count += 1
+            else:
+                failed += 1
+            time.sleep(1.5)  # rate limit: ~23 tickers/min
+        except Exception as _re:
+            failed += 1
+            log.warning(f"Intraday EM refresh exception for {ticker}: {_re}")
+    elapsed = time.time() - started
+    log.info(f"Intraday EM refresh complete: {count} updated, {failed} failed, {elapsed:.1f}s elapsed")
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -13990,6 +14027,44 @@ def _em_scheduler():
                     log.info("Silent thesis generation firing for all flow tickers (8:30 CT)")
                     threading.Thread(target=_generate_all_silent_theses,
                                      daemon=True, name="silent-thesis").start()
+
+            # ── v8.6 (Patch 1): Intraday silent thesis refresh ──
+            # Refreshes Redis thesis state during market hours so dashboard
+            # cards have fresher walls / gamma_flip / EM than the 8:30 snapshot.
+            # Does NOT write to em_predictions Sheet (preserves morning row for
+            # reconciler scoring). Default OFF.
+            #
+            # Env vars:
+            #   EM_INTRADAY_REFRESH_ENABLED=1     # turn on (default 0)
+            #   EM_INTRADAY_REFRESH_INTERVAL_MIN=60  # cadence (default 60)
+            #
+            # At default 60-min cadence the refresh times are 9:30, 10:30,
+            # 11:30, 12:30, 13:30, 14:30 CT (six passes/day, all before close).
+            if os.environ.get("EM_INTRADAY_REFRESH_ENABLED", "0") == "1":
+                try:
+                    _ref_interval = max(15, int(os.environ.get(
+                        "EM_INTRADAY_REFRESH_INTERVAL_MIN", "60")))
+                except (TypeError, ValueError):
+                    _ref_interval = 60
+                # Build refresh schedule: start 8:30 + interval, stop before 15:00.
+                _ref_total = 8 * 60 + 30 + _ref_interval
+                while _ref_total < 15 * 60:
+                    _ref_hr = _ref_total // 60
+                    _ref_mn = _ref_total % 60
+                    _ref_key = (date_str, "em_refresh", _ref_hr, _ref_mn)
+                    if _ref_key not in fired_today:
+                        if now_ct.hour == _ref_hr and abs(now_ct.minute - _ref_mn) <= 1:
+                            fired_today.add(_ref_key)
+                            log.info(
+                                f"Intraday EM refresh firing "
+                                f"({_ref_hr:02d}:{_ref_mn:02d} CT, "
+                                f"interval={_ref_interval}min)"
+                            )
+                            threading.Thread(
+                                target=_refresh_all_silent_theses,
+                                daemon=True, name="em-refresh"
+                            ).start()
+                    _ref_total += _ref_interval
 
             # ── Auto-reconciler: 4:15 PM CT (after market close) ──
             recon_key = (date_str, 16, 15)
