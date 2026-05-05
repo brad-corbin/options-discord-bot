@@ -4386,7 +4386,7 @@ def build_thesis_from_em_card(ticker, spot, bias, eng, em, walls, cagf=None, vix
     if flip is not None and spot > 0:
         d = (flip - spot) / spot * 100
         if d > 1.5: gex_sign = "negative"; log.info(f"Thesis GEX overridden: raw {gex_val:+.1f}M but spot {d:.1f}% below flip → negative")
-        elif d < -1.5: gex_sign = "positive"
+        elif d < -1.5: gex_sign = "positive"; log.info(f"Thesis GEX overridden: raw {gex_val:+.1f}M but spot {-d:.1f}% above flip → positive")  # v9 (Patch 4c): symmetric log
     # ── v9 (Patch 3): additive explicit fields. ────────────────────────────────
     # Three new fields populated alongside legacy gex_sign. NOT YET READ by any
     # downstream consumer — they exist for forward migration. dealer_regime is
