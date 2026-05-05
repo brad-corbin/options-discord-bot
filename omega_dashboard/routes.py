@@ -14,6 +14,12 @@ Patches applied:
     - PAGE_TABS: rename Command → Desk, Trading → Market View
     - load_family_roster() loads data/family_roster.yaml on demand
     - render_page() now passes family_roster context to all templates
+
+  legacy-v1.1: Sync Portfolio account picker to top-bar selection
+    - portfolio_section() defaults active_underlying from top-bar cookie
+      when no ?acct= is supplied, instead of hardcoding "brad"
+    - set_account() strips stale ?acct= from referer URL on redirect, so
+      clicking a top-bar chip while on Portfolio actually re-defaults
 ────────────────────────────────────────────────────────────────────
 """
 import os
@@ -245,6 +251,20 @@ def set_account(account_key):
     if not referer.startswith(request.host_url):
         referer = url_for("dashboard.command_center")
 
+    # legacy-v1.1: strip stale ?acct= from referer URL if present, so the
+    # newly-set cookie drives the Portfolio default rather than the URL param
+    # winning. Other query params (show_closed, since, ticker) are preserved.
+    try:
+        from urllib.parse import urlparse, urlencode, parse_qs, urlunparse
+        parsed = urlparse(referer)
+        if parsed.query:
+            qs = parse_qs(parsed.query, keep_blank_values=True)
+            if "acct" in qs:
+                qs.pop("acct", None)
+                referer = urlunparse(parsed._replace(query=urlencode(qs, doseq=True)))
+    except Exception:
+        log.debug("legacy-v1.1: failed to strip ?acct= from referer", exc_info=True)
+
     resp = make_response(redirect(referer))
     # Cookie persists for the session lifetime
     resp.set_cookie(
@@ -320,11 +340,31 @@ def portfolio_section(section):
     if section not in valid_sections:
         return redirect(url_for("dashboard.portfolio_section", section="cash"))
 
-    # Active underlying account for entry — resolved from query param or default
+    # Active underlying account for entry — resolved from query param,
+    # then top-bar cookie (legacy-v1.1), then "brad" default.
     from . import writes
     active_underlying = (request.args.get("acct") or "").strip().lower()
     if active_underlying not in writes.ALL_UNDERLYING_ACCOUNTS:
-        active_underlying = "brad"
+        # legacy-v1.1: take the top-bar selection as default before falling
+        # back to brad. Top-bar uses keys (combined/mine/mom/partner/kyleigh/clay);
+        # Portfolio entry uses underlying keys (brad/mom/partner/kyleigh/clay).
+        # combined and mine both collapse to brad since Combined isn't a valid
+        # entry account.
+        _TOP_TO_UNDERLYING = {
+            "combined": "brad",
+            "mine":     "brad",
+            "mom":      "mom",
+            "partner":  "partner",
+            "kyleigh":  "kyleigh",
+            "clay":     "clay",
+        }
+        try:
+            top_key = (get_active_account() or {}).get("key", "combined")
+        except Exception:
+            top_key = "combined"
+        active_underlying = _TOP_TO_UNDERLYING.get(top_key, "brad")
+        if active_underlying not in writes.ALL_UNDERLYING_ACCOUNTS:
+            active_underlying = "brad"
 
     page_data = writes.portfolio_page_data(
         active_underlying,
