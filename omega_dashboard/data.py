@@ -1847,13 +1847,17 @@ def _build_flow_ledger(ticker: str, bot_state, today_ct: str,
         notional_label = _fmt_notional(notional)
 
         # DTE pill
+        # v8.3 (Patch 2): now shows actual expiry date alongside DTE so the
+        # trader can see both at a glance. Format: "5/8 · 1D" (date · DTE).
+        # Falls back to just "1D" if expiry parse fails but DTE was computable.
         expiry = h.get("expiry") or ""
         dte = _calc_dte(expiry)
         if dte is None:
             dte_label = ""
             dte_class = "unknown"
         else:
-            dte_label = f"{dte}D"
+            md = _fmt_expiry_md(expiry)
+            dte_label = f"{md} · {dte}D" if md else f"{dte}D"
             # Color: 0DTE = warning (hedging/scalping), 7+DTE = success
             # (positioning), 1-6DTE = neutral
             if dte == 0:
@@ -1985,6 +1989,19 @@ def _calc_dte(expiry: str) -> Optional[int]:
         return max(0, (exp - today).days)
     except Exception:
         return None
+
+
+# v8.3 (Patch 2): compact M/D formatter for the DTE pill.
+# Same parsing path as _calc_dte so a string that yields a valid DTE will
+# also yield a date label. Returns "" on parse failure.
+def _fmt_expiry_md(expiry: str) -> str:
+    if not expiry:
+        return ""
+    try:
+        exp = _date_cls.fromisoformat(str(expiry)[:10])
+        return f"{exp.month}/{exp.day}"
+    except Exception:
+        return ""
 
 
 def _ct_today_date() -> _date_cls:
