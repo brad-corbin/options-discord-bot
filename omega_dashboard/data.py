@@ -1642,20 +1642,48 @@ def _build_levels(ticker: str, spot: Optional[float], bot_state,
 
 
 def _read_em_log(bot_state, ticker: str, today_utc: str) -> Optional[Dict]:
-    """em_log:{utc_date}:{ticker}:silent — written 8:30 AM CT for all 35
-    flow tickers."""
+    """em_log lookup — checks both :silent (morning baseline) and :manual
+    (force-runs), returning whichever is most recent.
+
+    v9 (Patch 2c): added :manual fallback. Previously only :silent was read,
+    which meant force-runs were invisible to the levels panel — a force-run
+    would update thesis_monitor:{ticker} and write em_log:{date}:{ticker}:manual
+    but the dashboard would keep showing morning's silent baseline. The whole
+    purpose of force-running (refresh the data because something changed) was
+    being defeated. Now both keys are read; the most recent wins by
+    logged_at_utc timestamp comparison. If only one exists, that one is
+    returned. Empty defensive returns (None) on any error so the calling
+    _build_levels function falls through to its other sources.
+    """
     try:
-        key = f"em_log:{today_utc}:{ticker.upper()}:silent"
-        return bot_state._json_get(key)
+        silent = bot_state._json_get(f"em_log:{today_utc}:{ticker.upper()}:silent")
+        manual = bot_state._json_get(f"em_log:{today_utc}:{ticker.upper()}:manual")
+        if silent and manual:
+            # Both present — take whichever has the newer timestamp
+            ts_s = silent.get("logged_at_utc") or silent.get("timestamp") or ""
+            ts_m = manual.get("logged_at_utc") or manual.get("timestamp") or ""
+            return manual if ts_m > ts_s else silent
+        return manual or silent  # one or neither — None falls through
     except Exception as e:
         log.debug(f"em_log read failed for {ticker}: {e}")
         return None
 
 
 def _read_gex(bot_state, ticker: str) -> Optional[Dict]:
-    """gex:{ticker} — written by oi_flow on every chain pull, 2h TTL."""
+    """GEX data via the persistent_state fallback chain.
+
+    v9 (Patch 2c): routed through bot_state.get_gex_data() which (per Patch
+    2b rev1) reads thesis_monitor:{ticker} as Source 1 and falls back to
+    gex:{ticker} only if thesis is missing. Previously this read gex:{ticker}
+    directly, bypassing the fallback chain entirely — which produced empty
+    levels panels whenever the lightweight blob was deleted/expired even if
+    a thesis was available. The lightweight gex:{ticker} writer is being
+    deprecated by Patch 2a anyway; routing through get_gex_data() decouples
+    this reader from that key's lifecycle.
+    """
     try:
-        return bot_state._json_get(f"gex:{ticker.upper()}")
+        result = bot_state.get_gex_data(ticker)
+        return result if result else None
     except Exception as e:
         log.debug(f"gex read failed for {ticker}: {e}")
         return None

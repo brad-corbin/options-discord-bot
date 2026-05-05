@@ -186,6 +186,13 @@ class ThesisLevels:
 class ThesisContext:
     ticker: str = ""; bias: str = "NEUTRAL"; bias_score: int = 0
     gex_sign: str = "positive"; gex_value: float = 0.0
+    # v9 (Patch 3): additive explicit fields for forward migration off gex_sign.
+    # Not yet read by any downstream consumer. dealer_regime mirrors the
+    # gex_sign override semantics so they stay in lockstep. See
+    # WALK1B_FINDINGS.md §6 for design rationale.
+    gex_value_sign: str = "neutral"   # v9 (Patch 3): literal sign of net GEX value
+    flip_location:  str = "unknown"   # v9 (Patch 3): spot vs flip, ignoring magnitude
+    dealer_regime:  str = "unknown"   # v9 (Patch 3): mirrors gex_sign override semantics
     dex_value: float = 0.0; vanna_value: float = 0.0; charm_value: float = 0.0
     regime: str = "UNKNOWN"; volatility_regime: str = "NORMAL"
     vix: float = 20.0; iv: float = 0.20
@@ -923,6 +930,10 @@ class ThesisMonitorEngine:
                     "atm_call_premium": thesis.atm_call_premium,
                     "atm_put_delta": thesis.atm_put_delta,
                     "atm_put_premium": thesis.atm_put_premium,
+                    # v9 (Patch 3): persist additive gex_sign companions
+                    "gex_value_sign": thesis.gex_value_sign,
+                    "flip_location":  thesis.flip_location,
+                    "dealer_regime":  thesis.dealer_regime,
             }
             self._store_set(f"thesis_monitor:{ticker}", json.dumps(data), ttl=86400)
             # Maintain monitored ticker list in store
@@ -949,7 +960,7 @@ class ThesisMonitorEngine:
             if not raw: return None
             d = json.loads(raw)
             levels = ThesisLevels(**{k: v for k, v in d.get("levels", {}).items() if k in ThesisLevels.__dataclass_fields__})
-            t = ThesisContext(ticker=d.get("ticker", ticker), bias=d.get("bias", "NEUTRAL"), bias_score=d.get("bias_score", 0), gex_sign=d.get("gex_sign", "positive"), gex_value=d.get("gex_value", 0), dex_value=d.get("dex_value", 0), vanna_value=d.get("vanna_value", 0), charm_value=d.get("charm_value", 0), regime=d.get("regime", "UNKNOWN"), volatility_regime=d.get("volatility_regime", "NORMAL"), vix=d.get("vix", 20), iv=d.get("iv", 0.20), prior_day_close=d.get("prior_day_close"), prior_day_context=d.get("prior_day_context", "NORMAL"), session_label=d.get("session_label", ""), created_at=d.get("created_at", ""), spot_at_creation=d.get("spot_at_creation", 0), levels=levels)
+            t = ThesisContext(ticker=d.get("ticker", ticker), bias=d.get("bias", "NEUTRAL"), bias_score=d.get("bias_score", 0), gex_sign=d.get("gex_sign", "positive"), gex_value=d.get("gex_value", 0), gex_value_sign=d.get("gex_value_sign", "neutral"), flip_location=d.get("flip_location", "unknown"), dealer_regime=d.get("dealer_regime", "unknown"), dex_value=d.get("dex_value", 0), vanna_value=d.get("vanna_value", 0), charm_value=d.get("charm_value", 0), regime=d.get("regime", "UNKNOWN"), volatility_regime=d.get("volatility_regime", "NORMAL"), vix=d.get("vix", 20), iv=d.get("iv", 0.20), prior_day_close=d.get("prior_day_close"), prior_day_context=d.get("prior_day_context", "NORMAL"), session_label=d.get("session_label", ""), created_at=d.get("created_at", ""), spot_at_creation=d.get("spot_at_creation", 0), levels=levels)
             # v15: restore ATM option data for premium stop
             t.atm_call_delta   = float(d.get("atm_call_delta", 0.0) or 0.0)
             t.atm_call_premium = float(d.get("atm_call_premium", 0.0) or 0.0)
@@ -4376,13 +4387,58 @@ def build_thesis_from_em_card(ticker, spot, bias, eng, em, walls, cagf=None, vix
         d = (flip - spot) / spot * 100
         if d > 1.5: gex_sign = "negative"; log.info(f"Thesis GEX overridden: raw {gex_val:+.1f}M but spot {d:.1f}% below flip → negative")
         elif d < -1.5: gex_sign = "positive"
+    # ── v9 (Patch 3): additive explicit fields. ────────────────────────────────
+    # Three new fields populated alongside legacy gex_sign. NOT YET READ by any
+    # downstream consumer — they exist for forward migration. dealer_regime is
+    # constructed to mirror the wrapper-override semantics above so it stays in
+    # lockstep with gex_sign for every production ticker. See WALK1B_FINDINGS.md
+    # §6 for the full audit. The block is self-contained: it does NOT rely on
+    # the override block's `d` being in scope (override gates on
+    # `flip is not None and spot > 0`, which is approximately but not identically
+    # equivalent to the guard below). Recomputing is cheap and removes the
+    # cross-block dependency.
+    # Field 1 — literal sign of net GEX value
+    if gex_val > 0:
+        gex_value_sign = "positive"
+    elif gex_val < 0:
+        gex_value_sign = "negative"
+    else:
+        gex_value_sign = "neutral"
+    # Field 2 — flip location (independent of GEX sign), ±0.25% band
+    if flip and spot:
+        _d_above = (spot - flip) / flip * 100   # positive = spot above flip
+        if abs(_d_above) < 0.25:
+            flip_location = "at_flip"
+        elif _d_above > 0:
+            flip_location = "above_flip"
+        else:
+            flip_location = "below_flip"
+    else:
+        flip_location = "unknown"
+    # Field 3 — dealer regime, mirrors the wrapper override semantics. Recompute
+    # `d` with the same formula as the override block above so the ±1.5% band
+    # matches exactly.
+    if flip and spot:
+        _d_override = (flip - spot) / spot * 100   # same formula as override
+        if _d_override < -1.5:
+            dealer_regime = "pin_range"            # spot well above flip
+        elif _d_override > 1.5:
+            dealer_regime = "trend_expansion"      # spot well below flip
+        else:
+            # Within ±1.5% band — fall back to literal sign (matches wrapper's
+            # behavior of using the initial gex_sign assignment when override
+            # doesn't fire).
+            dealer_regime = "pin_range" if gex_val >= 0 else "trend_expansion"
+    else:
+        dealer_regime = "unknown"
+    # ──────────────────────────────────────────────────────────────────────────
     regime = "UNKNOWN"
     if cagf and cagf.get("regime"): regime = cagf["regime"]
     elif eng.get("is_positive_gex") is not None: regime = "SUPPRESSING" if eng["is_positive_gex"] else "TRENDING"
     try:
         from zoneinfo import ZoneInfo; ts = datetime.now(ZoneInfo("America/Chicago")).isoformat()
     except Exception: ts = datetime.now(timezone.utc).isoformat()
-    ctx = ThesisContext(ticker=ticker, bias=bias.get("direction", "NEUTRAL"), bias_score=bias.get("score", 0), gex_sign=gex_sign, gex_value=round(gex_val, 2), dex_value=round(eng.get("dex", 0), 2), vanna_value=round(eng.get("vanna", 0), 2), charm_value=round(eng.get("charm", 0), 2), regime=regime, volatility_regime=v4_result.get("vol_regime", {}).get("label", "NORMAL") if v4_result else "NORMAL", vix=vix.get("vix", 20) if isinstance(vix, dict) else 20, iv=v4_result.get("iv", 0.20) if v4_result else 0.20, prior_day_close=prior_day_close, prior_day_context=prior_ctx, session_label=session_label, levels=levels, created_at=ts, spot_at_creation=spot)
+    ctx = ThesisContext(ticker=ticker, bias=bias.get("direction", "NEUTRAL"), bias_score=bias.get("score", 0), gex_sign=gex_sign, gex_value=round(gex_val, 2), gex_value_sign=gex_value_sign, flip_location=flip_location, dealer_regime=dealer_regime, dex_value=round(eng.get("dex", 0), 2), vanna_value=round(eng.get("vanna", 0), 2), charm_value=round(eng.get("charm", 0), 2), regime=regime, volatility_regime=v4_result.get("vol_regime", {}).get("label", "NORMAL") if v4_result else "NORMAL", vix=vix.get("vix", 20) if isinstance(vix, dict) else 20, iv=v4_result.get("iv", 0.20) if v4_result else 0.20, prior_day_close=prior_day_close, prior_day_context=prior_ctx, session_label=session_label, levels=levels, created_at=ts, spot_at_creation=spot)
     # v5.1 Fix A: Force volatility_regime from VIX directly.
     # The options engine (v4_result) may label VIX 25 as "ELEVATED" while
     # the regime detector calls it "CRISIS". The CRISIS long option framework
