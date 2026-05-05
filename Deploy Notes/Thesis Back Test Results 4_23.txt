@@ -1,0 +1,176 @@
+render@srv-d6j49cntskes738e202g-864957465d-t8tl4:~/project/src$ python3 backtest/run_backtest.py > /tmp/backtest_output.txt 2>&1
+echo "exit=$?"
+wc -l /tmp/backtest_output.txt
+cat /tmp/backtest_output.txt
+exit=0
+170 /tmp/backtest_output.txt
+==============================================================================
+THESIS RECON × SNAPSHOT BACKTEST — MEGA / TRAP / PIN
+==============================================================================
+recon rows: 174  |  thesis rows: 223
+bar CSVs found: 76
+
+MEGA candidates: 22  (expect ~22)
+TRAP candidates: 38  (expect ~38)
+PIN  candidates: 20  (expect ~20)
+Joined rows not in any bucket: 88
+
+==============================================================================
+SUMMARY — DIRECTIONAL BUCKETS (MEGA, TRAP)
+==============================================================================
+Convention: MFE = peak favorable $ move; MAE = peak adverse $ move (positive magnitude).
+Option P&L assumes ATM 0DTE long call/put, premium = 0.4*em_1sd, bell-curve theta decay.
+
+--- MEGA (n=22) ---
+  MFE ($)                  n= 22  mean=    8.09  med=    6.12  p25=    3.94  p75=   11.50  min=    1.77  max=   27.90
+  MAE ($)                  n= 22  mean=    1.84  med=    1.46  p25=    0.87  p75=    2.78  min=   -0.00  max=    4.27
+  MFE / em_1sd             n= 22  mean=   0.766  med=   0.599  p25=   0.485  p75=   1.097  min=   0.240  max=   1.954
+  MAE / em_1sd             n= 22  mean=   0.165  med=   0.142  p25=   0.108  p75=   0.210  min=  -0.000  max=   0.366
+  MFE / MAE ratio          n= 22  mean=   24.53  med=    3.42  p25=    2.36  p75=    9.94  min=    1.44  max=  394.50
+  Time-to-peak (min)       n= 22  mean=   268.2  med=   288.5  p25=   172.0  p75=   385.0  min=    36.0  max=   389.0
+  Final dS ($)             n= 22  mean=    6.29  med=    4.52  p25=    2.80  p75=    8.28  min=    1.04  max=   25.28
+  Peak opt P&L (%)         n= 22  mean=   141.6  med=   115.1  p25=    76.1  p75=   184.6  min=    39.7  max=   389.3
+  Trough opt P&L (%)       n= 22  mean=   -21.0  med=   -14.2  p25=   -37.5  p75=    -2.6  min=   -67.5  max=    -0.3
+  Final opt P&L (%)        n= 22  mean=    60.7  med=    19.2  p25=   -26.7  p75=   116.0  min=   -62.1  max=   378.5
+  peak option >= +50%:  19/22 (86%)
+  peak option >= +100%: 13/22 (59%)
+  closed green (any):   14/22 (64%)
+  closed <= -80% (~total loss): 0/22 (0%)
+
+--- TRAP (n=38) ---
+  MFE ($)                  n= 38  mean=    3.42  med=    2.12  p25=    0.86  p75=    4.22  min=    0.05  max=   21.26
+  MAE ($)                  n= 38  mean=    2.92  med=    2.31  p25=    0.81  p75=    3.45  min=   -0.00  max=   14.25
+  MFE / em_1sd             n= 38  mean=   0.366  med=   0.225  p25=   0.151  p75=   0.417  min=   0.039  max=   2.044
+  MAE / em_1sd             n= 38  mean=   0.291  med=   0.275  p25=   0.156  p75=   0.446  min=  -0.000  max=   0.725
+  MFE / MAE ratio          n= 38  mean=   14.91  med=    0.96  p25=    0.30  p75=    3.18  min=    0.07  max=  310.00
+  Time-to-peak (min)       n= 38  mean=   130.5  med=   126.5  p25=     8.0  p75=   179.0  min=     0.0  max=   389.0
+  Final dS ($)             n= 38  mean=    0.26  med=    0.02  p25=   -1.87  p75=    2.31  min=  -10.41  max=   13.94
+  Peak opt P&L (%)         n= 38  mean=    68.0  med=    42.9  p25=    22.8  p75=    75.8  min=     9.2  max=   420.1
+  Trough opt P&L (%)       n= 38  mean=   -58.5  med=   -70.4  p25=   -95.1  p75=   -23.5  min=   -95.6  max=    -0.3
+  Final opt P&L (%)        n= 38  mean=   -38.0  med=   -60.1  p25=   -95.1  p75=     9.4  min=   -95.5  max=    97.5
+  peak option >= +50%:  18/38 (47%)
+  peak option >= +100%: 7/38 (18%)
+  closed green (any):   11/38 (29%)
+  closed <= -80% (~total loss): 17/38 (45%)
+
+==============================================================================
+SUMMARY — PIN BUCKET (neutral, stay-inside-1sig)
+==============================================================================
+--- PIN (n=18) ---
+  Peak |exc| / em_1sd      n= 18  mean=   0.692  med=   0.570  p25=   0.382  p75=   0.726  min=   0.281  max=   1.860
+  Final |exc| / em_1sd     n= 18  mean=   0.457  med=   0.323  p25=   0.240  p75=   0.651  min=   0.081  max=   1.257
+  Peak |exc| ($)           n= 18  mean=    7.36  med=    6.01  p25=    4.82  p75=   11.79  min=    2.60  max=   15.91
+  Breach time (min)        n=  3  mean=   220.0  med=   288.0  p25=    31.0  p75=   341.0  min=    31.0  max=   341.0
+  closed inside 1sig:     17/18 (94%)
+  breached intraday:      3/18 (17%)
+  never breached intraday:15/18 (83%)
+
+[PIN] missing bars for 2 signals:
+    - QQQ_2026-03-20_morning
+    - QQQ_2026-04-07_morning
+
+==============================================================================
+PER-SIGNAL DETAIL
+==============================================================================
+
+--- MEGA detail (n=22) ---
+date       session     ticker  bias  em_1sd    MFE$    MAE$   MFE/EM  MAE/EM  t2pk  peak_opt  final_opt  actMov
+---------------------------------------------------------------------------------------------------------------
+2026-04-09  afternoon  QQQ     +8     7.38    +1.77   +1.23   +0.24   +0.17   172      +42%      +17%    0.23  [CALL]
+2026-04-15  morning    QQQ     +7     7.76    +8.75   +0.88   +1.13   +0.11   389     +185%     +170%    6.82  [CALL]
+2026-04-15  silent     AAPL    +6     4.36    +8.52   +0.23   +1.95   +0.05   389     +389%     +378%     8.3  [CALL]
+2026-04-15  silent     AVGO    +9    11.56    +7.28   +4.23   +0.63   +0.37   389     +123%      +52%    10.5  [CALL]
+2026-04-15  silent     META    +8    22.52   +11.50   +2.78   +0.51   +0.12   170      +94%      -44%    3.35  [CALL]
+2026-04-15  silent     MSFT    +9    11.72   +16.37   +1.27   +1.40   +0.11   306     +267%     +186%   13.15  [CALL]
+2026-04-15  silent     TSLA    +7    15.19   +27.90   +4.25   +1.84   +0.28   378     +370%     +317%   27.07  [CALL]
+2026-04-17  morning    QQQ     +8     9.21    +4.47   +1.46   +0.49   +0.16   196      +92%       -8%     1.6  [CALL]
+2026-04-17  silent     AAPL    +6     4.58    +5.23   +0.35   +1.14   +0.08   123     +229%      +74%    3.24  [CALL]
+2026-04-17  silent     META    +6    21.80   +12.91   +3.48   +0.59   +0.16   372      +94%      +20%   11.38  [CALL]
+2026-04-17  silent     NVDA    +5     6.59    +1.80   +0.63   +0.27   +0.10   389      +58%      -28%    1.95  [CALL]
+2026-04-17  silent     PLTR    +8     7.90    +2.95   +2.03   +0.37   +0.26    83      +76%      -62%     2.2  [CALL]
+2026-04-17  silent     QQQ     +8    11.70    +4.47   +1.46   +0.38   +0.12   196      +70%      -27%    3.73  [CALL]
+2026-04-17  silent     SPY     +9     9.28    +6.24   +0.39   +0.67   +0.04   195     +125%       +9%    2.89  [CALL]
+2026-04-17  silent     TSLA    +7    20.29   +13.36   +4.27   +0.66   +0.21   119     +132%      -37%    7.48  [CALL]
+2026-04-17  silent     UNH     +8     8.79    +5.22   +2.92   +0.59   +0.33   185     +110%      +32%     5.4  [CALL]
+2026-04-20  silent     AAPL    +5     7.13    +3.94   -0.00   +0.55   -0.00    36     +120%       -4%    2.49  [CALL]
+2026-04-22  morning    SPY     +5     7.87    +2.27   +0.96   +0.29   +0.12   389      +40%      -31%     1.1  [CALL]
+2026-04-22  silent     AAPL    +5     5.47    +6.00   +0.87   +1.10   +0.16   271     +208%     +152%    5.29  [CALL]
+2026-04-22  silent     AMZN    +6     6.14    +3.40   +2.21   +0.55   +0.36   383      +50%      +19%    3.99  [CALL]
+2026-04-22  silent     AVGO    +7    18.38   +16.22   +2.12   +0.88   +0.12   385     +132%     +116%   15.53  [CALL]
+2026-04-22  silent     MSFT    +5    12.44    +7.51   +2.51   +0.60   +0.20   385     +110%      +35%    6.39  [CALL]
+
+--- TRAP detail (n=38) ---
+date       session     ticker  bias  em_1sd    MFE$    MAE$   MFE/EM  MAE/EM  t2pk  peak_opt  final_opt  actMov
+---------------------------------------------------------------------------------------------------------------
+2026-03-25  morning    QQQ     +5    12.79    +2.23   +3.45   +0.17   +0.27     8      +41%      -95%    0.05  [CALL]
+2026-04-06  afternoon  QQQ     +5     8.95    +1.62   +2.52   +0.18   +0.28   170      +24%       +9%    0.61  [CALL]
+2026-04-06  afternoon  SPY     +6     8.61    +0.99   +2.41   +0.11   +0.28   179       +9%       +0%    0.83  [CALL]
+2026-04-06  morning    QQQ     +8    10.88    +4.40   +1.52   +0.40   +0.14    30      +90%      -42%    0.81  [CALL]
+2026-04-09  afternoon  SPY     +5     6.69    +1.30   +1.41   +0.20   +0.21    40      +42%      -26%   -0.39  [CALL]
+2026-04-10  afternoon  QQQ     +5     5.71    +0.86   +1.01   +0.15   +0.18   140      +17%       -9%    0.17  [CALL]
+2026-04-10  morning    QQQ     +5     7.98    +1.85   +2.24   +0.23   +0.28   114      +40%      -95%   -0.61  [CALL]
+2026-04-10  morning    SPY     +7     7.87    +0.73   +2.85   +0.09   +0.36   114      +20%      -95%   -1.22  [CALL]
+2026-04-13  afternoon  QQQ     +6     6.15   +12.57   +0.36   +2.04   +0.06   179     +420%      +93%    1.84  [CALL]
+2026-04-15  afternoon  SPY     +6     6.13    +3.72   +0.15   +0.61   +0.02   179     +113%      +98%    0.41  [CALL]
+2026-04-15  morning    SPY     +8     6.80    +5.02   +1.06   +0.74   +0.16   389     +101%      +72%    4.06  [CALL]
+2026-04-15  silent     AMZN    +6     5.43    +1.19   +2.05   +0.22   +0.38     0      +52%      -95%   -0.71  [CALL]
+2026-04-15  silent     GOOGL   +8     9.14    +4.59   +1.99   +0.50   +0.22   325      +62%      +21%     4.5  [CALL]
+2026-04-15  silent     NVDA    +8     6.79    +3.85   +0.81   +0.57   +0.12   138     +110%      -10%    0.52  [CALL]
+2026-04-15  silent     TLT     +8     0.60    +0.05   +0.30   +0.08   +0.49     9      +19%      -95%   -0.17  [CALL]
+2026-04-17  afternoon  QQQ     +7     5.18    +0.41   +2.98   +0.08   +0.58     4      +19%      -27%     0.3  [CALL]
+2026-04-17  afternoon  SPY     +6     4.26    +0.26   +2.92   +0.06   +0.69     3      +15%      -33%   -0.12  [CALL]
+2026-04-17  silent     AMD     +5    10.79    +3.49   +3.42   +0.32   +0.32     0      +76%      -78%    0.12  [CALL]
+2026-04-17  silent     ARM     +7     7.84    +1.63   +3.99   +0.21   +0.51   272      +23%      -94%   -0.02  [CALL]
+2026-04-17  silent     BA      +7     5.38    +7.17   +0.30   +1.33   +0.06    56     +271%      -79%   -0.33  [CALL]
+2026-04-17  silent     CAT     +5    19.06   +21.26   +4.51   +1.12   +0.24   201     +216%      +87%   11.52  [CALL]
+2026-04-17  silent     CRM     +6     9.87    +2.55   +4.40   +0.26   +0.45     1      +61%      -95%   -5.67  [CALL]
+2026-04-17  silent     GS      +6    36.41   +13.69   +3.28   +0.38   +0.09   202      +62%      -25%    5.19  [CALL]
+2026-04-17  silent     JPM     +9     8.39    +2.43   +2.38   +0.29   +0.28   153      +54%      -95%   -3.71  [CALL]
+2026-04-17  silent     MRNA    +5     4.90    +0.52   +2.59   +0.11   +0.53   334      +23%      -95%   -1.65  [CALL]
+2026-04-17  silent     MSFT    +5    13.28    +6.76   +4.13   +0.51   +0.31   115     +101%      -95%   -0.69  [CALL]
+2026-04-17  silent     SOFI    +6     1.27    +0.53   +0.21   +0.42   +0.17    75      +87%      -95%   -0.29  [CALL]
+2026-04-17  silent     TLT     +9     0.80    +0.16   +0.16   +0.20   +0.20   186      +28%      -95%    0.01  [CALL]
+2026-04-20  afternoon  SPY     +6     6.57    +1.16   +0.38   +0.18   +0.06   179      +25%      +13%    1.04  [CALL]
+2026-04-20  silent     AVGO    +6    16.84    +0.66   +9.86   +0.04   +0.59     0      +10%      -95%   -6.36  [CALL]
+2026-04-20  silent     GOOGL   +6    11.40    +0.64   +4.14   +0.06   +0.36     0      +14%      -95%   -0.83  [CALL]
+2026-04-20  silent     META    +6    24.28    +2.02  +13.36   +0.08   +0.55     0      +20%      -95%   -9.91  [CALL]
+2026-04-20  silent     TSLA    +6    24.52    +4.22  +14.25   +0.17   +0.58     0      +42%      -95%  -11.57  [CALL]
+2026-04-21  morning    QQQ     +6     8.55    +1.79   +6.20   +0.21   +0.73    47      +44%      -95%   -5.27  [CALL]
+2026-04-22  afternoon  QQQ     +5     8.22    +3.10   -0.00   +0.38   -0.00   174      +64%      +56%    0.79  [CALL]
+2026-04-22  afternoon  SPY     +5     6.28    +2.54   +0.02   +0.40   +0.00   179      +69%      +60%    0.79  [CALL]
+2026-04-22  morning    QQQ     +6     9.55    +5.18   +1.63   +0.54   +0.17   384      +65%      +33%    3.94  [CALL]
+2026-04-22  silent     GOOGL   +5    10.70    +2.75   +1.90   +0.26   +0.18   381      +35%      -41%    3.22  [CALL]
+
+--- PIN detail (n=18) ---
+date       session     ticker  em_1sd  peakUp  peakDn   pk/EM  fin/EM  brch_min  closed_in  breach  recon_in1s
+--------------------------------------------------------------------------------------------------------------
+2026-03-19  afternoon  QQQ     10.18    5.60    1.83  +0.55   +0.27     --       YES       no      TRUE 
+2026-03-19  manual     SPY      9.67    6.01    1.80  +0.62   +0.29     --       YES       no      TRUE 
+2026-03-19  morning    SPY     10.64    6.01    1.80  +0.56   +0.26     --       YES       no      TRUE 
+2026-03-20  manual     META     9.74    0.80   15.91  +1.63   +0.97      31      YES       YES     TRUE 
+2026-03-20  manual     SPY      6.34    0.18   11.79  +1.86   +1.26     288      no        YES     TRUE 
+2026-03-20  morning    SPY      9.15    0.18   11.79  +1.29   +0.87     341      YES       YES     TRUE 
+2026-03-24  afternoon  QQQ      9.73    1.59    2.86  +0.29   +0.16     --       YES       no      TRUE 
+2026-03-24  manual     QQQ     10.90    3.12    2.88  +0.29   +0.08     --       YES       no      TRUE 
+2026-03-24  manual     SPY     11.50    5.71    1.44  +0.50   +0.16     --       YES       no      TRUE 
+2026-03-25  afternoon  QQQ      9.26    1.71    2.60  +0.28   +0.12     --       YES       no      TRUE 
+2026-03-26  afternoon  SPY     11.15    0.46    4.82  +0.43   +0.41     --       YES       no      TRUE 
+2026-03-26  morning    SPY     11.75    2.80    7.23  +0.62   +0.59     --       YES       no      TRUE 
+2026-03-27  afternoon  QQQ      8.48    1.31    4.88  +0.58   +0.47     --       YES       no      TRUE 
+2026-03-27  morning    SPY     12.98    0.13    9.42  +0.73   +0.65     --       YES       no      TRUE 
+2026-03-30  afternoon  QQQ     10.21    0.45    6.36  +0.62   +0.36     --       YES       no      TRUE 
+2026-04-01  afternoon  SPY     10.85    0.70    4.15  +0.38   +0.24     --       YES       no      TRUE 
+2026-04-02  morning    QQQ     13.35   12.08    2.05  +0.90   +0.83     --       YES       no      TRUE 
+2026-04-17  silent     LLY     38.54   12.19    0.00  +0.32   +0.24     --       YES       no      TRUE 
+
+==============================================================================
+Notes
+==============================================================================
+- Option P&L model: ATM 0DTE, premium ≈ 0.4*em_1sd, intrinsic + bell-curve
+  time value decaying with sqrt(t_left/390). Does NOT account for bid-ask, IV crush,
+  or skew. Use for relative comparison across buckets, not absolute fills.
+- MFE/MAE use intraday high/low within the CT session window.
+- Session entry times (CT): morning=08:30, afternoon=12:00, manual/silent/session=08:30.
+- If every MEGA/TRAP row in the sample is bullish (bias>0), that's a sample artifact,
+  not a script limitation. The logic handles negative-bias (PUT) signals as well.
+- Done.

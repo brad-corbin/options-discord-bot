@@ -1,0 +1,1206 @@
+LAUNCH SCANNER — PER-DIRECTION SPLIT (fast $3+ moves)
+==============================================================================
+Windows: [10, 15, 30, 60, 120]
+Bar CSVs to scan: 76
+Launches found:  UP=175  DOWN=190  TOTAL=365
+Baseline non-launch bars sampled: 444
+
+==============================================================================
+FEATURE FIRING RATES — by group
+==============================================================================
+Columns: feature firing rate in [UP launches] vs [DOWN launches] vs [BASELINE].
+What matters: does the feature fire MUCH MORE in one launch direction than
+both (a) the other direction AND (b) the baseline? That's a real trigger.
+
+— Bar shape (directional) —
+  (UP checks = bull bar / break high; DOWN checks = bear bar / break low)
+  bar is in launch direction                  UP:  65/175 (  37%, lift  -10pp)   DOWN:  63/190 (  33%, lift  -18pp)
+  strong body (>=70%) in launch direction     UP:  14/175 (   8%, lift   -5pp)   DOWN:  11/190 (   6%, lift   -7pp)
+
+— Breaks (directional) —
+  break of 5-bar range (high for UP, low for DOWN)  UP:  56/175 (  32%, lift  +19pp)   DOWN:  32/190 (  17%, lift   +1pp)
+  break of 15-bar range                       UP:  44/175 (  25%, lift  +18pp)   DOWN:  25/190 (  13%, lift   +5pp)
+  break of 30-bar range                       UP:  39/175 (  22%, lift  +17pp)   DOWN:  23/190 (  12%, lift   +7pp)
+
+— VWAP alignment —
+  price on launch side of VWAP (above/below)  UP:  86/175 (  49%, lift   -9pp)   DOWN:  74/190 (  39%, lift   -3pp)
+
+— Volume (direction-agnostic) —
+  vol_ratio_10 >= 1.5x                        UP:  23/175 (  13%, lift   -2pp)   DOWN:  41/190 (  22%, lift   +6pp)
+  vol_ratio_10 >= 2.0x                        UP:   6/175 (   3%, lift   -2pp)   DOWN:  14/190 (   7%, lift   +2pp)
+  vol_ratio_20 >= 1.5x                        UP:  22/175 (  13%, lift   -0pp)   DOWN:  38/190 (  20%, lift   +7pp)
+  vol_ratio_20 >= 2.0x                        UP:   6/175 (   3%, lift   -2pp)   DOWN:  12/190 (   6%, lift   +1pp)
+
+— Drift direction (was price already moving in launch direction?) —
+  prior 5-min drift in launch direction       UP:  61/175 (  35%, lift  -15pp)   DOWN:  66/190 (  35%, lift  -15pp)
+  prior 10-min drift in launch direction      UP:  56/175 (  32%, lift  -18pp)   DOWN:  66/190 (  35%, lift  -15pp)
+
+==============================================================================
+CONJUNCTION RULES — directional combinations
+==============================================================================
+A useful alert rule fires on >=50% of launches in its direction but <20% of baseline.
+
+  bar-in-direction AND break of 5-bar range
+    UP:    33/175 (  19%)  vs baseline   12%  lift +6pp
+    DOWN:  26/190 (  14%)  vs baseline   16%  lift -2pp
+  bar-in-direction AND break of 5-bar range AND vol_ratio_10 >= 1.5x
+    UP:     9/175 (   5%)  vs baseline    3%  lift +2pp
+    DOWN:   5/190 (   3%)  vs baseline    5%  lift -2pp
+  strong body in direction AND break of 15-bar range
+    UP:     6/175 (   3%)  vs baseline    3%  lift +0pp
+    DOWN:   4/190 (   2%)  vs baseline    4%  lift -2pp
+  VWAP-aligned AND break of 15-bar range
+    UP:    22/175 (  13%)  vs baseline    6%  lift +7pp
+    DOWN:  16/190 (   8%)  vs baseline    5%  lift +3pp
+  VWAP-aligned AND strong body in direction AND vol >= 1.5x
+    UP:     3/175 (   2%)  vs baseline    1%  lift +0pp
+    DOWN:   1/190 (   1%)  vs baseline    2%  lift -1pp
+
+==============================================================================
+BIAS SCORE AT LAUNCH TIME — UP vs DOWN
+==============================================================================
+Does positive bias precede UP launches? Does negative bias precede DOWN?
+Bias source: recon.tsv bias field (signed, matched by ticker+date+session).
+
+  UP launches: n=175  mean=+4.40  median=+5.0
+    bias > 0:  148  (  85%)
+    bias == 0:   7  (   4%)
+    bias < 0:   20  (  11%)
+  DOWN launches: n=190  mean=+2.99  median=+3.0
+    bias > 0:  130  (  68%)
+    bias == 0:  15  (   8%)
+    bias < 0:   45  (  24%)
+  BASELINE bars: n=444  mean=+5.25  median=+6.0
+    bias > 0:  407  (  92%)
+    bias == 0:   4  (   1%)
+    bias < 0:   33  (   7%)
+
+— Launch direction matches bias-score sign? —
+    UP launch + bias > 0  (aligned):     148/175  (  85%)
+    UP launch + bias < 0  (contrarian):   20/175  (  11%)
+    DOWN launch + bias < 0 (aligned):     45/190  (  24%)
+    DOWN launch + bias > 0 (contrarian): 130/190  (  68%)
+
+— Bigger move → bigger |bias|? —
+    launches with |magnitude| >= $3: n=365  mean |bias|=4.30  median |bias|=5.0
+    launches with |magnitude| >= $5: n=48  mean |bias|=4.42  median |bias|=5.0
+    launches with |magnitude| >= $8: n=6  mean |bias|=5.50  median |bias|=6.0
+
+==============================================================================
+THESIS REGIME AT LAUNCH TIME — UP vs DOWN
+==============================================================================
+  regime                              UP %    DOWN %   BASELINE %   UP lift   DOWN lift
+  --------------------------------------------------------------------------------
+  (blank)                               0%        5%           3%       -3pp         +2pp
+  MODERATE PIN                         10%       17%           2%       +8pp        +15pp
+  MODERATE TREND                        0%        1%           0%       -0pp         +0pp
+  STRONG PIN                           20%       30%          12%       +8pp        +18pp
+  STRONG TREND / EXPLOSIVE             70%       48%          82%      -12pp        -34pp
+
+==============================================================================
+PIN-REGIME + VOLUME CONJUNCTIONS  (user hypothesis: pin + volume = alert)
+==============================================================================
+  STRONG PIN + vol_ratio_10 >= 1.5x
+    UP:     4/175 (   2%)  vs baseline    3%  lift -0pp
+    DOWN:  12/190 (   6%)  vs baseline    3%  lift +4pp
+  STRONG PIN + vol_ratio_10 >= 2.0x
+    UP:     1/175 (   1%)  vs baseline    1%  lift -0pp
+    DOWN:   6/190 (   3%)  vs baseline    1%  lift +2pp
+  ANY PIN regime + vol_ratio_10 >= 1.5x
+    UP:     8/175 (   5%)  vs baseline    3%  lift +2pp
+    DOWN:  17/190 (   9%)  vs baseline    3%  lift +6pp
+  ANY PIN regime + vol_ratio_10 >= 2.0x
+    UP:     1/175 (   1%)  vs baseline    1%  lift -0pp
+    DOWN:   7/190 (   4%)  vs baseline    1%  lift +3pp
+  STRONG TREND / EXPLOSIVE + vol_ratio_10 >= 1.5x
+    UP:    15/175 (   9%)  vs baseline   12%  lift -4pp
+    DOWN:  20/190 (  11%)  vs baseline   12%  lift -2pp
+  STRONG TREND / EXPLOSIVE + vol_ratio_10 >= 2.0x
+    UP:     5/175 (   3%)  vs baseline    4%  lift -1pp
+    DOWN:   5/190 (   3%)  vs baseline    4%  lift -1pp
+
+==============================================================================
+MOVE MAGNITUDE BY REGIME
+==============================================================================
+  STRONG TREND / EXPLOSIVE        n=213  mean=$3.99  median=$3.44  max=$12.61
+  STRONG PIN                      n= 92  mean=$3.95  median=$3.46  max=$ 9.66
+  MODERATE PIN                    n= 50  mean=$3.73  median=$3.49  max=$ 5.74
+  (blank)                         n=  9  mean=$3.36  median=$3.10  max=$ 4.56
+  MODERATE TREND                  n=  1  mean=$3.04  median=$3.04  max=$ 3.04
+
+==============================================================================
+HOW TO READ
+==============================================================================
+- A TRIGGER exists if a feature fires on >=50% of one-direction launches AND
+  lift over baseline is >= +15 percentage points.
+- If UP and DOWN baseline rates are very different (e.g. price above VWAP 60%
+  of bars overall vs below 40%), that's market drift bias — subtract it out
+  using the 'lift' column, not the raw rate.
+- Conjunction rules are stricter but cleaner alerts. A conjunction that fires
+  on 40% of UP launches but only 5% of baseline bars is a usable alert even
+  though its raw rate isn't majority.
+- Done.
+
+AFTERNOON THESIS → NEXT-MORNING FIRST-60-MIN STUDY
+==============================================================================
+Trade: buy 1-DTE ATM option at 2:45 CT (afternoon thesis time),
+       sell within the first 60 minutes of the next trading day.
+Bar files available: 76
+Afternoon theses total: 44
+Directional setups with valid bars: 37
+Skipped (neutral bias):              5
+Skipped (no next-day bars):          2
+
+==============================================================================
+HEADLINE — HIT RATES (first 60 min of next trading day)
+==============================================================================
+
+-- Favorable move measured FROM THESIS SPOT (includes overnight gap) --
+  peak favorable >= $1.00 (from thesis spot)               24/37  ( 64.9%)  ################################
+  peak favorable >= $2.00 (from thesis spot)               19/37  ( 51.4%)  #########################
+  peak favorable >= $3.00 (from thesis spot)               18/37  ( 48.6%)  ########################
+  peak favorable >= $5.00 (from thesis spot)               14/37  ( 37.8%)  ##################
+  closed GREEN at 09:30 (from thesis spot)                 23/37  ( 62.2%)  ###############################
+  overnight gap in thesis direction                        22/37  ( 59.5%)  #############################
+
+-- Favorable move measured FROM D+1 OPEN (intraday only, excludes gap) --
+  intraday peak >= $1.00 (from D+1 open)                   29/37  ( 78.4%)  #######################################
+  intraday peak >= $2.00 (from D+1 open)                   18/37  ( 48.6%)  ########################
+  intraday peak >= $3.00 (from D+1 open)                    6/37  ( 16.2%)  ########
+
+==============================================================================
+SIMULATED 1-DTE OPTION P&L (premium = 0.4 * em_1sd at buy)
+==============================================================================
+  Peak P&L (%)  — best exit         n=37  mean=+118.6%  med= +54.9%  min= -37.5%  max=+782.7%
+  Final P&L (%) — held to 09:30     n=37  mean= +90.6%  med= +31.3%  min= -50.0%  max=+760.1%
+  Peak >= +50%:   19/37
+  Peak >= +100%:  15/37
+  Final > 0%:     20/37
+  Final <= -50%:  14/37
+
+==============================================================================
+STRATIFIED — hit rate of peak_fav_from_thesis >= $3 by thesis feature
+==============================================================================
+(Baseline across all setups shown first; compare subgroups to that.)
+  BASELINE                              n= 37   hit= 18  (48.6%)
+
+  -- by v4_regime --
+    MODERATE PIN                  n=  4   $3+ hit=  2/4   ( 50.0%)   peak_fav med=$+0.62   peak opt P&L med= +18.0%
+    MODERATE TREND                n=  4   $3+ hit=  1/4   ( 25.0%)   peak_fav med=$-0.30   peak opt P&L med= -20.8%
+    STRONG PIN                    n= 11   $3+ hit=  4/11  ( 36.4%)   peak_fav med=$+0.22   peak opt P&L med= -31.5%
+    STRONG TREND / EXPLOSIVE      n= 18   $3+ hit= 11/18  ( 61.1%)   peak_fav med=$+4.67   peak opt P&L med=+108.5%
+
+  -- by v4_conf_label --
+    HIGH                          n= 29   $3+ hit= 14/29  ( 48.3%)   peak_fav med=$+1.65   peak opt P&L med= +23.4%
+    MODERATE                      n=  8   $3+ hit=  4/8   ( 50.0%)   peak_fav med=$+3.00   peak opt P&L med= +73.1%
+
+  -- by direction+|bias| --
+    bias=+1                       n=  5   $3+ hit=  3/5   ( 60.0%)   peak_fav med=$+4.09   peak opt P&L med= +73.4%
+    bias=+2                       n=  1   $3+ hit=  1/1   (100.0%)   peak_fav med=$+4.07   peak opt P&L med=+106.6%
+    bias=+3                       n=  1   $3+ hit=  0/1   (  0.0%)   peak_fav med=$+2.97   peak opt P&L med= +87.7%
+    bias=+4                       n=  4   $3+ hit=  4/4   (100.0%)   peak_fav med=$+11.87   peak opt P&L med=+332.0%
+    bias=+5                       n=  3   $3+ hit=  1/3   ( 33.3%)   peak_fav med=$+1.63   peak opt P&L med= +23.4%
+    bias=+6                       n=  6   $3+ hit=  4/6   ( 66.7%)   peak_fav med=$+6.48   peak opt P&L med=+213.0%
+    bias=+7                       n=  2   $3+ hit=  0/2   (  0.0%)   peak_fav med=$-1.12   peak opt P&L med= -19.9%
+    bias=+8                       n=  1   $3+ hit=  1/1   (100.0%)   peak_fav med=$+3.15   peak opt P&L med= +54.9%
+    bias=-1                       n=  4   $3+ hit=  1/4   ( 25.0%)   peak_fav med=$-0.37   peak opt P&L med= -29.3%
+    bias=-2                       n=  6   $3+ hit=  2/6   ( 33.3%)   peak_fav med=$+0.69   peak opt P&L med= -17.8%
+    bias=-3                       n=  4   $3+ hit=  1/4   ( 25.0%)   peak_fav med=$-4.77   peak opt P&L med= -37.5%
+
+  -- by |bias_score| --
+    |bias|=1                      n=  9   $3+ hit=  4/9   ( 44.4%)   peak_fav med=$+1.19   peak opt P&L med=  +0.4%
+    |bias|=2                      n=  7   $3+ hit=  3/7   ( 42.9%)   peak_fav med=$+1.15   peak opt P&L med=  -4.1%
+    |bias|=3                      n=  5   $3+ hit=  1/5   ( 20.0%)   peak_fav med=$-1.13   peak opt P&L med= -37.5%
+    |bias|=4                      n=  4   $3+ hit=  4/4   (100.0%)   peak_fav med=$+11.87   peak opt P&L med=+332.0%
+    |bias|=5                      n=  3   $3+ hit=  1/3   ( 33.3%)   peak_fav med=$+1.63   peak opt P&L med= +23.4%
+    |bias|=6                      n=  6   $3+ hit=  4/6   ( 66.7%)   peak_fav med=$+6.48   peak opt P&L med=+213.0%
+    |bias|=7                      n=  2   $3+ hit=  0/2   (  0.0%)   peak_fav med=$-1.12   peak opt P&L med= -19.9%
+    |bias|=8                      n=  1   $3+ hit=  1/1   (100.0%)   peak_fav med=$+3.15   peak opt P&L med= +54.9%
+
+  -- by structure_confluence --
+    sc=2                          n= 37   $3+ hit= 18/37  ( 48.6%)   peak_fav med=$+2.97   peak opt P&L med= +54.9%
+
+  -- by cagf_direction --
+    DOWNSIDE                      n=  2   $3+ hit=  0/2   (  0.0%)   peak_fav med=$-3.63   peak opt P&L med= -20.8%
+    NEUTRAL                       n=  5   $3+ hit=  2/5   ( 40.0%)   peak_fav med=$+2.97   peak opt P&L med= +87.7%
+    STRONG UPSIDE                 n= 15   $3+ hit=  9/15  ( 60.0%)   peak_fav med=$+6.19   peak opt P&L med=+129.3%
+    UPSIDE                        n= 15   $3+ hit=  7/15  ( 46.7%)   peak_fav med=$+1.35   peak opt P&L med=  +4.8%
+
+==============================================================================
+TIME-TO-PEAK DISTRIBUTION (minutes into session where peak hit)
+==============================================================================
+  min  0-14  n= 11  ###########
+  min 15-29  n=  6  ######
+  min 30-44  n=  7  #######
+  min 45-59  n=  8  ########
+  min 60-74  n=  5  #####
+
+==============================================================================
+PER-SETUP DETAIL
+==============================================================================
+thesis_dt  ->next     tk   bias conf   regime                       gap  peakF  peakA final60 t2pk opt_pk% opt_fi%
+------------------------------------------------------------------------------------------------------------------
+2026-04-10 2026-04-15 SPY    +4 MODERA STRONG TREND / EXPLOSIVE   $+16.1 $+17.9 $+15.0 $ +17.7   60   +783%   +760%
+2026-04-06 2026-04-09 QQQ    +5 HIGH   STRONG TREND / EXPLOSIVE   $+18.0 $+18.8 $+15.2 $ +15.5   15   +487%   +384%
+2026-04-06 2026-04-09 SPY    +6 HIGH   STRONG TREND / EXPLOSIVE   $+16.7 $+17.7 $+15.8 $ +16.2   13   +476%   +421%
+2026-04-13 2026-04-15 QQQ    +6 HIGH   STRONG TREND / EXPLOSIVE   $+13.5 $+16.3 $+12.7 $ +16.2   60   +456%   +440%
+2026-04-15 2026-04-17 SPY    +6 MODERA STRONG TREND / EXPLOSIVE   $+6.6 $ +9.9 $ +6.2 $  +9.7   56   +367%   +347%
+2026-04-13 2026-04-15 SPY    +4 HIGH   STRONG TREND / EXPLOSIVE   $+11.1 $+12.9 $+10.0 $ +12.7   60   +362%   +342%
+2026-04-15 2026-04-17 QQQ    +4 HIGH   STRONG TREND / EXPLOSIVE   $+8.9 $+10.9 $ +7.4 $ +10.3   41   +302%   +271%
+2026-04-07 2026-04-09 SPY    +1 MODERA MODERATE PIN               $+18.6 $+19.5 $+17.7 $ +18.1   13   +276%   +240%
+2026-03-19 2026-03-20 SPY    -2 HIGH   STRONG PIN                 $+3.7 $ +8.7 $ +3.5 $  +7.7   44   +187%   +149%
+2026-03-23 2026-03-24 QQQ    -2 HIGH   STRONG PIN                 $+5.4 $ +8.3 $ +3.9 $  +6.4   22   +165%   +107%
+2026-03-31 2026-04-01 QQQ    +1 HIGH   STRONG TREND / EXPLOSIVE   $+4.7 $ +7.6 $ +3.6 $  +7.5   52   +162%   +147%
+2026-03-26 2026-03-27 QQQ    -3 HIGH   STRONG PIN                 $+4.1 $ +8.8 $ +3.9 $  +8.3   30   +150%   +126%
+2026-03-25 2026-03-26 QQQ    -1 HIGH   STRONG PIN                 $+4.7 $ +6.9 $ +2.7 $  +4.0    9   +148%    +58%
+2026-03-31 2026-04-01 SPY    +4 HIGH   STRONG TREND / EXPLOSIVE   $+4.0 $ +6.2 $ +3.1 $  +5.5    9   +129%    +98%
+2026-04-14 2026-04-15 QQQ    +2 HIGH   MODERATE TREND             $+1.3 $ +4.1 $ +0.4 $  +4.0   60   +107%    +91%
+2026-04-14 2026-04-15 SPY    +3 MODERA STRONG TREND / EXPLOSIVE   $+1.2 $ +3.0 $ +0.1 $  +2.8   60    +88%    +66%
+2026-04-20 2026-04-21 QQQ    +1 HIGH   MODERATE PIN               $+2.3 $ +4.1 $ -0.1 $  +3.1   47    +73%    +35%
+2026-04-20 2026-04-22 SPY    +6 MODERA STRONG TREND / EXPLOSIVE   $+1.5 $ +3.0 $ +0.5 $  +2.6   52    +59%    +32%
+2026-04-09 2026-04-10 QQQ    +8 HIGH   STRONG TREND / EXPLOSIVE   $+1.9 $ +3.1 $ +0.7 $  +2.8    3    +55%    +31%
+2026-04-09 2026-04-10 SPY    +5 HIGH   STRONG TREND / EXPLOSIVE   $+1.0 $ +1.6 $ -0.3 $  +1.5    1    +23%     +5%
+2026-04-10 2026-04-13 QQQ    +5 HIGH   STRONG TREND / EXPLOSIVE   $-1.4 $ +1.4 $ -2.8 $  +0.4   37     +5%    -37%
+2026-04-08 2026-04-09 SPY    +1 MODERA STRONG TREND / EXPLOSIVE   $+0.2 $ +1.2 $ -0.7 $  -0.3   13     +0%    -50%
+2026-04-17 2026-04-21 QQQ    +7 HIGH   STRONG TREND / EXPLOSIVE   $-0.1 $ +1.7 $ -2.5 $  +0.7   47     -2%    -35%
+2026-04-08 2026-04-09 QQQ    -2 HIGH   MODERATE TREND             $-1.7 $ +1.1 $ -2.4 $  +0.8   57     -4%    -26%
+2026-04-01 2026-04-06 SPY    -1 HIGH   STRONG PIN                 $+0.4 $ +0.7 $ -3.5 $  -2.6    7    -21%    -50%
+2026-03-27 2026-03-30 SPY    -2 HIGH   STRONG PIN                 $-5.2 $ +0.2 $ -5.5 $  -1.3   28    -31%    -50%
+2026-03-20 2026-03-23 QQQ    -3 HIGH   STRONG PIN                 $-9.9 $ -8.4 $-14.5 $ -12.7    0    -38%    -50%
+2026-03-20 2026-03-24 SPY    -1 HIGH   MODERATE PIN               $-4.3 $ -2.9 $ -6.6 $  -5.7   12    -38%    -50%
+2026-03-30 2026-04-01 SPY    -3 HIGH   STRONG PIN                 $-24.5 $-23.7 $-26.7 $ -26.0   19    -38%    -50%
+2026-04-17 2026-04-20 SPY    +6 MODERA STRONG TREND / EXPLOSIVE   $-1.5 $ -0.3 $ -2.0 $  -1.4   26    -38%    -50%
+2026-04-21 2026-04-22 SPY    -2 MODERA MODERATE PIN               $-6.2 $ -5.3 $ -7.7 $  -7.3    5    -38%    -50%
+2026-04-21 2026-04-22 QQQ    -2 HIGH   STRONG PIN                 $-7.5 $ -5.9 $-10.3 $  -9.9   21    -38%    -50%
+2026-03-23 2026-03-24 SPY    +7 HIGH   MODERATE TREND             $-6.1 $ -3.9 $ -7.6 $  -4.7   40    -38%    -50%
+2026-03-24 2026-03-25 SPY    -3 HIGH   STRONG PIN                 $-4.1 $ -1.1 $ -6.3 $  -3.5   30    -38%    -50%
+2026-03-24 2026-03-25 QQQ    -1 HIGH   STRONG PIN                 $-3.9 $ -1.4 $ -6.1 $  -4.9   30    -38%    -50%
+2026-03-25 2026-03-26 SPY    +6 HIGH   MODERATE TREND             $-4.5 $ -1.7 $ -5.9 $  -2.6   45    -38%    -50%
+2026-04-01 2026-04-02 QQQ    +1 HIGH   STRONG TREND / EXPLOSIVE   $-11.1 $ -3.0 $-13.1 $  -6.4   46    -38%    -50%
+
+==============================================================================
+HOW TO READ
+==============================================================================
+- peak_fav_from_thesis = max favorable move from 2:45 thesis spot to peak in
+  first 60 min of D+1 (includes overnight gap). This is what the 1-DTE option
+  captures if held from 2:45 CT to next-morning peak.
+- Compare HIT RATES across subgroups — where does the $3+ hit rate exceed
+  baseline significantly? Those are high-EV setups for this trade.
+- SMALL SAMPLE WARNING: n~40 total, subgroups may have n=5-15.
+  Anything with n<8 is directional only — confirm with more data before trusting.
+- Trade is only viable if peak_fav >= ~$2 AND opt_pk% is meaningfully positive,
+  because you lose ~25% to overnight theta plus bid-ask slippage on entry/exit.
+render@srv-d6j49cntskes738e202g-747f6dbcd4-5g7tt:~/project/src$ 
+
+LAUNCH SCANNER — fast $3+ moves within [10, 15, 30, 60, 120] min
+==============================================================================
+For each launch, profile the SETUP BAR (the bar right before the move).
+Goal: find the common trigger pattern across launches.
+
+Bar CSVs to scan: 76
+Total launches found: 365
+
+==============================================================================
+BREAKDOWN BY DIRECTION AND WINDOW
+==============================================================================
+  DOWN  within 10 min: 11
+  DOWN  within 15 min: 3
+  DOWN  within 30 min: 33
+  DOWN  within 60 min: 53
+  DOWN  within 120 min: 90
+  UP    within 10 min: 19
+  UP    within 15 min: 6
+  UP    within 30 min: 34
+  UP    within 60 min: 44
+  UP    within 120 min: 72
+
+==============================================================================
+BREAKDOWN BY TICKER
+==============================================================================
+  QQQ   : 114
+  SPY   :  80
+  META  :  33
+  TSLA  :  23
+  AVGO  :  20
+  MSFT  :  20
+  AAPL  :  10
+  CAT   :   9
+  GS    :   9
+  LLY   :   9
+  GOOGL :   6
+  ARM   :   5
+  NVDA  :   5
+  AMD   :   4
+  BA    :   4
+  CRM   :   4
+  JPM   :   4
+  NFLX  :   2
+  AMZN  :   1
+  GLD   :   1
+  PLTR  :   1
+  UNH   :   1
+
+==============================================================================
+TIME OF DAY — minutes since 08:30 CT open, 30-min buckets
+==============================================================================
+  min   0-29   n= 65  ############################################################
+  min  30-59   n= 50  ##################################################
+  min  60-89   n= 45  #############################################
+  min  90-119  n= 37  #####################################
+  min 120-149  n= 34  ##################################
+  min 150-179  n= 33  #################################
+  min 180-209  n= 33  #################################
+  min 210-239  n= 33  #################################
+  min 240-269  n= 35  ###################################
+
+==============================================================================
+TRIGGER PATTERNS — how often does each feature fire AT the setup bar?
+==============================================================================
+(Compare to ~50% baseline for binary coin-flip features.)
+
+— Bar shape —
+  body_pct >= 0.70 (strong body)             96/365  ( 26.3%)  #############
+  bar is bullish (close > open)             192/365  ( 52.6%)  ##########################
+  bar is bearish (close < open)             172/365  ( 47.1%)  #######################
+  upper wick >= 40% of range                 86/365  ( 23.6%)  ###########
+  lower wick >= 40% of range                 82/365  ( 22.5%)  ###########
+— Volume / range —
+  vol_ratio_10 (last 10min) >= 1.5x          64/365  ( 17.5%)  ########
+  vol_ratio_10 (last 10min) >= 2.0x          20/365  (  5.5%)  ##
+  vol_ratio_20 (last 20min) >= 1.5x          60/365  ( 16.4%)  ########
+  vol_ratio_20 (last 20min) >= 2.0x          18/365  (  4.9%)  ##
+  vol_ratio_20 (last 20min) >= 3.0x           5/365  (  1.4%)  
+  range_ratio_20 >= 1.5x                     46/365  ( 12.6%)  ######
+  range_ratio_20 >= 2.0x                     13/365  (  3.6%)  #
+— Breaks —
+  break high of last 5 bars                  77/365  ( 21.1%)  ##########
+  break high of last 15 bars                 54/365  ( 14.8%)  #######
+  break high of last 30 bars                 32/365  (  8.8%)  ####
+  break low of last 5 bars                   48/365  ( 13.2%)  ######
+  break low of last 15 bars                  32/365  (  8.8%)  ####
+  break low of last 30 bars                  22/365  (  6.0%)  ###
+— VWAP —
+  above session VWAP                        202/365  ( 55.3%)  ###########################
+  below session VWAP                        163/365  ( 44.7%)  ######################
+— Directional alignment (bar direction matches launch direction) —
+  setup-bar direction matches launch direction       128/365  ( 35.1%)
+
+— UP launches — setup-bar features —
+  (n=175)
+    break high of last 5 bars                    22/175  ( 12.6%)
+    break high of last 15 bars                   10/175  (  5.7%)
+    break high of last 30 bars                    5/175  (  2.9%)
+    above VWAP                                   86/175  ( 49.1%)
+    vol_ratio >= 1.5x                            22/175  ( 12.6%)
+    bull bar (close > open)                      65/175  ( 37.1%)
+    strong body (body >= 70% of range)           40/175  ( 22.9%)
+
+— DOWN launches — setup-bar features —
+  (n=190)
+    break low of last 5 bars                     18/190  (  9.5%)
+    break low of last 15 bars                    11/190  (  5.8%)
+    break low of last 30 bars                     9/190  (  4.7%)
+    below VWAP                                   74/190  ( 38.9%)
+    vol_ratio >= 1.5x                            38/190  ( 20.0%)
+    bear bar (close < open)                      63/190  ( 33.2%)
+    strong body (body >= 70% of range)           56/190  ( 29.5%)
+
+==============================================================================
+THESIS CONTEXT AT LAUNCH TIME
+==============================================================================
+— v4_regime —
+    STRONG TREND / EXPLOSIVE        213  ( 58.4%)
+    STRONG PIN                       92  ( 25.2%)
+    MODERATE PIN                     50  ( 13.7%)
+    (blank)                           9  (  2.5%)
+    MODERATE TREND                    1  (  0.3%)
+— v4_conf_label —
+    HIGH                            287  ( 78.6%)
+    MODERATE                         69  ( 18.9%)
+    (blank)                           9  (  2.5%)
+— cagf_direction —
+    (blank)                         188  ( 51.5%)
+    STRONG UPSIDE                    75  ( 20.5%)
+    UPSIDE                           65  ( 17.8%)
+    NEUTRAL                          19  (  5.2%)
+    DOWNSIDE                          8  (  2.2%)
+    1                                 5  (  1.4%)
+    TRENDING                          5  (  1.4%)
+— cagf_regime —
+    MODERATE TREND                  157  ( 43.0%)
+    TRENDING                         92  ( 25.2%)
+    SUPPRESSING                      73  ( 20.0%)
+    (blank)                          23  (  6.3%)
+    MODERATE PIN                     13  (  3.6%)
+    1                                 5  (  1.4%)
+    NEUTRAL                           2  (  0.5%)
+— structure_confluence —
+    2                               306  ( 83.8%)
+    1                                40  ( 11.0%)
+    0                                10  (  2.7%)
+    (blank)                           9  (  2.5%)
+— |bias_score| at launch —
+    |bias|=0    34  (  9.3%)
+    |bias|=1    61  ( 16.7%)
+    |bias|=2    44  ( 12.1%)
+    |bias|=3    18  (  4.9%)
+    |bias|=4    27  (  7.4%)
+    |bias|=5    30  (  8.2%)
+    |bias|=6    64  ( 17.5%)
+    |bias|=7    36  (  9.9%)
+    |bias|=8    25  (  6.8%)
+    |bias|=9    23  (  6.3%)
+    |bias|=10    3  (  0.8%)
+
+==============================================================================
+PER-LAUNCH DETAIL (365 launches)
+==============================================================================
+date       ticker ts       dir    mag   W bias regime                     body%  volx brk5 brk15  vwap
+------------------------------------------------------------------------------------------------------
+2026-04-17 TSLA   09:00    UP   $12.6  60   +7 STRONG TREND / EXPLOSIVE     84%  0.8x    -     -   BLW
+2026-04-20 TSLA   12:17    UP   $10.7 120   +6 STRONG TREND / EXPLOSIVE     69%  0.8x    -     -   BLW
+2026-04-17 LLY    08:30    UP   $ 9.7  10   +1 STRONG PIN                  100%  1.0x    -     -   ABV
+2026-04-20 TSLA   12:47    UP   $ 9.6 120   +6 STRONG TREND / EXPLOSIVE     12%  0.7x    -     -   BLW
+2026-04-22 AVGO   08:30    UP   $ 9.1 120   +7 STRONG TREND / EXPLOSIVE     21%  1.0x    -     -   BLW
+2026-04-20 META   08:30    DOWN $ 8.5  10   +6 STRONG TREND / EXPLOSIVE      3%  1.0x    -     -   BLW
+2026-04-20 TSLA   08:30    DOWN $ 7.8  10   +6 STRONG TREND / EXPLOSIVE     59%  1.0x    -     -   ABV
+2026-04-20 META   09:00    DOWN $ 7.5  60   +6 STRONG TREND / EXPLOSIVE     54%  1.4x    -     -   BLW
+2026-04-02 QQQ    09:30    UP   $ 7.5  10   +0 STRONG PIN                   58%  0.7x    -     -   ABV
+2026-04-17 TSLA   11:31    DOWN $ 7.4  60   +7 STRONG TREND / EXPLOSIVE     84%  0.9x    H     H   ABV
+2026-03-23 QQQ    09:30    DOWN $ 7.3 120   -3 STRONG PIN                   89%  0.7x    L     -   ABV
+2026-04-02 QQQ    08:30    UP   $ 7.3  60   +0 STRONG PIN                   67%  1.0x    -     -   ABV
+2026-04-17 GS     08:30    UP   $ 6.8  10   +6 STRONG TREND / EXPLOSIVE     40%  1.0x    -     -   ABV
+2026-04-17 CAT    10:00    UP   $ 6.8  60   +5 STRONG TREND / EXPLOSIVE      6%  0.8x    -     -   ABV
+2026-04-17 CAT    11:30    DOWN $ 6.8  60   +5 STRONG TREND / EXPLOSIVE     78%  0.9x    H     H   ABV
+2026-04-17 CAT    09:00    UP   $ 6.6  10   +5 STRONG TREND / EXPLOSIVE     80%  1.1x    H     H   ABV
+2026-04-15 AVGO   08:30    UP   $ 6.6  10   +9 STRONG TREND / EXPLOSIVE     36%  1.0x    -     -   BLW
+2026-04-17 CAT    10:30    UP   $ 6.5  30   +5 STRONG TREND / EXPLOSIVE      3%  0.5x    H     H   ABV
+2026-04-17 META   12:40    UP   $ 6.3 120   +6 STRONG TREND / EXPLOSIVE      0%  0.4x    -     -   ABV
+2026-03-23 QQQ    10:00    DOWN $ 6.0  60   -3 STRONG PIN                   45%  0.8x    -     -   ABV
+2026-04-15 MSFT   12:08    UP   $ 6.0 120   +9 STRONG TREND / EXPLOSIVE     55%  0.6x    -     -   ABV
+2026-03-23 QQQ    10:30    DOWN $ 5.9  30   -3 STRONG PIN                   33%  0.9x    -     -   ABV
+2026-03-19 SPY    12:31    UP   $ 5.8 120   -2 STRONG PIN                   41%  1.0x    -     -   BLW
+2026-03-26 QQQ    11:00    DOWN $ 5.7 120   -2 MODERATE PIN                  3%  0.9x    -     -   BLW
+2026-04-15 TSLA   11:00    DOWN $ 5.7 120   +7 STRONG TREND / EXPLOSIVE      9%  0.8x    -     -   ABV
+2026-04-17 LLY    10:32    DOWN $ 5.7 120   +1 STRONG PIN                    5%  0.5x    -     -   ABV
+2026-04-20 AVGO   08:30    DOWN $ 5.7  60   +6 STRONG TREND / EXPLOSIVE     56%  1.0x    -     -   BLW
+2026-04-15 MSFT   11:38    UP   $ 5.6 120   +9 STRONG TREND / EXPLOSIVE     50%  0.6x    -     -   ABV
+2026-04-17 GS     12:02    DOWN $ 5.6  30   +6 STRONG TREND / EXPLOSIVE     84%  1.0x    L     -   ABV
+2026-04-17 LLY    09:30    DOWN $ 5.5  60   +1 STRONG PIN                   32%  2.4x    -     -   ABV
+2026-04-17 TSLA   12:01    DOWN $ 5.5  30   +7 STRONG TREND / EXPLOSIVE     33%  1.1x    -     -   ABV
+2026-04-17 MSFT   11:30    DOWN $ 5.5  60   +5 STRONG TREND / EXPLOSIVE     58%  0.6x    H     H   ABV
+2026-03-20 META   12:31    DOWN $ 5.5 120   +1 STRONG PIN                   52%  1.0x    L     -   BLW
+2026-03-19 QQQ    12:31    UP   $ 5.5 120   +0 STRONG PIN                    5%  1.0x    -     -   ABV
+2026-03-20 SPY    12:03    DOWN $ 5.5 120   -1 MODERATE PIN                  7%  0.8x    -     -   BLW
+2026-04-22 AVGO   09:30    UP   $ 5.4  60   +7 STRONG TREND / EXPLOSIVE     15%  0.6x    -     -   ABV
+2026-04-17 MSFT   09:00    UP   $ 5.3  60   +5 STRONG TREND / EXPLOSIVE     67%  1.0x    -     -   ABV
+2026-03-24 SPY    08:30    UP   $ 5.3 120   +1 STRONG PIN                   20%  1.0x    -     -   ABV
+2026-04-17 TSLA   11:01    DOWN $ 5.3 120   +7 STRONG TREND / EXPLOSIVE     58%  0.7x    -     -   ABV
+2026-03-30 QQQ    10:45    DOWN $ 5.3 120   +4 STRONG TREND / EXPLOSIVE     62%  1.1x    -     -   ABV
+2026-04-17 AAPL   08:30    UP   $ 5.3 120   +6 STRONG TREND / EXPLOSIVE      9%  1.0x    -     -   BLW
+2026-04-17 GS     11:32    DOWN $ 5.3  60   +6 STRONG TREND / EXPLOSIVE    100%  2.1x    H     H   ABV
+2026-03-23 QQQ    09:00    DOWN $ 5.2 120   -3 STRONG PIN                   44%  1.0x    -     -   ABV
+2026-04-17 MSFT   12:30    UP   $ 5.2  30   +5 STRONG TREND / EXPLOSIVE     63%  1.3x    H     -   BLW
+2026-03-30 QQQ    12:45    DOWN $ 5.1 120   +0 STRONG PIN                   93%  0.8x    H     H   BLW
+2026-04-17 META   08:30    UP   $ 5.1  10   +6 STRONG TREND / EXPLOSIVE     35%  1.0x    -     -   BLW
+2026-03-30 SPY    10:35    DOWN $ 5.1 120   +2 MODERATE PIN                 72%  1.8x    H     H   ABV
+2026-03-26 SPY    11:00    DOWN $ 5.0 120   +0 MODERATE PIN                 13%  0.7x    -     -   BLW
+2026-04-09 SPY    10:02    UP   $ 4.9  60   +4 STRONG TREND / EXPLOSIVE     23%  0.9x    -     -   ABV
+2026-03-20 SPY    12:33    DOWN $ 4.9 120   -1 MODERATE PIN                 58%  2.2x    L     L   BLW
+2026-03-30 SPY    08:30    DOWN $ 4.9  30   +2 MODERATE PIN                 64%  1.0x    -     -   BLW
+2026-04-09 SPY    09:02    UP   $ 4.9 120   +4 STRONG TREND / EXPLOSIVE     35%  0.8x    -     -   ABV
+2026-04-17 LLY    09:00    UP   $ 4.9  30   +1 STRONG PIN                   57%  0.8x    H     -   ABV
+2026-04-15 AAPL   08:30    UP   $ 4.9 120   +6 STRONG TREND / EXPLOSIVE     81%  1.0x    -     -   ABV
+2026-04-09 QQQ    09:01    UP   $ 4.9 120   +4 STRONG TREND / EXPLOSIVE     26%  0.8x    -     -   BLW
+2026-04-15 META   10:03    UP   $ 4.8 120   +8 STRONG TREND / EXPLOSIVE     91%  1.0x    L     -   ABV
+2026-04-02 QQQ    09:00    UP   $ 4.8  30   +0 STRONG PIN                    5%  1.7x    -     -   ABV
+2026-04-01 QQQ    08:30    UP   $ 4.8 120   +6 STRONG TREND / EXPLOSIVE     10%  1.0x    -     -   ABV
+2026-04-15 TSLA   09:30    UP   $ 4.8  30   +7 STRONG TREND / EXPLOSIVE     86%  0.8x    H     -   ABV
+2026-04-20 TSLA   09:31    DOWN $ 4.8  60   +6 STRONG TREND / EXPLOSIVE     64%  1.6x    -     -   BLW
+2026-04-17 MSFT   11:00    DOWN $ 4.8 120   +5 STRONG TREND / EXPLOSIVE     60%  0.5x    L     -   ABV
+2026-04-20 META   10:02    UP   $ 4.7  60   +6 STRONG TREND / EXPLOSIVE     46%  0.7x    -     -   BLW
+2026-04-01 QQQ    11:48    DOWN $ 4.7 120   +6 STRONG TREND / EXPLOSIVE     93%  0.4x    -     -   ABV
+2026-03-30 QQQ    08:30    DOWN $ 4.7  30   +4 STRONG TREND / EXPLOSIVE     77%  1.0x    -     -   BLW
+2026-04-15 TSLA   12:30    UP   $ 4.7 120   +7 STRONG TREND / EXPLOSIVE     78%  1.4x    H     -   ABV
+2026-04-15 AAPL   09:00    UP   $ 4.6  60   +6 STRONG TREND / EXPLOSIVE     42%  0.8x    -     -   BLW
+2026-03-30 QQQ    12:15    DOWN $ 4.6 120   +0 STRONG PIN                   59%  1.3x    L     L   BLW
+2026-03-27 QQQ    10:47    DOWN $ 4.6 120   -1 MODERATE PIN                  8%  0.7x    -     -   ABV
+2026-04-17 GS     10:00    UP   $ 4.6  60   +6 STRONG TREND / EXPLOSIVE     74%  1.6x    L     L   ABV
+2026-04-17 TSLA   09:30    UP   $ 4.6  10   +7 STRONG TREND / EXPLOSIVE     79%  1.6x    H     H   ABV
+2026-03-18 SPY    12:53    DOWN $ 4.6 120   +0                              49%  0.3x    -     -   BLW
+2026-04-15 AVGO   11:02    DOWN $ 4.5  60   +9 STRONG TREND / EXPLOSIVE     70%  1.1x    H     H   BLW
+2026-04-17 LLY    11:02    DOWN $ 4.5  30   +1 STRONG PIN                   63%  3.0x    -     -   ABV
+2026-04-09 QQQ    10:01    UP   $ 4.5  60   +4 STRONG TREND / EXPLOSIVE     38%  1.5x    -     -   ABV
+2026-03-25 SPY    09:00    UP   $ 4.5  30   +2 MODERATE PIN                 52%  1.8x    L     L   BLW
+2026-03-27 SPY    10:47    DOWN $ 4.5 120   -2 MODERATE PIN                 11%  0.6x    -     -   ABV
+2026-04-17 CAT    08:30    UP   $ 4.5  10   +5 STRONG TREND / EXPLOSIVE     31%  1.0x    -     -   ABV
+2026-03-25 QQQ    09:30    DOWN $ 4.5  60   -2 STRONG PIN                   11%  1.2x    -     -   ABV
+2026-04-15 META   11:33    DOWN $ 4.5 120   +8 STRONG TREND / EXPLOSIVE     19%  0.8x    -     -   ABV
+2026-03-25 QQQ    10:00    DOWN $ 4.5  30   -2 STRONG PIN                   45%  1.4x    L     L   ABV
+2026-03-27 QQQ    08:30    DOWN $ 4.4  30   -1 MODERATE PIN                 27%  1.0x    -     -   BLW
+2026-04-15 META   08:30    DOWN $ 4.4  10   +8 STRONG TREND / EXPLOSIVE     86%  1.0x    -     -   ABV
+2026-04-17 BA     08:30    UP   $ 4.4  10   +7 STRONG TREND / EXPLOSIVE     26%  1.0x    -     -   ABV
+2026-04-17 TSLA   08:30    UP   $ 4.4  10   +7 STRONG TREND / EXPLOSIVE     32%  1.0x    -     -   ABV
+2026-04-15 QQQ    08:30    UP   $ 4.4 120   +6 STRONG TREND / EXPLOSIVE      9%  1.0x    -     -   BLW
+2026-03-20 META   09:31    DOWN $ 4.4  60   +1 STRONG PIN                   37%  0.8x    -     -   BLW
+2026-04-22 MSFT   09:00    UP   $ 4.4 120   +5 STRONG TREND / EXPLOSIVE     86%  1.0x    H     -   ABV
+2026-04-17 UNH    08:30    UP   $ 4.4  30   +8 STRONG TREND / EXPLOSIVE     44%  1.0x    -     -   BLW
+2026-03-25 SPY    10:00    DOWN $ 4.3  30   +2 MODERATE PIN                 34%  0.7x    -     -   ABV
+2026-03-24 QQQ    10:45    DOWN $ 4.3 120   +1 STRONG PIN                    7%  0.7x    -     -   ABV
+2026-04-17 LLY    11:33    DOWN $ 4.3  60   +1 STRONG PIN                   37%  0.5x    -     -   BLW
+2026-04-15 MSFT   08:30    UP   $ 4.3  10   +9 STRONG TREND / EXPLOSIVE     27%  1.0x    -     -   ABV
+2026-03-20 SPY    08:30    DOWN $ 4.3  60   -1 STRONG PIN                   90%  1.0x    -     -   BLW
+2026-04-17 ARM    12:30    UP   $ 4.3  30   +7 STRONG TREND / EXPLOSIVE     74%  0.8x    H     -   BLW
+2026-04-15 MSFT   12:38    UP   $ 4.3  60   +9 STRONG TREND / EXPLOSIVE      0%  0.8x    -     -   ABV
+2026-03-26 QQQ    09:00    DOWN $ 4.3  60   -2 MODERATE PIN                 16%  0.9x    -     -   ABV
+2026-03-24 QQQ    12:45    UP   $ 4.2  60   -1 STRONG PIN                    9%  0.7x    -     -   BLW
+2026-03-27 QQQ    11:17    DOWN $ 4.2 120   -1 MODERATE PIN                 53%  1.7x    -     -   BLW
+2026-03-20 META   12:01    DOWN $ 4.2 120   +1 STRONG PIN                   65%  0.7x    -     -   BLW
+2026-03-27 SPY    11:47    DOWN $ 4.2 120   -2 MODERATE PIN                 62%  1.2x    H     H   BLW
+2026-04-22 AAPL   08:30    UP   $ 4.2  60   +5 STRONG TREND / EXPLOSIVE     21%  1.0x    -     -   ABV
+2026-04-17 META   09:01    DOWN $ 4.1  30   +6 STRONG TREND / EXPLOSIVE     66%  0.7x    H     -   ABV
+2026-03-27 SPY    11:17    DOWN $ 4.1 120   -2 MODERATE PIN                 39%  1.2x    -     -   BLW
+2026-04-01 SPY    11:49    DOWN $ 4.1 120   +3 STRONG TREND / EXPLOSIVE     23%  0.7x    -     -   ABV
+2026-03-30 SPY    12:36    DOWN $ 4.1 120   -3 STRONG PIN                   87%  2.0x    -     -   BLW
+2026-04-15 TSLA   10:30    UP   $ 4.1  10   +7 STRONG TREND / EXPLOSIVE     47%  1.0x    -     -   ABV
+2026-04-17 META   12:04    DOWN $ 4.1  30   +6 STRONG TREND / EXPLOSIVE     95%  0.4x    -     -   ABV
+2026-04-15 QQQ    12:47    UP   $ 4.0 120   +4 STRONG TREND / EXPLOSIVE      6%  0.8x    -     -   ABV
+2026-04-15 AVGO   09:00    DOWN $ 4.0 120   +9 STRONG TREND / EXPLOSIVE     39%  0.9x    -     -   ABV
+2026-03-25 QQQ    08:30    DOWN $ 4.0 120   -2 STRONG PIN                   51%  1.0x    -     -   ABV
+2026-04-17 BA     09:32    DOWN $ 4.0  60   +7 STRONG TREND / EXPLOSIVE     44%  0.3x    -     -   ABV
+2026-03-25 SPY    08:30    DOWN $ 4.0  30   +2 MODERATE PIN                 83%  1.0x    -     -   ABV
+2026-04-15 TSLA   12:00    UP   $ 4.0 120   +7 STRONG TREND / EXPLOSIVE     42%  0.7x    -     -   ABV
+2026-03-24 SPY    10:46    DOWN $ 4.0 120   +1 STRONG PIN                   33%  0.9x    -     -   ABV
+2026-03-30 SPY    12:05    DOWN $ 4.0 120   -3 STRONG PIN                   58%  1.9x    -     -   BLW
+2026-04-09 SPY    09:32    UP   $ 4.0  60   +4 STRONG TREND / EXPLOSIVE     30%  1.2x    L     L   BLW
+2026-04-15 TSLA   09:00    UP   $ 3.9  10   +7 STRONG TREND / EXPLOSIVE     42%  1.0x    L     -   ABV
+2026-04-15 QQQ    09:00    UP   $ 3.9 120   +6 STRONG TREND / EXPLOSIVE     68%  0.9x    -     -   ABV
+2026-04-17 QQQ    08:30    UP   $ 3.9 120   +8 STRONG TREND / EXPLOSIVE      3%  1.0x    -     -   BLW
+2026-04-15 AVGO   09:30    DOWN $ 3.9  60   +9 STRONG TREND / EXPLOSIVE     23%  0.6x    -     -   ABV
+2026-03-25 QQQ    09:00    UP   $ 3.9  30   -2 STRONG PIN                   53%  1.6x    L     L   BLW
+2026-03-24 SPY    12:46    UP   $ 3.9  60   -3 STRONG PIN                   41%  0.6x    -     -   BLW
+2026-03-23 QQQ    12:08    UP   $ 3.9 120   -2 STRONG PIN                   19%  0.9x    H     -   BLW
+2026-03-24 QQQ    12:15    UP   $ 3.9 120   -1 STRONG PIN                   24%  1.1x    -     -   BLW
+2026-03-26 QQQ    12:00    DOWN $ 3.9  60   -3 STRONG PIN                   63%  1.5x    H     H   BLW
+2026-03-20 SPY    11:33    DOWN $ 3.9 120   -1 STRONG PIN                   85%  0.9x    -     -   BLW
+2026-03-24 SPY    09:00    UP   $ 3.9  60   +1 STRONG PIN                   52%  1.3x    H     H   ABV
+2026-03-23 QQQ    11:38    UP   $ 3.9 120   -3 STRONG PIN                   66%  0.3x    -     -   BLW
+2026-04-15 TSLA   10:00    UP   $ 3.8  15   +7 STRONG TREND / EXPLOSIVE     35%  1.7x    -     -   ABV
+2026-04-20 AVGO   09:00    DOWN $ 3.8  10   +6 STRONG TREND / EXPLOSIVE     88%  1.4x    H     -   BLW
+2026-04-17 CAT    11:00    UP   $ 3.8  30   +5 STRONG TREND / EXPLOSIVE     52%  0.8x    L     -   ABV
+2026-04-01 QQQ    12:18    DOWN $ 3.8  60   +1 STRONG TREND / EXPLOSIVE     58%  0.9x    -     -   ABV
+2026-03-25 SPY    09:30    DOWN $ 3.8  60   +2 MODERATE PIN                 14%  1.0x    -     -   BLW
+2026-04-17 ARM    11:28    UP   $ 3.8 120   +7 STRONG TREND / EXPLOSIVE    100%  0.8x    -     -   BLW
+2026-03-26 QQQ    11:30    DOWN $ 3.8 120   -2 MODERATE PIN                 37%  1.5x    -     -   BLW
+2026-04-01 SPY    12:19    DOWN $ 3.8  60   -1 STRONG PIN                   63%  1.3x    -     -   ABV
+2026-04-17 MSFT   10:00    DOWN $ 3.8 120   +5 STRONG TREND / EXPLOSIVE     55%  1.2x    -     -   ABV
+2026-03-19 QQQ    08:30    UP   $ 3.8  30   -1 STRONG PIN                   56%  1.0x    -     -   BLW
+2026-04-09 QQQ    10:31    UP   $ 3.8  30   +4 STRONG TREND / EXPLOSIVE     27%  0.4x    -     -   ABV
+2026-04-22 AVGO   10:00    UP   $ 3.8  30   +7 STRONG TREND / EXPLOSIVE     56%  1.0x    L     -   ABV
+2026-04-17 AAPL   09:30    UP   $ 3.8  60   +6 STRONG TREND / EXPLOSIVE     62%  1.0x    L     L   ABV
+2026-03-24 SPY    12:16    UP   $ 3.8 120   -3 STRONG PIN                   46%  0.6x    -     -   BLW
+2026-03-24 QQQ    10:15    DOWN $ 3.7 120   +1 STRONG PIN                   62%  0.8x    H     H   ABV
+2026-04-17 GS     09:00    UP   $ 3.7  15   +6 STRONG TREND / EXPLOSIVE     80%  0.7x    -     -   ABV
+2026-04-15 QQQ    11:47    UP   $ 3.7 120   +6 STRONG TREND / EXPLOSIVE     43%  2.2x    L     L   BLW
+2026-04-21 QQQ    09:01    DOWN $ 3.7  60   +4 STRONG TREND / EXPLOSIVE      7%  0.9x    -     -   ABV
+2026-04-17 LLY    12:03    DOWN $ 3.7  10   +1 STRONG PIN                   31%  4.2x    -     -   BLW
+2026-04-15 GOOGL  08:36    UP   $ 3.7  60   +8 STRONG TREND / EXPLOSIVE     92%  0.5x    L     L   BLW
+2026-03-27 QQQ    09:39    UP   $ 3.7  60   -1 MODERATE PIN                 18%  0.9x    -     -   BLW
+2026-03-30 QQQ    11:15    DOWN $ 3.7 120   +4 STRONG TREND / EXPLOSIVE     70%  0.7x    -     -   BLW
+2026-04-20 META   09:30    DOWN $ 3.7  15   +6 STRONG TREND / EXPLOSIVE     20%  1.2x    -     -   BLW
+2026-03-26 QQQ    09:30    DOWN $ 3.6  30   -2 MODERATE PIN                 76%  1.4x    -     -   ABV
+2026-04-15 NVDA   10:25    DOWN $ 3.6 120   +8 STRONG TREND / EXPLOSIVE     21%  0.9x    -     -   ABV
+2026-04-15 MSFT   09:00    UP   $ 3.6  15   +9 STRONG TREND / EXPLOSIVE     62%  0.8x    -     -   ABV
+2026-04-15 QQQ    12:17    UP   $ 3.6 120   +4 STRONG TREND / EXPLOSIVE     58%  0.6x    -     -   ABV
+2026-04-17 CRM    09:30    DOWN $ 3.6 120   +6 STRONG TREND / EXPLOSIVE     34%  3.2x    H     H   BLW
+2026-04-06 SPY    08:32    UP   $ 3.6  30   +6 STRONG TREND / EXPLOSIVE     62%  0.5x    -     -   BLW
+2026-04-17 PLTR   08:30    UP   $ 3.6 120   +8 STRONG TREND / EXPLOSIVE     31%  1.0x    -     -   BLW
+2026-04-21 QQQ    09:31    DOWN $ 3.6  30   +4 STRONG TREND / EXPLOSIVE     44%  0.5x    -     -   ABV
+2026-04-20 TSLA   10:05    UP   $ 3.6  30   +6 STRONG TREND / EXPLOSIVE     26%  1.0x    -     -   BLW
+2026-03-18 QQQ    12:35    DOWN $ 3.6 120   +0                              89%  1.6x    H     H   BLW
+2026-04-15 TSLA   11:30    DOWN $ 3.6  15   +7 STRONG TREND / EXPLOSIVE     81%  1.2x    L     -   ABV
+2026-03-30 SPY    11:05    DOWN $ 3.6 120   +2 MODERATE PIN                  6%  1.2x    -     -   BLW
+2026-04-17 MSFT   09:30    UP   $ 3.6  30   +5 STRONG TREND / EXPLOSIVE     70%  1.6x    H     H   ABV
+2026-04-22 AVGO   12:56    UP   $ 3.6 120   +7 STRONG TREND / EXPLOSIVE     33%  1.4x    -     -   ABV
+2026-04-17 META   10:01    DOWN $ 3.6  30   +6 STRONG TREND / EXPLOSIVE     21%  1.4x    L     L   ABV
+2026-04-22 AAPL   09:00    UP   $ 3.6  30   +5 STRONG TREND / EXPLOSIVE     65%  0.7x    -     -   ABV
+2026-04-17 CAT    09:30    UP   $ 3.5  10   +5 STRONG TREND / EXPLOSIVE     86%  1.5x    L     -   ABV
+2026-03-26 SPY    10:30    DOWN $ 3.5 120   +0 MODERATE PIN                 59%  1.3x    L     L   BLW
+2026-04-20 TSLA   09:00    DOWN $ 3.5  15   +6 STRONG TREND / EXPLOSIVE      7%  0.6x    -     -   BLW
+2026-04-17 MSFT   08:30    UP   $ 3.5  60   +5 STRONG TREND / EXPLOSIVE     53%  1.0x    -     -   BLW
+2026-03-19 QQQ    09:30    UP   $ 3.5  60   -1 STRONG PIN                   22%  0.8x    -     -   BLW
+2026-03-26 QQQ    10:30    DOWN $ 3.5 120   -2 MODERATE PIN                 36%  1.1x    -     -   BLW
+2026-03-26 SPY    10:00    DOWN $ 3.5 120   +0 MODERATE PIN                 37%  1.3x    -     -   BLW
+2026-03-26 SPY    09:00    DOWN $ 3.5  60   +0 MODERATE PIN                 25%  1.0x    -     -   ABV
+2026-04-17 GS     10:30    UP   $ 3.5  30   +6 STRONG TREND / EXPLOSIVE     18%  1.2x    H     -   ABV
+2026-03-23 QQQ    11:08    DOWN $ 3.5  30   -3 STRONG PIN                   92%  1.1x    H     -   BLW
+2026-03-26 QQQ    10:00    DOWN $ 3.5 120   -2 MODERATE PIN                 45%  0.9x    H     -   BLW
+2026-04-01 QQQ    09:00    UP   $ 3.5  60   +6 STRONG TREND / EXPLOSIVE     18%  0.9x    -     -   ABV
+2026-03-20 META   08:30    DOWN $ 3.5  10   +1 STRONG PIN                   48%  1.0x    -     -   BLW
+2026-03-25 QQQ    10:43    UP   $ 3.5 120   -2 STRONG PIN                   25%  0.7x    -     -   BLW
+2026-03-18 SPY    11:53    DOWN $ 3.4 120   +0                              91%  1.7x    H     H   BLW
+2026-04-17 CAT    12:30    UP   $ 3.4  30   +5 STRONG TREND / EXPLOSIVE     41%  1.0x    -     -   ABV
+2026-03-27 SPY    12:17    DOWN $ 3.4 120   -2 STRONG PIN                   61%  1.1x    L     L   BLW
+2026-04-17 AAPL   09:00    UP   $ 3.4 120   +6 STRONG TREND / EXPLOSIVE     24%  0.7x    -     -   ABV
+2026-03-24 QQQ    09:00    UP   $ 3.4 120   +1 STRONG PIN                   59%  1.7x    H     H   ABV
+2026-04-17 BA     09:02    DOWN $ 3.4 120   +7 STRONG TREND / EXPLOSIVE     96%  1.8x    H     H   ABV
+2026-04-09 SPY    10:32    UP   $ 3.4  60   +4 STRONG TREND / EXPLOSIVE     69%  3.2x    H     H   ABV
+2026-04-17 MSFT   12:00    DOWN $ 3.4  30   +5 STRONG TREND / EXPLOSIVE     64%  1.7x    L     L   BLW
+2026-03-30 SPY    09:35    UP   $ 3.4  30   +2 MODERATE PIN                 79%  1.2x    L     L   BLW
+2026-04-01 SPY    09:01    UP   $ 3.4 120   +3 STRONG TREND / EXPLOSIVE     62%  0.8x    -     -   ABV
+2026-03-24 QQQ    11:45    DOWN $ 3.4  30   +1 STRONG PIN                   76%  1.9x    H     -   ABV
+2026-03-24 SPY    11:16    DOWN $ 3.4  60   +1 STRONG PIN                   91%  0.9x    H     H   ABV
+2026-03-26 SPY    12:35    DOWN $ 3.4 120   +0 STRONG PIN                   32%  0.9x    -     -   BLW
+2026-04-10 QQQ    10:27    DOWN $ 3.4 120   +6 STRONG TREND / EXPLOSIVE      7%  0.5x    -     -   ABV
+2026-04-15 NVDA   10:55    DOWN $ 3.3  60   +8 STRONG TREND / EXPLOSIVE     43%  0.3x    -     -   ABV
+2026-03-27 QQQ    10:17    UP   $ 3.3  15   -1 MODERATE PIN                 62%  1.3x    L     L   BLW
+2026-03-19 SPY    08:30    UP   $ 3.3  30   +0 STRONG PIN                   62%  1.0x    -     -   BLW
+2026-04-17 TSLA   10:00    DOWN $ 3.3  10   +7 STRONG TREND / EXPLOSIVE     83%  1.2x    H     H   ABV
+2026-04-17 GS     09:30    UP   $ 3.3  15   +6 STRONG TREND / EXPLOSIVE     45%  0.2x    H     H   ABV
+2026-03-25 QQQ    11:13    UP   $ 3.3 120   -2 STRONG PIN                   36%  0.3x    -     -   BLW
+2026-03-30 SPY    09:00    UP   $ 3.3 120   +2 MODERATE PIN                 56%  1.6x    -     -   BLW
+2026-04-15 AVGO   12:02    UP   $ 3.3 120   +9 STRONG TREND / EXPLOSIVE     75%  0.3x    -     -   BLW
+2026-03-18 SPY    12:23    DOWN $ 3.3 120   +0                              61%  0.6x    -     -   BLW
+2026-03-27 SPY    12:47    DOWN $ 3.3 120   -2 STRONG PIN                   19%  0.9x    -     -   BLW
+2026-03-20 META   10:31    UP   $ 3.3  30   +1 STRONG PIN                   43%  0.4x    -     -   BLW
+2026-04-17 ARM    11:59    UP   $ 3.3  60   +7 STRONG TREND / EXPLOSIVE     62%  4.2x    H     -   BLW
+2026-03-27 QQQ    11:47    DOWN $ 3.3  60   -1 MODERATE PIN                 41%  1.4x    H     H   BLW
+2026-04-01 QQQ    11:18    DOWN $ 3.3 120   +6 STRONG TREND / EXPLOSIVE     87%  1.8x    H     -   ABV
+2026-04-22 AVGO   11:00    UP   $ 3.3  15   +7 STRONG TREND / EXPLOSIVE     65%  1.0x    -     -   ABV
+2026-04-22 AVGO   10:30    UP   $ 3.3  60   +7 STRONG TREND / EXPLOSIVE     22%  0.7x    -     -   ABV
+2026-03-24 SPY    10:16    DOWN $ 3.3 120   +1 STRONG PIN                   64%  0.7x    H     H   ABV
+2026-03-30 SPY    10:05    DOWN $ 3.3 120   +2 MODERATE PIN                 40%  1.0x    -     -   ABV
+2026-04-01 SPY    11:19    DOWN $ 3.3 120   +3 STRONG TREND / EXPLOSIVE     55%  0.7x    H     -   ABV
+2026-03-19 SPY    12:01    UP   $ 3.3 120   -2 STRONG PIN                   89%  0.8x    -     -   BLW
+2026-03-30 SPY    11:35    DOWN $ 3.3 120   +2 MODERATE PIN                  7%  0.8x    -     -   BLW
+2026-04-20 AAPL   08:30    UP   $ 3.3  30   +5 STRONG TREND / EXPLOSIVE     35%  1.0x    -     -   BLW
+2026-04-17 CAT    12:00    DOWN $ 3.3  10   +5 STRONG TREND / EXPLOSIVE      4%  0.6x    -     -   ABV
+2026-03-20 META   11:01    DOWN $ 3.3 120   +1 STRONG PIN                   42%  0.8x    H     H   BLW
+2026-04-20 AVGO   09:31    DOWN $ 3.3  60   +6 STRONG TREND / EXPLOSIVE     44%  1.6x    -     -   BLW
+2026-04-22 AVGO   09:00    UP   $ 3.3  30   +7 STRONG TREND / EXPLOSIVE     98%  2.0x    H     H   ABV
+2026-04-21 QQQ    08:31    UP   $ 3.3  60   +4 STRONG TREND / EXPLOSIVE     83%  0.3x    -     -   BLW
+2026-03-27 SPY    08:30    DOWN $ 3.3  30   -2 MODERATE PIN                 82%  1.0x    -     -   BLW
+2026-04-17 BA     12:47    DOWN $ 3.3 120   +7 STRONG TREND / EXPLOSIVE     98%  1.1x    H     H   BLW
+2026-04-06 QQQ    12:12    UP   $ 3.3 120   +5 STRONG TREND / EXPLOSIVE     84%  2.5x    L     L   BLW
+2026-04-13 QQQ    08:31    UP   $ 3.3 120   -1 MODERATE PIN                 39%  0.2x    -     -   BLW
+2026-04-17 TSLA   10:30    DOWN $ 3.3  60   +7 STRONG TREND / EXPLOSIVE     23%  1.3x    -     -   ABV
+2026-04-01 QQQ    09:32    UP   $ 3.3 120   +6 STRONG TREND / EXPLOSIVE     79%  1.3x    -     -   ABV
+2026-04-21 QQQ    10:10    DOWN $ 3.3 120   +4 STRONG TREND / EXPLOSIVE     81%  0.9x    H     -   BLW
+2026-04-20 META   10:41    DOWN $ 3.3 120   +6 STRONG TREND / EXPLOSIVE     45%  1.0x    H     H   BLW
+2026-04-13 QQQ    11:05    UP   $ 3.2  30   -1 MODERATE PIN                 50%  1.3x    -     -   ABV
+2026-04-17 QQQ    11:30    DOWN $ 3.2  60   +8 STRONG TREND / EXPLOSIVE     91%  2.1x    H     H   ABV
+2026-04-21 QQQ    12:12    UP   $ 3.2  60   -2 STRONG PIN                   34%  1.3x    -     -   BLW
+2026-03-27 SPY    09:01    UP   $ 3.2 120   -2 MODERATE PIN                 71%  1.1x    -     -   BLW
+2026-04-17 JPM    09:01    UP   $ 3.2 120   +9 STRONG TREND / EXPLOSIVE      3%  0.9x    -     -   BLW
+2026-04-15 MSFT   10:36    UP   $ 3.2 120   +9 STRONG TREND / EXPLOSIVE     33%  0.9x    -     -   ABV
+2026-04-17 SPY    08:30    UP   $ 3.2  60   +9 STRONG TREND / EXPLOSIVE      9%  1.0x    -     -   BLW
+2026-03-23 QQQ    08:30    UP   $ 3.2  30   -3 STRONG PIN                   29%  1.0x    -     -   BLW
+2026-04-09 SPY    08:32    UP   $ 3.2 120   +4 STRONG TREND / EXPLOSIVE     80%  0.3x    -     -   BLW
+2026-04-20 GOOGL  08:34    DOWN $ 3.2 120   +6 STRONG TREND / EXPLOSIVE     95%  0.3x    -     -   ABV
+2026-04-15 META   11:03    UP   $ 3.2  30   +8 STRONG TREND / EXPLOSIVE     56%  0.8x    -     -   ABV
+2026-04-09 QQQ    09:31    UP   $ 3.2  60   +4 STRONG TREND / EXPLOSIVE     55%  1.0x    -     -   BLW
+2026-03-26 QQQ    08:30    UP   $ 3.2  60   -2 MODERATE PIN                 77%  1.0x    -     -   BLW
+2026-03-24 SPY    09:30    UP   $ 3.2  30   +1 STRONG PIN                   37%  0.9x    -     -   ABV
+2026-03-26 SPY    12:05    DOWN $ 3.2  60   +0 STRONG PIN                   85%  0.5x    -     -   BLW
+2026-03-20 META   09:01    UP   $ 3.2  60   +1 STRONG PIN                   46%  1.1x    L     L   BLW
+2026-04-15 META   09:01    DOWN $ 3.2  10   +8 STRONG TREND / EXPLOSIVE     86%  1.7x    H     H   ABV
+2026-04-15 META   12:34    DOWN $ 3.2  30   +8 STRONG TREND / EXPLOSIVE     47%  0.7x    -     -   ABV
+2026-04-06 QQQ    09:21    DOWN $ 3.2 120  +10 STRONG TREND / EXPLOSIVE     62%  0.5x    H     H   ABV
+2026-04-15 NVDA   08:30    UP   $ 3.2  60   +8 STRONG TREND / EXPLOSIVE     19%  1.0x    -     -   BLW
+2026-04-17 CRM    10:00    DOWN $ 3.2  60   +6 STRONG TREND / EXPLOSIVE     42%  1.0x    -     -   BLW
+2026-04-17 ARM    08:35    DOWN $ 3.2  60   +7 STRONG TREND / EXPLOSIVE     79%  0.5x    -     -   ABV
+2026-03-24 QQQ    09:30    UP   $ 3.2  30   +1 STRONG PIN                   25%  0.8x    -     -   BLW
+2026-03-26 QQQ    12:30    DOWN $ 3.2 120   -3 STRONG PIN                    6%  1.2x    -     -   BLW
+2026-03-27 SPY    09:38    UP   $ 3.2  60   -2 MODERATE PIN                 59%  1.4x    L     L   BLW
+2026-03-19 SPY    09:30    UP   $ 3.2  60   +0 STRONG PIN                   40%  0.9x    -     -   BLW
+2026-04-15 AAPL   09:30    UP   $ 3.2  60   +6 STRONG TREND / EXPLOSIVE     65%  1.1x    H     -   ABV
+2026-04-15 MSFT   09:30    UP   $ 3.2 120   +9 STRONG TREND / EXPLOSIVE     32%  0.7x    -     -   ABV
+2026-03-19 QQQ    12:01    UP   $ 3.2 120   +0 STRONG PIN                   89%  1.2x    -     -   BLW
+2026-04-15 GOOGL  11:59    UP   $ 3.2 120   +8 STRONG TREND / EXPLOSIVE     94%  0.9x    L     -   ABV
+2026-04-15 SPY    08:44    UP   $ 3.2 120   +8 STRONG TREND / EXPLOSIVE     74%  1.5x    L     L   BLW
+2026-04-17 ARM    10:57    UP   $ 3.2 120   +7 STRONG TREND / EXPLOSIVE     41%  1.0x    -     -   BLW
+2026-04-21 QQQ    11:12    DOWN $ 3.2 120   +4 STRONG TREND / EXPLOSIVE     10%  0.6x    -     -   BLW
+2026-04-01 SPY    08:31    UP   $ 3.2 120   +3 STRONG TREND / EXPLOSIVE     33%  0.3x    -     -   BLW
+2026-04-22 MSFT   09:43    UP   $ 3.2  60   +5 STRONG TREND / EXPLOSIVE     78%  1.2x    L     L   ABV
+2026-03-25 QQQ    12:27    DOWN $ 3.2 120   -1 STRONG PIN                   75%  1.0x    H     H   ABV
+2026-04-21 QQQ    12:42    DOWN $ 3.2 120   -2 STRONG PIN                   37%  1.8x    -     -   BLW
+2026-04-06 QQQ    11:37    DOWN $ 3.1  60  +10 STRONG TREND / EXPLOSIVE     47%  3.1x    H     H   ABV
+2026-04-17 QQQ    10:31    DOWN $ 3.1 120   +8 STRONG TREND / EXPLOSIVE     87%  2.0x    H     H   ABV
+2026-03-26 SPY    09:30    DOWN $ 3.1  30   +0 MODERATE PIN                 78%  1.2x    -     -   ABV
+2026-03-24 QQQ    11:15    DOWN $ 3.1  60   +1 STRONG PIN                   74%  0.4x    -     -   ABV
+2026-04-22 MSFT   08:30    UP   $ 3.1  10   +5 STRONG TREND / EXPLOSIVE     70%  1.0x    -     -   BLW
+2026-03-27 QQQ    12:17    DOWN $ 3.1 120   +0 STRONG PIN                   69%  1.1x    L     L   BLW
+2026-04-15 AVGO   10:32    UP   $ 3.1  60   +9 STRONG TREND / EXPLOSIVE     31%  0.9x    -     -   BLW
+2026-03-19 QQQ    11:02    DOWN $ 3.1 120   -1 STRONG PIN                   69%  1.9x    H     H   ABV
+2026-04-17 JPM    11:01    DOWN $ 3.1 120   +9 STRONG TREND / EXPLOSIVE     57%  1.5x    H     H   ABV
+2026-04-17 META   10:34    DOWN $ 3.1 120   +6 STRONG TREND / EXPLOSIVE     29%  0.5x    H     H   ABV
+2026-03-19 QQQ    09:00    DOWN $ 3.1 120   -1 STRONG PIN                   64%  1.2x    H     H   ABV
+2026-04-02 QQQ    10:44    DOWN $ 3.1  60   +0 STRONG PIN                   70%  1.3x    -     -   ABV
+2026-03-19 SPY    09:00    DOWN $ 3.1  30   +0 STRONG PIN                   60%  0.9x    H     H   ABV
+2026-04-17 NFLX   08:34    UP   $ 3.1 120   -2 STRONG PIN                   99%  0.6x    -     -   BLW
+2026-04-17 AMD    09:49    DOWN $ 3.1  60   +5 STRONG TREND / EXPLOSIVE     86%  1.7x    H     H   ABV
+2026-04-17 AMD    10:40    UP   $ 3.1 120   +5 STRONG TREND / EXPLOSIVE     54%  1.9x    L     L   BLW
+2026-03-30 QQQ    11:45    DOWN $ 3.1  60   +4 STRONG TREND / EXPLOSIVE     18%  0.5x    -     -   BLW
+2026-03-19 SPY    11:02    DOWN $ 3.1 120   +0 STRONG PIN                   79%  1.1x    H     H   ABV
+2026-04-17 AMD    08:30    UP   $ 3.1  10   +5 STRONG TREND / EXPLOSIVE     36%  1.0x    -     -   BLW
+2026-04-15 META   12:04    DOWN $ 3.1  60   +8 STRONG TREND / EXPLOSIVE     80%  1.0x    H     -   ABV
+2026-04-15 AVGO   10:00    DOWN $ 3.1  60   +9 STRONG TREND / EXPLOSIVE     57%  0.6x    -     -   ABV
+2026-04-17 GS     12:32    DOWN $ 3.1  10   +6 STRONG TREND / EXPLOSIVE    100%  0.5x    -     -   ABV
+2026-03-24 QQQ    08:30    DOWN $ 3.1  30   +1 STRONG PIN                   16%  1.0x    -     -   ABV
+2026-04-02 QQQ    10:10    DOWN $ 3.1 120   +0 STRONG PIN                   62%  0.8x    H     -   ABV
+2026-03-18 SPY    08:32    DOWN $ 3.1  60   +0                              38%  0.4x    -     -   ABV
+2026-03-25 SPY    10:43    UP   $ 3.1 120   +2 MODERATE PIN                  5%  0.5x    -     -   BLW
+2026-04-13 QQQ    09:35    UP   $ 3.1 120   -1 MODERATE PIN                 83%  0.8x    -     -   ABV
+2026-04-20 META   12:14    DOWN $ 3.1 120   +6 STRONG TREND / EXPLOSIVE     58%  0.7x    H     H   BLW
+2026-04-17 LLY    10:02    DOWN $ 3.1  10   +1 STRONG PIN                   58%  2.7x    -     -   ABV
+2026-04-17 LLY    12:33    UP   $ 3.1  60   +1 STRONG PIN                    6%  1.1x    -     -   BLW
+2026-03-26 SPY    08:30    UP   $ 3.1  30   +0 MODERATE PIN                 56%  1.0x    -     -   BLW
+2026-04-17 CRM    09:00    DOWN $ 3.1 120   +6 STRONG TREND / EXPLOSIVE     50%  1.1x    L     -   BLW
+2026-04-17 MSFT   10:30    DOWN $ 3.1  60   +5 STRONG TREND / EXPLOSIVE     32%  0.7x    -     -   ABV
+2026-04-17 META   11:34    DOWN $ 3.1  60   +6 STRONG TREND / EXPLOSIVE     90%  0.8x    H     H   ABV
+2026-04-17 JPM    08:31    DOWN $ 3.1  30   +9 STRONG TREND / EXPLOSIVE     59%  0.0x    -     -   ABV
+2026-04-13 QQQ    12:55    UP   $ 3.1 120   +6 STRONG TREND / EXPLOSIVE     71%  0.9x    H     -   ABV
+2026-04-01 SPY    12:49    DOWN $ 3.1  30   -1 STRONG PIN                   55%  1.7x    L     L   ABV
+2026-04-17 JPM    11:45    DOWN $ 3.1 120   +9 STRONG TREND / EXPLOSIVE     68%  1.1x    -     -   ABV
+2026-04-02 QQQ    12:51    UP   $ 3.1 120   +0 STRONG PIN                   66%  1.5x    -     -   ABV
+2026-04-20 GOOGL  09:12    DOWN $ 3.1  60   +6 STRONG TREND / EXPLOSIVE     96%  0.6x    H     -   ABV
+2026-03-18 QQQ    09:03    DOWN $ 3.1  30   +0                              51%  1.9x    -     -   BLW
+2026-04-06 QQQ    08:36    UP   $ 3.1  10  +10 STRONG TREND / EXPLOSIVE     96%  1.6x    L     L   BLW
+2026-04-10 QQQ    09:57    DOWN $ 3.1 120   +6 STRONG TREND / EXPLOSIVE     64%  0.6x    -     -   ABV
+2026-03-30 QQQ    09:36    UP   $ 3.1  30   +4 STRONG TREND / EXPLOSIVE     16%  2.5x    -     -   BLW
+2026-03-19 SPY    10:05    DOWN $ 3.1  60   +0 STRONG PIN                   82%  2.3x    H     H   ABV
+2026-04-17 META   09:31    UP   $ 3.1  10   +6 STRONG TREND / EXPLOSIVE     60%  0.6x    H     -   ABV
+2026-03-24 SPY    11:46    DOWN $ 3.1  60   +1 STRONG PIN                   54%  0.5x    -     -   ABV
+2026-04-15 AVGO   12:39    UP   $ 3.1 120   +9 STRONG TREND / EXPLOSIVE     90%  0.6x    L     -   BLW
+2026-03-18 QQQ    08:32    DOWN $ 3.1  60   +0                              34%  0.7x    -     -   ABV
+2026-04-17 QQQ    12:00    DOWN $ 3.1  30   +7 STRONG TREND / EXPLOSIVE     31%  2.7x    -     -   ABV
+2026-04-22 QQQ    08:30    UP   $ 3.1  60   +6 STRONG TREND / EXPLOSIVE     30%  1.0x    -     -   BLW
+2026-03-26 SPY    11:35    DOWN $ 3.1 120   +0 MODERATE PIN                 26%  0.8x    -     -   BLW
+2026-04-15 NVDA   11:25    DOWN $ 3.1  30   +8 STRONG TREND / EXPLOSIVE     44%  1.5x    L     -   ABV
+2026-04-21 QQQ    10:42    DOWN $ 3.1 120   +4 STRONG TREND / EXPLOSIVE     93%  0.5x    -     -   BLW
+2026-03-30 QQQ    10:15    UP   $ 3.1  60   +4 STRONG TREND / EXPLOSIVE     49%  1.2x    L     L   BLW
+2026-04-13 QQQ    10:35    UP   $ 3.1 120   -1 MODERATE PIN                  5%  0.7x    -     -   ABV
+2026-04-10 SPY    10:11    DOWN $ 3.0 120   +7 STRONG TREND / EXPLOSIVE     92%  1.1x    -     -   ABV
+2026-04-15 NVDA   09:55    DOWN $ 3.0 120   +8 STRONG TREND / EXPLOSIVE     33%  0.4x    -     -   ABV
+2026-04-17 GS     11:02    DOWN $ 3.0  30   +6 STRONG TREND / EXPLOSIVE     47%  0.9x    -     -   ABV
+2026-04-17 GLD    08:30    UP   $ 3.0  30   +2 STRONG TREND / EXPLOSIVE     25%  1.0x    -     -   ABV
+2026-03-18 QQQ    10:11    DOWN $ 3.0 120   +0                              50%  1.1x    -     -   ABV
+2026-03-19 QQQ    10:04    DOWN $ 3.0  60   -1 STRONG PIN                   52%  1.0x    H     H   ABV
+2026-04-17 SPY    11:36    DOWN $ 3.0  60   +9 STRONG TREND / EXPLOSIVE     45%  1.7x    H     H   ABV
+2026-04-17 NFLX   09:58    DOWN $ 3.0  60   -2 STRONG PIN                   40%  1.1x    H     H   ABV
+2026-04-15 MSFT   11:08    UP   $ 3.0 120   +9 STRONG TREND / EXPLOSIVE     25%  1.9x    -     -   ABV
+2026-04-01 QQQ    12:48    DOWN $ 3.0  30   +1 STRONG TREND / EXPLOSIVE     79%  0.6x    -     -   ABV
+2026-04-15 QQQ    11:17    DOWN $ 3.0  60   +6 STRONG TREND / EXPLOSIVE     65%  1.4x    H     H   ABV
+2026-03-25 SPY    12:39    DOWN $ 3.0 120   +6 MODERATE TREND               47%  1.8x    H     H   ABV
+2026-04-22 AVGO   11:48    UP   $ 3.0 120   +7 STRONG TREND / EXPLOSIVE     31%  0.3x    -     -   ABV
+2026-04-17 AMD    09:11    DOWN $ 3.0 120   +5 STRONG TREND / EXPLOSIVE     27%  1.4x    H     H   ABV
+2026-03-20 SPY    11:03    DOWN $ 3.0 120   -1 STRONG PIN                   81%  1.5x    H     H   ABV
+2026-04-17 QQQ    09:00    UP   $ 3.0 120   +8 STRONG TREND / EXPLOSIVE     69%  0.9x    H     H   ABV
+2026-03-25 SPY    11:15    UP   $ 3.0 120   +2 MODERATE PIN                 44%  0.8x    -     -   BLW
+2026-04-01 SPY    09:32    UP   $ 3.0 120   +3 STRONG TREND / EXPLOSIVE     85%  1.0x    -     -   ABV
+2026-04-15 TSLA   08:30    UP   $ 3.0  10   +7 STRONG TREND / EXPLOSIVE     55%  1.0x    -     -   BLW
+2026-04-15 META   09:32    DOWN $ 3.0  60   +8 STRONG TREND / EXPLOSIVE     71%  0.8x    -     -   ABV
+2026-04-17 CRM    08:30    DOWN $ 3.0  60   +6 STRONG TREND / EXPLOSIVE     98%  1.0x    -     -   ABV
+2026-04-15 AVGO   11:32    DOWN $ 3.0  30   +9 STRONG TREND / EXPLOSIVE     67%  1.5x    L     L   BLW
+2026-03-27 QQQ    09:09    UP   $ 3.0 120   -1 MODERATE PIN                 16%  0.9x    -     -   BLW
+2026-04-15 AAPL   10:20    UP   $ 3.0 120   +6 STRONG TREND / EXPLOSIVE     98%  0.6x    L     L   ABV
+2026-04-15 META   10:33    UP   $ 3.0  30   +8 STRONG TREND / EXPLOSIVE     34%  1.0x    -     -   ABV
+2026-04-20 SPY    09:05    DOWN $ 3.0  60   +4 MODERATE PIN                 66%  0.8x    -     -   ABV
+2026-04-15 QQQ    09:38    UP   $ 3.0 120   +6 STRONG TREND / EXPLOSIVE     93%  0.6x    L     -   ABV
+2026-03-20 META   11:31    DOWN $ 3.0 120   +1 STRONG PIN                   77%  2.0x    L     L   BLW
+2026-03-23 QQQ    12:43    UP   $ 3.0  60   -2 STRONG PIN                   51%  1.3x    L     -   BLW
+2026-03-30 QQQ    09:06    UP   $ 3.0  60   +4 STRONG TREND / EXPLOSIVE     10%  0.6x    -     -   BLW
+2026-04-09 QQQ    08:31    DOWN $ 3.0 120   +4 STRONG TREND / EXPLOSIVE     31%  0.3x    -     -   ABV
+2026-04-13 QQQ    10:05    UP   $ 3.0 120   -1 MODERATE PIN                  6%  0.5x    -     -   ABV
+2026-04-22 QQQ    09:03    UP   $ 3.0  60   +6 STRONG TREND / EXPLOSIVE     26%  1.4x    -     -   ABV
+2026-03-18 SPY    09:06    DOWN $ 3.0  30   +0                              72%  0.9x    -     -   BLW
+2026-03-27 SPY    10:17    UP   $ 3.0  30   -2 MODERATE PIN                 66%  1.8x    L     L   BLW
+2026-04-20 SPY    08:35    DOWN $ 3.0 120   +4 MODERATE PIN                 27%  0.4x    -     -   ABV
+2026-04-22 AMZN   08:33    UP   $ 3.0  60   +6 STRONG TREND / EXPLOSIVE     97%  0.4x    L     L   BLW
+2026-04-22 GOOGL  08:30    UP   $ 3.0 120   +5 STRONG TREND / EXPLOSIVE     68%  1.0x    -     -   BLW
+2026-04-20 META   12:49    DOWN $ 3.0 120   +6 STRONG TREND / EXPLOSIVE     43%  0.5x    -     -   BLW
+2026-03-20 META   10:01    DOWN $ 3.0  30   +1 STRONG PIN                   79%  1.5x    -     -   BLW
+2026-04-15 GOOGL  10:33    UP   $ 3.0 120   +8 STRONG TREND / EXPLOSIVE     42%  0.7x    -     -   BLW
+2026-04-15 SPY    11:47    UP   $ 3.0 120   +8 STRONG TREND / EXPLOSIVE     43%  1.4x    L     L   BLW
+
+==============================================================================
+HOW TO READ THIS
+==============================================================================
+- TRIGGER PATTERNS section: any feature firing at >70% is a strong candidate.
+  If 'break high of last 15 bars' fires on >80% of UP launches, that's your alert.
+- TIME OF DAY: if launches cluster in a specific 30-min bucket, alert only in that window.
+- THESIS CONTEXT: if >70% of launches have the same regime/bias/cagf label,
+  gate alerts on that context to cut noise.
+- PER-LAUNCH DETAIL: scan visually for patterns — is every big one a break-of-15 + vol >= 2x?
+  Those line-item commonalities are where the trigger hides.
+- Done.
+render@srv-d6j49cntskes738e202g-798d94b879-mbc44:~/project/src$ 
+
+
+LAUNCH SCANNER — fast $3+ moves within [5, 10, 15, 30] min
+==============================================================================
+For each launch, profile the SETUP BAR (the bar right before the move).
+Goal: find the common trigger pattern across launches.
+
+Bar CSVs to scan: 76
+Total launches found: 194
+
+==============================================================================
+BREAKDOWN BY DIRECTION AND WINDOW
+==============================================================================
+  DOWN  within  5 min: 3
+  DOWN  within 10 min: 8
+  DOWN  within 15 min: 6
+  DOWN  within 30 min: 69
+  UP    within  5 min: 9
+  UP    within 10 min: 11
+  UP    within 15 min: 9
+  UP    within 30 min: 79
+
+==============================================================================
+BREAKDOWN BY TICKER
+==============================================================================
+  QQQ   :  50
+  SPY   :  33
+  META  :  24
+  TSLA  :  22
+  AVGO  :  12
+  MSFT  :  11
+  CAT   :  10
+  GS    :  10
+  LLY   :  10
+  AAPL  :   4
+  AMD   :   1
+  ARM   :   1
+  BA    :   1
+  GLD   :   1
+  GOOGL :   1
+  JPM   :   1
+  NVDA  :   1
+  UNH   :   1
+
+==============================================================================
+TIME OF DAY — minutes since 08:30 CT open, 30-min buckets
+==============================================================================
+  min   0-29   n= 48  ################################################
+  min  30-59   n= 25  #########################
+  min  60-89   n= 25  #########################
+  min  90-119  n= 19  ###################
+  min 120-149  n= 12  ############
+  min 150-179  n=  9  #########
+  min 180-209  n= 13  #############
+  min 210-239  n= 11  ###########
+  min 240-269  n=  8  ########
+  min 270-299  n=  4  ####
+  min 300-329  n=  8  ########
+  min 330-359  n= 12  ############
+
+==============================================================================
+TRIGGER PATTERNS — how often does each feature fire AT the setup bar?
+==============================================================================
+(Compare to ~50% baseline for binary coin-flip features.)
+
+— Bar shape —
+  body_pct >= 0.70 (strong body)             64/194  ( 33.0%)  ################
+  bar is bullish (close > open)              90/194  ( 46.4%)  #######################
+  bar is bearish (close < open)             103/194  ( 53.1%)  ##########################
+  upper wick >= 40% of range                 38/194  ( 19.6%)  #########
+  lower wick >= 40% of range                 40/194  ( 20.6%)  ##########
+— Volume / range —
+  vol_ratio_20 >= 1.5x                       32/194  ( 16.5%)  ########
+  vol_ratio_20 >= 2.0x                       17/194  (  8.8%)  ####
+  vol_ratio_20 >= 3.0x                        8/194  (  4.1%)  ##
+  range_ratio_20 >= 1.5x                     36/194  ( 18.6%)  #########
+  range_ratio_20 >= 2.0x                     16/194  (  8.2%)  ####
+— Breaks —
+  break high of last 5 bars                  36/194  ( 18.6%)  #########
+  break high of last 15 bars                 20/194  ( 10.3%)  #####
+  break high of last 30 bars                 17/194  (  8.8%)  ####
+  break low of last 5 bars                   44/194  ( 22.7%)  ###########
+  break low of last 15 bars                  29/194  ( 14.9%)  #######
+  break low of last 30 bars                  18/194  (  9.3%)  ####
+— VWAP —
+  above session VWAP                        116/194  ( 59.8%)  #############################
+  below session VWAP                         78/194  ( 40.2%)  ####################
+— Directional alignment (bar direction matches launch direction) —
+  setup-bar direction matches launch direction        55/194  ( 28.4%)
+
+— UP launches — setup-bar features —
+  (n=108)
+    break high of last 5 bars                     9/108  (  8.3%)
+    break high of last 15 bars                    5/108  (  4.6%)
+    break high of last 30 bars                    4/108  (  3.7%)
+    above VWAP                                   55/108  ( 50.9%)
+    vol_ratio >= 1.5x                            15/108  ( 13.9%)
+    bull bar (close > open)                      30/108  ( 27.8%)
+    strong body (body >= 70% of range)           36/108  ( 33.3%)
+
+— DOWN launches — setup-bar features —
+  (n=86)
+    break low of last 5 bars                      8/86  (  9.3%)
+    break low of last 15 bars                     6/86  (  7.0%)
+    break low of last 30 bars                     5/86  (  5.8%)
+    below VWAP                                   25/86  ( 29.1%)
+    vol_ratio >= 1.5x                            17/86  ( 19.8%)
+    bear bar (close < open)                      25/86  ( 29.1%)
+    strong body (body >= 70% of range)           28/86  ( 32.6%)
+
+==============================================================================
+THESIS CONTEXT AT LAUNCH TIME
+==============================================================================
+— v4_regime —
+    STRONG TREND / EXPLOSIVE        116  ( 59.8%)
+    STRONG PIN                       57  ( 29.4%)
+    MODERATE PIN                     19  (  9.8%)
+    (blank)                           2  (  1.0%)
+— v4_conf_label —
+    HIGH                            148  ( 76.3%)
+    MODERATE                         44  ( 22.7%)
+    (blank)                           2  (  1.0%)
+— cagf_direction —
+    (blank)                         117  ( 60.3%)
+    UPSIDE                           28  ( 14.4%)
+    STRONG UPSIDE                    25  ( 12.9%)
+    NEUTRAL                          12  (  6.2%)
+    DOWNSIDE                          6  (  3.1%)
+    1                                 3  (  1.5%)
+    TRENDING                          3  (  1.5%)
+— cagf_regime —
+    MODERATE TREND                   99  ( 51.0%)
+    TRENDING                         45  ( 23.2%)
+    SUPPRESSING                      25  ( 12.9%)
+    MODERATE PIN                     11  (  5.7%)
+    (blank)                          10  (  5.2%)
+    1                                 3  (  1.5%)
+    NEUTRAL                           1  (  0.5%)
+— structure_confluence —
+    2                               157  ( 80.9%)
+    1                                29  ( 14.9%)
+    0                                 6  (  3.1%)
+    (blank)                           2  (  1.0%)
+— |bias_score| at launch —
+    |bias|=0    15  (  7.7%)
+    |bias|=1    36  ( 18.6%)
+    |bias|=2    20  ( 10.3%)
+    |bias|=3     8  (  4.1%)
+    |bias|=4    10  (  5.2%)
+    |bias|=5    21  ( 10.8%)
+    |bias|=6    37  ( 19.1%)
+    |bias|=7    25  ( 12.9%)
+    |bias|=8    10  (  5.2%)
+    |bias|=9    10  (  5.2%)
+    |bias|=10    2  (  1.0%)
+
+==============================================================================
+PER-LAUNCH DETAIL (194 launches)
+==============================================================================
+date       ticker ts       dir    mag   W bias regime                     body%  volx brk5 brk15  vwap
+------------------------------------------------------------------------------------------------------
+2026-04-20 TSLA   13:47    UP   $10.7  30   +6 STRONG TREND / EXPLOSIVE     78%  0.7x    -     -   BLW
+2026-04-17 LLY    08:30    UP   $ 9.1   5   +1 STRONG PIN                  100%  1.0x    -     -   ABV
+2026-04-20 META   08:30    DOWN $ 8.5  10   +6 STRONG TREND / EXPLOSIVE      3%  1.0x    -     -   BLW
+2026-04-17 META   14:10    UP   $ 7.2  30   +6 STRONG TREND / EXPLOSIVE     42%  0.4x    -     -   ABV
+2026-04-17 GS     08:30    UP   $ 6.8   5   +6 STRONG TREND / EXPLOSIVE     40%  1.0x    -     -   ABV
+2026-04-15 AVGO   08:30    UP   $ 6.6   5   +9 STRONG TREND / EXPLOSIVE     36%  1.0x    -     -   BLW
+2026-04-02 QQQ    09:31    UP   $ 6.1   5   +0 STRONG PIN                   30%  0.8x    -     -   ABV
+2026-04-17 CAT    10:31    UP   $ 5.5  30   +5 STRONG TREND / EXPLOSIVE     77%  0.4x    H     H   ABV
+2026-04-02 QQQ    09:01    UP   $ 5.1  15   +0 STRONG PIN                   50%  1.1x    -     -   ABV
+2026-04-17 META   08:30    UP   $ 5.1  10   +6 STRONG TREND / EXPLOSIVE     35%  1.0x    -     -   BLW
+2026-03-30 SPY    08:30    DOWN $ 4.9  30   +2 MODERATE PIN                 64%  1.0x    -     -   BLW
+2026-04-17 LLY    09:00    UP   $ 4.9  30   +1 STRONG PIN                   57%  0.8x    H     -   ABV
+2026-04-17 CAT    11:38    DOWN $ 4.8  30   +5 STRONG TREND / EXPLOSIVE     76%  0.7x    -     -   ABV
+2026-04-15 TSLA   09:30    UP   $ 4.8  30   +7 STRONG TREND / EXPLOSIVE     86%  0.8x    H     -   ABV
+2026-03-30 QQQ    08:30    DOWN $ 4.7  30   +4 STRONG TREND / EXPLOSIVE     77%  1.0x    -     -   BLW
+2026-03-25 SPY    09:00    UP   $ 4.5  30   +2 MODERATE PIN                 52%  1.8x    L     L   BLW
+2026-03-25 QQQ    09:46    DOWN $ 4.5  30   -2 STRONG PIN                   28%  0.7x    -     -   ABV
+2026-04-20 META   09:40    DOWN $ 4.4  15   +6 STRONG TREND / EXPLOSIVE     91%  3.2x    L     L   BLW
+2026-03-27 QQQ    08:30    DOWN $ 4.4  30   -1 MODERATE PIN                 27%  1.0x    -     -   BLW
+2026-04-17 TSLA   08:30    UP   $ 4.4   5   +7 STRONG TREND / EXPLOSIVE     32%  1.0x    -     -   ABV
+2026-04-17 MSFT   12:16    UP   $ 4.4  30   +5 STRONG TREND / EXPLOSIVE     68%  1.8x    L     L   BLW
+2026-04-20 TSLA   08:30    DOWN $ 4.4   5   +6 STRONG TREND / EXPLOSIVE     59%  1.0x    -     -   ABV
+2026-04-17 UNH    08:30    UP   $ 4.4  30   +8 STRONG TREND / EXPLOSIVE     44%  1.0x    -     -   BLW
+2026-04-17 MSFT   09:37    UP   $ 4.3  30   +5 STRONG TREND / EXPLOSIVE     48%  0.8x    -     -   ABV
+2026-04-17 TSLA   09:31    UP   $ 4.3  10   +7 STRONG TREND / EXPLOSIVE     60%  2.4x    H     H   ABV
+2026-04-15 MSFT   08:30    UP   $ 4.3  10   +9 STRONG TREND / EXPLOSIVE     27%  1.0x    -     -   ABV
+2026-04-17 CAT    08:30    UP   $ 4.2   5   +5 STRONG TREND / EXPLOSIVE     31%  1.0x    -     -   ABV
+2026-04-17 LLY    10:01    DOWN $ 4.2  30   +1 STRONG PIN                    5%  0.4x    -     -   ABV
+2026-04-17 CAT    09:00    UP   $ 4.2   5   +5 STRONG TREND / EXPLOSIVE     80%  1.1x    H     H   ABV
+2026-03-23 QQQ    10:38    DOWN $ 4.1  30   -3 STRONG PIN                   43%  1.9x    L     L   BLW
+2026-03-24 SPY    09:22    UP   $ 4.1  30   +1 STRONG PIN                   76%  1.0x    -     -   ABV
+2026-04-15 TSLA   10:30    UP   $ 4.1  10   +7 STRONG TREND / EXPLOSIVE     47%  1.0x    -     -   ABV
+2026-04-17 TSLA   09:01    UP   $ 4.0  30   +7 STRONG TREND / EXPLOSIVE     81%  0.7x    -     -   BLW
+2026-04-17 BA     08:30    UP   $ 4.0   5   +7 STRONG TREND / EXPLOSIVE     26%  1.0x    -     -   ABV
+2026-03-25 SPY    08:30    DOWN $ 4.0  30   +2 MODERATE PIN                 83%  1.0x    -     -   ABV
+2026-04-15 TSLA   11:31    DOWN $ 4.0  15   +7 STRONG TREND / EXPLOSIVE     14%  1.3x    L     -   ABV
+2026-04-15 TSLA   09:00    UP   $ 3.9  10   +7 STRONG TREND / EXPLOSIVE     42%  1.0x    L     -   ABV
+2026-04-22 AVGO   09:02    UP   $ 3.9  30   +7 STRONG TREND / EXPLOSIVE     75%  1.5x    -     -   ABV
+2026-04-17 LLY    09:31    DOWN $ 3.9  10   +1 STRONG PIN                   76%  3.0x    H     H   ABV
+2026-03-25 QQQ    09:00    UP   $ 3.9  30   -2 STRONG PIN                   53%  1.6x    L     L   BLW
+2026-04-15 TSLA   10:00    UP   $ 3.8  15   +7 STRONG TREND / EXPLOSIVE     35%  1.7x    -     -   ABV
+2026-04-15 META   08:30    DOWN $ 3.8   5   +8 STRONG TREND / EXPLOSIVE     86%  1.0x    -     -   ABV
+2026-04-22 AVGO   10:02    UP   $ 3.8  30   +7 STRONG TREND / EXPLOSIVE     41%  0.7x    -     -   ABV
+2026-03-19 QQQ    08:30    UP   $ 3.8  30   -1 STRONG PIN                   56%  1.0x    -     -   BLW
+2026-04-20 AVGO   08:34    DOWN $ 3.8  30   +6 STRONG TREND / EXPLOSIVE      4%  0.3x    -     -   BLW
+2026-03-24 QQQ    09:22    UP   $ 3.8  30   +1 STRONG PIN                   77%  1.0x    L     -   BLW
+2026-03-20 META   09:34    DOWN $ 3.8  30   +1 STRONG PIN                   17%  0.4x    -     -   BLW
+2026-04-17 MSFT   11:38    DOWN $ 3.8  30   +5 STRONG TREND / EXPLOSIVE     81%  1.1x    H     H   ABV
+2026-04-20 META   10:10    UP   $ 3.7  30   +6 STRONG TREND / EXPLOSIVE     81%  0.8x    H     -   BLW
+2026-03-25 SPY    09:46    DOWN $ 3.7  30   +2 MODERATE PIN                 11%  0.8x    -     -   ABV
+2026-04-21 QQQ    14:12    DOWN $ 3.7  30   -2 STRONG PIN                   94%  0.9x    H     H   ABV
+2026-04-17 META   11:54    DOWN $ 3.7  30   +6 STRONG TREND / EXPLOSIVE     16%  0.6x    -     -   ABV
+2026-03-24 SPY    08:41    UP   $ 3.7  30   +1 STRONG PIN                   91%  0.9x    L     L   BLW
+2026-03-19 SPY    14:06    DOWN $ 3.7  30   -2 STRONG PIN                   84%  3.0x    H     H   ABV
+2026-04-17 META   10:00    DOWN $ 3.6  30   +6 STRONG TREND / EXPLOSIVE     97%  1.2x    L     -   ABV
+2026-04-15 MSFT   09:00    UP   $ 3.6  15   +9 STRONG TREND / EXPLOSIVE     62%  0.8x    -     -   ABV
+2026-04-06 SPY    08:32    UP   $ 3.6  30   +6 STRONG TREND / EXPLOSIVE     62%  0.5x    -     -   BLW
+2026-04-17 GS     12:16    DOWN $ 3.6  10   +6 STRONG TREND / EXPLOSIVE     41%  1.6x    -     -   ABV
+2026-03-18 QQQ    08:58    DOWN $ 3.6  30   +0                              95%  0.6x    -     -   ABV
+2026-03-19 QQQ    10:05    DOWN $ 3.6  30   -1 STRONG PIN                   89%  3.3x    H     H   ABV
+2026-04-17 CAT    13:44    DOWN $ 3.6  30   +5 STRONG TREND / EXPLOSIVE    100%  1.2x    H     -   ABV
+2026-03-24 SPY    09:52    DOWN $ 3.6  10   +1 STRONG PIN                   14%  5.2x    H     H   ABV
+2026-04-17 CAT    09:30    UP   $ 3.5  10   +5 STRONG TREND / EXPLOSIVE     86%  1.5x    L     -   ABV
+2026-04-20 TSLA   09:00    DOWN $ 3.5  15   +6 STRONG TREND / EXPLOSIVE      7%  0.6x    -     -   BLW
+2026-04-17 TSLA   10:02    UP   $ 3.5  30   +7 STRONG TREND / EXPLOSIVE     83%  1.1x    -     -   ABV
+2026-04-17 LLY    10:59    DOWN $ 3.5  30   +1 STRONG PIN                   14%  2.7x    -     -   ABV
+2026-04-17 GS     11:16    UP   $ 3.5  30   +6 STRONG TREND / EXPLOSIVE     94%  1.1x    L     L   ABV
+2026-03-23 QQQ    11:08    DOWN $ 3.5  30   -3 STRONG PIN                   92%  1.1x    H     -   BLW
+2026-04-13 QQQ    08:36    UP   $ 3.5  30   -1 MODERATE PIN                 81%  0.6x    L     L   BLW
+2026-03-26 SPY    09:25    DOWN $ 3.5  30   +0 MODERATE PIN                 19%  0.8x    -     -   ABV
+2026-03-20 META   08:30    DOWN $ 3.5   5   +1 STRONG PIN                   48%  1.0x    -     -   BLW
+2026-04-15 META   12:28    DOWN $ 3.5  30   +8 STRONG TREND / EXPLOSIVE     85%  2.7x    -     -   ABV
+2026-04-17 MSFT   09:07    UP   $ 3.4  30   +5 STRONG TREND / EXPLOSIVE     72%  1.0x    L     L   BLW
+2026-04-17 GS     09:00    UP   $ 3.4  10   +6 STRONG TREND / EXPLOSIVE     80%  0.7x    -     -   ABV
+2026-04-20 META   09:10    DOWN $ 3.4  30   +6 STRONG TREND / EXPLOSIVE     56%  0.7x    -     -   ABV
+2026-04-22 AAPL   08:52    UP   $ 3.4  30   +5 STRONG TREND / EXPLOSIVE     76%  0.6x    L     -   ABV
+2026-03-18 SPY    08:58    DOWN $ 3.4  30   +0                              96%  0.8x    -     -   ABV
+2026-04-17 GS     11:46    DOWN $ 3.4  30   +6 STRONG TREND / EXPLOSIVE      0%  0.5x    -     -   ABV
+2026-04-15 TSLA   14:14    UP   $ 3.4  30   +7 STRONG TREND / EXPLOSIVE     68%  0.9x    L     -   ABV
+2026-04-15 META   11:00    UP   $ 3.4  30   +8 STRONG TREND / EXPLOSIVE     40%  1.3x    -     -   ABV
+2026-03-30 SPY    09:35    UP   $ 3.4  30   +2 MODERATE PIN                 79%  1.2x    L     L   BLW
+2026-03-24 QQQ    11:45    DOWN $ 3.4  30   +1 STRONG PIN                   76%  1.9x    H     -   ABV
+2026-04-15 META   11:30    DOWN $ 3.4  15   +8 STRONG TREND / EXPLOSIVE     66%  0.7x    L     L   ABV
+2026-04-17 META   09:30    UP   $ 3.4  10   +6 STRONG TREND / EXPLOSIVE     98%  1.2x    H     -   ABV
+2026-04-20 AVGO   09:39    DOWN $ 3.4  30   +6 STRONG TREND / EXPLOSIVE     56%  1.4x    H     H   BLW
+2026-04-17 MSFT   12:51    DOWN $ 3.3  30   +5 STRONG TREND / EXPLOSIVE     12%  0.8x    -     -   BLW
+2026-03-27 QQQ    10:17    UP   $ 3.3  15   -1 MODERATE PIN                 62%  1.3x    L     L   BLW
+2026-03-19 SPY    08:30    UP   $ 3.3  30   +0 STRONG PIN                   62%  1.0x    -     -   BLW
+2026-04-17 LLY    11:42    DOWN $ 3.3  30   +1 STRONG PIN                  100%  0.5x    H     -   BLW
+2026-04-21 QQQ    09:30    DOWN $ 3.3  30   +4 STRONG TREND / EXPLOSIVE     18%  0.9x    -     -   ABV
+2026-04-17 GS     09:30    UP   $ 3.3  15   +6 STRONG TREND / EXPLOSIVE     45%  0.2x    H     H   ABV
+2026-03-25 SPY    10:16    UP   $ 3.3  15   +2 MODERATE PIN                 92%  5.5x    L     L   BLW
+2026-03-20 META   10:31    UP   $ 3.3  30   +1 STRONG PIN                   43%  0.4x    -     -   BLW
+2026-04-15 MSFT   09:39    UP   $ 3.3  30   +9 STRONG TREND / EXPLOSIVE     68%  0.7x    L     L   ABV
+2026-04-20 AAPL   08:30    UP   $ 3.3  30   +5 STRONG TREND / EXPLOSIVE     35%  1.0x    -     -   BLW
+2026-04-17 TSLA   11:48    DOWN $ 3.3  30   +7 STRONG TREND / EXPLOSIVE     65%  0.6x    -     -   ABV
+2026-04-17 TSLA   12:18    DOWN $ 3.3  10   +7 STRONG TREND / EXPLOSIVE     18%  1.3x    -     -   ABV
+2026-03-27 SPY    08:30    DOWN $ 3.3  30   -2 MODERATE PIN                 82%  1.0x    -     -   BLW
+2026-04-17 META   09:00    DOWN $ 3.3  30   +6 STRONG TREND / EXPLOSIVE     52%  0.7x    H     -   ABV
+2026-03-23 QQQ    09:04    UP   $ 3.3  30   -3 STRONG PIN                   70%  1.2x    L     -   ABV
+2026-04-09 SPY    10:03    UP   $ 3.3  30   +4 STRONG TREND / EXPLOSIVE     80%  1.0x    L     -   BLW
+2026-04-22 AVGO   14:25    UP   $ 3.3  30   +7 STRONG TREND / EXPLOSIVE     68%  0.9x    -     -   ABV
+2026-04-17 GS     14:08    UP   $ 3.3  30   +6 STRONG TREND / EXPLOSIVE      8%  0.8x    -     -   ABV
+2026-04-13 QQQ    11:05    UP   $ 3.2  30   -1 MODERATE PIN                 50%  1.3x    -     -   ABV
+2026-03-20 SPY    14:08    DOWN $ 3.2  30   -1 MODERATE PIN                 36%  0.7x    -     -   BLW
+2026-04-15 TSLA   11:01    UP   $ 3.2  30   +7 STRONG TREND / EXPLOSIVE     66%  0.7x    -     -   ABV
+2026-04-15 META   09:00    UP   $ 3.2  30   +8 STRONG TREND / EXPLOSIVE     64%  1.8x    H     H   ABV
+2026-03-30 QQQ    10:51    DOWN $ 3.2  30   +4 STRONG TREND / EXPLOSIVE     67%  1.1x    H     H   ABV
+2026-03-23 QQQ    08:30    UP   $ 3.2  30   -3 STRONG PIN                   29%  1.0x    -     -   BLW
+2026-04-15 AAPL   09:33    UP   $ 3.2  30   +6 STRONG TREND / EXPLOSIVE     88%  0.8x    -     -   ABV
+2026-04-02 QQQ    08:31    DOWN $ 3.2  10   +0 STRONG PIN                   54%  0.4x    H     H   ABV
+2026-03-30 QQQ    09:35    UP   $ 3.2  30   +4 STRONG TREND / EXPLOSIVE     81%  1.1x    L     L   BLW
+2026-04-17 GS     10:39    UP   $ 3.2  15   +6 STRONG TREND / EXPLOSIVE     51%  0.1x    -     -   ABV
+2026-03-19 QQQ    09:11    DOWN $ 3.2  30   -1 STRONG PIN                   95%  1.9x    H     H   ABV
+2026-04-20 TSLA   09:31    DOWN $ 3.2  30   +6 STRONG TREND / EXPLOSIVE     64%  1.6x    -     -   BLW
+2026-04-17 GS     10:08    DOWN $ 3.2  15   +6 STRONG TREND / EXPLOSIVE     70%  1.3x    H     -   ABV
+2026-03-19 QQQ    14:06    DOWN $ 3.2  30   +0 STRONG PIN                   86%  2.9x    H     H   ABV
+2026-03-19 SPY    10:06    DOWN $ 3.2  30   +0 STRONG PIN                   75%  2.1x    H     H   ABV
+2026-04-17 CAT    12:08    DOWN $ 3.2  30   +5 STRONG TREND / EXPLOSIVE     71%  1.6x    L     L   ABV
+2026-03-20 SPY    08:31    DOWN $ 3.2  30   -1 STRONG PIN                   14%  0.5x    L     L   BLW
+2026-04-22 AVGO   09:32    UP   $ 3.2  30   +7 STRONG TREND / EXPLOSIVE     78%  1.4x    L     -   ABV
+2026-04-15 META   10:30    UP   $ 3.2  30   +8 STRONG TREND / EXPLOSIVE     97%  1.2x    L     -   ABV
+2026-04-06 QQQ    08:32    UP   $ 3.2  30  +10 STRONG TREND / EXPLOSIVE     55%  0.5x    -     -   BLW
+2026-03-24 SPY    13:17    UP   $ 3.2  30   -3 STRONG PIN                   40%  1.2x    -     -   BLW
+2026-03-25 QQQ    10:16    UP   $ 3.2  15   -2 STRONG PIN                   91%  4.1x    L     L   BLW
+2026-03-26 QQQ    09:22    DOWN $ 3.2  30   -2 MODERATE PIN                 87%  0.8x    H     -   ABV
+2026-04-22 QQQ    08:50    UP   $ 3.2  30   +6 STRONG TREND / EXPLOSIVE     51%  0.7x    -     -   BLW
+2026-04-21 QQQ    12:13    UP   $ 3.2  30   -2 STRONG PIN                   23%  1.4x    -     -   BLW
+2026-04-17 TSLA   10:33    DOWN $ 3.2  30   +7 STRONG TREND / EXPLOSIVE     37%  0.7x    -     -   ABV
+2026-04-15 QQQ    11:23    DOWN $ 3.2  30   +6 STRONG TREND / EXPLOSIVE     24%  1.5x    -     -   ABV
+2026-04-15 AVGO   11:10    DOWN $ 3.2  30   +9 STRONG TREND / EXPLOSIVE     58%  1.0x    -     -   ABV
+2026-04-17 META   12:56    DOWN $ 3.1  30   +6 STRONG TREND / EXPLOSIVE     37%  0.8x    -     -   ABV
+2026-03-19 SPY    13:31    UP   $ 3.1  30   -2 STRONG PIN                   39%  0.8x    -     -   BLW
+2026-04-22 MSFT   08:30    UP   $ 3.1  10   +5 STRONG TREND / EXPLOSIVE     70%  1.0x    -     -   BLW
+2026-04-15 TSLA   12:42    UP   $ 3.1  30   +7 STRONG TREND / EXPLOSIVE     49%  1.0x    L     -   ABV
+2026-04-06 QQQ    11:44    DOWN $ 3.1  30  +10 STRONG TREND / EXPLOSIVE     65%  0.4x    -     -   ABV
+2026-03-19 SPY    09:00    DOWN $ 3.1  30   +0 STRONG PIN                   60%  0.9x    H     H   ABV
+2026-04-17 CAT    10:01    DOWN $ 3.1  30   +5 STRONG TREND / EXPLOSIVE     56%  0.7x    -     -   ABV
+2026-04-15 MSFT   13:02    UP   $ 3.1  30   +9 STRONG TREND / EXPLOSIVE     33%  1.3x    -     -   ABV
+2026-03-27 QQQ    12:06    DOWN $ 3.1  30   +0 STRONG PIN                   94%  2.5x    H     H   BLW
+2026-04-01 QQQ    09:35    UP   $ 3.1  30   +6 STRONG TREND / EXPLOSIVE     32%  1.8x    L     L   ABV
+2026-04-17 AMD    08:30    UP   $ 3.1   5   +5 STRONG TREND / EXPLOSIVE     36%  1.0x    -     -   BLW
+2026-03-23 QQQ    10:08    DOWN $ 3.1  30   -3 STRONG PIN                   27%  0.8x    -     -   ABV
+2026-04-17 QQQ    11:54    DOWN $ 3.1  30   +8 STRONG TREND / EXPLOSIVE     78%  0.6x    -     -   ABV
+2026-04-17 CAT    11:01    UP   $ 3.1  30   +5 STRONG TREND / EXPLOSIVE     83%  1.2x    -     -   ABV
+2026-04-17 LLY    12:44    UP   $ 3.1  30   +1 STRONG PIN                   92%  1.0x    L     -   BLW
+2026-03-19 QQQ    13:32    UP   $ 3.1  30   +0 STRONG PIN                   94%  0.8x    -     -   ABV
+2026-04-15 TSLA   13:37    UP   $ 3.1  30   +7 STRONG TREND / EXPLOSIVE     94%  1.2x    L     L   ABV
+2026-04-17 MSFT   10:18    DOWN $ 3.1  30   +5 STRONG TREND / EXPLOSIVE      2%  0.6x    -     -   ABV
+2026-04-22 AVGO   08:32    UP   $ 3.1  30   +7 STRONG TREND / EXPLOSIVE     27%  0.2x    L     L   BLW
+2026-04-22 GOOGL  08:32    UP   $ 3.1  30   +5 STRONG TREND / EXPLOSIVE     65%  0.2x    L     L   BLW
+2026-03-24 QQQ    08:30    DOWN $ 3.1  30   +1 STRONG PIN                   16%  1.0x    -     -   ABV
+2026-04-17 CAT    12:38    UP   $ 3.1  30   +5 STRONG TREND / EXPLOSIVE     82%  0.8x    -     -   ABV
+2026-04-17 GS     13:07    UP   $ 3.1  30   +6 STRONG TREND / EXPLOSIVE     84%  0.6x    L     L   ABV
+2026-03-24 QQQ    09:53    DOWN $ 3.1  10   +1 STRONG PIN                   32%  1.3x    -     -   ABV
+2026-04-09 QQQ    10:33    UP   $ 3.1  30   +4 STRONG TREND / EXPLOSIVE     28%  3.1x    -     -   ABV
+2026-03-24 SPY    11:45    DOWN $ 3.1  30   +1 STRONG PIN                   65%  1.2x    H     -   ABV
+2026-03-26 SPY    08:30    UP   $ 3.1  30   +0 MODERATE PIN                 56%  1.0x    -     -   BLW
+2026-04-17 ARM    12:21    UP   $ 3.1  30   +7 STRONG TREND / EXPLOSIVE     50%  7.8x    L     L   BLW
+2026-04-22 AVGO   10:45    UP   $ 3.1  30   +7 STRONG TREND / EXPLOSIVE     44%  0.7x    L     -   ABV
+2026-04-17 JPM    08:31    DOWN $ 3.1  30   +9 STRONG TREND / EXPLOSIVE     59%  0.0x    -     -   ABV
+2026-04-01 SPY    12:49    DOWN $ 3.1  30   -1 STRONG PIN                   55%  1.7x    L     L   ABV
+2026-04-15 META   09:36    DOWN $ 3.1  10   +8 STRONG TREND / EXPLOSIVE     65%  1.4x    H     H   ABV
+2026-04-17 LLY    14:21    UP   $ 3.1  15   +1 STRONG PIN                   48%  1.2x    -     -   BLW
+2026-04-17 SPY    11:54    DOWN $ 3.1  30   +9 STRONG TREND / EXPLOSIVE     66%  0.6x    -     -   ABV
+2026-03-26 QQQ    08:32    UP   $ 3.1  30   -2 MODERATE PIN                 14%  0.5x    -     -   BLW
+2026-04-21 QQQ    08:39    UP   $ 3.1  30   +4 STRONG TREND / EXPLOSIVE     10%  0.4x    -     -   BLW
+2026-03-24 QQQ    13:17    UP   $ 3.1  30   -1 STRONG PIN                   39%  0.8x    -     -   BLW
+2026-04-20 AVGO   09:06    DOWN $ 3.1  15   +6 STRONG TREND / EXPLOSIVE     67%  0.7x    -     -   BLW
+2026-04-17 GLD    08:30    UP   $ 3.0  30   +2 STRONG TREND / EXPLOSIVE     25%  1.0x    -     -   ABV
+2026-04-09 QQQ    10:03    UP   $ 3.0  30   +4 STRONG TREND / EXPLOSIVE     56%  0.5x    -     -   ABV
+2026-04-17 META   12:24    UP   $ 3.0  30   +6 STRONG TREND / EXPLOSIVE     73%  2.6x    L     L   BLW
+2026-04-01 QQQ    12:48    DOWN $ 3.0  30   +1 STRONG TREND / EXPLOSIVE     79%  0.6x    -     -   ABV
+2026-04-17 SPY    08:47    UP   $ 3.0  30   +9 STRONG TREND / EXPLOSIVE     47%  1.2x    -     -   BLW
+2026-04-17 LLY    12:14    DOWN $ 3.0  30   +1 STRONG PIN                   53%  0.9x    H     -   BLW
+2026-03-30 QQQ    14:27    UP   $ 3.0  30   +0 STRONG PIN                   49%  1.1x    -     -   BLW
+2026-03-30 QQQ    13:41    DOWN $ 3.0  30   +0 STRONG PIN                   31%  1.0x    -     -   BLW
+2026-04-17 LLY    13:51    UP   $ 3.0  30   +1 STRONG PIN                   83%  1.3x    L     L   BLW
+2026-03-20 META   14:08    DOWN $ 3.0  30   +1 STRONG PIN                   16%  0.9x    -     -   BLW
+2026-04-15 TSLA   08:30    UP   $ 3.0  10   +7 STRONG TREND / EXPLOSIVE     55%  1.0x    -     -   BLW
+2026-04-09 SPY    10:33    UP   $ 3.0  30   +4 STRONG TREND / EXPLOSIVE     36%  2.7x    -     -   ABV
+2026-03-23 QQQ    12:16    UP   $ 3.0  30   -2 STRONG PIN                   29%  1.2x    L     -   BLW
+2026-04-01 QQQ    08:31    UP   $ 3.0  10   +6 STRONG TREND / EXPLOSIVE     38%  0.5x    -     -   BLW
+2026-03-25 QQQ    08:30    DOWN $ 3.0  30   -2 STRONG PIN                   51%  1.0x    -     -   ABV
+2026-04-15 AAPL   08:49    UP   $ 3.0  30   +6 STRONG TREND / EXPLOSIVE     44%  0.6x    L     L   BLW
+2026-04-20 TSLA   10:03    UP   $ 3.0  30   +6 STRONG TREND / EXPLOSIVE     47%  1.0x    -     -   BLW
+2026-03-30 SPY    14:27    UP   $ 3.0  30   -3 STRONG PIN                   55%  0.9x    -     -   BLW
+2026-04-15 AVGO   09:45    DOWN $ 3.0  30   +9 STRONG TREND / EXPLOSIVE     69%  0.9x    H     -   ABV
+2026-03-27 SPY    10:17    UP   $ 3.0  30   -2 MODERATE PIN                 66%  1.8x    L     L   BLW
+2026-04-20 SPY    09:24    DOWN $ 3.0  30   +4 MODERATE PIN                 12%  1.0x    -     -   ABV
+2026-03-20 META   09:02    UP   $ 3.0  30   +1 STRONG PIN                   20%  1.2x    -     -   BLW
+2026-03-30 SPY    13:41    DOWN $ 3.0  30   -3 STRONG PIN                   25%  1.1x    -     -   BLW
+2026-04-15 NVDA   11:23    DOWN $ 3.0  30   +8 STRONG TREND / EXPLOSIVE     45%  1.3x    H     -   ABV
+2026-03-20 SPY    12:55    DOWN $ 3.0  30   -1 MODERATE PIN                 89%  0.9x    H     -   BLW
+
+==============================================================================
+HOW TO READ THIS
+==============================================================================
+- TRIGGER PATTERNS section: any feature firing at >70% is a strong candidate.
+  If 'break high of last 15 bars' fires on >80% of UP launches, that's your alert.
+- TIME OF DAY: if launches cluster in a specific 30-min bucket, alert only in that window.
+- THESIS CONTEXT: if >70% of launches have the same regime/bias/cagf label,
+  gate alerts on that context to cut noise.
+- PER-LAUNCH DETAIL: scan visually for patterns — is every big one a break-of-15 + vol >= 2x?
+  Those line-item commonalities are where the trigger hides.
+- Done.
+
+
