@@ -3059,6 +3059,69 @@ body[data-account="clay"] {
   }
 }
 
+/* ─── v8.3 (Patch 2): Ticker search bar ───────────────────── */
+.trading-cards-search {
+  position: relative;
+  margin: 0 4px 12px;
+  max-width: 420px;
+}
+.trading-search-input {
+  width: 100%;
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid rgba(184, 175, 154, 0.18);
+  border-radius: 4px;
+  color: var(--text-muted);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  padding: 8px 32px 8px 12px;
+  outline: none;
+  transition: border-color 0.15s, box-shadow 0.15s, color 0.15s;
+}
+.trading-search-input::placeholder {
+  color: rgba(184, 175, 154, 0.45);
+}
+.trading-search-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 6px var(--accent-glow);
+  color: var(--accent-bright, var(--accent));
+}
+.trading-search-clear {
+  position: absolute;
+  top: 50%;
+  right: 6px;
+  transform: translateY(-50%);
+  width: 22px;
+  height: 22px;
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0;
+  border-radius: 3px;
+  transition: color 0.15s, background 0.15s;
+}
+.trading-search-clear:hover {
+  color: var(--accent);
+  background: rgba(184, 175, 154, 0.08);
+}
+
+/* Hidden cards: collapsed entirely so the grid reflows into a tight result set. */
+.tcard.tcard-hidden {
+  display: none !important;
+}
+
+/* "No tickers match X" inline message. */
+.trading-cards-empty {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: var(--text-dim, var(--text-muted));
+  padding: 16px 4px;
+  letter-spacing: 0.04em;
+}
+
 /* ─── Single card ─────────────────────────────────────── */
 .tcard {
   background: var(--bg-panel);

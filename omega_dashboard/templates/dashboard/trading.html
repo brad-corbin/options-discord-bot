@@ -31,6 +31,24 @@
     </div>
   </div>
 
+  <!-- v8.3 (Patch 2): Ticker search bar.
+       Live-filters the cards grid below by ticker prefix (case-insensitive).
+       Survives the 5s poll re-render. Esc clears, '/' focuses. -->
+  <div class="trading-cards-search">
+    <input type="text"
+           id="trading-search-input"
+           class="trading-search-input"
+           placeholder="Search ticker — e.g. AAPL  (press / to focus, Esc to clear)"
+           autocomplete="off"
+           spellcheck="false"
+           aria-label="Filter tickers" />
+    <button type="button"
+            id="trading-search-clear"
+            class="trading-search-clear"
+            aria-label="Clear search"
+            hidden>×</button>
+  </div>
+
   {% if page_data.error %}
     <div class="trading-cards-error">{{ page_data.error }}</div>
   {% endif %}
@@ -194,21 +212,112 @@
 
   function renderCards(cards) {
     grid.innerHTML = (cards || []).map(renderCard).join('');
+    // v8.3 (Patch 2): re-apply the active filter after every poll re-render
+    // so typed queries persist across the 5-second refresh cycle.
+    applyFilter();
   }
 
   function setStatus(state) {
     if (statusDot) statusDot.setAttribute('data-state', state);
   }
 
+  // v8.3 (Patch 2): retained from poll payloads so updateMeta can recompute
+  // the meta line when filter state changes between polls.
+  let lastPayload = null;
+
   function updateMeta(payload) {
-    if (metaTextEl && payload.tickers_total !== undefined) {
-      metaTextEl.innerHTML =
-        'Last update <span class="num" id="trading-last-update">' +
-        escapeHtml(payload.fetched_at_ct || '') + '</span> · ' +
-        (payload.tickers_with_data || 0) + ' of ' +
-        (payload.tickers_total || 0) + ' populated · refresh 5s';
+    if (!metaTextEl) return;
+    if (payload) lastPayload = payload;
+    const p = lastPayload || {};
+    const populated = p.tickers_with_data || 0;
+    const total = p.tickers_total || 0;
+    const fetched = p.fetched_at_ct || '';
+    let countStr;
+    if (currentFilter) {
+      // Show how many cards are currently visible after the prefix filter.
+      const visible = grid.querySelectorAll('.tcard:not(.tcard-hidden)').length;
+      countStr = visible + ' shown / ' + populated + ' populated';
+    } else {
+      countStr = populated + ' of ' + total + ' populated';
     }
+    metaTextEl.innerHTML =
+      'Last update <span class="num" id="trading-last-update">' +
+      escapeHtml(fetched) + '</span> · ' + countStr + ' · refresh 5s';
   }
+
+  // ─── v8.3 (Patch 2): client-side ticker filter ────────────────
+  // Pure DOM filter — no network, no page reload. Hides non-matching
+  // cards via the .tcard-hidden class. Match is case-insensitive prefix
+  // (typing "A" shows AAPL/AMZN/AVGO; typing "AM" narrows to AMZN).
+  const searchInput = document.getElementById('trading-search-input');
+  const searchClear = document.getElementById('trading-search-clear');
+  let currentFilter = '';
+  let emptyMsgEl = null;  // lazy-created "no matches" element
+
+  function applyFilter() {
+    const q = currentFilter;
+    const cards = grid.querySelectorAll('.tcard');
+    let visible = 0;
+    cards.forEach(function (card) {
+      const ticker = (card.getAttribute('data-ticker') || '').toUpperCase();
+      const match = !q || ticker.startsWith(q);
+      card.classList.toggle('tcard-hidden', !match);
+      if (match) visible += 1;
+    });
+    // No matches → show a small message inline above the grid.
+    if (q && visible === 0) {
+      if (!emptyMsgEl) {
+        emptyMsgEl = document.createElement('div');
+        emptyMsgEl.className = 'trading-cards-empty';
+        grid.parentNode.insertBefore(emptyMsgEl, grid);
+      }
+      emptyMsgEl.textContent = 'No tickers match "' + q + '"';
+      emptyMsgEl.hidden = false;
+    } else if (emptyMsgEl) {
+      emptyMsgEl.hidden = true;
+    }
+    // Keep the meta line accurate (e.g. "1 shown / 35 populated").
+    updateMeta(null);
+  }
+
+  function setFilter(raw) {
+    currentFilter = (raw || '').trim().toUpperCase();
+    if (searchClear) searchClear.hidden = !currentFilter;
+    applyFilter();
+  }
+
+  if (searchInput) {
+    searchInput.addEventListener('input', function () {
+      setFilter(searchInput.value);
+    });
+    searchInput.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Escape') {
+        searchInput.value = '';
+        setFilter('');
+        searchInput.blur();
+      }
+    });
+  }
+  if (searchClear) {
+    searchClear.addEventListener('click', function () {
+      if (searchInput) searchInput.value = '';
+      setFilter('');
+      if (searchInput) searchInput.focus();
+    });
+  }
+  // '/' anywhere on the page focuses the search box, like a vim/Notion shortcut.
+  // Skip if the user is already typing in some other input/textarea.
+  document.addEventListener('keydown', function (ev) {
+    if (ev.key !== '/') return;
+    const t = ev.target;
+    const tag = t && t.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || (t && t.isContentEditable)) return;
+    if (searchInput) {
+      ev.preventDefault();
+      searchInput.focus();
+      searchInput.select();
+    }
+  });
 
   let consecutiveFailures = 0;
 
