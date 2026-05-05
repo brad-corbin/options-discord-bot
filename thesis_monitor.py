@@ -90,6 +90,44 @@ except ImportError:
     MULTI_TOUCH_RECENT_TOUCH_MIN = 60
     BREAK_CONFIRM_POLLS = 3
 
+# ── v9 (Patch 4a): silent-default kill switch ─────────────────────────────
+# When STRICT_GEX_SIGN=1 in the environment, the historical silent default of
+# `gex_sign = "positive"` is replaced with "" (empty string = unknown). This
+# stops the system from fabricating a positive-gamma read whenever signal data
+# is missing. Defaults off (legacy behavior) so deploy is reversible by env var
+# alone — no code change required to roll back. Consumers using `==` checks
+# fall through cleanly on ""; consumers using `if X == "positive" else Y`
+# ternaries (6 sites at lines ~2938, 2941, 3299, 3307, 3339, 3342) will shift
+# to the else-branch on unknown inputs. That bias-shift is documented as a
+# known limitation; full fix is reader migration in Patch 5+. See
+# WALK1B_FINDINGS.md §5 Bug 2.
+import os as _os_p4a
+_STRICT_GEX_SIGN = _os_p4a.environ.get("STRICT_GEX_SIGN", "0") == "1"
+
+def _gex_sign_default() -> str:
+    """Returns the silent default for gex_sign. v9 (Patch 4a)."""
+    return "" if _STRICT_GEX_SIGN else "positive"
+
+# ── v9 (Patch 5): reader migration helper ──────────────────────────────────
+# Replaces six `if thesis.gex_sign == "positive" else ...` ternaries that
+# previously branched on a binary read of gex_sign and silently mishandled
+# unknown/transitional regimes. Each call site now provides three branches
+# explicitly: pin_range (suppression / positive gamma), trend_expansion
+# (negative gamma), and unknown (no flip data or transitional). The helper
+# reads `dealer_regime` from the ThesisContext, which is populated by the
+# wrapper-override-aware Patch 3 logic in build_thesis_from_em_card.
+def _gex_branch(dealer_regime, *, pin, trend, unknown):
+    """Three-way string select on dealer_regime. v9 (Patch 5).
+    pin   → returned when dealer_regime == 'pin_range' (suppression / GEX+)
+    trend → returned when dealer_regime == 'trend_expansion' (GEX-)
+    unknown → returned for 'unknown' or any other value (no flip / transitional)
+    """
+    if dealer_regime == "pin_range":
+        return pin
+    if dealer_regime == "trend_expansion":
+        return trend
+    return unknown
+
 MONITOR_POLL_INTERVAL_SEC = 60             # v7.0: was 300 — streaming spots are free, evaluate all tickers every cycle
 MONITOR_POLL_INTERVAL_FAST_SEC = 30        # v7.0: was 60 — streaming spots are instant, catch breaks 2x faster
 MONITOR_FAST_POLL_TICKERS = [              # v8.3.1: reverted to SPY/QQQ only.
@@ -481,7 +519,7 @@ def _contract_suggestion(
     Always returns a string safe to embed in the TRADE CARD block.
     """
     ticker     = getattr(thesis, "ticker",           "").upper() if thesis else ""
-    gex        = getattr(thesis, "gex_sign",         "positive") if thesis else "positive"
+    gex        = getattr(thesis, "gex_sign",         _gex_sign_default()) if thesis else _gex_sign_default()  # v9 (Patch 4a): env-gated silent default
     vol_regime = getattr(thesis, "volatility_regime", "NORMAL")  if thesis else "NORMAL"
     bias_score = getattr(thesis, "bias_score",        0)         if thesis else 0
     momentum   = getattr(state,  "momentum",          "NEUTRAL") if state  else "NEUTRAL"
@@ -960,7 +998,7 @@ class ThesisMonitorEngine:
             if not raw: return None
             d = json.loads(raw)
             levels = ThesisLevels(**{k: v for k, v in d.get("levels", {}).items() if k in ThesisLevels.__dataclass_fields__})
-            t = ThesisContext(ticker=d.get("ticker", ticker), bias=d.get("bias", "NEUTRAL"), bias_score=d.get("bias_score", 0), gex_sign=d.get("gex_sign", "positive"), gex_value=d.get("gex_value", 0), gex_value_sign=d.get("gex_value_sign", "neutral"), flip_location=d.get("flip_location", "unknown"), dealer_regime=d.get("dealer_regime", "unknown"), dex_value=d.get("dex_value", 0), vanna_value=d.get("vanna_value", 0), charm_value=d.get("charm_value", 0), regime=d.get("regime", "UNKNOWN"), volatility_regime=d.get("volatility_regime", "NORMAL"), vix=d.get("vix", 20), iv=d.get("iv", 0.20), prior_day_close=d.get("prior_day_close"), prior_day_context=d.get("prior_day_context", "NORMAL"), session_label=d.get("session_label", ""), created_at=d.get("created_at", ""), spot_at_creation=d.get("spot_at_creation", 0), levels=levels)
+            t = ThesisContext(ticker=d.get("ticker", ticker), bias=d.get("bias", "NEUTRAL"), bias_score=d.get("bias_score", 0), gex_sign=d.get("gex_sign", _gex_sign_default()), gex_value=d.get("gex_value", 0), gex_value_sign=d.get("gex_value_sign", "neutral"), flip_location=d.get("flip_location", "unknown"), dealer_regime=d.get("dealer_regime", "unknown"), dex_value=d.get("dex_value", 0), vanna_value=d.get("vanna_value", 0), charm_value=d.get("charm_value", 0), regime=d.get("regime", "UNKNOWN"), volatility_regime=d.get("volatility_regime", "NORMAL"), vix=d.get("vix", 20), iv=d.get("iv", 0.20), prior_day_close=d.get("prior_day_close"), prior_day_context=d.get("prior_day_context", "NORMAL"), session_label=d.get("session_label", ""), created_at=d.get("created_at", ""), spot_at_creation=d.get("spot_at_creation", 0), levels=levels)  # v9 (Patch 4a): env-gated silent default on Redis load
             # v15: restore ATM option data for premium stop
             t.atm_call_delta   = float(d.get("atm_call_delta", 0.0) or 0.0)
             t.atm_call_premium = float(d.get("atm_call_premium", 0.0) or 0.0)
@@ -2935,10 +2973,10 @@ class ThesisMonitorEngine:
         if ids or idr:
             g.append({"text": "— INTRADAY LEVELS —", "type": "divider"})
             if ids:
-                act = "Failed break = squeeze." if thesis.gex_sign == "positive" else "Break with momentum = short."
+                act = _gex_branch(thesis.dealer_regime, pin="Failed break = squeeze.", trend="Break with momentum = short.", unknown="Outcome depends on dealer flow — wait for confirmation.")  # v9 (Patch 5): reader migrated to dealer_regime
                 g.append({"text": f"Support: ${ids.price:.2f} ({ids.source.replace('_',' ')}, {ids.touches}x). {act}", "type": "info"})
             if idr:
-                act = "Failed break = fade." if thesis.gex_sign == "positive" else "Break with momentum = long."
+                act = _gex_branch(thesis.dealer_regime, pin="Failed break = fade.", trend="Break with momentum = long.", unknown="Outcome depends on dealer flow — wait for confirmation.")  # v9 (Patch 5): reader migrated to dealer_regime
                 g.append({"text": f"Resistance: ${idr.price:.2f} ({idr.source.replace('_',' ')}, {idr.touches}x). {act}", "type": "info"})
         if state.session_high is not None and state.session_low is not None:
             g.append({"text": f"Session: ${state.session_low:.2f}-${state.session_high:.2f} (${state.session_high - state.session_low:.2f} wide)", "type": "context"})
@@ -3296,7 +3334,7 @@ class ThesisMonitorEngine:
                 dte_line = _dte_guidance(tp["phase"], thesis.volatility_regime, thesis.vix)
                 if ba.direction == "DOWN":
                     direction = "LONG"
-                    rn = ("GEX+ — squeeze probability HIGH." if thesis.gex_sign == "positive" else "GEX- squeeze can run hard.")
+                    rn = _gex_branch(thesis.dealer_regime, pin="GEX+ — squeeze probability HIGH.", trend="GEX- squeeze can run hard.", unknown="Dealer regime unclear — moderate squeeze setup.")  # v9 (Patch 5): reader migrated to dealer_regime
                     contract_line = _contract_suggestion(_SETUP_FAILED_BREAKDOWN, direction, price, thesis, state, phase=tp["phase"])
                     if late:
                         events.append({"msg": f"🟩🚀🔥 FAILED BREAKDOWN — SQUEEZE LONG 🟩🚀🔥\n\n${ba.level:.2f} held after reclaim. Shorts trapped.\n⚠️ Extended {ext:.2f}% — DON'T CHASE.\nWait for retest.\nSTOP: below ${ba.level:.2f}\n{rn}\n\n— TRADE CARD —\n{dte_line}\n{contract_line}", "type": "critical", "priority": 5, "alert_key": f"fb_late_{ba.level:.2f}"})
@@ -3304,7 +3342,7 @@ class ThesisMonitorEngine:
                         events.append({"msg": f"🟩🚀🔥 FAILED BREAKDOWN — SQUEEZE LONG 🟩🚀🔥\n\n${ba.level:.2f} held after reclaim. Shorts trapped.\n\nENTRY: Now @ ~${price:.2f}\nSTOP: Below ${ba.level:.2f}\n{rn}\n\n— TRADE CARD —\n{dte_line}\n{contract_line}", "type": "critical", "priority": 5, "alert_key": f"fb_now_{ba.level:.2f}"})
                 else:
                     direction = "SHORT"
-                    rn = ("GEX+ — fade probability HIGH." if thesis.gex_sign == "positive" else "GEX- downside can accelerate.")
+                    rn = _gex_branch(thesis.dealer_regime, pin="GEX+ — fade probability HIGH.", trend="GEX- downside can accelerate.", unknown="Dealer regime unclear — moderate fade setup.")  # v9 (Patch 5): reader migrated to dealer_regime
                     contract_line = _contract_suggestion(_SETUP_FAILED_BREAKOUT, direction, price, thesis, state, phase=tp["phase"])
                     if late:
                         events.append({"msg": f"🟩🚀🔥 FAILED BREAKOUT — FADE SHORT 🟩🚀🔥\n\nLost + held. Longs trapped.\n⚠️ Extended {ext:.2f}% — DON'T CHASE.\nWait for retest.\nSTOP: above ${ba.level:.2f}\n{rn}\n\n— TRADE CARD —\n{dte_line}\n{contract_line}", "type": "critical", "priority": 5, "alert_key": f"fbo_late_{ba.level:.2f}"})
@@ -3336,10 +3374,10 @@ class ThesisMonitorEngine:
                 ba.retest_fired = True; tt = "💰 Naked calls" if thesis.gex_sign == "negative" else "💰 Call debit spread"
                 events.append({"msg": f"🎯 RETEST LONG ENTRY\n\nBreakout retested ${ba.level:.2f} and holding.\n\nENTRY: Now @ ~${price:.2f}\nSTOP: below ${ba.level:.2f}\n\n— TRADE CARD —\n{dte_line}\n{_contract_suggestion(_SETUP_RETEST_LONG, 'LONG', price, thesis, state, phase=tp['phase'])}", "type": "critical", "priority": 5, "alert_key": f"rt_long_{ba.level:.2f}"})
             elif ba.detected_as_failed and ba.direction == "DOWN" and net > (ba.level * 0.0008):
-                ba.retest_fired = True; tt = "💰 Call debit spread" if thesis.gex_sign == "positive" else "💰 Naked calls"
+                ba.retest_fired = True; tt = _gex_branch(thesis.dealer_regime, pin="💰 Call debit spread", trend="💰 Naked calls", unknown="💰 Call debit spread")  # v9 (Patch 5): reader migrated, unknown→safer spread
                 events.append({"msg": f"🎯 RETEST LONG (squeeze)\n\nFailed breakdown retested ${ba.level:.2f} and holding.\n\nENTRY: Now @ ~${price:.2f}\nSTOP: below ${ba.level:.2f}\n\n— TRADE CARD —\n{dte_line}\n{_contract_suggestion(_SETUP_RETEST_LONG, 'LONG', price, thesis, state, phase=tp['phase'])}", "type": "critical", "priority": 5, "alert_key": f"rt_fl_{ba.level:.2f}"})
             elif ba.detected_as_failed and ba.direction == "UP" and net < -(ba.level * 0.0008):
-                ba.retest_fired = True; tt = "💰 Put debit spread" if thesis.gex_sign == "positive" else "💰 Naked puts"
+                ba.retest_fired = True; tt = _gex_branch(thesis.dealer_regime, pin="💰 Put debit spread", trend="💰 Naked puts", unknown="💰 Put debit spread")  # v9 (Patch 5): reader migrated, unknown→safer spread
                 events.append({"msg": f"🎯 RETEST SHORT (fade)\n\nFailed breakout retested ${ba.level:.2f} and rejecting.\n\nENTRY: Now @ ~${price:.2f}\nSTOP: above ${ba.level:.2f}\n\n— TRADE CARD —\n{dte_line}\n{_contract_suggestion(_SETUP_RETEST_SHORT, 'SHORT', price, thesis, state, phase=tp['phase'])}", "type": "critical", "priority": 5, "alert_key": f"rt_fs_{ba.level:.2f}"})
         return events
 

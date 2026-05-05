@@ -11566,6 +11566,34 @@ def _log_em_prediction(ticker: str, session: str, spot: float, em: dict, bias: d
             # v8.3: GEX polarity + gamma flip distance for launch studies
             "gex_value": eng.get("gex", 0),
             "gex_sign": "positive" if eng.get("gex", 0) >= 0 else "negative",
+            # v9 (Patch 4b): explicit-field companions to legacy gex_sign. ─────
+            # gex_value_sign — literal sign of net GEX (no flip override).
+            #   Matches the existing gex_sign here (which is already literal),
+            #   but renamed explicitly so consumers know it's not the
+            #   wrapper-overridden version.
+            # flip_location — spot vs gamma_flip with ±0.25% band.
+            # dealer_regime — mirrors thesis_monitor's wrapper-override
+            #   semantics so journaling captures the same regime label that
+            #   thesis_monitor actually used at runtime.
+            # Same formulas as thesis_monitor.build_thesis_from_em_card §6.
+            "gex_value_sign": (
+                "positive" if eng.get("gex", 0) > 0
+                else "negative" if eng.get("gex", 0) < 0
+                else "neutral"
+            ),
+            "flip_location": (
+                ("at_flip" if abs((spot - (struct.get("gamma_flip") or eng.get("flip_price"))) /
+                                  (struct.get("gamma_flip") or eng.get("flip_price")) * 100) < 0.25
+                 else ("above_flip" if spot > (struct.get("gamma_flip") or eng.get("flip_price"))
+                       else "below_flip"))
+                if (struct.get("gamma_flip") or eng.get("flip_price")) and spot else "unknown"
+            ),
+            "dealer_regime": (
+                ("pin_range" if ((struct.get("gamma_flip") or eng.get("flip_price")) - spot) / spot * 100 < -1.5
+                 else "trend_expansion" if ((struct.get("gamma_flip") or eng.get("flip_price")) - spot) / spot * 100 > 1.5
+                 else ("pin_range" if eng.get("gex", 0) >= 0 else "trend_expansion"))
+                if (struct.get("gamma_flip") or eng.get("flip_price")) and spot else "unknown"
+            ),
             "dex_value": eng.get("dex", 0),
             "gamma_flip_distance": (spot - (struct.get("gamma_flip") or eng.get("flip_price") or spot)) if spot else 0,
             "cagf_direction": (cagf or {}).get("direction"),
@@ -11590,7 +11618,7 @@ def _log_em_prediction(ticker: str, session: str, spot: float, em: dict, bias: d
             "pin_zone_low","pin_zone_high","pivot","r1","s1","r2","s2","swing_high","swing_low",
             "fib_resistance","fib_support","vp_resistance","vp_support","vpoc","local_resistance_1","local_support_1",
             "local_resistance_sources","local_support_sources","structure_confluence",
-            "gex_value","gex_sign","dex_value","gamma_flip_distance",
+            "gex_value","gex_sign","gex_value_sign","flip_location","dealer_regime","dex_value","gamma_flip_distance",  # v9 (Patch 4b): explicit-field companions to gex_sign
             "cagf_direction","cagf_regime","trend_day_probability",
             "vol_regime_label","vol_regime_base","vol_caution_score","vol_transition_warning","vol_term_structure","vol_vvix","vol_size_mult"
         ]

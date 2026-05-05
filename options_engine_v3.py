@@ -56,6 +56,19 @@ from trading_rules import (
     get_em_strike_multiplier, get_naked_dte_range,
 )
 
+# ── v9 (Patch 4a): silent-default kill switch ─────────────────────────────
+# Mirror of thesis_monitor.py's helper. When STRICT_GEX_SIGN=1 in the env,
+# the historical silent default of `gex_sign = "positive"` is replaced with
+# "" at the two webhook unpack sites below (lines ~2586, ~2641). Defaults
+# off so deploy is reversible by env var alone. See WALK1B_FINDINGS.md §5
+# Bug 2 and DEPLOY_v9_p4a.md.
+import os as _os_p4a
+_STRICT_GEX_SIGN = _os_p4a.environ.get("STRICT_GEX_SIGN", "0") == "1"
+
+def _gex_sign_default() -> str:
+    """Returns the silent default for gex_sign. v9 (Patch 4a)."""
+    return "" if _STRICT_GEX_SIGN else "positive"
+
 # Phase 2.4: optional V2 5D edge model context. This is ranking-only;
 # it does not fetch chains, open trades, or replace the existing builder.
 try:
@@ -2583,7 +2596,7 @@ def recommend_trade(
         # v5.1: Try long option fallback before giving up
         _naked_check = should_use_long_option(
             bias=bias, vix=_vix_val,
-            gex_sign=webhook_data.get("gex_sign", v4_flow.get("gex_sign", "positive") if v4_flow else "positive"),
+            gex_sign=webhook_data.get("gex_sign", v4_flow.get("gex_sign", _gex_sign_default()) if v4_flow else _gex_sign_default()),  # v9 (Patch 4a): env-gated silent default
             confidence=webhook_data.get("pre_confidence", 50),
             dte=dte,
             is_snapback=webhook_data.get("is_snapback", False),
@@ -2638,7 +2651,7 @@ def recommend_trade(
         # v5.1: Try long option fallback when all spreads fail slippage
         _naked_check = should_use_long_option(
             bias=bias, vix=_vix_val,
-            gex_sign=webhook_data.get("gex_sign", v4_flow.get("gex_sign", "positive") if v4_flow else "positive"),
+            gex_sign=webhook_data.get("gex_sign", v4_flow.get("gex_sign", _gex_sign_default()) if v4_flow else _gex_sign_default()),  # v9 (Patch 4a): env-gated silent default
             confidence=webhook_data.get("pre_confidence", 50),
             dte=dte,
             is_snapback=webhook_data.get("is_snapback", False),
