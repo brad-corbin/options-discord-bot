@@ -115,7 +115,10 @@ def _gex_sign_default() -> str:
 # explicitly: pin_range (suppression / positive gamma), trend_expansion
 # (negative gamma), and unknown (no flip data or transitional). The helper
 # reads `dealer_regime` from the ThesisContext, which is populated by the
-# wrapper-override-aware Patch 3 logic in build_thesis_from_em_card.
+# geometric classifier in build_thesis_from_em_card. Post-Patch-9 the raw
+# gex_sign and dealer_regime agree by construction (SqueezeMetrics convention
+# at source), so this helper produces the same routing as a `gex_sign` read
+# would in normal data, but with cleaner three-way semantics for unknowns.
 def _gex_branch(dealer_regime, *, pin, trend, unknown):
     """Three-way string select on dealer_regime. v9 (Patch 5).
     pin   → returned when dealer_regime == 'pin_range' (suppression / GEX+)
@@ -4421,20 +4424,27 @@ def build_thesis_from_em_card(ticker, spot, bias, eng, em, walls, cagf=None, vix
         if gap > 0.5: prior_ctx = "GAP_UP" if spot > prior_day_close else "GAP_DOWN"
     gex_val = eng.get("gex", 0); gex_sign = "positive" if gex_val >= 0 else "negative"
     flip = eng.get("flip_price")
-    if flip is not None and spot > 0:
-        d = (flip - spot) / spot * 100
-        if d > 1.5: gex_sign = "negative"; log.info(f"Thesis GEX overridden: raw {gex_val:+.1f}M but spot {d:.1f}% below flip → negative")
-        elif d < -1.5: gex_sign = "positive"; log.info(f"Thesis GEX overridden: raw {gex_val:+.1f}M but spot {-d:.1f}% above flip → positive")  # v9 (Patch 4c): symmetric log
-    # ── v9 (Patch 3): additive explicit fields. ────────────────────────────────
-    # Three new fields populated alongside legacy gex_sign. NOT YET READ by any
-    # downstream consumer — they exist for forward migration. dealer_regime is
-    # constructed to mirror the wrapper-override semantics above so it stays in
-    # lockstep with gex_sign for every production ticker. See WALK1B_FINDINGS.md
-    # §6 for the full audit. The block is self-contained: it does NOT rely on
-    # the override block's `d` being in scope (override gates on
-    # `flip is not None and spot > 0`, which is approximately but not identically
-    # equivalent to the guard below). Recomputing is cheap and removes the
-    # cross-block dependency.
+    # Patch 9 (convention flip): the gex_sign override block that lived here is removed.
+    # Post-flip, raw gex_val agrees with geometric direction by construction (above flip → +,
+    # below flip → −) because _exposures now uses SqueezeMetrics convention. If raw and
+    # geometric ever disagree post-deploy, dealer_regime (computed below) is the geometric
+    # authority and gex_sign is the raw signal — divergence between them is a data anomaly
+    # worth investigating, not a workaround opportunity.
+    # ── v9 (Patch 9): explicit fields, post-convention-flip semantics. ─────────
+    # gex_value_sign / gex_sign — literal sign of net GEX. Post-Patch-9 these
+    #   represent SqueezeMetrics-aligned signal: positive above flip, negative
+    #   below flip in the typical case. They agree with dealer_regime by
+    #   construction in normal data.
+    # flip_location — spot vs gamma_flip with ±0.25% band, geometric.
+    # dealer_regime — geometric regime label. Read by the migrated consumers
+    #   from Patch 5 (entry_validator, exit_policy, options_engine_v3, etc.)
+    #   via `_gex_branch(dealer_regime, ...)`. Authoritative for routing.
+    #
+    # Divergence between gex_sign and dealer_regime in production data is
+    # a signal of a flow anomaly worth investigating, not a workaround
+    # opportunity. Pre-Patch-9 there was an override block here that forced
+    # them to agree; that block was removed because raw and geometric now
+    # agree by construction post-flip.
     # Field 1 — literal sign of net GEX value
     if gex_val > 0:
         gex_value_sign = "positive"
@@ -4453,19 +4463,19 @@ def build_thesis_from_em_card(ticker, spot, bias, eng, em, walls, cagf=None, vix
             flip_location = "below_flip"
     else:
         flip_location = "unknown"
-    # Field 3 — dealer regime, mirrors the wrapper override semantics. Recompute
-    # `d` with the same formula as the override block above so the ±1.5% band
-    # matches exactly.
+    # Field 3 — dealer regime, geometric authority for the regime label.
+    # Post-Patch-9, raw gex_val (above) and dealer_regime (here) agree by
+    # construction because _exposures uses SqueezeMetrics convention.
     if flip and spot:
-        _d_override = (flip - spot) / spot * 100   # same formula as override
+        _d_override = (flip - spot) / spot * 100
         if _d_override < -1.5:
             dealer_regime = "pin_range"            # spot well above flip
         elif _d_override > 1.5:
             dealer_regime = "trend_expansion"      # spot well below flip
         else:
-            # Within ±1.5% band — fall back to literal sign (matches wrapper's
-            # behavior of using the initial gex_sign assignment when override
-            # doesn't fire).
+            # Within ±1.5% band — fall back to literal sign of raw GEX.
+            # Post-Patch-9 this is correct: raw sign is SqueezeMetrics-aligned,
+            # so positive → pin_range and negative → trend_expansion.
             dealer_regime = "pin_range" if gex_val >= 0 else "trend_expansion"
     else:
         dealer_regime = "unknown"

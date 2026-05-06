@@ -11750,6 +11750,12 @@ def _log_em_prediction(ticker: str, session: str, spot: float, em: dict, bias: d
             "local_support_sources": struct.get("local_support_sources"),
             "structure_confluence": struct.get("structure_confluence"),
             # v8.3: GEX polarity + gamma flip distance for launch studies
+            # Patch 9 (convention flip): convention_version=2 marks rows produced under
+            # SqueezeMetrics-aligned dealer-side convention (post-Patch-9). Pre-Patch-9
+            # rows have no convention_version field (NULL/missing) and carry inverted
+            # signs on gex_value / dex_value / vanna_value / charm_value. Analytical
+            # code joining pre/post-cutover rows MUST filter or branch on this column.
+            "convention_version": 2,
             "gex_value": eng.get("gex", 0),
             "gex_sign": "positive" if eng.get("gex", 0) >= 0 else "negative",
             # v9 (Patch 4b): explicit-field companions to legacy gex_sign. ─────
@@ -11806,7 +11812,12 @@ def _log_em_prediction(ticker: str, session: str, spot: float, em: dict, bias: d
             "local_resistance_sources","local_support_sources","structure_confluence",
             "gex_value","gex_sign","gex_value_sign","flip_location","dealer_regime","dex_value","gamma_flip_distance",  # v9 (Patch 4b): explicit-field companions to gex_sign
             "cagf_direction","cagf_regime","trend_day_probability",
-            "vol_regime_label","vol_regime_base","vol_caution_score","vol_transition_warning","vol_term_structure","vol_vvix","vol_size_mult"
+            "vol_regime_label","vol_regime_base","vol_caution_score","vol_transition_warning","vol_term_structure","vol_vvix","vol_size_mult",
+            # Patch 9: convention_version MUST stay at the END of fieldnames. New columns
+            # appended at the end leave existing rows correctly aligned (just NULL in the
+            # new column). Mid-list insertion would shift all subsequent columns and
+            # corrupt historical-row alignment when Sheets sync rewrites the header.
+            "convention_version",
         ]
         _append_csv_row("em_predictions.csv", fieldnames, entry)
         _append_jsonl("em_predictions.jsonl", entry)
@@ -12810,22 +12821,13 @@ def _build_action_block(
     range_low = em.get("bear_1sd")
     range_high = em.get("bull_1sd")
 
-    # v4.3: Reconcile GEX sign with gamma flip position.
-    # Raw GEX can be positive, but if spot is far below the flip,
-    # the effective dealer positioning is amplifying, not suppressing.
-    # This catches the contradiction where the card says "GEX positive"
-    # while spot is $17 below the flip in full trending territory.
+    # Patch 9 (convention flip): the gex_positive override block that lived here is removed.
+    # Pre-Patch-9, raw GEX could be positive while spot was below flip (and vice versa)
+    # because _exposures used the inverted dealer-side convention. Post-flip, raw GEX
+    # sign matches geometric direction by construction (above flip → +, below flip → −),
+    # so the override is dead code. dealer_regime remains the authoritative geometric
+    # label downstream.
     gex_positive = tgex >= 0
-    if flip is not None and spot > 0:
-        dist_from_flip_pct = (flip - spot) / spot * 100
-        if dist_from_flip_pct > 1.5:
-            # Spot is meaningfully below flip — effective gamma is negative
-            # even if raw GEX number is positive
-            gex_positive = False
-            log.info(f"GEX sign overridden: raw GEX {tgex:+.1f}M but spot is {dist_from_flip_pct:.1f}% below flip — treating as negative gamma")
-        elif dist_from_flip_pct < -1.5:
-            # Spot is meaningfully above flip — effective gamma is positive
-            gex_positive = True
 
     # v4.3: Pin zone sanity — check if it's actionable or absurdly wide
     pin_actionable = False

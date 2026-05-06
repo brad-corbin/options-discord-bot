@@ -91,8 +91,10 @@ def _calc_bias(spot: float, em: dict, walls: dict, skew: dict,
                 signals.append(("◆", f"[FLIP 0] Price ${spot:.2f} is at gamma flip ${fp:.2f} ({dist_pct:+.2f}%) — pin/chop expected, no directional edge."))
             elif spot > fp:
                 score += 2
-                ctx = "range-bound bias" if tgex > 0 else "above flip but still negative GEX — trending likely"
-                signals.append(("▲▲", f"[FLIP +2] Price ${spot:.2f} is {abs(dist_pct):.1f}% ABOVE gamma flip ${fp:.2f} — {ctx}. Dealers suppress volatility above this level."))
+                # Patch 9 (convention flip): raw tgex now agrees with geometric above flip
+                # by construction. The pre-Patch-9 "tgex > 0 ? range-bound : trending likely"
+                # split papered over the inverted convention; it's no longer needed.
+                signals.append(("▲▲", f"[FLIP +2] Price ${spot:.2f} is {abs(dist_pct):.1f}% ABOVE gamma flip ${fp:.2f} — range-bound bias. Dealers suppress volatility above this level."))
             else:
                 score -= 2
                 signals.append(("▼▼", f"[FLIP -2] Price ${spot:.2f} is {abs(dist_pct):.1f}% BELOW gamma flip ${fp:.2f} — dealers AMPLIFY every move from here. Momentum and breakout setups favored."))

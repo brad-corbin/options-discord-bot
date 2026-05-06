@@ -733,8 +733,25 @@ class ExposureEngine:
         return{"type":ot,"strike":K,"days_to_exp":row.days_to_exp,"T":T,"iv":sigma,"oi":row.open_interest,"volume":row.volume,"S":S,"q":q,"contract_size":row.contract_size,"delta":delta,"gamma":gamma,"vanna":vanna,"charm":charm,"volga":volga,"speed":speed,"theta":theta,"rho":rho,"price":price,"exercise_style":row.exercise_style.value,"bid":row.bid,"ask":row.ask,"last":row.last,"oi_change":row.oi_change,"dealer_sign_confidence":conf,"inferred_side":row.inferred_side}
     def _exposures(self,d):
         S,oi,mul,ot=d["S"],d["oi"],d["contract_size"],d["type"];conf=d["dealer_sign_confidence"]
-        ds=-1 if ot=="call" else 1;gs=-1 if ot=="call" else 1
-        if d["inferred_side"]==TradeSide.SELL and conf>0.65: ds=-ds;gs=-gs
+        # Patch 9 (convention flip): dealer-side defaults are SqueezeMetrics convention —
+        # dealer is LONG calls (ds/gs = +1) and SHORT puts (ds/gs = -1). This matches
+        # the dominant SPX flow post-2008: customers buy OTM puts and sell OTM calls,
+        # so dealers take the inverse of those positions. See "The Implied Order Book"
+        # (SqueezeMetrics 2020) p1 + p4 + p8 for the canonical statement of this
+        # convention.
+        ds=1 if ot=="call" else -1;gs=1 if ot=="call" else -1
+        # Per-contract override: when transaction-level flow analysis shows this
+        # specific contract bucked the default customer-side assumption, flip the
+        # dealer side. Default for calls is customer-SOLD, so flip on observed BUY.
+        # Default for puts is customer-BOUGHT, so flip on observed SELL. (Pre-Patch-9
+        # this was a single symmetric `==SELL` check, which only worked correctly for
+        # one of the two option types under any given convention. The asymmetric flip
+        # below is the consistent fix.)
+        if conf>0.65 and (
+            (ot=="call" and d["inferred_side"]==TradeSide.BUY) or
+            (ot=="put"  and d["inferred_side"]==TradeSide.SELL)
+        ):
+            ds=-ds;gs=-gs
         return{**d,"dex":ds*d["delta"]*oi*mul*S,"gex":gs*d["gamma"]*oi*mul*S**2*0.01,"vanna_exp":ds*d["vanna"]*oi*mul*S,"charm_exp":ds*d["charm"]*oi*mul*S,"volga_exp":gs*d["volga"]*oi*mul*0.01,"speed_exp":gs*d["speed"]*oi*mul*S**2*0.01,"theta_exp":ds*d["theta"]*oi*mul,"rho_exp":ds*d["rho"]*oi*mul}
     def compute(self,rows):
         enriched=[self._exposures(self._enrich(r))for r in rows]
