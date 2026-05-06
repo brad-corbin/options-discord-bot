@@ -7054,18 +7054,21 @@ def _is_http_429(exc: Exception) -> bool:
 # OPTIONS CHAIN — SCALP (0-10 DTE)
 # ─────────────────────────────────────────────────────────
 
-def get_options_chain(ticker: str, side: str = None, strike_limit: int = 20) -> list:
+def get_options_chain(ticker: str, side: str = None, strike_limit: int | None = None) -> list:
     """Fetch option chains for scalp-eligible expirations (0-10 DTE).
 
-    v5.1.1 API credit optimization:
-    MarketData.app charges 1 credit PER option symbol returned.
-    SPY full chain = 390 credits. With strikeLimit=20 + side filter = ~20 credits.
-    This single change saves ~70,000 credits/day.
+    v9 (Patch 7): default strike_limit changed from 20 → None (full chain).
+    The v5.1.1 default of 20 was a MarketData.app credit-saving optimization
+    (1 credit per option symbol). Schwab — the current primary provider —
+    charges per-call, not per-symbol, so widening costs nothing while
+    restoring the engine's ability to find gamma_flip for high-vol tickers.
+    See Walk 1E.
 
     Args:
-        side: "call" or "put" — fetch one side only (50% credit savings)
-        strike_limit: limit to N nearest-ATM strikes per side (default 20).
-                      Set to None for full chain (OI sweep).
+        side: "call" or "put" — fetch one side only (still useful for parallelism)
+        strike_limit: limit to N nearest-ATM strikes per side. Default None
+                      (full chain). Callers may still pass a small int for
+                      bandwidth-bounded contexts (e.g. streaming subscriptions).
     """
     from trading_rules import MAX_EXPIRATIONS_TO_PULL
     ticker = ticker.strip().upper()
@@ -7155,9 +7158,11 @@ def get_options_chain(ticker: str, side: str = None, strike_limit: int = 20) -> 
 # OPTIONS CHAIN — SWING (7-60 DTE)
 # ─────────────────────────────────────────────────────────
 
-def get_options_chain_swing(ticker: str, side: str = None, strike_limit: int = 20) -> list:
-    """Fetch swing chains (7-60 DTE) with credit-saving filters.
-    v5.1.1: strikeLimit + side filter saves ~80-95% of chain credits."""
+def get_options_chain_swing(ticker: str, side: str = None, strike_limit: int | None = None) -> list:
+    """Fetch swing chains (7-60 DTE) with full chain by default.
+    v9 (Patch 7): default strike_limit changed from 20 → None. The v5.1.1
+    20-strike default was a MarketData.app credit constraint that no longer
+    applies to Schwab (per-call billing). See Walk 1E."""
     from swing_engine import SWING_MIN_DTE, SWING_MAX_DTE, SWING_MAX_EXPIRATIONS
     ticker = ticker.strip().upper()
     exps   = get_expirations(ticker)
@@ -7224,7 +7229,7 @@ def get_options_chain_swing(ticker: str, side: str = None, strike_limit: int = 2
 
 def _get_contracts_for_expiry(ticker: str, exp: str) -> list:
     """Fetch a single-expiry chain snapshot for wheel/monitor suggestions."""
-    data = _cached_md.get_chain(ticker, exp, strike_limit=20)  # v5.1.1: strikeLimit saves credits
+    data = _cached_md.get_chain(ticker, exp, strike_limit=None)  # v9 (Patch 7): credit-era strike_limit=20 was a MarketData artifact; Schwab charges per-call. See Walk 1E.
     if not isinstance(data, dict) or data.get("s") != "ok":
         return []
     sym_list = data.get("optionSymbol") or []
@@ -10182,7 +10187,7 @@ def _get_0dte_chain(ticker: str, target_date_str: str = None) -> tuple:
         if cached:
             return cached
         _spot = get_spot(ticker)
-        _data = _cached_md.get_chain(ticker, exp_str, strike_limit=20)
+        _data = _cached_md.get_chain(ticker, exp_str, strike_limit=None)  # v9 (Patch 7): credit-era strike_limit=20 was a MarketData artifact; Schwab charges per-call. Restores engine's gamma_flip detection for high-vol tickers (AMD/ARM/COIN/LLY/MRNA/MSTR/SMCI). See Walk 1E.
         if (not isinstance(_data, dict)
                 or _data.get("s") != "ok"
                 or not _data.get("optionSymbol")):
@@ -10414,6 +10419,45 @@ def _get_0dte_iv(ticker: str, target_date_str: str = None) -> tuple:
         v4["iv"] = final_iv
         v4["iv_meta"] = iv_meta
         vix = _discover_vix_market_snapshot()
+
+        # ── v9 (Patch 7): diagnostic log for missing gamma_flip ──────────────
+        # When the engine can't find a zero-crossing in its ±10% spot sweep,
+        # walls.gamma_flip stays None → flip_location="unknown" →
+        # dealer_regime="unknown". With Patch 7's full-chain widening this
+        # should be rare; when it does happen we want enough context to tell
+        # whether the chain is still too narrow vs the flip being genuinely
+        # outside the engine's ±10% sweep band. See Walk 1E.
+        try:
+            _eng_result = v4.get("engine_result", {}) or {}
+            _flip = _eng_result.get("flip_price")
+            if _flip is None:
+                _strikes = data.get("strike", []) if isinstance(data, dict) else []
+                _strikes_clean = [float(s) for s in _strikes if isinstance(s, (int, float)) and s and s > 0]
+                _row_count = len(data.get("optionSymbol", []) if isinstance(data, dict) else [])
+                _gex_val = _eng_result.get("gex")
+                _gex_sign = _eng_result.get("gex_sign", "unknown")
+                if _strikes_clean:
+                    _smin, _smax = min(_strikes_clean), max(_strikes_clean)
+                    _band_low, _band_high = spot * 0.90, spot * 1.10
+                    _covers_band = (_smin <= _band_low and _smax >= _band_high)
+                    log.warning(
+                        f"flip_price=None [_get_0dte_iv] {ticker} {target}: "
+                        f"spot={spot:.2f} rows={_row_count} "
+                        f"strike_range=[{_smin:.2f},{_smax:.2f}] "
+                        f"sweep_band=[{_band_low:.2f},{_band_high:.2f}] "
+                        f"covers_band={_covers_band} "
+                        f"gex={_gex_val} sign={_gex_sign}"
+                    )
+                else:
+                    log.warning(
+                        f"flip_price=None [_get_0dte_iv] {ticker} {target}: "
+                        f"spot={spot:.2f} chain_empty rows={_row_count} "
+                        f"gex={_gex_val} sign={_gex_sign}"
+                    )
+        except Exception as _e:
+            log.debug(f"Patch 7 diagnostic log failed for {ticker}: {_e}")
+        # ── end v9 (Patch 7) ─────────────────────────────────────────────────
+
         enriched_walls = _derive_structure_levels_from_chain(data, spot, v4.get("walls", {}), v4.get("engine_result", {}))
 
         return (
@@ -10435,7 +10479,7 @@ def _get_chain_for_expiry(ticker: str, target_date_str: str) -> tuple:
         if cached:
             return cached
         spot = get_spot(ticker)
-        data = _cached_md.get_chain(ticker, target_date_str, strike_limit=20)  # v5.1.1: strikeLimit saves credits
+        data = _cached_md.get_chain(ticker, target_date_str, strike_limit=None)  # v9 (Patch 7): credit-era strike_limit=20 was a MarketData artifact; Schwab charges per-call. See Walk 1E.
         if not isinstance(data, dict) or data.get("s") != "ok" or not data.get("optionSymbol"):
             return None, None, None
         _chain_cache_set(ticker, target_date_str, data, spot)
@@ -10705,6 +10749,38 @@ def _get_chain_iv_for_expiry(ticker: str, target_date_str: str, dte: float) -> t
         v4["iv"] = final_iv
         v4["iv_meta"] = iv_meta
         vix = _discover_vix_market_snapshot()
+
+        # ── v9 (Patch 7): diagnostic log for missing gamma_flip — see Walk 1E ──
+        try:
+            _eng_result = v4.get("engine_result", {}) or {}
+            _flip = _eng_result.get("flip_price")
+            if _flip is None:
+                _strikes = data.get("strike", []) if isinstance(data, dict) else []
+                _strikes_clean = [float(s) for s in _strikes if isinstance(s, (int, float)) and s and s > 0]
+                _row_count = len(data.get("optionSymbol", []) if isinstance(data, dict) else [])
+                _gex_val = _eng_result.get("gex")
+                _gex_sign = _eng_result.get("gex_sign", "unknown")
+                if _strikes_clean:
+                    _smin, _smax = min(_strikes_clean), max(_strikes_clean)
+                    _band_low, _band_high = spot * 0.90, spot * 1.10
+                    _covers_band = (_smin <= _band_low and _smax >= _band_high)
+                    log.warning(
+                        f"flip_price=None [_get_chain_iv_for_expiry] {ticker} {target}: "
+                        f"spot={spot:.2f} rows={_row_count} "
+                        f"strike_range=[{_smin:.2f},{_smax:.2f}] "
+                        f"sweep_band=[{_band_low:.2f},{_band_high:.2f}] "
+                        f"covers_band={_covers_band} "
+                        f"gex={_gex_val} sign={_gex_sign}"
+                    )
+                else:
+                    log.warning(
+                        f"flip_price=None [_get_chain_iv_for_expiry] {ticker} {target}: "
+                        f"spot={spot:.2f} chain_empty rows={_row_count} "
+                        f"gex={_gex_val} sign={_gex_sign}"
+                    )
+        except Exception as _e:
+            log.debug(f"Patch 7 diagnostic log failed for {ticker}: {_e}")
+
         enriched_walls = _derive_structure_levels_from_chain(data, spot, v4.get("walls", {}), v4.get("engine_result", {}))
         return (final_iv, spot, target, v4.get("engine_result", {}), enriched_walls,
                 v4.get("skew", {}), v4.get("pcr", {}), vix, v4)
@@ -11517,6 +11593,10 @@ def _log_em_prediction(ticker: str, session: str, spot: float, em: dict, bias: d
         now_dt = datetime.now(timezone.utc)
         now_str = now_dt.strftime("%Y-%m-%d")
         key = f"em_log:{now_str}:{ticker}:{session}"
+        # v9 (Patch 7): redundant — walls already enriched in _get_0dte_iv at line 10461
+        # via _derive_structure_levels_from_chain(data, ...). The {} here is a no-op
+        # that returns input walls unchanged. Documented (not removed) so future audits
+        # don't flag this as data loss. See Walk 1E findings.
         chain_struct = _derive_structure_levels_from_chain({}, spot, walls or {}, eng or {})
         price_struct = _compute_price_structure_levels(ticker, spot, days=90)
         struct = _merge_price_structure_with_walls(price_struct, chain_struct, spot, em)
@@ -12335,6 +12415,9 @@ def _post_em_card(ticker: str, session: str):
             if _daily and len(_daily) >= 2:
                 _prior_close = _daily[-2] if isinstance(_daily[-2], (int, float)) else None
 
+            # v9 (Patch 7): redundant — walls already enriched in _get_0dte_iv at line 10461
+            # via _derive_structure_levels_from_chain(data, ...). The {} here is a no-op
+            # that returns input walls unchanged. Documented (not removed). See Walk 1E.
             _thesis_chain_struct = _derive_structure_levels_from_chain({}, spot, walls or {}, eng or {})
             _thesis_price_struct = _compute_price_structure_levels(ticker, spot, days=90)
             _thesis_local_walls = _merge_price_structure_with_walls(_thesis_price_struct, _thesis_chain_struct, spot, em)
@@ -12470,6 +12553,9 @@ def _generate_silent_thesis(ticker: str, refresh_only: bool = False):
         bias = _calc_bias(spot, em, walls or {}, skew or {}, eng or {}, pcr or {}, vix or {})
 
         # Derive structural levels (same as full EM card)
+        # v9 (Patch 7): redundant — walls already enriched in _get_0dte_iv at line 10461
+        # via _derive_structure_levels_from_chain(data, ...). The {} here is a no-op
+        # that returns input walls unchanged. Documented (not removed). See Walk 1E.
         _chain_struct = _derive_structure_levels_from_chain({}, spot, walls or {}, eng or {})
         _price_struct = _compute_price_structure_levels(ticker, spot, days=90)
         _local_walls = _merge_price_structure_with_walls(_price_struct, _chain_struct, spot, em)
@@ -12935,6 +13021,9 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
             card_title = f"TRADE SETUP ({effective_dte_label})"
 
         def no_trade(reason, emoji="🟡"):
+            # v9 (Patch 7): redundant — walls already enriched upstream (caller
+            # received walls from _get_0dte_iv via the v4 pipeline). The {} is a
+            # no-op that returns input walls unchanged. Documented (not removed). See Walk 1E.
             chain_struct = _derive_structure_levels_from_chain({}, spot, walls or {}, eng or {})
             price_struct = _compute_price_structure_levels(ticker, spot, days=90)
             local_walls = _merge_price_structure_with_walls(price_struct, chain_struct, spot, em)
@@ -13130,6 +13219,8 @@ def _post_trade_card(ticker, spot, expiration, eng, walls, bias, em, vix, pcr,
             no_trade(f"Data quality LOW ({conf_score:.0%}) — {dg_str}", "⚠️")
             return
 
+        # v9 (Patch 7): redundant — walls already enriched upstream. The {} is a no-op
+        # that returns input walls unchanged. Documented (not removed). See Walk 1E.
         local_struct = _merge_price_structure_with_walls(
             _compute_price_structure_levels(ticker, spot, days=90),
             _derive_structure_levels_from_chain({}, spot, walls or {}, eng or {}),
@@ -14205,15 +14296,15 @@ def _em_scheduler():
                         def _oi_forward_chain_fn(ticker: str, expiration: str):
                             """
                             Fetch a specific forward expiration chain for OI tracking.
-                            Uses feed=cached (1 credit total) + strikeLimit=None for
-                            SPY/QQQ, strikeLimit=20 for everything else.
+                            v9 (Patch 7): full chain for all tickers (was SPY/QQQ-only
+                            with strike_limit=20 elsewhere). Schwab charges per-call,
+                            so the per-ticker special case carried no cost benefit while
+                            starving non-SPY/QQQ OI sweeps of strikes needed to detect
+                            institutional buildup at far strikes. See Walk 1E.
                             """
                             try:
-                                full_chain_tickers = {"SPY", "QQQ"}
-                                t = ticker.strip().upper()
-                                limit = None if t in full_chain_tickers else 20
-                                data = _cached_md.get_chain(t, expiration,
-                                    strike_limit=limit, feed="cached")
+                                data = _cached_md.get_chain(ticker.strip().upper(), expiration,
+                                    strike_limit=None, feed="cached")  # v9 (Patch 7)
                                 if isinstance(data, dict) and data.get("s") == "ok" and data.get("optionSymbol"):
                                     return data
                             except Exception as e:

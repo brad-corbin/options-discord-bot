@@ -341,19 +341,27 @@ class CachedMarketData:
                   feed: str = None) -> dict:
         """Cached option chain for a specific expiration.
 
-        v5.1.1 API credit optimization:
-        MarketData.app charges 1 credit PER OPTION SYMBOL in the response.
-        SPY with 390 contracts = 390 credits per fetch!
+        v5.1.1 / v9 (Patch 7) note on billing models:
+        MarketData.app charges 1 credit PER OPTION SYMBOL in the response —
+        SPY full chain = ~390 credits. Schwab (current primary provider via
+        schwab_adapter.CachedMarketDataSchwab) charges PER CALL, regardless
+        of how many contracts come back. Whether strike_limit saves anything
+        depends on which underlying adapter is in use.
 
-        v6.1: feed="cached" mode — 1 credit total regardless of chain size.
-        Use for OI/volume tracking where live quotes aren't needed.
+        v6.1: feed="cached" mode — 1 credit total on MarketData regardless
+        of chain size. Use for OI/volume tracking where live quotes aren't
+        needed.
 
         Args:
-            side: "call" or "put" — halves credit cost by fetching one side only
-            strike_limit: int — limits to N nearest-ATM strikes per side.
-                          With strike_limit=20: SPY drops from 390 to ~40 contracts.
-                          Combined with side: drops to ~20 contracts (95% savings).
-            feed: "cached" — 1 credit total. "live" or None — standard pricing.
+            side: "call" or "put" — fetch one side only. Useful for
+                  parallelism even on Schwab where it doesn't reduce billing.
+            strike_limit: int or None. Default None (full chain). On
+                          MarketData, smaller values reduce credit cost.
+                          On Schwab, smaller values reduce response payload
+                          but not billing. v9 (Patch 7) widened all engine-
+                          feeding callers to None — see Walk 1E.
+            feed: "cached" — 1 credit total on MarketData. "live" or None —
+                  standard pricing.
         """
         # Cache key includes filters so filtered/unfiltered don't collide
         filter_tag = ""
