@@ -10435,10 +10435,18 @@ def _get_0dte_iv(ticker: str, target_date_str: str = None) -> tuple:
                 _strikes_clean = [float(s) for s in _strikes if isinstance(s, (int, float)) and s and s > 0]
                 _row_count = len(data.get("optionSymbol", []) if isinstance(data, dict) else [])
                 _gex_val = _eng_result.get("gex")
-                _gex_sign = _eng_result.get("gex_sign", "unknown")
+                # v9 (Patch 7.1): correct sign reporting via is_positive_gex (engine_result
+                # has is_positive_gex bool, not gex_sign string — original Patch 7 looked
+                # for the wrong key). See Walk 1E.
+                _is_pos = _eng_result.get("is_positive_gex")
+                _gex_sign = "positive" if _is_pos is True else ("negative" if _is_pos is False else "unknown")
+                # v9 (Patch 7.1): report the ACTUAL production sweep band (±12% via
+                # InstitutionalExpectationEngine._grid at line 1065), not ±10%. The
+                # original Patch 7 hardcoded 0.90/1.10 in the log message but the
+                # production caller uses _grid(spot, pct=0.12). Cosmetic correction.
+                _band_low, _band_high = spot * 0.88, spot * 1.12
                 if _strikes_clean:
                     _smin, _smax = min(_strikes_clean), max(_strikes_clean)
-                    _band_low, _band_high = spot * 0.90, spot * 1.10
                     _covers_band = (_smin <= _band_low and _smax >= _band_high)
                     log.warning(
                         f"flip_price=None [_get_0dte_iv] {ticker} {target}: "
@@ -10454,6 +10462,59 @@ def _get_0dte_iv(ticker: str, target_date_str: str = None) -> tuple:
                         f"spot={spot:.2f} chain_empty rows={_row_count} "
                         f"gex={_gex_val} sign={_gex_sign}"
                     )
+                # ── v9 (Patch 7.1): empirical band-width test ────────────────
+                # Patch 7 widened the chain (root cause: chain truncation). Some
+                # tickers (MRNA empirically confirmed) still return flip_price=None
+                # post-Patch-7. Hypothesis: the engine's sweep band (±12% in
+                # InstitutionalExpectationEngine._grid) is too narrow for high-IV
+                # tickers where the gamma flip sits 15-25% from spot. To verify
+                # without modifying engine behavior, reconstruct rows and try
+                # gamma_flip with a wider band (±25%). Logs the tentative result.
+                # If this consistently finds flips for the failing tickers, the
+                # next patch widens _grid. If it still returns None, the bug is
+                # elsewhere (GEX summation, Greeks data, etc.). See Walk 1E.
+                try:
+                    from options_exposure import ExposureEngine as _ExposureEngine
+                    _diag_rows = build_option_rows(data, spot, max(dte, 0.5))
+                    if _diag_rows:
+                        _diag_engine = _ExposureEngine(r=0.04)
+                        # Wider band: ±25%, 201 grid points
+                        _wide_grid = [spot * (0.75 + 0.0025 * i) for i in range(201)]
+                        _wide_flip = _diag_engine.gamma_flip(_diag_rows, pg=_wide_grid)
+                        # Also dump GEX curve characteristics across production-equivalent ±12% band
+                        _prod_grid = [spot * (0.88 + 0.0024 * i) for i in range(101)]  # coarser for cost
+                        _gex_curve = []
+                        for _sp in _prod_grid:
+                            try:
+                                _shifted = [_diag_engine._mk(r, _sp) for r in _diag_rows]
+                                _net_gex = _diag_engine.compute(_shifted)["net"]["gex"]
+                                _gex_curve.append(_net_gex)
+                            except Exception:
+                                _gex_curve.append(None)
+                        _curve_clean = [v for v in _gex_curve if v is not None]
+                        if _curve_clean:
+                            _gex_min = min(_curve_clean)
+                            _gex_max = max(_curve_clean)
+                            _pos_count = sum(1 for v in _curve_clean if v > 0)
+                            _neg_count = sum(1 for v in _curve_clean if v < 0)
+                            _zero_count = sum(1 for v in _curve_clean if v == 0)
+                            log.warning(
+                                f"  [Patch 7.1 diag] {ticker}: "
+                                f"flip_at_25pct_band={_wide_flip} "
+                                f"gex_curve_minmax=[{_gex_min:.2f},{_gex_max:.2f}] "
+                                f"signs(+/-/0)={_pos_count}/{_neg_count}/{_zero_count} "
+                                f"engine_rows={len(_diag_rows)}"
+                            )
+                        else:
+                            log.warning(
+                                f"  [Patch 7.1 diag] {ticker}: "
+                                f"flip_at_25pct_band={_wide_flip} "
+                                f"gex_curve_failed engine_rows={len(_diag_rows)}"
+                            )
+                    else:
+                        log.warning(f"  [Patch 7.1 diag] {ticker}: build_option_rows returned 0 rows — IV filter dropped all rows")
+                except Exception as _diag_e:
+                    log.warning(f"  [Patch 7.1 diag] {ticker}: empirical test failed: {_diag_e}")
         except Exception as _e:
             log.debug(f"Patch 7 diagnostic log failed for {ticker}: {_e}")
         # ── end v9 (Patch 7) ─────────────────────────────────────────────────
@@ -10759,10 +10820,13 @@ def _get_chain_iv_for_expiry(ticker: str, target_date_str: str, dte: float) -> t
                 _strikes_clean = [float(s) for s in _strikes if isinstance(s, (int, float)) and s and s > 0]
                 _row_count = len(data.get("optionSymbol", []) if isinstance(data, dict) else [])
                 _gex_val = _eng_result.get("gex")
-                _gex_sign = _eng_result.get("gex_sign", "unknown")
+                # v9 (Patch 7.1): correct sign reporting via is_positive_gex
+                _is_pos = _eng_result.get("is_positive_gex")
+                _gex_sign = "positive" if _is_pos is True else ("negative" if _is_pos is False else "unknown")
+                # v9 (Patch 7.1): production sweep is ±12% via _grid, not ±10%
+                _band_low, _band_high = spot * 0.88, spot * 1.12
                 if _strikes_clean:
                     _smin, _smax = min(_strikes_clean), max(_strikes_clean)
-                    _band_low, _band_high = spot * 0.90, spot * 1.10
                     _covers_band = (_smin <= _band_low and _smax >= _band_high)
                     log.warning(
                         f"flip_price=None [_get_chain_iv_for_expiry] {ticker} {target}: "
@@ -10778,6 +10842,48 @@ def _get_chain_iv_for_expiry(ticker: str, target_date_str: str, dte: float) -> t
                         f"spot={spot:.2f} chain_empty rows={_row_count} "
                         f"gex={_gex_val} sign={_gex_sign}"
                     )
+                # ── v9 (Patch 7.1): empirical band-width test ────────────────
+                # See _get_0dte_iv variant for full rationale. Same diagnostic.
+                try:
+                    from options_exposure import ExposureEngine as _ExposureEngine
+                    _diag_rows = build_option_rows(data, spot, max(dte, 0.5))
+                    if _diag_rows:
+                        _diag_engine = _ExposureEngine(r=0.04)
+                        _wide_grid = [spot * (0.75 + 0.0025 * i) for i in range(201)]
+                        _wide_flip = _diag_engine.gamma_flip(_diag_rows, pg=_wide_grid)
+                        _prod_grid = [spot * (0.88 + 0.0024 * i) for i in range(101)]
+                        _gex_curve = []
+                        for _sp in _prod_grid:
+                            try:
+                                _shifted = [_diag_engine._mk(r, _sp) for r in _diag_rows]
+                                _net_gex = _diag_engine.compute(_shifted)["net"]["gex"]
+                                _gex_curve.append(_net_gex)
+                            except Exception:
+                                _gex_curve.append(None)
+                        _curve_clean = [v for v in _gex_curve if v is not None]
+                        if _curve_clean:
+                            _gex_min = min(_curve_clean)
+                            _gex_max = max(_curve_clean)
+                            _pos_count = sum(1 for v in _curve_clean if v > 0)
+                            _neg_count = sum(1 for v in _curve_clean if v < 0)
+                            _zero_count = sum(1 for v in _curve_clean if v == 0)
+                            log.warning(
+                                f"  [Patch 7.1 diag] {ticker}: "
+                                f"flip_at_25pct_band={_wide_flip} "
+                                f"gex_curve_minmax=[{_gex_min:.2f},{_gex_max:.2f}] "
+                                f"signs(+/-/0)={_pos_count}/{_neg_count}/{_zero_count} "
+                                f"engine_rows={len(_diag_rows)}"
+                            )
+                        else:
+                            log.warning(
+                                f"  [Patch 7.1 diag] {ticker}: "
+                                f"flip_at_25pct_band={_wide_flip} "
+                                f"gex_curve_failed engine_rows={len(_diag_rows)}"
+                            )
+                    else:
+                        log.warning(f"  [Patch 7.1 diag] {ticker}: build_option_rows returned 0 rows — IV filter dropped all rows")
+                except Exception as _diag_e:
+                    log.warning(f"  [Patch 7.1 diag] {ticker}: empirical test failed: {_diag_e}")
         except Exception as _e:
             log.debug(f"Patch 7 diagnostic log failed for {ticker}: {_e}")
 
