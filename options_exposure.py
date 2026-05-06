@@ -1,5 +1,12 @@
 # options_exposure.py  — v4 production-hardened
 # Educational/demo code. Not financial advice.
+#
+# v9 (Patch 8): IV-aware sweep band widening. The hardcoded ±10% (_dg) and
+# ±12% (_grid) bands were credit-era artifacts that worked for low-vol tickers
+# but missed gamma flips for high-IV names where the flip sits 15-25% from
+# spot. Empirically validated against MRNA/AMD/ARM/LLY (Patch 7.1 diagnostic
+# data). Formula: pct = max(0.15, min(0.40, 3.0 * iv * sqrt(dte_years))).
+# See post-Patch-7.1 handoff §Patch 8.
 
 import math, random, time, copy, json
 from dataclasses import dataclass, field
@@ -770,8 +777,13 @@ class ExposureEngine:
             if v0==0: return round(p0,2)
             if v0*v1<0: w=abs(v0)/(abs(v0)+abs(v1));return round(p0+(p1-p0)*w,2)
         return None
-    def _dg(self,rows):
-        S=rows[0].underlying_price if rows else 100;return[S*(0.90+0.001*i)for i in range(201)]
+    def _dg(self,rows,pct=0.25):
+        # v9 (Patch 8): widen ExposureEngine default sweep band from ±10% to ±25%.
+        # _dg is used by ExposureEngine.gamma_flip / vanna_flip when no grid is
+        # passed, and by DecaySimulator. ExposureEngine has no UnifiedIVSurface in
+        # scope, so _dg stays blanket-pct rather than IV-aware (the IV-aware path
+        # lives in InstitutionalExpectationEngine._grid). 201 steps preserved.
+        S=rows[0].underlying_price if rows else 100;return[S*(1-pct+2*pct/200*i)for i in range(201)]
     def gamma_flip(self,rows,pg=None):
         if pg is None: pg=self._dg(rows)
         return self._fz([(sp,self.compute([self._mk(r,sp)for r in rows])["net"]["gex"])for sp in pg])
@@ -1062,7 +1074,18 @@ class InstitutionalExpectationEngine:
         dc=clamp(net["dex"]/chain_scale,-0.55,0.55);vc=clamp(net["vanna"]/chain_scale,-0.25,0.25)
         cc=clamp(net["charm"]/chain_scale,-0.20,0.20);pc=clamp(pos["net_opening_bias"],-0.25,0.25)
         return clamp(0.45*dc+0.25*vc+0.15*cc+0.15*pc,-1,1)
-    def _grid(self,spot,pct=0.12,steps=121):
+    def _grid(self,spot,pct=None,steps=121,iv=None,dte_years=None):
+        # v9 (Patch 8): IV-aware band widening. When pct is not specified and
+        # both iv and dte_years are passed, scale to ~3σ daily move with floor
+        # 0.15 and ceiling 0.40. Validated against MRNA(0.21)/AMD(0.34)/
+        # ARM(0.40,clamped)/LLY(0.15,clamped) Patch 7.1 dataset. Callers without
+        # iv context fall through to a 0.25 blanket default — matches _dg.
+        if pct is None:
+            if iv is not None and dte_years is not None:
+                sigma=iv*(dte_years**0.5)
+                pct=max(0.15,min(0.40,3.0*sigma))
+            else:
+                pct=0.25
         lo=spot*(1-pct);hi=spot*(1+pct);st=(hi-lo)/max(steps-1,1)
         return[round(lo+i*st,2)for i in range(steps)]
     def _ladder(self,rows,ctx,ivs,events=None,audit=None):
@@ -1121,7 +1144,13 @@ class InstitutionalExpectationEngine:
         if ctx.is_0dte: sm=0.85+0.30*clamp(1-ctx.session_progress,0,1)
         a1s=a1b*fm*lm*rm*sm;pr=self._ps(exp["net"],ctx.spot,pos,rows=nr);bias=self._bl(pr)
         cs=a1s*0.40*pr;ec=ctx.spot+cs
-        grid=self._grid(ctx.spot);gf=self.ee.gamma_flip(nr,grid);vf=self.ee.vanna_flip(nr,grid)
+        # v9 (Patch 8): pass IV+DTE so _grid can widen sweep band proportionally
+        # for high-IV tickers. Same grid is reused by both gamma_flip and
+        # vanna_flip, so IV-aware widening flows to both — intentional.
+        # Using riv (raw representative IV), not aiv (event-adjusted): keeps
+        # the sweep band stable across earnings/FOMC windows. Empirical formula
+        # in _grid was validated against riv-equivalent IVs from Patch 7.1.
+        grid=self._grid(ctx.spot,iv=riv,dte_years=T);gf=self.ee.gamma_flip(nr,grid);vf=self.ee.vanna_flip(nr,grid)
         # Item 10: Touch routing for ladder
         ladder=self._ladder(nr,ctx,ivs,ev,audit)
         bst=exp["by_strike"];walls=exp["walls"]
