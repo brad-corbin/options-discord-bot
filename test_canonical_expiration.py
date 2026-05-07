@@ -252,6 +252,45 @@ def test_t60_returns_none_when_no_qualifying_expiration():
 
 
 # ───────────────────────────────────────────────────────────────────────
+# Tests — malformed input + upstream failure
+# ───────────────────────────────────────────────────────────────────────
+
+def test_empty_expiration_list_returns_none():
+    """No expirations available → None for any intent."""
+    router = _MockRouter([])
+    for intent in (INTENT_ZERO_DTE, INTENT_FRONT, INTENT_T7, INTENT_T30, INTENT_T60):
+        result = canonical_expiration("ANY", intent,
+                                      today=TUE_2026_05_05, data_router=router)
+        assert_is_none(result, f"{intent} on empty list returns None")
+    PASSED.append("test_empty_expiration_list_returns_none")
+
+
+def test_malformed_entries_skipped():
+    """Garbage entries (None, weird strings, ints) are skipped, not crashed on."""
+    bad_list = [
+        None,
+        "not-a-date",
+        "2026-13-99",   # invalid month/day
+        42,             # int
+        "2026-05-13",   # legitimate one to make sure we still pick it
+    ]
+    router = _MockRouter(bad_list)
+    result = canonical_expiration("AAPL", INTENT_T7,
+                                  today=TUE_2026_05_05, data_router=router)
+    assert_eq(result, "2026-05-13", "malformed entries skipped, valid one picked")
+    PASSED.append("test_malformed_entries_skipped")
+
+
+def test_upstream_get_expirations_raises_returns_none():
+    """If data_router.get_expirations raises, log and return None — never propagate."""
+    router = _RaisingRouter()
+    result = canonical_expiration("AAPL", INTENT_FRONT,
+                                  today=TUE_2026_05_05, data_router=router)
+    assert_is_none(result, "upstream failure returns None, doesn't propagate")
+    PASSED.append("test_upstream_get_expirations_raises_returns_none")
+
+
+# ───────────────────────────────────────────────────────────────────────
 # Run all
 # ───────────────────────────────────────────────────────────────────────
 
@@ -270,6 +309,9 @@ def main():
         test_t30_picks_monthly,
         test_t60_picks_further_monthly,
         test_t60_returns_none_when_no_qualifying_expiration,
+        test_empty_expiration_list_returns_none,
+        test_malformed_entries_skipped,
+        test_upstream_get_expirations_raises_returns_none,
     ]
     for t in tests:
         try:
