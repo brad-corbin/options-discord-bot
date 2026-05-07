@@ -269,13 +269,18 @@ Each patch follows the canonical-rebuild discipline:
 4. Don't bundle (audit rule 4) — each patch ships independently with its own tests passing
 5. Update CLAUDE.md when each patch lands (the living-context rule)
 
-### Patch A details
+### Patch A details *(shipped — see Patch A.1-A.9 commits)*
 
-**New files:**
+> **Status: shipped.** This section is preserved as historical record of what
+> Patch A delivered; do NOT re-implement. Verify current state by running
+> `python3 test_canonical_expiration.py` and grepping for `canonical_expiration`
+> in `omega_dashboard/research_data.py`.
+
+**Files that landed:**
 - `canonical_expiration.py` (~100 lines) — the wrapper + intent helpers
 - `test_canonical_expiration.py` (~150 lines, ~10 tests)
 
-**Tests:**
+**Test coverage:**
 - Each intent returns the right expiration on a fixture expiration list
 - Each intent returns None when no qualifying expiration exists
 - Wrapper-consistency: result matches a direct `data_router.get_expirations()` filter
@@ -283,11 +288,16 @@ Each patch follows the canonical-rebuild discipline:
 - Edge: AAPL on Tuesday with M/W/F weeklies, t7 picks Wednesday
 - Tiebreak: first qualifying date always
 
-**Modified files:**
-- `bot_state.py` — add `expiration_intent: str = "front"` field. Default value preserves backward compatibility.
-- `omega_dashboard/research_data.py` — `_default_expiration()` removed; `BotState.build()` now called with `expiration=canonical_expiration(ticker, "front", ...)` per ticker.
+**Files modified:**
+- `omega_dashboard/research_data.py` — `_default_expiration()` removed; `build_ticker_snapshot()` now calls `canonical_expiration(ticker, intent, data_router=...)` per ticker before building BotState.
 
-**Side effect:** Research page walls now use front non-0-DTE chains for every ticker. Will not match Market View's 0-DTE walls. This is correct per the design — it answers a different question — but the display contract (Patch D) is what makes that obvious to the user. Until D lands, the values just change but aren't labeled with intent.
+**Note on `expiration_intent` field:** Earlier draft proposed adding an
+`expiration_intent` field to BotState. This was superseded by Open
+Question #3's "envelope-only" resolution — intent is producer metadata
+that lives on the JSON envelope (Patch B), NOT inside the BotState
+dataclass. `bot_state.py` was correctly NOT modified by Patch A.
+
+**Side effect (still in effect):** Research page walls use front non-0-DTE chains for every ticker. Will not match Market View's 0-DTE walls. This is correct per the design — it answers a different question — but the display contract (Patch D) is what makes that obvious to the user. Until D lands, the values just change but aren't labeled with intent.
 
 ### Patch B details
 
@@ -336,6 +346,21 @@ BOT_STATE_PRODUCER_INTENTS_TIER_C=    # empty — Tier C disabled at first
 
 Total: 20 keys at steady state. ~13 fetches/min budget. Run for **7 trading days** with no producer-related rate-limit warnings → flip env vars to scale to the full 35 × 4 = 140 keys. Documented in the deploy notes for Patch B.
 
+**Env-var parsing note (Patch B implementer):** `"".split(",")` returns
+`[""]` (a one-element list containing an empty string), not `[]`. The
+intents parser must filter empty strings after split, so an unset or
+blank `BOT_STATE_PRODUCER_INTENTS_TIER_C=` cleanly disables that tier.
+Recommended pattern:
+
+```python
+def _parse_intents(env_value: str) -> list[str]:
+    return [s.strip() for s in (env_value or "").split(",") if s.strip()]
+```
+
+A tier with an empty intents list is a no-op — its daemon starts but
+sleeps without doing work, ready to be enabled by setting the env var
+without redeploying the producer module.
+
 **Important:** ships disabled by default (`BOT_STATE_PRODUCER_ENABLED=false`). Brad enables explicitly. Patch B can land in prod with zero behavior change.
 
 ### Patch C details
@@ -375,7 +400,7 @@ Old-version keys (below MIN_COMPATIBLE) and convention-mismatch keys render as "
 - Mock Redis returning a key with `producer_version=0` (below MIN_COMPATIBLE=1) → reader logs warning, renders warming-up
 - Mock Redis returning a key with `convention_version=1` → reader logs warning, renders warming-up (strict)
 - Stale Redis (TTL expired between read attempts) → falls through to warming-up
-- Existing 61 tests still pass
+- Existing 78 tests still pass (the count includes Patch 11.5 canonical_walls and Patch A canonical_expiration suites that landed after this spec was first drafted)
 
 **Operational note:** Patch C requires Patch B's producer to be enabled. Sequence: ship B disabled → enable in env → verify Redis has keys → ship C.
 
@@ -431,17 +456,34 @@ GET /research
   → no network round-trip
 ```
 
-**Cold start (Render restart):**
+**Cold start (Render restart) — staged tier daemons:**
+
+The three tier daemons start staggered (Tier A at T+0, Tier B at T+10s,
+Tier C at T+20s) so they don't fan out simultaneously into the rate
+limiter. With Patch B's initial 10-ticker × 2-intent universe (Tier C
+empty), realistic trace:
 
 ```
-T+0:    app.py boots, daemon starts
+T+0:    app.py boots, Tier A daemon starts
 T+0:    user hits /research → all keys missing → all cards warming-up
-T+5s:   producer's first loop completes ~half the universe
-T+30s:  producer's first loop completes
-T+30s+: page hits show real data
+T+~6s:  Tier A first pass (10 fetches) completes → front-DTE cards populate
+T+10s:  Tier B daemon starts
+T+~16s: Tier B first pass (10 fetches) completes → t7 drilldown rows ready
+T+20s:  Tier C daemon starts (no-op while Tier C intents empty)
 ```
 
-User-visible: the page is INSTANT but cards fill in over the first cadence cycle. Compared to the current "spin 3 min on cold start," this is a step-change.
+For full 35×4=140-key universe (post-7-day staging promotion):
+
+```
+T+0:    Tier A daemon starts
+T+~19s: Tier A first pass (35 fetches) completes
+T+10s:  Tier B daemon starts
+T+~30s: Tier B first pass (35 fetches) completes
+T+20s:  Tier C daemon starts
+T+~58s: Tier C first pass (70 fetches across t30+t60) completes
+```
+
+User-visible: the page is INSTANT but cards fill in over the first cadence cycle. Front-DTE walls (the most-watched values) populate within ~6s of cold start; deeper-tier drilldown rows fill in over the next ~30-60s. Compared to the current "spin 3 min on cold start," this is a step-change.
 
 ---
 
