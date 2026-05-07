@@ -312,4 +312,18 @@
   </div>
 </div>
 
+{# ─── Patch C.5: auto-reload while any card is warming up ─────────────
+   Server-rendered page is otherwise static — without this script, a
+   user loading the page mid-cycle sees warming-up cards that never
+   update until they manually refresh. Once all cards are populated,
+   the script tag is absent from the next render and polling stops. #}
+{% if page_data.available %}
+  {% set warming = page_data.snapshots | selectattr('warming_up') | list %}
+  {% if warming | length > 0 %}
+    <script>
+      setTimeout(function() { location.reload(); }, 5000);
+    </script>
+  {% endif %}
+{% endif %}
+
 {% endblock %}
