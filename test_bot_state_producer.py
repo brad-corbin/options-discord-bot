@@ -16,6 +16,7 @@ import os
 import json
 import time
 import math
+import threading
 from typing import Dict
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -137,7 +138,6 @@ class _FakeBuildContext:
     def __init__(self):
         # ticker → {"expiration": "2026-05-08", "state_dict": {...}, "raises": ExceptionInstance|None}
         self.config: Dict[str, dict] = {}
-        self.calls: list = []
 
     def canonical_expiration(self, ticker, intent, *, data_router=None):
         cfg = self.config.get(ticker)
@@ -491,6 +491,146 @@ def test_tier_pass_writes_telemetry_per_successful_build():
     assert_true(rec["elapsed_ms"] >= 0, "elapsed_ms is non-negative integer")
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Lock-keeper thread tests
+# ─────────────────────────────────────────────────────────────────────
+
+def test_lock_keeper_refreshes_on_schedule():
+    """Lock keeper wakes within (LOCK_TTL_SEC - 30) and refreshes the lock.
+    We don't actually wait LOCK_TTL_SEC seconds; we verify the keeper's
+    refresh path is called by stopping early and inspecting fake.ops.
+    """
+    from bot_state_producer import _run_lock_keeper, _acquire_lock
+    fake = _FakeRedis()
+    token = _acquire_lock(fake, "bsp:test", ttl_sec=60)
+    stop = threading.Event()
+    # Use a TINY interval so the test doesn't hang.
+    t = threading.Thread(
+        target=_run_lock_keeper,
+        kwargs={
+            "redis_client": fake,
+            "lock_key": "bsp:test",
+            "lock_token": token,
+            "ttl_sec": 60,
+            "refresh_interval_sec": 0.05,
+            "stop_event": stop,
+        },
+        daemon=True,
+    )
+    t.start()
+    time.sleep(0.15)  # let it refresh ~3 times
+    stop.set()
+    t.join(timeout=1.0)
+    # Verify refresh actually happened — the eval Lua call updates expiration.
+    eval_or_expire_seen = any(
+        op[0] == "expire" or op[0] == "set" for op in fake.ops
+    )
+    # The Lua-eval-EXPIRE path on _FakeRedis routes through .expire(),
+    # which appends ("expire", ...) to ops. So at least one expire op.
+    expire_calls = [op for op in fake.ops if op[0] == "expire"]
+    assert_true(len(expire_calls) >= 1, "lock-keeper called expire at least once")
+
+
+def test_lock_keeper_exits_when_lock_lost():
+    """If a different worker takes the lock, the keeper detects via
+    failed refresh and exits the loop without crashing."""
+    from bot_state_producer import _run_lock_keeper, _acquire_lock
+    fake = _FakeRedis()
+    token = _acquire_lock(fake, "bsp:test", 60)
+    # Steal the lock — overwrite with a different value.
+    fake.kv["bsp:test"] = "stolen-by-another-worker"
+    stop = threading.Event()
+    t = threading.Thread(
+        target=_run_lock_keeper,
+        kwargs={
+            "redis_client": fake,
+            "lock_key": "bsp:test",
+            "lock_token": token,
+            "ttl_sec": 60,
+            "refresh_interval_sec": 0.05,
+            "stop_event": stop,
+        },
+        daemon=True,
+    )
+    t.start()
+    # The keeper should detect the lost lock on its first refresh attempt
+    # and exit. We give it generous slack.
+    t.join(timeout=2.0)
+    assert_true(not t.is_alive(), "lock-keeper exited after lock was stolen")
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Lifecycle + flag-gating tests
+# ─────────────────────────────────────────────────────────────────────
+
+def test_start_producer_returns_none_when_disabled():
+    from bot_state_producer import start_producer
+    os.environ["BOT_STATE_PRODUCER_ENABLED"] = "false"
+    p = start_producer(cached_md=object(), redis_client=_FakeRedis())
+    assert_eq(p, None, "disabled flag → no producer instance")
+
+
+def test_start_producer_returns_none_when_redis_missing():
+    from bot_state_producer import start_producer
+    os.environ["BOT_STATE_PRODUCER_ENABLED"] = "true"
+    os.environ["BOT_STATE_PRODUCER_TICKERS"] = "AAPL"
+    p = start_producer(cached_md=object(), redis_client=None)
+    assert_eq(p, None, "no redis client → no producer")
+
+
+def test_start_producer_returns_none_when_universe_empty():
+    from bot_state_producer import start_producer
+    os.environ["BOT_STATE_PRODUCER_ENABLED"] = "true"
+    os.environ["BOT_STATE_PRODUCER_TICKERS"] = ""
+    p = start_producer(cached_md=object(), redis_client=_FakeRedis())
+    assert_eq(p, None, "empty TICKERS → no producer")
+
+
+def test_start_producer_spawns_when_enabled():
+    """Factory builds and starts the producer when conditions are met."""
+    from bot_state_producer import start_producer, BotStateProducer
+    os.environ["BOT_STATE_PRODUCER_ENABLED"] = "true"
+    os.environ["BOT_STATE_PRODUCER_TICKERS"] = "AAPL,MSFT"
+    os.environ["BOT_STATE_PRODUCER_INTENTS_TIER_A"] = "front"
+    os.environ["BOT_STATE_PRODUCER_INTENTS_TIER_B"] = "t7"
+    os.environ["BOT_STATE_PRODUCER_INTENTS_TIER_C"] = ""
+    p = start_producer(cached_md=object(), redis_client=_FakeRedis())
+    try:
+        assert_true(isinstance(p, BotStateProducer),
+                    "factory returns BotStateProducer when enabled")
+    finally:
+        if p is not None:
+            p.stop()
+            p.join(timeout=2.0)
+
+
+def test_start_producer_returns_none_when_lock_held():
+    """Cross-worker lock contention path — another worker is leader."""
+    from bot_state_producer import start_producer, LOCK_KEY
+    fake = _FakeRedis()
+    fake.kv[LOCK_KEY] = "another-worker-token"
+    os.environ["BOT_STATE_PRODUCER_ENABLED"] = "true"
+    os.environ["BOT_STATE_PRODUCER_TICKERS"] = "AAPL"
+    os.environ["BOT_STATE_PRODUCER_INTENTS_TIER_A"] = "front"
+    p = start_producer(cached_md=object(), redis_client=fake)
+    assert_eq(p, None, "lock held by another worker → factory returns None")
+
+
+def test_producer_stop_is_idempotent():
+    from bot_state_producer import start_producer
+    os.environ["BOT_STATE_PRODUCER_ENABLED"] = "true"
+    os.environ["BOT_STATE_PRODUCER_TICKERS"] = "AAPL"
+    os.environ["BOT_STATE_PRODUCER_INTENTS_TIER_A"] = "front"
+    p = start_producer(cached_md=object(), redis_client=_FakeRedis())
+    try:
+        p.stop()
+        p.stop()  # second call must not raise
+        assert_true(True, "double stop() is safe")
+    finally:
+        if p is not None:
+            p.join(timeout=2.0)
+
+
 if __name__ == "__main__":
     # Parsing
     test_parse_intents_filters_empty_strings()
@@ -504,7 +644,7 @@ if __name__ == "__main__":
     # Telemetry
     test_record_build_timing_writes_sorted_set_member()
     test_record_build_timing_sets_48h_ttl()
-    # Lock
+    # Lock primitives
     test_lock_acquire_when_free()
     test_lock_acquire_fails_when_held()
     test_lock_release_only_by_owner()
@@ -514,6 +654,16 @@ if __name__ == "__main__":
     test_tier_pass_skips_ticker_when_canonical_expiration_returns_none()
     test_tier_pass_isolates_per_ticker_errors()
     test_tier_pass_writes_telemetry_per_successful_build()
+    # Lock-keeper thread
+    test_lock_keeper_refreshes_on_schedule()
+    test_lock_keeper_exits_when_lock_lost()
+    # Lifecycle / factory
+    test_start_producer_returns_none_when_disabled()
+    test_start_producer_returns_none_when_redis_missing()
+    test_start_producer_returns_none_when_universe_empty()
+    test_start_producer_spawns_when_enabled()
+    test_start_producer_returns_none_when_lock_held()
+    test_producer_stop_is_idempotent()
     print(f"PASSED: {len(PASSED)}, FAILED: {len(FAILED)}")
     for f in FAILED:
         print(f"  ✗ {f}")

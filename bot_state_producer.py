@@ -12,7 +12,7 @@ For each (ticker, intent) in the tier:
   3. BotState.build_from_raw(raw) → BotState
   4. _build_envelope(state_dict, intent, expiration) → dict
   5. _serialize_envelope(env) → JSON string (NaN/inf → null)
-  6. redis.set(f"bot_state:{ticker}:{intent}", json, ex=tier_ttl)
+  6. redis.set(f"{KEY_PREFIX}{ticker}:{intent}", json, ex=tier_ttl)  # see KEY_PREFIX module constant
   7. _record_build_timing(redis, ticker, intent, elapsed_ms, expiration)
 
 Per-ticker errors caught and logged; the loop continues for other tickers.
@@ -45,6 +45,7 @@ log = logging.getLogger(__name__)
 
 PRODUCER_VERSION = 1
 CONVENTION_VERSION = 2  # Patch 9 dealer-side convention. Don't change.
+KEY_PREFIX = "bot_state:"  # Redis key prefix for envelopes: bot_state:{ticker}:{intent}
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -246,8 +247,6 @@ def _refresh_lock(redis_client, lock_key: str, token: str, ttl_sec: int) -> bool
 # binds the real implementations.
 # ─────────────────────────────────────────────────────────────────────
 
-KEY_PREFIX = "bot_state:"
-
 
 def _build_one_state(
     ticker: str,
@@ -320,3 +319,251 @@ def _run_tier_pass(
             elapsed_ms = int((time.time() - t_start) * 1000)
             _record_build_timing(redis_client, ticker, intent,
                                  elapsed_ms, built["expiration"])
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Lock-keeper thread — owns the cross-worker lock independently of any
+# tier loop. Wakes every (LOCK_TTL_SEC - 30s) and refreshes. If refresh
+# fails (another worker took over), signals all tier loops to stop.
+#
+# Decoupled from tier loops so an empty Tier A doesn't silently allow
+# the lock to expire (path b per Brad's design call on Q2).
+# ─────────────────────────────────────────────────────────────────────
+
+LOCK_KEY = "bot_state_producer:lock"
+LOCK_TTL_SEC = 90  # > Tier A cadence + max build time
+LOCK_REFRESH_INTERVAL_SEC = 60  # LOCK_TTL_SEC - 30s safety margin
+
+
+def _run_lock_keeper(
+    redis_client,
+    lock_key: str,
+    lock_token: str,
+    ttl_sec: int,
+    refresh_interval_sec: float,
+    stop_event,  # threading.Event
+) -> None:
+    """Forever-loop: refresh `lock_key` every `refresh_interval_sec`.
+
+    If refresh fails (lock owned by someone else now), set `stop_event`
+    so other producer threads exit, then return.
+    """
+    while not stop_event.is_set():
+        if stop_event.wait(timeout=refresh_interval_sec):
+            return
+        ok = _refresh_lock(redis_client, lock_key, lock_token, ttl_sec)
+        if not ok:
+            log.warning(
+                "[bsp lock-keeper] refresh failed; signaling all tier "
+                "loops to stop (another worker took over or lock expired)"
+            )
+            stop_event.set()
+            return
+
+
+# ─────────────────────────────────────────────────────────────────────
+# BotStateProducer — owns three tier daemons + one lock-keeper thread.
+# Tiers are staggered T+0/T+10/T+20 so the rate limiter sees a smooth
+# ramp rather than a synchronized burst at startup.
+# ─────────────────────────────────────────────────────────────────────
+
+
+class BotStateProducer:
+    """Daemon-thread producer with a dedicated lock-keeper.
+    Construct via `start_producer()`."""
+
+    def __init__(
+        self,
+        tickers: List[str],
+        tier_a_intents: List[str],
+        tier_b_intents: List[str],
+        tier_c_intents: List[str],
+        tier_a_cadence: int,
+        tier_b_cadence: int,
+        tier_c_cadence: int,
+        cached_md,
+        redis_client,
+    ):
+        self._tickers = tickers
+        self._tiers = [
+            ("A", tier_a_intents, tier_a_cadence, tier_a_cadence * 3, 0),
+            ("B", tier_b_intents, tier_b_cadence, tier_b_cadence * 3, 10),
+            ("C", tier_c_intents, tier_c_cadence, tier_c_cadence * 3, 20),
+        ]
+        self._cached_md = cached_md
+        self._redis = redis_client
+        self._stop = threading.Event()
+        self._threads: List[threading.Thread] = []
+        self._lock_token: Optional[str] = None
+
+    def start(self) -> bool:
+        """Acquire the cross-worker lock and spawn lock-keeper + tier
+        threads. Returns True on success, False if the lock is held by
+        another worker (this instance stays idle).
+        """
+        self._lock_token = _acquire_lock(self._redis, LOCK_KEY, LOCK_TTL_SEC)
+        if self._lock_token is None:
+            log.info(
+                "bot_state_producer: another worker holds the leader lock; "
+                "this instance staying idle"
+            )
+            return False
+
+        log.info(
+            f"bot_state_producer: starting "
+            f"{len([t for t in self._tiers if t[1]])} active tiers "
+            f"for {len(self._tickers)} tickers"
+        )
+
+        # Lock-keeper thread first — must be running before any tier work.
+        keeper = threading.Thread(
+            target=_run_lock_keeper,
+            kwargs={
+                "redis_client": self._redis,
+                "lock_key": LOCK_KEY,
+                "lock_token": self._lock_token,
+                "ttl_sec": LOCK_TTL_SEC,
+                "refresh_interval_sec": LOCK_REFRESH_INTERVAL_SEC,
+                "stop_event": self._stop,
+            },
+            name="bsp-lock-keeper",
+            daemon=True,
+        )
+        keeper.start()
+        self._threads.append(keeper)
+
+        # Tier daemons — only spawn for tiers with at least one intent.
+        for tier_name, intents, cadence, ttl, stagger in self._tiers:
+            if not intents:
+                continue
+            t = threading.Thread(
+                target=self._tier_loop,
+                args=(tier_name, intents, cadence, ttl, stagger),
+                name=f"bsp-tier-{tier_name}",
+                daemon=True,
+            )
+            t.start()
+            self._threads.append(t)
+
+        return True
+
+    def stop(self) -> None:
+        """Signal all threads to exit at the next sleep boundary; release
+        the lock. Idempotent — safe to call twice."""
+        self._stop.set()
+        if self._lock_token is not None:
+            _release_lock(self._redis, LOCK_KEY, self._lock_token)
+            self._lock_token = None
+
+    def join(self, timeout: Optional[float] = None) -> None:
+        for t in self._threads:
+            t.join(timeout=timeout)
+
+    # ──────────────────────────────────────────────────────────────────
+
+    def _tier_loop(self, tier_name: str, intents: List[str],
+                   cadence_sec: int, ttl_sec: int, stagger_sec: int) -> None:
+        """Forever-loop: stagger initial start, then pass + sleep. Outer
+        try/except restarts the loop on unexpected crashes (5s backoff)."""
+        # Initial stagger.
+        if self._stop.wait(timeout=stagger_sec):
+            return
+
+        # Lazy-import production deps so unit tests can stub the module
+        # before the thread runs the first pass.
+        from canonical_expiration import canonical_expiration
+        from raw_inputs import fetch_raw_inputs
+        from bot_state import BotState
+
+        while not self._stop.is_set():
+            t_start = time.time()
+            try:
+                _run_tier_pass(
+                    tier_name=tier_name,
+                    intents=intents,
+                    ttl_sec=ttl_sec,
+                    tickers=self._tickers,
+                    cached_md=self._cached_md,
+                    redis_client=self._redis,
+                    canonical_expiration_fn=canonical_expiration,
+                    fetch_raw_inputs_fn=fetch_raw_inputs,
+                    build_from_raw_fn=BotState.build_from_raw,
+                )
+            except Exception as e:
+                log.error(f"[bsp tier={tier_name}] outer loop crashed: {e}")
+                # 5s backoff before retry — avoid tight crash loops.
+                if self._stop.wait(timeout=5.0):
+                    return
+                continue
+            elapsed = time.time() - t_start
+            sleep_for = max(0.0, cadence_sec - elapsed)
+            log.info(
+                f"[bsp tier={tier_name}] pass complete in {elapsed:.1f}s; "
+                f"sleeping {sleep_for:.1f}s"
+            )
+            if self._stop.wait(timeout=sleep_for):
+                return
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Public factory — only entry point. Returns None when the producer
+# should not run for ANY reason (env flag off, no redis, no tickers,
+# lock held by another worker).
+# ─────────────────────────────────────────────────────────────────────
+
+_singleton: Optional["BotStateProducer"] = None
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def start_producer(cached_md, redis_client) -> Optional["BotStateProducer"]:
+    """Factory. Returns a started BotStateProducer or None.
+
+    Returns None when:
+      - BOT_STATE_PRODUCER_ENABLED is unset/false (env-flag rollback path)
+      - redis_client is None (we can't write envelopes)
+      - BOT_STATE_PRODUCER_TICKERS is empty (nothing to produce)
+      - cross-worker lock is held by another worker (silent — that
+        worker IS the producer)
+    """
+    global _singleton
+
+    if not _env_bool("BOT_STATE_PRODUCER_ENABLED", default=False):
+        log.info("bot_state_producer: BOT_STATE_PRODUCER_ENABLED is off; not starting")
+        return None
+    if redis_client is None:
+        log.warning("bot_state_producer: no redis_client; not starting")
+        return None
+
+    tickers = _parse_tickers(os.environ.get("BOT_STATE_PRODUCER_TICKERS"))
+    if not tickers:
+        log.warning("bot_state_producer: BOT_STATE_PRODUCER_TICKERS empty; not starting")
+        return None
+
+    p = BotStateProducer(
+        tickers=tickers,
+        tier_a_intents=_parse_intents(os.environ.get("BOT_STATE_PRODUCER_INTENTS_TIER_A", "front")),
+        tier_b_intents=_parse_intents(os.environ.get("BOT_STATE_PRODUCER_INTENTS_TIER_B", "t7")),
+        tier_c_intents=_parse_intents(os.environ.get("BOT_STATE_PRODUCER_INTENTS_TIER_C", "")),
+        tier_a_cadence=_parse_int_env(os.environ.get("BOT_STATE_PRODUCER_CADENCE_TIER_A"), 60),
+        tier_b_cadence=_parse_int_env(os.environ.get("BOT_STATE_PRODUCER_CADENCE_TIER_B"), 180),
+        tier_c_cadence=_parse_int_env(os.environ.get("BOT_STATE_PRODUCER_CADENCE_TIER_C"), 600),
+        cached_md=cached_md,
+        redis_client=redis_client,
+    )
+    if not p.start():
+        # Lock held by another worker — start() returned False. Don't
+        # cache a non-running instance in _singleton.
+        return None
+    _singleton = p
+    return p
+
+
+def get_producer() -> Optional["BotStateProducer"]:
+    """Diagnostic accessor for the running producer (or None)."""
+    return _singleton
