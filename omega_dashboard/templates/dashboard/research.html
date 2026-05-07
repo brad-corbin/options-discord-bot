@@ -105,7 +105,7 @@
           <div class="research-card-section">
             <div class="research-card-eyebrow">FLIP STATE &middot; <span class="research-live">live</span></div>
             <div class="research-card-row">
-              <span class="research-card-label">gamma_flip</span>
+              <span class="research-card-label">Gamma Flip</span>
               <span class="research-card-value">
                 {% if snap.gamma_flip %}
                   ${{ "%.2f"|format(snap.gamma_flip) }}
@@ -116,7 +116,7 @@
             </div>
             {% if snap.distance_from_flip_pct is not none %}
               <div class="research-card-row">
-                <span class="research-card-label">distance</span>
+                <span class="research-card-label">Distance</span>
                 <span class="research-card-value
                       {% if snap.distance_from_flip_pct > 0 %}positive
                       {% elif snap.distance_from_flip_pct < 0 %}negative{% endif %}">
@@ -125,7 +125,7 @@
               </div>
             {% endif %}
             <div class="research-card-row">
-              <span class="research-card-label">location</span>
+              <span class="research-card-label">Location</span>
               <span class="research-card-value">{{ snap.flip_location }}</span>
             </div>
           </div>
@@ -136,13 +136,13 @@
             <div class="research-card-eyebrow">IV STATE &middot; <span class="research-live">live</span></div>
             {% if snap.atm_iv is not none %}
               <div class="research-card-row">
-                <span class="research-card-label">atm_iv</span>
+                <span class="research-card-label">ATM IV</span>
                 <span class="research-card-value">{{ "%.1f"|format(snap.atm_iv * 100) }}%</span>
               </div>
             {% endif %}
             {% if snap.iv_skew_pp is not none %}
               <div class="research-card-row">
-                <span class="research-card-label">skew (95/105)</span>
+                <span class="research-card-label">Skew (95/105)</span>
                 <span class="research-card-value
                       {% if snap.iv_skew_pp > 0 %}positive
                       {% elif snap.iv_skew_pp < 0 %}negative{% endif %}">
@@ -158,7 +158,7 @@
           <div class="research-card-section">
             <div class="research-card-eyebrow">DEALER GREEKS &middot; <span class="research-live">live</span></div>
             <div class="research-card-row">
-              <span class="research-card-label">gex</span>
+              <span class="research-card-label">GEX</span>
               <span class="research-card-value
                     {% if snap.gex_sign == 'positive' %}positive
                     {% elif snap.gex_sign == 'negative' %}negative{% endif %}">
@@ -167,7 +167,7 @@
             </div>
             {% if snap.dex is not none %}
               <div class="research-card-row">
-                <span class="research-card-label">dex</span>
+                <span class="research-card-label">DEX</span>
                 <span class="research-card-value">
                   {{ "{:+,.0f}".format(snap.dex) }}
                 </span>
@@ -175,7 +175,7 @@
             {% endif %}
             {% if snap.vanna is not none %}
               <div class="research-card-row">
-                <span class="research-card-label">vanna</span>
+                <span class="research-card-label">Vanna</span>
                 <span class="research-card-value">
                   {{ "{:+,.0f}".format(snap.vanna) }}
                 </span>
@@ -183,7 +183,7 @@
             {% endif %}
             {% if snap.charm is not none %}
               <div class="research-card-row">
-                <span class="research-card-label">charm</span>
+                <span class="research-card-label">Charm</span>
                 <span class="research-card-value">
                   {{ "{:+,.0f}".format(snap.charm) }}
                 </span>
@@ -198,19 +198,19 @@
             <div class="research-card-eyebrow">WALLS &middot; <span class="research-live">live</span></div>
             {% if snap.call_wall is not none %}
               <div class="research-card-row">
-                <span class="research-card-label">call_wall</span>
+                <span class="research-card-label">Call Wall</span>
                 <span class="research-card-value positive">{{ "%.2f"|format(snap.call_wall) }}</span>
               </div>
             {% endif %}
             {% if snap.put_wall is not none %}
               <div class="research-card-row">
-                <span class="research-card-label">put_wall</span>
+                <span class="research-card-label">Put Wall</span>
                 <span class="research-card-value negative">{{ "%.2f"|format(snap.put_wall) }}</span>
               </div>
             {% endif %}
             {% if snap.gamma_wall is not none %}
               <div class="research-card-row">
-                <span class="research-card-label">gamma_wall</span>
+                <span class="research-card-label">Gamma Wall</span>
                 <span class="research-card-value">{{ "%.2f"|format(snap.gamma_wall) }}</span>
               </div>
             {% endif %}
