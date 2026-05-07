@@ -86,8 +86,11 @@ class PrevCloseStore:
         if not tickers:
             return []
 
-        # Build the missing list under lock so concurrent /api/spot-prices
-        # calls don't all fire identical Schwab requests.
+        # Snapshot the missing list under lock so we read a consistent
+        # _cache view. Note: this does NOT cross-call dedup — two
+        # concurrent ensure() calls can each fetch the same ticker once.
+        # Acceptable: idempotent writes, at most one wasted call per
+        # concurrent caller.
         to_fetch: List[str] = []
         with self._lock:
             for t in tickers:

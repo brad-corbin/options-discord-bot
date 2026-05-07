@@ -1,7 +1,8 @@
 """
 test_spot_prices_streaming.py — tests for the streaming-first spot fetcher.
 
-Mocks both the streaming spot store and the Schwab provider. Verifies:
+Fully offline: streaming spot store, Schwab provider, AND Yahoo fetcher
+are all stubbed inside _setup(). Verifies:
   - streaming hits short-circuit (no REST, no Yahoo)
   - REST falls in for unsubscribed tickers
   - Yahoo only runs when DASHBOARD_SPOT_USE_STREAMING is off (legacy mode)
@@ -97,6 +98,12 @@ def _setup(env_streaming="1", streaming_prices=None, prev_close=None,
     # Inject the schwab provider lookup.
     fake = _FakeSchwabProvider(schwab_table or {})
     spot_prices._get_schwab_provider = lambda: fake
+
+    # Stub the Yahoo fetcher so the test suite is fully offline.
+    # Without this, Phase 4 fallback in _fetch_streaming_first and the
+    # legacy Yahoo path both fire real network requests and can hit 403
+    # / rate-limit / DNS failures depending on the environment.
+    spot_prices._fetch_one_yahoo = lambda t: ({}, "err")
 
     return spot_prices, fake
 
