@@ -1,0 +1,217 @@
+{% extends "dashboard/base.html" %}
+
+{% block title %}The Legacy Desk &mdash; Research{% endblock %}
+{% block brand_sub %}Research &middot; {{ active_account.label }}{% endblock %}
+
+{% block content %}
+
+{# ─── Tagline header — matches Trading page pattern ─────────────────── #}
+<div class="trading-tagline fade-in">
+  <div class="tagline-primary">Edge Discovery &middot; The Rebuild Layer</div>
+  <div class="tagline-secondary">
+    Single Source of Truth &middot; Engines Built on BotState
+  </div>
+</div>
+
+{# ─── Section 1: Rebuild Progress ──────────────────────────────────── #}
+<div class="trading-cards-section fade-in">
+  <div class="trading-cards-header">
+    <div class="trading-cards-eyebrow">— REBUILD PROGRESS</div>
+    <div class="trading-cards-meta">
+      <span class="trading-status-dot"
+            data-state="{% if page_data.available %}live{% else %}stale{% endif %}"></span>
+      <span class="trading-meta-text">
+        {% if page_data.available %}
+          Last update <span class="num">{{ page_data.fetched_at_utc.strftime('%H:%M:%S') }} UTC</span>
+          &middot; {{ page_data.tickers_with_data }} of {{ page_data.tickers_total }} tickers populated
+          {% if page_data.tickers_errored > 0 %}
+            &middot; <span class="negative">{{ page_data.tickers_errored }} errored</span>
+          {% endif %}
+        {% else %}
+          {{ page_data.error or "Research data layer unavailable" }}
+        {% endif %}
+      </span>
+    </div>
+  </div>
+
+  {# ─── Canonical compute status grid ─────────────────────────────── #}
+  {% if page_data.available and page_data.canonical_status_summary %}
+  <div class="research-canonicals">
+    <div class="research-canonicals-eyebrow">CANONICAL COMPUTE STATUS</div>
+    <div class="research-canonicals-grid">
+      {% for cname, counts in page_data.canonical_status_summary|dictsort %}
+        {% set total = counts.live + counts.stub + counts.error %}
+        {% set state = 'live' if counts.live > 0 and counts.stub == 0
+                       else 'partial' if counts.live > 0
+                       else 'error' if counts.error > 0
+                       else 'stub' %}
+        <div class="research-canonical-cell research-canonical-{{ state }}">
+          <div class="research-canonical-name">{{ cname }}</div>
+          <div class="research-canonical-status">
+            {% if state == 'live' %}
+              <span class="num">LIVE</span> &middot; {{ counts.live }}/{{ total }}
+            {% elif state == 'partial' %}
+              <span class="num">PARTIAL</span> &middot; {{ counts.live }}/{{ total }}
+            {% elif state == 'error' %}
+              <span class="num">ERROR</span> &middot; {{ counts.error }}
+            {% else %}
+              <span class="muted">stub</span>
+            {% endif %}
+          </div>
+        </div>
+      {% endfor %}
+    </div>
+  </div>
+  {% endif %}
+</div>
+
+{# ─── Section 2: Per-ticker snapshots ──────────────────────────────── #}
+{% if page_data.available and page_data.snapshots %}
+<div class="trading-cards-section fade-in">
+  <div class="trading-cards-header">
+    <div class="trading-cards-eyebrow">— TICKER STATE &middot; {{ page_data.tickers_total }} TICKERS</div>
+    <div class="trading-cards-meta">
+      <span class="trading-meta-text">
+        Avg fields lit: <span class="num">{{ "%.1f"|format(page_data.fields_lit_avg) }}</span>
+        / {{ page_data.fields_total }} per ticker
+      </span>
+    </div>
+  </div>
+
+  <div class="research-grid">
+    {% for snap in page_data.snapshots %}
+      <div class="research-card {% if snap.error %}research-card-error{% endif %}">
+        <div class="research-card-header">
+          <div class="research-card-title-row">
+            <span class="research-card-ticker">{{ snap.ticker }}</span>
+            {% if snap.spot %}
+              <span class="research-card-spot">${{ "%.2f"|format(snap.spot) }}</span>
+            {% else %}
+              <span class="research-card-spot muted">—</span>
+            {% endif %}
+          </div>
+          <div class="research-card-progress">
+            <span class="num">{{ snap.fields_lit }}</span>/{{ snap.fields_total }} lit
+          </div>
+        </div>
+
+        {% if snap.error %}
+          <div class="research-card-error">
+            {{ snap.error }}
+          </div>
+        {% else %}
+
+          {# ─── LIVE: gamma_flip + flip_location ────────────────── #}
+          <div class="research-card-section">
+            <div class="research-card-eyebrow">FLIP STATE &middot; <span class="research-live">live</span></div>
+            <div class="research-card-row">
+              <span class="research-card-label">gamma_flip</span>
+              <span class="research-card-value">
+                {% if snap.gamma_flip %}
+                  ${{ "%.2f"|format(snap.gamma_flip) }}
+                {% else %}
+                  <span class="muted">none (outside band)</span>
+                {% endif %}
+              </span>
+            </div>
+            {% if snap.distance_from_flip_pct is not none %}
+              <div class="research-card-row">
+                <span class="research-card-label">distance</span>
+                <span class="research-card-value
+                      {% if snap.distance_from_flip_pct > 0 %}positive
+                      {% elif snap.distance_from_flip_pct < 0 %}negative{% endif %}">
+                  {{ "%+.2f"|format(snap.distance_from_flip_pct) }}%
+                </span>
+              </div>
+            {% endif %}
+            <div class="research-card-row">
+              <span class="research-card-label">location</span>
+              <span class="research-card-value">{{ snap.flip_location }}</span>
+            </div>
+          </div>
+
+          {# ─── PENDING: everything else ─────────────────────────── #}
+          <div class="research-card-section">
+            <div class="research-card-eyebrow">PENDING CANONICAL COMPUTES</div>
+            {% set pending_count = (snap.canonical_status.values()|list).count('stub') +
+                                   (snap.canonical_status|length - (snap.canonical_status.values()|list)|length) %}
+            <div class="research-card-pending">
+              {% set pending_names = [] %}
+              {% for cname, cstatus in snap.canonical_status|dictsort %}
+                {% if cstatus.startswith('stub') %}
+                  {% set _ = pending_names.append(cname) %}
+                {% endif %}
+              {% endfor %}
+              {% if pending_names %}
+                <span class="muted">{{ pending_names|join(' · ') }}</span>
+              {% else %}
+                <span class="muted">none — all canonical functions live</span>
+              {% endif %}
+            </div>
+          </div>
+
+          {# ─── Fetch health (if any errors) ─────────────────────── #}
+          {% if snap.fetch_errors %}
+            <div class="research-card-section">
+              <div class="research-card-eyebrow">FETCH ERRORS</div>
+              {% for op, errmsg in snap.fetch_errors %}
+                <div class="research-card-row">
+                  <span class="research-card-label negative">{{ op }}</span>
+                  <span class="research-card-value muted">{{ errmsg[:60] }}</span>
+                </div>
+              {% endfor %}
+            </div>
+          {% endif %}
+
+        {% endif %}
+      </div>
+    {% endfor %}
+  </div>
+</div>
+{% endif %}
+
+{# ─── Section 3: Rebuild Roadmap (always visible, even if data unavailable) ─── #}
+<div class="trading-cards-section fade-in">
+  <div class="trading-cards-header">
+    <div class="trading-cards-eyebrow">— REBUILD ROADMAP</div>
+  </div>
+  <div class="research-roadmap">
+    <div class="research-roadmap-row">
+      <span class="research-roadmap-status research-live">DONE</span>
+      <span class="research-roadmap-name">raw_inputs.py</span>
+      <span class="research-roadmap-desc">DataRouter wrapper with cache + fetch error tracking</span>
+    </div>
+    <div class="research-roadmap-row">
+      <span class="research-roadmap-status research-live">DONE</span>
+      <span class="research-roadmap-name">canonical_gamma_flip</span>
+      <span class="research-roadmap-desc">First canonical compute — single entry point for flip detection</span>
+    </div>
+    <div class="research-roadmap-row">
+      <span class="research-roadmap-status research-live">DONE</span>
+      <span class="research-roadmap-name">BotState.build_from_raw</span>
+      <span class="research-roadmap-desc">Permissive state builder — partial population during rebuild</span>
+    </div>
+    <div class="research-roadmap-row">
+      <span class="research-roadmap-status research-stub">NEXT</span>
+      <span class="research-roadmap-name">canonical_walls</span>
+      <span class="research-roadmap-desc">Pick canonical from 23 existing implementations across the codebase</span>
+    </div>
+    <div class="research-roadmap-row">
+      <span class="research-roadmap-status research-stub">NEXT</span>
+      <span class="research-roadmap-name">canonical_gex</span>
+      <span class="research-roadmap-desc">Wrap _exposures from options_exposure (post-Patch-9 source of truth)</span>
+    </div>
+    <div class="research-roadmap-row">
+      <span class="research-roadmap-status research-stub">NEXT</span>
+      <span class="research-roadmap-name">canonical_technicals</span>
+      <span class="research-roadmap-desc">RSI / MACD / ADX / VWAP — first-class for every engine</span>
+    </div>
+    <div class="research-roadmap-row">
+      <span class="research-roadmap-status research-stub">LATER</span>
+      <span class="research-roadmap-name">First shadow engine cutover</span>
+      <span class="research-roadmap-desc">silent_thesis rebuilt on BotState — runs in parallel to old, dashboard shows divergence</span>
+    </div>
+  </div>
+</div>
+
+{% endblock %}

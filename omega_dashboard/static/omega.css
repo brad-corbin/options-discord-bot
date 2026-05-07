@@ -3492,3 +3492,286 @@ body[data-account="clay"] {
   .family-panel-label::before,
   .family-panel-label::after { display: none; }
 }
+
+/* ════════════════════════════════════════════════════════
+   RESEARCH PAGE — appended for Patch 11.3
+
+   The rebuild progress + per-ticker BotState surface.
+   Uses existing Legacy Desk tokens (--bg-panel, --brass,
+   --text-muted, etc.) — no new color variables.
+
+   Three sections:
+     1. Canonical compute status grid (top, top-level rebuild progress)
+     2. Per-ticker BotState cards (middle, current state)
+     3. Roadmap (bottom, what's next)
+   ──────────────────────────────────────────────────────── */
+
+
+/* ─── Canonical compute status grid ─────────────────────────────── */
+
+.research-canonicals {
+  margin-top: 16px;
+  padding: 18px 20px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+}
+
+.research-canonicals-eyebrow {
+  font-family: 'Cinzel', serif;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 2.5px;
+  color: var(--brass);
+  margin-bottom: 14px;
+  text-transform: uppercase;
+}
+
+.research-canonicals-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 8px;
+}
+
+.research-canonical-cell {
+  padding: 10px 12px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--text-dim);
+}
+
+.research-canonical-cell.research-canonical-live {
+  border-left-color: #5C8A4F;        /* muted green for live */
+}
+.research-canonical-cell.research-canonical-partial {
+  border-left-color: var(--brass);   /* brass for partial */
+}
+.research-canonical-cell.research-canonical-stub {
+  border-left-color: var(--text-dim); /* dim for stubbed */
+  opacity: 0.7;
+}
+.research-canonical-cell.research-canonical-error {
+  border-left-color: #8B3A30;        /* oxblood for error */
+}
+
+.research-canonical-name {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  color: var(--text);
+  font-weight: 500;
+  margin-bottom: 4px;
+}
+
+.research-canonical-status {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  color: var(--text-muted);
+  letter-spacing: 0.8px;
+}
+
+.research-canonical-status .num {
+  color: var(--text);
+  font-weight: 600;
+}
+
+
+/* ─── Per-ticker grid ───────────────────────────────────────────── */
+
+.research-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.research-card {
+  padding: 14px 16px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--brass);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.research-card.research-card-error {
+  border-left-color: #8B3A30;
+}
+
+.research-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.research-card-title-row {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+}
+
+.research-card-ticker {
+  font-family: 'Cinzel', serif;
+  font-weight: 500;
+  font-size: 17px;
+  letter-spacing: 2px;
+  color: var(--brass-bright);
+}
+
+.research-card-spot {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 14px;
+  color: var(--text);
+  font-weight: 500;
+}
+
+.research-card-progress {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: var(--text-muted);
+  letter-spacing: 0.5px;
+}
+
+.research-card-progress .num {
+  color: var(--brass-bright);
+  font-weight: 600;
+}
+
+.research-card-section {
+  padding-bottom: 6px;
+}
+
+.research-card-section + .research-card-section {
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+
+.research-card-eyebrow {
+  font-family: 'Cinzel', serif;
+  font-size: 9.5px;
+  font-weight: 500;
+  letter-spacing: 2px;
+  color: var(--brass);
+  text-transform: uppercase;
+  margin-bottom: 6px;
+}
+
+.research-card-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  padding: 2px 0;
+}
+
+.research-card-label {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.research-card-value {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  color: var(--text);
+  font-weight: 500;
+}
+
+.research-card-value.positive {
+  color: #6FA85C;
+}
+
+.research-card-value.negative {
+  color: #B8503F;
+}
+
+.research-card-pending {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  color: var(--text-dim);
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+.research-card-error {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: #B8503F;
+  padding: 8px 0;
+}
+
+/* Inline status pills */
+.research-live {
+  color: #6FA85C;
+  font-family: 'JetBrains Mono', monospace;
+  font-weight: 600;
+  text-transform: lowercase;
+}
+.research-stub {
+  color: var(--text-dim);
+  font-family: 'JetBrains Mono', monospace;
+  font-weight: 500;
+  text-transform: lowercase;
+}
+
+
+/* ─── Roadmap section ───────────────────────────────────────────── */
+
+.research-roadmap {
+  margin-top: 16px;
+  padding: 16px 20px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.research-roadmap-row {
+  display: grid;
+  grid-template-columns: 70px 1fr 2fr;
+  gap: 16px;
+  align-items: baseline;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.research-roadmap-row:last-child {
+  border-bottom: none;
+}
+
+.research-roadmap-status {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 1.5px;
+  text-align: center;
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+}
+
+.research-roadmap-status.research-live {
+  color: #6FA85C;
+  border-color: #5C8A4F;
+}
+
+.research-roadmap-status.research-stub {
+  color: var(--text-muted);
+  border-color: var(--border);
+  text-transform: uppercase;
+}
+
+.research-roadmap-name {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 13px;
+  color: var(--brass-bright);
+  font-weight: 500;
+}
+
+.research-roadmap-desc {
+  font-family: 'Cormorant Garamond', serif;
+  font-size: 14px;
+  color: var(--text-muted);
+  font-style: italic;
+}
+
