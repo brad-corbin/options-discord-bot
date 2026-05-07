@@ -56,8 +56,13 @@ Dashboard ("The Legacy Desk"):
 - `omega_dashboard/__init__.py` — Flask blueprint setup
 - `omega_dashboard/routes.py` — page routes, PAGE_TABS config
 - `omega_dashboard/research_data.py` — Research page data layer (the canonical-rebuild surface)
+- `omega_dashboard/spot_prices.py` — dashboard `/api/spot-prices` fetcher.
+  Streaming-first when `DASHBOARD_SPOT_USE_STREAMING=1`, legacy Yahoo when off.
 - `omega_dashboard/templates/dashboard/` — Jinja templates
 - `omega_dashboard/static/omega.css` — single CSS file, all dashboard styles
+- `prev_close_store.py` — canonical previous-close cache. Lazy-fills from
+  Schwab `get_quote`, 25h TTL. Pairs with `schwab_stream.get_streaming_spot`
+  to feed the dashboard's `change`/`change_pct` columns.
 
 Canonical rebuild (the v11 work — see "Canonical rebuild" below):
 - `raw_inputs.py` — DataRouter wrapper bundle
@@ -116,6 +121,19 @@ Canonical rebuild (the v11 work — see "Canonical rebuild" below):
 - **Stalk / Alpha SPY Omega** — Telegram channels (separate from the
   main bot channel) for diagnostic/stalk content and non-confluence
   Potter Box breakouts.
+- **prev_close_store** — the canonical previous-close source. One module
+  per concept (audit rule 1). Used by `omega_dashboard/spot_prices.py` to
+  pair streaming live price with yesterday's close. Don't add parallel
+  implementations elsewhere; if you need prev_close, call
+  `get_prev_close_store().get(ticker)`.
+- **DASHBOARD_SPOT_USE_STREAMING** — env var (default off) gating the
+  streaming-first path in `omega_dashboard/spot_prices.py`. On → Schwab
+  WebSocket spots + prev_close_store + Schwab REST fallback. Off →
+  byte-identical v8.3 Yahoo behavior. Rollback is unset+redeploy.
+- **add_equity_symbols / remove_equity_symbols** — `SchwabStreamManager`
+  methods for dynamic Level 1 equity sub management (mirror of the
+  existing option pattern). The dashboard's `/api/register-tickers` calls
+  these on page load so portfolio/watchlist tickers join the stream.
 
 ---
 
@@ -299,6 +317,15 @@ is high. Don't argue with them.
   real lookback).
 - Default Research page intent: `front` (first non-0-DTE expiration per ticker, via `canonical_expiration`).
 - Research page cache: 60-second in-memory, keyed by (ticker, expiration).
+- Dashboard spot prices: streaming-first path (`DASHBOARD_SPOT_USE_STREAMING=1`)
+  reads from `schwab_stream.get_streaming_spot` + `prev_close_store`, with
+  Schwab REST `get_quote` as cold-start fallback and Yahoo as last resort.
+  Yahoo path retained verbatim from v8.3 as the rollback target — unset the
+  env var to revert. Trading-engine paths (`/trading/data`, silent thesis,
+  scanner) are unaffected; they still use existing quote logic.
+- `_tickers` on `SchwabStreamManager` is normalized uppercase at construction
+  (Patch S.1 fix). Don't pass lowercase symbols to `add_equity_symbols` and
+  expect Schwab to deduplicate — the manager dedups locally first.
 
 ---
 
@@ -341,6 +368,11 @@ python3 test_canonical_iv_state.py
 python3 test_canonical_exposures.py
 python3 test_canonical_expiration.py
 python3 test_bot_state.py
+
+# Streaming-spots dashboard tests (Patch S.1-S.4)
+python3 test_schwab_stream_equity_dynamic.py
+python3 test_prev_close_store.py
+python3 test_spot_prices_streaming.py
 
 # End-to-end demo of BotState pipeline (requires the repo's
 # options_exposure.py, engine_bridge.py to be importable)
