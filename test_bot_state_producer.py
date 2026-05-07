@@ -16,6 +16,7 @@ import os
 import json
 import time
 import math
+from typing import Dict
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 PASSED = []
@@ -44,6 +45,88 @@ def assert_true(cond, msg):
         return False
     PASSED.append(msg)
     return True
+
+
+class _FakeRedis:
+    """Minimal Redis stand-in for unit tests. Implements the SUBSET of
+    redis-py we need: SET (with NX/EX/XX), GET, DELETE, EXPIRE, TTL,
+    ZADD, ZRANGE, EVAL (for safe-release/refresh Lua). Enough to test
+    our helpers; nothing more. NOT a general-purpose mock.
+    """
+    def __init__(self):
+        self.kv: Dict[str, str] = {}
+        self.zset: Dict[str, list] = {}  # key → list of (score, member)
+        self.expirations: Dict[str, float] = {}
+        self.ops: list = []  # call log for assertions
+
+    def set(self, key, value, ex=None, nx=False, xx=False):
+        self.ops.append(("set", key, value, ex, nx, xx))
+        if nx and key in self.kv:
+            return None
+        if xx and key not in self.kv:
+            return None
+        self.kv[key] = value
+        if ex is not None:
+            self.expirations[key] = time.time() + ex
+        return True
+
+    def get(self, key):
+        return self.kv.get(key)
+
+    def delete(self, *keys):
+        n = 0
+        for k in keys:
+            if k in self.kv:
+                del self.kv[k]
+                n += 1
+            self.expirations.pop(k, None)
+        return n
+
+    def expire(self, key, seconds):
+        # Real Redis EXPIRE works on any key (kv, zset, hash, ...). Match
+        # that behavior so a sorted-set TTL update doesn't silently no-op.
+        self.ops.append(("expire", key, seconds))
+        if key in self.kv or key in self.zset:
+            self.expirations[key] = time.time() + seconds
+            return 1
+        return 0
+
+    def ttl(self, key):
+        if key not in self.kv and key not in self.zset:
+            return -2
+        if key not in self.expirations:
+            return -1
+        return int(self.expirations[key] - time.time())
+
+    def zadd(self, key, mapping):
+        z = self.zset.setdefault(key, [])
+        for member, score in mapping.items():
+            z.append((score, member))
+        return len(mapping)
+
+    def zrange(self, key, start, stop, withscores=False):
+        z = sorted(self.zset.get(key, []))
+        sliced = z[start:stop+1] if stop >= 0 else z[start:]
+        if withscores:
+            return [(m, s) for s, m in sliced]
+        return [m for _, m in sliced]
+
+    def eval(self, script, numkeys, *args):
+        """Minimal Lua eval — supports the safe-release and safe-refresh
+        owner-checked patterns used by _release_lock and _refresh_lock."""
+        keys = list(args[:numkeys])
+        argv = list(args[numkeys:])
+        # Owner-checked DEL (release).
+        if "redis.call('get'" in script and "redis.call('del'" in script:
+            if self.kv.get(keys[0]) == argv[0]:
+                return self.delete(keys[0])
+            return 0
+        # Owner-checked EXPIRE (refresh).
+        if "redis.call('get'" in script and "redis.call('expire'" in script:
+            if self.kv.get(keys[0]) == argv[0]:
+                return self.expire(keys[0], int(argv[1]))
+            return 0
+        raise NotImplementedError(f"FakeRedis.eval: unrecognized script")
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -171,14 +254,101 @@ def test_serialize_round_trip_clean_state():
     assert_eq(parsed["state"]["spot"], 184.50, "float round-trips")
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Telemetry tests
+# ─────────────────────────────────────────────────────────────────────
+
+def test_record_build_timing_writes_sorted_set_member():
+    from bot_state_producer import _record_build_timing
+    fake = _FakeRedis()
+    _record_build_timing(fake, ticker="AAPL", intent="front",
+                         elapsed_ms=143, expiration="2026-05-08")
+    keys = list(fake.zset.keys())
+    assert_eq(len(keys), 1, "exactly one timings key written")
+    assert_true(keys[0].startswith("bot_state_producer:timings:"),
+                "key prefix matches spec")
+    members = fake.zrange(keys[0], 0, -1, withscores=True)
+    assert_eq(len(members), 1, "one member written")
+    member, score = members[0]
+    parsed = json.loads(member)
+    assert_eq(parsed["ticker"], "AAPL", "ticker on member")
+    assert_eq(parsed["intent"], "front", "intent on member")
+    assert_eq(parsed["elapsed_ms"], 143, "elapsed_ms on member")
+    assert_eq(parsed["expiration"], "2026-05-08", "expiration on member")
+    assert_true(score > 0, "score is millisecond timestamp")
+
+
+def test_record_build_timing_sets_48h_ttl():
+    from bot_state_producer import _record_build_timing
+    fake = _FakeRedis()
+    _record_build_timing(fake, "AAPL", "front", 143, "2026-05-08")
+    # Verify the implementer called expire() on the timings key.
+    expire_calls = [op for op in fake.ops if op[0] == "expire"]
+    assert_true(len(expire_calls) >= 1, "expire() was called on the timings key")
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Multi-worker Redis lock tests
+# ─────────────────────────────────────────────────────────────────────
+
+def test_lock_acquire_when_free():
+    from bot_state_producer import _acquire_lock
+    fake = _FakeRedis()
+    token = _acquire_lock(fake, lock_key="bsp:lock", ttl_sec=60)
+    assert_true(token is not None, "acquire returns owner token when free")
+    assert_eq(fake.kv["bsp:lock"], token, "lock value is the token")
+
+
+def test_lock_acquire_fails_when_held():
+    from bot_state_producer import _acquire_lock
+    fake = _FakeRedis()
+    fake.kv["bsp:lock"] = "someone-else"
+    token = _acquire_lock(fake, lock_key="bsp:lock", ttl_sec=60)
+    assert_eq(token, None, "acquire returns None when lock is held")
+
+
+def test_lock_release_only_by_owner():
+    from bot_state_producer import _acquire_lock, _release_lock
+    fake = _FakeRedis()
+    token = _acquire_lock(fake, "bsp:lock", 60)
+    # Wrong-token release: lock stays.
+    released = _release_lock(fake, "bsp:lock", "wrong-token")
+    assert_eq(released, False, "wrong owner cannot release")
+    assert_eq(fake.kv["bsp:lock"], token, "lock still held by original owner")
+    # Right-token release: lock removed.
+    released = _release_lock(fake, "bsp:lock", token)
+    assert_eq(released, True, "owner can release")
+    assert_true("bsp:lock" not in fake.kv, "lock key gone after release")
+
+
+def test_lock_refresh_extends_ttl():
+    from bot_state_producer import _acquire_lock, _refresh_lock
+    fake = _FakeRedis()
+    token = _acquire_lock(fake, "bsp:lock", 60)
+    refreshed = _refresh_lock(fake, "bsp:lock", token, 120)
+    assert_eq(refreshed, True, "owner can refresh lock TTL")
+    refreshed = _refresh_lock(fake, "bsp:lock", "wrong", 120)
+    assert_eq(refreshed, False, "wrong token cannot refresh")
+
+
 if __name__ == "__main__":
+    # Parsing
     test_parse_intents_filters_empty_strings()
     test_parse_tickers_uppercase_dedup()
     test_parse_int_env_with_default()
+    # Envelope + serialization
     test_envelope_includes_required_metadata()
     test_envelope_does_not_mutate_state()
     test_serialize_handles_nan_and_inf()
     test_serialize_round_trip_clean_state()
+    # Telemetry
+    test_record_build_timing_writes_sorted_set_member()
+    test_record_build_timing_sets_48h_ttl()
+    # Lock
+    test_lock_acquire_when_free()
+    test_lock_acquire_fails_when_held()
+    test_lock_release_only_by_owner()
+    test_lock_refresh_extends_ttl()
     print(f"PASSED: {len(PASSED)}, FAILED: {len(FAILED)}")
     for f in FAILED:
         print(f"  ✗ {f}")

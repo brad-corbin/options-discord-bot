@@ -132,3 +132,105 @@ def _serialize_envelope(env: Dict[str, Any]) -> str:
     """
     cleaned = _clean_for_json(env)
     return json.dumps(cleaned, separators=(",", ":"))
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Per-build timing telemetry — hard deliverable per spec v4.
+#
+# Sorted set keyed by UTC date. Member is JSON, score is unix ms so
+# multiple builds for the same ticker in the same second don't collide.
+# ZRANGEBYSCORE lets the post-deploy analysis slice arbitrary windows.
+# ─────────────────────────────────────────────────────────────────────
+
+TIMINGS_KEY_PREFIX = "bot_state_producer:timings:"
+TIMINGS_TTL_SEC = 48 * 3600  # 48 hours — covers the 24h analysis window + slack
+
+
+def _record_build_timing(redis_client, ticker: str, intent: str,
+                         elapsed_ms: int, expiration: str) -> None:
+    """Append one build-timing record to the daily sorted set.
+
+    No-op on Redis errors — telemetry must NEVER block the producer loop.
+    """
+    if redis_client is None:
+        return
+    try:
+        from datetime import datetime, timezone
+        date_str = datetime.now(timezone.utc).strftime("%Y%m%d")
+        key = f"{TIMINGS_KEY_PREFIX}{date_str}"
+        member = json.dumps({
+            "ticker": ticker,
+            "intent": intent,
+            "elapsed_ms": int(elapsed_ms),
+            "expiration": expiration,
+        }, separators=(",", ":"))
+        score = int(time.time() * 1000)  # millis since epoch
+        redis_client.zadd(key, {member: score})
+        redis_client.expire(key, TIMINGS_TTL_SEC)
+    except Exception as e:
+        log.debug(f"telemetry write failed for {ticker}/{intent}: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Multi-worker lock — only one Render web worker runs the producer.
+#
+# Pattern: SET key token NX EX ttl (atomic acquire). Owner refreshes via
+# Lua-equivalent CAS. Release is owner-checked via Lua so a stale owner
+# can't unlock a lock that's been re-acquired by someone else.
+# ─────────────────────────────────────────────────────────────────────
+
+_RELEASE_SCRIPT = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+    return redis.call('del', KEYS[1])
+else
+    return 0
+end
+"""
+
+_REFRESH_SCRIPT = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+    return redis.call('expire', KEYS[1], ARGV[2])
+else
+    return 0
+end
+"""
+
+
+def _acquire_lock(redis_client, lock_key: str, ttl_sec: int) -> Optional[str]:
+    """Atomically acquire `lock_key` with TTL. Returns an owner token on
+    success, None on failure (lock already held). The token is required
+    to release/refresh and is opaque to callers."""
+    if redis_client is None:
+        return None
+    import secrets
+    token = secrets.token_hex(16)
+    try:
+        ok = redis_client.set(lock_key, token, nx=True, ex=ttl_sec)
+        return token if ok else None
+    except Exception as e:
+        log.warning(f"lock acquire failed: {e}")
+        return None
+
+
+def _release_lock(redis_client, lock_key: str, token: str) -> bool:
+    """Release a lock — only succeeds if `token` matches the current value."""
+    if redis_client is None:
+        return False
+    try:
+        result = redis_client.eval(_RELEASE_SCRIPT, 1, lock_key, token)
+        return bool(result)
+    except Exception as e:
+        log.warning(f"lock release failed: {e}")
+        return False
+
+
+def _refresh_lock(redis_client, lock_key: str, token: str, ttl_sec: int) -> bool:
+    """Bump TTL on a lock — only if `token` still owns it."""
+    if redis_client is None:
+        return False
+    try:
+        result = redis_client.eval(_REFRESH_SCRIPT, 1, lock_key, token, ttl_sec)
+        return bool(result)
+    except Exception as e:
+        log.warning(f"lock refresh failed: {e}")
+        return False
