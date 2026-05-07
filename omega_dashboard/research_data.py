@@ -25,7 +25,9 @@ the % goes up.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -83,6 +85,10 @@ class TickerSnapshot:
     chain_clean: bool
     fetch_errors: list
     error: Optional[str] = None    # set if build_from_raw failed entirely
+    # Patch C: distinguishes "producer hasn't written this ticker yet"
+    # (skeleton card, neutral styling) from "build raised an exception"
+    # (red error card). Always False on the legacy inline-build path.
+    warming_up: bool = False
 
 
 @dataclass
@@ -124,6 +130,118 @@ def _cache_get(ticker: str, expiration: str):
 
 def _cache_put(ticker: str, expiration: str, snap):
     _CACHE[(ticker, expiration)] = (time.time(), snap)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Patch C: Redis consumer helpers
+#
+# Reads pre-built BotState envelopes from Redis (written by Patch B's
+# bot_state_producer). Validates schema versioning; falls through to a
+# warming-up snapshot on any failure mode (missing key, JSON error,
+# version mismatch). Gated by RESEARCH_USE_REDIS env var (see
+# research_data() below).
+# ─────────────────────────────────────────────────────────────────────
+
+# Schema version compat — bump only on TRULY breaking changes.
+# Additive producer bumps (new fields, new canonicals) leave this alone.
+MIN_COMPATIBLE_PRODUCER_VERSION = 1
+
+# Strict — Patch 9 dealer-side convention. Mismatch = warming-up.
+EXPECTED_CONVENTION_VERSION = 2
+
+# Producer's Redis key prefix (must match bot_state_producer.KEY_PREFIX).
+KEY_PREFIX = "bot_state:"
+
+
+def _warming_up_snapshot(ticker: str, reason: str = "warming up") -> "TickerSnapshot":
+    """Construct a placeholder snapshot for tickers without (or with
+    invalid) Redis data. The template renders these as skeleton cards."""
+    return TickerSnapshot(
+        ticker=ticker,
+        spot=None,
+        gamma_flip=None,
+        distance_from_flip_pct=None,
+        flip_location="unknown",
+        atm_iv=None,
+        iv_skew_pp=None,
+        iv30=None,
+        gex=None,
+        dex=None,
+        vanna=None,
+        charm=None,
+        gex_sign="unknown",
+        call_wall=None,
+        put_wall=None,
+        gamma_wall=None,
+        fields_lit=0,
+        fields_total=0,
+        canonical_status={},
+        chain_clean=False,
+        fetch_errors=[],
+        error=reason,
+        warming_up=True,
+    )
+
+
+def _validate_envelope_versions(envelope: dict, ticker: str) -> Optional[str]:
+    """Returns None if the envelope's versions are acceptable, else an
+    error string suitable for log + warming-up display.
+
+    Forward compat: producer_version > our expected is accepted.
+    Backward incompat: producer_version < MIN_COMPATIBLE is rejected.
+    Convention strict: convention_version != EXPECTED_CONVENTION_VERSION
+    is rejected (Patch 9 protection).
+    """
+    pv = envelope.get("producer_version")
+    if pv is None:
+        return f"{ticker}: envelope missing producer_version"
+    if pv < MIN_COMPATIBLE_PRODUCER_VERSION:
+        return (f"{ticker}: producer_version {pv} below "
+                f"MIN_COMPATIBLE={MIN_COMPATIBLE_PRODUCER_VERSION}")
+
+    cv = envelope.get("convention_version")
+    if cv is None:
+        return f"{ticker}: envelope missing convention_version"
+    if cv != EXPECTED_CONVENTION_VERSION:
+        return (f"{ticker}: convention_version {cv} != expected "
+                f"{EXPECTED_CONVENTION_VERSION} (Patch 9 protection)")
+
+    return None
+
+
+def _snapshot_from_envelope(ticker: str, envelope: dict) -> "TickerSnapshot":
+    """Convert a validated producer envelope to a TickerSnapshot.
+
+    Caller must have already validated envelope versions — this function
+    parses the `state` dict permissively, defaulting missing fields to
+    None / "unknown" / 0 / {} / [] as appropriate.
+    """
+    state = envelope.get("state") or {}
+    return TickerSnapshot(
+        ticker=ticker,
+        spot=state.get("spot"),
+        gamma_flip=state.get("gamma_flip"),
+        distance_from_flip_pct=state.get("distance_from_flip_pct"),
+        flip_location=state.get("flip_location") or "unknown",
+        atm_iv=state.get("atm_iv"),
+        iv_skew_pp=state.get("iv_skew_pp"),
+        iv30=state.get("iv30"),
+        gex=state.get("gex"),
+        dex=state.get("dex"),
+        vanna=state.get("vanna"),
+        charm=state.get("charm"),
+        gex_sign=state.get("gex_sign") or "unknown",
+        call_wall=state.get("call_wall"),
+        put_wall=state.get("put_wall"),
+        gamma_wall=state.get("gamma_wall"),
+        fields_lit=state.get("fields_lit", 0),
+        fields_total=state.get("fields_total", 0),
+        canonical_status=state.get("canonical_status") or {},
+        chain_clean=bool(state.get("chain_clean", False)),
+        fetch_errors=state.get("fetch_errors") or [],
+        error=None,
+        warming_up=False,
+    )
 
 
 # ───────────────────────────────────────────────────────────────────────
