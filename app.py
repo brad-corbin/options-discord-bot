@@ -15004,6 +15004,19 @@ def _initialize_app():
                 from schwab_stream import start_streaming, start_continuous_flow
                 start_streaming(_cached_md)
 
+                # Patch B: bot_state_producer (Render leader only).
+                # Gated by BOT_STATE_PRODUCER_ENABLED env var; default off.
+                # Returns None when disabled, when no Redis, when no
+                # tickers, or when the cross-worker lock is held by
+                # another worker. Logs the disposition in any of those
+                # cases. Never crashes — wrapped in try/except so a
+                # producer startup failure doesn't block trading.
+                try:
+                    from bot_state_producer import start_producer
+                    start_producer(cached_md=_cached_md, redis_client=_get_redis())
+                except Exception as e:
+                    log.warning(f"bot_state_producer startup failed: {e}")
+
                 # v8.5 (Phase 3.1 remediation): subscription gate for the
                 # ContinuousFlowScanner post path. The schwab_stream.py side
                 # of this was wired on the prior deploy but the app.py side

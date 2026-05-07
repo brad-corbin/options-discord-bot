@@ -71,6 +71,11 @@ Canonical rebuild (the v11 work — see "Canonical rebuild" below):
 - `canonical_iv_state.py` — wraps `UnifiedIVSurface`
 - `canonical_exposures.py` — wraps `ExposureEngine.compute()`
 - `canonical_expiration.py` — picks chain expiration by intent (zero_dte / front / t7 / t30 / t60)
+- `bot_state_producer.py` — Patch B daemon. Three-tier loop (front/t7/t30+t60)
+  that periodically computes BotState per (ticker, intent) and writes JSON
+  envelopes to Redis. Gated by `BOT_STATE_PRODUCER_ENABLED`. Consumer is
+  Patch C's Research page rewrite (separate plan).
+- `test_bot_state_producer.py` — runnable without network or Redis (fake clients).
 - `test_*.py` for each — runnable without network or Schwab credentials
 
 ---
@@ -118,6 +123,23 @@ Canonical rebuild (the v11 work — see "Canonical rebuild" below):
   Blanket = ±25% always (used when no IV context). IV-aware = ±3σ of
   expected price movement, clamped to [15%, 40%] (Patch 8). Pass `iv` AND
   `dte_years` to canonical_gamma_flip to get IV-aware behavior.
+- **bot_state_producer** — daemon-thread producer that pre-computes BotState
+  for every (ticker, intent) on a tiered cadence and writes JSON envelopes
+  to Redis. Lives in `bot_state_producer.py`. The Research page (after
+  Patch C) becomes a pure consumer of these envelopes. Producer always
+  runs on exactly one Render worker (cross-worker Redis lock held by a
+  dedicated lock-keeper thread).
+- **producer envelope** — the JSON wrapper around BotState in Redis. Shape:
+  `{producer_version, convention_version, intent, expiration, state}`.
+  `producer_version` bumps on schema change (consumers reject unknown
+  versions); `convention_version=2` is Patch 9 dealer-side. `state` is
+  the BotState dataclass as-dict. Intent and expiration live on the
+  envelope, NOT inside BotState (Open Question #3 resolution).
+- **BOT_STATE_PRODUCER_ env vars** — `_ENABLED` (bool, default off),
+  `_TICKERS` (comma list), `_INTENTS_TIER_A/B/C` (comma lists; default
+  `front`/`t7`/empty), `_CADENCE_TIER_A/B/C` (seconds; defaults 60/180/600).
+  Empty-string Tier C cleanly disables that tier. Promote universe by
+  editing env vars and restarting.
 - **Stalk / Alpha SPY Omega** — Telegram channels (separate from the
   main bot channel) for diagnostic/stalk content and non-confluence
   Potter Box breakouts.
@@ -326,6 +348,19 @@ is high. Don't argue with them.
 - `_tickers` on `SchwabStreamManager` is normalized uppercase at construction
   (Patch S.1 fix). Don't pass lowercase symbols to `add_equity_symbols` and
   expect Schwab to deduplicate — the manager dedups locally first.
+- bot_state_producer ships behind `BOT_STATE_PRODUCER_ENABLED=false`
+  (default off). Initial production universe: 10 tickers × 2 intents
+  (front + t7), Tier C empty. Run 7 trading days clean before promoting
+  to full 35×4 universe. Per-build timing is recorded to a Redis sorted
+  set (`bot_state_producer:timings:{YYYYMMDD}`) for post-deploy cadence
+  tuning. Producer crashes are caught at the outer loop and restart with
+  5s backoff. No market-hours pause. Cross-worker lock is maintained by
+  a dedicated lock-keeper thread (path b — see review notes), independent
+  of tier work.
+- `producer_version` lives on the envelope and bumps on schema change.
+  Consumers (Research page after Patch C) check for forward and backward
+  compatibility on read; `convention_version` mismatch is treated as
+  "warming up" rather than rendered (Patch 9 protection).
 
 ---
 
@@ -368,6 +403,9 @@ python3 test_canonical_iv_state.py
 python3 test_canonical_exposures.py
 python3 test_canonical_expiration.py
 python3 test_bot_state.py
+
+# Patch B producer test (fake Redis, fake Schwab, no network)
+python3 test_bot_state_producer.py
 
 # Streaming-spots dashboard tests (Patch S.1-S.4)
 python3 test_schwab_stream_equity_dynamic.py
