@@ -312,34 +312,79 @@
   </div>
 </div>
 
-{# ─── Patch C.5/C.6: progressive auto-reload ─────────────────────────
-   Server-rendered page is otherwise static. While cards are warming
-   up, reload every 5s so they fill in. Patch C.6: only continue
-   reloading while the warming-up count is DECREASING — if a reload
-   shows the same count or more, the producer is stuck, so stop and
-   let the user see a stable page (manual F5 to retry). Once all
-   cards are populated the script tag is absent and polling stops. #}
+{# ─── Patch C.7: auto-refresh with visible controls + sane cap ───────
+   Bottom-of-page bar appears while any cards are warming up. Shows
+   countdown, lets user stop or trigger Refresh Now. Auto-refresh
+   continues every 5s up to a 60-attempt cap (5 minutes). If we hit
+   the cap — producer is genuinely stuck — the bar switches to a
+   "paused" state and waits for manual retry.
+
+   Earlier C.5 (refresh-while-warming) thrashed when keys expired
+   under rate-limit pressure; C.6 bumped producer TTL to 360s so
+   populated cards stay populated, AND tried "only refresh while
+   count decreases" — too tight, producer writes <1 ticker per 5s
+   under load so most cycles showed equal counts and gave up after
+   one refresh. This version just keeps going while there's anything
+   to wait for, with a visible escape hatch. #}
 {% if page_data.available %}
   {% set warming = page_data.snapshots | selectattr('warming_up') | list %}
   {% if warming | length > 0 %}
+    <div class="research-refresh-bar">
+      <span class="research-refresh-msg">
+        {{ warming | length }} ticker{{ 's' if warming|length != 1 else '' }} warming up.
+        Auto-refresh in <span id="research-rrt">5</span>s.
+      </span>
+      <button type="button" id="research-stop-btn" class="research-refresh-btn">Stop</button>
+      <button type="button" id="research-now-btn" class="research-refresh-btn">Refresh now</button>
+    </div>
     <script>
       (function() {
-        var current = {{ warming | length }};
-        var prev = parseInt(sessionStorage.getItem('research_warming_count'));
-        if (isNaN(prev)) prev = current + 1; // first load: assume progress
-        if (current < prev) {
-          sessionStorage.setItem('research_warming_count', current);
-          setTimeout(function() { location.reload(); }, 5000);
-        } else {
-          // No progress since last reload — stop the cycle.
-          sessionStorage.removeItem('research_warming_count');
+        var MAX_ATTEMPTS = 60;  // 5 minutes at 5s cadence
+        var attempts = parseInt(sessionStorage.getItem('research_refresh_attempts') || '0');
+        var msg = document.querySelector('.research-refresh-msg');
+        var rrt = document.getElementById('research-rrt');
+
+        if (attempts >= MAX_ATTEMPTS) {
+          sessionStorage.removeItem('research_refresh_attempts');
+          if (msg) msg.textContent = 'Auto-refresh paused after 5 min. Producer may be slow or stuck.';
+          if (rrt) rrt.textContent = '—';
+          // Wire Refresh Now to reset and reload.
+          var nowBtn = document.getElementById('research-now-btn');
+          if (nowBtn) nowBtn.addEventListener('click', function() {
+            sessionStorage.setItem('research_refresh_attempts', '0');
+            location.reload();
+          });
+          var stopBtn = document.getElementById('research-stop-btn');
+          if (stopBtn) stopBtn.style.display = 'none';
+          return;
         }
+
+        sessionStorage.setItem('research_refresh_attempts', String(attempts + 1));
+        var countdown = 5;
+        var iv = setInterval(function() {
+          countdown -= 1;
+          if (rrt) rrt.textContent = countdown;
+          if (countdown <= 0) { clearInterval(iv); location.reload(); }
+        }, 1000);
+
+        document.getElementById('research-stop-btn').addEventListener('click', function() {
+          clearInterval(iv);
+          sessionStorage.removeItem('research_refresh_attempts');
+          if (msg) msg.textContent = 'Auto-refresh stopped.';
+          if (rrt) rrt.textContent = '—';
+          this.style.display = 'none';
+        });
+        document.getElementById('research-now-btn').addEventListener('click', function() {
+          clearInterval(iv);
+          sessionStorage.setItem('research_refresh_attempts', '0');
+          location.reload();
+        });
       })();
     </script>
   {% else %}
     <script>
-      // All cards populated — clear stored progress state.
-      sessionStorage.removeItem('research_warming_count');
+      // All cards populated — clear refresh state for next time.
+      sessionStorage.removeItem('research_refresh_attempts');
     </script>
   {% endif %}
 {% endif %}
