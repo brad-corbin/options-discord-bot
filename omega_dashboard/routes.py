@@ -1687,6 +1687,44 @@ def health():
     }
 
 
+# ─── S.4: TICKER REGISTRATION ───────────────────────────────
+@dashboard_bp.route("/api/register-tickers", methods=["POST"])
+@login_required
+def api_register_tickers():
+    """Register a set of tickers for streaming spot subscription.
+
+    Called by the dashboard pages on load, BEFORE the first /api/spot-prices
+    request. Hands the ticker list to schwab_stream's add_equity_symbols
+    so the WebSocket sub catches up by the time the user's spot-prices
+    poll arrives. Idempotent — repeated calls with the same tickers are
+    silently de-duped inside add_equity_symbols.
+
+    Body: {"tickers": ["AAPL", "MSFT", ...]}
+    Returns: {"registered": N, "active": <streaming sub count>}
+
+    No-ops cleanly when DASHBOARD_SPOT_USE_STREAMING is off — the streamer
+    still subscribes; the dashboard just won't read from it.
+    """
+    from flask import jsonify, request
+    body = request.get_json(silent=True) or {}
+    raw = body.get("tickers") or []
+    tickers = [str(t).strip().upper() for t in raw if t and str(t).strip()]
+    if not tickers:
+        return jsonify({"registered": 0, "active": 0})
+
+    try:
+        from schwab_stream import _stream_manager
+        if _stream_manager is None:
+            log.debug("register-tickers: stream manager not running; skipping")
+            return jsonify({"registered": 0, "active": 0, "note": "stream offline"})
+        _stream_manager.add_equity_symbols(tickers)
+        active = _stream_manager.status.get("equity_symbols_subscribed", 0)
+        return jsonify({"registered": len(tickers), "active": active})
+    except Exception as e:
+        log.warning(f"register-tickers failed: {e}")
+        return jsonify({"registered": 0, "active": 0, "error": str(e)}), 200
+
+
 # ─── PHASE 4.5+ — LIVE SPOT PRICES ─────────────────────────
 @dashboard_bp.route("/api/spot-prices", methods=["GET"])
 @login_required

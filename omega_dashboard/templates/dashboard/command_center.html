@@ -512,6 +512,16 @@
   const tickers = [...new Set([...cells].map(el => el.dataset.ticker))].join(',');
   if (!tickers) return;
 
+  // S.4: register the ticker set with the streamer first, so the
+  // /api/spot-prices call below hits a warm streaming subscription.
+  // Fire-and-forget — failure here is non-fatal; spot-prices falls
+  // through to Schwab REST then Yahoo on its own.
+  fetch('/api/register-tickers', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({tickers: tickers.split(',')})
+  }).catch(() => {});
+
   fetch('/api/spot-prices?tickers=' + encodeURIComponent(tickers))
     .then(r => r.ok ? r.json() : Promise.reject(r.status))
     .then(data => {
