@@ -171,10 +171,13 @@ def test_canonical_status_records_each_canonical():
     raw = _build_realistic_raw_inputs()
     state = BotState.build_from_raw(raw)
 
+    # Live canonicals as of Patch 11.4: gamma_flip, iv_state, exposures
+    # Stubbed: walls, pivots, structure, em_state, technicals, bias, dealer_regime,
+    #          vol_regime, potter_box, flow_state, calendar
     expected_canonicals = {
-        "gamma_flip", "gex", "dex", "vanna", "charm", "walls", "pivots",
-        "structure", "iv_state", "em_state", "technicals", "bias",
-        "dealer_regime", "vol_regime", "potter_box", "flow_state", "calendar",
+        "gamma_flip", "iv_state", "exposures",
+        "walls", "pivots", "structure", "em_state", "technicals",
+        "bias", "dealer_regime", "vol_regime", "potter_box", "flow_state", "calendar",
     }
     for c in expected_canonicals:
         if c not in state.canonical_status:
@@ -221,9 +224,9 @@ def test_stubbed_canonicals_record_stub_status():
     raw = _build_realistic_raw_inputs()
     state = BotState.build_from_raw(raw)
 
-    # Live: gamma_flip (Patch 11.2), iv_state (Patch 11.3.2)
+    # Live: gamma_flip (Patch 11.2), iv_state (Patch 11.3.2), exposures (Patch 11.4)
     # Every other canonical should be stub.
-    expected_stubs = ["gex", "dex", "vanna", "charm", "walls", "pivots",
+    expected_stubs = ["walls", "pivots",
                       "structure", "em_state", "technicals",
                       "bias", "dealer_regime", "vol_regime", "potter_box",
                       "flow_state", "calendar"]
@@ -240,15 +243,16 @@ def test_stubbed_canonical_fields_are_none():
     raw = _build_realistic_raw_inputs()
     state = BotState.build_from_raw(raw)
 
-    # Greek aggregates
-    assert_is_none(state.gex, "gex None when canonical_gex stubbed")
-    assert_is_none(state.dex, "dex None")
-    assert_is_none(state.vanna, "vanna None")
-    assert_eq(state.gex_sign, "unknown", "gex_sign 'unknown' when no gex")
+    # Greek aggregates: NOW LIVE via canonical_exposures (Patch 11.4)
+    # — so they should NOT be None on a healthy chain. Sanity check inverted.
+    if state.gex is not None:
+        # gex_sign should also be set (positive/negative/neutral, not unknown)
+        assert_true(state.gex_sign in ("positive", "negative", "neutral"),
+                    f"gex_sign classified, got {state.gex_sign}")
 
-    # Walls
-    assert_is_none(state.call_wall, "call_wall None")
-    assert_is_none(state.put_wall, "put_wall None")
+    # Walls: still stubbed (separate canonical_walls patch)
+    assert_is_none(state.call_wall, "call_wall None — walls still stubbed")
+    assert_is_none(state.put_wall, "put_wall None — walls still stubbed")
     assert_is_none(state.max_pain, "max_pain None")
 
     # Technicals
@@ -414,6 +418,25 @@ def test_iv_state_handles_empty_chain_gracefully():
     PASSED.append("test_iv_state_handles_empty_chain_gracefully")
 
 
+def test_exposures_is_live_via_canonical():
+    """Patch 11.4: canonical_exposures landed. Greek aggregates populated,
+    gex_sign classified, exposures status 'live' in canonical_status."""
+    raw = _build_realistic_raw_inputs(spot=100.0)
+    state = BotState.build_from_raw(raw)
+
+    assert_eq(state.canonical_status.get("exposures"), "live", "exposures live")
+
+    if state.gex is None:
+        FAILED.append(f"test_exposures_live: gex None despite live status")
+        return
+    assert_true(isinstance(state.gex, (int, float)), "gex is a number")
+
+    # gex_sign should be classified now that gex is populated
+    assert_true(state.gex_sign in ("positive", "negative", "neutral"),
+                f"gex_sign classified from gex value, got {state.gex_sign}")
+    PASSED.append("test_exposures_is_live_via_canonical")
+
+
 # ───────────────────────────────────────────────────────────────────────
 # Run all
 # ───────────────────────────────────────────────────────────────────────
@@ -435,6 +458,7 @@ def main():
         test_iv_state_is_live_via_canonical,
         test_gamma_flip_uses_iv_aware_band_via_canonical_iv_state,
         test_iv_state_handles_empty_chain_gracefully,
+        test_exposures_is_live_via_canonical,
     ]
     for t in tests:
         try:
