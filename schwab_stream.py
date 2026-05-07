@@ -585,7 +585,7 @@ class SchwabStreamManager:
     def __init__(self, schwab_client, tickers: list,
                  option_symbols: list = None):
         self._client = schwab_client
-        self._tickers = list(tickers)
+        self._tickers = [t.upper() for t in tickers]
         self._option_symbols = list(option_symbols or [])
         self._pending_option_adds = []   # symbols queued for dynamic add
         self._pending_option_unsubs = [] # symbols queued for removal
@@ -668,9 +668,10 @@ class SchwabStreamManager:
         if not symbols:
             return
         with self._lock:
-            up = {s.upper() for s in symbols if s}
+            up = [s.upper() for s in symbols if s]
             self._pending_equity_unsubs.extend(up)
-            self._tickers = [t for t in self._tickers if t.upper() not in up]
+            upset = set(up)
+            self._tickers = [t for t in self._tickers if t not in upset]
 
     def stop(self):
         self._running = False

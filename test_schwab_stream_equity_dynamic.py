@@ -53,6 +53,18 @@ def test_add_equity_symbols_idempotent():
               "add_equity_symbols is idempotent on repeated calls")
 
 
+def test_add_equity_symbols_case_insensitive_dedup():
+    """Constructor input with lowercase tickers must still dedup against
+    later uppercase add_equity_symbols calls. Without this, a caller
+    passing lowercase from upstream would cause duplicate subscriptions."""
+    mgr = _make_mgr(["aapl"])
+    mgr.add_equity_symbols(["AAPL"])
+    assert_eq(mgr._pending_equity_adds, [],
+              "AAPL not re-queued when constructor was passed 'aapl'")
+    assert_eq(mgr._tickers, ["AAPL"],
+              "constructor uppercases tickers")
+
+
 def test_add_equity_symbols_empty_noop():
     mgr = _make_mgr(["AAPL"])
     mgr.add_equity_symbols([])
@@ -80,6 +92,7 @@ def test_remove_equity_symbols_unknown_is_noop():
 if __name__ == "__main__":
     test_add_equity_symbols_queues_new_only()
     test_add_equity_symbols_idempotent()
+    test_add_equity_symbols_case_insensitive_dedup()
     test_add_equity_symbols_empty_noop()
     test_remove_equity_symbols()
     test_remove_equity_symbols_unknown_is_noop()
