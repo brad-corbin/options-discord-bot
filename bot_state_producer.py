@@ -450,10 +450,17 @@ class BotStateProducer:
     def stop(self) -> None:
         """Signal all threads to exit at the next sleep boundary; release
         the lock. Idempotent — safe to call twice."""
+        global _singleton
         self._stop.set()
         if self._lock_token is not None:
             _release_lock(self._redis, LOCK_KEY, self._lock_token)
             self._lock_token = None
+        # Clear the diagnostic singleton if this instance was it. A
+        # different live instance shouldn't get nulled by an unrelated
+        # stopped one, but in practice there's only ever one producer
+        # per process.
+        if _singleton is self:
+            _singleton = None
 
     def join(self, timeout: Optional[float] = None) -> None:
         for t in self._threads:
@@ -470,10 +477,21 @@ class BotStateProducer:
             return
 
         # Lazy-import production deps so unit tests can stub the module
-        # before the thread runs the first pass.
-        from canonical_expiration import canonical_expiration
-        from raw_inputs import fetch_raw_inputs
-        from bot_state import BotState
+        # before the thread runs the first pass. Wrapped in try/except
+        # so a broken import (circular dep, refactor breakage, missing
+        # module) surfaces as a visible log line instead of a silent
+        # dead thread that would let the lock-keeper refresh forever
+        # while no envelopes get written.
+        try:
+            from canonical_expiration import canonical_expiration
+            from raw_inputs import fetch_raw_inputs
+            from bot_state import BotState
+        except Exception as e:
+            log.error(
+                f"[bsp tier={tier_name}] failed to import production "
+                f"dependencies: {e}; tier thread exiting"
+            )
+            return
 
         while not self._stop.is_set():
             t_start = time.time()

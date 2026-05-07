@@ -521,12 +521,9 @@ def test_lock_keeper_refreshes_on_schedule():
     time.sleep(0.15)  # let it refresh ~3 times
     stop.set()
     t.join(timeout=1.0)
-    # Verify refresh actually happened — the eval Lua call updates expiration.
-    eval_or_expire_seen = any(
-        op[0] == "expire" or op[0] == "set" for op in fake.ops
-    )
-    # The Lua-eval-EXPIRE path on _FakeRedis routes through .expire(),
-    # which appends ("expire", ...) to ops. So at least one expire op.
+    # Verify refresh actually happened — the Lua-eval-EXPIRE path on
+    # _FakeRedis routes through .expire(), which appends ("expire", ...)
+    # to ops. So at least one expire op.
     expire_calls = [op for op in fake.ops if op[0] == "expire"]
     assert_true(len(expire_calls) >= 1, "lock-keeper called expire at least once")
 
