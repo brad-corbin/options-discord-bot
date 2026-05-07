@@ -62,6 +62,11 @@ class TickerSnapshot:
     gamma_flip: Optional[float]
     distance_from_flip_pct: Optional[float]
     flip_location: str
+    # IV state (Patch 11.3.2 — canonical_iv_state)
+    atm_iv: Optional[float]
+    iv_skew_pp: Optional[float]
+    iv30: Optional[float]
+    # Progress
     fields_lit: int
     fields_total: int
     canonical_status: dict
@@ -130,6 +135,9 @@ def build_ticker_snapshot(ticker: str, expiration: str, *, data_router) -> Ticke
             gamma_flip=state.gamma_flip,
             distance_from_flip_pct=state.distance_from_flip_pct,
             flip_location=state.flip_location,
+            atm_iv=state.atm_iv,
+            iv_skew_pp=state.iv_skew_pp,
+            iv30=state.iv30,
             fields_lit=state.fields_lit,
             fields_total=state.fields_total,
             canonical_status=dict(state.canonical_status),
@@ -145,6 +153,9 @@ def build_ticker_snapshot(ticker: str, expiration: str, *, data_router) -> Ticke
             gamma_flip=None,
             distance_from_flip_pct=None,
             flip_location="unknown",
+            atm_iv=None,
+            iv_skew_pp=None,
+            iv30=None,
             fields_lit=0,
             fields_total=0,
             canonical_status={},

@@ -130,6 +130,29 @@
             </div>
           </div>
 
+          {# ─── LIVE: iv_state (Patch 11.3.2) ─────────────────────── #}
+          {% if snap.atm_iv is not none or snap.iv_skew_pp is not none %}
+          <div class="research-card-section">
+            <div class="research-card-eyebrow">IV STATE &middot; <span class="research-live">live</span></div>
+            {% if snap.atm_iv is not none %}
+              <div class="research-card-row">
+                <span class="research-card-label">atm_iv</span>
+                <span class="research-card-value">{{ "%.1f"|format(snap.atm_iv * 100) }}%</span>
+              </div>
+            {% endif %}
+            {% if snap.iv_skew_pp is not none %}
+              <div class="research-card-row">
+                <span class="research-card-label">skew (95/105)</span>
+                <span class="research-card-value
+                      {% if snap.iv_skew_pp > 0 %}positive
+                      {% elif snap.iv_skew_pp < 0 %}negative{% endif %}">
+                  {{ "%+.2f"|format(snap.iv_skew_pp) }} pp
+                </span>
+              </div>
+            {% endif %}
+          </div>
+          {% endif %}
+
           {# ─── PENDING: everything else ─────────────────────────── #}
           <div class="research-card-section">
             <div class="research-card-eyebrow">PENDING CANONICAL COMPUTES</div>
