@@ -11,6 +11,7 @@ Mocks both the streaming spot store and the Schwab provider. Verifies:
 from __future__ import annotations
 import sys
 import os
+import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 PASSED = []
@@ -138,6 +139,32 @@ def test_unfetchable_ticker_omitted():
     assert_not_in("FAKE", out, "unfetchable ticker omitted from result")
 
 
+def test_streaming_yahoo_fallback_respects_neg_cache():
+    """Phase 4 (Yahoo last-resort) must skip tickers already in cooldown.
+    Without this, the v8.3 Patch 1 429-storm fix regresses on the Yahoo
+    tail of the streaming path."""
+    sp, fake = _setup(
+        env_streaming="1",
+        streaming_prices={},  # all miss streaming
+        prev_close={},
+        schwab_table={},      # all miss Schwab too → falls to Phase 4 Yahoo
+    )
+    # Pre-populate the negative cache so YESTERDAYS_429 is in cooldown.
+    sp._neg_cache["YESTERDAYS_429"] = (time.time() + 300, "429")
+    # Track Yahoo calls by monkey-patching _fetch_one_yahoo.
+    yahoo_calls = []
+    original_fetch = sp._fetch_one_yahoo
+    def _spy_yahoo(t):
+        yahoo_calls.append(t)
+        return ({}, "err")
+    sp._fetch_one_yahoo = _spy_yahoo
+    try:
+        sp.get_spot_prices(["YESTERDAYS_429"])
+        assert_eq(yahoo_calls, [], "ticker in neg-cache cooldown is skipped")
+    finally:
+        sp._fetch_one_yahoo = original_fetch
+
+
 def test_legacy_mode_uses_yahoo():
     """When DASHBOARD_SPOT_USE_STREAMING is off, behavior matches the old path."""
     sp, fake = _setup(
@@ -157,6 +184,7 @@ if __name__ == "__main__":
     test_streaming_hit_uses_prev_close_for_change()
     test_streaming_miss_falls_to_schwab_rest()
     test_unfetchable_ticker_omitted()
+    test_streaming_yahoo_fallback_respects_neg_cache()
     test_legacy_mode_uses_yahoo()
     print(f"PASSED: {len(PASSED)}, FAILED: {len(FAILED)}")
     for f in FAILED:

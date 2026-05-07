@@ -167,7 +167,7 @@ def _fetch_one_schwab(ticker: str, schwab_provider) -> Optional[Dict]:
     try:
         data = schwab_provider._schwab_get("get_quote", ticker)
     except Exception as e:
-        log.debug(f"schwab spot fetch failed for {ticker}: {e}")
+        log.warning(f"schwab spot fetch failed for {ticker}: {e}")
         return None
 
     entry = (data or {}).get(ticker, {})
@@ -232,7 +232,20 @@ def _fetch_streaming_first(tickers: List[str]) -> Dict[str, Dict]:
     else:
         yahoo_misses = streaming_misses
 
-    # Phase 4: last-resort Yahoo fallback for the rest.
+    # Phase 4: last-resort Yahoo. Mirror the legacy negative-cache discipline:
+    # tickers in cooldown are silently skipped, and post-fetch failures
+    # populate the cooldown so we don't hammer Yahoo on the next page poll.
+    # Without this, the v8.3 Patch 1 429-storm bug regresses on the Yahoo
+    # tail of the streaming path.
+    now = time.time()
+    if yahoo_misses:
+        with _cache_lock:
+            in_cooldown = {
+                t for t in yahoo_misses
+                if (_neg_cache.get(t) and now < _neg_cache[t][0])
+            }
+        yahoo_misses = [t for t in yahoo_misses if t not in in_cooldown]
+
     for t in yahoo_misses:
         result, status = _fetch_one_yahoo(t)
         if status == "ok" and result:
@@ -240,6 +253,9 @@ def _fetch_streaming_first(tickers: List[str]) -> Dict[str, Dict]:
         elif status == "429" and _BACKOFF_429_SEC > 0:
             with _cache_lock:
                 _neg_cache[t] = (time.time() + _BACKOFF_429_SEC, "429")
+        elif status == "err" and _BACKOFF_ERR_SEC > 0:
+            with _cache_lock:
+                _neg_cache[t] = (time.time() + _BACKOFF_ERR_SEC, "err")
 
     return out
 
