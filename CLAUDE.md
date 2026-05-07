@@ -296,7 +296,7 @@ is high. Don't argue with them.
 - BotState `convention_version=2` (post-Patch-9), `snapshot_version=1`.
 - 504-bar OHLC default for `RawInputs` (covers Potter Box, the longest
   real lookback).
-- Default Research page expiration: next Friday.
+- Default Research page intent: `front` (first non-0-DTE expiration per ticker, via `canonical_expiration`).
 - Research page cache: 60-second in-memory, keyed by (ticker, expiration).
 
 ---
