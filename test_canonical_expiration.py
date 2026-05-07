@@ -291,6 +291,58 @@ def test_upstream_get_expirations_raises_returns_none():
 
 
 # ───────────────────────────────────────────────────────────────────────
+# Wrapper-consistency test (audit rule 5)
+# ───────────────────────────────────────────────────────────────────────
+
+def test_wrapper_consistency_against_direct_filter():
+    """canonical_expiration must return the same answer as a hand-written filter
+    on identical inputs. If they ever drift, the wrapper has diverged from
+    the ground truth.
+    """
+    router = _MockRouter(AAPL_LIST)
+    today = TUE_2026_05_05
+
+    # Direct filter — what canonical_expiration SHOULD produce, computed
+    # independently here so we can compare.
+    raw = router.get_expirations("AAPL")
+    parsed = sorted({date.fromisoformat(e[:10]) for e in raw if isinstance(e, str)})
+
+    expected_zero_dte = today.isoformat() if today in parsed else None
+    expected_front = next((e.isoformat() for e in parsed if (e - today).days >= 1), None)
+    expected_t7 = next((e.isoformat() for e in parsed if (e - today).days >= 7), None)
+    expected_t30 = next((e.isoformat() for e in parsed if (e - today).days >= 30), None)
+    expected_t60 = next((e.isoformat() for e in parsed if (e - today).days >= 60), None)
+
+    # Each wrapper call must match the direct-filter result.
+    assert_eq(
+        canonical_expiration("AAPL", INTENT_ZERO_DTE, today=today, data_router=router),
+        expected_zero_dte,
+        "zero_dte wrapper matches direct filter",
+    )
+    assert_eq(
+        canonical_expiration("AAPL", INTENT_FRONT, today=today, data_router=router),
+        expected_front,
+        "front wrapper matches direct filter",
+    )
+    assert_eq(
+        canonical_expiration("AAPL", INTENT_T7, today=today, data_router=router),
+        expected_t7,
+        "t7 wrapper matches direct filter",
+    )
+    assert_eq(
+        canonical_expiration("AAPL", INTENT_T30, today=today, data_router=router),
+        expected_t30,
+        "t30 wrapper matches direct filter",
+    )
+    assert_eq(
+        canonical_expiration("AAPL", INTENT_T60, today=today, data_router=router),
+        expected_t60,
+        "t60 wrapper matches direct filter",
+    )
+    PASSED.append("test_wrapper_consistency_against_direct_filter")
+
+
+# ───────────────────────────────────────────────────────────────────────
 # Run all
 # ───────────────────────────────────────────────────────────────────────
 
@@ -312,6 +364,7 @@ def main():
         test_empty_expiration_list_returns_none,
         test_malformed_entries_skipped,
         test_upstream_get_expirations_raises_returns_none,
+        test_wrapper_consistency_against_direct_filter,
     ]
     for t in tests:
         try:
