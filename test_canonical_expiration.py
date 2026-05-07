@@ -174,6 +174,84 @@ def test_zero_dte_returns_none_when_today_not_in_list():
 
 
 # ───────────────────────────────────────────────────────────────────────
+# Tests — front / t7 / t30 / t60 (first DTE >= N)
+# ───────────────────────────────────────────────────────────────────────
+
+def test_front_skips_today_picks_dte_1():
+    """SPY on a Monday: 0DTE excluded, front returns next day (DTE 1)."""
+    router = _MockRouter(SPY_LIST)
+    result = canonical_expiration("SPY", INTENT_FRONT,
+                                  today=MON_2026_05_04, data_router=router)
+    assert_eq(result, "2026-05-05", "front returns first DTE >= 1, skipping 0DTE")
+    PASSED.append("test_front_skips_today_picks_dte_1")
+
+
+def test_front_picks_first_qualifying_when_no_0dte():
+    """AAPL on a Tuesday with no Tuesday chain: front returns Wed (DTE 1)."""
+    router = _MockRouter(AAPL_LIST)
+    result = canonical_expiration("AAPL", INTENT_FRONT,
+                                  today=TUE_2026_05_05, data_router=router)
+    assert_eq(result, "2026-05-06", "front returns next available expiration (Wed, DTE 1)")
+    PASSED.append("test_front_picks_first_qualifying_when_no_0dte")
+
+
+def test_t7_picks_first_dte_at_or_above_7():
+    """AAPL Tuesday: M/W/F weeklies. t7 picks Wed of next week (DTE 8 >= 7)."""
+    router = _MockRouter(AAPL_LIST)
+    result = canonical_expiration("AAPL", INTENT_T7,
+                                  today=TUE_2026_05_05, data_router=router)
+    assert_eq(result, "2026-05-13", "t7 returns Wed of next week (DTE 8)")
+    PASSED.append("test_t7_picks_first_dte_at_or_above_7")
+
+
+def test_t7_exact_match_when_dte_7_exists():
+    """SPY Monday: dailies, DTE 7 exists exactly → t7 returns it."""
+    router = _MockRouter(SPY_LIST)
+    result = canonical_expiration("SPY", INTENT_T7,
+                                  today=MON_2026_05_04, data_router=router)
+    assert_eq(result, "2026-05-11", "t7 returns exact DTE-7 when available")
+    PASSED.append("test_t7_exact_match_when_dte_7_exists")
+
+
+def test_t7_friday_only_jumps_to_following_friday():
+    """COIN-style Friday-only weeklies: this Fri is DTE 3 (< 7),
+    next Fri is DTE 10 → t7 picks next Fri."""
+    router = _MockRouter(FRIDAY_ONLY_LIST)
+    result = canonical_expiration("COIN", INTENT_T7,
+                                  today=TUE_2026_05_05, data_router=router)
+    assert_eq(result, "2026-05-15", "t7 jumps over close Friday to following Friday")
+    PASSED.append("test_t7_friday_only_jumps_to_following_friday")
+
+
+def test_t30_picks_monthly():
+    """AAPL Tuesday: t30 returns the ~45-DTE monthly (no closer >=30 chain)."""
+    router = _MockRouter(AAPL_LIST)
+    result = canonical_expiration("AAPL", INTENT_T30,
+                                  today=TUE_2026_05_05, data_router=router)
+    assert_eq(result, "2026-06-19", "t30 returns first DTE >= 30")
+    PASSED.append("test_t30_picks_monthly")
+
+
+def test_t60_picks_further_monthly():
+    """AAPL Tuesday: t60 returns the ~73-DTE monthly."""
+    router = _MockRouter(AAPL_LIST)
+    result = canonical_expiration("AAPL", INTENT_T60,
+                                  today=TUE_2026_05_05, data_router=router)
+    assert_eq(result, "2026-07-17", "t60 returns first DTE >= 60")
+    PASSED.append("test_t60_picks_further_monthly")
+
+
+def test_t60_returns_none_when_no_qualifying_expiration():
+    """AAPL Tuesday with chain only out 30 days: t60 returns None."""
+    short_list = ["2026-05-06", "2026-05-08", "2026-05-13", "2026-06-04"]  # max DTE 30
+    router = _MockRouter(short_list)
+    result = canonical_expiration("AAPL", INTENT_T60,
+                                  today=TUE_2026_05_05, data_router=router)
+    assert_is_none(result, "t60 None when no expiration is far enough out")
+    PASSED.append("test_t60_returns_none_when_no_qualifying_expiration")
+
+
+# ───────────────────────────────────────────────────────────────────────
 # Run all
 # ───────────────────────────────────────────────────────────────────────
 
@@ -184,6 +262,14 @@ def main():
         test_valid_intents_constant_is_complete,
         test_zero_dte_returns_today_when_today_in_list,
         test_zero_dte_returns_none_when_today_not_in_list,
+        test_front_skips_today_picks_dte_1,
+        test_front_picks_first_qualifying_when_no_0dte,
+        test_t7_picks_first_dte_at_or_above_7,
+        test_t7_exact_match_when_dte_7_exists,
+        test_t7_friday_only_jumps_to_following_friday,
+        test_t30_picks_monthly,
+        test_t60_picks_further_monthly,
+        test_t60_returns_none_when_no_qualifying_expiration,
     ]
     for t in tests:
         try:

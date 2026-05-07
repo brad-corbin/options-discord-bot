@@ -119,8 +119,8 @@ def canonical_expiration(
     if intent == INTENT_ZERO_DTE:
         return _select_zero_dte(exp_dates, today)
 
-    # All other intents are first-DTE-at-or-above-N. Implemented in Task 4.
-    raise NotImplementedError(f"intent {intent!r} not yet implemented (Task 4)")
+    min_dte = _MIN_DTE_BY_INTENT[intent]
+    return _select_min_dte(exp_dates, today, min_dte)
 
 
 # ───────────────────────────────────────────────────────────────────────
@@ -158,6 +158,19 @@ def _select_zero_dte(exp_dates: list[date], today: date) -> Optional[str]:
     """Return today's expiration if it's in the list, else None."""
     if today in exp_dates:
         return today.isoformat()
+    return None
+
+
+def _select_min_dte(exp_dates: list[date], today: date, min_dte: int) -> Optional[str]:
+    """Return the first expiration whose DTE >= `min_dte`. Never walks backward.
+
+    `exp_dates` must be sorted ascending. Returns None if no expiration is far
+    enough out.
+    """
+    for exp in exp_dates:
+        dte = (exp - today).days
+        if dte >= min_dte:
+            return exp.isoformat()
     return None
 
 
