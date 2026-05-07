@@ -202,15 +202,145 @@ def test_snapshot_from_envelope_handles_missing_optional_fields():
     assert_eq(snap.fetch_errors, [], "missing fetch_errors → []")
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Redis consumer entry point
+# ─────────────────────────────────────────────────────────────────────
+
+def test_load_snapshot_returns_warming_up_when_key_missing():
+    from omega_dashboard.research_data import _load_snapshot_from_redis
+    fake = _FakeRedis()
+    snap = _load_snapshot_from_redis("AAPL", "front", redis_client=fake)
+    assert_eq(snap.ticker, "AAPL", "ticker preserved")
+    assert_eq(snap.warming_up, True, "missing key → warming up")
+    assert_eq(snap.error, "missing key", "reason set")
+
+
+def test_load_snapshot_returns_warming_up_when_redis_is_none():
+    from omega_dashboard.research_data import _load_snapshot_from_redis
+    snap = _load_snapshot_from_redis("AAPL", "front", redis_client=None)
+    assert_eq(snap.warming_up, True, "no redis client → warming up")
+    assert_eq(snap.error, "redis unavailable", "reason set")
+
+
+def test_load_snapshot_parses_valid_envelope():
+    from omega_dashboard.research_data import _load_snapshot_from_redis, KEY_PREFIX
+    fake = _FakeRedis()
+    fake.set(f"{KEY_PREFIX}AAPL:front", json.dumps(_make_envelope()))
+    snap = _load_snapshot_from_redis("AAPL", "front", redis_client=fake)
+    assert_eq(snap.warming_up, False, "valid envelope → not warming up")
+    assert_eq(snap.spot, 184.50, "spot parsed")
+    assert_eq(snap.gex, 12345678.0, "gex parsed")
+
+
+def test_load_snapshot_warming_up_on_malformed_json():
+    from omega_dashboard.research_data import _load_snapshot_from_redis, KEY_PREFIX
+    fake = _FakeRedis()
+    fake.set(f"{KEY_PREFIX}AAPL:front", "not-valid-json{{{")
+    snap = _load_snapshot_from_redis("AAPL", "front", redis_client=fake)
+    assert_eq(snap.warming_up, True, "malformed JSON → warming up")
+
+
+def test_load_snapshot_warming_up_on_version_mismatch():
+    """convention_version=1 (Patch 9 mismatch) → warming up, not silent accept."""
+    from omega_dashboard.research_data import _load_snapshot_from_redis, KEY_PREFIX
+    fake = _FakeRedis()
+    fake.set(f"{KEY_PREFIX}AAPL:front",
+             json.dumps(_make_envelope(convention_version=1)))
+    snap = _load_snapshot_from_redis("AAPL", "front", redis_client=fake)
+    assert_eq(snap.warming_up, True, "convention_version mismatch → warming up")
+    assert_true("convention_version" in (snap.error or ""),
+                "error explains the mismatch")
+
+
+def test_load_snapshot_accepts_future_producer_version():
+    """producer_version=99 (newer than reader expects) is accepted."""
+    from omega_dashboard.research_data import _load_snapshot_from_redis, KEY_PREFIX
+    fake = _FakeRedis()
+    fake.set(f"{KEY_PREFIX}AAPL:front",
+             json.dumps(_make_envelope(producer_version=99)))
+    snap = _load_snapshot_from_redis("AAPL", "front", redis_client=fake)
+    assert_eq(snap.warming_up, False,
+              "future producer_version accepted (forward compat)")
+    assert_eq(snap.spot, 184.50, "data still parsed")
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Universe-level consumer
+# ─────────────────────────────────────────────────────────────────────
+
+def test_research_data_from_redis_mixed_population():
+    """SPY populated, QQQ missing → SPY card lit, QQQ shows warming-up."""
+    from omega_dashboard.research_data import _research_data_from_redis, KEY_PREFIX
+    fake = _FakeRedis()
+    spy_env = _make_envelope(state_overrides={"ticker": "SPY", "spot": 590.00})
+    fake.set(f"{KEY_PREFIX}SPY:front", json.dumps(spy_env))
+    # No key for QQQ.
+
+    payload = _research_data_from_redis(
+        tickers=["SPY", "QQQ"],
+        intent="front",
+        redis_client=fake,
+    )
+    assert_eq(payload.tickers_total, 2, "two tickers requested")
+    assert_eq(len(payload.snapshots), 2, "two snapshots returned")
+    by_ticker = {s.ticker: s for s in payload.snapshots}
+    assert_eq(by_ticker["SPY"].warming_up, False, "SPY not warming up")
+    assert_eq(by_ticker["SPY"].spot, 590.00, "SPY spot from envelope")
+    assert_eq(by_ticker["QQQ"].warming_up, True, "QQQ warming up (no key)")
+
+
+def test_research_data_from_redis_aggregates_correctly():
+    """fields_lit_avg should reflect ONLY tickers with data, not warming-up ones."""
+    from omega_dashboard.research_data import _research_data_from_redis, KEY_PREFIX
+    fake = _FakeRedis()
+    fake.set(f"{KEY_PREFIX}SPY:front",
+             json.dumps(_make_envelope(state_overrides={
+                 "ticker": "SPY", "spot": 590.00, "fields_lit": 22, "fields_total": 64,
+             })))
+    payload = _research_data_from_redis(
+        tickers=["SPY", "QQQ"],
+        intent="front",
+        redis_client=fake,
+    )
+    assert_eq(payload.tickers_with_data, 1, "1 of 2 has data")
+    assert_eq(payload.fields_total, 64, "fields_total from populated ticker")
+    assert_eq(payload.fields_lit_avg, 22.0, "avg = 22 (only counting populated)")
+
+
+def test_research_data_from_redis_returns_unavailable_when_no_redis():
+    from omega_dashboard.research_data import _research_data_from_redis
+    payload = _research_data_from_redis(
+        tickers=["SPY"],
+        intent="front",
+        redis_client=None,
+    )
+    assert_eq(payload.available, False, "no redis → available=False")
+    assert_true("redis" in (payload.error or "").lower(), "error mentions redis")
+
+
 if __name__ == "__main__":
+    # warming-up factory
     test_warming_up_snapshot_has_all_none_fields()
+    # version validation
     test_validate_envelope_versions_accepts_current()
     test_validate_envelope_versions_accepts_future_producer_version()
     test_validate_envelope_versions_rejects_old_producer_version()
     test_validate_envelope_versions_rejects_convention_mismatch()
     test_validate_envelope_versions_rejects_missing_versions()
+    # envelope → snapshot
     test_snapshot_from_envelope_full_data()
     test_snapshot_from_envelope_handles_missing_optional_fields()
+    # _load_snapshot_from_redis
+    test_load_snapshot_returns_warming_up_when_key_missing()
+    test_load_snapshot_returns_warming_up_when_redis_is_none()
+    test_load_snapshot_parses_valid_envelope()
+    test_load_snapshot_warming_up_on_malformed_json()
+    test_load_snapshot_warming_up_on_version_mismatch()
+    test_load_snapshot_accepts_future_producer_version()
+    # _research_data_from_redis
+    test_research_data_from_redis_mixed_population()
+    test_research_data_from_redis_aggregates_correctly()
+    test_research_data_from_redis_returns_unavailable_when_no_redis()
     print(f"PASSED: {len(PASSED)}, FAILED: {len(FAILED)}")
     for f in FAILED:
         print(f"  ✗ {f}")

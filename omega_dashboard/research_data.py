@@ -244,6 +244,111 @@ def _snapshot_from_envelope(ticker: str, envelope: dict) -> "TickerSnapshot":
     )
 
 
+def _load_snapshot_from_redis(
+    ticker: str,
+    intent: str,
+    *,
+    redis_client,
+) -> "TickerSnapshot":
+    """GET bot_state:{ticker}:{intent}, decode + validate, return a
+    TickerSnapshot. Any failure mode (no Redis, missing key, malformed
+    JSON, version mismatch) returns a warming-up snapshot with the
+    failure reason set as snap.error.
+    """
+    if redis_client is None:
+        return _warming_up_snapshot(ticker, reason="redis unavailable")
+
+    key = f"{KEY_PREFIX}{ticker}:{intent}"
+    try:
+        raw = redis_client.get(key)
+    except Exception as e:
+        log.warning(f"research_data: redis GET {key} failed: {e}")
+        return _warming_up_snapshot(ticker, reason="redis error")
+
+    if raw is None:
+        return _warming_up_snapshot(ticker, reason="missing key")
+
+    try:
+        envelope = json.loads(raw)
+    except Exception as e:
+        log.warning(f"research_data: malformed envelope for {ticker}: {e}")
+        return _warming_up_snapshot(ticker, reason="malformed envelope")
+
+    err = _validate_envelope_versions(envelope, ticker)
+    if err is not None:
+        log.warning(f"research_data: {err}")
+        return _warming_up_snapshot(ticker, reason=err)
+
+    try:
+        return _snapshot_from_envelope(ticker, envelope)
+    except Exception as e:
+        log.warning(f"research_data: snapshot construction failed for {ticker}: {e}")
+        return _warming_up_snapshot(ticker, reason=f"parse error: {e}")
+
+
+def _research_data_from_redis(
+    tickers: list,
+    intent: str,
+    *,
+    redis_client,
+) -> "ResearchData":
+    """Build the full Research page payload by reading each ticker's
+    envelope from Redis. Tickers without populated keys render as
+    warming-up. Returns ResearchData ready for the template."""
+    if redis_client is None:
+        return ResearchData(
+            fetched_at_utc=datetime.now(timezone.utc),
+            tickers_total=len(tickers),
+            tickers_with_data=0,
+            tickers_errored=0,
+            fields_lit_avg=0.0,
+            fields_total=0,
+            canonical_status_summary={},
+            snapshots=[],
+            available=False,
+            error="redis client not available",
+        )
+
+    snapshots = [
+        _load_snapshot_from_redis(t, intent, redis_client=redis_client)
+        for t in tickers
+    ]
+
+    # Aggregate metrics — count "with_data" as not-warming-up, not-errored.
+    with_data = sum(1 for s in snapshots if not s.warming_up and s.error is None)
+    errored = sum(1 for s in snapshots if s.error is not None and not s.warming_up)
+    fields_lit_avg = (
+        sum(s.fields_lit for s in snapshots if not s.warming_up) / max(with_data, 1)
+        if with_data > 0 else 0.0
+    )
+    fields_total = next((s.fields_total for s in snapshots if s.fields_total > 0), 0)
+
+    status_summary: dict = {}
+    for s in snapshots:
+        for cname, cstatus in s.canonical_status.items():
+            if cname not in status_summary:
+                status_summary[cname] = {"live": 0, "stub": 0, "error": 0}
+            if cstatus == "live":
+                status_summary[cname]["live"] += 1
+            elif cstatus.startswith("stub"):
+                status_summary[cname]["stub"] += 1
+            else:
+                status_summary[cname]["error"] += 1
+
+    return ResearchData(
+        fetched_at_utc=datetime.now(timezone.utc),
+        tickers_total=len(tickers),
+        tickers_with_data=with_data,
+        tickers_errored=errored,
+        fields_lit_avg=fields_lit_avg,
+        fields_total=fields_total,
+        canonical_status_summary=status_summary,
+        snapshots=snapshots,
+        available=True,
+        error=None,
+    )
+
+
 # ───────────────────────────────────────────────────────────────────────
 # Per-ticker snapshot
 # ───────────────────────────────────────────────────────────────────────
