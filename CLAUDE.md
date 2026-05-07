@@ -65,6 +65,7 @@ Canonical rebuild (the v11 work — see "Canonical rebuild" below):
 - `canonical_gamma_flip.py` — wraps `ExposureEngine.gamma_flip`
 - `canonical_iv_state.py` — wraps `UnifiedIVSurface`
 - `canonical_exposures.py` — wraps `ExposureEngine.compute()`
+- `canonical_expiration.py` — picks chain expiration by intent (zero_dte / front / t7 / t30 / t60)
 - `test_*.py` for each — runnable without network or Schwab credentials
 
 ---
@@ -102,6 +103,12 @@ Canonical rebuild (the v11 work — see "Canonical rebuild" below):
 - **walls** — call_wall, put_wall, gamma_wall, vol_trigger. Strikes
   where dealer positioning concentrates. ExposureEngine.compute() returns
   these as a single dict alongside Greek aggregates.
+- **canonical_expiration intent** — short string describing which expiration
+  to pick for a chain query. Five intents: `zero_dte` (today's chain), `front`
+  (first DTE ≥ 1, never 0DTE), `t7` (first DTE ≥ 7), `t30` (first DTE ≥ 30),
+  `t60` (first DTE ≥ 60). Resolved per-ticker via `canonical_expiration()`.
+  Different intents = different chains = different walls; that's by design,
+  not a bug. Display layers tag values with their intent (e.g. "Call Wall · 1DTE").
 - **±25% blanket band / IV-aware band** — gamma_flip search grid.
   Blanket = ±25% always (used when no IV context). IV-aware = ±3σ of
   expected price movement, clamped to [15%, 40%] (Patch 8). Pass `iv` AND
@@ -161,7 +168,7 @@ The pattern, in order:
 
 10. **Update CLAUDE.md if a major architectural decision was made.**
 
-What's done as of last session (v11.5):
+What's done as of last session (v11.6 / Patch A):
 - canonical_gamma_flip
 - canonical_iv_state (replaces a brief mistake — see "Audit discipline" below)
 - canonical_exposures (Greek aggregates: gex/dex/vanna/charm/gex_sign)
@@ -169,10 +176,19 @@ What's done as of last session (v11.5):
   ExposureEngine.compute() pass. No separate wrapper file. Wires
   call_wall/put_wall/gamma_wall to BotState; max_pain/pin_zone_low/
   pin_zone_high stay None pending a separate canonical.
+- canonical_expiration — five-intent registry; replaces ad-hoc "next Friday"
+  in Research page. Side effect: Research walls now use front non-0-DTE
+  chains per ticker. Patch B (producer daemon) not yet shipped, so the page
+  is still slow — only the EXPIRATION choice changed in this patch.
 - BotState with permissive build, 64 fields total, ~22 currently lit per ticker
 - Research page replaces the old Diagnostic placeholder
 
 What's queued (in roughly this order):
+- bot_state_producer (Patch B) — daemon thread + Redis-backed shared store.
+  See spec at docs/superpowers/specs/2026-05-07-research-page-multi-dte-walls-design.md.
+  Unlocks the Research page (Patch C) and silent thesis migration (Patch E later).
+- Research reads from Redis (Patch C) — pure consumer; the 3-minute spin disappears here.
+- Multi-DTE drilldown UI (Patch D) — click-to-expand front/t7/t30/t60 walls per card.
 - canonical_technicals — RSI / MACD / ADX / VWAP. First-class for every engine.
 - canonical_pivots — universal pivot math, simple consolidation
 - canonical_em_state, canonical_dealer_regime, canonical_potter_box,
