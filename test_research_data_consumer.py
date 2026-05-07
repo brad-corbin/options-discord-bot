@@ -341,6 +341,44 @@ def test_research_data_from_redis_returns_unavailable_when_no_redis():
     assert_true("redis" in (payload.error or "").lower(), "error mentions redis")
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Env-var dispatch in research_data()
+# ─────────────────────────────────────────────────────────────────────
+
+def test_research_data_uses_redis_when_env_var_on():
+    """RESEARCH_USE_REDIS=1 → dispatch to consumer path; data_router ignored."""
+    from omega_dashboard.research_data import research_data, KEY_PREFIX
+    os.environ["RESEARCH_USE_REDIS"] = "1"
+    fake = _FakeRedis()
+    fake.set(f"{KEY_PREFIX}SPY:front",
+             json.dumps(_make_envelope(state_overrides={
+                 "ticker": "SPY", "spot": 590.00,
+             })))
+    payload = research_data(
+        tickers=["SPY"],
+        intent="front",
+        data_router=None,           # would normally cause unavailable
+        redis_client=fake,          # but Redis path takes over
+    )
+    assert_eq(payload.available, True, "Redis path returns available=True")
+    assert_eq(len(payload.snapshots), 1, "one snapshot")
+    assert_eq(payload.snapshots[0].spot, 590.00, "spot from envelope")
+
+
+def test_research_data_uses_legacy_when_env_var_off():
+    """RESEARCH_USE_REDIS=0 → legacy path; redis_client ignored."""
+    from omega_dashboard.research_data import research_data
+    os.environ["RESEARCH_USE_REDIS"] = "0"
+    payload = research_data(
+        tickers=["SPY"],
+        intent="front",
+        data_router=None,           # legacy path returns unavailable
+        redis_client=_FakeRedis(),  # ignored in legacy mode
+    )
+    assert_eq(payload.available, False,
+              "legacy path with no data_router returns unavailable")
+
+
 if __name__ == "__main__":
     # warming-up factory
     test_warming_up_snapshot_has_all_none_fields()
@@ -365,6 +403,9 @@ if __name__ == "__main__":
     test_research_data_from_redis_mixed_population()
     test_research_data_from_redis_aggregates_correctly()
     test_research_data_from_redis_returns_unavailable_when_no_redis()
+    # Env-var dispatch
+    test_research_data_uses_redis_when_env_var_on()
+    test_research_data_uses_legacy_when_env_var_off()
     print(f"PASSED: {len(PASSED)}, FAILED: {len(FAILED)}")
     for f in FAILED:
         print(f"  ✗ {f}")

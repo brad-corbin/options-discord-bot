@@ -36,6 +36,15 @@ from typing import Optional
 log = logging.getLogger(__name__)
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    """Parse a boolean env var. Truthy: 1/true/yes/on (case-insensitive).
+    Anything else (or unset) → default."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 # ───────────────────────────────────────────────────────────────────────
 # Configuration
 # ───────────────────────────────────────────────────────────────────────
@@ -462,17 +471,21 @@ def research_data(
     intent: str = "front",
     *,
     data_router=None,
+    redis_client=None,
 ) -> ResearchData:
     """Build the full Research page payload.
+
+    When RESEARCH_USE_REDIS=1, reads pre-built envelopes from Redis
+    (Patch C consumer path). Otherwise builds inline via DataRouter +
+    canonical_expiration + BotState.build (legacy v11 path).
 
     Args:
         tickers:      list of tickers to include; defaults to DEFAULT_TICKERS
         intent:       canonical_expiration intent for chain selection. Default
                       'front' = first non-0-DTE expiration per ticker. Other
-                      valid values: 't7', 't30', 't60'. ('zero_dte' is reserved
-                      for silent thesis and is not used by the Research page.)
-        data_router:  required for live data. If None, returns an empty
-                      payload with available=False (page still renders).
+                      valid values: 't7', 't30', 't60'.
+        data_router:  required for legacy path. Ignored when RESEARCH_USE_REDIS=1.
+        redis_client: required for consumer path. Ignored when env var is off.
 
     Returns:
         ResearchData ready for the template.
@@ -480,6 +493,16 @@ def research_data(
     if tickers is None:
         tickers = list(DEFAULT_TICKERS)
 
+    # Patch C: env-var-gated dispatch. Default off → legacy inline path
+    # runs unchanged. Set to 1/true to activate the Redis consumer.
+    if _env_bool("RESEARCH_USE_REDIS", default=False):
+        return _research_data_from_redis(
+            tickers=tickers,
+            intent=intent,
+            redis_client=redis_client,
+        )
+
+    # Legacy inline-build path (unchanged from v11.6 / Patch A).
     if data_router is None:
         return ResearchData(
             fetched_at_utc=datetime.now(timezone.utc),
@@ -499,7 +522,6 @@ def research_data(
         snap = build_ticker_snapshot(t, intent, data_router=data_router)
         snapshots.append(snap)
 
-    # Aggregate metrics
     with_data = sum(1 for s in snapshots if s.error is None and s.spot)
     errored = sum(1 for s in snapshots if s.error is not None)
     fields_lit_avg = (
@@ -508,7 +530,6 @@ def research_data(
     )
     fields_total = next((s.fields_total for s in snapshots if s.fields_total > 0), 0)
 
-    # canonical_status_summary: count how many tickers have each canonical 'live'
     status_summary: dict = {}
     for s in snapshots:
         for cname, cstatus in s.canonical_status.items():
