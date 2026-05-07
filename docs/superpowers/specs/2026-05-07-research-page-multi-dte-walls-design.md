@@ -2,7 +2,9 @@
 
 **Date:** 2026-05-07
 **Author:** Brad C. + Claude (brainstorming session)
-**Status:** Draft v2 — pending user review
+**Status:** Draft v3 — pending user review
+
+**v3 changes from v2:** telemetry destination pinned to Redis sorted set (concrete schema); `producer_version` switched from strict equality to `>= MIN_COMPATIBLE_PRODUCER_VERSION` (additive bumps non-disruptive); sign-off checklist gains a `PRODUCER_VERSION` bump checkbox.
 
 **v2 changes from v1:** tiered cadence (front 60s / t7 180s / t30+t60 600s); explicit rate-budget math; universe staging in Patch B; per-build timing telemetry as a hard Patch B deliverable; `producer_version` schema field with reader-side rejection; explicit no-market-hours-pause stance. See Revision History at the end.
 
@@ -196,9 +198,23 @@ Value envelope (JSON):
 }
 ```
 
-**`producer_version`** bumps on any producer behavior change (new canonical landed, schema field added, serialization fix). Readers reject keys whose `producer_version` doesn't match what they expect — the key is treated as missing and renders as "warming up." Prevents readers from displaying old-format data after a deploy.
+**`producer_version`** bumps on any producer behavior change (new canonical landed, schema field added, serialization fix).
 
-**`convention_version` reader-side rejection** — Patch 9 (Walk 1E) settled the dealer-side sign convention to `convention_version=2`. The producer writes that. Readers verify on read: if `convention_version != 2`, skip render with a warning. Protects against the historical class of bugs where engines and displays disagreed about whether dealers are long or short calls.
+**Reader semantics:** `>= MIN_COMPATIBLE_PRODUCER_VERSION`, NOT strict equality. Readers accept any key whose `producer_version` is at or above their declared minimum. Why:
+- Most producer bumps are **additive** — new field, new canonical, extra metadata. Readers reading old-format keys just miss the new fields, no display corruption.
+- Strict equality would mean every bump triggers a Research-page blackout until the producer fully repopulates Redis with new-version keys. At Tier C cadence (10 min), that's a potential 10-minute outage per bump.
+- Strict equality would discourage frequent bumping, which is the opposite of what we want — we want bumps to be cheap so the field actually gets used.
+
+**Truly breaking changes** (renaming a field, changing units, removing a field readers depend on) require bumping `MIN_COMPATIBLE_PRODUCER_VERSION` in the reader. That's a deliberate code change, not just a constant bump. The deploy procedure for breaking changes:
+
+1. Producer side: deploy new producer (writes `producer_version=N+1`).
+2. Wait one full Tier C cycle (10 min) for Redis to repopulate with new-version keys.
+3. Reader side: deploy new reader with `MIN_COMPATIBLE_PRODUCER_VERSION = N+1` — old keys (still in Redis under old TTL) start being rejected as "warming up" until they expire.
+4. Self-heals within one Tier cycle.
+
+For non-breaking bumps (the common case): just deploy the producer; readers continue accepting old AND new keys with `producer_version >= MIN_COMPATIBLE`.
+
+**`convention_version` reader-side rejection** — Patch 9 (Walk 1E) settled the dealer-side sign convention to `convention_version=2`. The producer writes that. Readers verify on read: **strict equality** `if convention_version != 2`, skip render with a warning. Patch 9 protection is non-negotiable — a wrong sign on dealer Greeks is a correctness bug, not a missing field. Strict match here, `>=` for `producer_version`.
 
 **TTL per tier:** Tier A keys 180s, Tier B 540s, Tier C 1800s (3× cadence). If the producer dies, readers see stale-empty within one cadence cycle.
 
@@ -290,10 +306,21 @@ Each patch follows the canonical-rebuild discipline:
 **Modified files:**
 - `app.py` — add producer to boot sequence, gated by `BOT_STATE_PRODUCER_ENABLED` env var
 
-**Hard deliverable: per-build timing telemetry.** Each `BotState.build` call inside the producer logs `(ticker, intent, elapsed_ms)` to either stdout (Render captures) or a Redis sorted set with TTL. After ~24 hours of production data, we examine the distribution:
+**Hard deliverable: per-build timing telemetry.** Each `BotState.build` call inside the producer writes one entry to a Redis sorted set:
 
-- p50, p95, p99 of build duration per (ticker, intent)
-- Which tickers/intents are >2s consistently — those become candidates for slower tiers
+- **Key:** `bot_state_producer:timings:{YYYYMMDD}` — one sorted set per UTC day
+- **Score:** unix-timestamp-milliseconds of when the build completed (`time.time() * 1000`, integer)
+- **Member:** JSON string `{"ticker": "...", "intent": "...", "elapsed_ms": N, "expiration": "..."}` — millisecond-precise scores avoid duplicate-member collisions
+- **TTL:** 48 hours on the key (refreshed via `EXPIRE` on each write) — enough window for the 24-hour analysis with breathing room
+
+Why sorted set, not stdout:
+- ZRANGEBYSCORE lets us slice by time window without scraping logs
+- One Redis-side query gives us "all SPY builds in the last hour" or "all builds today between 9:30 and 10:00 ET"
+- Stdout-into-Render-logs is technically possible but log-grep at the end of 24h is brittle compared to a structured query
+
+After ~24 hours of production data, run an analysis (one-off script, can be a Jupyter notebook):
+- p50, p95, p99 of `elapsed_ms` per (ticker, intent)
+- Which tickers/intents are >2s consistently — those are candidates for slower tiers
 - Whether the steady-state fetches/min math holds (the 53.7/min estimate)
 
 If the data shows the cadence assumptions are wrong, **re-tier in a follow-on patch with measured numbers**. This is not optional — it's a deliverable of Patch B.
@@ -320,13 +347,19 @@ Total: 20 keys at steady state. ~13 fetches/min budget. Run for **7 trading days
 **Reader-side version checks.** When deserializing each Redis value:
 
 ```python
-EXPECTED_PRODUCER_VERSION = 1
+# Lower bound: bump only on TRULY breaking schema changes.
+# Additive producer bumps (new fields, new canonicals) leave this constant alone.
+MIN_COMPATIBLE_PRODUCER_VERSION = 1
+
+# Strict — Patch 9 protection is non-negotiable.
 EXPECTED_CONVENTION_VERSION = 2
 
 def _snapshot_from_envelope(ticker, raw_json):
     env = json.loads(raw_json)
-    if env.get("producer_version") != EXPECTED_PRODUCER_VERSION:
-        log.warning(f"{ticker}: producer_version mismatch (got {env.get('producer_version')})")
+    pv = env.get("producer_version")
+    if pv is None or pv < MIN_COMPATIBLE_PRODUCER_VERSION:
+        log.warning(f"{ticker}: producer_version {pv!r} below "
+                    f"MIN_COMPATIBLE={MIN_COMPATIBLE_PRODUCER_VERSION}")
         return _warming_up_snapshot(ticker)
     if env.get("convention_version") != EXPECTED_CONVENTION_VERSION:
         log.warning(f"{ticker}: convention_version mismatch (Patch 9 protection)")
@@ -334,12 +367,13 @@ def _snapshot_from_envelope(ticker, raw_json):
     return _snapshot_from_state_dict(ticker, env["state"], env["intent"], env["expiration"])
 ```
 
-Mismatched versions render as "warming up" (same UX as missing key), and the reader logs a warning. Prevents stale-format data from displaying after a deploy.
+Old-version keys (below MIN_COMPATIBLE) and convention-mismatch keys render as "warming up" (same UX as missing key), and the reader logs a warning.
 
 **Tests:**
 - Mock Redis returning JSON for SPY, missing key for QQQ → SPY card renders, QQQ shows warming-up skeleton
-- Mock Redis returning a key with `producer_version=99` → reader logs warning, renders warming-up (does NOT show the data)
-- Mock Redis returning a key with `convention_version=1` → same: log warning, render warming-up
+- Mock Redis returning a key with `producer_version=99` (newer than reader expects) → reader **accepts**, renders successfully (forward compatibility)
+- Mock Redis returning a key with `producer_version=0` (below MIN_COMPATIBLE=1) → reader logs warning, renders warming-up
+- Mock Redis returning a key with `convention_version=1` → reader logs warning, renders warming-up (strict)
 - Stale Redis (TTL expired between read attempts) → falls through to warming-up
 - Existing 61 tests still pass
 
@@ -483,10 +517,28 @@ Before each patch lands:
 - [ ] Patch is single-concept (audit rule 4)
 - [ ] Wrapper-consistency test exists if a new canonical (audit rule 5)
 - [ ] CLAUDE.md updated to reflect the new "what's done" line (living-context rule)
+- [ ] **If producer schema or serialization changed: `PRODUCER_VERSION` bumped in `bot_state_producer.py`. If the change is breaking, `MIN_COMPATIBLE_PRODUCER_VERSION` also bumped in the reader (`research_data.py`).** This is structural insurance — the version field only protects readers if it actually gets bumped when behavior changes. Cheap to do at the moment of the change; impossible to retrofit later.
 
 ---
 
 ## Revision History
+
+### v3 — 2026-05-07
+
+Pushback after v2 identified three operational gaps. v3 closes them:
+
+**Resolved:**
+- **Telemetry destination pinned.** v2 left "stdout or Redis sorted set" as an open choice. v3 specifies Redis sorted set with concrete schema (`bot_state_producer:timings:{YYYYMMDD}`, score=unix_ms, member=JSON, TTL=48h). Enables ZRANGEBYSCORE queries instead of log-scraping for the 24h analysis.
+- **`producer_version` semantics changed from strict equality to `>= MIN_COMPATIBLE_PRODUCER_VERSION`.** v2's strict-match design would cause a Research blackout on every producer bump (up to 10 min at Tier C cadence). v3 accepts forward-compatible versions; `MIN_COMPATIBLE` only bumps on truly breaking schema changes. Documented deploy procedure for breaking vs additive bumps. `convention_version` stays strict (Patch 9 protection is non-negotiable).
+- **Sign-off checklist gains `PRODUCER_VERSION` bump checkbox.** Structural reminder — without it, the version field only works if the human discipline holds. Cheap insurance.
+
+**Unchanged from v2:**
+- Tiered cadence (front 60s / t7 180s / t30+t60 600s)
+- Rate-budget math (~53.7/min vs 110/min)
+- Universe staging (10×2 → 35×4)
+- No-market-hours-pause stance
+- Five-intent registry
+- 5-patch sequence
 
 ### v2 — 2026-05-07
 
