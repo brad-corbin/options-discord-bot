@@ -585,10 +585,14 @@ class SchwabStreamManager:
     def __init__(self, schwab_client, tickers: list,
                  option_symbols: list = None):
         self._client = schwab_client
-        self._tickers = tickers
+        self._tickers = list(tickers)
         self._option_symbols = list(option_symbols or [])
         self._pending_option_adds = []   # symbols queued for dynamic add
         self._pending_option_unsubs = [] # symbols queued for removal
+        # S.1: equity dynamic subscription queues — mirror the option pattern.
+        self._pending_equity_adds = []
+        self._pending_equity_unsubs = []
+        self._equity_fields = None       # set during _stream, reused by _process_pending_subs
         self._stream_client = None       # set during _stream for dynamic ops
         self._thread = None
         self._running = False
@@ -602,6 +606,7 @@ class SchwabStreamManager:
             "errors": 0,
             "last_update": None,
             "option_symbols_subscribed": 0,
+            "equity_symbols_subscribed": 0,
         }
         self._lock = threading.Lock()
 
@@ -639,6 +644,33 @@ class SchwabStreamManager:
         with self._lock:
             self._pending_option_unsubs.extend(symbols)
             self._option_symbols = [s for s in self._option_symbols if s not in set(symbols)]
+
+    # S.1: equity dynamic subscription — mirrors add_option_symbols.
+    def add_equity_symbols(self, symbols: list):
+        """Queue equity tickers for dynamic Level 1 subscription.
+
+        Idempotent: tickers already in _tickers are silently dropped.
+        Thread-safe. Newly added tickers are picked up by the periodic
+        _process_pending_subs sweep within ~5 seconds.
+        """
+        if not symbols:
+            return
+        with self._lock:
+            existing = set(self._tickers)
+            new_syms = [s.upper() for s in symbols if s and s.upper() not in existing]
+            if new_syms:
+                self._pending_equity_adds.extend(new_syms)
+                self._tickers.extend(new_syms)
+                log.info(f"Queued {len(new_syms)} equity symbols for streaming subscription")
+
+    def remove_equity_symbols(self, symbols: list):
+        """Queue equity tickers for unsubscribe and drop them from _tickers."""
+        if not symbols:
+            return
+        with self._lock:
+            up = {s.upper() for s in symbols if s}
+            self._pending_equity_unsubs.extend(up)
+            self._tickers = [t for t in self._tickers if t.upper() not in up]
 
     def stop(self):
         self._running = False
@@ -736,7 +768,10 @@ class SchwabStreamManager:
             StreamClient.LevelOneEquityFields.ASK_PRICE,
             StreamClient.LevelOneEquityFields.TOTAL_VOLUME,
         ]
+        self._equity_fields = equity_fields  # S.1: needed by _process_pending_subs
         await stream_client.level_one_equity_subs(self._tickers, fields=equity_fields)
+        with self._lock:
+            self._stats["equity_symbols_subscribed"] = len(self._tickers)
         log.info(f"Subscribed to Level 1 equity quotes: {len(self._tickers)} symbols")
 
         # ── Option handler (Phase 3) ──
@@ -819,30 +854,54 @@ class SchwabStreamManager:
                 await self._process_pending_subs(stream_client)
 
     async def _process_pending_subs(self, stream_client):
-        """Add/remove option symbols dynamically without reconnecting."""
+        """Add/remove option AND equity symbols dynamically without reconnecting."""
+        # Snapshot under lock, then operate on copies.
         with self._lock:
-            adds = list(self._pending_option_adds)
+            opt_adds = list(self._pending_option_adds)
             self._pending_option_adds.clear()
-            unsubs = list(self._pending_option_unsubs)
+            opt_unsubs = list(self._pending_option_unsubs)
             self._pending_option_unsubs.clear()
+            eq_adds = list(self._pending_equity_adds)
+            self._pending_equity_adds.clear()
+            eq_unsubs = list(self._pending_equity_unsubs)
+            self._pending_equity_unsubs.clear()
 
-        if adds:
+        if opt_adds:
             try:
-                await stream_client.level_one_option_add(adds, fields=self._option_fields)
+                await stream_client.level_one_option_add(opt_adds, fields=self._option_fields)
                 with self._lock:
-                    self._stats["option_symbols_subscribed"] += len(adds)
-                log.info(f"Dynamically added {len(adds)} option symbols to stream")
+                    self._stats["option_symbols_subscribed"] += len(opt_adds)
+                log.info(f"Dynamically added {len(opt_adds)} option symbols to stream")
             except Exception as e:
                 log.warning(f"Failed to add option symbols: {e}")
 
-        if unsubs:
+        if opt_unsubs:
             try:
-                await stream_client.level_one_option_unsubs(unsubs)
+                await stream_client.level_one_option_unsubs(opt_unsubs)
                 with self._lock:
-                    self._stats["option_symbols_subscribed"] -= len(unsubs)
-                log.info(f"Unsubscribed {len(unsubs)} option symbols from stream")
+                    self._stats["option_symbols_subscribed"] -= len(opt_unsubs)
+                log.info(f"Unsubscribed {len(opt_unsubs)} option symbols from stream")
             except Exception as e:
                 log.warning(f"Failed to unsub option symbols: {e}")
+
+        # S.1: equity branch
+        if eq_adds:
+            try:
+                await stream_client.level_one_equity_add(eq_adds, fields=self._equity_fields)
+                with self._lock:
+                    self._stats["equity_symbols_subscribed"] += len(eq_adds)
+                log.info(f"Dynamically added {len(eq_adds)} equity symbols to stream")
+            except Exception as e:
+                log.warning(f"Failed to add equity symbols: {e}")
+
+        if eq_unsubs:
+            try:
+                await stream_client.level_one_equity_unsubs(eq_unsubs)
+                with self._lock:
+                    self._stats["equity_symbols_subscribed"] -= len(eq_unsubs)
+                log.info(f"Unsubscribed {len(eq_unsubs)} equity symbols from stream")
+            except Exception as e:
+                log.warning(f"Failed to unsub equity symbols: {e}")
 
     @property
     def status(self) -> dict:
