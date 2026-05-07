@@ -240,6 +240,29 @@ def test_load_snapshot_warming_up_on_malformed_json():
     assert_eq(snap.warming_up, True, "malformed JSON → warming up")
 
 
+def test_load_snapshot_warming_up_on_non_dict_json():
+    """JSON-valid but non-dict payload (list, scalar, null) → warming up.
+    Defends the 'never propagates exceptions' contract against an unusual
+    Redis payload shape from a future bug or a manual SET."""
+    from omega_dashboard.research_data import _load_snapshot_from_redis, KEY_PREFIX
+    fake = _FakeRedis()
+    # Each of these is valid JSON but won't have .get() — would crash
+    # the consumer pre-fix.
+    for payload, label in [
+        ("[1,2,3]", "list"),
+        ("42", "int"),
+        ('"hello"', "string"),
+        ("null", "null"),
+    ]:
+        fake.kv.clear()
+        fake.set(f"{KEY_PREFIX}AAPL:front", payload)
+        snap = _load_snapshot_from_redis("AAPL", "front", redis_client=fake)
+        assert_eq(snap.warming_up, True,
+                  f"non-dict JSON ({label}) → warming up")
+        assert_true("not a dict" in (snap.error or ""),
+                    f"reason mentions 'not a dict' for {label}")
+
+
 def test_load_snapshot_warming_up_on_version_mismatch():
     """convention_version=1 (Patch 9 mismatch) → warming up, not silent accept."""
     from omega_dashboard.research_data import _load_snapshot_from_redis, KEY_PREFIX
@@ -335,6 +358,7 @@ if __name__ == "__main__":
     test_load_snapshot_returns_warming_up_when_redis_is_none()
     test_load_snapshot_parses_valid_envelope()
     test_load_snapshot_warming_up_on_malformed_json()
+    test_load_snapshot_warming_up_on_non_dict_json()
     test_load_snapshot_warming_up_on_version_mismatch()
     test_load_snapshot_accepts_future_producer_version()
     # _research_data_from_redis

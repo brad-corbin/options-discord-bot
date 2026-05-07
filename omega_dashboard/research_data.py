@@ -274,6 +274,16 @@ def _load_snapshot_from_redis(
         log.warning(f"research_data: malformed envelope for {ticker}: {e}")
         return _warming_up_snapshot(ticker, reason="malformed envelope")
 
+    # Defensive: a JSON-valid but non-dict payload (e.g., "null", "42",
+    # "[1,2,3]") would crash _validate_envelope_versions on .get(). The
+    # consumer must never propagate exceptions; route to warming-up.
+    if not isinstance(envelope, dict):
+        log.warning(
+            f"research_data: envelope for {ticker} is not a dict "
+            f"(got {type(envelope).__name__})"
+        )
+        return _warming_up_snapshot(ticker, reason="envelope not a dict")
+
     err = _validate_envelope_versions(envelope, ticker)
     if err is not None:
         log.warning(f"research_data: {err}")
@@ -316,10 +326,13 @@ def _research_data_from_redis(
 
     # Aggregate metrics — count "with_data" as not-warming-up, not-errored.
     with_data = sum(1 for s in snapshots if not s.warming_up and s.error is None)
+    # Note: on the Redis-consumer path errored is structurally always 0
+    # (any failure sets warming_up=True). The metric carries non-zero
+    # values from the legacy build_ticker_snapshot inline-build path.
     errored = sum(1 for s in snapshots if s.error is not None and not s.warming_up)
     fields_lit_avg = (
-        sum(s.fields_lit for s in snapshots if not s.warming_up) / max(with_data, 1)
-        if with_data > 0 else 0.0
+        sum(s.fields_lit for s in snapshots if not s.warming_up)
+        / max(with_data, 1)
     )
     fields_total = next((s.fields_total for s in snapshots if s.fields_total > 0), 0)
 
