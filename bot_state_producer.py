@@ -234,3 +234,89 @@ def _refresh_lock(redis_client, lock_key: str, token: str, ttl_sec: int) -> bool
     except Exception as e:
         log.warning(f"lock refresh failed: {e}")
         return False
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Per-tier work function — one full pass over (ticker × intent) for
+# this tier. Per-ticker errors are caught and logged; the pass always
+# completes for every (ticker, intent) regardless of individual failures.
+#
+# Dependencies are injected (canonical_expiration_fn, fetch_raw_inputs_fn,
+# build_from_raw_fn) so unit tests can mock them. In production B.4
+# binds the real implementations.
+# ─────────────────────────────────────────────────────────────────────
+
+KEY_PREFIX = "bot_state:"
+
+
+def _build_one_state(
+    ticker: str,
+    intent: str,
+    cached_md,
+    canonical_expiration_fn,
+    fetch_raw_inputs_fn,
+    build_from_raw_fn,
+) -> Optional[Dict[str, Any]]:
+    """Build a single (ticker, intent) state dict + expiration. Returns
+    None if no qualifying expiration. Raises on fetch/build failures —
+    caller handles per-ticker isolation.
+    """
+    expiration = canonical_expiration_fn(ticker, intent, data_router=cached_md)
+    if not expiration:
+        return None
+    raw = fetch_raw_inputs_fn(ticker, expiration, data_router=cached_md)
+    state = build_from_raw_fn(raw)
+    # If state is a dataclass instance, convert to dict for the envelope.
+    state_dict = asdict(state) if is_dataclass(state) else dict(state)
+    return {"state_dict": state_dict, "expiration": expiration}
+
+
+def _run_tier_pass(
+    tier_name: str,
+    intents: List[str],
+    ttl_sec: int,
+    tickers: List[str],
+    cached_md,
+    redis_client,
+    canonical_expiration_fn,
+    fetch_raw_inputs_fn,
+    build_from_raw_fn,
+) -> None:
+    """One full pass over (ticker × intent) for this tier. Always
+    completes; per-ticker errors are logged and skipped."""
+    if not intents or not tickers:
+        return
+    for ticker in tickers:
+        for intent in intents:
+            t_start = time.time()
+            try:
+                built = _build_one_state(
+                    ticker, intent, cached_md,
+                    canonical_expiration_fn,
+                    fetch_raw_inputs_fn,
+                    build_from_raw_fn,
+                )
+            except Exception as e:
+                log.warning(
+                    f"[bsp tier={tier_name}] {ticker}/{intent} build failed: {e}"
+                )
+                continue
+            if built is None:
+                continue
+            envelope = _build_envelope(
+                state=built["state_dict"],
+                intent=intent,
+                expiration=built["expiration"],
+            )
+            try:
+                payload = _serialize_envelope(envelope)
+                key = f"{KEY_PREFIX}{ticker}:{intent}"
+                redis_client.set(key, payload, ex=ttl_sec)
+            except Exception as e:
+                log.warning(
+                    f"[bsp tier={tier_name}] {ticker}/{intent} write failed: {e}"
+                )
+                continue
+            elapsed_ms = int((time.time() - t_start) * 1000)
+            _record_build_timing(redis_client, ticker, intent,
+                                 elapsed_ms, built["expiration"])

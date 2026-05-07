@@ -129,6 +129,36 @@ class _FakeRedis:
         raise NotImplementedError(f"FakeRedis.eval: unrecognized script")
 
 
+class _FakeBuildContext:
+    """Fakes the (canonical_expiration, fetch_raw_inputs, BotState.build_from_raw)
+    chain. Returns canned values per ticker; supports raising specific
+    exceptions to test error isolation.
+    """
+    def __init__(self):
+        # ticker → {"expiration": "2026-05-08", "state_dict": {...}, "raises": ExceptionInstance|None}
+        self.config: Dict[str, dict] = {}
+        self.calls: list = []
+
+    def canonical_expiration(self, ticker, intent, *, data_router=None):
+        cfg = self.config.get(ticker)
+        if cfg is None:
+            return None  # no qualifying chain
+        return cfg["expiration"]
+
+    def fetch_raw_inputs(self, ticker, expiration, *, data_router, **kwargs):
+        cfg = self.config.get(ticker, {})
+        if cfg.get("raises_at") == "fetch":
+            raise cfg["raises"]
+        return {"_fake_raw": ticker, "_exp": expiration}
+
+    def build_from_raw(self, raw, *, days_to_exp=None):
+        ticker = raw.get("_fake_raw") if isinstance(raw, dict) else None
+        cfg = self.config.get(ticker, {})
+        if cfg.get("raises_at") == "build":
+            raise cfg["raises"]
+        return cfg["state_dict"]
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Parsing tests
 # ─────────────────────────────────────────────────────────────────────
@@ -331,6 +361,136 @@ def test_lock_refresh_extends_ttl():
     assert_eq(refreshed, False, "wrong token cannot refresh")
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Single-tier pass tests
+# ─────────────────────────────────────────────────────────────────────
+
+def test_tier_pass_writes_one_key_per_ticker_intent():
+    """Two tickers × one intent → two Redis keys with valid envelopes."""
+    from bot_state_producer import _run_tier_pass
+    fake_redis = _FakeRedis()
+    fake_ctx = _FakeBuildContext()
+    fake_ctx.config["AAPL"] = {
+        "expiration": "2026-05-08",
+        "state_dict": {"ticker": "AAPL", "spot": 184.50, "fields_lit": 22,
+                       "fetch_errors": [], "canonical_status": {}},
+    }
+    fake_ctx.config["MSFT"] = {
+        "expiration": "2026-05-08",
+        "state_dict": {"ticker": "MSFT", "spot": 412.30, "fields_lit": 22,
+                       "fetch_errors": [], "canonical_status": {}},
+    }
+    _run_tier_pass(
+        tier_name="A",
+        intents=["front"],
+        ttl_sec=180,
+        tickers=["AAPL", "MSFT"],
+        cached_md=object(),
+        redis_client=fake_redis,
+        canonical_expiration_fn=fake_ctx.canonical_expiration,
+        fetch_raw_inputs_fn=fake_ctx.fetch_raw_inputs,
+        build_from_raw_fn=fake_ctx.build_from_raw,
+    )
+    aapl_raw = fake_redis.get("bot_state:AAPL:front")
+    msft_raw = fake_redis.get("bot_state:MSFT:front")
+    assert_true(aapl_raw is not None, "AAPL key written")
+    assert_true(msft_raw is not None, "MSFT key written")
+    aapl = json.loads(aapl_raw)
+    assert_eq(aapl["intent"], "front", "AAPL envelope intent")
+    assert_eq(aapl["expiration"], "2026-05-08", "AAPL envelope expiration")
+    assert_eq(aapl["state"]["spot"], 184.50, "AAPL state body intact")
+
+
+def test_tier_pass_skips_ticker_when_canonical_expiration_returns_none():
+    from bot_state_producer import _run_tier_pass
+    fake_redis = _FakeRedis()
+    fake_ctx = _FakeBuildContext()
+    fake_ctx.config["AAPL"] = {
+        "expiration": "2026-05-08",
+        "state_dict": {"ticker": "AAPL", "spot": 184.50, "fields_lit": 22,
+                       "fetch_errors": [], "canonical_status": {}},
+    }
+    # NO entry for FAKE → canonical_expiration returns None → skip.
+    _run_tier_pass(
+        "A", ["front"], 180,
+        tickers=["AAPL", "FAKE"],
+        cached_md=object(),
+        redis_client=fake_redis,
+        canonical_expiration_fn=fake_ctx.canonical_expiration,
+        fetch_raw_inputs_fn=fake_ctx.fetch_raw_inputs,
+        build_from_raw_fn=fake_ctx.build_from_raw,
+    )
+    assert_true(fake_redis.get("bot_state:AAPL:front") is not None,
+                "AAPL key written")
+    assert_eq(fake_redis.get("bot_state:FAKE:front"), None,
+              "FAKE skipped silently when no qualifying chain")
+
+
+def test_tier_pass_isolates_per_ticker_errors():
+    """Spec mandate: one ticker raising must not stop the loop."""
+    from bot_state_producer import _run_tier_pass
+    fake_redis = _FakeRedis()
+    fake_ctx = _FakeBuildContext()
+    fake_ctx.config["AAPL"] = {
+        "expiration": "2026-05-08",
+        "state_dict": {"ticker": "AAPL", "spot": 184.50, "fields_lit": 22,
+                       "fetch_errors": [], "canonical_status": {}},
+    }
+    fake_ctx.config["BAD"] = {
+        "expiration": "2026-05-08",
+        "raises_at": "build",
+        "raises": RuntimeError("simulated build failure"),
+    }
+    fake_ctx.config["MSFT"] = {
+        "expiration": "2026-05-08",
+        "state_dict": {"ticker": "MSFT", "spot": 412.30, "fields_lit": 22,
+                       "fetch_errors": [], "canonical_status": {}},
+    }
+    _run_tier_pass(
+        "A", ["front"], 180,
+        tickers=["AAPL", "BAD", "MSFT"],
+        cached_md=object(),
+        redis_client=fake_redis,
+        canonical_expiration_fn=fake_ctx.canonical_expiration,
+        fetch_raw_inputs_fn=fake_ctx.fetch_raw_inputs,
+        build_from_raw_fn=fake_ctx.build_from_raw,
+    )
+    assert_true(fake_redis.get("bot_state:AAPL:front") is not None,
+                "AAPL key written before BAD raised")
+    assert_true(fake_redis.get("bot_state:MSFT:front") is not None,
+                "MSFT key written after BAD raised")
+    assert_eq(fake_redis.get("bot_state:BAD:front"), None,
+              "BAD ticker has no key (build raised)")
+
+
+def test_tier_pass_writes_telemetry_per_successful_build():
+    from bot_state_producer import _run_tier_pass, TIMINGS_KEY_PREFIX
+    fake_redis = _FakeRedis()
+    fake_ctx = _FakeBuildContext()
+    fake_ctx.config["AAPL"] = {
+        "expiration": "2026-05-08",
+        "state_dict": {"ticker": "AAPL", "spot": 184.50, "fields_lit": 22,
+                       "fetch_errors": [], "canonical_status": {}},
+    }
+    _run_tier_pass(
+        "A", ["front"], 180,
+        tickers=["AAPL"],
+        cached_md=object(),
+        redis_client=fake_redis,
+        canonical_expiration_fn=fake_ctx.canonical_expiration,
+        fetch_raw_inputs_fn=fake_ctx.fetch_raw_inputs,
+        build_from_raw_fn=fake_ctx.build_from_raw,
+    )
+    timings_keys = [k for k in fake_redis.zset.keys() if k.startswith(TIMINGS_KEY_PREFIX)]
+    assert_eq(len(timings_keys), 1, "one timings key for the day")
+    members = fake_redis.zrange(timings_keys[0], 0, -1, withscores=False)
+    assert_eq(len(members), 1, "one timing record written")
+    rec = json.loads(members[0])
+    assert_eq(rec["ticker"], "AAPL", "timing record ticker")
+    assert_eq(rec["intent"], "front", "timing record intent")
+    assert_true(rec["elapsed_ms"] >= 0, "elapsed_ms is non-negative integer")
+
+
 if __name__ == "__main__":
     # Parsing
     test_parse_intents_filters_empty_strings()
@@ -349,6 +509,11 @@ if __name__ == "__main__":
     test_lock_acquire_fails_when_held()
     test_lock_release_only_by_owner()
     test_lock_refresh_extends_ttl()
+    # Single-tier pass
+    test_tier_pass_writes_one_key_per_ticker_intent()
+    test_tier_pass_skips_ticker_when_canonical_expiration_returns_none()
+    test_tier_pass_isolates_per_ticker_errors()
+    test_tier_pass_writes_telemetry_per_successful_build()
     print(f"PASSED: {len(PASSED)}, FAILED: {len(FAILED)}")
     for f in FAILED:
         print(f"  ✗ {f}")
