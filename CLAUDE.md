@@ -160,7 +160,8 @@ The pattern, in order:
 
 8. **Run all canonical test suites.** Currently: `test_raw_inputs`,
    `test_canonical_gamma_flip`, `test_canonical_iv_state`,
-   `test_canonical_exposures`, `test_bot_state`. All must pass.
+   `test_canonical_exposures`, `test_canonical_expiration`,
+   `test_bot_state`. All must pass.
 
 9. **AST-check every Python file touched.** `python3 -c "import ast;
    ast.parse(open('file.py').read())"`. Never ship a file that hasn't
@@ -338,6 +339,7 @@ python3 test_raw_inputs.py
 python3 test_canonical_gamma_flip.py
 python3 test_canonical_iv_state.py
 python3 test_canonical_exposures.py
+python3 test_canonical_expiration.py
 python3 test_bot_state.py
 
 # End-to-end demo of BotState pipeline (requires the repo's

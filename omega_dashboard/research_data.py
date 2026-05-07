@@ -106,8 +106,9 @@ class ResearchData:
 
 # Keyed by (ticker, expiration) tuple — a request for the same ticker at a
 # different expiration must NOT be served from a cached snapshot of the
-# wrong chain. This is rare in normal page use (default expiration is
-# next-Friday for everyone) but easy to get wrong if added later.
+# wrong chain. Per-ticker canonical_expiration can legitimately yield
+# different dates for different tickers or intents, so the (ticker,
+# expiration) pair is the right granularity for the cache.
 _CACHE: dict = {}    # (ticker, expiration) -> (timestamp, snapshot)
 
 
