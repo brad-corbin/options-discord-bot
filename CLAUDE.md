@@ -127,14 +127,21 @@ Canonical rebuild (the v11 work — see "Canonical rebuild" below):
   for every (ticker, intent) on a tiered cadence and writes JSON envelopes
   to Redis. Lives in `bot_state_producer.py`. The Research page (after
   Patch C) becomes a pure consumer of these envelopes. Producer always
-  runs on exactly one Render worker (cross-worker Redis lock held by a
-  dedicated lock-keeper thread).
+  runs on exactly one Render worker (cross-worker Redis lock). The
+  lock-keeper thread polls for acquisition continuously (Patch B.7), so
+  the producer auto-recovers from redeploy gaps where a stale lock from
+  the prior worker is still in Redis at boot. Tier threads block on the
+  acquired event before each pass — work only happens while we hold the
+  leader lock.
 - **producer envelope** — the JSON wrapper around BotState in Redis. Shape:
   `{producer_version, convention_version, intent, expiration, state}`.
   `producer_version` bumps on schema change (consumers reject unknown
   versions); `convention_version=2` is Patch 9 dealer-side. `state` is
-  the BotState dataclass as-dict. Intent and expiration live on the
-  envelope, NOT inside BotState (Open Question #3 resolution).
+  the BotState dataclass as-dict, with NaN/+inf/-inf floats converted to
+  null and datetime/date converted to ISO 8601 strings (Patch B.6 hotfix —
+  json.dumps doesn't accept NaN literals or raw datetime objects). Intent
+  and expiration live on the envelope, NOT inside BotState (Open Question
+  #3 resolution).
 - **BOT_STATE_PRODUCER_ env vars** — `_ENABLED` (bool, default off),
   `_TICKERS` (comma list), `_INTENTS_TIER_A/B/C` (comma lists; default
   `front`/`t7`/empty), `_CADENCE_TIER_A/B/C` (seconds; defaults 60/180/600).
@@ -361,6 +368,15 @@ is high. Don't argue with them.
   Consumers (Research page after Patch C) check for forward and backward
   compatibility on read; `convention_version` mismatch is treated as
   "warming up" rather than rendered (Patch 9 protection).
+- bot_state_producer lock-keeper is poll-acquire, not fail-fast (Patch B.7).
+  At startup the producer is "running" structurally regardless of whether
+  it currently holds the cross-worker Redis lock; the keeper polls every
+  LOCK_REFRESH_INTERVAL_SEC=60 to acquire, and tier threads block on
+  `_lock_state.acquired` before each pass. This was added after the first
+  env-flag flip in production hit a redeploy gap (old worker's 90s lock
+  TTL hadn't expired when new worker booted, producer stayed dormant
+  forever). The keeper also releases the lock on graceful stop() so the
+  next deploy acquires immediately instead of waiting for TTL.
 
 ---
 
