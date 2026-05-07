@@ -192,10 +192,33 @@ class BotState:
         if days_to_exp is None:
             days_to_exp = _days_to_exp_from_iso(raw.expiration, raw.fetched_at_utc)
 
+        # ─── Live: IV state via canonical_iv_state (Patch 11.3.2) ──
+        # Wraps options_exposure.UnifiedIVSurface — the production-canonical
+        # IV calculator. Replaces the inline _atm_iv_from_chain that briefly
+        # lived here and was correctly called out as the wrong pattern.
+        iv_state_result = _try_canonical(
+            "iv_state",
+            lambda: _call_canonical_iv_state(raw.chain, raw.spot, days_to_exp),
+            status,
+        ) or {}
+        # representative_iv is what production feeds to the gamma_flip IV-aware band
+        representative_iv = (iv_state_result.get("representative_iv")
+                             if isinstance(iv_state_result, dict) else None)
+        atm_iv_val = (iv_state_result.get("atm_iv")
+                      if isinstance(iv_state_result, dict) else None)
+        iv_skew_pp_val = (iv_state_result.get("iv_skew_pp")
+                          if isinstance(iv_state_result, dict) else None)
+        iv30_val = (iv_state_result.get("iv30")
+                    if isinstance(iv_state_result, dict) else None)
+
         # ─── Live: gamma_flip via canonical_gamma_flip (Patch 11.2) ──
+        # Pass representative_iv (the production-canonical IV value) so the
+        # IV-aware band from Patch 8 is used. Without this, blanket ±25%.
         gamma_flip_val = _try_canonical(
             "gamma_flip",
-            lambda: _call_canonical_gamma_flip(raw.chain, raw.spot, days_to_exp),
+            lambda: _call_canonical_gamma_flip(
+                raw.chain, raw.spot, days_to_exp, iv=representative_iv,
+            ),
             status,
         )
 
@@ -214,7 +237,6 @@ class BotState:
         walls = _try_canonical("walls", lambda: _stub("walls"), status) or {}
         pivots = _try_canonical("pivots", lambda: _stub("pivots"), status) or {}
         structure = _try_canonical("structure", lambda: _stub("structure"), status) or {}
-        iv_state = _try_canonical("iv_state", lambda: _stub("iv_state"), status) or {}
         em_state = _try_canonical("em_state", lambda: _stub("em_state"), status) or {}
         technicals = _try_canonical("technicals", lambda: _stub("technicals"), status) or {}
         bias = _try_canonical("bias", lambda: _stub("bias"), status) or {}
@@ -270,9 +292,9 @@ class BotState:
             vpoc=structure.get("vpoc") if isinstance(structure, dict) else None,
             swing_high=structure.get("swing_high") if isinstance(structure, dict) else None,
             swing_low=structure.get("swing_low") if isinstance(structure, dict) else None,
-            atm_iv=iv_state.get("atm_iv") if isinstance(iv_state, dict) else None,
-            iv30=iv_state.get("iv30") if isinstance(iv_state, dict) else None,
-            iv_skew_pp=iv_state.get("iv_skew_pp") if isinstance(iv_state, dict) else None,
+            atm_iv=atm_iv_val,
+            iv30=iv30_val,
+            iv_skew_pp=iv_skew_pp_val,
             em_1sd_intraday=em_state.get("em_1sd_intraday") if isinstance(em_state, dict) else None,
             em_1sd_thesis=em_state.get("em_1sd_thesis") if isinstance(em_state, dict) else None,
             volume_today=volume_today,
@@ -381,10 +403,20 @@ def _stub(name: str):
     raise NotImplementedError(f"canonical_{name} pending implementation")
 
 
-def _call_canonical_gamma_flip(chain, spot, days_to_exp):
-    """Wrapper around canonical_gamma_flip with proper imports."""
+def _call_canonical_gamma_flip(chain, spot, days_to_exp, *, iv=None):
+    """Wrapper around canonical_gamma_flip with proper imports.
+
+    iv is forwarded if provided. dte_years is auto-derived from days_to_exp
+    inside canonical_gamma_flip when iv is given (Patch 11.2.1 safety fix).
+    """
     from canonical_gamma_flip import canonical_gamma_flip
-    return canonical_gamma_flip(chain, spot=spot, days_to_exp=days_to_exp)
+    return canonical_gamma_flip(chain, spot=spot, days_to_exp=days_to_exp, iv=iv)
+
+
+def _call_canonical_iv_state(chain, spot, days_to_exp):
+    """Wrapper around canonical_iv_state with proper imports."""
+    from canonical_iv_state import canonical_iv_state
+    return canonical_iv_state(chain, spot=spot, days_to_exp=days_to_exp)
 
 
 # ───────────────────────────────────────────────────────────────────────

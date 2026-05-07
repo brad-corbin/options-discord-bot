@@ -221,9 +221,10 @@ def test_stubbed_canonicals_record_stub_status():
     raw = _build_realistic_raw_inputs()
     state = BotState.build_from_raw(raw)
 
-    # gamma_flip is live (Patch 11.2). Every other canonical should be stub.
+    # Live: gamma_flip (Patch 11.2), iv_state (Patch 11.3.2)
+    # Every other canonical should be stub.
     expected_stubs = ["gex", "dex", "vanna", "charm", "walls", "pivots",
-                      "structure", "iv_state", "em_state", "technicals",
+                      "structure", "em_state", "technicals",
                       "bias", "dealer_regime", "vol_regime", "potter_box",
                       "flow_state", "calendar"]
     for c in expected_stubs:
@@ -351,6 +352,68 @@ def test_empty_chain_doesnt_crash_build():
     PASSED.append("test_empty_chain_doesnt_crash_build")
 
 
+def test_iv_state_is_live_via_canonical():
+    """Patch 11.3.2: canonical_iv_state landed and BotState wires through to it.
+    iv_state should be 'live' in canonical_status, atm_iv should be populated,
+    and the representative_iv flows into canonical_gamma_flip's IV-aware band.
+    """
+    raw = _build_realistic_raw_inputs(spot=100.0)
+    state = BotState.build_from_raw(raw)
+
+    iv_state_status = state.canonical_status.get("iv_state", "")
+    assert_eq(iv_state_status, "live", "iv_state status is live")
+
+    if state.atm_iv is None:
+        FAILED.append(f"test_iv_state_live: atm_iv None despite live status")
+        return
+    # Synthetic chain has IV=0.25 throughout — UnifiedIVSurface re-derives via
+    # resolve_iv so won't be exactly 0.25 but should be in same neighborhood
+    assert_in_range(state.atm_iv, 0.10, 0.50,
+                    f"atm_iv in reasonable range, got {state.atm_iv}")
+    PASSED.append("test_iv_state_is_live_via_canonical")
+
+
+def test_gamma_flip_uses_iv_aware_band_via_canonical_iv_state():
+    """End-to-end: BotState calls canonical_iv_state, gets representative_iv,
+    passes it to canonical_gamma_flip → IV-aware band. Both canonicals should
+    be live, gamma_flip should be a real value."""
+    raw = _build_realistic_raw_inputs(spot=100.0)
+    state = BotState.build_from_raw(raw)
+
+    assert_eq(state.canonical_status.get("iv_state"), "live", "iv_state live")
+    assert_eq(state.canonical_status.get("gamma_flip"), "live", "gamma_flip live")
+
+    if state.gamma_flip is None:
+        FAILED.append("test_iv_aware_e2e: gamma_flip None")
+        return
+    assert_in_range(state.gamma_flip, 75.0, 125.0, "flip in reasonable band")
+    PASSED.append("test_gamma_flip_uses_iv_aware_band_via_canonical_iv_state")
+
+
+def test_iv_state_handles_empty_chain_gracefully():
+    """Empty chain → iv_state status is 'live' but the result has empty values
+    (canonical_iv_state returns a dict with None fields, source='empty_chain').
+    """
+    raw = RawInputs(
+        ticker="EMPTY",
+        spot=100.0,
+        chain={},
+        expiration="2026-05-09",
+        quote={},
+        bars=[],
+        iv_surface=None,
+        fetched_at_utc=datetime(2026, 5, 6, tzinfo=timezone.utc),
+        fetch_errors=(("get_chain", "empty"),),
+    )
+    state = BotState.build_from_raw(raw)
+    # canonical_iv_state returns gracefully (status 'live'), but the values are None
+    assert_eq(state.canonical_status.get("iv_state"), "live",
+              "iv_state status 'live' even on empty (graceful return)")
+    assert_is_none(state.atm_iv, "atm_iv None on empty chain")
+    assert_is_none(state.iv_skew_pp, "iv_skew_pp None on empty chain")
+    PASSED.append("test_iv_state_handles_empty_chain_gracefully")
+
+
 # ───────────────────────────────────────────────────────────────────────
 # Run all
 # ───────────────────────────────────────────────────────────────────────
@@ -369,6 +432,9 @@ def main():
         test_fields_lit_progress_indicator,
         test_fetch_errors_propagated,
         test_empty_chain_doesnt_crash_build,
+        test_iv_state_is_live_via_canonical,
+        test_gamma_flip_uses_iv_aware_band_via_canonical_iv_state,
+        test_iv_state_handles_empty_chain_gracefully,
     ]
     for t in tests:
         try:
