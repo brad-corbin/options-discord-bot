@@ -331,11 +331,15 @@ def _run_tier_pass(
 
 # ─────────────────────────────────────────────────────────────────────
 # Lock-keeper thread — owns the cross-worker lock independently of any
-# tier loop. Wakes every (LOCK_TTL_SEC - 30s) and refreshes. If refresh
-# fails (another worker took over), signals all tier loops to stop.
+# tier loop. Patch B.7: poll-acquires when no token, refreshes when held.
+# Survives transient losses (refresh fails) AND startup contention
+# (stale lock from a prior deploy still in Redis) by retrying acquire
+# every cycle until it succeeds.
 #
 # Decoupled from tier loops so an empty Tier A doesn't silently allow
-# the lock to expire (path b per Brad's design call on Q2).
+# the lock to expire (path b). Tier threads wait on `lock_state.acquired`
+# before each pass — if the keeper loses the lock mid-flight, tiers
+# pause; when the keeper re-acquires, tiers resume.
 # ─────────────────────────────────────────────────────────────────────
 
 LOCK_KEY = "bot_state_producer:lock"
@@ -343,30 +347,91 @@ LOCK_TTL_SEC = 90  # > Tier A cadence + max build time
 LOCK_REFRESH_INTERVAL_SEC = 60  # LOCK_TTL_SEC - 30s safety margin
 
 
+class _LockState:
+    """Mutable lock state shared between the lock-keeper thread and the
+    tier threads. The keeper writes (set/clear); tiers read via
+    `acquired.wait()` to gate their work passes.
+    """
+    def __init__(self):
+        self._token: Optional[str] = None
+        self._lock = threading.Lock()
+        self.acquired = threading.Event()
+
+    def set(self, token: str) -> None:
+        """Atomically store the token and signal acquired."""
+        with self._lock:
+            self._token = token
+        self.acquired.set()
+
+    def clear(self) -> Optional[str]:
+        """Atomically clear the token and de-signal acquired. Returns
+        the prior token (for the caller to release if it wants)."""
+        with self._lock:
+            old = self._token
+            self._token = None
+        self.acquired.clear()
+        return old
+
+    def get(self) -> Optional[str]:
+        with self._lock:
+            return self._token
+
+
 def _run_lock_keeper(
     redis_client,
     lock_key: str,
-    lock_token: str,
     ttl_sec: int,
     refresh_interval_sec: float,
     stop_event,  # threading.Event
+    lock_state: "_LockState",
 ) -> None:
-    """Forever-loop: refresh `lock_key` every `refresh_interval_sec`.
+    """Maintain cross-worker leadership in a poll loop. Acquires when
+    no token is held; refreshes when held. Survives both transient
+    refresh failures (another worker briefly stole or lock expired) AND
+    startup contention (stale lock from a prior deploy still in Redis)
+    by retrying acquire every refresh_interval_sec.
 
-    If refresh fails (lock owned by someone else now), set `stop_event`
-    so other producer threads exit, then return.
+    The producer is "running" from start() onward; tier threads block
+    on lock_state.acquired before doing real work. Eventual consistency:
+    even if no worker holds the lock at startup, the keeper will pick
+    it up within one refresh interval after the stale TTL expires.
     """
-    while not stop_event.is_set():
-        if stop_event.wait(timeout=refresh_interval_sec):
-            return
-        ok = _refresh_lock(redis_client, lock_key, lock_token, ttl_sec)
-        if not ok:
-            log.warning(
-                "[bsp lock-keeper] refresh failed; signaling all tier "
-                "loops to stop (another worker took over or lock expired)"
-            )
-            stop_event.set()
-            return
+    try:
+        while not stop_event.is_set():
+            token = lock_state.get()
+            if token is None:
+                # Try to acquire.
+                new_token = _acquire_lock(redis_client, lock_key, ttl_sec)
+                if new_token is not None:
+                    lock_state.set(new_token)
+                    log.info(
+                        "[bsp lock-keeper] acquired leader lock; "
+                        "tier threads will begin work on next cycle"
+                    )
+                else:
+                    log.debug(
+                        "[bsp lock-keeper] another worker holds the lock; "
+                        "will retry in %ds", int(refresh_interval_sec)
+                    )
+            else:
+                # Refresh.
+                ok = _refresh_lock(redis_client, lock_key, token, ttl_sec)
+                if not ok:
+                    log.warning(
+                        "[bsp lock-keeper] refresh failed; relinquishing "
+                        "leadership (tier threads will pause until "
+                        "re-acquire succeeds)"
+                    )
+                    lock_state.clear()
+            if stop_event.wait(timeout=refresh_interval_sec):
+                return
+    finally:
+        # Final cleanup — release if still held so the next worker
+        # acquires immediately on its next poll cycle instead of waiting
+        # for the TTL.
+        token = lock_state.clear()
+        if token is not None:
+            _release_lock(redis_client, lock_key, token)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -378,7 +443,15 @@ def _run_lock_keeper(
 
 class BotStateProducer:
     """Daemon-thread producer with a dedicated lock-keeper.
-    Construct via `start_producer()`."""
+    Construct via `start_producer()`.
+
+    Patch B.7: the producer is "running" from start() onward regardless
+    of whether it currently holds the cross-worker lock. The lock-keeper
+    polls for acquisition continuously; tier threads block on
+    `_lock_state.acquired` before each pass. This auto-recovers from
+    redeploy gaps where a stale lock from the prior worker is still in
+    Redis when the new worker boots.
+    """
 
     def __init__(
         self,
@@ -402,37 +475,29 @@ class BotStateProducer:
         self._redis = redis_client
         self._stop = threading.Event()
         self._threads: List[threading.Thread] = []
-        self._lock_token: Optional[str] = None
+        self._lock_state = _LockState()
 
-    def start(self) -> bool:
-        """Acquire the cross-worker lock and spawn lock-keeper + tier
-        threads. Returns True on success, False if the lock is held by
-        another worker (this instance stays idle).
-        """
-        self._lock_token = _acquire_lock(self._redis, LOCK_KEY, LOCK_TTL_SEC)
-        if self._lock_token is None:
-            log.info(
-                "bot_state_producer: another worker holds the leader lock; "
-                "this instance staying idle"
-            )
-            return False
-
+    def start(self) -> None:
+        """Spawn lock-keeper + tier threads. The producer is "running"
+        immediately; the lock-keeper handles cross-worker contention
+        asynchronously. Tier threads block on the acquired event before
+        their first pass."""
         log.info(
-            f"bot_state_producer: starting "
-            f"{len([t for t in self._tiers if t[1]])} active tiers "
-            f"for {len(self._tickers)} tickers"
+            f"bot_state_producer: spawning lock-keeper + "
+            f"{len([t for t in self._tiers if t[1]])} active tier threads "
+            f"for {len(self._tickers)} tickers (waiting for leader lock)"
         )
 
-        # Lock-keeper thread first — must be running before any tier work.
+        # Lock-keeper thread — runs immediately, acquires when possible.
         keeper = threading.Thread(
             target=_run_lock_keeper,
             kwargs={
                 "redis_client": self._redis,
                 "lock_key": LOCK_KEY,
-                "lock_token": self._lock_token,
                 "ttl_sec": LOCK_TTL_SEC,
                 "refresh_interval_sec": LOCK_REFRESH_INTERVAL_SEC,
                 "stop_event": self._stop,
+                "lock_state": self._lock_state,
             },
             name="bsp-lock-keeper",
             daemon=True,
@@ -440,7 +505,8 @@ class BotStateProducer:
         keeper.start()
         self._threads.append(keeper)
 
-        # Tier daemons — only spawn for tiers with at least one intent.
+        # Tier daemons — spawn unconditionally; they block on
+        # _lock_state.acquired before doing real work.
         for tier_name, intents, cadence, ttl, stagger in self._tiers:
             if not intents:
                 continue
@@ -453,20 +519,19 @@ class BotStateProducer:
             t.start()
             self._threads.append(t)
 
-        return True
-
     def stop(self) -> None:
         """Signal all threads to exit at the next sleep boundary; release
-        the lock. Idempotent — safe to call twice."""
+        the lock if we hold it. Idempotent — safe to call twice."""
         global _singleton
         self._stop.set()
-        if self._lock_token is not None:
-            _release_lock(self._redis, LOCK_KEY, self._lock_token)
-            self._lock_token = None
-        # Clear the diagnostic singleton if this instance was it. A
-        # different live instance shouldn't get nulled by an unrelated
-        # stopped one, but in practice there's only ever one producer
-        # per process.
+        # The lock-keeper's finally block releases the lock when it sees
+        # _stop. To make stop() synchronous we ALSO drain + release here;
+        # the keeper's finally then becomes a no-op (lock_state.clear()
+        # returns None). Either path is safe — the release is owner-checked.
+        token = self._lock_state.clear()
+        if token is not None:
+            _release_lock(self._redis, LOCK_KEY, token)
+        # Clear the diagnostic singleton if this instance was it.
         if _singleton is self:
             _singleton = None
 
@@ -478,8 +543,11 @@ class BotStateProducer:
 
     def _tier_loop(self, tier_name: str, intents: List[str],
                    cadence_sec: int, ttl_sec: int, stagger_sec: int) -> None:
-        """Forever-loop: stagger initial start, then pass + sleep. Outer
-        try/except restarts the loop on unexpected crashes (5s backoff)."""
+        """Forever-loop: stagger initial start, then (wait-for-lock + pass +
+        sleep). Outer try/except restarts the loop on unexpected crashes
+        (5s backoff). Patch B.7: tier blocks on _lock_state.acquired
+        before each pass — work only happens while we hold the leader
+        lock."""
         # Initial stagger.
         if self._stop.wait(timeout=stagger_sec):
             return
@@ -488,8 +556,7 @@ class BotStateProducer:
         # before the thread runs the first pass. Wrapped in try/except
         # so a broken import (circular dep, refactor breakage, missing
         # module) surfaces as a visible log line instead of a silent
-        # dead thread that would let the lock-keeper refresh forever
-        # while no envelopes get written.
+        # dead thread.
         try:
             from canonical_expiration import canonical_expiration
             from raw_inputs import fetch_raw_inputs
@@ -502,6 +569,25 @@ class BotStateProducer:
             return
 
         while not self._stop.is_set():
+            # Patch B.7: wait until the lock-keeper says we hold the
+            # cross-worker lock. Polls in 1s slices so we react to stop
+            # signals quickly. If the keeper ever clears `acquired` mid-
+            # flight (refresh failed), the next iteration blocks here
+            # until re-acquire.
+            if not self._lock_state.acquired.is_set():
+                log.info(
+                    f"[bsp tier={tier_name}] waiting for leader lock"
+                )
+                while not self._stop.is_set():
+                    if self._lock_state.acquired.wait(timeout=1.0):
+                        log.info(
+                            f"[bsp tier={tier_name}] leader lock acquired; "
+                            f"resuming work"
+                        )
+                        break
+                if self._stop.is_set():
+                    return
+
             t_start = time.time()
             try:
                 _run_tier_pass(
@@ -554,8 +640,12 @@ def start_producer(cached_md, redis_client) -> Optional["BotStateProducer"]:
       - BOT_STATE_PRODUCER_ENABLED is unset/false (env-flag rollback path)
       - redis_client is None (we can't write envelopes)
       - BOT_STATE_PRODUCER_TICKERS is empty (nothing to produce)
-      - cross-worker lock is held by another worker (silent — that
-        worker IS the producer)
+
+    Patch B.7: no longer returns None on cross-worker lock contention.
+    The producer is constructed and threads spawn regardless; the
+    lock-keeper polls for acquisition and tier threads block on the
+    acquired event. This auto-recovers from redeploy gaps where the
+    prior worker's stale lock is still in Redis at boot time.
     """
     global _singleton
 
@@ -582,10 +672,7 @@ def start_producer(cached_md, redis_client) -> Optional["BotStateProducer"]:
         cached_md=cached_md,
         redis_client=redis_client,
     )
-    if not p.start():
-        # Lock held by another worker — start() returned False. Don't
-        # cache a non-running instance in _singleton.
-        return None
+    p.start()
     _singleton = p
     return p
 

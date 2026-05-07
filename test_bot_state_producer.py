@@ -528,23 +528,24 @@ def test_tier_pass_writes_telemetry_per_successful_build():
 
 def test_lock_keeper_refreshes_on_schedule():
     """Lock keeper wakes within (LOCK_TTL_SEC - 30) and refreshes the lock.
-    We don't actually wait LOCK_TTL_SEC seconds; we verify the keeper's
-    refresh path is called by stopping early and inspecting fake.ops.
+    Patch B.7: keeper takes a _LockState object now. We pre-acquire and
+    pre-set the state so the keeper goes straight into refresh mode.
     """
-    from bot_state_producer import _run_lock_keeper, _acquire_lock
+    from bot_state_producer import _run_lock_keeper, _acquire_lock, _LockState
     fake = _FakeRedis()
     token = _acquire_lock(fake, "bsp:test", ttl_sec=60)
+    state = _LockState()
+    state.set(token)  # pre-populate so keeper is in refresh mode
     stop = threading.Event()
-    # Use a TINY interval so the test doesn't hang.
     t = threading.Thread(
         target=_run_lock_keeper,
         kwargs={
             "redis_client": fake,
             "lock_key": "bsp:test",
-            "lock_token": token,
             "ttl_sec": 60,
             "refresh_interval_sec": 0.05,
             "stop_event": stop,
+            "lock_state": state,
         },
         daemon=True,
     )
@@ -552,39 +553,103 @@ def test_lock_keeper_refreshes_on_schedule():
     time.sleep(0.15)  # let it refresh ~3 times
     stop.set()
     t.join(timeout=1.0)
-    # Verify refresh actually happened — the Lua-eval-EXPIRE path on
-    # _FakeRedis routes through .expire(), which appends ("expire", ...)
-    # to ops. So at least one expire op.
     expire_calls = [op for op in fake.ops if op[0] == "expire"]
     assert_true(len(expire_calls) >= 1, "lock-keeper called expire at least once")
 
 
-def test_lock_keeper_exits_when_lock_lost():
-    """If a different worker takes the lock, the keeper detects via
-    failed refresh and exits the loop without crashing."""
-    from bot_state_producer import _run_lock_keeper, _acquire_lock
+def test_lock_keeper_acquires_after_initial_failure():
+    """Patch B.7: keeper polls and acquires when the lock becomes free.
+    Tests the redeploy-recovery path — old worker's stale lock is in
+    Redis at startup, then TTLs out, new worker's keeper picks it up.
+    """
+    from bot_state_producer import _run_lock_keeper, _LockState
     fake = _FakeRedis()
-    token = _acquire_lock(fake, "bsp:test", 60)
-    # Steal the lock — overwrite with a different value.
-    fake.kv["bsp:test"] = "stolen-by-another-worker"
+    # Stale lock from "previous worker" — held when keeper starts.
+    fake.kv["bsp:test"] = "previous-worker-token"
+    state = _LockState()
     stop = threading.Event()
     t = threading.Thread(
         target=_run_lock_keeper,
         kwargs={
             "redis_client": fake,
             "lock_key": "bsp:test",
-            "lock_token": token,
             "ttl_sec": 60,
             "refresh_interval_sec": 0.05,
             "stop_event": stop,
+            "lock_state": state,
         },
         daemon=True,
     )
     t.start()
-    # The keeper should detect the lost lock on its first refresh attempt
-    # and exit. We give it generous slack.
-    t.join(timeout=2.0)
-    assert_true(not t.is_alive(), "lock-keeper exited after lock was stolen")
+    # Let the keeper try to acquire (and fail) at least once.
+    time.sleep(0.10)
+    assert_true(not state.acquired.is_set(),
+                "keeper hasn't acquired while stale lock is held")
+    # Simulate the stale lock TTL'ing out.
+    del fake.kv["bsp:test"]
+    # Wait for the keeper's next poll cycle to acquire.
+    acquired = state.acquired.wait(timeout=2.0)
+    # Snapshot the token BEFORE setting stop — the keeper's finally
+    # block clears state on shutdown.
+    token_held = state.get()
+    stop.set()
+    t.join(timeout=1.0)
+    assert_true(acquired,
+                "keeper acquired after stale lock was freed")
+    assert_true(token_held is not None,
+                "keeper stored the new token in lock_state")
+
+
+def test_lock_keeper_re_acquires_after_loss():
+    """Patch B.7: keeper survives transient losses and re-acquires.
+    Earlier behavior was to set stop_event and exit; new behavior is
+    to clear acquired, retry on next cycle, set acquired when it gets
+    the lock back.
+    """
+    from bot_state_producer import _run_lock_keeper, _acquire_lock, _LockState
+    fake = _FakeRedis()
+    token = _acquire_lock(fake, "bsp:test", ttl_sec=60)
+    state = _LockState()
+    state.set(token)
+    stop = threading.Event()
+    t = threading.Thread(
+        target=_run_lock_keeper,
+        kwargs={
+            "redis_client": fake,
+            "lock_key": "bsp:test",
+            "ttl_sec": 60,
+            "refresh_interval_sec": 0.05,
+            "stop_event": stop,
+            "lock_state": state,
+        },
+        daemon=True,
+    )
+    t.start()
+    # Let the keeper run a few refresh cycles successfully.
+    time.sleep(0.10)
+    assert_true(state.acquired.is_set(),
+                "keeper holds the lock initially")
+    # Steal the lock — overwrite with a different value.
+    fake.kv["bsp:test"] = "stolen-by-another-worker"
+    # Wait for the keeper to detect the loss and clear acquired.
+    cleared = False
+    for _ in range(20):  # up to 1s
+        if not state.acquired.is_set():
+            cleared = True
+            break
+        time.sleep(0.05)
+    assert_true(cleared,
+                "keeper cleared acquired after refresh failure")
+    assert_true(t.is_alive(),
+                "keeper did NOT exit on loss (Patch B.7 — it retries)")
+    # Free the lock so the keeper can re-acquire.
+    del fake.kv["bsp:test"]
+    # Wait for re-acquire.
+    re_acquired = state.acquired.wait(timeout=2.0)
+    stop.set()
+    t.join(timeout=1.0)
+    assert_true(re_acquired,
+                "keeper re-acquired after the stolen lock was freed")
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -632,16 +697,30 @@ def test_start_producer_spawns_when_enabled():
             p.join(timeout=2.0)
 
 
-def test_start_producer_returns_none_when_lock_held():
-    """Cross-worker lock contention path — another worker is leader."""
-    from bot_state_producer import start_producer, LOCK_KEY
+def test_start_producer_runs_idle_when_lock_held():
+    """Patch B.7: cross-worker lock contention no longer returns None.
+    Producer is constructed and threads spawn; lock-keeper polls until
+    acquire succeeds. Tier threads block on the acquired event meanwhile.
+    """
+    from bot_state_producer import start_producer, BotStateProducer, LOCK_KEY
     fake = _FakeRedis()
     fake.kv[LOCK_KEY] = "another-worker-token"
     os.environ["BOT_STATE_PRODUCER_ENABLED"] = "true"
     os.environ["BOT_STATE_PRODUCER_TICKERS"] = "AAPL"
     os.environ["BOT_STATE_PRODUCER_INTENTS_TIER_A"] = "front"
     p = start_producer(cached_md=object(), redis_client=fake)
-    assert_eq(p, None, "lock held by another worker → factory returns None")
+    try:
+        assert_true(isinstance(p, BotStateProducer),
+                    "factory returns producer even when lock held (Patch B.7)")
+        # Lock-keeper hasn't acquired yet because the stale lock is held.
+        # Tier threads should be blocked on the acquired event.
+        time.sleep(0.05)  # let keeper run one poll cycle
+        assert_true(not p._lock_state.acquired.is_set(),
+                    "lock-keeper hasn't acquired (stale lock still held)")
+    finally:
+        if p is not None:
+            p.stop()
+            p.join(timeout=2.0)
 
 
 def test_producer_stop_is_idempotent():
@@ -683,15 +762,16 @@ if __name__ == "__main__":
     test_tier_pass_skips_ticker_when_canonical_expiration_returns_none()
     test_tier_pass_isolates_per_ticker_errors()
     test_tier_pass_writes_telemetry_per_successful_build()
-    # Lock-keeper thread
+    # Lock-keeper thread (Patch B.7: poll-acquire model)
     test_lock_keeper_refreshes_on_schedule()
-    test_lock_keeper_exits_when_lock_lost()
+    test_lock_keeper_acquires_after_initial_failure()
+    test_lock_keeper_re_acquires_after_loss()
     # Lifecycle / factory
     test_start_producer_returns_none_when_disabled()
     test_start_producer_returns_none_when_redis_missing()
     test_start_producer_returns_none_when_universe_empty()
     test_start_producer_spawns_when_enabled()
-    test_start_producer_returns_none_when_lock_held()
+    test_start_producer_runs_idle_when_lock_held()
     test_producer_stop_is_idempotent()
     print(f"PASSED: {len(PASSED)}, FAILED: {len(FAILED)}")
     for f in FAILED:
