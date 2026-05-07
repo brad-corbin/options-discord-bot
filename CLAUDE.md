@@ -10,6 +10,13 @@ end-to-end before touching code. The "Audit discipline" and "Canonical
 rebuild" sections are not optional — the human has been burned by sessions
 that ignored them, and will push back hard if you skip them.
 
+This file is the project's living context. When we make decisions during
+a session that future sessions will need to know — new vocabulary, new
+conventions, architectural choices, roadmap status changes, "we tried X
+and it didn't work" lessons — proactively suggest updates to this file
+before the session ends. Show the proposed diff; the human approves or
+edits. Never update silently.
+
 ---
 
 ## Who I am, what this bot does
@@ -154,16 +161,18 @@ The pattern, in order:
 
 10. **Update CLAUDE.md if a major architectural decision was made.**
 
-What's done as of last session (v11.4.1):
+What's done as of last session (v11.5):
 - canonical_gamma_flip
 - canonical_iv_state (replaces a brief mistake — see "Audit discipline" below)
-- canonical_exposures (Greek aggregates wired to BotState; walls computed but not yet wired to BotState fields)
-- BotState with permissive build, 64 fields total, ~19 currently lit per ticker
+- canonical_exposures (Greek aggregates: gex/dex/vanna/charm/gex_sign)
+- canonical_walls — wiring-only patch; walls share canonical_exposures'
+  ExposureEngine.compute() pass. No separate wrapper file. Wires
+  call_wall/put_wall/gamma_wall to BotState; max_pain/pin_zone_low/
+  pin_zone_high stay None pending a separate canonical.
+- BotState with permissive build, 64 fields total, ~22 currently lit per ticker
 - Research page replaces the old Diagnostic placeholder
 
 What's queued (in roughly this order):
-- canonical_walls — small patch, reads `.walls` from canonical_exposures'
-  existing output, wires call_wall/put_wall/gamma_wall to BotState fields
 - canonical_technicals — RSI / MACD / ADX / VWAP. First-class for every engine.
 - canonical_pivots — universal pivot math, simple consolidation
 - canonical_em_state, canonical_dealer_regime, canonical_potter_box,
