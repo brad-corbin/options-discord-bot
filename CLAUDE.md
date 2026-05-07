@@ -400,6 +400,14 @@ is high. Don't argue with them.
   version mismatches all render as "warming up" skeleton cards (CSS
   class `research-card-warming-up`) — the dashboard never errors out
   whole-page on a single bad ticker.
+- Research page auto-reloads every 5s while any card is warming up
+  (Patch C.5). The page is server-rendered, so without this users
+  loading mid-cycle would see warming-up cards stuck until manual F5.
+  Implementation is a 4-line inline `<script>` at the bottom of
+  `research.html`, conditional on `selectattr('warming_up')` being
+  non-empty. Once all cards are populated, the script tag is absent
+  from the next render and polling stops cleanly. Zero JS overhead
+  in steady state.
 - Schema versioning split: `producer_version` is forward-compatible
   (newer producer accepted by older reader as long as MIN_COMPATIBLE
   is met). `convention_version` is strict-equal — mismatch is treated
