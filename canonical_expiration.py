@@ -103,8 +103,62 @@ def canonical_expiration(
         )
     if data_router is None:
         raise ValueError("data_router is required")
-    # NotImplementedError until Tasks 3-4 fill in the body.
-    raise NotImplementedError("body not yet implemented (Tasks 3-4)")
+
+    today = today or _today_utc()
+
+    try:
+        raw_exps = data_router.get_expirations(ticker)
+    except Exception as e:
+        log.warning(f"canonical_expiration {ticker}/{intent}: get_expirations failed: {e}")
+        return None
+
+    exp_dates = _parse_expirations(raw_exps)
+    if not exp_dates:
+        return None
+
+    if intent == INTENT_ZERO_DTE:
+        return _select_zero_dte(exp_dates, today)
+
+    # All other intents are first-DTE-at-or-above-N. Implemented in Task 4.
+    raise NotImplementedError(f"intent {intent!r} not yet implemented (Task 4)")
+
+
+# ───────────────────────────────────────────────────────────────────────
+# Helpers
+# ───────────────────────────────────────────────────────────────────────
+
+def _today_utc() -> date:
+    """Current UTC date, injectable via the `today` argument for testing."""
+    return datetime.now(timezone.utc).date()
+
+
+def _parse_expirations(raw: list) -> list[date]:
+    """Convert raw expiration entries to date objects. Sort and de-dupe.
+
+    Skips malformed entries (logs at debug). Returns an empty list if none parse.
+    Accepts:
+      - ISO strings ("2026-05-09" or "2026-05-09T00:00:00Z" — first 10 chars used)
+      - date objects directly
+    """
+    parsed: list[date] = []
+    for e in raw:
+        try:
+            if isinstance(e, str):
+                parsed.append(date.fromisoformat(e[:10]))
+            elif isinstance(e, date):
+                parsed.append(e)
+            else:
+                log.debug(f"canonical_expiration: skipping non-date entry {e!r}")
+        except (ValueError, TypeError) as parse_err:
+            log.debug(f"canonical_expiration: failed to parse {e!r}: {parse_err}")
+    return sorted(set(parsed))
+
+
+def _select_zero_dte(exp_dates: list[date], today: date) -> Optional[str]:
+    """Return today's expiration if it's in the list, else None."""
+    if today in exp_dates:
+        return today.isoformat()
+    return None
 
 
 # ───────────────────────────────────────────────────────────────────────

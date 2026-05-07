@@ -152,6 +152,28 @@ def test_valid_intents_constant_is_complete():
 
 
 # ───────────────────────────────────────────────────────────────────────
+# Tests — zero_dte intent
+# ───────────────────────────────────────────────────────────────────────
+
+def test_zero_dte_returns_today_when_today_in_list():
+    """SPY on a Monday: today's expiration exists (daily), zero_dte returns it."""
+    router = _MockRouter(SPY_LIST)  # contains 2026-05-04 == today
+    result = canonical_expiration("SPY", INTENT_ZERO_DTE,
+                                  today=MON_2026_05_04, data_router=router)
+    assert_eq(result, "2026-05-04", "zero_dte returns today's ISO string")
+    PASSED.append("test_zero_dte_returns_today_when_today_in_list")
+
+
+def test_zero_dte_returns_none_when_today_not_in_list():
+    """AAPL on a Tuesday: AAPL has M/W/F only, no Tuesday chain → None."""
+    router = _MockRouter(AAPL_LIST)  # contains no 2026-05-05
+    result = canonical_expiration("AAPL", INTENT_ZERO_DTE,
+                                  today=TUE_2026_05_05, data_router=router)
+    assert_is_none(result, "zero_dte returns None when today not in expiration list")
+    PASSED.append("test_zero_dte_returns_none_when_today_not_in_list")
+
+
+# ───────────────────────────────────────────────────────────────────────
 # Run all
 # ───────────────────────────────────────────────────────────────────────
 
@@ -160,6 +182,8 @@ def main():
         test_unknown_intent_raises,
         test_missing_data_router_raises,
         test_valid_intents_constant_is_complete,
+        test_zero_dte_returns_today_when_today_in_list,
+        test_zero_dte_returns_none_when_today_not_in_list,
     ]
     for t in tests:
         try:
