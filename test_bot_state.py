@@ -171,12 +171,12 @@ def test_canonical_status_records_each_canonical():
     raw = _build_realistic_raw_inputs()
     state = BotState.build_from_raw(raw)
 
-    # Live canonicals as of Patch 11.4: gamma_flip, iv_state, exposures
-    # Stubbed: walls, pivots, structure, em_state, technicals, bias, dealer_regime,
+    # Live canonicals as of Patch 11.5: gamma_flip, iv_state, exposures, walls
+    # Stubbed: pivots, structure, em_state, technicals, bias, dealer_regime,
     #          vol_regime, potter_box, flow_state, calendar
     expected_canonicals = {
-        "gamma_flip", "iv_state", "exposures",
-        "walls", "pivots", "structure", "em_state", "technicals",
+        "gamma_flip", "iv_state", "exposures", "walls",
+        "pivots", "structure", "em_state", "technicals",
         "bias", "dealer_regime", "vol_regime", "potter_box", "flow_state", "calendar",
     }
     for c in expected_canonicals:
@@ -224,9 +224,10 @@ def test_stubbed_canonicals_record_stub_status():
     raw = _build_realistic_raw_inputs()
     state = BotState.build_from_raw(raw)
 
-    # Live: gamma_flip (Patch 11.2), iv_state (Patch 11.3.2), exposures (Patch 11.4)
+    # Live: gamma_flip (Patch 11.2), iv_state (Patch 11.3.2),
+    #       exposures + walls (Patches 11.4 / 11.5)
     # Every other canonical should be stub.
-    expected_stubs = ["walls", "pivots",
+    expected_stubs = ["pivots",
                       "structure", "em_state", "technicals",
                       "bias", "dealer_regime", "vol_regime", "potter_box",
                       "flow_state", "calendar"]
@@ -250,10 +251,10 @@ def test_stubbed_canonical_fields_are_none():
         assert_true(state.gex_sign in ("positive", "negative", "neutral"),
                     f"gex_sign classified, got {state.gex_sign}")
 
-    # Walls: still stubbed (separate canonical_walls patch)
-    assert_is_none(state.call_wall, "call_wall None — walls still stubbed")
-    assert_is_none(state.put_wall, "put_wall None — walls still stubbed")
-    assert_is_none(state.max_pain, "max_pain None")
+    # Walls: NOW LIVE via canonical_exposures (Patch 11.5).
+    # call_wall/put_wall/gamma_wall populated when chain has the structure.
+    # max_pain stays None — separate canonical, not yet wired.
+    assert_is_none(state.max_pain, "max_pain None — separate canonical")
 
     # Technicals
     assert_is_none(state.rsi, "rsi None")
@@ -307,7 +308,7 @@ def test_fields_lit_progress_indicator():
     # Currently lit: ticker, timestamp_utc, spot, expiration, chain_clean,
     # convention_version, snapshot_version, gamma_flip, distance_from_flip_pct,
     # flip_location, volume_today, rvol = ~12 fields
-    assert_in_range(lit, 8, 20, f"fields_lit reasonable for early rebuild (got {lit}/{total})")
+    assert_in_range(lit, 8, 25, f"fields_lit reasonable for early rebuild (got {lit}/{total})")
     assert_in_range(total, 50, 80, f"fields_total reasonable (got {total})")
     assert_true(lit < total, "fields_lit < total (rebuild in progress)")
     PASSED.append("test_fields_lit_progress_indicator")
@@ -437,6 +438,29 @@ def test_exposures_is_live_via_canonical():
     PASSED.append("test_exposures_is_live_via_canonical")
 
 
+def test_walls_are_live_via_canonical_exposures():
+    """Patch 11.5: walls share canonical_exposures' compute (no separate
+    canonical). When exposures is live, walls status mirrors it and
+    call_wall/put_wall/gamma_wall populate from exposures.walls dict.
+    """
+    raw = _build_realistic_raw_inputs(spot=100.0)
+    state = BotState.build_from_raw(raw)
+
+    # Status: walls mirrors exposures since they share the same compute
+    assert_eq(state.canonical_status.get("walls"), "live", "walls live")
+    assert_eq(state.canonical_status.get("exposures"), "live",
+              "exposures live (walls share its compute)")
+
+    # The realistic chain has put-wall (8000 OI at 92/95/97) and call-wall
+    # (8000 OI at 103/105/108) positioning, so call_wall and put_wall
+    # should populate from canonical_exposures.walls.
+    assert_true(state.call_wall is not None,
+                f"call_wall populated, got {state.call_wall}")
+    assert_true(state.put_wall is not None,
+                f"put_wall populated, got {state.put_wall}")
+    PASSED.append("test_walls_are_live_via_canonical_exposures")
+
+
 # ───────────────────────────────────────────────────────────────────────
 # Run all
 # ───────────────────────────────────────────────────────────────────────
@@ -459,6 +483,7 @@ def main():
         test_gamma_flip_uses_iv_aware_band_via_canonical_iv_state,
         test_iv_state_handles_empty_chain_gracefully,
         test_exposures_is_live_via_canonical,
+        test_walls_are_live_via_canonical_exposures,
     ]
     for t in tests:
         try:

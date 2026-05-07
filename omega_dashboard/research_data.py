@@ -72,6 +72,10 @@ class TickerSnapshot:
     vanna: Optional[float]
     charm: Optional[float]
     gex_sign: str
+    # Walls (Patch 11.5 — wired from canonical_exposures, no separate compute)
+    call_wall: Optional[float]
+    put_wall: Optional[float]
+    gamma_wall: Optional[float]
     # Progress
     fields_lit: int
     fields_total: int
@@ -153,6 +157,9 @@ def build_ticker_snapshot(ticker: str, expiration: str, *, data_router) -> Ticke
             vanna=state.vanna,
             charm=state.charm,
             gex_sign=state.gex_sign,
+            call_wall=state.call_wall,
+            put_wall=state.put_wall,
+            gamma_wall=state.gamma_wall,
             fields_lit=state.fields_lit,
             fields_total=state.fields_total,
             canonical_status=dict(state.canonical_status),
@@ -176,6 +183,9 @@ def build_ticker_snapshot(ticker: str, expiration: str, *, data_router) -> Ticke
             vanna=None,
             charm=None,
             gex_sign="unknown",
+            call_wall=None,
+            put_wall=None,
+            gamma_wall=None,
             fields_lit=0,
             fields_total=0,
             canonical_status={},

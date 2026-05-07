@@ -246,8 +246,15 @@ class BotState:
         vanna_val = net_exposures.get("vanna") if isinstance(net_exposures, dict) else None
         charm_val = net_exposures.get("charm") if isinstance(net_exposures, dict) else None
 
+        # ─── Walls: share canonical_exposures' compute (Patch 11.5) ──
+        # Walls and Greek aggregates come from the same ExposureEngine.compute()
+        # pass — see canonical_exposures.py "NOTE ON SCOPE". No separate
+        # canonical_walls function or wrapper file; this is a wiring-only patch.
+        # Status mirrors canonical_exposures since they share the same compute.
+        walls = (exposures.get("walls", {}) if isinstance(exposures, dict) else {}) or {}
+        status["walls"] = status.get("exposures", "stub")
+
         # ─── Stubs — replace with real canonical_X as each lands ─────
-        walls = _try_canonical("walls", lambda: _stub("walls"), status) or {}
         pivots = _try_canonical("pivots", lambda: _stub("pivots"), status) or {}
         structure = _try_canonical("structure", lambda: _stub("structure"), status) or {}
         em_state = _try_canonical("em_state", lambda: _stub("em_state"), status) or {}
