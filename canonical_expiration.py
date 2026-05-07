@@ -82,6 +82,32 @@ _MIN_DTE_BY_INTENT = {
 
 
 # ───────────────────────────────────────────────────────────────────────
+# MAIN ENTRY POINT
+# ───────────────────────────────────────────────────────────────────────
+
+def canonical_expiration(
+    ticker: str,
+    intent: str,
+    *,
+    today: Optional[date] = None,
+    data_router=None,
+) -> Optional[str]:
+    """Resolve `intent` to an ISO date string for this ticker's chain.
+
+    See module docstring for intent semantics. Returns None when no
+    qualifying expiration exists. Raises ValueError on bad arguments.
+    """
+    if intent not in VALID_INTENTS:
+        raise ValueError(
+            f"unknown intent: {intent!r}; valid: {sorted(VALID_INTENTS)}"
+        )
+    if data_router is None:
+        raise ValueError("data_router is required")
+    # NotImplementedError until Tasks 3-4 fill in the body.
+    raise NotImplementedError("body not yet implemented (Tasks 3-4)")
+
+
+# ───────────────────────────────────────────────────────────────────────
 # Direct-run sanity (filled in by Task 8)
 # ───────────────────────────────────────────────────────────────────────
 
