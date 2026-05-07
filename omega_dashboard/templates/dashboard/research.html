@@ -153,6 +153,45 @@
           </div>
           {% endif %}
 
+          {# ─── LIVE: dealer Greeks (Patch 11.4 — canonical_exposures) ─── #}
+          {% if snap.gex is not none %}
+          <div class="research-card-section">
+            <div class="research-card-eyebrow">DEALER GREEKS &middot; <span class="research-live">live</span></div>
+            <div class="research-card-row">
+              <span class="research-card-label">gex</span>
+              <span class="research-card-value
+                    {% if snap.gex_sign == 'positive' %}positive
+                    {% elif snap.gex_sign == 'negative' %}negative{% endif %}">
+                {{ "{:+,.0f}".format(snap.gex) }}
+              </span>
+            </div>
+            {% if snap.dex is not none %}
+              <div class="research-card-row">
+                <span class="research-card-label">dex</span>
+                <span class="research-card-value">
+                  {{ "{:+,.0f}".format(snap.dex) }}
+                </span>
+              </div>
+            {% endif %}
+            {% if snap.vanna is not none %}
+              <div class="research-card-row">
+                <span class="research-card-label">vanna</span>
+                <span class="research-card-value">
+                  {{ "{:+,.0f}".format(snap.vanna) }}
+                </span>
+              </div>
+            {% endif %}
+            {% if snap.charm is not none %}
+              <div class="research-card-row">
+                <span class="research-card-label">charm</span>
+                <span class="research-card-value">
+                  {{ "{:+,.0f}".format(snap.charm) }}
+                </span>
+              </div>
+            {% endif %}
+          </div>
+          {% endif %}
+
           {# ─── PENDING: everything else ─────────────────────────── #}
           <div class="research-card-section">
             <div class="research-card-eyebrow">PENDING CANONICAL COMPUTES</div>
@@ -215,14 +254,19 @@
       <span class="research-roadmap-desc">Permissive state builder — partial population during rebuild</span>
     </div>
     <div class="research-roadmap-row">
-      <span class="research-roadmap-status research-stub">NEXT</span>
-      <span class="research-roadmap-name">canonical_walls</span>
-      <span class="research-roadmap-desc">Pick canonical from 23 existing implementations across the codebase</span>
+      <span class="research-roadmap-status research-live">DONE</span>
+      <span class="research-roadmap-name">canonical_iv_state</span>
+      <span class="research-roadmap-desc">Wraps UnifiedIVSurface — representative IV / ATM IV / skew</span>
+    </div>
+    <div class="research-roadmap-row">
+      <span class="research-roadmap-status research-live">DONE</span>
+      <span class="research-roadmap-name">canonical_exposures</span>
+      <span class="research-roadmap-desc">Wraps ExposureEngine.compute() — net dealer Greeks (post-Patch-9)</span>
     </div>
     <div class="research-roadmap-row">
       <span class="research-roadmap-status research-stub">NEXT</span>
-      <span class="research-roadmap-name">canonical_gex</span>
-      <span class="research-roadmap-desc">Wrap _exposures from options_exposure (post-Patch-9 source of truth)</span>
+      <span class="research-roadmap-name">canonical_walls</span>
+      <span class="research-roadmap-desc">Wire walls from canonical_exposures.walls — same canonical, no new compute</span>
     </div>
     <div class="research-roadmap-row">
       <span class="research-roadmap-status research-stub">NEXT</span>

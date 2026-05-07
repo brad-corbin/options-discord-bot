@@ -229,11 +229,24 @@ class BotState:
             distance_from_flip_pct = (raw.spot - gamma_flip_val) / gamma_flip_val * 100
             flip_location = _classify_flip_location(distance_from_flip_pct)
 
+        # ─── Live: exposures via canonical_exposures (Patch 11.4) ────
+        # Wraps ExposureEngine.compute() — production canonical for
+        # dealer Greek aggregates AND walls. This patch wires the Greek
+        # aggregates only (gex/dex/vanna/charm/gex_sign). Walls are wired
+        # in a follow-on patch; the canonical itself produces both in one pass.
+        exposures = _try_canonical(
+            "exposures",
+            lambda: _call_canonical_exposures(raw.chain, raw.spot, days_to_exp),
+            status,
+        ) or {}
+        net_exposures = (exposures.get("net", {})
+                         if isinstance(exposures, dict) else {})
+        gex_val = net_exposures.get("gex") if isinstance(net_exposures, dict) else None
+        dex_val = net_exposures.get("dex") if isinstance(net_exposures, dict) else None
+        vanna_val = net_exposures.get("vanna") if isinstance(net_exposures, dict) else None
+        charm_val = net_exposures.get("charm") if isinstance(net_exposures, dict) else None
+
         # ─── Stubs — replace with real canonical_X as each lands ─────
-        gex_val = _try_canonical("gex", lambda: _stub("gex"), status)
-        dex_val = _try_canonical("dex", lambda: _stub("dex"), status)
-        vanna_val = _try_canonical("vanna", lambda: _stub("vanna"), status)
-        charm_val = _try_canonical("charm", lambda: _stub("charm"), status)
         walls = _try_canonical("walls", lambda: _stub("walls"), status) or {}
         pivots = _try_canonical("pivots", lambda: _stub("pivots"), status) or {}
         structure = _try_canonical("structure", lambda: _stub("structure"), status) or {}
@@ -406,17 +419,30 @@ def _stub(name: str):
 def _call_canonical_gamma_flip(chain, spot, days_to_exp, *, iv=None):
     """Wrapper around canonical_gamma_flip with proper imports.
 
-    iv is forwarded if provided. dte_years is auto-derived from days_to_exp
-    inside canonical_gamma_flip when iv is given (Patch 11.2.1 safety fix).
+    Passes both `iv` and `dte_years` EXPLICITLY when iv is given. Don't rely
+    on canonical_gamma_flip's internal auto-derive (Patch 11.2.1) — that's
+    a safety net inside the canonical, but the caller's CONTRACT is clearer
+    when both args are passed at the call site. Defense-in-depth: if the
+    canonical's auto-derive is ever refactored, this caller still works.
     """
     from canonical_gamma_flip import canonical_gamma_flip
-    return canonical_gamma_flip(chain, spot=spot, days_to_exp=days_to_exp, iv=iv)
+    dte_years = (max(days_to_exp, 0.01) / 365.0) if iv is not None else None
+    return canonical_gamma_flip(
+        chain, spot=spot, days_to_exp=days_to_exp,
+        iv=iv, dte_years=dte_years,
+    )
 
 
 def _call_canonical_iv_state(chain, spot, days_to_exp):
     """Wrapper around canonical_iv_state with proper imports."""
     from canonical_iv_state import canonical_iv_state
     return canonical_iv_state(chain, spot=spot, days_to_exp=days_to_exp)
+
+
+def _call_canonical_exposures(chain, spot, days_to_exp):
+    """Wrapper around canonical_exposures with proper imports."""
+    from canonical_exposures import canonical_exposures
+    return canonical_exposures(chain, spot=spot, days_to_exp=days_to_exp)
 
 
 # ───────────────────────────────────────────────────────────────────────

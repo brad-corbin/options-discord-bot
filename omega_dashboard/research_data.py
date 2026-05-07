@@ -66,6 +66,12 @@ class TickerSnapshot:
     atm_iv: Optional[float]
     iv_skew_pp: Optional[float]
     iv30: Optional[float]
+    # Dealer Greek aggregates (Patch 11.4 — canonical_exposures)
+    gex: Optional[float]
+    dex: Optional[float]
+    vanna: Optional[float]
+    charm: Optional[float]
+    gex_sign: str
     # Progress
     fields_lit: int
     fields_total: int
@@ -94,11 +100,15 @@ class ResearchData:
 # Cache
 # ───────────────────────────────────────────────────────────────────────
 
-_CACHE: dict = {}    # ticker -> (timestamp, snapshot)
+# Keyed by (ticker, expiration) tuple — a request for the same ticker at a
+# different expiration must NOT be served from a cached snapshot of the
+# wrong chain. This is rare in normal page use (default expiration is
+# next-Friday for everyone) but easy to get wrong if added later.
+_CACHE: dict = {}    # (ticker, expiration) -> (timestamp, snapshot)
 
 
-def _cache_get(ticker: str):
-    entry = _CACHE.get(ticker)
+def _cache_get(ticker: str, expiration: str):
+    entry = _CACHE.get((ticker, expiration))
     if not entry:
         return None
     ts, snap = entry
@@ -107,8 +117,8 @@ def _cache_get(ticker: str):
     return snap
 
 
-def _cache_put(ticker: str, snap: TickerSnapshot):
-    _CACHE[ticker] = (time.time(), snap)
+def _cache_put(ticker: str, expiration: str, snap):
+    _CACHE[(ticker, expiration)] = (time.time(), snap)
 
 
 # ───────────────────────────────────────────────────────────────────────
@@ -122,7 +132,7 @@ def build_ticker_snapshot(ticker: str, expiration: str, *, data_router) -> Ticke
     inside the snapshot, never raised. Caller renders all snapshots
     uniformly.
     """
-    cached = _cache_get(ticker)
+    cached = _cache_get(ticker, expiration)
     if cached is not None:
         return cached
 
@@ -138,6 +148,11 @@ def build_ticker_snapshot(ticker: str, expiration: str, *, data_router) -> Ticke
             atm_iv=state.atm_iv,
             iv_skew_pp=state.iv_skew_pp,
             iv30=state.iv30,
+            gex=state.gex,
+            dex=state.dex,
+            vanna=state.vanna,
+            charm=state.charm,
+            gex_sign=state.gex_sign,
             fields_lit=state.fields_lit,
             fields_total=state.fields_total,
             canonical_status=dict(state.canonical_status),
@@ -156,6 +171,11 @@ def build_ticker_snapshot(ticker: str, expiration: str, *, data_router) -> Ticke
             atm_iv=None,
             iv_skew_pp=None,
             iv30=None,
+            gex=None,
+            dex=None,
+            vanna=None,
+            charm=None,
+            gex_sign="unknown",
             fields_lit=0,
             fields_total=0,
             canonical_status={},
@@ -164,7 +184,7 @@ def build_ticker_snapshot(ticker: str, expiration: str, *, data_router) -> Ticke
             error=f"{type(e).__name__}: {str(e)[:200]}",
         )
 
-    _cache_put(ticker, snap)
+    _cache_put(ticker, expiration, snap)
     return snap
 
 
