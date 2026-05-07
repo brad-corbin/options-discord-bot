@@ -80,7 +80,9 @@
 
   <div class="research-grid">
     {% for snap in page_data.snapshots %}
-      <div class="research-card {% if snap.error %}research-card-error{% endif %}">
+      <div class="research-card
+                  {% if snap.warming_up %}research-card-warming-up
+                  {% elif snap.error %}research-card-error{% endif %}">
         <div class="research-card-header">
           <div class="research-card-title-row">
             <span class="research-card-ticker">{{ snap.ticker }}</span>
@@ -95,7 +97,11 @@
           </div>
         </div>
 
-        {% if snap.error %}
+        {% if snap.warming_up %}
+          <div class="research-card-warming-up-msg">
+            <span class="muted">Warming up &middot;</span> {{ snap.error }}
+          </div>
+        {% elif snap.error %}
           <div class="research-card-error">
             {{ snap.error }}
           </div>

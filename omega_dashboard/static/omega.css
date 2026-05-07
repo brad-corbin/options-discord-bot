@@ -3775,3 +3775,24 @@ body[data-account="clay"] {
   font-style: italic;
 }
 
+
+/* ─── Patch C: Research warming-up state ─── */
+/* Distinguishes "producer hasn't written this ticker yet" (neutral
+   skeleton) from "build raised an exception" (existing red card). */
+.research-card-warming-up {
+  opacity: 0.55;
+  border-style: dashed;
+  animation: research-warming-pulse 2.4s ease-in-out infinite;
+}
+
+.research-card-warming-up-msg {
+  font-size: 0.85em;
+  padding: 0.6em 0.8em;
+  color: var(--research-warming-color, #888);
+  font-style: italic;
+}
+
+@keyframes research-warming-pulse {
+  0%, 100% { opacity: 0.55; }
+  50%      { opacity: 0.75; }
+}

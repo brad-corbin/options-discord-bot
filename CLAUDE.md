@@ -133,6 +133,21 @@ Canonical rebuild (the v11 work — see "Canonical rebuild" below):
   the prior worker is still in Redis at boot. Tier threads block on the
   acquired event before each pass — work only happens while we hold the
   leader lock.
+- **RESEARCH_USE_REDIS** — env var (default off) gating the consumer path
+  in `omega_dashboard/research_data.py`. On → reads pre-built BotState
+  envelopes from Redis (Patch B's `bot_state_producer` writes them).
+  Off → legacy inline-build path runs unchanged (build BotState per
+  request via DataRouter + canonical_expiration). Same rollback
+  contract as `DASHBOARD_SPOT_USE_STREAMING` and
+  `BOT_STATE_PRODUCER_ENABLED`: unset the env var, redeploy, behavior
+  reverts within 60s.
+- **MIN_COMPATIBLE_PRODUCER_VERSION / EXPECTED_CONVENTION_VERSION** —
+  consumer-side schema gates in `omega_dashboard/research_data.py`.
+  `MIN_COMPATIBLE_PRODUCER_VERSION = 1` rejects envelopes from very-old
+  producers (forward-compatible: newer producer versions are accepted).
+  `EXPECTED_CONVENTION_VERSION = 2` is strict — Patch 9 dealer-side
+  protection. Mismatch → render the ticker as "warming up" with a
+  warning log; never display dealer-side-flipped numbers.
 - **producer envelope** — the JSON wrapper around BotState in Redis. Shape:
   `{producer_version, convention_version, intent, expiration, state}`.
   `producer_version` bumps on schema change (consumers reject unknown
@@ -377,6 +392,19 @@ is high. Don't argue with them.
   TTL hadn't expired when new worker booted, producer stayed dormant
   forever). The keeper also releases the lock on graceful stop() so the
   next deploy acquires immediately instead of waiting for TTL.
+- Research page reads from Redis when `RESEARCH_USE_REDIS=1` (Patch C).
+  Cold-start dashboard load goes from ~3 minutes (inline build per
+  request) to <1 second (35 Redis GETs of pre-built envelopes). The
+  inline path stays in `research_data.py` for rollback; default off
+  on first ship. Consumer is permissive: missing keys, malformed JSON,
+  version mismatches all render as "warming up" skeleton cards (CSS
+  class `research-card-warming-up`) — the dashboard never errors out
+  whole-page on a single bad ticker.
+- Schema versioning split: `producer_version` is forward-compatible
+  (newer producer accepted by older reader as long as MIN_COMPATIBLE
+  is met). `convention_version` is strict-equal — mismatch is treated
+  as "warming up" rather than rendered, to prevent ever displaying
+  dealer-side-flipped numbers post a Patch 9-style convention shift.
 
 ---
 

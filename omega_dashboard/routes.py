@@ -1510,7 +1510,13 @@ def research():
         )
 
     data_router = _get_bot_data_router()
-    payload = rd.research_data(data_router=data_router)
+    # Patch C: pass the Redis client so the consumer path is reachable.
+    # When RESEARCH_USE_REDIS env var is off, redis_client is ignored.
+    from app import _get_redis
+    payload = rd.research_data(
+        data_router=data_router,
+        redis_client=_get_redis(),
+    )
     return render_page(
         "dashboard/research.html",
         page_key="research",
@@ -1533,7 +1539,13 @@ def research_data_json():
         return jsonify({"available": False, "error": "research_data unavailable"}), 503
 
     data_router = _get_bot_data_router()
-    payload = rd.research_data(data_router=data_router)
+    # Patch C: pass the Redis client so the consumer path is reachable.
+    # When RESEARCH_USE_REDIS env var is off, redis_client is ignored.
+    from app import _get_redis
+    payload = rd.research_data(
+        data_router=data_router,
+        redis_client=_get_redis(),
+    )
     from dataclasses import asdict, is_dataclass
     body = asdict(payload) if is_dataclass(payload) else payload
     resp = jsonify(body)
