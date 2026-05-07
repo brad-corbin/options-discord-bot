@@ -112,14 +112,22 @@ def _build_envelope(state: Dict[str, Any], intent: str, expiration: str) -> Dict
 # ─────────────────────────────────────────────────────────────────────
 
 def _clean_for_json(obj: Any) -> Any:
-    """Recursively convert NaN, +inf, -inf to None so json.dumps doesn't
-    emit non-standard JSON (NaN/Infinity literals). Standard JSON parsers
-    in JS/Go/etc. reject those; converting to null is the safest default.
+    """Recursively normalize values so json.dumps doesn't choke:
+      - NaN/+inf/-inf floats → None (non-standard JSON literals).
+      - datetime / date → ISO 8601 string (BotState carries snapshot
+        timestamps; json.dumps raises TypeError on them by default).
+    Standard JSON parsers in JS/Go/etc. reject NaN literals, and there
+    is no native JSON datetime type, so ISO strings are the safe default.
     """
     if isinstance(obj, float):
         if math.isnan(obj) or math.isinf(obj):
             return None
         return obj
+    # datetime is a subclass of date, so the datetime branch must come
+    # first OR a single isinstance check on (datetime, date) handles both.
+    from datetime import datetime, date
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
     if isinstance(obj, dict):
         return {k: _clean_for_json(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):

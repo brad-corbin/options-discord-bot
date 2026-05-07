@@ -267,6 +267,37 @@ def test_serialize_handles_nan_and_inf():
     assert_eq(parsed["state"]["vanna"], None, "-inf replaced with None")
 
 
+def test_serialize_handles_datetime_and_date():
+    """BotState carries datetime fields (snapshot timestamps, etc).
+    The serializer must convert datetime/date to ISO 8601 strings —
+    json.dumps raises TypeError on raw datetime by default.
+
+    Hotfix regression test: an earlier version of _clean_for_json only
+    handled NaN/inf floats, causing every producer write to fail with
+    'Object of type datetime is not JSON serializable' once enabled in
+    production.
+    """
+    from datetime import datetime, date, timezone
+    from bot_state_producer import _serialize_envelope
+    env = {
+        "producer_version": 1,
+        "convention_version": 2,
+        "intent": "front",
+        "expiration": "2026-05-08",
+        "state": {
+            "ticker": "AAPL",
+            "snapshot_at": datetime(2026, 5, 7, 21, 25, 0, tzinfo=timezone.utc),
+            "trade_date": date(2026, 5, 7),
+        },
+    }
+    raw = _serialize_envelope(env)
+    parsed = json.loads(raw)  # round-trip through standard json
+    assert_eq(parsed["state"]["snapshot_at"], "2026-05-07T21:25:00+00:00",
+              "datetime serialized as ISO 8601 with timezone")
+    assert_eq(parsed["state"]["trade_date"], "2026-05-07",
+              "date serialized as ISO 8601")
+
+
 def test_serialize_round_trip_clean_state():
     """No NaN/inf → the output is byte-equivalent to json.dumps(env)."""
     from bot_state_producer import _serialize_envelope
@@ -637,6 +668,7 @@ if __name__ == "__main__":
     test_envelope_includes_required_metadata()
     test_envelope_does_not_mutate_state()
     test_serialize_handles_nan_and_inf()
+    test_serialize_handles_datetime_and_date()
     test_serialize_round_trip_clean_state()
     # Telemetry
     test_record_build_timing_writes_sorted_set_member()
