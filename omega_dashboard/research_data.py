@@ -129,13 +129,31 @@ def _cache_put(ticker: str, expiration: str, snap):
 # Per-ticker snapshot
 # ───────────────────────────────────────────────────────────────────────
 
-def build_ticker_snapshot(ticker: str, expiration: str, *, data_router) -> TickerSnapshot:
+def build_ticker_snapshot(ticker: str, intent: str = "front", *, data_router) -> TickerSnapshot:
     """Build a single ticker's research snapshot.
 
-    Returns a TickerSnapshot regardless of success — errors are captured
-    inside the snapshot, never raised. Caller renders all snapshots
-    uniformly.
+    Resolves the chain expiration per-ticker via canonical_expiration, then
+    builds BotState. Defaults to intent='front' (first non-0-DTE chain) — the
+    Research page's standard view. Returns a TickerSnapshot regardless of
+    success; errors are captured inside the snapshot, never raised.
     """
+    from canonical_expiration import canonical_expiration
+    expiration = canonical_expiration(ticker, intent, data_router=data_router)
+    if expiration is None:
+        # No qualifying chain (e.g. t60 on a ticker with only short-dated chains).
+        return TickerSnapshot(
+            ticker=ticker,
+            spot=None, gamma_flip=None, distance_from_flip_pct=None,
+            flip_location="unknown",
+            atm_iv=None, iv_skew_pp=None, iv30=None,
+            gex=None, dex=None, vanna=None, charm=None,
+            gex_sign="unknown",
+            call_wall=None, put_wall=None, gamma_wall=None,
+            fields_lit=0, fields_total=0,
+            canonical_status={}, chain_clean=False, fetch_errors=[],
+            error=f"no chain for intent={intent}",
+        )
+
     cached = _cache_get(ticker, expiration)
     if cached is not None:
         return cached
@@ -204,7 +222,7 @@ def build_ticker_snapshot(ticker: str, expiration: str, *, data_router) -> Ticke
 
 def research_data(
     tickers: Optional[list] = None,
-    expiration: Optional[str] = None,
+    intent: str = "front",
     *,
     data_router=None,
 ) -> ResearchData:
@@ -212,8 +230,10 @@ def research_data(
 
     Args:
         tickers:      list of tickers to include; defaults to DEFAULT_TICKERS
-        expiration:   chain expiration to use for all tickers; if None,
-                      uses the next-Friday expiration as a safe default
+        intent:       canonical_expiration intent for chain selection. Default
+                      'front' = first non-0-DTE expiration per ticker. Other
+                      valid values: 't7', 't30', 't60'. ('zero_dte' is reserved
+                      for silent thesis and is not used by the Research page.)
         data_router:  required for live data. If None, returns an empty
                       payload with available=False (page still renders).
 
@@ -222,8 +242,6 @@ def research_data(
     """
     if tickers is None:
         tickers = list(DEFAULT_TICKERS)
-    if expiration is None:
-        expiration = _default_expiration()
 
     if data_router is None:
         return ResearchData(
@@ -241,7 +259,7 @@ def research_data(
 
     snapshots = []
     for t in tickers:
-        snap = build_ticker_snapshot(t, expiration, data_router=data_router)
+        snap = build_ticker_snapshot(t, intent, data_router=data_router)
         snapshots.append(snap)
 
     # Aggregate metrics
@@ -280,16 +298,6 @@ def research_data(
     )
 
 
-def _default_expiration() -> str:
-    """Next Friday's date, ISO format. Reasonable default for the Research page."""
-    from datetime import timedelta
-    today = datetime.now(timezone.utc).date()
-    days_to_friday = (4 - today.weekday()) % 7
-    if days_to_friday == 0:
-        days_to_friday = 7   # next Friday, not today
-    return (today + timedelta(days=days_to_friday)).isoformat()
-
-
 # ───────────────────────────────────────────────────────────────────────
 # Direct-run sanity
 # ───────────────────────────────────────────────────────────────────────
@@ -301,4 +309,3 @@ if __name__ == "__main__":
     print(f"  available: {payload.available}")
     print(f"  error: {payload.error}")
     print(f"  tickers_total: {payload.tickers_total}")
-    print(f"  default_expiration: {_default_expiration()}")
