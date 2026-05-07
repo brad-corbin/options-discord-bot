@@ -2,7 +2,9 @@
 
 **Date:** 2026-05-07
 **Author:** Brad C. + Claude (brainstorming session)
-**Status:** Draft — pending user review
+**Status:** Draft v2 — pending user review
+
+**v2 changes from v1:** tiered cadence (front 60s / t7 180s / t30+t60 600s); explicit rate-budget math; universe staging in Patch B; per-build timing telemetry as a hard Patch B deliverable; `producer_version` schema field with reader-side rejection; explicit no-market-hours-pause stance. See Revision History at the end.
 
 ---
 
@@ -106,25 +108,46 @@ Wraps `DataRouter.get_expirations(ticker)` — does not introduce a new fetch pa
 
 New module: `bot_state_producer.py`. Daemon thread started from `app.py` boot sequence alongside existing daemons.
 
-Loop body, every `CADENCE_SECONDS` (default 60):
+**Tiered cadence — different intents, different refresh rates.** Walls at 1-DTE move on a 60s timescale; walls at 30/60 days don't. Spending Schwab budget refreshing them at the same rate is waste. Three independent loops:
+
+| Tier | Intents | Cadence | Why |
+|---|---|---|---|
+| A | `front` | 60s | Front-DTE walls move with intraday flow; users want fresh |
+| B | `t7` | 180s | One-week walls shift slowly enough that 3 min is plenty |
+| C | `t30`, `t60` | 600s | Monthlies are essentially structural; 10 min is fine |
+
+Each tier runs its own loop body:
 
 ```python
-for ticker in DEFAULT_TICKERS:                  # the 35-ticker universe
-    for intent in PRODUCED_INTENTS:             # 5 intents
-        try:
-            exp = canonical_expiration(ticker, intent, data_router=...)
-            if exp is None:
-                continue                        # skip if no qualifying chain
-            state = BotState.build(ticker, exp, data_router=...)
-            payload = _serialize(state)
-            redis.set(f"bot_state:{ticker}:{intent}", payload,
-                      ex=CADENCE_SECONDS * 3)   # 180s TTL
-        except Exception as e:
-            log.warning(f"producer {ticker}/{intent}: {e}")
-            continue                            # one ticker error doesn't stop the loop
+def tier_loop(intents: list[str], cadence_sec: int, ttl_sec: int):
+    """One tier. Sleeps `cadence_sec` between iterations."""
+    while not _shutdown.is_set():
+        t0 = time.monotonic()
+        for ticker in PRODUCED_TICKERS:
+            for intent in intents:
+                _build_and_write(ticker, intent, ttl_sec)
+        elapsed = time.monotonic() - t0
+        log_loop_timing(intents, elapsed)               # Patch B deliverable
+        _shutdown.wait(max(0, cadence_sec - elapsed))   # don't double-fire if loop ran long
+
+def _build_and_write(ticker, intent, ttl_sec):
+    try:
+        exp = canonical_expiration(ticker, intent, data_router=...)
+        if exp is None:
+            return                                       # no qualifying chain
+        t0 = time.monotonic()
+        state = BotState.build(ticker, exp, data_router=...)
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+        log_build_timing(ticker, intent, elapsed_ms)     # Patch B deliverable
+        payload = _serialize(state, producer_version=PRODUCER_VERSION)
+        redis.set(f"bot_state:{ticker}:{intent}", payload, ex=ttl_sec)
+    except Exception as e:
+        log.warning(f"producer {ticker}/{intent}: {e}")
 ```
 
-**Lifecycle:** daemon thread, restarts on uncaught exception (matches silent thesis pattern). Logs once per loop with timing breakdown. Per audit rule 6, has unit tests for start/stop/error isolation.
+**TTL per tier:** `cadence × 3`. Tier A keys live 180s, Tier B 540s, Tier C 1800s. Readers see stale-empty within one cadence cycle if the producer stops.
+
+**Lifecycle:** three daemon threads (one per tier), restart on uncaught exception (matches silent thesis pattern). Per audit rule 6, has unit tests for start/stop/error isolation per tier.
 
 **Feature flag:** `BOT_STATE_PRODUCER_ENABLED` env var, defaults off — per CLAUDE.md "every new feature needs an on/off env var that defaults to off."
 
@@ -132,19 +155,59 @@ for ticker in DEFAULT_TICKERS:                  # the 35-ticker universe
 
 **Configuration:**
 - `BOT_STATE_PRODUCER_ENABLED` — on/off, default off
-- `BOT_STATE_PRODUCER_CADENCE_SEC` — loop interval, default 60
-- `BOT_STATE_PRODUCER_TICKERS` — comma-separated override of DEFAULT_TICKERS
-- `BOT_STATE_PRODUCER_INTENTS` — comma-separated override of {front, t7, t30, t60} (zero_dte excluded by default; only enabled for silent-thesis migration step)
+- `BOT_STATE_PRODUCER_TIER_A_SEC` / `_TIER_B_SEC` / `_TIER_C_SEC` — per-tier cadence overrides; defaults 60 / 180 / 600
+- `BOT_STATE_PRODUCER_TICKERS` — comma-separated override of DEFAULT_TICKERS (used for universe staging — see Patch B)
+- `BOT_STATE_PRODUCER_INTENTS_TIER_A` / `_TIER_B` / `_TIER_C` — comma-separated overrides per tier; defaults `front` / `t7` / `t30,t60`. `zero_dte` excluded from all tiers; only enabled when a silent-thesis migration step opts in.
+
+#### Cadence and rate budget
+
+Schwab rate limit is 110/min (per `rate_limiter.py`, env-tunable via `SCHWAB_RATE_PER_MIN`). The producer must coexist with trading-engine traffic without starving it.
+
+**Steady-state fetch cost** (full 35-ticker universe, all four produced intents):
+
+| Tier | Universe × intents | Fetches per cycle | Cycle | Fetches/min |
+|---|---|---|---|---|
+| A | 35 × 1 = 35 | 35 chains | 60s | 35.0 |
+| B | 35 × 1 = 35 | 35 chains | 180s | 11.7 |
+| C | 35 × 2 = 70 | 70 chains | 600s | 7.0 |
+| **Total** | | | | **~53.7/min** |
+
+That's ~49% of the 110/min budget, leaving 56/min for trading engine + dashboard + everything else. Trading engine's silent-thesis daemon and conviction scorer also pull from the budget — measured headroom shouldn't be a problem in practice, but **see "What we're explicitly NOT doing" below: no market-hours pause.** Backpressure is handled by the existing rate limiter, which queues requests at saturation rather than failing them.
+
+**Cold start.** Stagger tier start times so all three don't fire at T+0. Tier A starts immediately, B at T+10s, C at T+20s. First-pass time for Tier A under saturation: 35 fetches at 110/min = 19s minimum. After that the page has front-intent data for every ticker. Drilldown rows fill in over the next 1-2 minutes as Tiers B/C complete.
+
+**Universe scaling.** Patch B ships with a smaller universe — 10 tickers × {front, t7} = 20 entries — for production-stable validation before scaling to the full 35 × 4 = 140 entries. Scale-up criterion: no producer-related rate-limit warnings for 7 trading days. See Patch B details.
 
 #### Redis schema
 
 Key pattern: `bot_state:{ticker}:{intent}` — one BotState snapshot per ticker per intent.
 
-Value: JSON-serialized BotState dataclass. All ~64 fields preserved, including `canonical_status` dict (for debugging "is this canonical live for this ticker") and `fetch_errors` tuple.
+Value envelope (JSON):
 
-TTL: 180 seconds (3× default cadence). If the producer dies, readers see stale-empty within one cadence cycle, never stale-stuck.
+```jsonc
+{
+  "producer_version": 1,           // bumps on every producer change; reader rejects mismatch
+  "convention_version": 2,         // Patch 9 protection; reader rejects mismatch
+  "snapshot_version": 1,           // BotState schema version
+  "written_at_utc": "2026-05-07T14:30:12Z",
+  "intent": "front",               // duplicates the key intent; explicit on the value
+  "expiration": "2026-05-08",      // the ISO date canonical_expiration resolved to
+  "state": { /* dataclasses.asdict(BotState) — all ~64 fields */ }
+}
+```
 
-Serialization detail: `dataclasses.asdict(state)` handles primitives. `fetch_errors` (tuple of tuples) round-trips through JSON as nested arrays. `canonical_status` (dict) round-trips natively. `datetime` fields serialize as ISO strings.
+**`producer_version`** bumps on any producer behavior change (new canonical landed, schema field added, serialization fix). Readers reject keys whose `producer_version` doesn't match what they expect — the key is treated as missing and renders as "warming up." Prevents readers from displaying old-format data after a deploy.
+
+**`convention_version` reader-side rejection** — Patch 9 (Walk 1E) settled the dealer-side sign convention to `convention_version=2`. The producer writes that. Readers verify on read: if `convention_version != 2`, skip render with a warning. Protects against the historical class of bugs where engines and displays disagreed about whether dealers are long or short calls.
+
+**TTL per tier:** Tier A keys 180s, Tier B 540s, Tier C 1800s (3× cadence). If the producer dies, readers see stale-empty within one cadence cycle.
+
+**Serialization details:**
+- `dataclasses.asdict(state)` handles BotState's primitive fields cleanly
+- `fetch_errors` (tuple of `(operation, error_str)` tuples) → JSON nested arrays. Round-trips losslessly. **Confirmed in test_bot_state_producer.py.**
+- `chain_clean: bool` from BotState is preserved in the envelope. Lets readers distinguish "data is real" from "data was built from a partially-failed fetch."
+- `canonical_status` (dict) round-trips natively. Useful for surfacing "exposures status: live" / "walls status: stub: ..." on the dashboard.
+- `datetime` fields serialize as ISO strings.
 
 #### Research page (consumer)
 
@@ -213,20 +276,40 @@ Each patch follows the canonical-rebuild discipline:
 ### Patch B details
 
 **New files:**
-- `bot_state_producer.py` (~150 lines)
-- `test_bot_state_producer.py` (~100 lines)
+- `bot_state_producer.py` (~250 lines — three-tier loop + telemetry + lock + serialization)
+- `test_bot_state_producer.py` (~150 lines)
 
 **Tests:**
-- Daemon starts and stops cleanly
-- One ticker raising an exception doesn't stop the loop for other tickers
-- Redis keys written with correct schema and TTL
+- Each tier daemon starts and stops cleanly
+- One ticker raising an exception doesn't stop the loop for other tickers (per-tier isolation)
+- Redis keys written with correct envelope schema (`producer_version`, `convention_version`, `intent`, `expiration`, `state`) and per-tier TTL
 - Multi-worker lock acquired/released correctly (mock Redis)
-- Cadence configurable via env var
+- Cadence and intent overrides via env vars
+- Per-build timing logs emit to expected destination
 
 **Modified files:**
 - `app.py` — add producer to boot sequence, gated by `BOT_STATE_PRODUCER_ENABLED` env var
 
-**Important:** ships disabled by default. Brad enables it explicitly when ready to validate. This means Patch B can ship to prod without affecting anything.
+**Hard deliverable: per-build timing telemetry.** Each `BotState.build` call inside the producer logs `(ticker, intent, elapsed_ms)` to either stdout (Render captures) or a Redis sorted set with TTL. After ~24 hours of production data, we examine the distribution:
+
+- p50, p95, p99 of build duration per (ticker, intent)
+- Which tickers/intents are >2s consistently — those become candidates for slower tiers
+- Whether the steady-state fetches/min math holds (the 53.7/min estimate)
+
+If the data shows the cadence assumptions are wrong, **re-tier in a follow-on patch with measured numbers**. This is not optional — it's a deliverable of Patch B.
+
+**Universe staging.** Initial production rollout uses a 10-ticker × 2-intent universe via env vars:
+
+```
+BOT_STATE_PRODUCER_TICKERS=SPY,QQQ,IWM,DIA,AAPL,MSFT,NVDA,AMZN,META,TSLA
+BOT_STATE_PRODUCER_INTENTS_TIER_A=front
+BOT_STATE_PRODUCER_INTENTS_TIER_B=t7
+BOT_STATE_PRODUCER_INTENTS_TIER_C=    # empty — Tier C disabled at first
+```
+
+Total: 20 keys at steady state. ~13 fetches/min budget. Run for **7 trading days** with no producer-related rate-limit warnings → flip env vars to scale to the full 35 × 4 = 140 keys. Documented in the deploy notes for Patch B.
+
+**Important:** ships disabled by default (`BOT_STATE_PRODUCER_ENABLED=false`). Brad enables explicitly. Patch B can land in prod with zero behavior change.
 
 ### Patch C details
 
@@ -234,8 +317,29 @@ Each patch follows the canonical-rebuild discipline:
 - `omega_dashboard/research_data.py` — replace BotState.build() loop with Redis reads
 - `omega_dashboard/templates/dashboard/research.html` — handle "warming up" snapshots in the per-card render
 
+**Reader-side version checks.** When deserializing each Redis value:
+
+```python
+EXPECTED_PRODUCER_VERSION = 1
+EXPECTED_CONVENTION_VERSION = 2
+
+def _snapshot_from_envelope(ticker, raw_json):
+    env = json.loads(raw_json)
+    if env.get("producer_version") != EXPECTED_PRODUCER_VERSION:
+        log.warning(f"{ticker}: producer_version mismatch (got {env.get('producer_version')})")
+        return _warming_up_snapshot(ticker)
+    if env.get("convention_version") != EXPECTED_CONVENTION_VERSION:
+        log.warning(f"{ticker}: convention_version mismatch (Patch 9 protection)")
+        return _warming_up_snapshot(ticker)
+    return _snapshot_from_state_dict(ticker, env["state"], env["intent"], env["expiration"])
+```
+
+Mismatched versions render as "warming up" (same UX as missing key), and the reader logs a warning. Prevents stale-format data from displaying after a deploy.
+
 **Tests:**
 - Mock Redis returning JSON for SPY, missing key for QQQ → SPY card renders, QQQ shows warming-up skeleton
+- Mock Redis returning a key with `producer_version=99` → reader logs warning, renders warming-up (does NOT show the data)
+- Mock Redis returning a key with `convention_version=1` → same: log warning, render warming-up
 - Stale Redis (TTL expired between read attempts) → falls through to warming-up
 - Existing 61 tests still pass
 
@@ -262,15 +366,20 @@ Each patch follows the canonical-rebuild discipline:
 
 ## Data Flow
 
-**Producer cycle (every 60s):**
+**Producer cycle (per tier; A=60s, B=180s, C=600s):**
 
 ```
-ticker, intent
+For each (ticker, intent) in this tier:
   → canonical_expiration(ticker, intent)
   → fetch_raw_inputs(ticker, expiration)  # via DataRouter caches
   → BotState.build_from_raw()             # 3 canonicals: gamma_flip, iv_state, exposures
+  → log_build_timing(ticker, intent, elapsed_ms)
+  → wrap in envelope: {producer_version, convention_version, intent, expiration, state}
   → JSON serialize
-  → redis.set("bot_state:{ticker}:{intent}", json, ex=180)
+  → redis.set("bot_state:{ticker}:{intent}", json, ex=tier_ttl)
+
+After full pass: log_loop_timing(intents, elapsed)
+Sleep: max(0, cadence - elapsed)
 ```
 
 **Consumer (Research page request):**
@@ -311,7 +420,9 @@ User-visible: the page is INSTANT but cards fill in over the first cadence cycle
 | Redis unavailable | Producer logs warnings, retries with exponential backoff. Consumer (Research page) falls through to a "data layer unavailable" message — same fallback the page already has when DataRouter is None. |
 | Missing keys at consumer (cold start, daemon paused) | Consumer renders "warming up" skeleton, JS polls every 5s. Equivalent to Market View's pattern. |
 | Stale data (>180s old) | TTL handles it — key disappears, consumer sees missing → "warming up" skeleton. Self-healing. |
-| Producer rate-limit pressure | DataRouter's existing rate_limiter wraps the underlying Schwab calls. Producer waits in line like any other caller. Loop time grows under saturation but never violates rate limit. |
+| Producer rate-limit pressure | DataRouter's existing rate_limiter wraps the underlying Schwab calls. Producer waits in line like any other caller. Loop time grows under saturation but never violates rate limit. **No market-hours pause.** |
+| `producer_version` mismatch on read | Reader logs warning, renders "warming up" skeleton for that ticker. Prevents stale-format data display after a deploy. |
+| `convention_version` mismatch on read | Same: log warning, render warming-up. Patch 9 protection — no display of dealer-side-flipped numbers. |
 
 ---
 
@@ -336,15 +447,18 @@ After all patches: ~93 tests, all green.
 
 ## Open Questions (need decisions before implementation)
 
-1. **Render multi-worker count**: how many web workers does Render run? If 1, the lock is overkill. If >1, the lock is essential. Defaulting to "assume >1" — implementing the lock is cheap insurance.
+1. **Render multi-worker count**: how many web workers does Render run? If 1, the lock is overkill. If >1, the lock is essential. Defaulting to "assume >1" — implementing the lock is cheap insurance. **(v2: still open — verify before Patch B ships)**
 
-2. **JSON serialization edge case**: `BotState.fetch_errors` is `tuple[tuple[str, str]]`. Through `dataclasses.asdict` it becomes nested lists. On read, the consumer doesn't currently care (it only reads a few specific fields). Confirming this is fine, not a blocker.
+2. **Drilldown UX trigger**: click on the WALLS eyebrow text? On the section as a whole? Disclosure triangle? — leaving for Patch D when we look at the live design. Mockup decision, not architecture.
 
-3. **Drilldown UX trigger**: click on the WALLS eyebrow text? On the section as a whole? Disclosure triangle? — leaving for Patch D when we look at the live design. Mockup decision, not architecture.
+3. **`expiration_intent` field on BotState vs envelope-only**: v2 puts `intent` and `expiration` on the JSON envelope (outside the `state` blob), keeping BotState itself pure. **Resolved: envelope-only.** No BotState dataclass field. Cleaner — the intent is producer metadata, not state data.
 
-4. **`zero_dte` intent** — included in the registry per design but EXCLUDED from `PRODUCED_INTENTS` by default. Only useful for silent thesis (Patch E, separate). Keeping it in the registry now means Patch E doesn't need to revisit the `canonical_expiration` API.
+**Resolved in v2 (no longer open):**
 
-5. **`expiration_intent` field on BotState** — adds metadata. Default `"front"` keeps existing test coverage clean. Worth confirming this is the right metadata to attach (vs. e.g. a separate dict on the producer's serialized envelope, leaving BotState pure).
+- ~~JSON serialization of `fetch_errors`~~ → spec now explicitly tests round-trip in `test_bot_state_producer.py`.
+- ~~`zero_dte` intent~~ → kept in `canonical_expiration` API but excluded from default `PRODUCED_INTENTS_TIER_A/B/C`. Used only by silent thesis migration (Patch E).
+- ~~Cadence assumption (1s/op math)~~ → replaced with explicit per-tier rate budget; per-build timing telemetry is a hard Patch B deliverable; re-tier with measured numbers if reality diverges.
+- ~~Schema provenance~~ → `producer_version`, `convention_version`, `chain_clean` all explicit in the envelope. Reader-side rejection on version mismatch.
 
 ---
 
@@ -353,9 +467,10 @@ After all patches: ~93 tests, all green.
 - Touch DataRouter / Schwab adapter
 - Modify silent thesis or `_get_0dte_chain`
 - Change `ExposureEngine.compute()` walls algorithm
-- Compute multiple walls per side
+- Compute multiple walls per side (one canonical wall per side per intent — `ExposureEngine` already returns this)
 - Implement reactive WebSocket/SSE pushes (polling is fine for snapshot data)
 - Bundle patches (each ships independently with passing tests)
+- **Pause the producer during market open or close.** Those are exactly the windows when fresh walls matter most — positioning resets, gamma rolls, intraday flow shifts. Pausing then would show stale data when the user most needs fresh. Backpressure is handled by the existing rate_limiter; if trading-engine traffic surges, producer requests queue behind it and complete a cycle later. That's the right tradeoff: producer stretches, never blanks.
 
 ---
 
@@ -368,3 +483,39 @@ Before each patch lands:
 - [ ] Patch is single-concept (audit rule 4)
 - [ ] Wrapper-consistency test exists if a new canonical (audit rule 5)
 - [ ] CLAUDE.md updated to reflect the new "what's done" line (living-context rule)
+
+---
+
+## Revision History
+
+### v2 — 2026-05-07
+
+Authored after pushback on v1. Most v1 architecture survives intact; the changes below tighten the operational story.
+
+**Added:**
+- **Tiered cadence** (`bot_state_producer` → tier table). Tier A `front` 60s; Tier B `t7` 180s; Tier C `t30`+`t60` 600s. Replaces the v1 single 60s flat loop. Aligns refresh rate with how fast each intent's data actually changes.
+- **Cadence and rate budget subsection** with explicit math (~53.7 fetches/min steady-state vs 110/min Schwab budget). Cold-start staggering (Tier A at T+0, B at T+10s, C at T+20s).
+- **Per-build timing telemetry as a hard Patch B deliverable** — log `(ticker, intent, elapsed_ms)` per build, examine after 24h, re-tier with measured data if assumptions are wrong.
+- **Universe staging in Patch B** — initial 10 × 2 = 20 keys for production-stable validation; scale to 35 × 4 = 140 via env vars after 7 trading days clean.
+- **`producer_version` schema field** with reader-side rejection on mismatch. Prevents stale-format data display after deploys.
+- **Explicit `convention_version=2` reader-side rejection** (Patch 9 protection) wired into Patch C's reader code.
+- **`chain_clean` and `fetch_errors` confirmed in envelope serialization** — readers can distinguish real data from data built on a partially-failed fetch.
+- **Explicit no-market-hours-pause stance** in "What I'm Not Going to Do" — those windows are when fresh walls matter most; pausing then defeats the purpose. Rate limiter handles priority.
+
+**Resolved (moved out of Open Questions):**
+- JSON serialization of `fetch_errors` (now explicitly tested in `test_bot_state_producer.py`)
+- `zero_dte` intent placement (in registry, excluded from default produced intents)
+- `expiration_intent` field placement — **decision: envelope-only, not on BotState dataclass.** Keeps BotState pure.
+
+**Unchanged from v1:**
+- Five-intent registry (`zero_dte`, `front`, `t7`, `t30`, `t60`)
+- 5-patch sequence (A: canonical_expiration; B: producer; C: Research reads Redis; D: drilldown UI; E: silent thesis migration — separate spec)
+- Single producer / many consumers architecture
+- Multi-worker Redis lock
+- Feature-flag gating on Patch B (`BOT_STATE_PRODUCER_ENABLED` defaults off)
+- Cold-start "warming up" skeleton UX
+- Audit-rule sign-off checklist
+
+### v1 — 2026-05-07
+
+Initial design. Single 60s flat cadence; full 35 × 4 universe from day one; no rate-budget math; basic Redis schema (no producer_version); telemetry mentioned but not a hard deliverable. Pushback identified four real gaps (cadence math, universe staging, schema provenance, telemetry-as-deliverable) → v2.
