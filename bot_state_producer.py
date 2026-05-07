@@ -466,10 +466,18 @@ class BotStateProducer:
         redis_client,
     ):
         self._tickers = tickers
+        # Patch C.6: TTL = cadence * 6 (was * 3). When the producer's
+        # actual pass time exceeds TTL — which happens at startup or
+        # under rate-limit pressure with a 35×4 universe — tickers
+        # written early in a pass expire BEFORE the producer comes
+        # around to rewrite them on the next pass. The consumer then
+        # sees them as warming-up, the auto-refresh fires, and the
+        # cycle thrashes. ×6 gives any reasonable pass-time spike
+        # plenty of headroom; steady-state behavior is unchanged.
         self._tiers = [
-            ("A", tier_a_intents, tier_a_cadence, tier_a_cadence * 3, 0),
-            ("B", tier_b_intents, tier_b_cadence, tier_b_cadence * 3, 10),
-            ("C", tier_c_intents, tier_c_cadence, tier_c_cadence * 3, 20),
+            ("A", tier_a_intents, tier_a_cadence, tier_a_cadence * 6, 0),
+            ("B", tier_b_intents, tier_b_cadence, tier_b_cadence * 6, 10),
+            ("C", tier_c_intents, tier_c_cadence, tier_c_cadence * 6, 20),
         ]
         self._cached_md = cached_md
         self._redis = redis_client

@@ -312,16 +312,34 @@
   </div>
 </div>
 
-{# ─── Patch C.5: auto-reload while any card is warming up ─────────────
-   Server-rendered page is otherwise static — without this script, a
-   user loading the page mid-cycle sees warming-up cards that never
-   update until they manually refresh. Once all cards are populated,
-   the script tag is absent from the next render and polling stops. #}
+{# ─── Patch C.5/C.6: progressive auto-reload ─────────────────────────
+   Server-rendered page is otherwise static. While cards are warming
+   up, reload every 5s so they fill in. Patch C.6: only continue
+   reloading while the warming-up count is DECREASING — if a reload
+   shows the same count or more, the producer is stuck, so stop and
+   let the user see a stable page (manual F5 to retry). Once all
+   cards are populated the script tag is absent and polling stops. #}
 {% if page_data.available %}
   {% set warming = page_data.snapshots | selectattr('warming_up') | list %}
   {% if warming | length > 0 %}
     <script>
-      setTimeout(function() { location.reload(); }, 5000);
+      (function() {
+        var current = {{ warming | length }};
+        var prev = parseInt(sessionStorage.getItem('research_warming_count'));
+        if (isNaN(prev)) prev = current + 1; // first load: assume progress
+        if (current < prev) {
+          sessionStorage.setItem('research_warming_count', current);
+          setTimeout(function() { location.reload(); }, 5000);
+        } else {
+          // No progress since last reload — stop the cycle.
+          sessionStorage.removeItem('research_warming_count');
+        }
+      })();
+    </script>
+  {% else %}
+    <script>
+      // All cards populated — clear stored progress state.
+      sessionStorage.removeItem('research_warming_count');
     </script>
   {% endif %}
 {% endif %}
