@@ -68,7 +68,7 @@ PAGE_TABS = [
     {"key": "dashboard",  "label": "Desk",         "endpoint": "dashboard.command_center"},
     {"key": "trading",    "label": "Market View",  "endpoint": "dashboard.trading"},
     {"key": "portfolio",  "label": "Portfolio",    "endpoint": "dashboard.portfolio"},
-    {"key": "diagnostic", "label": "Diagnostic",   "endpoint": "dashboard.diagnostic"},
+    {"key": "research",   "label": "Research",     "endpoint": "dashboard.research"},
     {"key": "restore",    "label": "Durability",   "endpoint": "dashboard.restore"},
 ]
 
@@ -1489,10 +1489,98 @@ def portfolio_partner_host_set():
     return redirect(url_for("dashboard.portfolio_section", section="cash") + f"?acct={partner}")
 
 
+@dashboard_bp.route("/research", methods=["GET"])
+@login_required
+def research():
+    """Research tab — rebuild progress + per-ticker BotState (Patch 11.3).
+
+    Shows what's been migrated to the canonical rebuild and the live state
+    of each ticker through the new compute path. As canonical functions
+    land in subsequent patches, more fields go from 'pending' to lit
+    values automatically.
+    """
+    try:
+        from . import research_data as rd
+    except ImportError as e:
+        log.warning("research_data module not available: %s", e)
+        return render_page(
+            "dashboard/research.html",
+            page_key="research",
+            page_data=_empty_research_payload(str(e)),
+        )
+
+    data_router = _get_bot_data_router()
+    payload = rd.research_data(data_router=data_router)
+    return render_page(
+        "dashboard/research.html",
+        page_key="research",
+        page_data=payload,
+    )
+
+
+@dashboard_bp.route("/research/data", methods=["GET"])
+@login_required
+def research_data_json():
+    """JSON feed for any future polling JS on the Research page.
+
+    Right now the page server-renders on each visit (60s in-memory cache
+    in research_data.py keeps Schwab cost flat).
+    """
+    from flask import jsonify
+    try:
+        from . import research_data as rd
+    except ImportError:
+        return jsonify({"available": False, "error": "research_data unavailable"}), 503
+
+    data_router = _get_bot_data_router()
+    payload = rd.research_data(data_router=data_router)
+    from dataclasses import asdict, is_dataclass
+    body = asdict(payload) if is_dataclass(payload) else payload
+    resp = jsonify(body)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+# Backward-compat: old /diagnostic URL → /research.
+# Remove after a release or two once external bookmarks have updated.
 @dashboard_bp.route("/diagnostic", methods=["GET"])
 @login_required
-def diagnostic():
-    return render_page("dashboard/diagnostic.html", page_key="diagnostic")
+def diagnostic_redirect():
+    return redirect(url_for("dashboard.research"))
+
+
+def _get_bot_data_router():
+    """Locate the bot's DataRouter instance.
+
+    The bot exposes it as `_cached_md` in app.py, set up by
+    `build_data_router()`. We import lazily to avoid module-load
+    circular dependencies. Returns None if not available — caller
+    renders a graceful 'unavailable' state.
+    """
+    try:
+        import app
+        return getattr(app, "_cached_md", None)
+    except Exception as e:
+        log.warning("Could not locate bot data_router: %s", e)
+        return None
+
+
+def _empty_research_payload(error_msg: str):
+    """Fallback payload when research_data module is unavailable."""
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        fetched_at_utc=datetime.now(timezone.utc),
+        tickers_total=0,
+        tickers_with_data=0,
+        tickers_errored=0,
+        fields_lit_avg=0.0,
+        fields_total=0,
+        canonical_status_summary={},
+        snapshots=[],
+        available=False,
+        error=error_msg,
+    )
 
 
 # ──────────────────────────────────────────────────────────
