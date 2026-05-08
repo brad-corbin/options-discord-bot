@@ -98,6 +98,12 @@ class TickerSnapshot:
     # (skeleton card, neutral styling) from "build raised an exception"
     # (red error card). Always False on the legacy inline-build path.
     warming_up: bool = False
+    # Patch D.1: list of {intent, expiration, dte_days, dte_tag, call_wall,
+    # put_wall, gamma_wall} dicts, one per intent in INTENTS_ORDER. Populated
+    # by _research_data_from_redis when consumer reads all 4 intents per
+    # ticker. Empty on the legacy inline-build path. Template renders the
+    # click-to-expand WALLS disclosure when this list has entries.
+    walls_by_intent: list = field(default_factory=list)
 
 
 @dataclass
@@ -251,6 +257,123 @@ def _snapshot_from_envelope(ticker: str, envelope: dict) -> "TickerSnapshot":
         error=None,
         warming_up=False,
     )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Patch D.1: Multi-DTE drilldown helpers
+#
+# The producer writes four envelopes per ticker, one per intent:
+#   bot_state:{ticker}:front
+#   bot_state:{ticker}:t7
+#   bot_state:{ticker}:t30
+#   bot_state:{ticker}:t60
+# The Research page's WALLS section is a click-to-expand disclosure that
+# shows all four intents' walls with DTE tags. _load_walls_for_all_intents
+# reads all four per ticker and returns a list-of-dicts in INTENTS_ORDER.
+# ─────────────────────────────────────────────────────────────────────
+
+# Order matters — the front intent goes in the disclosure's collapsed
+# summary; t7/t30/t60 expand below. Must match canonical_expiration's
+# intent vocabulary.
+INTENTS_ORDER = ("front", "t7", "t30", "t60")
+
+
+def _compute_dte_days(expiration_iso: Optional[str], today=None) -> Optional[int]:
+    """Days-to-expiration as an integer, or None on missing/malformed input.
+    `today` is overridable for tests; production calls use UTC today."""
+    if not expiration_iso:
+        return None
+    try:
+        from datetime import date, datetime
+        if today is None:
+            today = datetime.now(timezone.utc).date()
+        exp = datetime.fromisoformat(expiration_iso).date() if "T" in expiration_iso \
+              else date.fromisoformat(expiration_iso)
+        return (exp - today).days
+    except Exception:
+        return None
+
+
+def _format_dte_tag(dte_days: Optional[int]) -> str:
+    """Format a DTE integer as a display tag.
+
+    Convention: "0DTE"/"1DTE" for the immediate expirations (matches
+    options-trader vocabulary), "ND" for everything further out.
+    None → "—" so missing-data rows render with a dash.
+    """
+    if dte_days is None:
+        return "—"
+    if dte_days <= 1:
+        return f"{dte_days}DTE"
+    return f"{dte_days}D"
+
+
+def _load_walls_for_all_intents(ticker: str, redis_client) -> list:
+    """Read all four intents' envelopes for a ticker. Returns a list of
+    dicts in INTENTS_ORDER. Each dict has keys:
+      - intent: str (e.g. "front")
+      - expiration: ISO date string or None
+      - dte_days: int or None
+      - dte_tag: pre-formatted display string ("1DTE"/"8D"/"—")
+      - call_wall, put_wall, gamma_wall: float or None
+
+    Missing/malformed envelopes contribute an entry with all None values
+    so the consumer always returns 4 entries (template renders "—" for
+    missing rows). No exception ever propagates to the caller.
+
+    `dte_tag` is computed here (not in the template) so the Jinja
+    template stays simple — `{{ w.dte_tag }}` instead of inline
+    string concatenation.
+    """
+    out = []
+    for intent in INTENTS_ORDER:
+        entry = {
+            "intent": intent,
+            "expiration": None,
+            "dte_days": None,
+            "dte_tag": "—",
+            "call_wall": None,
+            "put_wall": None,
+            "gamma_wall": None,
+        }
+        if redis_client is None:
+            out.append(entry)
+            continue
+
+        key = f"{KEY_PREFIX}{ticker}:{intent}"
+        try:
+            raw = redis_client.get(key)
+        except Exception as e:
+            log.debug(f"walls reader: redis GET {key} failed: {e}")
+            out.append(entry)
+            continue
+
+        if raw is None:
+            out.append(entry)
+            continue
+
+        try:
+            envelope = json.loads(raw)
+        except Exception:
+            out.append(entry)
+            continue
+        if not isinstance(envelope, dict):
+            out.append(entry)
+            continue
+        if _validate_envelope_versions(envelope, ticker) is not None:
+            out.append(entry)
+            continue
+
+        state = envelope.get("state") or {}
+        entry["expiration"] = envelope.get("expiration")
+        entry["dte_days"] = _compute_dte_days(entry["expiration"])
+        entry["dte_tag"] = _format_dte_tag(entry["dte_days"])
+        entry["call_wall"] = state.get("call_wall")
+        entry["put_wall"] = state.get("put_wall")
+        entry["gamma_wall"] = state.get("gamma_wall")
+        out.append(entry)
+
+    return out
 
 
 def _load_snapshot_from_redis(

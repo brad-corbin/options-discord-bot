@@ -379,6 +379,106 @@ def test_research_data_uses_legacy_when_env_var_off():
               "legacy path with no data_router returns unavailable")
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Patch D.1: DTE helpers + multi-intent walls reader
+# ─────────────────────────────────────────────────────────────────────
+
+def test_compute_dte_days_basic():
+    from omega_dashboard.research_data import _compute_dte_days
+    from datetime import date
+    today = date(2026, 5, 7)
+    assert_eq(_compute_dte_days("2026-05-07", today=today), 0, "today → 0")
+    assert_eq(_compute_dte_days("2026-05-08", today=today), 1, "tomorrow → 1")
+    assert_eq(_compute_dte_days("2026-05-15", today=today), 8, "8 days out")
+    assert_eq(_compute_dte_days("2026-06-12", today=today), 36, "monthly")
+
+
+def test_compute_dte_days_handles_invalid_input():
+    from omega_dashboard.research_data import _compute_dte_days
+    assert_is_none(_compute_dte_days(None), "None input → None")
+    assert_is_none(_compute_dte_days(""), "empty string → None")
+    assert_is_none(_compute_dte_days("not-a-date"), "garbage → None")
+
+
+def test_format_dte_tag_format():
+    """Spec: '1DTE'/'8D'/'32D'/'61D' — ≤1 days → 'NDTE', >1 → 'ND'."""
+    from omega_dashboard.research_data import _format_dte_tag
+    assert_eq(_format_dte_tag(0), "0DTE", "0 days → '0DTE'")
+    assert_eq(_format_dte_tag(1), "1DTE", "1 day → '1DTE'")
+    assert_eq(_format_dte_tag(8), "8D", "8 days → '8D'")
+    assert_eq(_format_dte_tag(32), "32D", "32 days → '32D'")
+    assert_eq(_format_dte_tag(None), "—", "None → '—' fallback")
+
+
+def test_load_walls_for_all_intents_full():
+    """Producer has all 4 intents populated; reader returns 4 entries."""
+    from omega_dashboard.research_data import (
+        _load_walls_for_all_intents, INTENTS_ORDER, KEY_PREFIX,
+    )
+    fake = _FakeRedis()
+    for intent, exp, cw, pw in [
+        ("front", "2026-05-08", 590.0, 580.0),
+        ("t7",    "2026-05-15", 595.0, 575.0),
+        ("t30",   "2026-06-08", 600.0, 570.0),
+        ("t60",   "2026-07-08", 610.0, 560.0),
+    ]:
+        env = _make_envelope(
+            state_overrides={"ticker": "SPY", "call_wall": cw, "put_wall": pw, "gamma_wall": cw},
+            intent=intent,
+            expiration=exp,
+        )
+        fake.set(f"{KEY_PREFIX}SPY:{intent}", json.dumps(env))
+
+    out = _load_walls_for_all_intents("SPY", redis_client=fake)
+    assert_eq(len(out), 4, "four entries, one per intent")
+    assert_eq([e["intent"] for e in out], list(INTENTS_ORDER), "ordered by INTENTS_ORDER")
+    assert_eq(out[0]["call_wall"], 590.0, "front call_wall")
+    assert_eq(out[1]["call_wall"], 595.0, "t7 call_wall")
+    assert_eq(out[2]["expiration"], "2026-06-08", "t30 expiration carried")
+    assert_true(out[3]["dte_days"] is not None and out[3]["dte_days"] > 30,
+                "t60 dte_days computed")
+    assert_true(out[0]["dte_tag"] in ("0DTE", "1DTE"),
+                "front dte_tag populated as 'NDTE'")
+    assert_true(out[1]["dte_tag"].endswith("D") and "DTE" not in out[1]["dte_tag"],
+                "t7 dte_tag populated as 'ND'")
+
+
+def test_load_walls_for_all_intents_partial():
+    """Spec: missing t60 key → entry exists with None values, doesn't break."""
+    from omega_dashboard.research_data import (
+        _load_walls_for_all_intents, INTENTS_ORDER, KEY_PREFIX,
+    )
+    fake = _FakeRedis()
+    # Populate only front; t7/t30/t60 missing.
+    fake.set(
+        f"{KEY_PREFIX}SPY:front",
+        json.dumps(_make_envelope(
+            state_overrides={"ticker": "SPY", "call_wall": 590.0, "put_wall": 580.0},
+            intent="front", expiration="2026-05-08",
+        )),
+    )
+
+    out = _load_walls_for_all_intents("SPY", redis_client=fake)
+    assert_eq(len(out), 4, "four entries even with partial population")
+    by_intent = {e["intent"]: e for e in out}
+    assert_eq(by_intent["front"]["call_wall"], 590.0, "front populated")
+    assert_is_none(by_intent["t7"]["call_wall"], "t7 missing → None")
+    assert_is_none(by_intent["t30"]["expiration"], "t30 missing → expiration None")
+    assert_is_none(by_intent["t60"]["dte_days"], "t60 missing → dte_days None")
+
+
+def test_load_walls_for_all_intents_redis_unavailable():
+    from omega_dashboard.research_data import _load_walls_for_all_intents, INTENTS_ORDER
+    out = _load_walls_for_all_intents("SPY", redis_client=None)
+    assert_eq(len(out), 4, "always returns 4 entries (one per intent)")
+    assert_eq([e["intent"] for e in out], list(INTENTS_ORDER),
+              "intents in canonical order")
+    for e in out:
+        assert_is_none(e["call_wall"], f"{e['intent']} call_wall is None")
+        assert_is_none(e["expiration"], f"{e['intent']} expiration is None")
+        assert_eq(e["dte_tag"], "—", f"{e['intent']} dte_tag is '—' fallback")
+
+
 if __name__ == "__main__":
     # warming-up factory
     test_warming_up_snapshot_has_all_none_fields()
@@ -406,6 +506,13 @@ if __name__ == "__main__":
     # Env-var dispatch
     test_research_data_uses_redis_when_env_var_on()
     test_research_data_uses_legacy_when_env_var_off()
+    # Patch D.1: DTE helpers + multi-intent walls reader
+    test_compute_dte_days_basic()
+    test_compute_dte_days_handles_invalid_input()
+    test_format_dte_tag_format()
+    test_load_walls_for_all_intents_full()
+    test_load_walls_for_all_intents_partial()
+    test_load_walls_for_all_intents_redis_unavailable()
     print(f"PASSED: {len(PASSED)}, FAILED: {len(FAILED)}")
     for f in FAILED:
         print(f"  ✗ {f}")
