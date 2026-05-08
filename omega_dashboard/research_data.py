@@ -30,7 +30,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Optional
 
 log = logging.getLogger(__name__)
@@ -284,7 +284,6 @@ def _compute_dte_days(expiration_iso: Optional[str], today=None) -> Optional[int
     if not expiration_iso:
         return None
     try:
-        from datetime import date, datetime
         if today is None:
             today = datetime.now(timezone.utc).date()
         exp = datetime.fromisoformat(expiration_iso).date() if "T" in expiration_iso \
@@ -354,13 +353,17 @@ def _load_walls_for_all_intents(ticker: str, redis_client) -> list:
 
         try:
             envelope = json.loads(raw)
-        except Exception:
+        except Exception as e:
+            log.debug(f"walls reader: malformed envelope for {ticker}/{intent}: {e}")
             out.append(entry)
             continue
         if not isinstance(envelope, dict):
+            log.debug(f"walls reader: envelope for {ticker}/{intent} is not a dict")
             out.append(entry)
             continue
-        if _validate_envelope_versions(envelope, ticker) is not None:
+        version_err = _validate_envelope_versions(envelope, ticker)
+        if version_err is not None:
+            log.debug(f"walls reader: {version_err}")
             out.append(entry)
             continue
 
