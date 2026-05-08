@@ -198,29 +198,75 @@
           </div>
           {% endif %}
 
-          {# ─── LIVE: walls (Patch 11.5 — wired from canonical_exposures) ─── #}
-          {% if snap.call_wall is not none or snap.put_wall is not none or snap.gamma_wall is not none %}
-          <div class="research-card-section">
-            <div class="research-card-eyebrow">WALLS &middot; <span class="research-live">live</span></div>
-            {% if snap.call_wall is not none %}
-              <div class="research-card-row">
-                <span class="research-card-label">Call Wall</span>
-                <span class="research-card-value positive">{{ "%.2f"|format(snap.call_wall) }}</span>
-              </div>
-            {% endif %}
-            {% if snap.put_wall is not none %}
-              <div class="research-card-row">
-                <span class="research-card-label">Put Wall</span>
-                <span class="research-card-value negative">{{ "%.2f"|format(snap.put_wall) }}</span>
-              </div>
-            {% endif %}
-            {% if snap.gamma_wall is not none %}
-              <div class="research-card-row">
-                <span class="research-card-label">Gamma Wall</span>
-                <span class="research-card-value">{{ "%.2f"|format(snap.gamma_wall) }}</span>
-              </div>
-            {% endif %}
-          </div>
+          {# ─── LIVE: walls (Patch D.3 — multi-DTE drilldown disclosure) ─── #}
+          {% if snap.walls_by_intent %}
+            {# Multi-intent path: <details> disclosure with all 4 intents.
+               dte_tag is pre-formatted in research_data.py so the template
+               stays simple. #}
+            {% set front = snap.walls_by_intent[0] %}
+            <details class="research-card-section research-card-walls-disclosure">
+              <summary class="research-card-walls-summary">
+                <div class="research-card-eyebrow">
+                  WALLS &middot; <span class="research-live">live</span>
+                  <span class="research-walls-chevron">▾</span>
+                </div>
+                {% if front.call_wall is not none %}
+                  <div class="research-card-row">
+                    <span class="research-card-label">Call Wall &middot; {{ front.dte_tag }}</span>
+                    <span class="research-card-value positive">{{ "%.2f"|format(front.call_wall) }}</span>
+                  </div>
+                {% endif %}
+                {% if front.put_wall is not none %}
+                  <div class="research-card-row">
+                    <span class="research-card-label">Put Wall &middot; {{ front.dte_tag }}</span>
+                    <span class="research-card-value negative">{{ "%.2f"|format(front.put_wall) }}</span>
+                  </div>
+                {% endif %}
+              </summary>
+              {# Expanded: t7/t30/t60 rows #}
+              {% for w in snap.walls_by_intent[1:] %}
+                <div class="research-card-row research-walls-extra">
+                  <span class="research-card-label">Call Wall &middot; {{ w.dte_tag }}</span>
+                  {% if w.call_wall is not none %}
+                    <span class="research-card-value positive">{{ "%.2f"|format(w.call_wall) }}</span>
+                  {% else %}
+                    <span class="research-card-value muted">—</span>
+                  {% endif %}
+                </div>
+                <div class="research-card-row research-walls-extra">
+                  <span class="research-card-label">Put Wall &middot; {{ w.dte_tag }}</span>
+                  {% if w.put_wall is not none %}
+                    <span class="research-card-value negative">{{ "%.2f"|format(w.put_wall) }}</span>
+                  {% else %}
+                    <span class="research-card-value muted">—</span>
+                  {% endif %}
+                </div>
+              {% endfor %}
+            </details>
+          {% elif snap.call_wall is not none or snap.put_wall is not none or snap.gamma_wall is not none %}
+            {# Legacy fallback: single-intent rendering (env var off, or
+               warming-up edge cases). Identical to pre-Patch-D output. #}
+            <div class="research-card-section">
+              <div class="research-card-eyebrow">WALLS &middot; <span class="research-live">live</span></div>
+              {% if snap.call_wall is not none %}
+                <div class="research-card-row">
+                  <span class="research-card-label">Call Wall</span>
+                  <span class="research-card-value positive">{{ "%.2f"|format(snap.call_wall) }}</span>
+                </div>
+              {% endif %}
+              {% if snap.put_wall is not none %}
+                <div class="research-card-row">
+                  <span class="research-card-label">Put Wall</span>
+                  <span class="research-card-value negative">{{ "%.2f"|format(snap.put_wall) }}</span>
+                </div>
+              {% endif %}
+              {% if snap.gamma_wall is not none %}
+                <div class="research-card-row">
+                  <span class="research-card-label">Gamma Wall</span>
+                  <span class="research-card-value">{{ "%.2f"|format(snap.gamma_wall) }}</span>
+                </div>
+              {% endif %}
+            </div>
           {% endif %}
 
           {# ─── PENDING: everything else ─────────────────────────── #}

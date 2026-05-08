@@ -3844,3 +3844,41 @@ body[data-account="clay"] {
   border-color: #888;
   color: #fff;
 }
+
+/* ─── Patch D.3: walls disclosure ─── */
+/* Ticker card's WALLS section is a <details> element. Collapsed shows
+   the front-DTE walls. Click/keyboard-activate to reveal t7/t30/t60. */
+.research-card-walls-disclosure {
+  /* Inherits .research-card-section spacing; overrides default <details> */
+}
+
+.research-card-walls-summary {
+  cursor: pointer;
+  list-style: none;
+  /* Suppress the default browser disclosure triangle (we draw our own
+     in the eyebrow row via .research-walls-chevron). */
+}
+
+.research-card-walls-summary::-webkit-details-marker {
+  display: none;
+}
+
+.research-walls-chevron {
+  display: inline-block;
+  margin-left: 0.4em;
+  font-size: 0.8em;
+  color: var(--research-warming-color, #888);
+  transition: transform 0.2s ease;
+}
+
+details[open] .research-walls-chevron {
+  transform: rotate(180deg);
+}
+
+.research-walls-extra {
+  /* Slight indent for the t7/t30/t60 rows so the visual hierarchy
+     reads "summary row → expansion rows below". */
+  padding-left: 0.6em;
+  border-left: 1px solid rgba(255, 255, 255, 0.08);
+  margin-left: 0.2em;
+}
