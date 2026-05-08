@@ -479,6 +479,63 @@ def test_load_walls_for_all_intents_redis_unavailable():
         assert_eq(e["dte_tag"], "—", f"{e['intent']} dte_tag is '—' fallback")
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Patch D.2: integration — wire walls reader into consumer flow
+# ─────────────────────────────────────────────────────────────────────
+
+def test_research_data_from_redis_populates_walls_by_intent():
+    """Integration: _research_data_from_redis attaches walls_by_intent
+    to each snapshot (read from all 4 intent keys)."""
+    from omega_dashboard.research_data import (
+        _research_data_from_redis, INTENTS_ORDER, KEY_PREFIX,
+    )
+    fake = _FakeRedis()
+    # Populate front + t7 for SPY; t30/t60 missing.
+    fake.set(
+        f"{KEY_PREFIX}SPY:front",
+        json.dumps(_make_envelope(
+            state_overrides={
+                "ticker": "SPY", "spot": 590.0, "call_wall": 595.0, "put_wall": 585.0,
+            },
+            intent="front", expiration="2026-05-08",
+        )),
+    )
+    fake.set(
+        f"{KEY_PREFIX}SPY:t7",
+        json.dumps(_make_envelope(
+            state_overrides={
+                "ticker": "SPY", "spot": 590.0, "call_wall": 600.0, "put_wall": 580.0,
+            },
+            intent="t7", expiration="2026-05-15",
+        )),
+    )
+
+    payload = _research_data_from_redis(
+        tickers=["SPY"], intent="front", redis_client=fake,
+    )
+    assert_eq(len(payload.snapshots), 1, "one ticker")
+    snap = payload.snapshots[0]
+    assert_eq(len(snap.walls_by_intent), 4, "always 4 entries (one per intent)")
+    assert_eq(snap.walls_by_intent[0]["intent"], "front", "front first")
+    assert_eq(snap.walls_by_intent[0]["call_wall"], 595.0, "front call_wall")
+    assert_eq(snap.walls_by_intent[1]["intent"], "t7", "t7 second")
+    assert_eq(snap.walls_by_intent[1]["call_wall"], 600.0, "t7 call_wall")
+    assert_is_none(snap.walls_by_intent[2]["call_wall"],
+                   "t30 missing → None (no envelope written)")
+    assert_is_none(snap.walls_by_intent[3]["call_wall"],
+                   "t60 missing → None (no envelope written)")
+
+
+def test_warming_up_snapshot_has_empty_walls_by_intent():
+    """Tickers that fail the primary-intent read still get walls_by_intent
+    populated as empty list (NOT 4-entry-with-Nones — the warming-up
+    snapshot is purely synthetic and shouldn't pretend to have data)."""
+    from omega_dashboard.research_data import _warming_up_snapshot
+    snap = _warming_up_snapshot("AAPL", reason="missing key")
+    assert_eq(snap.walls_by_intent, [],
+              "warming-up snapshot has empty walls_by_intent")
+
+
 if __name__ == "__main__":
     # warming-up factory
     test_warming_up_snapshot_has_all_none_fields()
@@ -513,6 +570,9 @@ if __name__ == "__main__":
     test_load_walls_for_all_intents_full()
     test_load_walls_for_all_intents_partial()
     test_load_walls_for_all_intents_redis_unavailable()
+    # Patch D.2: integration
+    test_research_data_from_redis_populates_walls_by_intent()
+    test_warming_up_snapshot_has_empty_walls_by_intent()
     print(f"PASSED: {len(PASSED)}, FAILED: {len(FAILED)}")
     for f in FAILED:
         print(f"  ✗ {f}")

@@ -454,10 +454,17 @@ def _research_data_from_redis(
             error="redis client not available",
         )
 
-    snapshots = [
-        _load_snapshot_from_redis(t, intent, redis_client=redis_client)
-        for t in tickers
-    ]
+    snapshots = []
+    for t in tickers:
+        snap = _load_snapshot_from_redis(t, intent, redis_client=redis_client)
+        # Patch D.2: attach all-intents walls. For warming-up snapshots
+        # leave walls_by_intent empty — the synthetic placeholder
+        # shouldn't pretend to have data the producer never wrote.
+        if not snap.warming_up:
+            snap.walls_by_intent = _load_walls_for_all_intents(
+                t, redis_client=redis_client,
+            )
+        snapshots.append(snap)
 
     # Aggregate metrics — count "with_data" as not-warming-up, not-errored.
     with_data = sum(1 for s in snapshots if not s.warming_up and s.error is None)
