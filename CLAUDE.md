@@ -113,6 +113,17 @@ Canonical rebuild (the v11 work — see "Canonical rebuild" below):
 - **walls** — call_wall, put_wall, gamma_wall, vol_trigger. Strikes
   where dealer positioning concentrates. ExposureEngine.compute() returns
   these as a single dict alongside Greek aggregates.
+- **walls_by_intent** — per-snapshot list of dicts populated by
+  `_load_walls_for_all_intents` in `omega_dashboard/research_data.py`.
+  One entry per intent in `INTENTS_ORDER = ("front", "t7", "t30", "t60")`.
+  Each entry has keys: `intent`, `expiration`, `dte_days`, `dte_tag`,
+  `call_wall`, `put_wall`, `gamma_wall`. Powers the click-to-expand
+  WALLS disclosure on the Research page — front intent renders in the
+  `<summary>` (collapsed), t7/t30/t60 expand below.
+- **dte_tag** — display label for an expiration's days-to-expiration.
+  Format: "0DTE"/"1DTE" for `dte_days <= 1`, "{n}D" for `dte_days > 1`,
+  "—" for unknown. Pre-computed in research_data.py so templates stay
+  simple.
 - **canonical_expiration intent** — short string describing which expiration
   to pick for a chain query. Five intents: `zero_dte` (today's chain), `front`
   (first DTE ≥ 1, never 0DTE), `t7` (first DTE ≥ 7), `t30` (first DTE ≥ 30),
@@ -231,7 +242,7 @@ The pattern, in order:
 
 10. **Update CLAUDE.md if a major architectural decision was made.**
 
-What's done as of last session (v11.6 / Patch A):
+What's done as of last session (v11.7 / Patch D):
 - canonical_gamma_flip
 - canonical_iv_state (replaces a brief mistake — see "Audit discipline" below)
 - canonical_exposures (Greek aggregates: gex/dex/vanna/charm/gex_sign)
@@ -245,13 +256,23 @@ What's done as of last session (v11.6 / Patch A):
   is still slow — only the EXPIRATION choice changed in this patch.
 - BotState with permissive build, 64 fields total, ~22 currently lit per ticker
 - Research page replaces the old Diagnostic placeholder
+- Multi-DTE walls drilldown (Patch D) — Research page WALLS section is now
+  a native HTML `<details>` disclosure. Front-DTE walls render in the
+  collapsed `<summary>`; t7/t30/t60 rows expand below with `dte_tag` labels
+  ("8D"/"32D"/"61D"). Touches `omega_dashboard/research_data.py` (DTE helpers,
+  `_load_walls_for_all_intents`, `walls_by_intent` field on TickerSnapshot),
+  `omega_dashboard/templates/dashboard/research.html` (disclosure markup +
+  legacy fallback), `omega_dashboard/static/omega.css` (disclosure styling).
+  This completes the consumer side of the producer/consumer architecture:
+  producer was Patch B, consumer skeleton was Patch C, multi-DTE drilldown
+  is Patch D. The producer was already writing all 4 intents per ticker —
+  Patch D finally surfaces them.
 
 What's queued (in roughly this order):
 - bot_state_producer (Patch B) — daemon thread + Redis-backed shared store.
   See spec at docs/superpowers/specs/2026-05-07-research-page-multi-dte-walls-design.md.
   Unlocks the Research page (Patch C) and silent thesis migration (Patch E later).
 - Research reads from Redis (Patch C) — pure consumer; the 3-minute spin disappears here.
-- Multi-DTE drilldown UI (Patch D) — click-to-expand front/t7/t30/t60 walls per card.
 - canonical_technicals — RSI / MACD / ADX / VWAP. First-class for every engine.
 - canonical_pivots — universal pivot math, simple consolidation
 - canonical_em_state, canonical_dealer_regime, canonical_potter_box,
@@ -421,6 +442,13 @@ is high. Don't argue with them.
   is met). `convention_version` is strict-equal — mismatch is treated
   as "warming up" rather than rendered, to prevent ever displaying
   dealer-side-flipped numbers post a Patch 9-style convention shift.
+- Research page WALLS section is a native HTML `<details>` disclosure.
+  Front-DTE Call/Put walls in the collapsed `<summary>`; t7/t30/t60 rows
+  expand below with their own `dte_tag` labels. Zero JavaScript — full
+  keyboard accessibility comes free with `<details>`/`<summary>`. Legacy
+  single-intent block (Call/Put/Gamma rows, no DTE tags) stays as a
+  fallback when `walls_by_intent` is empty (env-var-off path or
+  warming-up snapshots).
 
 ---
 
