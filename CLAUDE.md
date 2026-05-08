@@ -400,14 +400,22 @@ is high. Don't argue with them.
   version mismatches all render as "warming up" skeleton cards (CSS
   class `research-card-warming-up`) — the dashboard never errors out
   whole-page on a single bad ticker.
-- Research page auto-reloads every 5s while any card is warming up
-  (Patch C.5). The page is server-rendered, so without this users
-  loading mid-cycle would see warming-up cards stuck until manual F5.
-  Implementation is a 4-line inline `<script>` at the bottom of
-  `research.html`, conditional on `selectattr('warming_up')` being
-  non-empty. Once all cards are populated, the script tag is absent
-  from the next render and polling stops cleanly. Zero JS overhead
-  in steady state.
+- Research page auto-refreshes while any card is warming up
+  (Patch C.5/C.6/C.7 — three iterations). Server-rendered page with
+  inline JS that reloads every 5s, capped at 60 attempts (5 min).
+  Sticky bottom bar shows the countdown plus Stop/Refresh-now buttons,
+  so user always has explicit control. Once all cards populate the
+  bar disappears (the script tag is conditional on
+  `selectattr('warming_up')` being non-empty). After the 60-attempt
+  cap the bar switches to "paused" and waits for manual retry —
+  protects against runaway loops if the producer is genuinely stuck.
+
+  Producer-side companion: tier TTL is `cadence × 6` (Patch C.6, was
+  `× 3`). Without this, when the producer's actual pass time
+  exceeded the TTL — common at startup or under rate-limit pressure
+  with a 35×4 universe — populated cards would expire BEFORE the
+  next pass rewrote them, so the auto-refresh thrashed forever.
+  Tier A: 360s TTL (was 180s), Tier B: 1080s, Tier C: 3600s.
 - Schema versioning split: `producer_version` is forward-compatible
   (newer producer accepted by older reader as long as MIN_COMPATIBLE
   is met). `convention_version` is strict-equal — mismatch is treated
