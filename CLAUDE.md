@@ -306,7 +306,7 @@ WWhat's queued (in order):
   Reconciliation requires session-anchor and band-multiplier design decisions —
   it's not a stateless lift. Patch E was intentionally scoped to stateless
   indicators only; VWAP needs its own design pass.
-- Patch G (or later): risk_manager ADX migration. risk_manager._compute_adx is SMA-seeded Wilder ADX, drifts from active_scanner's RMA-seeded variant (now canonical). Migration shifts ADX values, may shift regime classifier on borderline inputs. Plan: capture the actual numerical drift on real SPY data first (separate one-off script), include the drift in the commit message, gate behind env var if shift is meaningful.
+- Later patch: risk_manager ADX migration. risk_manager._compute_adx is SMA-seeded Wilder ADX, drifts from active_scanner's RMA-seeded variant (now canonical). Migration shifts ADX values, may shift regime classifier on borderline inputs. Plan: capture the actual numerical drift on real SPY data first (separate one-off script), include the drift in the commit message, gate behind env var if shift is meaningful.
 - Later patch: RSI consolidation across `app.py:_rsi`, `unified_models.py:_rsi` (Wilder-smoothed, different from canonical), `swing_scanner.py:_rsi` (Wilder-smoothed AND list-returning, different shape), `income_scanner.compute_rsi` (close to canonical, rounds to 1 decimal). Needs design pass — Wilder-smoothed canonical, OR migration with documented drift, OR list-returning canonical for swing_scanner. Multiple sub-patches when it lands.
 - Eventual cleanup: delete the `_compute_*` shims in active_scanner once nothing imports them. Requires confirming no external caller references the legacy names.
 
