@@ -1175,6 +1175,25 @@ class ContinuousFlowScanner:
                             self._intraday_chat_id):
                         self._post(msg, chat_id=self._intraday_chat_id)
 
+                    # v11.7 (Patch G.6): record conviction alert (continuous-flow
+                    # scanner site — schwab_stream.py). alert_recorder is not
+                    # imported at module-top here (separate module from app.py
+                    # to keep G.6 blast radius tight); inline import + try/except
+                    # mirrors the wrapper in app.py:_record_conviction_after_post.
+                    try:
+                        from oi_flow import _build_conviction_alert_payload
+                        import alert_recorder as _alert_recorder
+                        _alert_recorder.record_alert(
+                            **_build_conviction_alert_payload(
+                                cp=cp,
+                                canonical_snapshot={},
+                                posted_to="conviction",
+                            )
+                        )
+                    except Exception as _rec_g6_err:
+                        log.warning(f"recorder G.6: conviction hook failed for "
+                                    f"{cp.get('ticker','?')}: {_rec_g6_err}")
+
                     # v7.2.1: Confirm direction posted — enables exit signals
                     # and prevents duplicate posts on subsequent scan cycles.
                     # Previously only called in app.py, never here, causing

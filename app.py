@@ -7857,6 +7857,8 @@ def _run_v4_prefilter(ticker: str, spot: float, chains: list, candle_closes: lis
                                 _record_conviction_recommendation(cp, spot, chain_data=chain_data, source="conviction_flow")
                             except Exception as _rce:
                                 log.warning(f"Rec tracker conviction failed for {cp.get('ticker','?')}: {_rce}")
+                            # v11.7 (Patch G.6): record conviction alert (immediate route).
+                            _record_conviction_after_post(cp, posted_to="conviction")
 
                         elif route == "income":
                             # 3-7 DTE: unified conviction + income card
@@ -7949,6 +7951,8 @@ def _run_v4_prefilter(ticker: str, spot: float, chains: list, candle_closes: lis
                                 _record_conviction_recommendation(cp, spot, chain_data=chain_data, best_income=_best_income, source="conviction_flow")
                             except Exception as _rce:
                                 log.warning(f"Rec tracker conviction failed for {cp.get('ticker','?')}: {_rce}")
+                            # v11.7 (Patch G.6): record conviction alert (income route).
+                            _record_conviction_after_post(cp, posted_to="conviction")
 
                         elif route == "swing":
                             # v8.4.4 (Patch 2A): conviction flow → intraday, not main (was dual-posted)
@@ -7958,11 +7962,15 @@ def _run_v4_prefilter(ticker: str, spot: float, chains: list, candle_closes: lis
                                 _record_conviction_recommendation(cp, spot, chain_data=chain_data, source="conviction_flow")
                             except Exception as _rce:
                                 log.warning(f"Rec tracker conviction failed for {cp.get('ticker','?')}: {_rce}")
+                            # v11.7 (Patch G.6): record conviction alert (swing route).
+                            _record_conviction_after_post(cp, posted_to="conviction")
 
                         elif route == "stalk":
                             # v8.4.4 (Patch 2A): conviction flow → intraday, not main
                             _cp_chat = TELEGRAM_CHAT_INTRADAY or TELEGRAM_CHAT_ID
                             _tg_rate_limited_post(msg, chat_id=_cp_chat)
+                            # v11.7 (Patch G.6): record conviction alert (stalk route).
+                            _record_conviction_after_post(cp, posted_to="conviction")
 
                         log.info(f"💎 CONVICTION [{route.upper()}]{' (SHADOW)' if _is_shadow else ''}: "
                                f"{cp['ticker']} {cp['trade_side']} ${cp['strike']:.0f} "
@@ -9513,6 +9521,33 @@ def _build_v25d_alert_payload(*, ticker: str, spot: float, v2_result,
     )
 
 
+# v11.7 (Patch G.6): alert recorder thin wrapper — CONVICTION PLAY.
+# DRYs the 7 conviction-card post sites in app.py. Each site already
+# calls _flow_detector.format_conviction_play(cp) -> _tg_rate_limited_post(msg);
+# this wrapper records the alert immediately after, gated by
+# RECORDER_ENABLED + RECORDER_CONVICTION_ENABLED inside record_alert (so
+# when off it's a near-no-op). Failures swallowed via log.warning so the
+# recorder NEVER affects conviction posting.
+#
+# The schwab_stream.py site has its own inline try/except (separate
+# module, alert_recorder not imported there at module top — keeps the
+# blast radius of this patch tight).
+def _record_conviction_after_post(cp: dict, posted_to: str) -> None:
+    """Record a conviction-play alert after the Telegram post succeeds."""
+    try:
+        from oi_flow import _build_conviction_alert_payload
+        _alert_recorder.record_alert(
+            **_build_conviction_alert_payload(
+                cp=cp,
+                canonical_snapshot={},  # not in scope at conviction post sites
+                posted_to=posted_to,
+            )
+        )
+    except Exception as _rec_g6_err:
+        log.warning(f"recorder G.6: conviction hook failed for "
+                    f"{cp.get('ticker','?')}: {_rec_g6_err}")
+
+
 def _try_post_long_call_burst(ticker: str, bias: str, spot: float,
                                 webhook_data: dict, exps: list,
                                 today, worker_id: int,
@@ -10632,6 +10667,8 @@ def _get_0dte_iv(ticker: str, target_date_str: str = None) -> tuple:
                                 _record_conviction_recommendation(cp, spot, chain_data=rows if "rows" in locals() else None, source="conviction_flow")
                             except Exception as _rce:
                                 log.warning(f"Rec tracker conviction failed for {cp.get('ticker','?')}: {_rce}")
+                            # v11.7 (Patch G.6): record conviction alert (site2).
+                            _record_conviction_after_post(cp, posted_to="conviction")
                             # v7.2 fix: Confirm direction posted for exit signal tracking
                             _flow_detector.confirm_conviction_posted(
                                 cp["ticker"], cp.get("trade_direction", ""), cp.get("strike", 0))
@@ -11023,6 +11060,8 @@ def _get_chain_iv_for_expiry(ticker: str, target_date_str: str, dte: float) -> t
                                 _record_conviction_recommendation(cp, spot, chain_data=rows if "rows" in locals() else None, source="conviction_flow")
                             except Exception as _rce:
                                 log.warning(f"Rec tracker conviction failed for {cp.get('ticker','?')}: {_rce}")
+                            # v11.7 (Patch G.6): record conviction alert (site3).
+                            _record_conviction_after_post(cp, posted_to="conviction")
                             # v7.2 fix: Confirm direction posted for exit signal tracking
                             _flow_detector.confirm_conviction_posted(
                                 cp["ticker"], cp.get("trade_direction", ""), cp.get("strike", 0))
@@ -15505,6 +15544,8 @@ def _initialize_app():
                                     _record_conviction_recommendation(cp, get_spot(cp.get("ticker")) or 0, source="conviction_sweep")
                                 except Exception as _rce:
                                     log.warning(f"Rec tracker conviction failed for {cp.get('ticker','?')}: {_rce}")
+                                # v11.7 (Patch G.6): record conviction alert (site4 — sweep handler).
+                                _record_conviction_after_post(cp, posted_to="conviction")
                                 # v7.2 fix: Confirm direction posted for exit signal tracking
                                 _flow_detector.confirm_conviction_posted(
                                     cp["ticker"], cp.get("trade_direction", ""), cp.get("strike", 0))

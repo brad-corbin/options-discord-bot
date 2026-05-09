@@ -142,6 +142,86 @@ SECTOR_MAP = {
 }
 
 
+# v11.7 (Patch G.6): alert recorder helper — CONVICTION PLAY.
+# Pure function: builds the kwargs dict consumed by
+# alert_recorder.record_alert from a conviction play `cp` dict (the play
+# returned by FlowDetector.detect_conviction_plays — see oi_flow.py:2705).
+# Tested hermetically by test_alert_recorder_conviction_wire.py. Bump
+# CONVICTION_ENGINE_VERSION whenever the flow detector's classification
+# logic, conviction routing, or trade_direction mapping changes so
+# recorded alerts are queryable by engine version.
+#
+# Lives at module scope (not a class method) so the AST-extract test
+# pattern can load it cleanly. The helper is pure — no I/O, no state.
+CONVICTION_ENGINE_VERSION = "oi_flow_conviction@v8.4.2"
+
+
+def _build_conviction_alert_payload(*, cp: dict, canonical_snapshot: dict,
+                                    posted_to: str) -> dict:
+    """Build kwargs for alert_recorder.record_alert from a conviction play.
+
+    Pure function — no I/O. cp is the play dict returned by
+    FlowDetector.detect_conviction_plays (see oi_flow.py:2705 for the
+    full schema). trade_direction maps as:
+        bullish -> CONVICTION_LONG_CALL / direction=bull / long_call
+        bearish -> CONVICTION_LONG_PUT  / direction=bear / long_put
+        anything else -> CONVICTION_UNKNOWN / direction=None
+
+    parent_alert_id is always None — oi_flow conviction plays are
+    independent of the V2 5D parent context (unlike credit/LCB which
+    can chain off a V2 5D evaluation).
+    """
+    trade_direction = cp.get("trade_direction") or ""
+    if trade_direction == "bullish":
+        classification, direction, struct_type = (
+            "CONVICTION_LONG_CALL", "bull", "long_call")
+    elif trade_direction == "bearish":
+        classification, direction, struct_type = (
+            "CONVICTION_LONG_PUT", "bear", "long_put")
+    else:
+        classification, direction, struct_type = (
+            "CONVICTION_UNKNOWN", None, None)
+
+    suggested_structure = {
+        "type":   struct_type,
+        "strike": cp.get("strike"),
+        "expiry": cp.get("expiry"),
+        "route":  cp.get("route"),
+    }
+    features = {
+        "notional":             cp.get("notional"),
+        "sweep_notional":       cp.get("sweep_notional"),
+        "is_streaming_sweep":   bool(cp.get("is_streaming_sweep")),
+        "burst":                cp.get("burst"),
+        "vol_oi_ratio":         cp.get("vol_oi_ratio"),
+        "volume":               cp.get("volume"),
+        "dte":                  cp.get("dte"),
+        "route":                cp.get("route"),
+        "directional_bias":     cp.get("directional_bias"),
+        "direction_confidence": cp.get("direction_confidence"),
+        "em_aligned":           cp.get("em_aligned"),
+        "em_conflict":          cp.get("em_conflict"),
+        "is_exit_signal":       cp.get("is_exit_signal"),
+        "is_reactive":          cp.get("is_reactive"),
+        "shadow_agrees":        cp.get("shadow_agrees"),
+    }
+    return dict(
+        engine="oi_flow_conviction",
+        engine_version=CONVICTION_ENGINE_VERSION,
+        ticker=cp.get("ticker"),
+        classification=classification,
+        direction=direction,
+        suggested_structure=suggested_structure,
+        suggested_dte=cp.get("dte"),
+        spot_at_fire=cp.get("spot"),
+        canonical_snapshot=canonical_snapshot,
+        raw_engine_payload=cp,
+        features=features,
+        telegram_chat=posted_to,
+        parent_alert_id=None,
+    )
+
+
 def _get_volume_tier(ticker: str) -> dict:
     """Get volume tier config for a ticker."""
     t = ticker.upper()
