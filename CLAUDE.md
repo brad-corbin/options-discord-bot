@@ -32,6 +32,24 @@ deploy. Deploys go via GitHub Desktop → Render auto-rebuild.
 The current release line is v8.x for the trading engine and v11.x for the
 canonical-rebuild work running alongside it.
 
+## Project framing — Corbin Family Trade Desk
+
+The codebase started as a Discord/Telegram options bot and is mid-transition
+into a real **trade desk**: a multi-surface platform with Portfolio,
+Research (canonical), Market View (signals + plays + measurement), and
+Telegram (delivery) as separate surfaces with separate responsibilities.
+
+When in doubt, the desk owns measurement and attribution. Telegram is a
+delivery surface but not the source of truth for "did this engine make
+money." That's the desk's job. The canonical-rebuild work (Patches A
+through D) was the foundation. The recorder (Patches G through I) is
+where the foundation pays off.
+
+The phrase "the bot" still appears throughout legacy code and docs.
+Don't globally rename — just understand the framing has shifted. New
+surfaces go on the desk. Telegram remains for now and may be deprecated
+later, but only after measured edge says it's safe.
+
 ---
 
 ## Repo layout (what matters)
@@ -268,23 +286,64 @@ What's done as of last session (v11.7 / Patch D):
   is Patch D. The producer was already writing all 4 intents per ticker —
   Patch D finally surfaces them.
 
-What's queued (in roughly this order):
-- bot_state_producer (Patch B) — daemon thread + Redis-backed shared store.
-  See spec at docs/superpowers/specs/2026-05-07-research-page-multi-dte-walls-design.md.
-  Unlocks the Research page (Patch C) and silent thesis migration (Patch E later).
-- Research reads from Redis (Patch C) — pure consumer; the 3-minute spin disappears here.
-- canonical_technicals — RSI / MACD / ADX / VWAP. First-class for every engine.
-- canonical_pivots — universal pivot math, simple consolidation
-- canonical_em_state, canonical_dealer_regime, canonical_potter_box,
-  canonical_flow_state, canonical_calendar — exact order TBD by Brad
-- First migration: pick one production engine that calls
-  `ExposureEngine.compute()` directly, redirect to read from
-  `state.gex` etc., side-by-side log to confirm same value, then commit.
+WWhat's queued (in order):
 
-The migration step is the more important question once enough canonicals
-exist. Right now silent_thesis still computes its own everything — the
-canonicals only feed the Research dashboard. Migration is what makes the
-rebuild real and not just parallel.
+**Foundation work (additive, no behavior change to trading path):**
+- canonical_technicals (Patch E) — lift _compute_rsi / _compute_macd /
+  _compute_ema / _compute_wavetrend / _compute_adx / _rma byte-identically
+  from active_scanner.py and risk_manager.py into canonical_technicals.py.
+  Wrapper-consistency tests prove identical output. active_scanner is NOT
+  touched in Patch E. _compute_adx exists in 3 places today
+  (active_scanner.py:213, risk_manager.py:335, ported from
+  backtest_v3_runner.py per code comment) — Patch E consolidates.
+- active_scanner uses canonical (Patch F) — replace inline _compute_*
+  calls with imports from canonical_technicals. Same math, same output,
+  only import path changes. Each module migration in a separate commit,
+  each independently revertable.
+
+**The recorder — V1 measurement infrastructure:**
+
+The recorder is the platform's central artifact and the reason all the
+canonical-rebuild work exists. Records every alert that hits the main
+Telegram channel with full input vector + canonical snapshot + price
+track + outcomes at multiple horizons. Answers Brad's actual question:
+"of the alerts you're showing me, what's the win rate, and would I have
+won at horizon X."
+
+- Patch G — V1 alert recorder. SQLite at /var/backtest/desk.db. Four
+  tables: alerts + alert_features + alert_price_track + alert_outcomes.
+  Records 4 engines: LONG CALL BURST, V2 5D EDGE MODEL, v8.4 CREDIT,
+  CONVICTION PLAY. Full universe (whatever the bot is running on, no
+  ticker filter). Price tracking piggybacks on existing
+  recommendation_tracker polling — zero new Schwab REST calls.
+  See spec at docs/superpowers/specs/2026-05-08-alert-recorder-v1.md.
+- Patch H — Barometer dashboard. Query layer + Market View page surfacing
+  win rate by engine, classification, regime, holding horizon. This is
+  where Patch G's data becomes visible. Without H, the recorder is a
+  silent database. With H, it's the lever-finding workbench.
+
+**V2+ work (real, valuable, not V1):**
+- Took-trade tracking (link Brad's portfolio entries to alert_ids)
+- Campaigns / rolls / transformations (the JPM-rolling-to-next-Friday model)
+- Multi-signal justification (one position, multiple signals over time)
+- Engine promotion logic (proven vs. unproven dashboard surfaces)
+- Setup-level dedup with fire sub-rows (currently V1 records each fire as
+  its own alert; dedup is a V2 query-layer concern)
+- Recording suppressed/internal events (V1 records only what hits Telegram)
+- Exit gate (Patches J/K/L: shadow → notify → trusted)
+
+**Other canonicals (build only when a concrete consumer needs them):**
+- canonical_pivots, canonical_em_state, canonical_dealer_regime,
+  canonical_potter_box, canonical_flow_state, canonical_calendar.
+  These are NOT built ahead of consumers. They are built when a
+  Patch G/H/I consumer surfaces a concrete dependency. The "build
+  canonicals for completeness" trap is the parallel-system trap.
+
+**First migration (deferred to V2):**
+Once V1 recorder + barometer ship and a few weeks of side-by-side data
+exists, pick one production engine and redirect it to read from
+canonicals + recorder data instead of computing inline. Migration is
+what makes the rebuild real and not just parallel.
 
 ---
 
@@ -449,7 +508,57 @@ is high. Don't argue with them.
   single-intent block (Call/Put/Gamma rows, no DTE tags) stays as a
   fallback when `walls_by_intent` is empty (env-var-off path or
   warming-up snapshots).
+- **The recorder is the platform's central artifact.** Every alert that
+  hits the main Telegram channel records its full input vector + the
+  canonical snapshot at fire time + spot. Outcomes attach to alerts via
+  stable alert_ids. The recorder schema is immutable; rebuilds change
+  canonicals but old alerts must remain queryable in their original
+  context. See docs/superpowers/specs/2026-05-08-alert-recorder-v1.md.
 
+- **Engine versioning is mandatory.** Every engine has a version string.
+  When scoring weights, thresholds, or logic change, the version bumps.
+  The recorder stores engine + engine_version with every alert. Queries
+  always filter or group by version. Without this, long-window analysis
+  silently mixes apples and oranges and the lever-finding doesn't work.
+
+- **SQLite for forever-storage, Redis for live state only.** The
+  signal/outcome ledger lives in durable storage at /var/backtest/desk.db
+  (Render persistent disk, 5 GB current, snapshot-backed). Redis stays
+  for live state with TTLs ≤ 24h: BotState envelopes, OI cache,
+  prev_close_store, lock keys, telemetry sorted sets, recent scan_results.
+  The 25 MB Redis cap (free tier with allkeys-lru eviction) is hard.
+  At 16/25 MB used today, recorder data will not fit and would evict
+  live state. SQLite is the only correct answer for the recorder.
+
+- **Capture more than the engine reads.** When an alert fires, the
+  recorder snapshots the entire BotState envelope — not just the fields
+  the engine consumed. This is how new levers get found later: by
+  querying alerts against canonicals that didn't exist or weren't wired
+  in at fire time, but whose state was preserved.
+
+- **Recorder is V1 narrow on purpose.** V1 records 4 engines on full
+  universe, with price tracks and outcomes at standard horizons. It does
+  NOT track took-trade, campaigns, transformations, suppressed events,
+  or implement engine promotion. These are V2+. The V1 schema does not
+  preclude any of them — they are purely additive. Old V1 data stays
+  valid forever.
+
+- **canonical_technicals lift order.** Lift the math byte-identically
+  into canonical_technicals.py FIRST (Patch E), then migrate
+  active_scanner and risk_manager to import from canonical (Patch F),
+  then build measurement infrastructure on top (Patch G+). This avoids
+  the dashboard-locked-to-active_scanner-internals problem.
+
+- **No speculative canonicals.** Future canonicals (em_state,
+  dealer_regime, potter_box, flow_state, calendar) are NOT built ahead
+  of consumers. They are built when a Patch G/H/I consumer surfaces a
+  concrete dependency.
+
+- **Exit gate is staged.** Future Patches J → K → L: shadow → notify →
+  trusted. Each stage requires explicit Brad approval based on data
+  from the prior stage. Trusted mode is the only stage with real blast
+  radius and is not implemented without prior discussion of fail-safes
+  and kill switches.
 ---
 
 ## Known issues — document but don't fix unless asked
