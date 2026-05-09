@@ -38,7 +38,7 @@ Lifted under Patch E (v11.7). See docs/superpowers/plans/
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 
 # v11.7 (Patch E.2): MACD constants — mirror active_scanner.py:82-84.
@@ -66,3 +66,43 @@ def rsi(closes: list, period: int = 14) -> Optional[float]:
         return 100.0
     rs = avg_gain / avg_loss
     return 100.0 - (100.0 / (1 + rs))
+
+
+# v11.7 (Patch E.2): _ema helper lifted byte-identically from
+# active_scanner._compute_ema. Used by macd().
+def _ema(values: list, period: int) -> list:
+    if len(values) < period:
+        return []
+    ema = [sum(values[:period]) / period]
+    mult = 2.0 / (period + 1)
+    for v in values[period:]:
+        ema.append(v * mult + ema[-1] * (1 - mult))
+    return ema
+
+
+# v11.7 (Patch E.2): MACD lifted byte-identically from
+# active_scanner._compute_macd. Returns macd_line, signal_line,
+# macd_hist, and bull/bear cross flags. Returns {} when insufficient
+# data — the conviction scorer treats {} as "MACD unavailable, skip".
+def macd(closes: list) -> Dict:
+    if len(closes) < MACD_SLOW + MACD_SIGNAL:
+        return {}
+    ema_fast = _ema(closes, MACD_FAST)
+    ema_slow = _ema(closes, MACD_SLOW)
+    offset = MACD_SLOW - MACD_FAST
+    macd_line = [ema_fast[i + offset] - ema_slow[i] for i in range(len(ema_slow))]
+    if len(macd_line) < MACD_SIGNAL:
+        return {}
+    signal = _ema(macd_line, MACD_SIGNAL)
+    hist = macd_line[-1] - signal[-1] if signal else 0
+    return {
+        "macd_line": macd_line[-1] if macd_line else 0,
+        "signal_line": signal[-1] if signal else 0,
+        "macd_hist": hist,
+        "macd_cross_bull": (len(macd_line) >= 2 and len(signal) >= 2
+                           and macd_line[-2] < signal[-2]
+                           and macd_line[-1] > signal[-1]) if signal else False,
+        "macd_cross_bear": (len(macd_line) >= 2 and len(signal) >= 2
+                           and macd_line[-2] > signal[-2]
+                           and macd_line[-1] < signal[-1]) if signal else False,
+    }

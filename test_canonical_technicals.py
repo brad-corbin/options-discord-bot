@@ -123,6 +123,71 @@ def test_rsi_wrapper_consistency_alternating():
 
 
 # ───────────────────────────────────────────────────────────────────────
+# MACD tests
+# ───────────────────────────────────────────────────────────────────────
+
+def test_macd_insufficient_data_returns_empty():
+    from canonical_technicals import macd
+    assert_eq(macd([100.0] * 20), {},
+              "macd: <slow+signal closes returns {}")
+    assert_eq(macd([]), {}, "macd: empty list returns {}")
+
+
+def test_macd_returns_required_keys():
+    from canonical_technicals import macd
+    closes = _ramp_closes(100.0, 0.5, 60)
+    out = macd(closes)
+    for key in ("macd_line", "signal_line", "macd_hist",
+                "macd_cross_bull", "macd_cross_bear"):
+        assert_true(key in out, f"macd: result has key {key!r}")
+
+
+def test_macd_wrapper_consistency_uptrend():
+    from canonical_technicals import macd as canon
+    from active_scanner import _compute_macd as src
+    closes = _ramp_closes(100.0, 0.5, 60)
+    assert_eq(canon(closes), src(closes),
+              "macd wrapper-consistency: uptrend")
+
+
+def test_macd_wrapper_consistency_oscillation():
+    from canonical_technicals import macd as canon
+    from active_scanner import _compute_macd as src
+    closes = _gentle_oscillation(80)
+    assert_eq(canon(closes), src(closes),
+              "macd wrapper-consistency: oscillation")
+
+
+def test_macd_wrapper_consistency_choppy():
+    from canonical_technicals import macd as canon
+    from active_scanner import _compute_macd as src
+    closes = _alternating_closes(100.0, 1.0, 80)
+    assert_eq(canon(closes), src(closes),
+              "macd wrapper-consistency: alternating")
+
+
+def test_macd_wrapper_consistency_minimum_length():
+    """Right at the boundary: slow + signal = 26 + 9 = 35 closes."""
+    from canonical_technicals import macd as canon
+    from active_scanner import _compute_macd as src
+    closes = _ramp_closes(100.0, 0.3, 35)
+    assert_eq(canon(closes), src(closes),
+              "macd wrapper-consistency: 35-close minimum")
+
+
+def test_ema_wrapper_consistency():
+    from canonical_technicals import _ema as canon
+    from active_scanner import _compute_ema as src
+    values = _ramp_closes(100.0, 1.0, 30)
+    assert_eq(canon(values, 12), src(values, 12),
+              "_ema wrapper-consistency: ramp period=12")
+    assert_eq(canon(values, 26), src(values, 26),
+              "_ema wrapper-consistency: ramp period=26")
+    assert_eq(canon([1.0, 2.0, 3.0], 5), src([1.0, 2.0, 3.0], 5),
+              "_ema wrapper-consistency: insufficient data → []")
+
+
+# ───────────────────────────────────────────────────────────────────────
 # Test runner
 # ───────────────────────────────────────────────────────────────────────
 
@@ -134,6 +199,13 @@ def main():
         test_rsi_wrapper_consistency_uptrend,
         test_rsi_wrapper_consistency_oscillation,
         test_rsi_wrapper_consistency_alternating,
+        test_macd_insufficient_data_returns_empty,
+        test_macd_returns_required_keys,
+        test_macd_wrapper_consistency_uptrend,
+        test_macd_wrapper_consistency_oscillation,
+        test_macd_wrapper_consistency_choppy,
+        test_macd_wrapper_consistency_minimum_length,
+        test_ema_wrapper_consistency,
     ]
     for t in tests:
         try:
