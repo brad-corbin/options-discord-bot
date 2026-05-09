@@ -307,7 +307,7 @@ def _format_dte_tag(dte_days: Optional[int]) -> str:
     return f"{dte_days}D"
 
 
-def _load_walls_for_all_intents(ticker: str, redis_client) -> list:
+def _load_walls_for_all_intents(ticker: str, redis_client, today=None) -> list:
     """Read all four intents' envelopes for a ticker. Returns a list of
     dicts in INTENTS_ORDER. Each dict has keys:
       - intent: str (e.g. "front")
@@ -369,7 +369,7 @@ def _load_walls_for_all_intents(ticker: str, redis_client) -> list:
 
         state = envelope.get("state") or {}
         entry["expiration"] = envelope.get("expiration")
-        entry["dte_days"] = _compute_dte_days(entry["expiration"])
+        entry["dte_days"] = _compute_dte_days(entry["expiration"], today=today)
         entry["dte_tag"] = _format_dte_tag(entry["dte_days"])
         entry["call_wall"] = state.get("call_wall")
         entry["put_wall"] = state.get("put_wall")

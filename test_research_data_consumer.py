@@ -415,6 +415,7 @@ def test_load_walls_for_all_intents_full():
     from omega_dashboard.research_data import (
         _load_walls_for_all_intents, INTENTS_ORDER, KEY_PREFIX,
     )
+    from datetime import date
     fake = _FakeRedis()
     for intent, exp, cw, pw in [
         ("front", "2026-05-08", 590.0, 580.0),
@@ -429,7 +430,7 @@ def test_load_walls_for_all_intents_full():
         )
         fake.set(f"{KEY_PREFIX}SPY:{intent}", json.dumps(env))
 
-    out = _load_walls_for_all_intents("SPY", redis_client=fake)
+    out = _load_walls_for_all_intents("SPY", redis_client=fake, today=date(2026, 5, 7))
     assert_eq(len(out), 4, "four entries, one per intent")
     assert_eq([e["intent"] for e in out], list(INTENTS_ORDER), "ordered by INTENTS_ORDER")
     assert_eq(out[0]["call_wall"], 590.0, "front call_wall")
