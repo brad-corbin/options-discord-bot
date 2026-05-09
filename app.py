@@ -15320,6 +15320,13 @@ def _initialize_app():
                 except Exception as e:
                     log.warning(f"alert tracker daemon: failed to start: {e}")
 
+                # v11.7 (Patch G.8): start outcome computer daemon (gated by env var).
+                try:
+                    import outcome_computer_daemon as _ocd
+                    _ocd.start()
+                except Exception as e:
+                    log.warning(f"outcome computer daemon: failed to start: {e}")
+
                 # v8.5 (Phase 3.1 remediation): subscription gate for the
                 # ContinuousFlowScanner post path. The schwab_stream.py side
                 # of this was wired on the prior deploy but the app.py side
