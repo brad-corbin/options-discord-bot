@@ -225,10 +225,11 @@ def test_stubbed_canonicals_record_stub_status():
     state = BotState.build_from_raw(raw)
 
     # Live: gamma_flip (Patch 11.2), iv_state (Patch 11.3.2),
-    #       exposures + walls (Patches 11.4 / 11.5)
+    #       exposures + walls (Patches 11.4 / 11.5),
+    #       technicals (Patch F.5.2 — only 'stub' when bars is empty)
     # Every other canonical should be stub.
     expected_stubs = ["pivots",
-                      "structure", "em_state", "technicals",
+                      "structure", "em_state",
                       "bias", "dealer_regime", "vol_regime", "potter_box",
                       "flow_state", "calendar"]
     for c in expected_stubs:
@@ -256,9 +257,9 @@ def test_stubbed_canonical_fields_are_none():
     # max_pain stays None — separate canonical, not yet wired.
     assert_is_none(state.max_pain, "max_pain None — separate canonical")
 
-    # Technicals
-    assert_is_none(state.rsi, "rsi None")
-    assert_is_none(state.macd_hist, "macd_hist None")
+    # Technicals: NOW LIVE via canonical_technicals (Patch F.5.2).
+    # rsi / macd_hist populate when bars are present in the raw inputs.
+    # (No assertion here — both None and non-None are valid depending on bars.)
 
     # Bias / regime
     assert_eq(state.dealer_regime, "unknown", "dealer_regime 'unknown'")
@@ -572,6 +573,80 @@ def test_build_technicals_from_raw_partial_bar_keys():
 
 
 # ───────────────────────────────────────────────────────────────────────
+# v11.7 (Patch F.5.2): BotState.build_from_raw technicals wiring tests.
+# ───────────────────────────────────────────────────────────────────────
+
+def test_build_from_raw_status_technicals_is_live():
+    """Spec F.5.2: BotState.build_from_raw with clean bars returns
+    status['technicals'] == 'live', NOT 'stub'. Confirms the wiring
+    landed and BotState is reading from canonical_technicals."""
+    bars = [
+        {"h": 100.0 + i + 0.5, "l": 100.0 + i - 0.5, "c": 100.0 + i,
+         "o": 100.0 + i - 0.2, "v": 1_000_000}
+        for i in range(100)
+    ]
+    raw = RawInputs(
+        ticker="TEST",
+        spot=199.0,
+        expiration="2026-05-09",
+        chain={},
+        quote={},
+        bars=bars,
+        iv_surface=None,
+        fetched_at_utc=datetime.now(timezone.utc),
+        fetch_errors=(),
+    )
+    state = BotState.build_from_raw(raw)
+    s = state.canonical_status.get("technicals")
+    if s != "live":
+        FAILED.append(
+            f"test_build_from_raw_status_technicals_is_live: "
+            f"Expected canonical_status['technicals']='live', got {s!r}. "
+            f"F.5.2 wiring did not land."
+        )
+        return
+    # Sanity: indicator values populated on the snapshot.
+    if state.rsi is None:
+        FAILED.append("test_build_from_raw_status_technicals_is_live: rsi should populate from helper")
+        return
+    if state.adx is None:
+        FAILED.append("test_build_from_raw_status_technicals_is_live: adx should populate from helper")
+        return
+    PASSED.append("test_build_from_raw_status_technicals_is_live")
+
+
+def test_build_from_raw_status_technicals_handles_bad_bars():
+    """If raw.bars is malformed, the helper's defensive guard kicks in
+    and returns all-None / adx=0.0; build_from_raw still runs cleanly
+    (permissive build contract)."""
+    raw = RawInputs(
+        ticker="TEST",
+        spot=199.0,
+        expiration="2026-05-09",
+        chain={},
+        quote={},
+        bars=[{"this_is_not_a_bar": "garbage"}],  # missing every OHLC key
+        iv_surface=None,
+        fetched_at_utc=datetime.now(timezone.utc),
+        fetch_errors=(),
+    )
+    state = BotState.build_from_raw(raw)
+    # Helper returned all-None on partial keys; status is "live" because no
+    # exception raised. Build did NOT crash — that's the contract.
+    s = state.canonical_status.get("technicals") or ""
+    if not (s == "live" or s.startswith("stub") or s.startswith("error")):
+        FAILED.append(
+            f"test_build_from_raw_status_technicals_handles_bad_bars: "
+            f"unexpected canonical_status {s!r}"
+        )
+        return
+    if state.ticker != "TEST":
+        FAILED.append("test_build_from_raw_status_technicals_handles_bad_bars: ticker lost")
+        return
+    PASSED.append("test_build_from_raw_status_technicals_handles_bad_bars")
+
+
+# ───────────────────────────────────────────────────────────────────────
 # Run all
 # ───────────────────────────────────────────────────────────────────────
 
@@ -599,6 +674,9 @@ def main():
         test_build_technicals_from_raw_handles_long_key_format,
         test_build_technicals_from_raw_empty_bars,
         test_build_technicals_from_raw_partial_bar_keys,
+        # v11.7 (Patch F.5.2): BotState.build_from_raw technicals wiring
+        test_build_from_raw_status_technicals_is_live,
+        test_build_from_raw_status_technicals_handles_bad_bars,
     ]
     for t in tests:
         try:

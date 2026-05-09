@@ -258,7 +258,10 @@ class BotState:
         pivots = _try_canonical("pivots", lambda: _stub("pivots"), status) or {}
         structure = _try_canonical("structure", lambda: _stub("structure"), status) or {}
         em_state = _try_canonical("em_state", lambda: _stub("em_state"), status) or {}
-        technicals = _try_canonical("technicals", lambda: _stub("technicals"), status) or {}
+        # v11.7 (Patch F.5.2): wire canonical_technicals via helper.
+        technicals = _try_canonical(
+            "technicals", lambda: _build_technicals_from_raw(raw), status
+        ) or {}
         bias = _try_canonical("bias", lambda: _stub("bias"), status) or {}
         regime = _try_canonical("dealer_regime", lambda: _stub("dealer_regime"), status) or {}
         vol_regime = _try_canonical("vol_regime", lambda: _stub("vol_regime"), status) or {}
