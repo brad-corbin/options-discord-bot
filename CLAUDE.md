@@ -60,6 +60,7 @@ Trading engine (production, ~11k lines):
 - `rate_limiter.py`, `thesis_monitor.py`, `schwab_stream.py`,
   `schwab_adapter.py`, `recommendation_tracker.py`, `persistent_state.py`,
   `oi_flow.py`, `position_monitor.py`, etc.
+- `active_scanner.py` — main intraday scanner (`_analyze_ticker`, ActiveScanner class). Technical-indicator helpers delegate to canonical_technicals as of Patch F.
 
 The Greeks / exposure math:
 - `options_exposure.py` — `ExposureEngine`, `UnifiedIVSurface`,
@@ -264,7 +265,7 @@ The pattern, in order:
 
 10. **Update CLAUDE.md if a major architectural decision was made.**
 
-What's done as of last session (v11.7 / Patch E):
+What's done as of last session (v11.7 / Patch F):
 - canonical_gamma_flip
 - canonical_iv_state (replaces a brief mistake — see "Audit discipline" below)
 - canonical_exposures (Greek aggregates: gex/dex/vanna/charm/gex_sign)
@@ -282,6 +283,7 @@ What's done as of last session (v11.7 / Patch E):
   with backtest_v3_runner.py:346-364 ind_adx quintile data). risk_manager's
   SMA-seeded _compute_adx is documented as DRIFT and reconciled in Patch F.
   Patch E is purely additive — no caller is modified.
+- Patch F (active_scanner technicals redirect) — `_compute_rsi/_compute_macd/_compute_ema/_compute_adx/_rma` in active_scanner.py are now thin delegation wrappers around `canonical_technicals.*`. Zero behavior change verified by `test_active_scanner_technicals_delegate.py` (6 tests including an `_analyze_ticker` end-to-end sanity check). Backtest imports keep working unchanged through the existing names. canonical_technicals is no longer library-with-no-readers — active_scanner is its first production consumer. Orphaned `MACD_FAST/SLOW/SIGNAL` constants in active_scanner.py deleted; canonical_technicals.MACD_FAST/SLOW/SIGNAL is the single source.
 - BotState with permissive build, 64 fields total, ~22 currently lit per ticker
 - Research page replaces the old Diagnostic placeholder
 - Multi-DTE walls drilldown (Patch D) — Research page WALLS section is now
@@ -304,10 +306,9 @@ WWhat's queued (in order):
   Reconciliation requires session-anchor and band-multiplier design decisions —
   it's not a stateless lift. Patch E was intentionally scoped to stateless
   indicators only; VWAP needs its own design pass.
-- Patch F: redirect active_scanner.py and risk_manager.py to consume from
-  canonical_technicals. Reconcile risk_manager's drifted ADX (document any
-  regime-classification shift in commit message). Add DRIFT comment marker
-  at risk_manager._compute_adx.
+- Patch G (or later): risk_manager ADX migration. risk_manager._compute_adx is SMA-seeded Wilder ADX, drifts from active_scanner's RMA-seeded variant (now canonical). Migration shifts ADX values, may shift regime classifier on borderline inputs. Plan: capture the actual numerical drift on real SPY data first (separate one-off script), include the drift in the commit message, gate behind env var if shift is meaningful.
+- Later patch: RSI consolidation across `app.py:_rsi`, `unified_models.py:_rsi` (Wilder-smoothed, different from canonical), `swing_scanner.py:_rsi` (Wilder-smoothed AND list-returning, different shape), `income_scanner.compute_rsi` (close to canonical, rounds to 1 decimal). Needs design pass — Wilder-smoothed canonical, OR migration with documented drift, OR list-returning canonical for swing_scanner. Multiple sub-patches when it lands.
+- Eventual cleanup: delete the `_compute_*` shims in active_scanner once nothing imports them. Requires confirming no external caller references the legacy names.
 
 **The recorder — V1 measurement infrastructure:**
 
