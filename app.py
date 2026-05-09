@@ -9548,6 +9548,36 @@ def _record_conviction_after_post(cp: dict, posted_to: str) -> None:
                     f"{cp.get('ticker','?')}: {_rec_g6_err}")
 
 
+# v11.7 (Patch G.9): engine versions registry — populated at boot.
+def register_engine_versions() -> None:
+    """Idempotent INSERT OR REPLACE of every known engine's version into
+    the engine_versions lookup table. Called once at boot. Master gate
+    must be on; if off, this is a no-op (DB may not even exist)."""
+    if not _alert_recorder._master_enabled():
+        return
+    try:
+        from oi_flow import CONVICTION_ENGINE_VERSION
+        import sqlite3 as _sqlite3
+        conn = _sqlite3.connect(_alert_recorder._db_path(), timeout=10.0)
+        now = _alert_recorder._utc_micros()
+        rows = [
+            ("long_call_burst",     LCB_ENGINE_VERSION,        now),
+            ("v2_5d",               V25D_ENGINE_VERSION,       now),
+            ("credit_v84",          CREDIT_ENGINE_VERSION,     now),
+            ("oi_flow_conviction",  CONVICTION_ENGINE_VERSION, now),
+        ]
+        conn.executemany(
+            "INSERT OR REPLACE INTO engine_versions "
+            "(engine, engine_version, recorded_at) VALUES (?,?,?)",
+            rows,
+        )
+        conn.commit()
+        conn.close()
+        log.info("recorder G.9: engine_versions populated (%d engines)", len(rows))
+    except Exception as e:
+        log.warning(f"engine_versions: register failed: {e}")
+
+
 def _try_post_long_call_burst(ticker: str, bias: str, spot: float,
                                 webhook_data: dict, exps: list,
                                 today, worker_id: int,
@@ -15312,6 +15342,15 @@ def _initialize_app():
                     start_producer(cached_md=_cached_md, redis_client=_get_redis())
                 except Exception as e:
                     log.warning(f"bot_state_producer startup failed: {e}")
+
+                # v11.7 (Patch G.9): apply DB migrations + register engine
+                # versions before daemons start so the schema is in place.
+                try:
+                    from db_migrate import apply_migrations
+                    apply_migrations(_alert_recorder._db_path())
+                    register_engine_versions()
+                except Exception as e:
+                    log.warning(f"recorder boot: setup failed: {e}")
 
                 # v11.7 (Patch G.7): start alert tracker daemon (gated by env var).
                 try:
