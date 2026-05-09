@@ -15313,6 +15313,13 @@ def _initialize_app():
                 except Exception as e:
                     log.warning(f"bot_state_producer startup failed: {e}")
 
+                # v11.7 (Patch G.7): start alert tracker daemon (gated by env var).
+                try:
+                    import alert_tracker_daemon as _atd
+                    _atd.start()
+                except Exception as e:
+                    log.warning(f"alert tracker daemon: failed to start: {e}")
+
                 # v8.5 (Phase 3.1 remediation): subscription gate for the
                 # ContinuousFlowScanner post path. The schwab_stream.py side
                 # of this was wired on the prior deploy but the app.py side
