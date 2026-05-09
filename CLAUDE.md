@@ -281,7 +281,7 @@ What's done as of last session (v11.7 / Patch F):
   out of active_scanner.py into canonical_technicals.py with wrapper-
   consistency tests. ADX uses active_scanner's RMA-seeded version (aligned
   with backtest_v3_runner.py:346-364 ind_adx quintile data). risk_manager's
-  SMA-seeded _compute_adx is documented as DRIFT and reconciled in Patch F.
+  SMA-seeded _compute_adx is documented as DRIFT and reconciled in a later patch.
   Patch E is purely additive — no caller is modified.
 - Patch F (active_scanner technicals redirect) — `_compute_rsi/_compute_macd/_compute_ema/_compute_adx/_rma` in active_scanner.py are now thin delegation wrappers around `canonical_technicals.*`. Zero behavior change verified by `test_active_scanner_technicals_delegate.py` (6 tests including an `_analyze_ticker` end-to-end sanity check). Backtest imports keep working unchanged through the existing names. canonical_technicals is no longer library-with-no-readers — active_scanner is its first production consumer. Orphaned `MACD_FAST/SLOW/SIGNAL` constants in active_scanner.py deleted; canonical_technicals.MACD_FAST/SLOW/SIGNAL is the single source.
 - BotState with permissive build, 64 fields total, ~22 currently lit per ticker
