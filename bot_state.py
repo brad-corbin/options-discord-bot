@@ -452,6 +452,68 @@ def _call_canonical_exposures(chain, spot, days_to_exp):
     return canonical_exposures(chain, spot=spot, days_to_exp=days_to_exp)
 
 
+# v11.7 (Patch F.5.1): canonical_technicals integration helper.
+def _build_technicals_from_raw(raw):
+    """Compute RSI / MACD / ADX from raw.bars using canonical_technicals.
+
+    Defensive about bar key naming: some upstream sources use
+    'high'/'low'/'close', others use 'h'/'l'/'c'. Mirrors the pattern at
+    risk_manager.py:275.
+
+    Returns a dict with keys: rsi (float|None), macd_line (float|None),
+    macd_signal (float|None), macd_hist (float|None), adx (float).
+
+    None values for RSI/MACD mean insufficient data (matching
+    canonical_technicals' return). ADX returns 0.0 on insufficient data
+    rather than None — this matches canonical_technicals.adx and lets
+    downstream scorers' ADX-quintile rules check for the zero sentinel
+    without special-casing None vs 0.0.
+
+    Forward-compat note: macd_line and macd_signal are returned but
+    BotState's dataclass currently only reads macd_hist (see
+    build_from_raw at lines ~324-326). The line/signal keys are
+    preserved for V2 when MACD line/signal land as their own BotState
+    fields. Don't delete them as "unused" — that would break the
+    forward-compat surface.
+    """
+    import canonical_technicals
+    bars = getattr(raw, "bars", None) or []
+    if not bars:
+        return {
+            "rsi": None,
+            "macd_line": None,
+            "macd_signal": None,
+            "macd_hist": None,
+            "adx": 0.0,
+        }
+
+    highs  = [b.get("h") or b.get("high")  for b in bars]
+    lows   = [b.get("l") or b.get("low")   for b in bars]
+    closes = [b.get("c") or b.get("close") for b in bars]
+
+    # Defend against partial bars — any None breaks the indicator math.
+    if not all(highs) or not all(lows) or not all(closes):
+        return {
+            "rsi": None,
+            "macd_line": None,
+            "macd_signal": None,
+            "macd_hist": None,
+            "adx": 0.0,
+        }
+
+    rsi_val = canonical_technicals.rsi(closes)
+    macd_dict = canonical_technicals.macd(closes) or {}
+    adx_val = canonical_technicals.adx(highs, lows, closes)
+
+    return {
+        "rsi":         rsi_val,
+        "macd_line":   macd_dict.get("macd_line"),
+        "macd_signal": macd_dict.get("signal_line"),
+        "macd_hist":   macd_dict.get("macd_hist"),
+        "adx":         adx_val,
+    }
+
+
 # ───────────────────────────────────────────────────────────────────────
 # UTILITIES
 # ───────────────────────────────────────────────────────────────────────

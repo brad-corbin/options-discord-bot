@@ -462,6 +462,116 @@ def test_walls_are_live_via_canonical_exposures():
 
 
 # ───────────────────────────────────────────────────────────────────────
+# v11.7 (Patch F.5.1): canonical_technicals integration tests.
+# ───────────────────────────────────────────────────────────────────────
+
+def test_build_technicals_from_raw_full_clean_bars():
+    """With ~100 clean bars, helper returns the same numbers as
+    canonical_technicals when called directly. Wrapper-consistency."""
+    from bot_state import _build_technicals_from_raw
+    import canonical_technicals as ct
+
+    # Build 100 synthetic bars (enough for RSI(14), MACD(26+9=35), ADX(14)).
+    # Use a simple linear ramp so the indicators have nonzero, deterministic
+    # values.
+    bars = [
+        {"h": 100.0 + i + 0.5, "l": 100.0 + i - 0.5, "c": 100.0 + i,
+         "o": 100.0 + i - 0.2, "v": 1_000_000}
+        for i in range(100)
+    ]
+
+    class FakeRaw:
+        ticker = "TEST"
+        bars = None  # set below
+    raw = FakeRaw()
+    raw.bars = bars
+
+    result = _build_technicals_from_raw(raw)
+
+    # Wrapper-consistency: each value matches canonical_technicals' output.
+    closes = [b["c"] for b in bars]
+    highs  = [b["h"] for b in bars]
+    lows   = [b["l"] for b in bars]
+    expected_rsi = ct.rsi(closes)
+    expected_macd = ct.macd(closes)
+    expected_adx = ct.adx(highs, lows, closes)
+
+    assert result["rsi"] == expected_rsi, \
+        f"RSI drift: helper={result['rsi']}, canonical={expected_rsi}"
+    assert result["macd_line"] == expected_macd.get("macd_line"), \
+        f"MACD line drift: helper={result['macd_line']}, canonical={expected_macd.get('macd_line')}"
+    assert result["macd_signal"] == expected_macd.get("signal_line"), \
+        f"MACD signal drift"
+    assert result["macd_hist"] == expected_macd.get("macd_hist"), \
+        f"MACD hist drift"
+    assert result["adx"] == expected_adx, \
+        f"ADX drift: helper={result['adx']}, canonical={expected_adx}"
+    PASSED.append("test_build_technicals_from_raw_full_clean_bars")
+
+
+def test_build_technicals_from_raw_handles_long_key_format():
+    """Bars using 'high'/'low'/'close' (not h/l/c) must work — defensive
+    pattern from risk_manager.py:275."""
+    from bot_state import _build_technicals_from_raw
+    import canonical_technicals as ct
+
+    bars = [
+        {"high": 100.0 + i + 0.5, "low": 100.0 + i - 0.5, "close": 100.0 + i}
+        for i in range(100)
+    ]
+    class FakeRaw:
+        ticker = "TEST"
+        bars = None
+    raw = FakeRaw()
+    raw.bars = bars
+    result = _build_technicals_from_raw(raw)
+
+    closes = [b["close"] for b in bars]
+    assert result["rsi"] == ct.rsi(closes)
+    assert result["macd_hist"] == ct.macd(closes).get("macd_hist")
+    PASSED.append("test_build_technicals_from_raw_handles_long_key_format")
+
+
+def test_build_technicals_from_raw_empty_bars():
+    """Empty bars list -> all-None RSI/MACD, ADX=0.0 (matches canonical_technicals
+    convention)."""
+    from bot_state import _build_technicals_from_raw
+
+    class FakeRaw:
+        ticker = "TEST"
+        bars = []
+    raw = FakeRaw()
+
+    result = _build_technicals_from_raw(raw)
+    assert result["rsi"] is None
+    assert result["macd_line"] is None
+    assert result["macd_signal"] is None
+    assert result["macd_hist"] is None
+    assert result["adx"] == 0.0, "ADX is 0.0 on insufficient data, not None"
+    PASSED.append("test_build_technicals_from_raw_empty_bars")
+
+
+def test_build_technicals_from_raw_partial_bar_keys():
+    """A bar missing one of the OHLC keys -> all-None/0.0. The helper does
+    not silently fill in zeros that would corrupt the math."""
+    from bot_state import _build_technicals_from_raw
+
+    bars = [{"h": 100.0, "l": 99.0, "c": 99.5} for _ in range(50)]
+    bars[10] = {"h": 100.0, "l": 99.0}  # missing close -> must trip defense
+    class FakeRaw:
+        ticker = "TEST"
+        bars = None
+    raw = FakeRaw()
+    raw.bars = bars
+
+    result = _build_technicals_from_raw(raw)
+    assert result["rsi"] is None
+    assert result["macd_hist"] is None
+    assert result["adx"] == 0.0
+    PASSED.append("test_build_technicals_from_raw_partial_bar_keys")
+
+
+# ───────────────────────────────────────────────────────────────────────
 # Run all
 # ───────────────────────────────────────────────────────────────────────
 
@@ -484,6 +594,11 @@ def main():
         test_iv_state_handles_empty_chain_gracefully,
         test_exposures_is_live_via_canonical,
         test_walls_are_live_via_canonical_exposures,
+        # v11.7 (Patch F.5.1): canonical_technicals integration
+        test_build_technicals_from_raw_full_clean_bars,
+        test_build_technicals_from_raw_handles_long_key_format,
+        test_build_technicals_from_raw_empty_bars,
+        test_build_technicals_from_raw_partial_bar_keys,
     ]
     for t in tests:
         try:
