@@ -4405,7 +4405,7 @@ def _post_v2_review_card_under_v1(result: dict):
         def _post_to_chat(chat_id: str, text: str):
             return _tg_rate_limited_post(text, chat_id=chat_id)
 
-        post_v2_under_v1(
+        _v2_post_status = post_v2_under_v1(
             ticker=_ticker,
             bias=_bias,
             telegram_chat_id=TELEGRAM_CHAT_ID,
@@ -4426,6 +4426,27 @@ def _post_v2_review_card_under_v1(result: dict):
             enabled=V2_5D_EDGE_ENABLED,
             post_enabled=V2_5D_EDGE_POST_UNDER_V1,
         )
+
+        # v11.7 (Patch G.4): record V2 5D alert after successful main-channel post.
+        # Master gate RECORDER_ENABLED + RECORDER_V25D_ENABLED both default off;
+        # when off record_alert is a no-op. Failures swallowed so recorder
+        # NEVER affects the V2 5D card flow.
+        if isinstance(_v2_post_status, dict) and _v2_post_status.get("posted"):
+            _v25d_v2_result = _v2_post_status.get("v2_result")
+            _v25d_spot = _v2_post_status.get("spot")
+            if _v25d_v2_result is not None:
+                try:
+                    _alert_recorder.record_alert(
+                        **_build_v25d_alert_payload(
+                            ticker=_ticker,
+                            spot=float(_v25d_spot or 0.0),
+                            v2_result=_v25d_v2_result,
+                            canonical_snapshot={},  # no canonical snapshot in scope here
+                            webhook_data=_webhook_data or {},
+                        )
+                    )
+                except Exception as _rec_err:
+                    log.warning(f"recorder G.4: V2 5D hook failed for {_ticker}: {_rec_err}")
     except Exception as _v2_err:
         log.warning(f"V2 5D review card failed under V1: {_v2_err}")
 
@@ -4639,6 +4660,21 @@ def _maybe_post_v2_orphan(ticker, bias, v2_result, v1_status,
                          card_mode="orphan_posted", bias=bias)
         log.info(f"V2 ORPHAN POSTED: {ticker} {bias} grade={grade} "
                  f"(V1 silent: {v1_status})")
+
+        # v11.7 (Patch G.4): record V2 5D orphan alert after successful main-channel post.
+        # Same gate semantics as the under-V1 hook above. Failures swallowed.
+        try:
+            _alert_recorder.record_alert(
+                **_build_v25d_alert_payload(
+                    ticker=ticker,
+                    spot=float(spot or 0.0),
+                    v2_result=v2_result,
+                    canonical_snapshot={},  # no canonical snapshot in scope here
+                    webhook_data=webhook_data or {},
+                )
+            )
+        except Exception as _rec_err:
+            log.warning(f"recorder G.4: V2 5D orphan hook failed for {ticker}: {_rec_err}")
         return True
     except Exception as e:
         log.warning(f"V2 orphan post failed for {ticker} {bias}: {e}")
@@ -8973,7 +9009,8 @@ def _v84_credit_vehicle_reject_reason(spread: dict) -> str:
 
 def _post_v84_credit_card(ticker: str, direction: str, spot: float,
                           expiry: str, regime_trend: str,
-                          webhook_data: dict, chains=None):
+                          webhook_data: dict, chains=None,
+                          v2_5d_parent_alert_id=None):  # v11.7 (Patch G.4)
     """Post a v8.4 credit spread card alongside the debit card.
 
     Runs at the end of a successful check_ticker() debit post. Gated by
@@ -9310,7 +9347,7 @@ def _build_lcb_alert_payload(*, ticker: str, bias: str, spot: float,
         "entry_mark": entry_mark,
     }
     features = {
-        "v2_5d_grade":          getattr(v2_result, "grade", None),
+        "v2_5d_grade":          getattr(v2_result, "setup_grade", None) or getattr(v2_result, "grade", None),
         "momentum_burst_label": getattr(v2_result, "momentum_burst_label", None),
         "momentum_burst_score": getattr(v2_result, "momentum_burst_score", None),
         "rsi":                  getattr(v2_result, "rsi", None),
@@ -9338,9 +9375,61 @@ def _build_lcb_alert_payload(*, ticker: str, bias: str, spot: float,
     )
 
 
+# v11.7 (Patch G.4): alert recorder helper — V2 5D EDGE MODEL.
+# Pure function: builds the kwargs dict consumed by
+# _alert_recorder.record_alert from the V2 5D card-post site. V2 5D is a
+# classifier (grade A+/A/B/SHADOW/BLOCK), not a vehicle picker, so
+# suggested_dte is None and suggested_structure is a sentinel
+# {"type": "evaluation"}. Bump V25D_ENGINE_VERSION whenever the V2 5D
+# scoring weights or classification thresholds change so recorded alerts
+# remain queryable by engine version.
+V25D_ENGINE_VERSION = "v2_5d@v8.4.2"
+
+
+def _build_v25d_alert_payload(*, ticker: str, spot: float, v2_result,
+                              canonical_snapshot, webhook_data):
+    """Build kwargs for _alert_recorder.record_alert from a V2SetupResult.
+
+    Pure function — no I/O. Missing attributes on v2_result resolve to
+    None via getattr defaults; some attribute names listed below are
+    aspirational (not on the current V2SetupResult dataclass) but harmless
+    when absent."""
+    grade = getattr(v2_result, "setup_grade", None) or getattr(v2_result, "grade", None)
+    direction = getattr(v2_result, "bias", None) or getattr(v2_result, "direction", None)
+    features = {
+        "v2_5d_grade":           grade,
+        "setup_archetype":       getattr(v2_result, "setup_archetype", None),
+        "action":                getattr(v2_result, "action", None),
+        "final_action":          getattr(v2_result, "final_action", None),
+        "trade_expression":      getattr(v2_result, "trade_expression", None),
+        "vehicle_status":        getattr(v2_result, "vehicle_status", None),
+        "momentum_burst_score":  getattr(v2_result, "momentum_burst_score", None),
+        "momentum_burst_label":  getattr(v2_result, "momentum_burst_label", None),
+        "historical_proxy_wr":   getattr(v2_result, "historical_proxy_wr", None),
+        "mtf_alignment":         getattr(v2_result, "mtf_alignment", None),
+        "hold_window":           getattr(v2_result, "hold_window", None),
+    }
+    return dict(
+        engine="v2_5d",
+        engine_version=V25D_ENGINE_VERSION,
+        ticker=ticker,
+        classification=grade,
+        direction=direction,
+        suggested_structure={"type": "evaluation"},
+        suggested_dte=None,
+        spot_at_fire=spot,
+        canonical_snapshot=canonical_snapshot,
+        raw_engine_payload=webhook_data,
+        features=features,
+        telegram_chat="main",
+        parent_alert_id=None,
+    )
+
+
 def _try_post_long_call_burst(ticker: str, bias: str, spot: float,
                                 webhook_data: dict, exps: list,
-                                today, worker_id: int) -> bool:
+                                today, worker_id: int,
+                                v2_5d_parent_alert_id=None) -> bool:  # v11.7 (Patch G.4)
     """v8.4 (Phase 2.6): Try to post a Long Call Burst card.
 
     v8.4 (Phase 2.5b — Patch N): returns (posted_bool, vehicle_id).
@@ -9568,9 +9657,9 @@ def _try_post_long_call_burst(ticker: str, bias: str, spot: float,
         # v11.7 (Patch G.3): record alert after successful post.
         # Master gate RECORDER_ENABLED + RECORDER_LCB_ENABLED both default
         # off; when off record_alert is a no-op. Failures swallowed so
-        # recorder NEVER affects LCB. parent_alert_id is wired as a kwarg
-        # but always None for now — G.4 (V2 5D) will pass through the
-        # parent's alert_id once V2 5D records first.
+        # recorder NEVER affects LCB.
+        # v11.7 (Patch G.4): parent_alert_id now flows through from caller
+        # scope when V2 5D recorded first; default None when no V2 parent.
         try:
             _lcb_payload = _build_lcb_alert_payload(
                 ticker=ticker, bias=bias, spot=spot,
@@ -9581,7 +9670,7 @@ def _try_post_long_call_burst(ticker: str, bias: str, spot: float,
                 dte_days=_cand_td,
                 canonical_snapshot={},  # G.3: no snapshot in scope; G-future may add
                 webhook_data=webhook_data or {},
-                v2_5d_parent_alert_id=None,  # G.4 wires this; G.3 leaves null.
+                v2_5d_parent_alert_id=v2_5d_parent_alert_id,  # v11.7 (Patch G.4): from caller scope.
             )
             _alert_recorder.record_alert(**_lcb_payload)
         except Exception as _rec_err:

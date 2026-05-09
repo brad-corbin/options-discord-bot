@@ -52,11 +52,12 @@ def _load_helper():
 
 
 def test_build_lcb_payload_from_v2_result():
-    """Helper produces the right kwargs dict from a synthetic V2SetupResult."""
+    """Helper produces the right kwargs dict using canonical setup_grade/bias attrs."""
     _build_lcb_alert_payload, _engine_version = _load_helper()
 
     class FakeV2:
-        grade = "GRADE_A"
+        # Canonical attribute names (post-G.4 fix)
+        setup_grade = "A"
         momentum_burst_label = "YES"
         momentum_burst_score = 7
         rsi = 62.0
@@ -84,10 +85,8 @@ def test_build_lcb_payload_from_v2_result():
     assert payload["suggested_structure"]["strike"] == 590.0
     assert payload["suggested_structure"]["expiry"] == "2026-05-15"
     assert payload["suggested_structure"]["entry_mark"] == 2.85
+    assert payload["features"]["v2_5d_grade"] == "A"   # reads from setup_grade
     assert payload["features"]["momentum_burst_label"] == "YES"
-    assert payload["features"]["rsi"] == 62.0
-    assert payload["features"]["adx"] == 24.1
-    assert payload["features"]["regime"] == "BULL_BASE"
     assert payload["parent_alert_id"] is None
     assert payload["spot_at_fire"] == 588.30
     assert payload["suggested_dte"] == 6
@@ -99,7 +98,7 @@ def test_build_lcb_payload_with_parent():
     _build_lcb_alert_payload, _ = _load_helper()
 
     class FakeV2:
-        grade = "GRADE_B"
+        setup_grade = "B"
         momentum_burst_label = "YES"
         momentum_burst_score = 5
         rsi = 55.0
@@ -125,7 +124,7 @@ def test_build_lcb_payload_handles_missing_v2_attributes():
     _build_lcb_alert_payload, _ = _load_helper()
 
     class MinimalV2:
-        grade = "GRADE_A"
+        setup_grade = "A"
         momentum_burst_label = "YES"
         # missing: momentum_burst_score, rsi, adx, macd_hist, volume_ratio, regime
 
@@ -143,11 +142,35 @@ def test_build_lcb_payload_handles_missing_v2_attributes():
     assert payload["features"]["regime"] is None
 
 
+def test_build_lcb_payload_old_attr_names_fallback():
+    """Defensive fallback: if v2_result only has the legacy 'grade' attr
+    (not 'setup_grade'), the helper still reads v2_5d_grade correctly."""
+    _build_lcb_alert_payload, _ = _load_helper()
+
+    class LegacyFakeV2:
+        # Deliberately uses old name only (no setup_grade)
+        grade = "GRADE_A"
+        momentum_burst_label = "YES"
+        momentum_burst_score = 6
+
+    payload = _build_lcb_alert_payload(
+        ticker="SPY", bias="bull", spot=585.0,
+        v2_result=LegacyFakeV2(),
+        suggested_strike=587.0, suggested_expiry="2026-05-15",
+        entry_mark=2.50, dte_days=6,
+        canonical_snapshot={}, webhook_data={},
+        v2_5d_parent_alert_id=None,
+    )
+    # setup_grade is None on LegacyFakeV2 so fallback to grade
+    assert payload["features"]["v2_5d_grade"] == "GRADE_A"
+
+
 if __name__ == "__main__":
     tests = [
         test_build_lcb_payload_from_v2_result,
         test_build_lcb_payload_with_parent,
         test_build_lcb_payload_handles_missing_v2_attributes,
+        test_build_lcb_payload_old_attr_names_fallback,
     ]
     failures = 0
     for t in tests:

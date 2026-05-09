@@ -142,6 +142,10 @@ def post_v2_under_v1(
             "setup_archetype": result.setup_archetype,
             "action": result.action,
             "best_spread": best_spread,
+            # v11.7 (Patch G.4): expose V2SetupResult + spot to caller so
+            # the alert recorder can record this as a V2 5D alert.
+            "v2_result": result,
+            "spot": spot,
         }
     except Exception as e:
         if log_warning_fn:
