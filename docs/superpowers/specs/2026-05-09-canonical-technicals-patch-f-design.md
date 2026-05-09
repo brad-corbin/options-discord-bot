@@ -32,7 +32,7 @@ Source: `active_scanner.py` lines 99-260. Targets: `canonical_technicals.py`.
 | `_compute_macd(closes)` | 125-146 | `canonical_technicals.macd(closes)` | Public-style helper; called at active_scanner.py:344 and the same backtest files |
 | `_compute_ema(values, period)` | 99-106 | `canonical_technicals._ema(values, period)` | Used internally by `_compute_macd` AND by `_compute_wavetrend` (which Patch E did NOT lift); also called from active_scanner.py:336/337/371/372 and backtest equivalents |
 | `_compute_adx(highs, lows, closes, length=14)` | 213-260 | `canonical_technicals.adx(highs, lows, closes, length)` | Called at active_scanner.py:352 and backtest/bt_active_v8.py |
-| `_rma(values, length)` | 195-210 | `canonical_technicals._rma(values, length)` | Used internally by `_compute_adx`; not imported externally per current grep, but kept as a delegation wrapper for safety |
+| `_rma(values, length)` | 195-210 | `canonical_technicals._rma(values, length)` | Used internally by `_compute_adx`; imported by `test_canonical_technicals.py:277` (`from active_scanner import _rma`) for wrapper-consistency tests; kept as a delegation wrapper for that and any future external callers |
 
 After F.2, every active_scanner technical-indicator call (including `_compute_wavetrend`'s internal use of `_compute_ema`) lands in canonical_technicals. The `_compute_wavetrend` function itself stays native — its lift is a future patch.
 
@@ -55,6 +55,27 @@ assert _compute_rsi(closes) == rsi(closes)
 ```
 
 Verifies: (a) the active_scanner name is importable, (b) it produces the same output as canonical_technicals' counterpart. Hardcoded goldens would duplicate canonical_technicals' own tests and create maintenance debt.
+
+**Test file header comment (per Brad's refinement #2).** The new file's module docstring must explain its purpose to future readers — particularly that the assertions become tautological after F.2 lands but still serve a real role:
+
+```python
+"""
+test_active_scanner_technicals_delegate.py — Verify the F.2 shim wiring.
+
+Pre-F.2: this test confirms active_scanner._compute_* matches
+canonical_technicals.* (already true — Patch E proved byte-identicalness).
+
+Post-F.2: this test verifies the shim wiring — that active_scanner.X is
+importable, present in the namespace, and delegates correctly. The
+equality assertions become tautological (both paths call the same code),
+but the test still catches: broken imports, missing names, accidental
+deletion of a delegation wrapper, AttributeError on the canonical_technicals
+side, and end-to-end composition via _analyze_ticker.
+
+Math correctness is verified by test_canonical_technicals.py — don't
+duplicate that work here.
+"""
+```
 
 **Test functions** (one per delegation + one end-to-end):
 
@@ -105,7 +126,22 @@ def _compute_adx(highs: list, lows: list, closes: list, length: int = 14) -> flo
     return canonical_technicals.adx(highs, lows, closes, length)
 ```
 
-Each replaces the existing function body. Function signature, return type annotation, and the constants block (`MACD_FAST = 12`, etc., lines 82-87) all stay untouched. The `_compute_wavetrend` function (lines 149-184) stays native — it now calls the delegated `_compute_ema`, which routes to canonical_technicals._ema. Same math, no Wavetrend behavior change.
+Each replaces the existing function body. Function signatures and return type annotations stay untouched.
+
+**MACD constants — delete in F.2 (per Brad's polish item #1).** Pre-F.2 verification confirms `MACD_FAST`, `MACD_SLOW`, and `MACD_SIGNAL` (active_scanner.py:82-84) are referenced only inside `_compute_macd`'s body (lines 126-134) and are not imported externally:
+
+- `grep -nE "MACD_FAST|MACD_SLOW|MACD_SIGNAL" active_scanner.py` returns only their definitions and uses inside `_compute_macd`.
+- `grep -rnE "from active_scanner import.*MACD_|active_scanner\.MACD_" --include="*.py"` returns no matches.
+
+Once `_compute_macd`'s body is replaced with the delegation, the three constants become dead code. Delete them in the same F.2 commit. Replace lines 82-84 with a single one-line breadcrumb so future readers can grep their way to canonical_technicals:
+
+```python
+# MACD_FAST/SLOW/SIGNAL moved to canonical_technicals.MACD_FAST/SLOW/SIGNAL (Patch F).
+```
+
+Surrounding constants in the same block (`EMA_FAST`, `EMA_SLOW`, `RSI_PERIOD`, `WT_CHANNEL`, `WT_AVERAGE`) are still used by `_analyze_ticker` (336/337/348) and `_compute_wavetrend` (152/167) — they stay.
+
+The `_compute_wavetrend` function (lines 149-184) stays native — it now calls the delegated `_compute_ema`, which routes to canonical_technicals._ema. Same math, no Wavetrend behavior change.
 
 **Add the import.** Locate the existing import block near the top of `active_scanner.py` (lines 38-52, ending with `from ticker_rules import (...)`). Append a blank line followed by:
 
@@ -120,7 +156,7 @@ The import lands after the existing block and before the `log = logging.getLogge
 **Verification (per Brad's refinement #3):**
 1. `python test_active_scanner_technicals_delegate.py` — must pass all 6 tests including the `_analyze_ticker` smoke test, confirming the shim chain composes correctly.
 2. `python test_canonical_technicals.py` — still passes (tautologically — wrapper-consistency tests now compare canonical_technicals to itself, but they pass).
-3. `python test_raw_inputs.py / test_canonical_gamma_flip.py / test_canonical_iv_state.py / test_canonical_exposures.py / test_canonical_expiration.py / test_bot_state.py` — no regression in any sibling canonical suite.
+3. `python test_raw_inputs.py / test_canonical_gamma_flip.py / test_canonical_iv_state.py / test_canonical_exposures.py / test_canonical_expiration.py / test_bot_state.py / test_bot_state_producer.py / test_research_data_consumer.py` — no regression in any sibling canonical or producer/consumer suite (per Brad's polish item #4).
 4. AST-check: `python -c "import ast; ast.parse(open('active_scanner.py').read())"` passes.
 5. Importability check: `python -c "import active_scanner; print(active_scanner._compute_rsi([100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114]))"` produces a number (not an exception).
 
@@ -156,7 +192,7 @@ Three small edits:
 | F.1 acceptance | `python test_active_scanner_technicals_delegate.py` | All 6 tests pass against native implementations |
 | F.2 verification 1 | `python test_active_scanner_technicals_delegate.py` | Same 6 tests still pass against delegations |
 | F.2 verification 2 | `python test_canonical_technicals.py` | All 21 tests pass (now tautological for wrapper-consistency tests) |
-| F.2 verification 3 | All 6 sibling canonical suites | All pass — no regression |
+| F.2 verification 3 | All 8 sibling canonical / producer / consumer suites | All pass — no regression |
 | F.2 verification 4 | AST-check active_scanner.py | Silent success |
 | F.2 verification 5 | Importability smoke | `_compute_rsi(...)` returns a number, not exception |
 | F.3 acceptance | `git diff CLAUDE.md` | Only the three planned edits visible |
@@ -178,7 +214,7 @@ After Patch F ships:
 1. `active_scanner._compute_rsi/_compute_macd/_compute_ema/_compute_adx/_rma` exist as thin one-line delegations to `canonical_technicals.*`.
 2. `_compute_wavetrend` is unchanged but routes through canonical via the delegated `_compute_ema`.
 3. `test_active_scanner_technicals_delegate.py` exists with 6 tests, all passing.
-4. All existing tests pass — `test_canonical_technicals.py` (21 tests, now partly tautological), `test_raw_inputs.py`, `test_canonical_gamma_flip.py`, `test_canonical_iv_state.py`, `test_canonical_exposures.py`, `test_canonical_expiration.py`, `test_bot_state.py`.
+4. All existing tests pass — `test_canonical_technicals.py` (21 tests, now partly tautological), `test_raw_inputs.py`, `test_canonical_gamma_flip.py`, `test_canonical_iv_state.py`, `test_canonical_exposures.py`, `test_canonical_expiration.py`, `test_bot_state.py`, `test_bot_state_producer.py`, `test_research_data_consumer.py`.
 5. CLAUDE.md updated: active_scanner repo-layout note clarified, Patch F moved to "done" section, Patch G (risk_manager) and the broader RSI consolidation queued explicitly.
 6. Three commits, each with `Patch F.N:` prefix on the message; each AST-checked; nothing else modified.
 
