@@ -684,6 +684,13 @@ from oi_flow import FlowDetector, FLOW_TICKERS
 from potter_box import PotterBoxScanner
 import recommendation_tracker as _rt_mod
 
+# v11.7 (Patch G.3): alert recorder wire — write-side module for the
+# canonical recorder. Engines call _alert_recorder.record_alert(...) after
+# their card posts. Master gate RECORDER_ENABLED + per-engine
+# RECORDER_<ENGINE>_ENABLED both default off; when off record_alert is a
+# no-op. Recorder failures NEVER propagate back to engines.
+import alert_recorder as _alert_recorder
+
 # ── v4.3: Thesis Monitor ──
 from thesis_monitor import (
     get_engine as get_thesis_engine,
@@ -9280,6 +9287,57 @@ def _post_v84_credit_card(ticker: str, direction: str, spot: float,
 # care about. This hook fires right after _mark_scorer_posted so the credit card
 # gets its own chance regardless of whether the debit side can place a spread.
 
+# v11.7 (Patch G.3): alert recorder helper — LONG CALL BURST.
+# Pure function: builds the kwargs dict consumed by
+# _alert_recorder.record_alert from local state at the LCB post site.
+# Tested hermetically by test_alert_recorder_lcb_wire.py. Bump
+# LCB_ENGINE_VERSION whenever the LCB classifier or scoring weights
+# change so recorded alerts are queryable by engine version.
+LCB_ENGINE_VERSION = "long_call_burst@v8.4.2"
+
+
+def _build_lcb_alert_payload(*, ticker: str, bias: str, spot: float,
+                             v2_result, suggested_strike, suggested_expiry,
+                             entry_mark, dte_days, canonical_snapshot,
+                             webhook_data, v2_5d_parent_alert_id):
+    """Build the kwargs dict for _alert_recorder.record_alert from the
+    LCB post site's local state. Pure function — no I/O. Missing
+    attributes on v2_result resolve to None via getattr defaults."""
+    suggested_structure = {
+        "type":       "long_call",
+        "strike":     suggested_strike,
+        "expiry":     suggested_expiry,
+        "entry_mark": entry_mark,
+    }
+    features = {
+        "v2_5d_grade":          getattr(v2_result, "grade", None),
+        "momentum_burst_label": getattr(v2_result, "momentum_burst_label", None),
+        "momentum_burst_score": getattr(v2_result, "momentum_burst_score", None),
+        "rsi":                  getattr(v2_result, "rsi", None),
+        "adx":                  getattr(v2_result, "adx", None),
+        "macd_hist":            getattr(v2_result, "macd_hist", None),
+        "volume_ratio":         getattr(v2_result, "volume_ratio", None),
+        "regime":               getattr(v2_result, "regime", None),
+        "bias":                 bias,
+        "dte_days":             dte_days,
+    }
+    return dict(
+        engine="long_call_burst",
+        engine_version=LCB_ENGINE_VERSION,
+        ticker=ticker,
+        classification="BURST_YES",
+        direction=bias,
+        suggested_structure=suggested_structure,
+        suggested_dte=dte_days,
+        spot_at_fire=spot,
+        canonical_snapshot=canonical_snapshot,
+        raw_engine_payload=webhook_data,
+        features=features,
+        telegram_chat="main",
+        parent_alert_id=v2_5d_parent_alert_id,
+    )
+
+
 def _try_post_long_call_burst(ticker: str, bias: str, spot: float,
                                 webhook_data: dict, exps: list,
                                 today, worker_id: int) -> bool:
@@ -9506,6 +9564,29 @@ def _try_post_long_call_burst(ticker: str, bias: str, spot: float,
         except Exception as _rec_err:
             log.warning(f"[worker-{worker_id}] burst routing: rec-tracker write "
                         f"failed for {ticker} (post already shipped): {_rec_err}")
+
+        # v11.7 (Patch G.3): record alert after successful post.
+        # Master gate RECORDER_ENABLED + RECORDER_LCB_ENABLED both default
+        # off; when off record_alert is a no-op. Failures swallowed so
+        # recorder NEVER affects LCB. parent_alert_id is wired as a kwarg
+        # but always None for now — G.4 (V2 5D) will pass through the
+        # parent's alert_id once V2 5D records first.
+        try:
+            _lcb_payload = _build_lcb_alert_payload(
+                ticker=ticker, bias=bias, spot=spot,
+                v2_result=_v2_res,
+                suggested_strike=_strike_f,
+                suggested_expiry=_cand_exp,
+                entry_mark=_debit_f,
+                dte_days=_cand_td,
+                canonical_snapshot={},  # G.3: no snapshot in scope; G-future may add
+                webhook_data=webhook_data or {},
+                v2_5d_parent_alert_id=None,  # G.4 wires this; G.3 leaves null.
+            )
+            _alert_recorder.record_alert(**_lcb_payload)
+        except Exception as _rec_err:
+            log.warning(f"[worker-{worker_id}] recorder G.3: hook failed for "
+                        f"{ticker}: {_rec_err}")
 
         # vehicle_id is deterministic per (ticker, strike, expiry).
         return (True, _vid)
