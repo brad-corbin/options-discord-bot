@@ -89,6 +89,10 @@ Canonical rebuild (the v11 work — see "Canonical rebuild" below):
 - `canonical_iv_state.py` — wraps `UnifiedIVSurface`
 - `canonical_exposures.py` — wraps `ExposureEngine.compute()`
 - `canonical_expiration.py` — picks chain expiration by intent (zero_dte / front / t7 / t30 / t60)
+- `canonical_technicals.py` — RSI / MACD / ADX lifted byte-identically
+  from `active_scanner._compute_rsi/_compute_macd/_compute_adx` (Patch E).
+  Pure additive lift. Patch F redirects callers and reconciles
+  risk_manager's drifted ADX.
 - `bot_state_producer.py` — Patch B daemon. Three-tier loop (front/t7/t30+t60)
   that periodically computes BotState per (ticker, intent) and writes JSON
   envelopes to Redis. Gated by `BOT_STATE_PRODUCER_ENABLED`. Consumer is
@@ -260,7 +264,7 @@ The pattern, in order:
 
 10. **Update CLAUDE.md if a major architectural decision was made.**
 
-What's done as of last session (v11.7 / Patch D):
+What's done as of last session (v11.7 / Patch E):
 - canonical_gamma_flip
 - canonical_iv_state (replaces a brief mistake — see "Audit discipline" below)
 - canonical_exposures (Greek aggregates: gex/dex/vanna/charm/gex_sign)
@@ -272,6 +276,12 @@ What's done as of last session (v11.7 / Patch D):
   in Research page. Side effect: Research walls now use front non-0-DTE
   chains per ticker. Patch B (producer daemon) not yet shipped, so the page
   is still slow — only the EXPIRATION choice changed in this patch.
+- canonical_technicals (Patch E) — RSI / MACD / ADX lifted byte-identically
+  out of active_scanner.py into canonical_technicals.py with wrapper-
+  consistency tests. ADX uses active_scanner's RMA-seeded version (aligned
+  with backtest_v3_runner.py:346-364 ind_adx quintile data). risk_manager's
+  SMA-seeded _compute_adx is documented as DRIFT and reconciled in Patch F.
+  Patch E is purely additive — no caller is modified.
 - BotState with permissive build, 64 fields total, ~22 currently lit per ticker
 - Research page replaces the old Diagnostic placeholder
 - Multi-DTE walls drilldown (Patch D) — Research page WALLS section is now
@@ -289,17 +299,15 @@ What's done as of last session (v11.7 / Patch D):
 WWhat's queued (in order):
 
 **Foundation work (additive, no behavior change to trading path):**
-- canonical_technicals (Patch E) — lift _compute_rsi / _compute_macd /
-  _compute_ema / _compute_wavetrend / _compute_adx / _rma byte-identically
-  from active_scanner.py and risk_manager.py into canonical_technicals.py.
-  Wrapper-consistency tests prove identical output. active_scanner is NOT
-  touched in Patch E. _compute_adx exists in 3 places today
-  (active_scanner.py:213, risk_manager.py:335, ported from
-  backtest_v3_runner.py per code comment) — Patch E consolidates.
-- active_scanner uses canonical (Patch F) — replace inline _compute_*
-  calls with imports from canonical_technicals. Same math, same output,
-  only import path changes. Each module migration in a separate commit,
-  each independently revertable.
+- Patch E.5 (or later): canonical_vwap — session VWAP + bands. Three
+  implementations exist today (vwap_bands.py, bar_state.py, income_scanner.py).
+  Reconciliation requires session-anchor and band-multiplier design decisions —
+  it's not a stateless lift. Patch E was intentionally scoped to stateless
+  indicators only; VWAP needs its own design pass.
+- Patch F: redirect active_scanner.py and risk_manager.py to consume from
+  canonical_technicals. Reconcile risk_manager's drifted ADX (document any
+  regime-classification shift in commit message). Add DRIFT comment marker
+  at risk_manager._compute_adx.
 
 **The recorder — V1 measurement infrastructure:**
 
@@ -600,6 +608,7 @@ python3 test_canonical_iv_state.py
 python3 test_canonical_exposures.py
 python3 test_canonical_expiration.py
 python3 test_bot_state.py
+python3 test_canonical_technicals.py
 
 # Patch B producer test (fake Redis, fake Schwab, no network)
 python3 test_bot_state_producer.py
