@@ -106,3 +106,83 @@ def macd(closes: list) -> Dict:
                            and macd_line[-2] > signal[-2]
                            and macd_line[-1] < signal[-1]) if signal else False,
     }
+
+
+# v11.7 (Patch E.3): _rma (Wilder's recursive moving average) lifted
+# byte-identically from active_scanner._rma. Used by adx().
+def _rma(values: list, length: int) -> list:
+    """Wilder's smoothing (RMA). Recursive moving average.
+
+    Lifted byte-identically from active_scanner._rma (which itself was
+    ported from backtest_v3_runner.py to keep live ADX aligned with
+    backtest's ind_adx quintile data). Used internally by adx().
+    """
+    if not values or length <= 0:
+        return []
+    out = []
+    s = 0.0
+    for i, v in enumerate(values):
+        if i == 0:
+            s = float(v)
+        else:
+            s = s + (float(v) - s) / length
+        out.append(s)
+    return out
+
+
+# v11.7 (Patch E.3): ADX lifted byte-identically from
+# active_scanner._compute_adx. RMA-seeded Wilder ADX (NOT the SMA-seeded
+# variant in risk_manager._compute_adx — that one is documented in
+# Patch F as "DRIFT: not canonical, reconcile to canonical_technicals.adx").
+# Returns the most recent ADX reading or 0.0 on insufficient data /
+# malformed inputs / arithmetic error. The conviction scorer treats 0.0
+# as "ADX unavailable" and skips ADX-quintile rules accordingly.
+def adx(highs: list, lows: list, closes: list, length: int = 14) -> float:
+    """Compute the current ADX value from OHLC arrays.
+
+    Returns the most recent ADX reading as a float. Returns 0.0 on any
+    failure — the scorer's ADX quintile rules check for missing data
+    and skip, so a silent zero is safe.
+
+    Matches active_scanner._compute_adx exactly (which was ported from
+    backtest_v3_runner.py:346-364 for backtest-vs-live alignment).
+    """
+    try:
+        n = len(closes)
+        if n < 2 or len(highs) != n or len(lows) != n:
+            return 0.0
+        if n < length + 1:
+            # Not enough bars for Wilder's smoothing to stabilize
+            return 0.0
+
+        dmp = [0.0]
+        dmn = [0.0]
+        tr = [highs[0] - lows[0]]
+        for i in range(1, n):
+            up = highs[i] - highs[i - 1]
+            dn = lows[i - 1] - lows[i]
+            dmp.append(up if up > dn and up > 0 else 0.0)
+            dmn.append(dn if dn > up and dn > 0 else 0.0)
+            tr.append(max(
+                highs[i] - lows[i],
+                abs(highs[i] - closes[i - 1]),
+                abs(lows[i] - closes[i - 1]),
+            ))
+
+        stt = _rma(tr, length)
+        sp = _rma(dmp, length)
+        sn = _rma(dmn, length)
+
+        dip = [100 * sp[i] / stt[i] if stt[i] != 0 else 0.0 for i in range(n)]
+        din = [100 * sn[i] / stt[i] if stt[i] != 0 else 0.0 for i in range(n)]
+
+        dx = []
+        for i in range(n):
+            s = dip[i] + din[i]
+            dx.append(100 * abs(dip[i] - din[i]) / s if s != 0 else 0.0)
+
+        adx_series = _rma(dx, length)
+        return float(adx_series[-1]) if adx_series else 0.0
+    except Exception:
+        # Defensive — never let ADX computation break signal analysis
+        return 0.0
