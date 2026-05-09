@@ -297,6 +297,7 @@ What's done as of last session (v11.7 / Patch F):
   producer was Patch B, consumer skeleton was Patch C, multi-DTE drilldown
   is Patch D. The producer was already writing all 4 intents per ticker —
   Patch D finally surfaces them.
+- Patch F.5 (canonical_technicals on BotState) — `_build_technicals_from_raw(raw)` helper added to `bot_state.py`; replaces the technicals stub in `build_from_raw`. BotState's `rsi` / `macd_hist` / `adx` fields now populate from `canonical_technicals.rsi/macd/adx` instead of None, and `canonical_status["technicals"]` flips from `stub` to `live`. Defensive about bar key naming — `risk_manager.py:275` pattern (`b.get("h") or b.get("high")`). Wrapper-consistency tests assert no parallel RSI/MACD/ADX math sneaks into the helper. canonical_technicals now has two production readers: active_scanner (Patch F) and BotState (F.5).
 
 WWhat's queued (in order):
 
