@@ -9309,6 +9309,31 @@ def _post_v84_credit_card(ticker: str, direction: str, spot: float,
     except Exception as _rec_err:
         log.warning(f"v8.4 credit rec-tracker failed for {ticker}: {_rec_err}")
 
+    # v11.7 (Patch G.5): record v8.4 CREDIT after successful post.
+    # Master gate RECORDER_ENABLED + RECORDER_CREDIT_ENABLED both default
+    # off; when off record_alert is a no-op. Failures swallowed so recorder
+    # NEVER affects credit posting or return value.
+    try:
+        _alert_recorder.record_alert(
+            **_build_credit_alert_payload(
+                ticker=ticker,
+                direction=direction,
+                spot=spot,
+                short_strike=spread["short_strike"],
+                long_strike=spread["long_strike"],
+                width=spread["width"],
+                expiry=expiry,
+                credit=spread["credit"],
+                dte_days=dte_hint,
+                v2_result=_v2_res_for_log if V2_PEER_MODE_ENABLED else None,
+                canonical_snapshot={},
+                webhook_data=wd or {},
+                v2_5d_parent_alert_id=v2_5d_parent_alert_id,
+            )
+        )
+    except Exception as _rec_g5_err:
+        log.warning(f"recorder G.5: credit hook failed for {ticker}: {_rec_g5_err}")
+
     # v8.4 (Phase 2.5c): announce the same pre-post vehicle_id to caller for
     # the scorer snapshot. Same strikes/expiry => same id => future duplicate
     # suppresses; different strikes/expiry => new id => allowed.
@@ -9323,6 +9348,68 @@ def _post_v84_credit_card(ticker: str, direction: str, spot: float,
 # rejects most signals on liquidity/slippage/EV filters the CREDIT gate doesn't
 # care about. This hook fires right after _mark_scorer_posted so the credit card
 # gets its own chance regardless of whether the debit side can place a spread.
+
+# v11.7 (Patch G.5): alert recorder helper — v8.4 CREDIT.
+# Pure function: builds the kwargs dict consumed by
+# _alert_recorder.record_alert from local state at the credit post site.
+# Tested hermetically by test_alert_recorder_credit_wire.py. Bump
+# CREDIT_ENGINE_VERSION whenever the credit gate logic, strike placement,
+# or scoring weights change so recorded alerts are queryable by version.
+CREDIT_ENGINE_VERSION = "credit_v84@v8.4.2"
+
+
+def _build_credit_alert_payload(*, ticker, direction, spot, short_strike,
+                                long_strike, width, expiry, credit, dte_days,
+                                v2_result, canonical_snapshot, webhook_data,
+                                v2_5d_parent_alert_id):
+    """Build kwargs for _alert_recorder.record_alert from the credit post site.
+
+    Pure function — no I/O. direction="bull" -> bull_put / CREDIT_BULL_PUT;
+    direction="bear" -> bear_call / CREDIT_BEAR_CALL. dte_days is calendar-DTE
+    ((expiry - today).days) matching the credit engine's own dte_hint variable.
+    v2_result defensive fallback: setup_grade with grade fallback (per G.4 fix).
+    """
+    if direction == "bull":
+        struct_type, classification = "bull_put", "CREDIT_BULL_PUT"
+    else:
+        struct_type, classification = "bear_call", "CREDIT_BEAR_CALL"
+    suggested_structure = {
+        "type":   struct_type,
+        "short":  short_strike,
+        "long":   long_strike,
+        "width":  width,
+        "credit": credit,
+        "expiry": expiry,
+    }
+    # v2_5d_grade defensive fallback per G.4 fix (setup_grade vs grade).
+    v2_grade = None
+    if v2_result is not None:
+        v2_grade = (getattr(v2_result, "setup_grade", None)
+                    or getattr(v2_result, "grade", None))
+    features = {
+        "width":       width,
+        "credit":      credit,
+        "credit_pct":  (credit / width) if (width and credit is not None) else None,
+        "dte_days":    dte_days,
+        "v2_5d_grade": v2_grade,
+        "regime":      getattr(v2_result, "regime", None) if v2_result is not None else None,
+    }
+    return dict(
+        engine="credit_v84",
+        engine_version=CREDIT_ENGINE_VERSION,
+        ticker=ticker,
+        classification=classification,
+        direction=direction,
+        suggested_structure=suggested_structure,
+        suggested_dte=dte_days,
+        spot_at_fire=spot,
+        canonical_snapshot=canonical_snapshot,
+        raw_engine_payload=webhook_data,
+        features=features,
+        telegram_chat="main",
+        parent_alert_id=v2_5d_parent_alert_id,
+    )
+
 
 # v11.7 (Patch G.3): alert recorder helper — LONG CALL BURST.
 # Pure function: builds the kwargs dict consumed by
