@@ -51,6 +51,8 @@ from ticker_rules import (
     TICKER_RULES,
 )
 
+import canonical_technicals  # v11.7 (Patch F.2): canonical home for RSI/MACD/EMA/ADX.
+
 log = logging.getLogger(__name__)
 
 # ── Watchlist tiers ──
@@ -79,9 +81,7 @@ SCAN_INTERVAL_C = 300    # v7.0: was 900
 # ── Technical signal thresholds ──
 EMA_FAST    = 5
 EMA_SLOW    = 12
-MACD_FAST   = 12
-MACD_SLOW   = 26
-MACD_SIGNAL = 9
+# v11.7 (Patch F.2): MACD_FAST/SLOW/SIGNAL moved to canonical_technicals.MACD_FAST/SLOW/SIGNAL.
 RSI_PERIOD  = 14
 WT_CHANNEL  = 10
 WT_AVERAGE  = 21
@@ -97,53 +97,18 @@ MIN_SIGNAL_SCORE    = SIGNAL_TIER_2_SCORE   # 55 — scores 50-54 are rejected
 # ═══════════════════════════════════════════════════════════
 
 def _compute_ema(values: list, period: int) -> list:
-    if len(values) < period:
-        return []
-    ema = [sum(values[:period]) / period]
-    mult = 2.0 / (period + 1)
-    for v in values[period:]:
-        ema.append(v * mult + ema[-1] * (1 - mult))
-    return ema
+    # v11.7 (Patch F.2): delegated to canonical_technicals.
+    return canonical_technicals._ema(values, period)
 
 
 def _compute_rsi(closes: list, period: int = 14) -> Optional[float]:
-    if len(closes) < period + 1:
-        return None
-    gains, losses = [], []
-    for i in range(1, len(closes)):
-        diff = closes[i] - closes[i-1]
-        gains.append(max(0, diff))
-        losses.append(max(0, -diff))
-    avg_gain = sum(gains[-period:]) / period
-    avg_loss = sum(losses[-period:]) / period
-    if avg_loss == 0:
-        return 100.0
-    rs = avg_gain / avg_loss
-    return 100.0 - (100.0 / (1 + rs))
+    # v11.7 (Patch F.2): delegated to canonical_technicals.
+    return canonical_technicals.rsi(closes, period)
 
 
 def _compute_macd(closes: list) -> Dict:
-    if len(closes) < MACD_SLOW + MACD_SIGNAL:
-        return {}
-    ema_fast = _compute_ema(closes, MACD_FAST)
-    ema_slow = _compute_ema(closes, MACD_SLOW)
-    offset = MACD_SLOW - MACD_FAST
-    macd_line = [ema_fast[i + offset] - ema_slow[i] for i in range(len(ema_slow))]
-    if len(macd_line) < MACD_SIGNAL:
-        return {}
-    signal = _compute_ema(macd_line, MACD_SIGNAL)
-    hist = macd_line[-1] - signal[-1] if signal else 0
-    return {
-        "macd_line": macd_line[-1] if macd_line else 0,
-        "signal_line": signal[-1] if signal else 0,
-        "macd_hist": hist,
-        "macd_cross_bull": (len(macd_line) >= 2 and len(signal) >= 2
-                           and macd_line[-2] < signal[-2]
-                           and macd_line[-1] > signal[-1]) if signal else False,
-        "macd_cross_bear": (len(macd_line) >= 2 and len(signal) >= 2
-                           and macd_line[-2] > signal[-2]
-                           and macd_line[-1] < signal[-1]) if signal else False,
-    }
+    # v11.7 (Patch F.2): delegated to canonical_technicals.
+    return canonical_technicals.macd(closes)
 
 
 def _compute_wavetrend(hlc3: list) -> Dict:
@@ -193,71 +158,13 @@ def _compute_wavetrend(hlc3: list) -> Dict:
 # ═══════════════════════════════════════════════════════════
 
 def _rma(values: list, length: int) -> list:
-    """Wilder's smoothing (RMA). Recursive moving average.
-
-    Ported from backtest_v3_runner.py. Used internally by _compute_adx.
-    """
-    if not values or length <= 0:
-        return []
-    out = []
-    s = 0.0
-    for i, v in enumerate(values):
-        if i == 0:
-            s = float(v)
-        else:
-            s = s + (float(v) - s) / length
-        out.append(s)
-    return out
+    # v11.7 (Patch F.2): delegated to canonical_technicals.
+    return canonical_technicals._rma(values, length)
 
 
 def _compute_adx(highs: list, lows: list, closes: list, length: int = 14) -> float:
-    """Compute the current ADX value from OHLC arrays.
-
-    Returns the most recent ADX reading as a float. Returns 0.0 on any
-    failure — the scorer's ADX quintile rules check for missing data
-    and skip, so a silent zero is safe.
-
-    Matches backtest_v3_runner.py:346-364 exactly for alignment.
-    """
-    try:
-        n = len(closes)
-        if n < 2 or len(highs) != n or len(lows) != n:
-            return 0.0
-        if n < length + 1:
-            # Not enough bars for Wilder's smoothing to stabilize
-            return 0.0
-
-        dmp = [0.0]
-        dmn = [0.0]
-        tr = [highs[0] - lows[0]]
-        for i in range(1, n):
-            up = highs[i] - highs[i - 1]
-            dn = lows[i - 1] - lows[i]
-            dmp.append(up if up > dn and up > 0 else 0.0)
-            dmn.append(dn if dn > up and dn > 0 else 0.0)
-            tr.append(max(
-                highs[i] - lows[i],
-                abs(highs[i] - closes[i - 1]),
-                abs(lows[i] - closes[i - 1]),
-            ))
-
-        stt = _rma(tr, length)
-        sp = _rma(dmp, length)
-        sn = _rma(dmn, length)
-
-        dip = [100 * sp[i] / stt[i] if stt[i] != 0 else 0.0 for i in range(n)]
-        din = [100 * sn[i] / stt[i] if stt[i] != 0 else 0.0 for i in range(n)]
-
-        dx = []
-        for i in range(n):
-            s = dip[i] + din[i]
-            dx.append(100 * abs(dip[i] - din[i]) / s if s != 0 else 0.0)
-
-        adx_series = _rma(dx, length)
-        return float(adx_series[-1]) if adx_series else 0.0
-    except Exception:
-        # Defensive — never let ADX computation break signal analysis
-        return 0.0
+    # v11.7 (Patch F.2): delegated to canonical_technicals.
+    return canonical_technicals.adx(highs, lows, closes, length)
 
 
 # ═══════════════════════════════════════════════════════════
