@@ -3886,3 +3886,270 @@ details[open] .research-walls-chevron {
   border-left: 1px solid rgba(255, 255, 255, 0.08);
   margin-left: 0.2em;
 }
+
+
+/* ════════════════════════════════════════════════════════
+   v11.7 (Patch H.4): Alerts feed page styles.
+   Reuses tokens from :root (lines 17-63):
+     --bg-void / --bg-panel / --bg-elev / --border / --border-bright
+     --text / --text-muted / --text-dim
+     --brass / --brass-bright / --brass-deep
+     --positive / --positive-bright / --negative / --negative-soft
+     --warn (LCB)  --partner (credit)  --mine (conviction)
+   ════════════════════════════════════════════════════════ */
+
+.alerts-page {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 24px 40px;
+  font-family: 'Outfit', sans-serif;
+}
+
+.alerts-eyebrow {
+  font-family: 'Cinzel', serif;
+  font-size: 11px;
+  letter-spacing: 4px;
+  text-transform: uppercase;
+  color: var(--brass-deep);
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 4px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.alerts-eyebrow-meta {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: var(--text-dim);
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.alerts-status-strip {
+  display: flex;
+  gap: 18px;
+  padding: 14px 18px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 13px;
+  color: var(--text-muted);
+  align-items: center;
+}
+.alerts-status-pill { display: inline-flex; align-items: center; gap: 6px; }
+.alerts-status-pill-label {
+  color: var(--text-dim);
+  font-size: 11px;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+}
+.alerts-status-pill-value {
+  color: var(--brass-bright);
+  font-weight: 500;
+}
+.alerts-status-dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  margin-right: 4px;
+  display: inline-block;
+}
+.alerts-status-dot.live {
+  background: var(--positive);
+  box-shadow: 0 0 6px rgba(79, 138, 87, 0.6);
+}
+.alerts-status-dot.off { background: #5F5E5A; box-shadow: none; }
+.alerts-status-divider { color: var(--border); }
+.alerts-status-spacer { flex: 1; }
+.alerts-status-engines {
+  cursor: help;
+  border-bottom: 1px dotted var(--brass-deep);
+}
+
+.alerts-section-header {
+  font-family: 'Cinzel', serif;
+  font-size: 12px;
+  letter-spacing: 4px;
+  color: var(--brass-deep);
+  text-transform: uppercase;
+  margin: 16px 0 10px 0;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+}
+.alerts-section-count {
+  color: var(--text-dim);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.alerts-cards { display: flex; flex-direction: column; gap: 8px; }
+
+.alerts-section-historical { margin-top: 4px; }
+.alerts-collapsed-summary {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  padding: 12px 18px;
+  cursor: pointer;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  color: var(--text-dim);
+  list-style: none;
+}
+.alerts-collapsed-summary::-webkit-details-marker { display: none; }
+.alerts-collapsed-summary:hover { background: var(--bg-elev); }
+.alerts-chevron-collapse {
+  color: var(--brass-deep);
+  display: inline-block;
+  transition: transform 0.15s;
+}
+details[open] .alerts-chevron-collapse { transform: rotate(90deg); }
+.alerts-collapsed-action { color: var(--brass-deep); }
+details[open] .alerts-collapsed-summary { margin-bottom: 8px; }
+
+.alerts-empty {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  padding: 40px 24px;
+  text-align: center;
+  font-family: 'Outfit', sans-serif;
+  margin-bottom: 8px;
+}
+.alerts-empty.alerts-empty-soft { padding: 24px; opacity: 0.85; }
+.alerts-empty-icon {
+  font-size: 32px;
+  color: var(--brass-deep);
+  margin-bottom: 12px;
+}
+.alerts-empty-title {
+  font-family: 'Cinzel', serif;
+  font-size: 14px;
+  letter-spacing: 3px;
+  color: var(--text-muted);
+  margin-bottom: 8px;
+  text-transform: uppercase;
+}
+.alerts-empty-message {
+  font-size: 13px;
+  color: var(--text-dim);
+  max-width: 520px;
+  margin: 0 auto;
+  line-height: 1.6;
+}
+.alerts-empty-message code {
+  color: var(--brass-bright);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+}
+
+/* Card structure */
+.alert-card {
+  display: block;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--border-bright);
+  padding: 14px 18px;
+  text-decoration: none;
+  color: inherit;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+.alert-card:hover {
+  background: var(--bg-elev);
+  border-color: var(--border-bright);
+  text-shadow: none;
+}
+.alert-card-engine-lcb        { border-left-color: var(--warn); }
+.alert-card-engine-v25d       { border-left-color: var(--brass-bright); }
+.alert-card-engine-credit     { border-left-color: var(--partner); }
+.alert-card-engine-conviction { border-left-color: var(--mine); }
+.alert-card-engine-unknown    { border-left-color: var(--border-bright); }
+
+.alert-card-recent {
+  animation: alertCardPulse 2.5s ease-in-out infinite;
+}
+@keyframes alertCardPulse {
+  0%, 100% { box-shadow: inset 4px 0 0 0 rgba(213, 176, 107, 0); }
+  50%      { box-shadow: inset 4px 0 0 0 rgba(213, 176, 107, 0.45); }
+}
+.alert-card-old { opacity: 0.65; }
+
+.alert-card-row1 {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-bottom: 6px;
+}
+.alert-card-row1-left { display: inline-flex; gap: 8px; align-items: baseline; }
+.alert-card-time { color: var(--text-muted); }
+.alert-card-relative { color: var(--brass-deep); }
+
+.alert-card-badge {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  padding: 2px 8px;
+  letter-spacing: 1px;
+}
+.alert-card-badge.badge-active {
+  background: rgba(213, 176, 107, 0.08);
+  color: var(--brass-bright);
+  border: 1px solid var(--brass-deep);
+}
+
+.alert-card-row2 {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 6px;
+}
+.alert-card-engine {
+  font-family: 'Outfit', sans-serif;
+  font-size: 14px;
+  font-weight: 500;
+  letter-spacing: 1px;
+}
+.alert-card-engine-text-lcb        { color: var(--warn); }
+.alert-card-engine-text-v25d       { color: var(--brass-bright); }
+.alert-card-engine-text-credit     { color: var(--partner); }
+.alert-card-engine-text-conviction { color: var(--negative-soft); }
+
+.alert-card-ticker {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 16px;
+  color: var(--text);
+  font-weight: 500;
+}
+.alert-card-chevron { font-family: 'JetBrains Mono', monospace; font-size: 12px; }
+.alert-card-chevron.positive { color: var(--positive-bright); }
+.alert-card-chevron.negative { color: var(--negative-soft); }
+
+.alert-card-row3 {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 13px;
+  color: var(--text-muted);
+  margin-bottom: 4px;
+}
+
+.alert-card-row4 {
+  font-family: 'Outfit', sans-serif;
+  font-size: 12px;
+  color: var(--brass-deep);
+  font-style: italic;
+  padding-left: 12px;
+}
+
+/* Make .num inherit its parent's color so the row1 timestamp etc. stay
+   muted rather than picking up a bright global override. */
+.alerts-page .num,
+.alerts-detail-page .num { color: inherit; font-family: 'JetBrains Mono', monospace; }

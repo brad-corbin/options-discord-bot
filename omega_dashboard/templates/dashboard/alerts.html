@@ -1,0 +1,256 @@
+{% extends "dashboard/base.html" %}
+
+{% block title %}The Legacy Desk &mdash; Alerts{% endblock %}
+{% block brand_sub %}Alerts &middot; {{ active_account.label }}{% endblock %}
+
+{% block content %}
+
+{# v11.7 (Patch H.4): alerts feed page.
+   Three zones: status strip, today's cards (4 rows; row 5 deferred to
+   Patch H.8 — see plan), collapsible historical sections.
+   10s polling via vanilla JS with full innerHTML swap of card grids.
+   Hover-pause prevents mid-click DOM-swap races.
+   Pulse + muted are pure CSS. #}
+
+<div class="alerts-page fade-in">
+
+  {# ── Eyebrow ─────────────────────────────────────────────── #}
+  <div class="alerts-eyebrow">
+    <span>— ALERTS &middot; LIVE FEED</span>
+    <span class="alerts-eyebrow-meta num">
+      {% if page_data.status.last_fire_ct %}
+        last fire {{ page_data.status.last_fire_ct }} CT
+        &middot;
+      {% endif %}
+      {{ page_data.status.count_today }} today
+    </span>
+  </div>
+
+  {# ── Zone 1: Status strip ─────────────────────────────────── #}
+  <div class="alerts-status-strip">
+    {% set status = page_data.status %}
+    <span class="alerts-status-pill">
+      <span class="alerts-status-dot {% if status.master_on %}live{% else %}off{% endif %}"></span>
+      <span class="alerts-status-pill-label">RECORDER</span>
+      <span class="alerts-status-pill-value">{% if status.master_on %}LIVE{% else %}OFF{% endif %}</span>
+    </span>
+    <span class="alerts-status-divider">·</span>
+    <span class="alerts-status-pill alerts-status-engines"
+          title="engines on: {{ status.engines_on|join(', ') if status.engines_on else 'none' }} | daemons on: {{ status.daemons_on|join(', ') if status.daemons_on else 'none' }}">
+      <span class="alerts-status-pill-label">ENGINES</span>
+      <span class="alerts-status-pill-value">{{ status.engines_on_count }} ON</span>
+    </span>
+    <span class="alerts-status-divider">·</span>
+    <span class="alerts-status-pill">
+      <span class="alerts-status-pill-label">LAST FIRE</span>
+      <span class="alerts-status-pill-value">{{ status.last_fire_ct or '—' }}</span>
+    </span>
+    <span class="alerts-status-spacer"></span>
+    <span class="alerts-status-pill">
+      <span class="alerts-status-pill-label">REFRESH IN</span>
+      <span class="alerts-status-pill-value"><span id="alerts-refresh-countdown" class="num">10</span>s</span>
+    </span>
+  </div>
+
+  {# ── Empty-state matrix (4 distinct states) ──────────────── #}
+  {% if not page_data.available %}
+    {# State 1: DB missing #}
+    <div class="alerts-empty">
+      <div class="alerts-empty-icon">⚙</div>
+      <div class="alerts-empty-title">RECORDER NOT INITIALIZED</div>
+      <div class="alerts-empty-message">
+        {{ page_data.error or "The recorder database doesn't exist yet. Check that RECORDER_ENABLED is set in your environment and the bot has been deployed since the recorder shipped." }}
+      </div>
+    </div>
+  {% elif page_data.total_count == 0 %}
+    {# State 2: DB empty #}
+    <div class="alerts-empty">
+      <div class="alerts-empty-icon">∅</div>
+      <div class="alerts-empty-title">NO ALERTS CAPTURED YET</div>
+      <div class="alerts-empty-message">
+        The recorder is running but hasn't logged any alerts. Alerts will appear here as engines fire during market hours. Check that per-engine gates (<code>RECORDER_LCB_ENABLED</code>, etc.) are flipped on for the engines you want to track.
+      </div>
+    </div>
+  {% elif page_data.today|length == 0 and page_data.yesterday|length == 0 and page_data.this_week|length == 0 and page_data.earlier|length > 0 %}
+    {# State 3: all alerts >7 days old #}
+    <div class="alerts-empty alerts-empty-soft">
+      <div class="alerts-empty-icon">○</div>
+      <div class="alerts-empty-title">NO RECENT ACTIVITY</div>
+      <div class="alerts-empty-message">
+        No alerts in the last 7 days. Showing historical alerts below. If you're seeing this on a weekday during market hours, check that engine gates are still on.
+      </div>
+    </div>
+  {% endif %}
+
+  {# ── Zone 2: Today ────────────────────────────────────────── #}
+  {% if page_data.today %}
+    <div class="alerts-section-header">
+      <span>TODAY</span>
+      <span class="alerts-section-count">{{ page_data.today|length }} alerts</span>
+    </div>
+    <div class="alerts-cards" id="alerts-cards-today">
+      {% for card in page_data.today %}
+        {% include 'dashboard/_alert_card.html' %}
+      {% endfor %}
+    </div>
+  {% endif %}
+
+  {# ── Zone 3: Historical (collapsed) ──────────────────────── #}
+  {% if page_data.yesterday %}
+    <div class="alerts-section-header">
+      <span>YESTERDAY</span>
+      <span class="alerts-section-count">{{ page_data.yesterday|length }} alerts</span>
+    </div>
+    <details class="alerts-section-historical">
+      <summary class="alerts-collapsed-summary">
+        <span><span class="alerts-chevron-collapse">▶</span>&nbsp;&nbsp;Yesterday — {{ page_data.yesterday|length }} alerts</span>
+        <span class="alerts-collapsed-action">expand</span>
+      </summary>
+      <div class="alerts-cards" id="alerts-cards-yesterday">
+        {% for card in page_data.yesterday %}
+          {% include 'dashboard/_alert_card.html' %}
+        {% endfor %}
+      </div>
+    </details>
+  {% endif %}
+
+  {% if page_data.this_week %}
+    <div class="alerts-section-header">
+      <span>THIS WEEK</span>
+      <span class="alerts-section-count">{{ page_data.this_week|length }} alerts</span>
+    </div>
+    <details class="alerts-section-historical">
+      <summary class="alerts-collapsed-summary">
+        <span><span class="alerts-chevron-collapse">▶</span>&nbsp;&nbsp;This week — {{ page_data.this_week|length }} alerts</span>
+        <span class="alerts-collapsed-action">expand</span>
+      </summary>
+      <div class="alerts-cards" id="alerts-cards-this-week">
+        {% for card in page_data.this_week %}
+          {% include 'dashboard/_alert_card.html' %}
+        {% endfor %}
+      </div>
+    </details>
+  {% endif %}
+
+  {% if page_data.earlier %}
+    <div class="alerts-section-header">
+      <span>EARLIER</span>
+      <span class="alerts-section-count">{{ page_data.earlier|length }} alerts (older than 7 days)</span>
+    </div>
+    <details class="alerts-section-historical">
+      <summary class="alerts-collapsed-summary">
+        <span><span class="alerts-chevron-collapse">▶</span>&nbsp;&nbsp;Earlier — {{ page_data.earlier|length }} alerts (older than 7 days)</span>
+        <span class="alerts-collapsed-action">expand</span>
+      </summary>
+      <div class="alerts-cards" id="alerts-cards-earlier">
+        {% for card in page_data.earlier %}
+          {% include 'dashboard/_alert_card.html' %}
+        {% endfor %}
+      </div>
+    </details>
+  {% endif %}
+
+</div>
+
+<script>
+(function () {
+  'use strict';
+  // v11.7 (Patch H.4): 10s polling that fully replaces card grids.
+  // Simple innerHTML swap — no diff, no per-card animation collisions.
+  // Pauses while the user is hovering a card (prevents mid-click races).
+  const POLL_INTERVAL_MS = 10000;
+  const ENDPOINT = "{{ url_for('dashboard.alerts_data_json') }}";
+  const DETAIL_BASE = "/alerts/";
+  const countdownEl = document.getElementById('alerts-refresh-countdown');
+  let secondsLeft = POLL_INTERVAL_MS / 1000;
+
+  // Hover-pause: track via delegated mouseover/mouseout on the page root.
+  let isHovering = false;
+  const pageEl = document.querySelector('.alerts-page');
+  if (pageEl) {
+    pageEl.addEventListener('mouseover', function (e) {
+      if (e.target.closest && e.target.closest('.alert-card')) isHovering = true;
+    });
+    pageEl.addEventListener('mouseout', function (e) {
+      if (e.target.closest && e.target.closest('.alert-card')) isHovering = false;
+    });
+  }
+
+  function escapeHtml(s) {
+    if (s === null || s === undefined) return '';
+    return String(s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  function renderCard(c) {
+    const recentCls = c.is_recent ? ' alert-card-recent' : '';
+    const oldCls    = c.is_old    ? ' alert-card-old'    : '';
+    const badge = c.is_recent
+      ? '<span class="alert-card-badge badge-active">ACTIVE</span>'
+      : '';
+    const chev =
+      c.direction === 'bull' ? '<span class="alert-card-chevron positive">▲ bull</span>' :
+      c.direction === 'bear' ? '<span class="alert-card-chevron negative">▼ bear</span>' : '';
+    const parent = c.parent_alert_id
+      ? '<div class="alert-card-row4">↳ parent alert</div>'
+      : '';
+    const stripe = escapeHtml(c.stripe);
+    return (
+      '<a class="alert-card alert-card-engine-' + stripe + recentCls + oldCls + '"' +
+      ' href="' + DETAIL_BASE + encodeURIComponent(c.alert_id) + '"' +
+      ' data-alert-id="' + escapeHtml(c.alert_id) + '">' +
+        '<div class="alert-card-row1">' +
+          '<div class="alert-card-row1-left">' +
+            '<span class="alert-card-time num">' + escapeHtml(c.fired_at_ct) + '</span>' +
+            '<span class="alert-card-relative">· ' + escapeHtml(c.fired_at_relative) + '</span>' +
+          '</div>' +
+          badge +
+        '</div>' +
+        '<div class="alert-card-row2">' +
+          '<span class="alert-card-engine alert-card-engine-text-' + stripe + '">' +
+            escapeHtml(c.engine_icon) + ' ' + escapeHtml(c.engine_label) +
+          '</span>' +
+          '<span class="alert-card-ticker">' + escapeHtml(c.ticker) + '</span>' +
+          chev +
+        '</div>' +
+        '<div class="alert-card-row3 num">' + escapeHtml(c.structure_summary) + '</div>' +
+        parent +
+      '</a>'
+    );
+  }
+
+  function refreshBucket(elementId, cards) {
+    const el = document.getElementById(elementId);
+    if (!el) return;
+    el.innerHTML = (cards || []).map(renderCard).join('');
+  }
+
+  function poll() {
+    if (isHovering) {
+      secondsLeft = POLL_INTERVAL_MS / 1000;
+      return;
+    }
+    fetch(ENDPOINT, { credentials: 'same-origin' })
+      .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
+      .then(function (payload) {
+        if (!payload.available) return;
+        refreshBucket('alerts-cards-today',     payload.today);
+        refreshBucket('alerts-cards-yesterday', payload.yesterday);
+        refreshBucket('alerts-cards-this-week', payload.this_week);
+        refreshBucket('alerts-cards-earlier',   payload.earlier);
+      })
+      .catch(function () { /* swallow — keep polling */ })
+      .finally(function () { secondsLeft = POLL_INTERVAL_MS / 1000; });
+  }
+
+  setInterval(function () {
+    secondsLeft -= 1;
+    if (secondsLeft <= 0) { poll(); secondsLeft = POLL_INTERVAL_MS / 1000; }
+    if (countdownEl) countdownEl.textContent = secondsLeft;
+  }, 1000);
+})();
+</script>
+
+{% endblock %}

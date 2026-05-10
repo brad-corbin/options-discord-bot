@@ -1,0 +1,51 @@
+{# v11.7 (Patch H.4): single alert card.
+   Used by alerts.html initial render AND mirrored by the inline JS
+   renderCard() in alerts.html (same DOM shape so polling re-render
+   produces identical markup).
+
+   Card structure (4 rows in V1; mockup row 5 deferred to Patch H.8):
+     row 1 — timestamp + relative time + status badge
+     row 2 — engine icon/label + ticker + bull/bear chevron
+     row 3 — structure summary (no DTE; convention varies per engine)
+     row 4 — parent linkage (if any)
+
+   CSS classes:
+     .alert-card                  — base
+     .alert-card-engine-{stripe}  — color-coded left border
+                                    (lcb=warn, v25d=brass-bright,
+                                     credit=partner, conviction=mine)
+     .alert-card-recent           — pulse border when <5min old
+     .alert-card-old              — muted opacity when >24h old
+#}
+<a class="alert-card alert-card-engine-{{ card.stripe }}
+          {% if card.is_recent %}alert-card-recent{% endif %}
+          {% if card.is_old %}alert-card-old{% endif %}"
+   href="{{ url_for('dashboard.alerts_detail', alert_id=card.alert_id) }}"
+   data-alert-id="{{ card.alert_id }}">
+
+  <div class="alert-card-row1">
+    <div class="alert-card-row1-left">
+      <span class="alert-card-time num">{{ card.fired_at_ct }}</span>
+      <span class="alert-card-relative">· {{ card.fired_at_relative }}</span>
+    </div>
+    {% if card.is_recent %}
+      <span class="alert-card-badge badge-active">ACTIVE</span>
+    {% endif %}
+  </div>
+
+  <div class="alert-card-row2">
+    <span class="alert-card-engine alert-card-engine-text-{{ card.stripe }}">{{ card.engine_icon }} {{ card.engine_label }}</span>
+    <span class="alert-card-ticker">{{ card.ticker }}</span>
+    {% if card.direction == 'bull' %}
+      <span class="alert-card-chevron positive">▲ bull</span>
+    {% elif card.direction == 'bear' %}
+      <span class="alert-card-chevron negative">▼ bear</span>
+    {% endif %}
+  </div>
+
+  <div class="alert-card-row3 num">{{ card.structure_summary }}</div>
+
+  {% if card.parent_alert_id %}
+    <div class="alert-card-row4">↳ parent alert</div>
+  {% endif %}
+</a>
