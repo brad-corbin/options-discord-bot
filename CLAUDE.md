@@ -449,6 +449,65 @@ What's done as of last session (v11.7 / Patch F):
   `sqlite_autoindex_alert_outcomes_1` (composite PK on
   `alert_id, horizon`) covers query 4 — verified via EXPLAIN
   QUERY PLAN. No 0002 migration needed.
+- Patch M (EM brief on Market View) — Surfaces the rich `/em` Telegram
+  output (DEALER EM BRIEF + ACTION GUIDE) on the Market View dashboard
+  tab. Two-phase delivery:
+
+  **Phase 1 (M.0–M.3) — pure-extraction refactor.** New
+  `_compute_em_brief_data(ticker, session=None)` helper at
+  `app.py:12959` lifts the data layer out of `_post_em_card`'s 474
+  lines. Both the Telegram path and the silent-thesis store consume
+  it (refactored in M.2 + M.3). `session=None` auto-resolves from
+  time-of-day matching the existing `_post_em_card` logic. Refactor
+  is gated by `test_em_brief_snapshot.py` (M.0) which captures
+  byte-identical pre-refactor output for 3 scenarios (spy/hood/thin)
+  with deterministic mocks of `_get_0dte_iv`, `post_to_telegram`,
+  `_estimate_liquidity`, `get_daily_candles`. Test passes at every
+  refactor commit; fixtures live under `tests/fixtures/em_brief_snapshots/`.
+
+  **Phase 2 (M.4–M.8) — dashboard surface.** New
+  `omega_dashboard/em_data.py` module wraps `_compute_em_brief_data`
+  with dashboard-specific shape (CT timestamps, partial-brief warning,
+  `available_sections` detection). New `start_refresh_all()` is
+  idempotent — concurrent POSTs return the existing job_id rather
+  than starting a duplicate batch. Daemon thread serializes per-ticker
+  with `time.sleep(2.0)` between calls (`INTER_TICKER_SLEEP_SEC`)
+  to protect the global Schwab rate limiter. After 60s elapsed the
+  status surfaces a "(this can take several minutes during market
+  hours)" caption.
+
+  Three new login_required routes in `omega_dashboard/routes.py`:
+  `GET /em/brief/<ticker>` (ticker validated `^[A-Z]{1,8}$`),
+  `POST /em/refresh`, `GET /em/refresh/status/<job_id>`. All return
+  410 Gone when `EM_BRIEF_DASHBOARD_ENABLED=false`.
+
+  Anchored panel below the header strip (refresh button + ticker
+  input + status text), above the cards grid. Sticky positioning +
+  opaque `var(--bg-panel)` background + `z-index: 5` ensures clean
+  overlay during the cards grid 5s repaints. Three entry paths
+  populate the panel: whole-card click (entire trading card is the
+  click target — matches alerts-feed pattern from Patch H, no corner
+  button), ticker input + Enter, URL `?em=TICKER` deep-link.
+  Last-write-wins via `currentRequestId` guard. Esc key dismisses;
+  × button clears; URL strips the param via `history.replaceState`.
+  No auto-scroll on populate — sticky positioning makes it
+  unnecessary, and auto-scroll would disrupt mid-grid browsing.
+
+  Display fidelity: structured HTML cards (header + bias pill +
+  levels grid + dealer flow + vol regime + signal breakdown +
+  footer) using existing omega.css tokens. NOT a raw `<pre>` text
+  dump. Partial-brief states render `n/a` for missing sections plus
+  a subtle warning banner; full-error state only when nothing
+  computes (e.g., truly unknown ticker).
+
+  Hermetic tests in `test_em_data.py` (11 tests): kill-switch behavior,
+  partial-brief detection, refresh-all idempotency + Redis state
+  decoding + slow-caption threshold + finished-state. Plus
+  `test_em_brief_snapshot.py` (1 mega-test, 3 scenarios) for the
+  refactor gate.
+
+  All env gates default ON for the dashboard surface. `/em` Telegram
+  command behavior unchanged — refactor is provably text-identical.
 
 What's queued (in order):
 
