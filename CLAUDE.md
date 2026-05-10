@@ -77,6 +77,22 @@ Dashboard ("The Legacy Desk"):
 - `omega_dashboard/research_data.py` — Research page data layer (the canonical-rebuild surface)
 - `omega_dashboard/spot_prices.py` — dashboard `/api/spot-prices` fetcher.
   Streaming-first when `DASHBOARD_SPOT_USE_STREAMING=1`, legacy Yahoo when off.
+- `omega_dashboard/alerts_data.py` — Alerts feed read-side data layer
+  (Patch H). Owns its own read-only sqlite3 connection
+  (`mode=ro` URI form) to `/var/backtest/desk.db`; never imports
+  `alert_recorder` write internals. `list_alerts()` (single-query feed,
+  capped at LIST_LIMIT=200, bucketed in CT via `zoneinfo`),
+  `get_alert_detail()` (UUID v4 enforced, six single-row queries for
+  one alert), defensive `format_structure_summary()`, status-strip
+  env reads, and `_build_pnl_svg()` (server-rendered inline SVG line
+  chart with MFE + current markers, no client-side charting library).
+- `/alerts`, `/alerts/data`, and `/alerts/<alert_id>` routes in
+  `omega_dashboard/routes.py` (Patch H). Pair with `/alerts/data` JSON
+  endpoint for the 10s polling loop. Mirrors the `/trading` +
+  `/trading/data` pattern at `routes.py:297-325`.
+- `omega_dashboard/templates/dashboard/alerts.html` +
+  `_alert_card.html` + `alerts_detail.html` — Alerts feed and detail
+  templates (Patch H.4 / H.5).
 - `omega_dashboard/templates/dashboard/` — Jinja templates
 - `omega_dashboard/static/omega.css` — single CSS file, all dashboard styles
 - `prev_close_store.py` — canonical previous-close cache. Lazy-fills from
@@ -356,6 +372,45 @@ What's done as of last session (v11.7 / Patch F):
   dict-like and `getattr(...)` otherwise. Both naming conventions
   still supported. New `test_build_technicals_from_raw_handles_ohlc_objects`
   pins the regression.
+- Patch H (alert feed dashboard) — Patch G's recorder finally gets a
+  user-visible surface. New `/alerts` tab between Market View and
+  Portfolio (Patch H.1) shows alerts as they're recorded, polling
+  `/alerts/data` every 10 seconds for fresh cards. Three-zone layout
+  per the visual mockup at `docs/superpowers/mockups/2026-05-10-alerts-mockup.html`:
+  status strip (RECORDER live/off pill, ENGINES count, LAST FIRE,
+  REFRESH IN countdown), today's full-width cards color-coded by
+  engine via 4px left border (LCB `--warn`, V2 5D `--brass-bright`,
+  credit `--partner`, conviction `--mine`) with pure-CSS pulse for
+  <5min and muted opacity for >24h, and collapsible Yesterday /
+  This week / Earlier sections via native `<details>`/`<summary>`.
+  Hover-pause on `.alert-card` prevents 10s polling from racing a
+  click. Click any card → `/alerts/<alert_id>` detail page (Patch H.5)
+  with parent/children linkage, structure block (DTE shown ONLY with
+  explicit per-engine convention tag — LCB "trading days" vs CREDIT
+  "calendar days" — never side-by-side without distinguishing),
+  server-rendered SVG line chart of price track with MFE + current
+  markers, outcomes table (horizon × pnl/PT1/PT2/PT3/MFE/MAE),
+  features grid (alphabetical), and collapsible raw JSON for
+  `canonical_snapshot` + `raw_engine_payload`. Read-side is
+  `omega_dashboard/alerts_data.py` (Patch H.2) with its own RO
+  sqlite3 connection (`mode=ro` URI form) — does NOT import any
+  private helper from `alert_recorder.py`, clean R/W boundary so
+  recorder refactors don't break the dashboard. UUID v4 enforced
+  on the detail route (`get_alert_detail` rejects anything that
+  doesn't match the UUID shape, never hits the DB). Single-query
+  feed (200-row cap, bucketed in CT via zoneinfo — no N+1) and
+  6-single-row-query detail. 15 hermetic tests in `test_alerts_data.py`
+  (Patch H.6) covering all 4 empty states (missing DB, empty DB,
+  all-old DB, partial detail sub-sections), per-engine
+  structure_summary including v2_5d-built-from-classification+direction,
+  malformed input fallbacks, parent linkage, UUID enforcement, and
+  the LIST_LIMIT cap with proof of no per-row enrichment. All env
+  gates default OFF; Patch H is purely additive — doesn't touch the
+  trading path, recorder write path, or daemons. Card row 5
+  (`tracking · MFE · current · PT-hits` from the mockup) is deferred
+  to Patch H.8 — needs batched IN-clause aggregate queries against
+  `alert_price_track` and `alert_outcomes` to stay no-N+1; out of
+  scope for V1.
 
 What's queued (in order):
 
