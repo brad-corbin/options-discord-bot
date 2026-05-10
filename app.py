@@ -558,7 +558,9 @@ import logging
 import csv
 import threading
 import queue
-import fcntl
+# fcntl is Unix-only; lazy-imported inside _acquire_background_leader so
+# app.py can be imported on Windows for local dev (e.g., snapshot tests).
+# Production runs on Render/Linux where the function actually executes.
 import portfolio
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
@@ -15034,6 +15036,12 @@ def _acquire_background_leader() -> bool:
     if _background_lock_fh is not None:
         return True
     lock_path = os.getenv("OMEGA_BG_LOCK_PATH", "/tmp/omega_background.lock").strip() or "/tmp/omega_background.lock"
+    try:
+        import fcntl  # Unix-only; production runs on Linux
+    except ImportError:
+        # Windows local dev — caller will see False and skip background work,
+        # which is the correct behavior outside Render anyway.
+        return False
     try:
         fh = open(lock_path, "a+")
         fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
