@@ -64,9 +64,11 @@ ACCOUNT_KEYS = {a["key"] for a in ACCOUNTS}
 
 # Top-nav page tabs
 # legacy-v1: renamed Command → Desk, Trading → Market View (endpoints unchanged)
+# v11.7 (Patch H.1): Alerts tab between Market View and Portfolio.
 PAGE_TABS = [
     {"key": "dashboard",  "label": "Desk",         "endpoint": "dashboard.command_center"},
     {"key": "trading",    "label": "Market View",  "endpoint": "dashboard.trading"},
+    {"key": "alerts",     "label": "Alerts",       "endpoint": "dashboard.alerts"},
     {"key": "portfolio",  "label": "Portfolio",    "endpoint": "dashboard.portfolio"},
     {"key": "research",   "label": "Research",     "endpoint": "dashboard.research"},
     {"key": "restore",    "label": "Durability",   "endpoint": "dashboard.restore"},
