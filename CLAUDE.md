@@ -411,6 +411,44 @@ What's done as of last session (v11.7 / Patch F):
   to Patch H.8 — needs batched IN-clause aggregate queries against
   `alert_price_track` and `alert_outcomes` to stay no-N+1; out of
   scope for V1.
+- Patch H.8 (alert feed row 5 + enriched status badge) — completes
+  the visual mockup deferred from Patch H. Three additional batched
+  aggregate queries on `list_alerts()`: track aggregate (MAX/MIN
+  pnl + latest_elapsed via GROUP BY), latest sample (window function
+  with deterministic tie-break on `(elapsed_seconds DESC, sampled_at
+  DESC)` — guards against any future case where two track rows
+  share elapsed_seconds), outcomes any-PT (MAX(hit_pt1/2/3) GROUP BY).
+  Total: 4 SQL statements per page render regardless of row count;
+  empty-input guard early-returns `{}` so a zero-row alerts table
+  doesn't construct `IN ()`. New module-level constant
+  `TRACKING_HORIZON_SECONDS = 72 * 60 * 60` (single horizon for
+  visual simplicity in V1; promote to per-engine in V1.1 if outcome
+  data shows distinct decay profiles). New helper
+  `_compute_status_badge(engine, elapsed_seconds, latest_pnl)`
+  returns `(text, style_class)` with first-match-wins logic:
+  v2_5d → EVAL, past horizon → EXPIRED, latest_pnl present →
+  +N% / -N% (sign-aware integer rounding), else ACTIVE. Card dict
+  gains `badge_text` / `badge_class` / `row5` fields; `row5` is a
+  mode-driven dict with one of `active` (bar + MFE + current + optional
+  ★ PT3/PT2/PT1 highest-tier wins), `warming` (countdown to first
+  sample at 60s elapsed), `v2_5d` (no tracking, lists outcome
+  horizons), or `expired` (bar pinned at 100%, final pnl). Template
+  + JS renderCard mirror each other with explicit sync-point
+  comments — server vs client render drift would silently break
+  polling. CSS adds `.alert-card-badge.badge-{eval|expired|positive|negative}`
+  on top of H.4's `.badge-active`, plus `.alert-card-row5` +
+  `.track-bar` + `.track-bar-fill` + `.alert-card-row5-pt-hit`
+  styling. **Decision: MFE shown alongside PT-hit star** (Option B
+  per spec) — operational signal value over mockup fidelity; the
+  MFE-vs-current spread carries operationally distinct stories
+  ("peaked at PT then drifted" vs "ran way past PT then gave it
+  back"). 9 new hermetic tests on top of Patch H's 15 — 24 total
+  in `test_alerts_data.py`. No schema change, no env var change,
+  no daemon change. Index verification (Brad): existing
+  `idx_track_alert` covers queries 2 & 3,
+  `sqlite_autoindex_alert_outcomes_1` (composite PK on
+  `alert_id, horizon`) covers query 4 — verified via EXPLAIN
+  QUERY PLAN. No 0002 migration needed.
 
 What's queued (in order):
 
