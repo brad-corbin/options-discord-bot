@@ -384,6 +384,63 @@ def alerts_detail(alert_id):
     )
 
 
+# v11.7 (Patch M.5): EM brief routes for Market View. Three routes:
+#   GET  /em/brief/<ticker>          — synchronous, returns JSON for the panel
+#   POST /em/refresh                 — starts the all-35 refresh job
+#   GET  /em/refresh/status/<job_id> — progress poll (every 2s from JS)
+#
+# All login-required. All read-only against the existing trading path
+# except /em/refresh which writes ThesisContext via _generate_silent_thesis
+# (same write path the periodic loop uses). EM_BRIEF_DASHBOARD_ENABLED
+# kill switch handled inside em_data — routes return 410 when disabled.
+
+import re as _re
+
+_TICKER_RE = _re.compile(r"^[A-Z]{1,8}$")
+
+
+@dashboard_bp.route("/em/brief/<string:ticker>", methods=["GET"])
+@login_required
+def em_brief(ticker):
+    from . import em_data
+    ticker_upper = (ticker or "").upper().strip()
+    if not _TICKER_RE.match(ticker_upper):
+        return jsonify({"available": False,
+                        "error": f"Invalid ticker: {ticker}",
+                        "ticker": ticker}), 400
+    payload = em_data.get_em_brief(ticker_upper)
+    if payload.get("error") and "disabled" in (payload.get("error") or ""):
+        return jsonify(payload), 410
+    resp = jsonify(payload)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@dashboard_bp.route("/em/refresh", methods=["POST"])
+@login_required
+def em_refresh():
+    from . import em_data
+    payload = em_data.start_refresh_all()
+    if payload.get("error") and "disabled" in (payload.get("error") or ""):
+        return jsonify(payload), 410
+    resp = jsonify(payload)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@dashboard_bp.route("/em/refresh/status/<string:job_id>", methods=["GET"])
+@login_required
+def em_refresh_status(job_id):
+    from . import em_data
+    # Reject anything that isn't a UUID-shaped string before hitting Redis.
+    if not _re.match(r"^[0-9a-f-]{8,40}$", job_id, _re.IGNORECASE):
+        return jsonify({"found": False, "error": "Invalid job_id"}), 400
+    payload = em_data.get_refresh_progress(job_id)
+    resp = jsonify(payload)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
 @dashboard_bp.route("/portfolio", methods=["GET"])
 @login_required
 def portfolio():
