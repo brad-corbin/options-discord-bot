@@ -1,0 +1,18 @@
+{# v11.7 (Patch M.6): EM brief panel partial.
+   Renders ONLY the empty-placeholder state for initial page render.
+   When a ticker is selected (whole-card click, ticker input, URL ?em=),
+   the JS in trading.html replaces this content via fetch() against
+   /em/brief/<ticker>.
+
+   States the JS toggles:
+     - empty placeholder (this template's content; default state)
+     - loading (spinner overlay)
+     - populated (full structured brief)
+     - error (friendly message + dismiss)
+     - partial (warning banner + populated brief)
+#}
+<div class="em-brief-panel em-brief-panel-empty" id="em-brief-panel">
+  <div class="em-brief-empty-message">
+    Click any card or type a ticker above to see the dealer EM brief.
+  </div>
+</div>
