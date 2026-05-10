@@ -500,14 +500,36 @@ What's done as of last session (v11.7 / Patch F):
   a subtle warning banner; full-error state only when nothing
   computes (e.g., truly unknown ticker).
 
-  Hermetic tests in `test_em_data.py` (11 tests): kill-switch behavior,
-  partial-brief detection, refresh-all idempotency + Redis state
-  decoding + slow-caption threshold + finished-state. Plus
-  `test_em_brief_snapshot.py` (1 mega-test, 3 scenarios) for the
+  Hermetic tests in `test_em_data.py` (17 tests after M.8.1):
+  kill-switch behavior, partial-brief detection, refresh-all
+  idempotency + Redis state decoding + slow-caption threshold +
+  finished-state, plus the M.8.1 `_json_safe` regression battery.
+  Plus `test_em_brief_snapshot.py` (1 mega-test, 3 scenarios) for the
   refactor gate.
 
   All env gates default ON for the dashboard surface. `/em` Telegram
   command behavior unchanged — refactor is provably text-identical.
+- Patch M.8.1 hotfix (`/em/brief` JSON serialization) — production
+  hit `TypeError: Object of type ExerciseStyle is not JSON
+  serializable` on `GET /em/brief/HOOD`. Root cause:
+  `_compute_em_brief_data` returns `v4_result` which contains
+  `OptionRow` dataclasses with an `exercise_style: ExerciseStyle`
+  Enum field; Flask's default `jsonify` (`json.dumps`) can't handle
+  Enum or dataclass instances. The Telegram path didn't surface this
+  because `_post_em_card` formats the data as text — never
+  JSON-serializes — so the bug was invisible to the snapshot test
+  gate. Fix: new `omega_dashboard/em_data._json_safe(obj)` recursive
+  sanitizer applied to the data dict before returning from
+  `get_em_brief()`. Handles Enum (`.name`), dataclass
+  (`dataclasses.asdict` recursively), NaN/inf (→ None), datetime/date
+  (ISO 8601), dict/list/tuple/set (recurse), unknown objects
+  (`str()` fallback so jsonify never 500s). Same pattern
+  `bot_state_producer._clean_for_json` uses for envelope
+  serialization, extended with Enum + dataclass support. 6 new
+  regression tests in `test_em_data.py` pin the fix — including one
+  end-to-end test (`test_get_em_brief_response_is_jsonifiable_with_enum_in_v4_result`)
+  that simulates the exact production failure shape and asserts
+  `json.dumps(get_em_brief())` round-trips cleanly.
 
 What's queued (in order):
 
@@ -838,6 +860,19 @@ is high. Don't argue with them.
   always.** OI flow conviction plays don't chain off a V2 5D
   evaluation the way LCB / credit do. If conviction ever becomes
   V2 5D-gated, this changes; until then, hardcoded None.
+- **Dashboard routes that return engine-internal data MUST sanitize
+  before `jsonify`.** Engine internals contain `Enum` (e.g.,
+  `ExerciseStyle`), dataclass instances (`OptionRow`), `NaN`/`inf`
+  floats, and datetime objects — none of which Flask's default
+  JSON encoder handles. The `/em/brief` route hit this in production
+  (Patch M.8.1 hotfix) because `v4_result.rows[*].exercise_style` is
+  an Enum buried 5 levels deep in the response. Use the existing
+  `omega_dashboard.em_data._json_safe(obj)` recursive sanitizer (or
+  copy the pattern: `Enum→.name`, `dataclass→asdict`, `NaN/inf→None`,
+  `datetime→isoformat`, recurse into dict/list, `str()` fallback for
+  unknowns). The Telegram path doesn't surface these bugs — it
+  formats text, never JSON-serializes — so snapshot tests don't catch
+  them. New dashboard routes need an explicit JSON-safety pass.
 ---
 
 ## Known issues — document but don't fix unless asked
