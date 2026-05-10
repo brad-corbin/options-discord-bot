@@ -565,6 +565,7 @@ import portfolio
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Optional, Dict, Any, List  # v11.7 (Patch M.1)
 
 import requests
 from flask import Flask, request, jsonify
@@ -12945,6 +12946,190 @@ def _post_em_card(ticker: str, session: str):
 
     except Exception as e:
         log.error(f"EM card error for {ticker} ({session}): {e}", exc_info=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v11.7 (Patch M.1): pure-compute extraction. Single source of truth for the
+# EM brief data layer.
+#
+# Consumers: _post_em_card (refactored in M.2), _generate_silent_thesis
+# (refactored in M.3), and the dashboard (added in M.4). M.1 is purely
+# additive — _post_em_card still computes inline and is unchanged.
+# ─────────────────────────────────────────────────────────────────────────────
+def _compute_em_brief_data(ticker: str, session: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Compute the EM brief data layer for a ticker.
+
+    Pure-compute helper that replicates the data-gathering prefix of
+    _post_em_card without any Telegram I/O or line formatting. Returns a
+    dict with the canonical "EM data shape" or None on missing inputs /
+    unhandled error.
+
+    Session resolution:
+        session=None  → "afternoon" if market closed, else "manual"
+        session="morning"/"afternoon"/"manual" → honored, but auto-flips
+        to afternoon-mode behavior when market is closed.
+
+    Returns None when iv or spot can't be fetched, mirroring _post_em_card's
+    skip path. Wraps the entire body in try/except so callers never see
+    exceptions — failure is signalled by None.
+    """
+    try:
+        import pytz
+        ct = pytz.timezone("America/Chicago")
+        now_ct = datetime.now(ct)
+        today_dt = now_ct.date()
+
+        # Default session when caller passes None: use afternoon when the
+        # market is closed (matches the auto-detect flip below), else manual.
+        market_open_ct = now_ct.replace(hour=8, minute=30, second=0, microsecond=0)
+        market_close_ct = now_ct.replace(hour=15, minute=0, second=0, microsecond=0)
+        is_market_closed = now_ct > market_close_ct or now_ct < market_open_ct
+
+        if session is None:
+            session_resolved = "afternoon" if is_market_closed else "manual"
+        else:
+            session_resolved = session
+
+        is_afternoon = (session_resolved == "afternoon")
+
+        # Mirror _post_em_card's auto-flip: if not afternoon but market is
+        # closed, treat as afternoon/next-day preview.
+        if not is_afternoon and is_market_closed:
+            is_afternoon = True
+            session_resolved = "afternoon"
+
+        if is_afternoon:
+            target_date_str = _get_next_trading_day(today_dt)
+            hours_for_em = 6.5
+            session_emoji = "🌆"
+            session_label = "Next Day Preview"
+            horizon_note = f"Full session EM for {target_date_str}"
+        else:
+            target_date_str = today_dt.strftime("%Y-%m-%d")
+            hours_for_em = max((market_close_ct - now_ct).total_seconds() / 3600, 0.25)
+            if now_ct >= market_open_ct:
+                session_emoji = "🔔"
+                session_label = "Today (Live)"
+            else:
+                session_emoji = "🌅"
+                session_label = "Today (Pre-Open)"
+            horizon_note = f"{hours_for_em:.1f}h remaining today"
+
+        # 9-element tuple includes v4_result.
+        result_tuple = _get_0dte_iv(ticker, target_date_str)
+        iv, spot, expiration = result_tuple[0], result_tuple[1], result_tuple[2]
+        eng = result_tuple[3]
+        walls = result_tuple[4]
+        skew = result_tuple[5]
+        pcr = result_tuple[6]
+        vix = result_tuple[7]
+        v4_result = result_tuple[8] if len(result_tuple) > 8 else {}
+
+        if iv is None or spot is None:
+            log.warning(f"_compute_em_brief_data({ticker}): IV unavailable for {target_date_str}")
+            return None
+
+        em = _calc_intraday_em(spot, iv, hours_for_em)
+        if not em:
+            return None
+
+        # VIX proxy from chain IV when API sources fail (matches _post_em_card).
+        if not vix or not vix.get("vix"):
+            if iv and iv > 0:
+                proxy_vix = round(iv * 100, 1)
+                vix = {"vix": proxy_vix, "vix9d": None, "term": "unknown", "source": "iv_proxy"}
+
+        vol_regime = get_canonical_vol_regime(ticker, get_daily_candles(ticker, days=30), vix_override=vix)
+        bias = _calc_bias(spot, em, walls or {}, skew or {}, eng or {}, pcr or {}, vix or {})
+
+        # Institutional flow model (CAGF) — SPY/QQQ/SPX only, gated on dealer eng.
+        cagf = None
+        dte_rec = None
+        if eng and ticker.upper() in ("SPY", "QQQ", "SPX"):
+            _session_secs = (market_close_ct - market_open_ct).total_seconds()
+            _elapsed = max(0, (now_ct - market_open_ct).total_seconds())
+            _sess_progress = min(1.0, _elapsed / _session_secs) if _session_secs > 0 else 0.5
+
+            _rv = 0
+            if v4_result and v4_result.get("vol_regime"):
+                _rv = v4_result["vol_regime"].get("realized_vol_20d", 0) or 0
+
+            _vix_val = vix.get("vix", 20) if vix else 20
+            _adv, _ = _estimate_liquidity(ticker, spot)
+            _closes = get_daily_candles(ticker, days=60)
+
+            cagf = compute_cagf(
+                dealer_flows={
+                    "gex": eng.get("gex", 0),
+                    "dex": eng.get("dex", 0),
+                    "vanna": eng.get("vanna", 0),
+                    "charm": eng.get("charm", 0),
+                    "gamma_flip": eng.get("flip_price"),
+                },
+                iv=iv,
+                rv=_rv,
+                spot=spot,
+                vix=_vix_val,
+                session_progress=_sess_progress,
+                adv=_adv,
+                candle_closes=_closes,
+                ticker=ticker,
+            )
+
+            dte_rec = recommend_dte(
+                cagf=cagf,
+                iv=iv,
+                vix=_vix_val,
+                session_progress=_sess_progress,
+            )
+
+        # Section availability checks — simple non-empty / non-None tests.
+        available_sections: List[str] = []
+        if iv is not None and spot is not None:
+            available_sections.append("header")
+        if em:
+            available_sections.append("em_range")
+        if walls:
+            available_sections.append("walls")
+        if eng:
+            available_sections.append("dealer_flow")
+        if bias is not None:
+            available_sections.append("bias")
+        if cagf is not None:
+            available_sections.append("cagf")
+        if dte_rec is not None:
+            available_sections.append("dte_rec")
+        if vol_regime is not None:
+            available_sections.append("vol_regime")
+
+        return {
+            "ticker": ticker,
+            "session_resolved": session_resolved,
+            "expiration": expiration,
+            "target_date_str": target_date_str,
+            "hours_for_em": hours_for_em,
+            "session_emoji": session_emoji,
+            "session_label": session_label,
+            "horizon_note": horizon_note,
+            "iv": iv,
+            "spot": spot,
+            "eng": eng,
+            "walls": walls,
+            "skew": skew,
+            "pcr": pcr,
+            "vix": vix,
+            "v4_result": v4_result,
+            "vol_regime": vol_regime,
+            "em": em,
+            "bias": bias,
+            "cagf": cagf,
+            "dte_rec": dte_rec,
+            "available_sections": available_sections,
+        }
+
+    except Exception as e:
+        log.warning(f"_compute_em_brief_data({ticker}): {e}", exc_info=True)
+        return None
 
 
 def _generate_silent_thesis(ticker: str, refresh_only: bool = False):
