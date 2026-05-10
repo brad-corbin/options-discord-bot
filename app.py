@@ -12476,6 +12476,19 @@ def _post_options_map_card(ticker: str, route: str = None, compact: bool = False
 
 def _post_em_card(ticker: str, session: str):
     try:
+        # v11.7 (Patch M.2): consume _compute_em_brief_data for the data
+        # layer. Text formatting + terminal post calls below are
+        # byte-identical to the pre-refactor code; snapshot test
+        # (test_em_brief_snapshot.py) gates this contract.
+        #
+        # Session resolution + target_date_str computed inline here so the
+        # early-return warning text matches the pre-refactor format
+        # byte-for-byte (the snapshot fixture pins this exact string), and
+        # so now_ct / is_afternoon remain available to the
+        # thesis-monitor / paper-trade-tag / trade-card blocks below.
+        # The helper does the same resolution internally — duplicating
+        # the few lines here is cheaper than reshaping the helper's
+        # return contract.
         import pytz
         ct = pytz.timezone("America/Chicago"); now_ct = datetime.now(ct); today_dt = now_ct.date()
         is_afternoon = (session == "afternoon")
@@ -12494,42 +12507,47 @@ def _post_em_card(ticker: str, session: str):
 
         if is_afternoon:
             target_date_str = _get_next_trading_day(today_dt)
-            hours_for_em = 6.5; session_emoji = "🌆"; session_label = "Next Day Preview"
-            horizon_note = f"Full session EM for {target_date_str}"
         else:
             target_date_str = today_dt.strftime("%Y-%m-%d")
-            hours_for_em = max((market_close_ct - now_ct).total_seconds() / 3600, 0.25)
-            # v15: Distinguish pre-open from live session for thesis label
-            if now_ct >= market_open_ct:
-                session_emoji = "🔔"; session_label = "Today (Live)"
-            else:
-                session_emoji = "🌅"; session_label = "Today (Pre-Open)"
-            horizon_note = f"{hours_for_em:.1f}h remaining today"
 
-        # v4: 9-element tuple now includes v4_result
-        result_tuple = _get_0dte_iv(ticker, target_date_str)
-        iv, spot, expiration = result_tuple[0], result_tuple[1], result_tuple[2]
-        eng, walls, skew, pcr, vix = result_tuple[3], result_tuple[4], result_tuple[5], result_tuple[6], result_tuple[7]
-        v4_result = result_tuple[8] if len(result_tuple) > 8 else {}
-
-        if iv is None or spot is None:
+        data = _compute_em_brief_data(ticker, session)
+        if data is None:
             log.warning(f"EM card skipped for {ticker}: IV unavailable")
             post_to_telegram(f"⚠️ {ticker} EM: could not fetch IV for {target_date_str}")
             return
 
-        em = _calc_intraday_em(spot, iv, hours_for_em)
-        if not em: return
+        # Unpack helper output into the same locals the original body used
+        # so the rest of the function stays byte-identical.
+        ticker = data["ticker"]
+        session_emoji = data["session_emoji"]
+        session_label = data["session_label"]
+        horizon_note = data["horizon_note"]
+        target_date_str = data["target_date_str"]
+        iv = data["iv"]
+        spot = data["spot"]
+        expiration = data["expiration"]
+        eng = data["eng"]
+        walls = data["walls"]
+        skew = data["skew"]
+        pcr = data["pcr"]
+        vix = data["vix"]
+        v4_result = data["v4_result"]
+        vol_regime = data["vol_regime"]
+        em = data["em"]
+        bias = data["bias"]
+        cagf = data["cagf"]
+        dte_rec = data["dte_rec"]
 
-        # v4.3: VIX proxy from chain IV when all VIX API sources fail.
-        # For SPY, ATM IV × 100 ≈ VIX. For others, close enough for regime classification.
-        if not vix or not vix.get("vix"):
-            if iv and iv > 0:
-                proxy_vix = round(iv * 100, 1)
-                vix = {"vix": proxy_vix, "vix9d": None, "term": "unknown", "source": "iv_proxy"}
-                log.info(f"VIX proxy from {ticker} ATM IV: {proxy_vix:.1f} (all API sources failed)")
-
-        vol_regime = get_canonical_vol_regime(ticker, get_daily_candles(ticker, days=30), vix_override=vix)
-        bias = _calc_bias(spot, em, walls or {}, skew or {}, eng or {}, pcr or {}, vix or {})
+        # v4.3: Preserve the VIX-proxy observability log line that the
+        # helper intentionally omits (Option A from the M.2 plan). When
+        # all VIX API sources failed inside the helper, vix["source"] is
+        # "iv_proxy"; emit the same log message _post_em_card emitted
+        # pre-refactor so the production log surface is unchanged.
+        if isinstance(vix, dict) and vix.get("source") == "iv_proxy":
+            _proxy_vix_val = vix.get("vix")
+            if _proxy_vix_val is not None:
+                log.info(f"VIX proxy from {ticker} ATM IV: "
+                         f"{_proxy_vix_val:.1f} (all API sources failed)")
 
         iv_pct = iv * 100
         if iv_pct < 10: iv_emoji = "🟢"; iv_note = "Low IV — tight range."
@@ -12604,60 +12622,15 @@ def _post_em_card(ticker: str, session: str):
                 lines.append(f"  🔍 {ts_line}")
 
         # ══════ INSTITUTIONAL FLOW MODEL (CAGF) — SPY/QQQ ══════
-        cagf = None
-        dte_rec = None
-        if eng and ticker.upper() in ("SPY", "QQQ", "SPX"):
-            # Compute CAGF from dealer flows
-            import pytz as _pytz
-            _ct = _pytz.timezone("America/Chicago")
-            _now_ct = datetime.now(_ct)
-            _mkt_open = _now_ct.replace(hour=8, minute=30, second=0, microsecond=0)
-            _mkt_close = _now_ct.replace(hour=15, minute=0, second=0, microsecond=0)
-            _session_secs = (_mkt_close - _mkt_open).total_seconds()
-            _elapsed = max(0, (_now_ct - _mkt_open).total_seconds())
-            _sess_progress = min(1.0, _elapsed / _session_secs) if _session_secs > 0 else 0.5
-
-            # Get RV from v4 result
-            _rv = 0
-            if v4_result and v4_result.get("vol_regime"):
-                _rv = v4_result["vol_regime"].get("realized_vol_20d", 0) or 0
-
-            _vix_val = vix.get("vix", 20) if vix else 20
-
-            # Get ADV for normalization
-            _adv, _ = _estimate_liquidity(ticker, spot)
-
-            # Get candle closes for momentum component
-            _closes = get_daily_candles(ticker, days=60)
-
-            cagf = compute_cagf(
-                dealer_flows={
-                    "gex": eng.get("gex", 0),
-                    "dex": eng.get("dex", 0),
-                    "vanna": eng.get("vanna", 0),
-                    "charm": eng.get("charm", 0),
-                    "gamma_flip": eng.get("flip_price"),
-                },
-                iv=iv,
-                rv=_rv,
-                spot=spot,
-                vix=_vix_val,
-                session_progress=_sess_progress,
-                adv=_adv,
-                candle_closes=_closes,
-                ticker=ticker,
-            )
+        # v11.7 (Patch M.2): cagf and dte_rec are now computed inside
+        # _compute_em_brief_data and unpacked above. The format calls and
+        # observability log line stay here — they emit the same lines /
+        # log messages as the pre-refactor code.
+        if cagf is not None:
             lines += format_cagf_block(cagf)
-
-            # DTE recommendation
-            dte_rec = recommend_dte(
-                cagf=cagf,
-                iv=iv,
-                vix=_vix_val,
-                session_progress=_sess_progress,
-            )
+        if dte_rec is not None:
             lines += format_dte_block(dte_rec)
-
+        if cagf is not None and dte_rec is not None:
             log.info(f"CAGF {ticker}: edge={cagf['edge']:+.2f} dir={cagf['direction']} "
                      f"trend={cagf['trend_day_probability']:.0%} regime={cagf['regime']} "
                      f"dte_rec={dte_rec['primary']['label']}")
