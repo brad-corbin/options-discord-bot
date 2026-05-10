@@ -325,6 +325,63 @@ def trading_data_json():
     return resp
 
 
+# v11.7 (Patch H.3): alerts feed routes. Read-only against the recorder
+# DB at /var/backtest/desk.db; mirrors the /trading + /trading/data
+# pattern above. Three login-required routes:
+#   /alerts                 — page render + initial payload
+#   /alerts/data            — JSON payload for the 10s polling loop
+#   /alerts/<alert_id>      — detail page (UUID v4 enforced inside)
+#
+# alerts_data.py owns its own read-only sqlite3 connection (mode=ro
+# URI form). It does NOT import alert_recorder write internals — the
+# read/write boundary is intentional so future recorder refactors don't
+# break the dashboard.
+
+@dashboard_bp.route("/alerts", methods=["GET"])
+@login_required
+def alerts():
+    from . import alerts_data
+    page_data = alerts_data.list_alerts()
+    return render_page(
+        "dashboard/alerts.html",
+        page_key="alerts",
+        page_data=page_data,
+    )
+
+
+@dashboard_bp.route("/alerts/data", methods=["GET"])
+@login_required
+def alerts_data_json():
+    from . import alerts_data
+    payload = alerts_data.list_alerts()
+    resp = jsonify(payload)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@dashboard_bp.route("/alerts/<string:alert_id>", methods=["GET"])
+@login_required
+def alerts_detail(alert_id):
+    from . import alerts_data
+    detail = alerts_data.get_alert_detail(alert_id)
+    if detail is None:
+        # 404 with friendly empty-state, not raw Flask 404. The UUID v4
+        # check inside get_alert_detail also returns None for malformed
+        # ids — same friendly path.
+        return render_page(
+            "dashboard/alerts_detail.html",
+            page_key="alerts",
+            page_data={"available": False,
+                       "error": f"Alert not found: {alert_id}",
+                       "detail": None},
+        ), 404
+    return render_page(
+        "dashboard/alerts_detail.html",
+        page_key="alerts",
+        page_data={"available": True, "error": None, "detail": detail},
+    )
+
+
 @dashboard_bp.route("/portfolio", methods=["GET"])
 @login_required
 def portfolio():
