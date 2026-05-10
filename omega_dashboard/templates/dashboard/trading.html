@@ -12,6 +12,26 @@
   </div>
 </div>
 
+{# v11.7 (Patch M.7): EM brief header strip + anchored panel.
+   Three entry paths populate the panel: whole-card click,
+   ticker input + Enter, URL ?em=TICKER on page load. #}
+<div class="em-brief-header-strip">
+  <button id="em-refresh-all-btn" class="em-refresh-all-btn" type="button">
+    &#x21bb; Refresh all 35
+  </button>
+  <input id="em-ticker-input"
+         class="em-ticker-input"
+         type="text"
+         placeholder="Type ticker (e.g. HOOD) and press Enter&hellip;"
+         autocomplete="off"
+         spellcheck="false"
+         maxlength="8"
+         aria-label="Look up EM brief for any ticker" />
+  <span id="em-refresh-status" class="em-refresh-status" role="status"></span>
+</div>
+
+{% include 'dashboard/_em_brief_panel.html' %}
+
 <div class="trading-cards-section fade-in">
   <div class="trading-cards-header">
     <div class="trading-cards-eyebrow">— SITUATION · {{ page_data.tickers_total }} TICKERS</div>
@@ -111,7 +131,13 @@
     const stripe = (t.thesis && t.thesis.stripe_class) ? t.thesis.stripe_class : 'neutral';
     const lines = [];
 
-    lines.push('<div class="tcard stripe-' + stripe + '" data-ticker="' + escapeHtml(t.ticker) + '">');
+    // v11.7 (Patch M.7): include tcard-clickable + role/tabindex/aria so
+    // the whole-card click target survives the 5s poll re-render. Must
+    // mirror the Jinja partial in _trading_card.html exactly.
+    lines.push('<div class="tcard tcard-clickable stripe-' + stripe + '"' +
+               ' data-ticker="' + escapeHtml(t.ticker) + '"' +
+               ' role="button" tabindex="0"' +
+               ' aria-label="Show EM brief for ' + escapeHtml(t.ticker) + '">');
 
     // Header
     lines.push('<div class="tcard-header">');
@@ -349,6 +375,329 @@
   }
 
   setInterval(poll, POLL_INTERVAL_MS);
+})();
+</script>
+
+<script>
+// v11.7 (Patch M.7): EM brief panel + refresh-all wiring.
+(function () {
+  'use strict';
+  // Three entry paths populate the same panel; last-write-wins via
+  // currentRequestId to ignore stale responses.
+
+  const POLL_INTERVAL_MS = 2000;  // refresh-status poll cadence
+  const PANEL_EL = document.getElementById('em-brief-panel');
+  const REFRESH_BTN = document.getElementById('em-refresh-all-btn');
+  const TICKER_INPUT = document.getElementById('em-ticker-input');
+  const STATUS_EL = document.getElementById('em-refresh-status');
+  const GRID = document.getElementById('trading-cards-grid');
+
+  let currentRequestId = 0;     // last-write-wins guard
+  let activeRefreshJob = null;  // job_id of in-flight refresh-all
+
+  function escapeHtml(s) {
+    if (s === null || s === undefined) return '';
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+      .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+  }
+
+  function setUrl(ticker) {
+    const url = new URL(window.location.href);
+    if (ticker) url.searchParams.set('em', ticker);
+    else url.searchParams.delete('em');
+    window.history.replaceState({}, '', url.toString());
+  }
+
+  // EM brief: render functions
+  function renderEmpty() {
+    if (!PANEL_EL) return;
+    PANEL_EL.className = 'em-brief-panel em-brief-panel-empty';
+    PANEL_EL.innerHTML = '<div class="em-brief-empty-message">Click any card or type a ticker above to see the dealer EM brief.</div>';
+  }
+
+  function renderLoading(ticker, refreshInFlight) {
+    if (!PANEL_EL) return;
+    const caption = refreshInFlight
+      ? 'Computing brief for ' + escapeHtml(ticker) + '… (refresh-all in progress, may be slower)'
+      : 'Computing brief for ' + escapeHtml(ticker) + '…';
+    let overlay = PANEL_EL.querySelector('.em-brief-loading');
+    if (!overlay) {
+      overlay = document.createElement('div');
+      overlay.className = 'em-brief-loading';
+      PANEL_EL.appendChild(overlay);
+    }
+    overlay.innerHTML = '<div class="em-brief-spinner"></div><div class="em-brief-loading-caption">' + caption + '</div>';
+    PANEL_EL.classList.add('em-brief-panel-loading');
+  }
+
+  function renderError(ticker, message) {
+    if (!PANEL_EL) return;
+    PANEL_EL.className = 'em-brief-panel em-brief-panel-error';
+    PANEL_EL.innerHTML =
+      '<div class="em-brief-error-icon">⚠</div>' +
+      '<div class="em-brief-error-title">' + escapeHtml(ticker) + '</div>' +
+      '<div class="em-brief-error-message">' + escapeHtml(message) + '</div>' +
+      '<button class="em-brief-dismiss" type="button" aria-label="Dismiss">×</button>';
+  }
+
+  function renderBrief(payload) {
+    if (!PANEL_EL) return;
+    const d = payload.data;
+    const t = payload.ticker;
+    const warning = payload.partial_warning
+      ? '<div class="em-brief-partial-warning">⚠ ' + escapeHtml(payload.partial_warning) + '</div>'
+      : '';
+    const verdict = (d.bias && d.bias.verdict) ? d.bias.verdict : '';
+    const verdictClass = verdictToClass(verdict);
+    const headerHtml =
+      '<div class="em-brief-section em-brief-header em-brief-engine-' + verdictClass + '">' +
+        '<div class="em-brief-engine-label">' + escapeHtml(d.session_emoji || '') + ' ' + escapeHtml(t) + ' — DEALER EM BRIEF</div>' +
+        '<div class="em-brief-meta">Spot $' + Number(d.spot).toFixed(2) +
+          ' · IV ' + Number(d.iv * 100).toFixed(1) + '%' +
+          ' · Exp ' + escapeHtml(d.expiration || '') +
+          ' · ' + escapeHtml(d.session_label || '') + '</div>' +
+      '</div>';
+    const biasHtml = d.bias
+      ? '<div class="em-brief-section">' +
+          '<div class="em-brief-section-title">Bias</div>' +
+          '<div class="em-brief-bias-pill em-brief-bias-' + biasToClass(d.bias.direction) + '">' +
+            escapeHtml(d.bias.direction) +
+            ' (score ' + d.bias.score + '/' + d.bias.max_score + ')' +
+          '</div>' +
+        '</div>' : '';
+    const levelsHtml = renderLevelsGrid(d);
+    const dealerHtml = renderDealerFlow(d);
+    const volHtml = renderVolBlock(d);
+    const actionHtml = renderActionGuide(d);
+    const footer = '<div class="em-brief-footer">computed at ' + escapeHtml(payload.computed_at_ct) + ' — Not financial advice</div>';
+
+    PANEL_EL.className = 'em-brief-panel em-brief-panel-populated';
+    PANEL_EL.innerHTML =
+      '<div class="em-brief-panel-header">' +
+        '<div class="em-brief-panel-ticker">' + escapeHtml(t) + '</div>' +
+        '<button class="em-brief-refresh" type="button" title="Refresh this brief" aria-label="Refresh">↻</button>' +
+        '<button class="em-brief-dismiss" type="button" title="Close (Esc)" aria-label="Dismiss">×</button>' +
+      '</div>' +
+      warning +
+      headerHtml + biasHtml + levelsHtml + dealerHtml + volHtml + actionHtml + footer;
+  }
+
+  function verdictToClass(v) {
+    const u = (v || '').toUpperCase();
+    if (u.indexOf('NO TRADE') >= 0) return 'no-trade';
+    if (u.indexOf('STRONG') >= 0)   return 'strong';
+    return 'neutral';
+  }
+  function biasToClass(dir) {
+    const u = (dir || '').toUpperCase();
+    if (u.indexOf('BULL') >= 0) return 'bull';
+    if (u.indexOf('BEAR') >= 0) return 'bear';
+    return 'neutral';
+  }
+
+  function renderLevelsGrid(d) {
+    if (!d.em && !d.walls) return '';
+    const rows = [];
+    if (d.em) {
+      rows.push(['1σ Range',
+        '$' + Number(d.em.bear_1sd).toFixed(2) + ' – $' + Number(d.em.bull_1sd).toFixed(2)]);
+    }
+    if (d.eng && d.eng.flip_price !== null && d.eng.flip_price !== undefined) {
+      rows.push(['Gamma Flip', '$' + Number(d.eng.flip_price).toFixed(2)]);
+    }
+    if (d.walls) {
+      if (d.walls.call_wall !== undefined) rows.push(['Call Wall', '$' + Number(d.walls.call_wall).toFixed(0)]);
+      if (d.walls.put_wall !== undefined)  rows.push(['Put Wall',  '$' + Number(d.walls.put_wall).toFixed(0)]);
+      if (d.walls.gamma_wall !== undefined) rows.push(['Gamma Wall', '$' + Number(d.walls.gamma_wall).toFixed(0)]);
+    }
+    if (!rows.length) return '';
+    const body = rows.map(r =>
+      '<div class="em-brief-label">' + escapeHtml(r[0]) + '</div>' +
+      '<div class="em-brief-value">' + escapeHtml(r[1]) + '</div>'
+    ).join('');
+    return '<div class="em-brief-section"><div class="em-brief-section-title">Levels</div>' +
+           '<div class="em-brief-levels-grid">' + body + '</div></div>';
+  }
+
+  function renderDealerFlow(d) {
+    if (!d.eng) {
+      return '<div class="em-brief-section"><div class="em-brief-section-title">Dealer Flow</div>' +
+             '<div class="em-brief-na">n/a</div></div>';
+    }
+    const gex = d.eng.gex || 0;
+    const gexSign = gex >= 0 ? '+$' + gex.toFixed(1) + 'M' : '-$' + Math.abs(gex).toFixed(1) + 'M';
+    const gexMode = gex >= 0 ? 'SUPPRESSING moves' : 'AMPLIFYING moves';
+    return '<div class="em-brief-section">' +
+             '<div class="em-brief-section-title">Dealer Flow</div>' +
+             '<div class="em-brief-dealer-row">GEX: <span class="' + (gex >= 0 ? 'positive' : 'negative') + '">' + escapeHtml(gexSign) + '</span> — ' + escapeHtml(gexMode) + '</div>' +
+             '<div class="em-brief-dealer-row">DEX: ' + (d.eng.dex || 0).toFixed(1) + 'M</div>' +
+             '<div class="em-brief-dealer-row">Vanna: ' + (d.eng.vanna || 0).toFixed(1) + 'M · Charm: ' + (d.eng.charm || 0).toFixed(1) + 'M</div>' +
+           '</div>';
+  }
+
+  function renderVolBlock(d) {
+    const vix = d.vix || {};
+    const reg = (d.vol_regime && d.vol_regime.regime) || 'unknown';
+    return '<div class="em-brief-section">' +
+             '<div class="em-brief-section-title">Volatility Regime</div>' +
+             '<div class="em-brief-vol-row">Regime: ' + escapeHtml(reg) +
+               ' · VIX ' + (vix.vix || 'n/a') +
+               ' · Term: ' + escapeHtml(vix.term || 'n/a') + '</div>' +
+           '</div>';
+  }
+
+  function renderActionGuide(d) {
+    // V1: shows bias verdict + signals breakdown rather than the full
+    // plain-English action guide. Full action guide is V1.1 once the
+    // panel layout proves out in production.
+    if (!d.bias || !d.bias.signals || !d.bias.signals.length) return '';
+    const items = d.bias.signals.map(s => {
+      const arrow = (s[0] || '').replace(/[<>&]/g, '');
+      const text = escapeHtml(s[1] || '');
+      return '<li>' + escapeHtml(arrow) + ' ' + text + '</li>';
+    }).join('');
+    return '<div class="em-brief-section">' +
+             '<div class="em-brief-section-title">Signal Breakdown (' + d.bias.n_signals + '/14)</div>' +
+             '<ul class="em-brief-signals">' + items + '</ul>' +
+           '</div>';
+  }
+
+  // EM brief: fetch + load
+  function loadEmBrief(ticker) {
+    if (!ticker || !PANEL_EL) return;
+    const t = ticker.toUpperCase().trim();
+    setUrl(t);
+    const requestId = ++currentRequestId;
+    renderLoading(t, activeRefreshJob !== null);
+    fetch('/em/brief/' + encodeURIComponent(t), { credentials: 'same-origin' })
+      .then(r => r.ok ? r.json() : r.json().then(j => Promise.reject(j)))
+      .then(payload => {
+        if (requestId !== currentRequestId) return;  // stale
+        if (!payload.available) {
+          renderError(t, payload.error || 'Couldn\'t compute brief.');
+          return;
+        }
+        renderBrief(payload);
+      })
+      .catch(err => {
+        if (requestId !== currentRequestId) return;
+        const msg = (err && err.error) ? err.error : 'Network error fetching brief.';
+        renderError(t, msg);
+      });
+  }
+
+  function dismiss() {
+    setUrl(null);
+    renderEmpty();
+  }
+
+  // Refresh-all: button click
+  function triggerRefreshAll() {
+    if (!REFRESH_BTN || REFRESH_BTN.disabled) return;
+    REFRESH_BTN.disabled = true;
+    REFRESH_BTN.textContent = 'Starting…';
+    fetch('/em/refresh', { method: 'POST', credentials: 'same-origin' })
+      .then(r => r.json())
+      .then(payload => {
+        if (!payload.job_id) {
+          if (STATUS_EL) STATUS_EL.textContent = payload.error || 'Refresh failed to start.';
+          REFRESH_BTN.textContent = '↻ Refresh all 35';
+          REFRESH_BTN.disabled = false;
+          return;
+        }
+        activeRefreshJob = payload.job_id;
+        pollRefreshStatus();
+      })
+      .catch(() => {
+        REFRESH_BTN.textContent = '↻ Refresh all 35';
+        REFRESH_BTN.disabled = false;
+      });
+  }
+
+  function pollRefreshStatus() {
+    if (!activeRefreshJob || !REFRESH_BTN) return;
+    fetch('/em/refresh/status/' + encodeURIComponent(activeRefreshJob),
+          { credentials: 'same-origin' })
+      .then(r => r.json())
+      .then(p => {
+        if (!p.found) {
+          activeRefreshJob = null;
+          REFRESH_BTN.textContent = '↻ Refresh all 35';
+          REFRESH_BTN.disabled = false;
+          return;
+        }
+        if (p.finished_at) {
+          const errs = p.errors > 0 ? ' (' + p.errors + ' errors)' : '';
+          REFRESH_BTN.textContent = 'Refreshed' + errs;
+          REFRESH_BTN.disabled = false;
+          activeRefreshJob = null;
+          setTimeout(() => {
+            if (!activeRefreshJob) REFRESH_BTN.textContent = '↻ Refresh all 35';
+          }, 30000);
+          return;
+        }
+        const cap = p.slow_caption
+          ? ' (this can take several minutes during market hours)' : '';
+        REFRESH_BTN.textContent = 'Refreshing ' + p.completed + '/' + p.total + '…' + cap;
+        setTimeout(pollRefreshStatus, POLL_INTERVAL_MS);
+      })
+      .catch(() => {
+        setTimeout(pollRefreshStatus, POLL_INTERVAL_MS);
+      });
+  }
+
+  // Wire up entry paths
+  if (GRID) {
+    GRID.addEventListener('click', function (e) {
+      const card = e.target.closest('.tcard-clickable');
+      if (!card) return;
+      if (e.target.closest('a, button, input, textarea, select')) return;
+      const ticker = card.getAttribute('data-ticker');
+      if (ticker) loadEmBrief(ticker);
+    });
+    GRID.addEventListener('keydown', function (e) {
+      if (e.key !== 'Enter' && e.key !== ' ') return;
+      const card = e.target.closest('.tcard-clickable');
+      if (!card) return;
+      e.preventDefault();
+      const ticker = card.getAttribute('data-ticker');
+      if (ticker) loadEmBrief(ticker);
+    });
+  }
+
+  if (TICKER_INPUT) {
+    TICKER_INPUT.addEventListener('keydown', function (e) {
+      if (e.key !== 'Enter') return;
+      const ticker = TICKER_INPUT.value.toUpperCase().trim();
+      if (ticker) loadEmBrief(ticker);
+    });
+  }
+
+  const initialTicker = (new URL(window.location.href)).searchParams.get('em');
+  if (initialTicker) {
+    loadEmBrief(initialTicker);
+  }
+
+  if (REFRESH_BTN) {
+    REFRESH_BTN.addEventListener('click', triggerRefreshAll);
+  }
+
+  if (PANEL_EL) {
+    PANEL_EL.addEventListener('click', function (e) {
+      if (e.target.closest('.em-brief-dismiss')) {
+        dismiss();
+      } else if (e.target.closest('.em-brief-refresh')) {
+        const ticker = (new URL(window.location.href)).searchParams.get('em');
+        if (ticker) loadEmBrief(ticker);
+      }
+    });
+  }
+
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape' && PANEL_EL && PANEL_EL.classList.contains('em-brief-panel-populated')) {
+      dismiss();
+    }
+  });
 })();
 </script>
 

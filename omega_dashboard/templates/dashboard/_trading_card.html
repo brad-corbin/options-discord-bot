@@ -1,7 +1,14 @@
 {# Single-card partial — renders one card from a `card` context dict.
    Mirrors the JS renderCard() output so server-side initial paint
    matches what polling produces. #}
-<div class="tcard stripe-{{ card.thesis.stripe_class }}" data-ticker="{{ card.ticker }}">
+{# v11.7 (Patch M.7): whole card is the EM brief click target.
+   No corner button — matches alerts-feed pattern from Patch H.
+   The .tcard-clickable class is what the JS event delegate listens for. #}
+<div class="tcard tcard-clickable stripe-{{ card.thesis.stripe_class }}"
+     data-ticker="{{ card.ticker }}"
+     role="button"
+     tabindex="0"
+     aria-label="Show EM brief for {{ card.ticker }}">
   <div class="tcard-header">
     <div class="tcard-title-row">
       <span class="tcard-ticker">{{ card.ticker }}</span>
