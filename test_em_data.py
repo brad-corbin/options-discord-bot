@@ -2,7 +2,12 @@
 
 # v11.7 (Patch M.8): hermetic — no network, no Schwab, no Telegram.
 # Mocks app._compute_em_brief_data so each test owns its own scenario.
+# Patch M.8.1 hotfix added _json_safe sanitizer + regression tests below.
 """
+import dataclasses
+import enum
+import json as _json
+import math
 import os
 import sys
 import time
@@ -181,6 +186,120 @@ def test_get_refresh_progress_shows_finished_when_complete():
         result = em_data.get_refresh_progress("a-job-id")
     assert result["finished_at"] == finished_ms
     assert result["slow_caption"] is False  # finished, no caption
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Patch M.8.1 hotfix — _json_safe sanitizer regression tests.
+# Production hit `TypeError: Object of type ExerciseStyle is not JSON
+# serializable` on /em/brief/HOOD because v4_result contained an
+# OptionRow dataclass with an Enum field. These tests pin the fix.
+# ─────────────────────────────────────────────────────────────────────
+
+
+class _FakeEnum(enum.Enum):
+    AMERICAN = "A"
+    EUROPEAN = "E"
+
+
+@dataclasses.dataclass
+class _FakeOptionRow:
+    strike: float
+    exercise_style: _FakeEnum
+    bid: float
+
+
+def test_json_safe_handles_enum_values():
+    from omega_dashboard.em_data import _json_safe
+    assert _json_safe(_FakeEnum.AMERICAN) == "AMERICAN"
+    assert _json_safe(_FakeEnum.EUROPEAN) == "EUROPEAN"
+
+
+def test_json_safe_handles_dataclass_with_enum_field():
+    """The exact production failure shape: dataclass containing an enum."""
+    from omega_dashboard.em_data import _json_safe
+    row = _FakeOptionRow(strike=215.0, exercise_style=_FakeEnum.AMERICAN, bid=2.5)
+    safe = _json_safe(row)
+    assert safe == {"strike": 215.0, "exercise_style": "AMERICAN", "bid": 2.5}
+    # End-to-end: jsonify-equivalent must succeed.
+    _json.dumps(safe)  # raises if not serializable
+
+
+def test_json_safe_handles_nan_and_inf():
+    from omega_dashboard.em_data import _json_safe
+    assert _json_safe(math.nan) is None
+    assert _json_safe(math.inf) is None
+    assert _json_safe(-math.inf) is None
+    assert _json_safe(3.14) == 3.14
+
+
+def test_json_safe_recursive_through_nested_v4_result_shape():
+    """Mirror the production payload shape that broke at /em/brief/HOOD."""
+    from omega_dashboard.em_data import _json_safe
+    payload = {
+        "iv": 0.18,
+        "spot": 588.5,
+        "v4_result": {
+            "rows": [
+                _FakeOptionRow(215.0, _FakeEnum.AMERICAN, 2.5),
+                _FakeOptionRow(220.0, _FakeEnum.EUROPEAN, 1.8),
+            ],
+            "confidence": {"label": "HIGH", "composite": 0.78},
+            "rv": math.nan,  # NaN in nested dict
+        },
+        "vix": {"vix": 18.5, "term": "normal"},
+    }
+    safe = _json_safe(payload)
+    # End-to-end JSON round-trip must succeed.
+    s = _json.dumps(safe)
+    parsed = _json.loads(s)
+    # Spot-check key conversions.
+    assert parsed["v4_result"]["rows"][0]["exercise_style"] == "AMERICAN"
+    assert parsed["v4_result"]["rows"][1]["exercise_style"] == "EUROPEAN"
+    assert parsed["v4_result"]["rv"] is None  # NaN coerced
+    assert parsed["iv"] == 0.18
+
+
+def test_json_safe_unknown_object_falls_back_to_str():
+    """Last-resort fallback so unknown types never 500 the route."""
+    from omega_dashboard.em_data import _json_safe
+
+    class _Mystery:
+        def __str__(self):
+            return "mystery-instance"
+    assert _json_safe(_Mystery()) == "mystery-instance"
+
+
+def test_get_em_brief_response_is_jsonifiable_with_enum_in_v4_result():
+    """End-to-end: simulate the exact production failure scenario by
+    putting an OptionRow-with-Enum into v4_result.rows, and assert the
+    resulting payload survives a full JSON round-trip."""
+    fake_data = {
+        "ticker": "HOOD", "session_resolved": "manual",
+        "expiration": "2026-05-15", "target_date_str": "2026-05-15",
+        "hours_for_em": 6.5, "session_emoji": "🌆",
+        "session_label": "Test", "horizon_note": "test",
+        "iv": 0.42, "spot": 77.03,
+        "eng": {"gex": 4.4}, "walls": {"call_wall": 80, "put_wall": 75},
+        "skew": None, "pcr": None, "vix": {"vix": 17.2, "term": "normal"},
+        "v4_result": {
+            "rows": [_FakeOptionRow(75.0, _FakeEnum.AMERICAN, 1.5)],
+            "confidence": {"label": "HIGH"},
+        },
+        "vol_regime": {"regime": "NORMAL"},
+        "em": {"bull_1sd": 79, "bear_1sd": 75},
+        "bias": {"direction": "NEUTRAL", "score": 0, "max_score": 14,
+                 "verdict": "NO TRADE", "signals": []},
+        "cagf": None, "dte_rec": None,
+        "available_sections": ["header", "em_range", "walls", "bias"],
+    }
+    with patch("app._compute_em_brief_data", return_value=fake_data):
+        from omega_dashboard import em_data
+        result = em_data.get_em_brief("HOOD")
+    assert result["available"] is True
+    # The fix: this MUST round-trip cleanly. Pre-fix it raised TypeError.
+    s = _json.dumps(result)
+    parsed = _json.loads(s)
+    assert parsed["data"]["v4_result"]["rows"][0]["exercise_style"] == "AMERICAN"
 
 
 if __name__ == "__main__":

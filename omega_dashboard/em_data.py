@@ -21,13 +21,16 @@ Three public functions:
 Kill switch: EM_BRIEF_DASHBOARD_ENABLED=false → all entry points
 return friendly disabled responses.
 """
+import dataclasses
+import enum
 import json
 import logging
+import math
 import os
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
@@ -58,6 +61,49 @@ def _kill_switch_off() -> bool:
     """Return True if EM_BRIEF_DASHBOARD_ENABLED is explicitly set to false.
     Defaults to enabled (env unset → not killed)."""
     return os.getenv("EM_BRIEF_DASHBOARD_ENABLED", "true").strip().lower() in ("0", "false", "no")
+
+
+def _json_safe(obj: Any) -> Any:
+    """Recursively convert obj into something Flask's jsonify can serialize.
+
+    # v11.7 (Patch M.8.1) hotfix: production hit
+    #   TypeError: Object of type ExerciseStyle is not JSON serializable
+    # at /em/brief/HOOD because v4_result contains OptionRow dataclasses
+    # whose `exercise_style` field is an Enum. Telegram path didn't surface
+    # this (it formats text, never JSON-serializes). Apply this sanitizer
+    # before returning the data dict so the route's jsonify() always works.
+
+    Handles:
+      - None / bool / int / str — returned as-is
+      - float — NaN/inf collapsed to None (standard JSON parsers reject NaN)
+      - datetime / date — ISO 8601 strings
+      - Enum instances — .name (stable across enum value changes)
+      - dataclass instances — recursively converted via dataclasses.asdict
+      - dict — recursively converted (keys coerced to str)
+      - list / tuple — recursively converted
+      - anything else — str(obj) fallback so jsonify never fails
+    """
+    if obj is None or isinstance(obj, (bool, int, str)):
+        return obj
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return obj
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    if isinstance(obj, enum.Enum):
+        return obj.name
+    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        return _json_safe(dataclasses.asdict(obj))
+    if isinstance(obj, dict):
+        return {str(k): _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set, frozenset)):
+        return [_json_safe(v) for v in obj]
+    # Last-resort fallback. Better to ship a string than 500.
+    try:
+        return str(obj)
+    except Exception:
+        return None
 
 
 def get_em_brief(ticker: str, session: Optional[str] = None) -> Dict[str, Any]:
@@ -103,7 +149,10 @@ def get_em_brief(ticker: str, session: Optional[str] = None) -> Dict[str, Any]:
         "error": None,
         "partial_warning": partial_warning,
         "ticker": ticker,
-        "data": data,
+        # v11.7 (Patch M.8.1) hotfix: sanitize before returning so the
+        # route's jsonify() never chokes on Enum / dataclass / NaN values
+        # buried inside nested fields like v4_result.rows[*].exercise_style.
+        "data": _json_safe(data),
         "computed_at_ct": datetime.now(timezone.utc)
             .astimezone(CHICAGO_TZ).strftime("%H:%M:%S CT"),
     }
