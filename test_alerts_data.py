@@ -426,6 +426,146 @@ def test_get_alert_detail_empty_subsections_render():
 
 
 # ─────────────────────────────────────────────────────────────────────
+# Patch H.8 aggregate queries — track + outcomes batched IN-clause
+# ─────────────────────────────────────────────────────────────────────
+
+def _insert_track(db, alert_id, samples):
+    """samples: list of (elapsed_seconds, structure_pnl_pct) tuples."""
+    conn = sqlite3.connect(db)
+    base_sampled = 1_700_000_000_000_000
+    for elapsed, pnl in samples:
+        conn.execute(
+            "INSERT INTO alert_price_track (alert_id, elapsed_seconds, "
+            "sampled_at, underlying_price, structure_mark, "
+            "structure_pnl_pct, structure_pnl_abs, market_state) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (alert_id, elapsed, base_sampled + elapsed * 1_000_000,
+             100.0, 1.0, pnl, 0.0, "rth")
+        )
+    conn.commit()
+    conn.close()
+
+
+def _insert_outcome(db, alert_id, horizon, hit_pt1=0, hit_pt2=0, hit_pt3=0,
+                   pnl_pct=None):
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "INSERT INTO alert_outcomes (alert_id, horizon, outcome_at, "
+        "underlying_price, structure_mark, pnl_pct, pnl_abs, "
+        "hit_pt1, hit_pt2, hit_pt3, max_favorable_pct, max_adverse_pct) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (alert_id, horizon, 1_700_000_001_000_000, 100.0, 1.0,
+         pnl_pct, 0.0, hit_pt1, hit_pt2, hit_pt3, None, None)
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_list_alerts_attaches_track_aggregates():
+    """Three track samples with pnl_pct values -2, +5, +12. The
+    aggregate query should produce mfe=12, mae=-2, latest=12."""
+    tmpdir, db = _setup_db()
+    try:
+        now = _utc_micros_for(2026, 5, 9, hour=20)
+        aid = _u("agg-track")
+        _insert_alert(db, aid, fired_at=_utc_micros_for(2026, 5, 9, hour=18),
+                      engine="long_call_burst")
+        _insert_track(db, aid, [(60, -2.0), (120, 5.0), (180, 12.0)])
+        from omega_dashboard import alerts_data
+        payload = alerts_data.list_alerts(now_micros=now)
+        cards = payload["today"]
+        assert len(cards) == 1
+        card = cards[0]
+        assert card["row5"]["mode"] == "active", card["row5"]
+        assert card["row5"]["mfe_pct"] == 12.0, card["row5"]
+        assert card["row5"]["current_pct"] == 12.0, card["row5"]
+        # Badge derives from latest pnl, not MFE.
+        assert card["badge_text"] == "+12%", card["badge_text"]
+        assert card["badge_class"] == "positive"
+    finally:
+        _teardown_db(tmpdir)
+
+
+def test_list_alerts_pt_hit_from_outcomes_aggregate():
+    """PT-hit label uses HIGHEST tier touched (PT3 > PT2 > PT1).
+    Verifies the outcomes any-PT GROUP BY query produces correct flags."""
+    tmpdir, db = _setup_db()
+    try:
+        now = _utc_micros_for(2026, 5, 9, hour=20)
+        # First alert: hit_pt1=1 only
+        a1 = _u("pt1-only")
+        _insert_alert(db, a1, fired_at=_utc_micros_for(2026, 5, 9, hour=18),
+                      engine="long_call_burst")
+        _insert_track(db, a1, [(60, 8.0)])
+        _insert_outcome(db, a1, horizon="5min", hit_pt1=1)
+        # Second alert: hit_pt1=1 AND hit_pt3=1 across different horizons
+        # — highest tier (PT3) wins regardless of which horizon row holds it
+        a2 = _u("pt-stack")
+        _insert_alert(db, a2, fired_at=_utc_micros_for(2026, 5, 9, hour=17),
+                      engine="long_call_burst")
+        _insert_track(db, a2, [(60, 25.0)])
+        _insert_outcome(db, a2, horizon="5min", hit_pt1=1)
+        _insert_outcome(db, a2, horizon="15min", hit_pt1=1, hit_pt3=1)
+        from omega_dashboard import alerts_data
+        payload = alerts_data.list_alerts(now_micros=now)
+        cards = {c["alert_id"]: c for c in payload["today"]}
+        assert cards[a1]["row5"]["pt_hit_label"] == "★ PT1", \
+            cards[a1]["row5"]
+        assert cards[a2]["row5"]["pt_hit_label"] == "★ PT3", \
+            cards[a2]["row5"]
+    finally:
+        _teardown_db(tmpdir)
+
+
+def test_list_alerts_warming_state_when_no_track_samples():
+    """Alert fired 30s ago with no track samples → mode='warming',
+    warming_seconds_left counts down from 60. Badge falls back to ACTIVE."""
+    tmpdir, db = _setup_db()
+    try:
+        now = _utc_micros_for(2026, 5, 9, hour=20, minute=0)
+        # Fired 30s before "now"
+        fired = now - 30 * 1_000_000
+        aid = _u("warming")
+        _insert_alert(db, aid, fired_at=fired, engine="long_call_burst")
+        # No track samples inserted.
+        from omega_dashboard import alerts_data
+        payload = alerts_data.list_alerts(now_micros=now)
+        card = payload["today"][0]
+        assert card["row5"]["mode"] == "warming", card["row5"]
+        # 60 - 30 = 30 seconds left
+        assert card["row5"]["warming_seconds_left"] == 30, card["row5"]
+        # Badge: no pnl available yet → ACTIVE
+        assert card["badge_text"] == "ACTIVE"
+        assert card["badge_class"] == "active"
+    finally:
+        _teardown_db(tmpdir)
+
+
+def test_list_alerts_does_not_explode_with_zero_alerts():
+    """Empty alerts table → _fetch_aggregates must early-return {} so
+    we never construct an 'IN ()' clause (which SQLite rejects)."""
+    tmpdir, db = _setup_db()
+    try:
+        from omega_dashboard import alerts_data
+        # Direct unit test of the helper.
+        import sqlite3 as _sqlite3
+        conn = _sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        conn.row_factory = _sqlite3.Row
+        try:
+            assert alerts_data._fetch_aggregates(conn, []) == {}
+        finally:
+            conn.close()
+        # End-to-end: list_alerts with empty DB returns the friendly
+        # empty payload (state 2) without raising.
+        payload = alerts_data.list_alerts()
+        assert payload["available"] is True
+        assert payload["total_count"] == 0
+        # No exception raised.
+    finally:
+        _teardown_db(tmpdir)
+
+
+# ─────────────────────────────────────────────────────────────────────
 # LIST_LIMIT cap + no N+1 on the list view
 # ─────────────────────────────────────────────────────────────────────
 

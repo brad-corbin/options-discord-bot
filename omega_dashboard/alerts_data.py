@@ -218,8 +218,72 @@ def format_structure_summary(engine: str, structure: Any,
         return f"{engine} [parse error]"
 
 
-def _format_card(row: sqlite3.Row, now_micros: int) -> Dict[str, Any]:
-    """Build the per-card dict consumed by _alert_card.html."""
+def _build_row5(engine: str, elapsed_seconds: int,
+                aggregates: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Return the row5 dict consumed by _alert_card.html.
+
+    Five modes (first match wins):
+      - v2_5d   — engine == 'v2_5d', no tracking, lists outcome horizons
+      - expired — elapsed > TRACKING_HORIZON_SECONDS, bar pinned at 100%
+      - warming — no track samples yet (first sample lands at ~60s)
+                  Note: warming_seconds_left is intentional at-render
+                  staleness — V1 doesn't tick this client-side. Browser
+                  shows the value computed at fetch time; the next 10s
+                  poll refreshes it.
+      - active  — has at least one track sample with non-None pnl
+
+    PT-hit label uses highest tier (PT3 > PT2 > PT1) per spec.
+    """
+    if engine == "v2_5d":
+        return {
+            "mode": "v2_5d",
+            "horizons_text": "outcomes compute at 5min · 15min · 30min · 1h · 4h · 1d",
+        }
+    if elapsed_seconds > TRACKING_HORIZON_SECONDS:
+        # Past horizon — locked-in "final" state. final == current_pct
+        # (latest sample IS the final once tracking ends; no extra query).
+        if not aggregates or aggregates.get("latest_pnl_pct") is None:
+            return {"mode": "expired", "bar_pct": 100, "no_samples": True}
+        return {
+            "mode": "expired",
+            "bar_pct": 100,
+            "mfe_pct": aggregates.get("mfe_pct"),
+            "current_pct": aggregates.get("latest_pnl_pct"),
+        }
+    if not aggregates or aggregates.get("latest_pnl_pct") is None:
+        # First track sample lands at ~60s elapsed; show countdown.
+        warming_seconds_left = max(60 - int(elapsed_seconds), 0)
+        return {
+            "mode": "warming",
+            "warming_seconds_left": warming_seconds_left,
+        }
+    # Active tracking with at least one sample
+    bar_pct = int(min(elapsed_seconds / TRACKING_HORIZON_SECONDS, 1.0) * 100)
+    pt_hit_label = None
+    if aggregates.get("any_pt3"):
+        pt_hit_label = "★ PT3"
+    elif aggregates.get("any_pt2"):
+        pt_hit_label = "★ PT2"
+    elif aggregates.get("any_pt1"):
+        pt_hit_label = "★ PT1"
+    return {
+        "mode": "active",
+        "bar_pct": bar_pct,
+        "mfe_pct": aggregates.get("mfe_pct"),
+        "current_pct": aggregates.get("latest_pnl_pct"),
+        "pt_hit_label": pt_hit_label,
+    }
+
+
+def _format_card(row: sqlite3.Row, now_micros: int,
+                 aggregates: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Build the per-card dict consumed by _alert_card.html.
+
+    Patch H.8: now consumes per-alert aggregates (track MFE/MAE/latest +
+    outcome PT hits) to populate `badge_text`/`badge_class` (row 1 enriched
+    badge) and `row5` (tracking summary). Aggregates default to None for
+    callers that don't have them — card falls back to ACTIVE/warming.
+    """
     engine = row["engine"]
     display = ENGINE_DISPLAY.get(engine, {
         "icon": "•", "label": engine, "stripe": "unknown",
@@ -235,7 +299,10 @@ def _format_card(row: sqlite3.Row, now_micros: int) -> Dict[str, Any]:
     )
     fired_dt = datetime.fromtimestamp(row["fired_at"] / 1_000_000, tz=timezone.utc)
     fired_ct = fired_dt.astimezone(CHICAGO_TZ)
-    elapsed_seconds = (now_micros - row["fired_at"]) // 1_000_000
+    elapsed_seconds = int((now_micros - row["fired_at"]) // 1_000_000)
+    latest_pnl = aggregates.get("latest_pnl_pct") if aggregates else None
+    badge_text, badge_class = _compute_status_badge(engine, elapsed_seconds, latest_pnl)
+    row5 = _build_row5(engine, elapsed_seconds, aggregates)
     return {
         "alert_id": row["alert_id"],
         "engine": engine,
@@ -247,12 +314,100 @@ def _format_card(row: sqlite3.Row, now_micros: int) -> Dict[str, Any]:
         "classification": row["classification"],
         "structure_summary": summary,
         "fired_at_ct": fired_ct.strftime("%H:%M:%S CT"),
-        "fired_at_relative": _humanize_elapsed(int(elapsed_seconds)),
-        "elapsed_seconds": int(elapsed_seconds),
+        "fired_at_relative": _humanize_elapsed(elapsed_seconds),
+        "elapsed_seconds": elapsed_seconds,
         "is_recent": elapsed_seconds < 5 * 60,    # CSS pulse when True
         "is_old": elapsed_seconds > 24 * 60 * 60, # CSS muted when True
         "parent_alert_id": row["parent_alert_id"],
+        "badge_text": badge_text,
+        "badge_class": badge_class,
+        "row5": row5,
     }
+
+
+def _fetch_aggregates(conn: sqlite3.Connection,
+                      alert_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+    """Three batched aggregate queries → merged dict per alert_id.
+
+    Returns: {alert_id: {"mfe_pct", "mae_pct", "latest_pnl_pct",
+                         "latest_elapsed", "any_pt1", "any_pt2", "any_pt3"}}
+
+    Empty input → {} (early-return so we never construct 'IN ()' which
+    SQLite rejects).
+
+    Alerts with no track rows AND no outcome rows → not in result.
+    Alerts with track but no outcomes → all any_ptN flags False.
+    Alerts with outcomes but no track → all track fields None.
+
+    All queries are single statements with batched IN clauses; total
+    DB cost is 3 indexed queries regardless of how many alert_ids
+    are passed in (caller uses LIST_LIMIT=200 cap).
+    """
+    if not alert_ids:
+        return {}
+    placeholders = ",".join(["?"] * len(alert_ids))
+    aggs: Dict[str, Dict[str, Any]] = {}
+
+    # Query 2: track aggregate — MFE / MAE / latest_elapsed per alert.
+    rows = conn.execute(
+        f"SELECT alert_id, MAX(structure_pnl_pct) AS mfe, "
+        f"MIN(structure_pnl_pct) AS mae, "
+        f"MAX(elapsed_seconds) AS latest_elapsed "
+        f"FROM alert_price_track WHERE alert_id IN ({placeholders}) "
+        f"GROUP BY alert_id",
+        alert_ids
+    ).fetchall()
+    for r in rows:
+        aggs[r["alert_id"]] = {
+            "mfe_pct": r["mfe"],
+            "mae_pct": r["mae"],
+            "latest_elapsed": r["latest_elapsed"],
+            "latest_pnl_pct": None,
+            "any_pt1": False,
+            "any_pt2": False,
+            "any_pt3": False,
+        }
+
+    # Query 3: latest pnl sample — window function with deterministic
+    # tie-break on (elapsed_seconds DESC, sampled_at DESC). Guards
+    # against any future case where two track rows share elapsed_seconds.
+    # Requires SQLite 3.25+; Render is well past this.
+    rows = conn.execute(
+        f"SELECT alert_id, structure_pnl_pct FROM ("
+        f"  SELECT alert_id, structure_pnl_pct, "
+        f"         ROW_NUMBER() OVER ("
+        f"           PARTITION BY alert_id "
+        f"           ORDER BY elapsed_seconds DESC, sampled_at DESC"
+        f"         ) AS rn "
+        f"  FROM alert_price_track WHERE alert_id IN ({placeholders})"
+        f") WHERE rn = 1",
+        alert_ids
+    ).fetchall()
+    for r in rows:
+        if r["alert_id"] in aggs:
+            aggs[r["alert_id"]]["latest_pnl_pct"] = r["structure_pnl_pct"]
+
+    # Query 4: outcomes — any-touch PT hits (max across horizons).
+    rows = conn.execute(
+        f"SELECT alert_id, MAX(hit_pt1) AS p1, MAX(hit_pt2) AS p2, "
+        f"MAX(hit_pt3) AS p3 "
+        f"FROM alert_outcomes WHERE alert_id IN ({placeholders}) "
+        f"GROUP BY alert_id",
+        alert_ids
+    ).fetchall()
+    for r in rows:
+        if r["alert_id"] not in aggs:
+            # Outcomes exist but no track samples — initialize entry.
+            aggs[r["alert_id"]] = {
+                "mfe_pct": None, "mae_pct": None,
+                "latest_elapsed": None, "latest_pnl_pct": None,
+                "any_pt1": False, "any_pt2": False, "any_pt3": False,
+            }
+        aggs[r["alert_id"]]["any_pt1"] = bool(r["p1"])
+        aggs[r["alert_id"]]["any_pt2"] = bool(r["p2"])
+        aggs[r["alert_id"]]["any_pt3"] = bool(r["p3"])
+
+    return aggs
 
 
 def _status_strip(buckets: Dict[str, List[Dict[str, Any]]],
@@ -282,8 +437,13 @@ def _status_strip(buckets: Dict[str, List[Dict[str, Any]]],
 
 def list_alerts(limit: int = LIST_LIMIT,
                 now_micros: Optional[int] = None) -> Dict[str, Any]:
-    """Return bucketed feed payload. ONE SQL query against alerts table.
-    Does NOT fetch features/outcomes/track per row (no N+1).
+    """Return bucketed feed payload.
+
+    Patch H.8: now does 1 alerts query + 3 batched aggregate queries
+    (track MFE/MAE/latest, latest pnl via ROW_NUMBER, outcomes any-PT)
+    — 4 SQL statements total regardless of row count, no N+1. The
+    aggregates power row 5 (tracking summary) and the enriched row-1
+    badge.
 
     Empty-state matrix:
       1. DB file missing      -> available=False, helpful error
@@ -308,6 +468,7 @@ def list_alerts(limit: int = LIST_LIMIT,
         )
         log.info(f"alerts_data: DB open failed: {e}")
         return payload
+    aggregates_by_id: Dict[str, Dict[str, Any]] = {}
     try:
         try:
             conn.row_factory = sqlite3.Row
@@ -318,6 +479,11 @@ def list_alerts(limit: int = LIST_LIMIT,
                 "FROM alerts ORDER BY fired_at DESC LIMIT ?",
                 (int(limit),)
             ).fetchall()
+            # Patch H.8: fetch aggregates BEFORE closing the connection.
+            # _fetch_aggregates handles the empty-input case so a
+            # zero-row alerts table doesn't construct an 'IN ()' clause.
+            alert_ids = [r["alert_id"] for r in rows]
+            aggregates_by_id = _fetch_aggregates(conn, alert_ids)
         except sqlite3.DatabaseError as e:
             payload["error"] = f"Recorder DB unreadable: {e}"
             log.warning(f"alerts_data: list_alerts query failed: {e}")
@@ -331,7 +497,8 @@ def list_alerts(limit: int = LIST_LIMIT,
     newest = rows[0]["fired_at"] if rows else None
     for row in rows:
         try:
-            card = _format_card(row, now)
+            aggregates = aggregates_by_id.get(row["alert_id"])
+            card = _format_card(row, now, aggregates)
             bucket = _bucket(row["fired_at"], now)
             payload[bucket].append(card)
         except Exception as e:
