@@ -490,9 +490,20 @@ def _build_technicals_from_raw(raw):
             "adx": 0.0,
         }
 
-    highs  = [b.get("h") or b.get("high")  for b in bars]
-    lows   = [b.get("l") or b.get("low")   for b in bars]
-    closes = [b.get("c") or b.get("close") for b in bars]
+    # v11.7 (Patch F.5.1 hotfix): bars come in two shapes in production —
+    # dict-shaped (with 'h'/'l'/'c' or 'high'/'low'/'close' keys) and
+    # OHLC dataclass objects (.high/.low/.close attrs, no short aliases,
+    # see options_exposure.py:501). Without this fallback, OHLC bars
+    # raise AttributeError on b.get(...) and flood the logs with
+    # "canonical_technicals failed: 'OHLC' object has no attribute 'get'".
+    def _bar_field(b, short_key, long_key):
+        if hasattr(b, "get"):
+            return b.get(short_key) or b.get(long_key)
+        return getattr(b, short_key, None) or getattr(b, long_key, None)
+
+    highs  = [_bar_field(b, "h", "high")  for b in bars]
+    lows   = [_bar_field(b, "l", "low")   for b in bars]
+    closes = [_bar_field(b, "c", "close") for b in bars]
 
     # Defend against partial bars — any None breaks the indicator math.
     if not all(highs) or not all(lows) or not all(closes):

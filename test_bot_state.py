@@ -572,6 +572,49 @@ def test_build_technicals_from_raw_partial_bar_keys():
     PASSED.append("test_build_technicals_from_raw_partial_bar_keys")
 
 
+def test_build_technicals_from_raw_handles_ohlc_objects():
+    """Production hotfix regression: bars in production come as either
+    dicts OR OHLC dataclass objects (options_exposure.py:501). The helper
+    must support both shapes — a dict-only implementation floods logs
+    with 'OHLC object has no attribute get' AttributeErrors."""
+    from bot_state import _build_technicals_from_raw
+    import canonical_technicals as ct
+    from dataclasses import dataclass
+    from typing import Optional
+
+    @dataclass
+    class FakeOHLC:
+        open: float
+        high: float
+        low: float
+        close: float
+        prev_close: Optional[float] = None
+
+    bars = [
+        FakeOHLC(open=100.0 + i - 0.2,
+                 high=100.0 + i + 0.5,
+                 low=100.0 + i - 0.5,
+                 close=100.0 + i)
+        for i in range(100)
+    ]
+    class FakeRaw:
+        ticker = "TEST"
+        bars = None
+    raw = FakeRaw()
+    raw.bars = bars
+
+    result = _build_technicals_from_raw(raw)
+
+    closes = [b.close for b in bars]
+    highs  = [b.high  for b in bars]
+    lows   = [b.low   for b in bars]
+    assert result["rsi"] == ct.rsi(closes), \
+        f"RSI drift on OHLC bars: helper={result['rsi']}, canonical={ct.rsi(closes)}"
+    assert result["adx"] == ct.adx(highs, lows, closes), \
+        f"ADX drift on OHLC bars"
+    PASSED.append("test_build_technicals_from_raw_handles_ohlc_objects")
+
+
 # ───────────────────────────────────────────────────────────────────────
 # v11.7 (Patch F.5.2): BotState.build_from_raw technicals wiring tests.
 # ───────────────────────────────────────────────────────────────────────
@@ -674,6 +717,7 @@ def main():
         test_build_technicals_from_raw_handles_long_key_format,
         test_build_technicals_from_raw_empty_bars,
         test_build_technicals_from_raw_partial_bar_keys,
+        test_build_technicals_from_raw_handles_ohlc_objects,
         # v11.7 (Patch F.5.2): BotState.build_from_raw technicals wiring
         test_build_from_raw_status_technicals_is_live,
         test_build_from_raw_status_technicals_handles_bad_bars,
