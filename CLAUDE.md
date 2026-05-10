@@ -357,7 +357,7 @@ What's done as of last session (v11.7 / Patch F):
   still supported. New `test_build_technicals_from_raw_handles_ohlc_objects`
   pins the regression.
 
-WWhat's queued (in order):
+What's queued (in order):
 
 **Foundation work (additive, no behavior change to trading path):**
 - Patch E.5 (or later): canonical_vwap — session VWAP + bands. Three
