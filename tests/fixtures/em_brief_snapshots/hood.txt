@@ -1,0 +1,39 @@
+🎯 HOOD — DEALER EM BRIEF (0DTE)  |  Exp: 05-15
+🟡 NO TRADE — Lean SLIGHT BULLISH but score only +1/14 — edge too thin.
+
+🧭 Bias: SLIGHT BULLISH (score 1/14)
+📍 Spot: $77.03
+📐 1σ Range: $76.23 – $77.83
+🌀 Gamma Flip: $75.79  (spot above)
+📵 Call Wall / Resistance: $80.00
+🛡️ Put Wall / Support: $75.00
+🎯 Gamma Wall: $75.00
+🧨 Range-break triggers
+• Up: above $77.83
+• Down: below $76.23
+🔄 Regime-shift trigger
+• Lose gamma flip: $75.79
+⚙️ Dealer Regime (0DTE): PIN / RANGE — Spot is still trapped near balance / pin structure. Favor watchlist mode until a clean break confirms direction. Context: inside dealer pin zone.
+🧭 Raw Dealer Flow: SUPPRESSING (raw GEX)
+🚦 Entry filter: trigger required beyond local structure before treating this as directional.
+🏦 Dealer Structure: spot above flip | flip $75.79 | walls $75.00/$80.00
+🌡️ Volatility Regime: 🌡️ NORMAL | VIX 17.2 | term normal
+🪖 Posture: Reduce size. Wait for a clean break beyond local structure before treating this as directional.
+
+────────────────────────────────
+📡 WHAT TO DO — Plain English
+🕐 Power Hour: GEX+ = pinning. GEX- = expansion.
+⚙️ GEX is POSITIVE — failed moves and mean reversion are MORE LIKELY than continuation.
+   → Don't chase breakouts. TRADE THE FAILURES.
+📈 Above gamma flip $75.79 (1.24 away) — bullish structure. Dealers buy dips.
+
+🎯 SETUPS TO WATCH:
+  IF price drops below $76.23 (range break) → watch for trap. Reclaim = squeeze long. Continuation = real breakdown.
+  IF price pops above $77.83 (range break) → watch for trap. Lost = fade short. Holds = real breakout.
+
+⚠️ MOMENTUM RULES (on 5m chart):
+  A break is ONLY valid with large 5m candles + continuation on the next candle.
+  Small candles breaking a level = likely a TRAP. Wait for the failure.
+  If your trade's momentum fades (5m candles getting smaller) → tighten or exit.
+
+— Not financial advice —

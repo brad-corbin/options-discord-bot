@@ -1,0 +1,5 @@
+# Snapshot fixtures must round-trip with byte-identical line endings on
+# every checkout (Linux/Render and Windows/dev). Force LF so the snapshot
+# regression test never fails on a CRLF-translated working copy.
+*.txt   text eol=lf
+*.json  text eol=lf

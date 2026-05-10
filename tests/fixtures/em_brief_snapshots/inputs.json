@@ -1,0 +1,57 @@
+{
+  "spy": {
+    "ticker": "SPY",
+    "session": "manual",
+    "now_iso_ct": "2026-05-12T10:30:00-05:00",
+    "_get_0dte_iv_returns": {
+      "iv": 0.18, "spot": 588.50, "expiration": "2026-05-13",
+      "eng": {"gex": 12.4, "dex": -3.1, "vanna": 1.2, "charm": -0.8,
+              "flip_price": 585.00,
+              "regime": {"preferred": "long puts on rallies", "avoid": "naked calls"}},
+      "walls": {"call_wall": 595, "call_wall_oi": 42000,
+                "put_wall": 580, "put_wall_oi": 38000,
+                "gamma_wall": 590,
+                "call_top3": [595, 600, 605], "put_top3": [580, 575, 570]},
+      "skew": {"skew_25d": -0.04, "rr_25d": -0.025, "interpretation": "put skew rich"},
+      "pcr": {"pcr_oi": 1.42, "pcr_vol": 1.31},
+      "vix": {"vix": 18.5, "vix9d": 17.2, "term": "normal", "source": "live"},
+      "v4_result": {"confidence": {"label": "HIGH", "composite": 0.78},
+                    "downgrades": [],
+                    "vol_regime": {"realized_vol_20d": 0.16}}
+    },
+    "_estimate_liquidity_returns": {"adv": 80000000, "_": null},
+    "get_daily_candles_returns": [580.1, 581.5, 583.2, 585.8, 587.1, 588.0, 588.50]
+  },
+  "hood": {
+    "ticker": "HOOD",
+    "session": "manual",
+    "now_iso_ct": "2026-05-12T14:00:00-05:00",
+    "_get_0dte_iv_returns": {
+      "iv": 0.42, "spot": 77.03, "expiration": "2026-05-15",
+      "eng": {"gex": 4.4, "dex": 0.2, "vanna": 0.1, "charm": 0.05,
+              "flip_price": 75.79,
+              "regime": {"preferred": "iron condor", "avoid": "directional"}},
+      "walls": {"call_wall": 80, "call_wall_oi": 12000,
+                "put_wall": 75, "put_wall_oi": 11000,
+                "gamma_wall": 75},
+      "skew": null,
+      "pcr": {"pcr_oi": 0.95, "pcr_vol": 0.88},
+      "vix": {"vix": 17.2, "vix9d": null, "term": "normal", "source": "live"},
+      "v4_result": {}
+    },
+    "_estimate_liquidity_returns": {"adv": 5000000, "_": null},
+    "get_daily_candles_returns": [75.5, 76.0, 76.8, 77.2, 76.9, 77.0, 77.03]
+  },
+  "thin": {
+    "ticker": "ZZZZ",
+    "session": "manual",
+    "now_iso_ct": "2026-05-12T11:15:00-05:00",
+    "_get_0dte_iv_returns": {
+      "iv": null, "spot": null, "expiration": null,
+      "eng": null, "walls": null, "skew": null,
+      "pcr": null, "vix": null, "v4_result": {}
+    },
+    "_estimate_liquidity_returns": {"adv": 100000, "_": null},
+    "get_daily_candles_returns": []
+  }
+}
