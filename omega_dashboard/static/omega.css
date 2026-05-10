@@ -4153,3 +4153,229 @@ details[open] .alerts-collapsed-summary { margin-bottom: 8px; }
    muted rather than picking up a bright global override. */
 .alerts-page .num,
 .alerts-detail-page .num { color: inherit; font-family: 'JetBrains Mono', monospace; }
+
+
+/* ════════════════════════════════════════════════════════
+   v11.7 (Patch H.5): Alert detail page styles.
+   ════════════════════════════════════════════════════════ */
+
+.alerts-detail-page {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 24px 40px;
+  font-family: 'Outfit', sans-serif;
+  max-width: 960px;
+}
+
+.alerts-detail-back {
+  color: var(--brass-deep);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  text-decoration: none;
+  margin-bottom: 8px;
+  display: inline-block;
+}
+.alerts-detail-back:hover { color: var(--brass); text-shadow: none; }
+
+.alerts-detail-eyebrow {
+  font-family: 'Cinzel', serif;
+  font-size: 11px;
+  letter-spacing: 4px;
+  color: var(--brass-deep);
+  text-transform: uppercase;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 4px;
+}
+
+.alerts-detail-header {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--border-bright);
+  padding: 20px 24px;
+}
+.alerts-detail-engine {
+  font-family: 'Outfit', sans-serif;
+  font-size: 18px;
+  font-weight: 500;
+  letter-spacing: 1px;
+  margin-bottom: 4px;
+}
+.alerts-detail-ticker-line {
+  display: flex;
+  align-items: baseline;
+  gap: 16px;
+  margin-bottom: 8px;
+}
+.alerts-detail-ticker {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 28px;
+  color: var(--text);
+  font-weight: 500;
+}
+.alerts-detail-classification {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 13px;
+  color: var(--brass-bright);
+}
+.alerts-detail-meta {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-top: 8px;
+  word-break: break-all;
+}
+
+.alerts-detail-parent-link,
+.alerts-detail-children {
+  display: inline-block;
+  margin-top: 10px;
+  padding: 4px 10px;
+  background: rgba(213, 176, 107, 0.08);
+  color: var(--brass-bright);
+  border: 1px solid var(--brass-deep);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  text-decoration: none;
+}
+.alerts-detail-parent-link:hover {
+  background: rgba(213, 176, 107, 0.18);
+  text-shadow: none;
+}
+.alerts-detail-children { padding: 6px 12px; }
+.alerts-detail-children a { padding: 0; background: transparent; border: 0; color: var(--brass-bright); }
+
+.alerts-detail-section {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  padding: 18px 22px;
+}
+.alerts-detail-section-title {
+  font-family: 'Cinzel', serif;
+  font-size: 11px;
+  letter-spacing: 4px;
+  color: var(--brass-deep);
+  text-transform: uppercase;
+  margin-bottom: 14px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+}
+
+.alerts-detail-struct-grid {
+  display: grid;
+  grid-template-columns: 140px 1fr;
+  gap: 6px 16px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 13px;
+}
+.alerts-detail-label { color: var(--text-dim); }
+.alerts-detail-value { color: var(--text); }
+.alerts-detail-dte-tag {
+  color: var(--warn);
+  font-size: 10px;
+  letter-spacing: 1px;
+  padding-left: 6px;
+}
+.alerts-detail-dte-untagged { color: var(--brass-deep); font-style: italic; }
+
+.alerts-detail-chart-area { padding: 8px 0; }
+.alerts-pnl-chart {
+  width: 100%;
+  height: 180px;
+  display: block;
+  background: var(--bg-panel);
+  border: 0;
+}
+.alerts-detail-chart-stats {
+  display: flex;
+  gap: 24px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--border);
+}
+.alerts-detail-chart-stat-label {
+  color: var(--text-dim);
+  font-size: 10px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  display: block;
+}
+.alerts-detail-chart-stat-value {
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 500;
+}
+.alerts-detail-chart-stat-value.pos { color: var(--positive-bright); }
+.alerts-detail-chart-stat-value.neg { color: var(--negative-soft); }
+
+.alerts-detail-outcomes {
+  width: 100%;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  border-collapse: collapse;
+}
+.alerts-detail-outcomes th {
+  color: var(--brass-deep);
+  font-weight: 400;
+  text-transform: uppercase;
+  letter-spacing: 2px;
+  font-size: 10px;
+  padding: 6px 8px;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+}
+.alerts-detail-outcomes td {
+  padding: 8px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-muted);
+}
+.alerts-detail-outcomes tr:last-child td { border-bottom: none; }
+.alerts-detail-outcomes .pt-yes { color: var(--brass-bright); font-weight: 500; }
+.alerts-detail-outcomes .pt-no { color: var(--border); }
+.alerts-detail-outcomes .pnl-pos { color: var(--positive-bright); }
+.alerts-detail-outcomes .pnl-neg { color: var(--negative-soft); }
+.alerts-detail-outcomes .pnl-pending { color: var(--text-dim); font-style: italic; }
+
+.alerts-detail-features-grid {
+  display: grid;
+  grid-template-columns: 200px 1fr 200px 1fr;
+  gap: 4px 16px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+}
+.alerts-detail-fname { color: var(--text-dim); padding: 4px 0; }
+.alerts-detail-fval { color: var(--text); padding: 4px 0; word-break: break-all; }
+
+.alerts-detail-section details summary {
+  cursor: pointer;
+  color: var(--brass);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  letter-spacing: 1px;
+  padding: 8px 0;
+  list-style: none;
+}
+.alerts-detail-section details summary::-webkit-details-marker { display: none; }
+.alerts-detail-section details summary::before {
+  content: "▶";
+  color: var(--brass-deep);
+  padding-right: 8px;
+  display: inline-block;
+}
+.alerts-detail-section details[open] summary::before { content: "▼"; }
+.alerts-detail-section details summary:hover { color: var(--brass-bright); }
+.alerts-detail-raw {
+  background: var(--bg-void);
+  border: 1px solid var(--border);
+  padding: 12px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: var(--text-muted);
+  overflow-x: auto;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-all;
+}

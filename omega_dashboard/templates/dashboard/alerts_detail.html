@@ -1,0 +1,231 @@
+{% extends "dashboard/base.html" %}
+
+{% block title %}The Legacy Desk &mdash; Alert Detail{% endblock %}
+{% block brand_sub %}Alert &middot; {{ active_account.label }}{% endblock %}
+
+{% block content %}
+
+{# v11.7 (Patch H.5): alert detail page.
+   Layered: header (most relevant) -> structure -> SVG chart ->
+   outcomes table -> features grid -> collapsible raw JSON.
+   Every sub-section has its own empty state — no section crashes
+   when its data is missing. #}
+
+<div class="alerts-detail-page fade-in">
+
+  <a href="{{ url_for('dashboard.alerts') }}" class="alerts-detail-back">← back to feed</a>
+
+  {% if not page_data.available %}
+    {# 404 path — friendly, not a raw Flask 404 #}
+    <div class="alerts-empty">
+      <div class="alerts-empty-icon">⚠</div>
+      <div class="alerts-empty-title">ALERT NOT FOUND</div>
+      <div class="alerts-empty-message">
+        {{ page_data.error or "No alert with that id exists in the recorder DB. The id may be malformed (must be UUID v4 shape) or the alert may not have been recorded yet." }}
+      </div>
+    </div>
+  {% else %}
+    {% set d = page_data.detail %}
+
+    <div class="alerts-detail-eyebrow">— ALERT DETAIL &middot; {{ d.alert_id_short }}…</div>
+
+    {# ── Header ──────────────────────────────────────────── #}
+    <div class="alerts-detail-header alert-card-engine-{{ d.stripe }}">
+      <div class="alerts-detail-engine alert-card-engine-text-{{ d.stripe }}">
+        {{ d.engine_icon }} {{ d.engine_label }}
+      </div>
+      <div class="alerts-detail-ticker-line">
+        <span class="alerts-detail-ticker">{{ d.ticker }}
+          {% if d.direction == 'bull' %}<span class="alert-card-chevron positive">▲</span>
+          {% elif d.direction == 'bear' %}<span class="alert-card-chevron negative">▼</span>{% endif %}
+        </span>
+        {% if d.classification %}
+          <span class="alerts-detail-classification">
+            {{ d.classification }}{% if d.direction %} &middot; {{ d.direction }}{% endif %}
+          </span>
+        {% endif %}
+      </div>
+      <div class="alerts-detail-meta num">
+        Fired {{ d.fired_at_ct }}
+        &middot; {{ d.fired_at_relative }}
+        &middot; alert_id <span title="{{ d.alert_id }}">{{ d.alert_id }}</span>
+        &middot; v{{ d.engine_version }}
+      </div>
+      {% if d.parent %}
+        <a href="{{ url_for('dashboard.alerts_detail', alert_id=d.parent.alert_id) }}"
+           class="alerts-detail-parent-link">
+          ↳ parent: {{ d.parent.engine_label }}
+          {% if d.parent.classification %}({{ d.parent.classification }}{% if d.parent.direction %} {{ d.parent.direction }}{% endif %}){% endif %}
+          &middot; click to view
+        </a>
+      {% endif %}
+      {% if d.children %}
+        <div class="alerts-detail-children">
+          Children:
+          {% for c in d.children %}
+            <a href="{{ url_for('dashboard.alerts_detail', alert_id=c.alert_id) }}"
+               class="alerts-detail-parent-link">
+              {{ c.engine_label }}{% if c.classification %} ({{ c.classification }}){% endif %}
+            </a>{% if not loop.last %} &nbsp; {% endif %}
+          {% endfor %}
+        </div>
+      {% endif %}
+    </div>
+
+    {# ── Structure block ────────────────────────────────── #}
+    <div class="alerts-detail-section">
+      <div class="alerts-detail-section-title">Structure</div>
+      <div class="alerts-detail-struct-grid">
+        {% if d.structure.get('type') %}
+          <div class="alerts-detail-label">Type</div>
+          <div class="alerts-detail-value">{{ d.structure.get('type')|replace('_', ' ') }}</div>
+        {% endif %}
+        {% if d.structure.get('strike') is not none %}
+          <div class="alerts-detail-label">Strike</div>
+          <div class="alerts-detail-value">${{ "%.2f"|format(d.structure.get('strike')) }}</div>
+        {% endif %}
+        {% if d.structure.get('short_strike') is not none %}
+          <div class="alerts-detail-label">Short / Long</div>
+          <div class="alerts-detail-value">{{ "%.0f"|format(d.structure.get('short_strike')) }} / {{ "%.0f"|format(d.structure.get('long_strike')) }}</div>
+        {% endif %}
+        {% if d.structure.get('expiry') %}
+          <div class="alerts-detail-label">Expiry</div>
+          <div class="alerts-detail-value">
+            {{ d.structure.get('expiry') }}
+            {% if d.dte_label %}
+              <span class="alerts-detail-dte-tag">{{ d.dte_label }}</span>
+            {% elif d.dte_value is not none %}
+              <span class="alerts-detail-dte-tag alerts-detail-dte-untagged"
+                    title="this engine has no DTE convention; raw value">{{ d.dte_value }} (raw)</span>
+            {% endif %}
+          </div>
+        {% endif %}
+        {% if d.structure.get('entry_mark') is not none %}
+          <div class="alerts-detail-label">Entry mark</div>
+          <div class="alerts-detail-value">${{ "%.2f"|format(d.structure.get('entry_mark')) }}</div>
+        {% endif %}
+        {% if d.structure.get('credit') is not none %}
+          <div class="alerts-detail-label">Credit</div>
+          <div class="alerts-detail-value">${{ "%.2f"|format(d.structure.get('credit')) }}</div>
+        {% endif %}
+        {% if d.spot_at_fire is not none %}
+          <div class="alerts-detail-label">Spot at fire</div>
+          <div class="alerts-detail-value">${{ "%.2f"|format(d.spot_at_fire) }}</div>
+        {% endif %}
+        {% if not d.structure %}
+          <div class="alerts-detail-label">Summary</div>
+          <div class="alerts-detail-value">{{ d.structure_summary }}</div>
+        {% endif %}
+      </div>
+    </div>
+
+    {# ── Price track (server-rendered SVG) ─────────────── #}
+    <div class="alerts-detail-section">
+      <div class="alerts-detail-section-title">Price track</div>
+      {% if d.pnl_svg %}
+        <div class="alerts-detail-chart-area">
+          {{ d.pnl_svg|safe }}
+        </div>
+        {% if d.chart_stats %}
+          <div class="alerts-detail-chart-stats">
+            <div>
+              <span class="alerts-detail-chart-stat-label">Current</span>
+              <span class="alerts-detail-chart-stat-value {% if d.chart_stats.current_pct > 0 %}pos{% elif d.chart_stats.current_pct < 0 %}neg{% endif %}">
+                {{ "%+.1f"|format(d.chart_stats.current_pct) }}%
+              </span>
+            </div>
+            <div>
+              <span class="alerts-detail-chart-stat-label">MFE</span>
+              <span class="alerts-detail-chart-stat-value {% if d.chart_stats.mfe_pct > 0 %}pos{% endif %}">
+                {{ "%+.1f"|format(d.chart_stats.mfe_pct) }}%
+              </span>
+            </div>
+            <div>
+              <span class="alerts-detail-chart-stat-label">MAE</span>
+              <span class="alerts-detail-chart-stat-value {% if d.chart_stats.mae_pct < 0 %}neg{% endif %}">
+                {{ "%+.1f"|format(d.chart_stats.mae_pct) }}%
+              </span>
+            </div>
+            <div>
+              <span class="alerts-detail-chart-stat-label">Samples</span>
+              <span class="alerts-detail-chart-stat-value">{{ d.chart_stats.samples }}</span>
+            </div>
+          </div>
+        {% endif %}
+      {% else %}
+        <div class="alerts-empty alerts-empty-soft">
+          <div class="alerts-empty-message">
+            Price tracking not yet started — first sample lands at 60s elapsed.
+          </div>
+        </div>
+      {% endif %}
+    </div>
+
+    {# ── Outcomes table ────────────────────────────────── #}
+    <div class="alerts-detail-section">
+      <div class="alerts-detail-section-title">Outcomes</div>
+      {% if d.outcomes %}
+        <table class="alerts-detail-outcomes">
+          <thead>
+            <tr>
+              <th>Horizon</th><th>PnL</th><th>PT1</th><th>PT2</th><th>PT3</th><th>MFE</th><th>MAE</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for o in d.outcomes %}
+              <tr>
+                <td>{{ o.horizon }}</td>
+                <td class="{% if o.pnl_pct is not none and o.pnl_pct > 0 %}pnl-pos{% elif o.pnl_pct is not none and o.pnl_pct < 0 %}pnl-neg{% else %}pnl-pending{% endif %}">
+                  {% if o.pnl_pct is not none %}{{ "%+.1f"|format(o.pnl_pct) }}%{% else %}pending{% endif %}
+                </td>
+                <td class="{% if o.hit_pt1 %}pt-yes{% else %}pt-no{% endif %}">{% if o.hit_pt1 %}✓{% else %}─{% endif %}</td>
+                <td class="{% if o.hit_pt2 %}pt-yes{% else %}pt-no{% endif %}">{% if o.hit_pt2 %}✓{% else %}─{% endif %}</td>
+                <td class="{% if o.hit_pt3 %}pt-yes{% else %}pt-no{% endif %}">{% if o.hit_pt3 %}✓{% else %}─{% endif %}</td>
+                <td>{% if o.max_favorable_pct is not none %}{{ "%+.1f"|format(o.max_favorable_pct) }}%{% else %}─{% endif %}</td>
+                <td>{% if o.max_adverse_pct is not none %}{{ "%+.1f"|format(o.max_adverse_pct) }}%{% else %}─{% endif %}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      {% else %}
+        <div class="alerts-empty alerts-empty-soft">
+          <div class="alerts-empty-message">No outcomes computed yet — the outcome computer daemon writes rows as horizons cross.</div>
+        </div>
+      {% endif %}
+    </div>
+
+    {# ── Features grid ────────────────────────────────── #}
+    <div class="alerts-detail-section">
+      <div class="alerts-detail-section-title">Features at fire time ({{ d.features|length }})</div>
+      {% if d.features %}
+        <div class="alerts-detail-features-grid">
+          {% for f in d.features %}
+            <div class="alerts-detail-fname">{{ f.name }}</div>
+            <div class="alerts-detail-fval">{{ f.value }}</div>
+          {% endfor %}
+        </div>
+      {% else %}
+        <div class="alerts-empty alerts-empty-soft">
+          <div class="alerts-empty-message">No features captured for this alert.</div>
+        </div>
+      {% endif %}
+    </div>
+
+    {# ── Collapsible raw JSON ───────────────────────────── #}
+    <div class="alerts-detail-section">
+      <div class="alerts-detail-section-title">Raw payloads</div>
+      <details>
+        <summary>canonical_snapshot</summary>
+        <pre class="alerts-detail-raw">{{ d.canonical_snapshot | tojson(indent=2) }}</pre>
+      </details>
+      <details>
+        <summary>raw_engine_payload</summary>
+        <pre class="alerts-detail-raw">{{ d.raw_engine_payload | tojson(indent=2) }}</pre>
+      </details>
+    </div>
+
+  {% endif %}
+
+</div>
+
+{% endblock %}
