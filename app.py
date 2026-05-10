@@ -13121,39 +13121,38 @@ def _generate_silent_thesis(ticker: str, refresh_only: bool = False):
     the single prediction-of-record scored against the closing price.
     """
     try:
+        # v11.7 (Patch M.3): consume _compute_em_brief_data for the data
+        # layer. Both Telegram (_post_em_card) and silent-thesis store
+        # consumers now share the same compute path. The ThesisContext-
+        # write side below is unchanged from pre-refactor.
+        data = _compute_em_brief_data(ticker, session=None)
+        if data is None:
+            # Silent thesis runs frequently in periodic loops; use debug
+            # so we don't spam warnings on every miss (matches the
+            # pre-refactor early-return level for missing IV).
+            log.debug(f"Silent thesis skipped for {ticker}: data unavailable")
+            return False
+
+        iv = data["iv"]
+        spot = data["spot"]
+        eng = data["eng"]
+        walls = data["walls"]
+        skew = data["skew"]
+        pcr = data["pcr"]
+        vix = data["vix"]
+        v4_result = data["v4_result"]
+        vol_regime = data["vol_regime"]
+        em = data["em"]
+        bias = data["bias"]
+
+        # today_str is used downstream for _get_0dte_chain + the
+        # em_predictions Sheet write key; compute inline since the
+        # helper doesn't expose it directly (it exposes target_date_str,
+        # which can be the NEXT trading day in afternoon/closed sessions).
         import pytz
         ct = pytz.timezone("America/Chicago")
         now_ct = datetime.now(ct)
         today_str = now_ct.strftime("%Y-%m-%d")
-
-        market_close_ct = now_ct.replace(hour=15, minute=0, second=0, microsecond=0)
-        hours_for_em = max((market_close_ct - now_ct).total_seconds() / 3600, 0.25)
-
-        result_tuple = _get_0dte_iv(ticker, today_str)
-        iv, spot, expiration = result_tuple[0], result_tuple[1], result_tuple[2]
-        eng = result_tuple[3]
-        walls = result_tuple[4]
-        skew = result_tuple[5]
-        pcr = result_tuple[6]
-        vix = result_tuple[7]
-        v4_result = result_tuple[8] if len(result_tuple) > 8 else {}
-
-        if iv is None or spot is None:
-            log.debug(f"Silent thesis skipped for {ticker}: IV unavailable")
-            return False
-
-        em = _calc_intraday_em(spot, iv, hours_for_em)
-        if not em:
-            return False
-
-        # VIX proxy fallback
-        if not vix or not vix.get("vix"):
-            if iv and iv > 0:
-                proxy_vix = round(iv * 100, 1)
-                vix = {"vix": proxy_vix, "vix9d": None, "term": "unknown", "source": "iv_proxy"}
-
-        vol_regime = get_canonical_vol_regime(ticker, get_daily_candles(ticker, days=30), vix_override=vix)
-        bias = _calc_bias(spot, em, walls or {}, skew or {}, eng or {}, pcr or {}, vix or {})
 
         # Derive structural levels (same as full EM card)
         # v9 (Patch 7): redundant — walls already enriched in _get_0dte_iv at line 10461
