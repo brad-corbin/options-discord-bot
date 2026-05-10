@@ -698,6 +698,19 @@ is high. Don't argue with them.
 - Option peaks fire on every new intraday high, not PT1/PT2/PT3 only
 - `BREAKDOWN CONFIRMED` Potter Box annotation shows 0 hits in Telegram
   export — low priority
+- Research page shows "0/0 lit" per ticker
+  (`omega_dashboard/templates/dashboard/research.html:96`). Root cause:
+  `BotState.fields_lit` / `fields_total` are `@property` accessors, not
+  dataclass fields, so `dataclasses.asdict(state)` in
+  `bot_state_producer._build_state(...)` (`bot_state_producer.py:277`)
+  drops them. The envelope's `state_dict` never carries those keys, so
+  `state.get("fields_lit", 0)` at `omega_dashboard/research_data.py:252`
+  falls back to `0` for every snapshot. Pre-existing (predates Patch G/H).
+  Two fixes available: (a) compute `fields_lit` / `fields_total` in
+  `_build_envelope` by counting non-None fields on the BotState envelope,
+  or (b) hide the line in the template until populated. Defer to its own
+  patch — not blocking; counter is technically accurate (zero of zero
+  ARE lit).
 
 ---
 
