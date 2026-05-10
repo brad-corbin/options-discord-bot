@@ -101,6 +101,34 @@ Canonical rebuild (the v11 work — see "Canonical rebuild" below):
 - `test_bot_state_producer.py` — runnable without network or Redis (fake clients).
 - `test_*.py` for each — runnable without network or Schwab credentials
 
+Alert recorder (Patch G — V1 measurement infrastructure):
+- `migrations/0001_initial_schema.sql` — six-table SQLite schema:
+  alerts / alert_features / alert_price_track / alert_outcomes /
+  engine_versions / schema_migrations. WAL mode, lives at
+  `/var/backtest/desk.db`.
+- `db_migrate.py` — boot-time migration runner. Idempotent.
+  Called from `app.py` boot just before the daemon spawns.
+- `alert_recorder.py` — pure write-side. `record_alert()`,
+  `record_track_sample()`, `record_outcome()`, `list_active_alerts()`,
+  `get_alert()`. Master + per-engine gates inside; every entrypoint
+  try/except → recorder failure NEVER affects engines.
+- `alert_tracker_daemon.py` — daemon thread. Samples structure marks
+  per cadence (60s/5m/15m/30m/1h by elapsed). Reads only from
+  `OptionQuoteStore` + `schwab_stream.get_streaming_spot` — zero new
+  Schwab REST calls. Behind `RECORDER_TRACKER_ENABLED`.
+- `outcome_computer_daemon.py` — daemon thread. Reads
+  `alert_price_track`, writes `alert_outcomes` at standard horizons
+  (5min/15min/30min/1h/4h/1d/2d/3d/5d/expiry). ANY-touch hit_pt
+  semantics. Idempotent. Behind `RECORDER_OUTCOMES_ENABLED`.
+- `recorder_queries.sql` — 10 verification queries (win rate by
+  engine + horizon, LCB grade-A vs grade-B via parent_alert_id,
+  conditional win rate, etc). Patch H barometer reads these.
+- `test_db_migrate.py`, `test_alert_recorder.py`,
+  `test_alert_recorder_{lcb,v25d,credit,conviction}_wire.py`,
+  `test_alert_tracker_daemon.py`, `test_outcome_computer_daemon.py`,
+  `test_engine_versions.py`, `test_recorder_queries.py` — 45 tests
+  total. Hermetic; no Schwab/Redis/network needed.
+
 ---
 
 ## Project vocabulary (terms that mean specific things here)
@@ -298,6 +326,36 @@ What's done as of last session (v11.7 / Patch F):
   is Patch D. The producer was already writing all 4 intents per ticker —
   Patch D finally surfaces them.
 - Patch F.5 (canonical_technicals on BotState) — `_build_technicals_from_raw(raw)` helper added to `bot_state.py`; replaces the technicals stub in `build_from_raw`. BotState's `rsi` / `macd_hist` / `adx` fields now populate from `canonical_technicals.rsi/macd/adx` instead of None, and `canonical_status["technicals"]` flips from `stub` to `live`. Defensive about bar key naming — `risk_manager.py:275` pattern (`b.get("h") or b.get("high")`). Wrapper-consistency tests assert no parallel RSI/MACD/ADX math sneaks into the helper. canonical_technicals now has two production readers: active_scanner (Patch F) and BotState (F.5).
+- Patch G (alert recorder V1) — the platform's central measurement
+  artifact shipped. Schema at `/var/backtest/desk.db` (SQLite, WAL).
+  Four engines wired: LONG CALL BURST, V2 5D EDGE MODEL, v8.4 CREDIT,
+  CONVICTION PLAY. Each engine's post-Telegram-send hook calls
+  `record_alert(...)` with full input snapshot, canonical_snapshot,
+  classification, parent_alert_id where applicable (V2 5D parents
+  LCB and credit). Two daemons: `alert_tracker_daemon` samples
+  structure marks on variable cadence (zero new Schwab REST —
+  piggybacks on existing OptionQuoteStore) and `outcome_computer_daemon`
+  computes pnl/MFE/MAE/hit_pt at horizon boundaries with ANY-touch
+  semantics. Engine versions auto-registered at boot via
+  `register_engine_versions()`. `apply_migrations()` now runs at boot
+  just before daemon spawn — without G.9, the schema would never
+  exist on a fresh deploy. Gated behind `RECORDER_ENABLED` (master)
+  + per-engine + per-daemon flags, all default OFF; staged rollout
+  per spec. Recorder failures NEVER propagate to engines (try/except
+  at every hook + inside `record_alert` itself). 13-commit series
+  (F.5.1/2/3 + G.1-G.10) plus an OHLC bar-shape hotfix and an
+  implementation plan in `docs/superpowers/plans/`. 45 new tests +
+  full canonical regression battery green.
+- Patch G hotfix (F.5.1 OHLC support) — production was flooding logs
+  with "canonical_technicals failed: 'OHLC' object has no attribute
+  'get'". Root cause: F.5.1's `_build_technicals_from_raw` assumed
+  bars are dicts with `.get()`, but production passes both dicts AND
+  `OHLC` dataclass instances (`options_exposure.py:501`, fields
+  `.high/.low/.close`, no short aliases). Fix: tiny `_bar_field(b,
+  short_key, long_key)` inner helper that uses `b.get(...)` for
+  dict-like and `getattr(...)` otherwise. Both naming conventions
+  still supported. New `test_build_technicals_from_raw_handles_ohlc_objects`
+  pins the regression.
 
 WWhat's queued (in order):
 
@@ -569,6 +627,65 @@ is high. Don't argue with them.
   from the prior stage. Trusted mode is the only stage with real blast
   radius and is not implemented without prior discussion of fail-safes
   and kill switches.
+- **Recorder default state: every gate OFF.** `RECORDER_ENABLED`
+  (master) and per-engine (`_LCB`, `_V25D`, `_CREDIT`, `_CONVICTION`)
+  + per-daemon (`_TRACKER`, `_OUTCOMES`) all default to `false`.
+  Staged rollout: master ON → per-engine one at a time (24h
+  validation each) → tracker ON → outcomes ON. Rollback: unset
+  master, redeploy; recorder hooks become no-ops within 60s, DB
+  intact.
+- **Recorder uses SQLite at `/var/backtest/desk.db`, NOT Redis or
+  Postgres.** Free Render Redis is 25 MB capped with allkeys-lru
+  eviction; recorder data would evict live state. Postgres free
+  tier has 90-day retention (incompatible with forever-storage).
+  SQLite on the persistent disk is durable, queryable, snapshot-
+  backed. Schema is portable to Postgres later via SQLAlchemy if
+  scale demands it.
+- **Recorder hooks NEVER affect engines.** Every wire site is
+  wrapped in try/except → `log.warning` on failure → return.
+  `record_alert` itself has internal try/except → returns None on
+  failure. Two layers of defense; the contract is load-bearing.
+  Don't simplify by removing the outer try/except; the inner one
+  exists to handle expected error modes (DB locked, malformed
+  payload), the outer one exists to catch unexpected ones (import
+  errors after schema migration, etc).
+- **DTE convention divergence is a known data-quality flag.**
+  LCB records `suggested_dte` as TRADING-DTE (`count_trading_days_between`).
+  v8.4 CREDIT records CALENDAR-DTE (`(expiry - today).days`).
+  V2 5D and CONVICTION PLAY record None (no structure / no DTE field).
+
+  Implication: any barometer query that filters or groups by `suggested_dte`
+  across engines is comparing apples to oranges. Patch I's design must
+  either (a) normalize at query time to one convention, (b) add a
+  `dte_convention` column to alerts and require queries to filter by it,
+  or (c) only group within-engine. Until Patch I, this divergence sits
+  in the data — every alert recorded today carries one of two semantics.
+
+  Backfilling a normalization later is awkward but possible since both
+  the original `suggested_dte` and the structure's `expiry` are recorded.
+- **V2SetupResult attribute names are `setup_grade` and `bias`,
+  NOT `grade` and `direction`.** Helpers (`_build_v25d_alert_payload`,
+  `_build_lcb_alert_payload`'s v2_5d_grade lookup,
+  `_build_credit_alert_payload`'s v2_5d_grade lookup) use defensive
+  `getattr(v2_result, "setup_grade", None) or getattr(v2_result,
+  "grade", None)` so future renames don't break recorder records.
+- **Conviction-play hook count is 8, not 5.** The spec said "5
+  sites" but site 1 in `app.py:_run_v4_prefilter` has 4 route
+  branches (immediate / income / swing / stalk), each with its own
+  Telegram post + its own recorder hook. Plus one site each in
+  `app.py:10671`, `11064`, `15548`, and `schwab_stream.py:1183`. The
+  `_record_conviction_after_post(cp, posted_to)` wrapper in app.py
+  DRYs the 7 app.py sites; schwab_stream uses an inline try/except
+  to keep its module-top imports tight.
+- **`apply_migrations` is now wired at boot in `app.py` inside the
+  leader-only `_acquire_background_leader()` block.** Without G.9
+  adding this, the schema never gets created on a fresh deploy and
+  every recorder write fails silently. The migration runner is
+  idempotent — re-running on subsequent boots does nothing.
+- **Conviction is independent of V2 5D — `parent_alert_id=None`
+  always.** OI flow conviction plays don't chain off a V2 5D
+  evaluation the way LCB / credit do. If conviction ever becomes
+  V2 5D-gated, this changes; until then, hardcoded None.
 ---
 
 ## Known issues — document but don't fix unless asked
