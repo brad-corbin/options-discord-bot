@@ -112,6 +112,47 @@ class _FakeRedis:
             return [(m, s) for s, m in sliced]
         return [m for _, m in sliced]
 
+    def zremrangebyrank(self, key, start, stop):
+        """Remove members in the rank range [start, stop] (inclusive),
+        ordered by score ascending. Negative indices count from the end
+        like real Redis. Used by Patch B.bsp-fix to cap the timings zset.
+
+        Critical edge case mirrored from real Redis: if a negative `stop`
+        resolves to a position BEFORE index 0 (e.g. n=1, stop=-1001 →
+        n+stop=-1000), the range is empty and the call is a no-op.
+        Naively clamping to 0 would wrongly remove the first element."""
+        self.ops.append(("zremrangebyrank", key, start, stop))
+        z = self.zset.get(key)
+        if not z:
+            return 0
+        z_sorted = sorted(z)  # ascending by (score, member)
+        n = len(z_sorted)
+        # Normalize negative indices.
+        s = start if start >= 0 else n + start
+        e = stop if stop >= 0 else n + stop
+        # Empty-range guards (in real Redis order):
+        if e < 0:
+            return 0  # entire range falls before index 0
+        if s >= n:
+            return 0  # entire range falls past last index
+        # Clamp survivors into bounds.
+        if s < 0:
+            s = 0
+        if e >= n:
+            e = n - 1
+        if s > e:
+            return 0
+        keep = z_sorted[:s] + z_sorted[e + 1:]
+        removed = (e - s + 1)
+        self.zset[key] = keep
+        return removed
+
+    def pipeline(self):
+        """Return a buffered pipeline that dispatches to this fake on
+        execute(). Mirrors redis-py's chainable pipeline API for the
+        commands Patch B.bsp-fix uses (zadd / zremrangebyrank / expire)."""
+        return _FakePipeline(self)
+
     def eval(self, script, numkeys, *args):
         """Minimal Lua eval — supports the safe-release and safe-refresh
         owner-checked patterns used by _release_lock and _refresh_lock."""
@@ -128,6 +169,37 @@ class _FakeRedis:
                 return self.expire(keys[0], int(argv[1]))
             return 0
         raise NotImplementedError(f"FakeRedis.eval: unrecognized script")
+
+
+class _FakePipeline:
+    """Buffered pipeline that records commands and dispatches them to the
+    parent _FakeRedis on execute(). Each command returns self so callers
+    can chain. Patch B.bsp-fix uses zadd + zremrangebyrank + expire."""
+
+    def __init__(self, redis):
+        self._redis = redis
+        self._buffer: list = []  # list of (method_name, args, kwargs)
+
+    def zadd(self, key, mapping):
+        self._buffer.append(("zadd", (key, mapping), {}))
+        return self
+
+    def zremrangebyrank(self, key, start, stop):
+        self._buffer.append(("zremrangebyrank", (key, start, stop), {}))
+        return self
+
+    def expire(self, key, seconds):
+        self._buffer.append(("expire", (key, seconds), {}))
+        return self
+
+    def execute(self):
+        results = []
+        for method, args, kwargs in self._buffer:
+            fn = getattr(self._redis, method)
+            results.append(fn(*args, **kwargs))
+        # Real redis-py pipelines clear after execute; mirror that.
+        self._buffer = []
+        return results
 
 
 class _FakeBuildContext:
@@ -346,6 +418,34 @@ def test_record_build_timing_sets_48h_ttl():
     # Verify the implementer called expire() on the timings key.
     expire_calls = [op for op in fake.ops if op[0] == "expire"]
     assert_true(len(expire_calls) >= 1, "expire() was called on the timings key")
+
+
+def test_record_build_timing_caps_at_1000():
+    """Patch B.bsp-fix — daily timings zset capped at TIMINGS_CAP (1000)
+    most-recent members. Without this cap, three tier threads writing
+    ~140 members per producer cycle dominated the 25 MB Redis cap and
+    triggered allkeys-lru eviction of live state. The cap is enforced
+    via a pipelined ZADD + ZREMRANGEBYRANK(0, -1001) + EXPIRE."""
+    from bot_state_producer import _record_build_timing, TIMINGS_CAP
+    assert_eq(TIMINGS_CAP, 1000, "cap is the documented 1000")
+    fake = _FakeRedis()
+    # Write 1500 unique members with monotonically increasing scores.
+    # _record_build_timing uses time.time() * 1000 — most members will
+    # share a score, so we rely on (score, member) ordering for the
+    # remove-oldest semantic.
+    for i in range(1500):
+        _record_build_timing(fake, ticker=f"T{i:04d}", intent="front",
+                             elapsed_ms=100 + i, expiration="2026-05-08")
+    keys = list(fake.zset.keys())
+    assert_eq(len(keys), 1, "single timings key written")
+    members = fake.zrange(keys[0], 0, -1, withscores=True)
+    assert_eq(len(members), 1000,
+              f"zset capped at TIMINGS_CAP, got {len(members)} members")
+    # Verify the trim command actually went through the wire (proxy:
+    # via fake.ops, populated by _FakeRedis.zremrangebyrank).
+    trim_ops = [op for op in fake.ops if op[0] == "zremrangebyrank"]
+    assert_true(len(trim_ops) == 1500,
+                f"one trim per write, got {len(trim_ops)}")
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -752,6 +852,7 @@ if __name__ == "__main__":
     # Telemetry
     test_record_build_timing_writes_sorted_set_member()
     test_record_build_timing_sets_48h_ttl()
+    test_record_build_timing_caps_at_1000()
     # Lock primitives
     test_lock_acquire_when_free()
     test_lock_acquire_fails_when_held()

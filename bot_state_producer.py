@@ -153,11 +153,23 @@ def _serialize_envelope(env: Dict[str, Any]) -> str:
 
 TIMINGS_KEY_PREFIX = "bot_state_producer:timings:"
 TIMINGS_TTL_SEC = 48 * 3600  # 48 hours — covers the 24h analysis window + slack
+# v11.7 (Patch B.bsp-fix): cap the daily timings zset to the most-recent
+# 1000 members. Without this, three tier threads writing ~140 members per
+# producer cycle accumulate to ~5MB/day per zset; three days of TTL overlap
+# would dominate the 25MB free-tier Redis cap and start evicting live state
+# (thesis_monitor, em_log, OI cache) via allkeys-lru. 1000 is comfortably
+# more than any realistic post-deploy analysis window — Tier A alone produces
+# only ~2-3 timings/sec at peak, so 1000 covers ~5-7 minutes of dense
+# Tier A activity, which is enough to catch latency drift in the analysis
+# window. Trimming happens atomically with the zadd via pipeline.
+TIMINGS_CAP = 1000
 
 
 def _record_build_timing(redis_client, ticker: str, intent: str,
                          elapsed_ms: int, expiration: str) -> None:
-    """Append one build-timing record to the daily sorted set.
+    """Append one build-timing record to the daily sorted set, then trim
+    to the most-recent TIMINGS_CAP members. Pipelined so write/trim/expire
+    are dispatched in a single round-trip.
 
     No-op on Redis errors — telemetry must NEVER block the producer loop.
     """
@@ -174,8 +186,15 @@ def _record_build_timing(redis_client, ticker: str, intent: str,
             "expiration": expiration,
         }, separators=(",", ":"))
         score = int(time.time() * 1000)  # millis since epoch
-        redis_client.zadd(key, {member: score})
-        redis_client.expire(key, TIMINGS_TTL_SEC)
+        # v11.7 (Patch B.bsp-fix): pipelined write + trim + expire.
+        # ZREMRANGEBYRANK(key, 0, -1001) removes everything except the
+        # last TIMINGS_CAP=1000 members ordered by score (timestamp).
+        # All three commands hit the wire as one MULTI/EXEC payload.
+        pipe = redis_client.pipeline()
+        pipe.zadd(key, {member: score})
+        pipe.zremrangebyrank(key, 0, -(TIMINGS_CAP + 1))
+        pipe.expire(key, TIMINGS_TTL_SEC)
+        pipe.execute()
     except Exception as e:
         log.debug(f"telemetry write failed for {ticker}/{intent}: {e}")
 
