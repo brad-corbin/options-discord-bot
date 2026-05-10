@@ -22,6 +22,11 @@ DEFAULT_DB_PATH = "/var/backtest/desk.db"
 LIST_LIMIT = 200                     # hard cap on alerts fetched per page load
 CHICAGO_TZ = ZoneInfo("America/Chicago")
 
+# v11.7 (Patch H.8): single track-bar horizon for visual simplicity.
+# If outcome data shows distinct decay profiles per engine in the
+# data we collect, swap to a per-engine dict in V1.1.
+TRACKING_HORIZON_SECONDS = 72 * 60 * 60   # 3 days
+
 # alert_recorder generates alert_ids via uuid.uuid4(). Reject anything
 # that doesn't match this shape on the detail route — belt-and-suspenders
 # with the SQL parameter binding and Flask's <string:> converter.
@@ -123,6 +128,32 @@ def _humanize_elapsed(seconds: int) -> str:
         m = (seconds % 3600) // 60
         return f"{h}h {m}m ago" if m else f"{h}h ago"
     return f"{seconds // 86400}d ago"
+
+
+def _compute_status_badge(engine: str, elapsed_seconds: int,
+                          latest_pnl: Optional[float]) -> tuple:
+    """Return (text, style_class) for the row-1 status badge.
+
+    First-match-wins logic:
+      1. engine == 'v2_5d'                   -> ('EVAL',     'eval')
+      2. elapsed > TRACKING_HORIZON_SECONDS  -> ('EXPIRED',  'expired')
+      3. latest_pnl is not None              -> ('+N%' or '-N%', positive/negative)
+      4. else                                -> ('ACTIVE',   'active')
+
+    PT-hit info is intentionally NOT in the badge — it lives on row 5.
+    Badge focuses on "is this making money now"; row 5 carries
+    trajectory + PT detail.
+    """
+    if engine == "v2_5d":
+        return ("EVAL", "eval")
+    if elapsed_seconds > TRACKING_HORIZON_SECONDS:
+        return ("EXPIRED", "expired")
+    if latest_pnl is not None:
+        sign = "+" if latest_pnl >= 0 else ""
+        text = f"{sign}{int(round(latest_pnl))}%"
+        cls = "positive" if latest_pnl >= 0 else "negative"
+        return (text, cls)
+    return ("ACTIVE", "active")
 
 
 def format_structure_summary(engine: str, structure: Any,

@@ -225,6 +225,71 @@ def test_format_structure_summary_malformed_does_not_raise():
 
 
 # ─────────────────────────────────────────────────────────────────────
+# _compute_status_badge — Patch H.8 row-1 enriched badge logic
+# ─────────────────────────────────────────────────────────────────────
+
+def test_compute_status_badge_v2_5d_returns_eval():
+    """v2_5d alerts always render EVAL — even when fresh, even if a
+    pnl somehow exists. Engine identity wins."""
+    from omega_dashboard.alerts_data import _compute_status_badge
+    assert _compute_status_badge("v2_5d", elapsed_seconds=30,
+                                 latest_pnl=None) == ("EVAL", "eval")
+    assert _compute_status_badge("v2_5d", elapsed_seconds=30,
+                                 latest_pnl=12.0) == ("EVAL", "eval")
+
+
+def test_compute_status_badge_expired_when_past_horizon():
+    """elapsed > 3 days flips to EXPIRED regardless of pnl."""
+    from omega_dashboard.alerts_data import (_compute_status_badge,
+                                             TRACKING_HORIZON_SECONDS)
+    over = TRACKING_HORIZON_SECONDS + 1
+    assert _compute_status_badge("long_call_burst", elapsed_seconds=over,
+                                 latest_pnl=None) == ("EXPIRED", "expired")
+    # latest_pnl present but past horizon → still EXPIRED
+    assert _compute_status_badge("credit_v84", elapsed_seconds=over,
+                                 latest_pnl=8.5) == ("EXPIRED", "expired")
+
+
+def test_compute_status_badge_positive_pnl():
+    """Latest pnl > 0 → '+N%' / 'positive' style."""
+    from omega_dashboard.alerts_data import _compute_status_badge
+    text, cls = _compute_status_badge("long_call_burst",
+                                      elapsed_seconds=600,
+                                      latest_pnl=12.4)
+    assert text == "+12%", text
+    assert cls == "positive"
+    # Zero pnl is positive (>=0).
+    text2, cls2 = _compute_status_badge("long_call_burst",
+                                        elapsed_seconds=600,
+                                        latest_pnl=0.0)
+    assert text2 == "+0%" and cls2 == "positive"
+
+
+def test_compute_status_badge_active_when_no_track():
+    """Fresh alert with no track samples yet → ACTIVE / 'active'."""
+    from omega_dashboard.alerts_data import _compute_status_badge
+    assert _compute_status_badge("long_call_burst", elapsed_seconds=30,
+                                 latest_pnl=None) == ("ACTIVE", "active")
+    assert _compute_status_badge("oi_flow_conviction",
+                                 elapsed_seconds=120,
+                                 latest_pnl=None) == ("ACTIVE", "active")
+
+
+def test_compute_status_badge_negative_pnl():
+    """Latest pnl < 0 → '-N%' / 'negative' style. Sign formatting check."""
+    from omega_dashboard.alerts_data import _compute_status_badge
+    text, cls = _compute_status_badge("credit_v84", elapsed_seconds=600,
+                                      latest_pnl=-3.2)
+    assert text == "-3%", text
+    assert cls == "negative"
+    # Larger negative — no thousands sep, just integer rounding.
+    text2, cls2 = _compute_status_badge("long_call_burst",
+                                        elapsed_seconds=600,
+                                        latest_pnl=-47.6)
+    assert text2 == "-48%" and cls2 == "negative"
+
+
+# ─────────────────────────────────────────────────────────────────────
 # get_alert_detail — assembly + parent linkage + UUID enforcement
 # ─────────────────────────────────────────────────────────────────────
 
