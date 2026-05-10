@@ -40,10 +40,12 @@ Three additions to the Market View tab, sharing one data path:
    Sticky-scrolled, smooth height transition. Three entry paths populate
    it; one panel, last-write-wins.
 
-3. **Per-card "View EM Brief" button** + a **single-ticker input field**
-   at the top of the page next to the refresh button. Clicking either,
-   or pressing Enter on the input, populates the panel with that
-   ticker's EM brief.
+3. **Whole-card click target** (entire trading card is clickable; no
+   small button in a corner) + a **single-ticker input field** at the
+   top of the page next to the refresh button. Clicking any card or
+   pressing Enter on the input populates the panel with that ticker's
+   EM brief. Matches the alerts-feed pattern from Patch H — reduces
+   visual density, larger hit target, more obvious affordance.
 
 **Data path (the load-bearing decision):**
 
@@ -52,7 +54,7 @@ Extract a new pure-compute helper from the existing `_post_em_card` /
 
 ```python
 # app.py (or new em_compute.py)
-def _compute_em_brief_data(ticker: str, session: str = "manual") -> Optional[dict]:
+def _compute_em_brief_data(ticker: str, session: Optional[str] = None) -> Optional[dict]:
     """Pure compute. Returns the structured data dict an EM brief needs.
     Does NOT post to Telegram. Does NOT write to ThesisContext.
     Single source of truth for EM brief content."""
@@ -83,7 +85,7 @@ or the silent-thesis store. The only new thing is a third consumer
 | File | Change |
 |---|---|
 | `app.py` | Extract `_compute_em_brief_data(ticker, session)` from existing `_post_em_card` body. Existing `_post_em_card` becomes `data = _compute_em_brief_data(...); text = _format_em_brief_text(data); post_to_telegram(text)`. Existing `_generate_silent_thesis` becomes `data = _compute_em_brief_data(...); _write_thesis_context(...)`. **Zero behavior change to the Telegram path** — same inputs, same outputs, same side effects. |
-| `omega_dashboard/em_data.py` | New module. `get_em_brief(ticker, session="manual") -> dict` — calls `_compute_em_brief_data` and shapes the result for the dashboard template (e.g., maps emoji-prefixed Telegram lines into structured sections). `start_refresh_all() -> str` returns a job_id; `get_refresh_progress(job_id) -> dict` returns `{started_at, completed, total, errors, finished_at}`. |
+| `omega_dashboard/em_data.py` | New module. `get_em_brief(ticker, session=None) -> dict` — calls `_compute_em_brief_data` (which resolves session from time-of-day if None, matching `_post_em_card`'s auto-detect) and shapes the result for the dashboard template (e.g., maps emoji-prefixed Telegram lines into structured sections; surfaces `available_sections` for partial-brief rendering). `start_refresh_all() -> str` returns a job_id; `get_refresh_progress(job_id) -> dict` returns `{started_at, completed, total, errors, finished_at}`. |
 | `omega_dashboard/routes.py` | Three new routes (all `@login_required`): `POST /em/refresh` (triggers all-35 batch, returns job_id); `GET /em/refresh/status/<job_id>` (polled by JS); `GET /em/brief/<ticker>` (synchronous, returns JSON or rendered HTML for the panel). |
 
 ### Frontend
@@ -91,8 +93,8 @@ or the silent-thesis store. The only new thing is a third consumer
 | File | Change |
 |---|---|
 | `omega_dashboard/templates/dashboard/_em_brief_panel.html` | New partial. Renders the structured EM brief: header (ticker + DTE + verdict), bias pill, levels grid (spot/1σ range/gamma flip/max pain/walls), local structure (R/S/pivot), fib + VPOC + pin zone, triggers list (micro/range-break/regime-shift), dealer regime block, vol regime + posture + structure score, ACTION GUIDE block (thesis line, GEX context, gamma flip context, pin zone context, "what to watch" setups). |
-| `omega_dashboard/templates/dashboard/trading.html` | Add page-header strip with: refresh-all button, single-ticker input, status text. Add anchored EM-brief panel container (initially empty, populated by JS). Add per-card "View EM Brief" button (small icon in card corner). Modify the inline JS: add `loadEmBrief(ticker)` that fetches `/em/brief/<ticker>` and swaps panel innerHTML; wire up the three entry paths (per-card click, input Enter, URL `?em=` on page load); add `triggerRefreshAll()` that POSTs and polls status. |
-| `omega_dashboard/static/omega.css` | Add `.em-brief-panel` (sticky positioning, smooth height transition, loading overlay), `.em-brief-header`, `.em-brief-bias-pill`, `.em-brief-levels-grid` (2-column), `.em-brief-triggers`, `.em-brief-regime-block`, `.em-brief-action-guide`, `.em-brief-empty` (placeholder), `.em-brief-loading` (spinner overlay), `.em-brief-error`. Plus `.refresh-all-btn` + `.em-ticker-input` + per-card `.tcard-em-button`. |
+| `omega_dashboard/templates/dashboard/trading.html` | Add page-header strip with: refresh-all button, single-ticker input, status text. Add anchored EM-brief panel container (initially empty, populated by JS). Modify each `.tcard` (or the existing `_trading_card.html` partial) so the entire card is a click target — wrap card body in a clickable surface that fires `loadEmBrief(card.ticker)`. NO per-card "View EM Brief" button (entire card is the affordance — matches alerts-feed pattern). Modify the inline JS: add `loadEmBrief(ticker)` that fetches `/em/brief/<ticker>` and swaps panel innerHTML; wire up the three entry paths (whole-card click, input Enter, URL `?em=` on page load); add `triggerRefreshAll()` that POSTs and polls status. |
+| `omega_dashboard/static/omega.css` | Add `.em-brief-panel` (sticky positioning + opaque `background: var(--bg-panel)` + `z-index: 5` so it cleanly overlays the card grid during 5s repaints — without these, panel content can flicker / show through during grid reflow), smooth height transition, loading overlay. Plus `.em-brief-header`, `.em-brief-bias-pill`, `.em-brief-levels-grid` (2-column), `.em-brief-triggers`, `.em-brief-regime-block`, `.em-brief-action-guide`, `.em-brief-empty` (placeholder), `.em-brief-loading` (spinner overlay), `.em-brief-error`, `.em-brief-partial-warning` (subtle banner for partial-brief failure modes), `.refresh-all-btn`, `.em-ticker-input`. **No** per-card `.tcard-em-button` — the entire trading card is the click target (matches alerts-feed pattern from Patch H, reduces visual density). |
 
 ### Tests
 
@@ -142,12 +144,18 @@ Click refresh button ──► POST /em/refresh
    Daemon loops: for ticker in FLOW_TICKERS:
        _generate_silent_thesis(ticker)   (writes ThesisContext)
        redis.hincrby("em_refresh:{job_id}", "completed", 1)
+       time.sleep(2.0)   # explicit serialization; protects rate
+                         # limiter from competing with live trading
+                         # path during market hours
                               │
                               ▼ (35 iterations later)
        redis.hset("em_refresh:{job_id}", "finished_at", now)
 
 JS polls GET /em/refresh/status/<job_id> every 2s:
-   "Refreshing 12/35…"  →  "Refreshed at 14:24 CT"
+   "Refreshing 12/35…"
+       (after 60s elapsed: "Refreshing 22/35… (this can take several
+                            minutes during market hours)")
+   →  "Refreshed at 14:24 CT"
 
 Existing card grid keeps polling /trading/data every 5s; cards
 update naturally as ThesisContext fills in. Refresh button itself
@@ -199,9 +207,13 @@ JetBrains Mono for numerals, Outfit for body. No new fonts.
   placeholder if first load), overlays a centered spinner with
   "Computing brief for HOOD…" caption. Doesn't change panel height.
 - **Populated state:** smooth height transition to full content
-  (~600-800px). Auto-scroll page to top on populate so the brief is in
-  view. Sticky positioning so it stays pinned while you scroll the grid
-  below.
+  (~600-800px). Sticky positioning keeps the panel pinned at the top of
+  the viewport, so it remains visible without auto-scrolling. **Do NOT
+  auto-scroll to top on populate** — the sticky behavior makes it
+  unnecessary, and auto-scroll would disrupt mid-grid browsing (you
+  click a card you spotted while scrolled down, and don't want the page
+  to jump). Smooth height animation is the only visual feedback;
+  panel content fades in over ~150ms.
 - **Error state:** brief panel shows friendly message
   ("Couldn't compute brief for HOOD: IV unavailable. Try again or pick
   another ticker."). × button clears.
@@ -222,10 +234,14 @@ JetBrains Mono for numerals, Outfit for body. No new fonts.
   `currentRequestId`; ignore stale responses.
 
 **Session parameter:** Telegram `/em` supports `morning` / `afternoon` /
-`manual` session args. V1 dashboard always uses `session="manual"` —
-matches the existing `_post_em_card` auto-detect logic (after-hours
-auto-flips to next-day preview). If session selection becomes useful
-later, add a small dropdown to the panel header in V1.1.
+`manual` session args. V1 dashboard does NOT hard-code a session — it
+passes `session=None` to `_compute_em_brief_data`, which resolves the
+session from time-of-day using the **same auto-detect logic that
+`_post_em_card` uses today** (pre-open → today live, post-close →
+next-day preview, etc.). Hard-coding `"manual"` would diverge from the
+Telegram path's behavior, defeating the point of the pure-extraction
+refactor. If user-overridable session selection becomes useful later,
+add a small dropdown to the panel header in V1.1.
 
 ---
 
@@ -250,9 +266,10 @@ later, add a small dropdown to the panel header in V1.1.
    `_generate_silent_thesis` called within ~90 seconds. ThesisContext
    updates in Redis. Existing card grid pills (bias / GEX) refresh on
    the next 5s poll.
-2. Click any ticker card's `View EM Brief` button → anchored panel
-   populates with that ticker's full structured EM brief within ~3
-   seconds.
+2. Click anywhere on any ticker card (entire card is the click target)
+   → anchored panel populates with that ticker's full structured EM
+   brief within ~3 seconds. No auto-scroll — sticky panel stays in
+   view via CSS only.
 3. Type `HOOD` in the input field + press Enter → panel populates
    with HOOD's brief, even though HOOD is not in FLOW_TICKERS. No
    ThesisContext write for HOOD.
@@ -271,6 +288,11 @@ later, add a small dropdown to the panel header in V1.1.
    identical output to today's behavior (refactor is pure-extraction).
 10. All existing test suites still green; new `test_em_data.py` covers
     the new module.
+11. **`test_em_brief_snapshot_unchanged` exists, was committed BEFORE
+    the extraction refactor, passed against pre-refactor code, and
+    continues to pass after refactor.** Three fixture files
+    (spy/hood/thin) committed under `tests/fixtures/em_brief_snapshots/`.
+    Without this gate the refactor cannot ship.
 
 ---
 
@@ -278,26 +300,88 @@ later, add a small dropdown to the panel header in V1.1.
 
 **Risks:**
 
-- **Schwab rate limit during all-35 refresh.** 35 chain pulls + IV +
-  walls computations in ~90s = ~25 calls/sec at peak. Existing
-  `SCHWAB_RATE_PER_MIN=110` (CLAUDE.md decision) gives 1.83/sec average,
-  so 25/sec needs to be smoothed. **Mitigation:** the daemon thread
-  serializes per-ticker (one at a time), no parallelism. 35 tickers ×
-  3s/ticker = ~105s total, well within rate limit.
+- **Schwab rate limit + cache pressure during all-35 refresh.** Each
+  ticker triggers 4-6 Schwab calls (chain × multiple slices, daily
+  candles, quote, options snapshot) — not 1. During market hours,
+  `_get_0dte_iv` competes with the live trading path's polling. Under
+  realistic conditions:
+  - **Pre-market / weekend:** ~90 seconds for 35 tickers (caches mostly
+    cold but no contention)
+  - **During market hours:** **3-6 minutes** for 35 tickers, sometimes
+    longer if rate limiter is throttling competing requests
+  - Optimistic ~3s/ticker estimate from earlier was wrong; real range
+    is ~5-10s/ticker
+  
+  **Mitigation:** the daemon thread serializes per-ticker (one at a
+  time, no parallelism) AND inserts `time.sleep(2.0)` between tickers
+  to give the rate limiter slack and avoid starving the live trading
+  path. Total worst-case: 35 × 10s + 34 × 2s = ~6 min, within
+  acceptable range. Status text adapts: if `elapsed > 60s` and not
+  yet done, button shows
+  `Refreshing 22/35… (this can take several minutes during market hours)`.
 - **`_post_em_card` refactor regression.** The pure-extraction must
-  not change Telegram output. **Mitigation:** capture current Telegram
-  output for 3 representative tickers (1 trade-on, 1 neutral, 1 no-data)
-  before refactor; assert byte-identical text after refactor. Add a
-  regression test that calls `_compute_em_brief_data` + `_format_em_brief_text`
-  and snapshots the result.
-- **Single-ticker input for unknown ticker.** User types "FAKE" — Schwab
-  returns no chain. **Mitigation:** route catches the exception,
-  returns 200 with friendly error payload; panel renders the error
-  state. Never 500.
+  not change Telegram output. **This is the load-bearing risk** — if
+  the refactor silently changes /em output, Brad's trading workflow
+  breaks invisibly until somebody notices.
+
+  **Mitigation — pre-refactor snapshot gate (MANDATORY, ships first):**
+  1. **Before** writing any extraction code, capture current Telegram
+     output for 3 representative tickers via the existing
+     `_post_em_card` path: 1 trade-on (e.g., SPY during volatility),
+     1 neutral / pin-zone (e.g., HOOD on a quiet day), 1 no-data
+     edge case (e.g., low-volume single-name with thin chain).
+  2. Snapshot the rendered text into 3 fixture files
+     (`tests/fixtures/em_brief_snapshots/{spy,hood,thin}.txt`).
+  3. Write a snapshot regression test
+     (`test_em_brief_snapshot_unchanged`) that calls
+     `_compute_em_brief_data` + `_format_em_brief_text` and asserts
+     byte-identical output to the fixture files.
+  4. Test must **pass against current code (before refactor)** so the
+     fixtures are validated as accurate captures of today's behavior.
+  5. **Only then** start the extraction. Test continues to pass at
+     every commit during the refactor — refactor is done when the
+     extracted code path produces byte-identical text.
+
+  This sequencing matters: writing the test AFTER the refactor would
+  let any silent drift from the original `_post_em_card` body slip
+  through (the test would lock in the post-refactor output, not the
+  pre-refactor output). Write the snapshot test first; refactor
+  against it.
+- **Single-ticker input — three failure modes, not one.** Three distinct
+  data-availability failures the panel must handle gracefully:
+  1. **Ticker truly unknown (Schwab returns no chain).** Full error
+     state: friendly "Couldn't compute brief for FAKE: no option chain
+     available" message + × dismiss.
+  2. **Chain available but daily history missing** (e.g., recently-IPO'd
+     ticker). Render partial brief: spot, IV, walls, EM range all
+     populate; pivot/fib/VPOC sections render with `n/a` values and
+     a **subtle warning banner** at the top of the panel:
+     `⚠ Partial brief — daily history unavailable; structure levels
+     may be incomplete.`
+  3. **IV available but walls/exposure compute fails** (e.g., chain
+     too thin to estimate dealer GEX). Same partial-brief pattern:
+     render what we have, warning banner notes which sections are
+     `n/a`.
+  
+  **Mitigation:** `_compute_em_brief_data` returns a dict with explicit
+  `available_sections: List[str]` field; the dashboard template iterates
+  sections and renders `n/a` for missing ones. Full-error state only
+  when nothing computes (case 1).
 - **Concurrent refresh-all requests.** User clicks refresh, then clicks
   again 5s later. **Mitigation:** `start_refresh_all()` checks for an
   in-flight job in Redis; if one exists, returns its job_id rather than
   starting a new one. Idempotent.
+
+- **Individual card click during all-35 refresh.** User clicks "Refresh
+  all 35" then immediately clicks an individual card. Both run.
+  Behavior is documented (not coordinated): the individual `/em/brief`
+  request goes through the same `_get_0dte_iv` path the daemon uses;
+  both share the global Schwab rate limiter, which throttles them
+  fairly. Individual click may be slower than usual (3-8s instead of
+  2-3s) because the daemon is consuming rate-limit budget. No deadlock,
+  no error — just slower. **No special coordination needed.** Document
+  this in the panel's loading caption when a refresh is in flight:
+  `Computing brief for HOOD… (refresh-all in progress, may be slower)`.
 
 **Rollback:**
 
@@ -309,6 +393,21 @@ later, add a small dropdown to the panel header in V1.1.
   true after ship) hides the new panel + button, returns 410 from new
   routes, leaves the existing trading_data path untouched. One env var
   flip + redeploy = rollback.
+
+---
+
+## Ship sequencing
+
+Per Brad's QC: this patch does NOT parallel-ship with H.8 — both touch
+the dashboard (`omega.css`, `omega_dashboard/templates/dashboard/`) and
+parallel ship complicates QC. Sequencing:
+
+- **Mon 2026-05-11:** flip recorder gates (RECORDER_ENABLED + per-engine)
+- **Tue 2026-05-12:** H.8 stabilizes; observe row 5 + badge in production
+- **Wed 2026-05-13+:** EM brief patch can ship
+
+Spec + plan can be written today (Sun 2026-05-10); implementation work
+holds until Wed.
 
 ---
 
