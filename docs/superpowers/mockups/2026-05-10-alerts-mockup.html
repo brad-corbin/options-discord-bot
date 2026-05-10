@@ -14,15 +14,13 @@
    (var(--bg-void), var(--brass), etc.) rather than the hex values
    hardcoded here.
 
-   ── DEFERRED IN V1 (Patch H) ──────────────────────────────
-   Card row 5 (.alert-row5: tracking · bar · MFE · current · PT-hit)
-   is shown here as the V1.1 target but NOT shipped in Patch H.
-   Reason: row 5 needs per-card lookups against alert_price_track
-   and alert_outcomes, which violates the "no N+1 queries" contract.
-   Patch H ships 4-row cards (timestamp / engine+ticker / structure /
-   parent linkage). Row 5 lands in Patch H.8 with batched IN-clause
-   aggregate queries (1 alerts + 1 track-aggregate + 1 latest-sample
-   + 1 outcomes-aggregate = 4 SQL statements regardless of row count).
+   ── ROW 5 SHIPPED IN PATCH H.8 ────────────────────────────
+   Patch H shipped 4-row cards. Patch H.8 ships row 5 (.alert-row5:
+   tracking · bar · MFE · current · ★ PT-hit) using batched
+   IN-clause aggregate queries (1 alerts + 1 track-aggregate +
+   1 latest-sample + 1 outcomes-aggregate = 4 SQL statements
+   regardless of row count). MFE + PT-hit shown together (Option B
+   per spec) — operational signal value over mockup fidelity.
    ──────────────────────────────────────────────────────────
    
    Token mapping (this file → omega.css):
@@ -269,6 +267,11 @@ body { background: #0D0F10; color: #E8DFC9; font-family: 'Outfit', sans-serif; m
   vertical-align: middle;
   margin: 0 4px;
 }
+/* Bar fill = min(elapsed_seconds / TRACKING_HORIZON_SECONDS, 1.0).
+   TRACKING_HORIZON_SECONDS = 72 * 60 * 60 (3 days) in V1 — single
+   horizon for visual simplicity. The illustrative widths in the
+   mockup cards below (70/60/85) were NOT formulaic; the H.8
+   implementation replaces them with the elapsed/horizon ratio. */
 .track-bar-fill {
   height: 100%;
   background: linear-gradient(90deg, #4F8A57 0%, #73B27B 100%);
