@@ -1,0 +1,877 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Patch H — Alert feed visual reference</title>
+<style>
+/* ============================================================
+   PATCH H VISUAL REFERENCE — ALERT FEED + DETAIL PAGE
+   ============================================================
+   This file is reference-only for the implementer building Patch H.
+   Match these colors, typography, and card structures as closely as
+   feasible. The actual dashboard uses Flask/Jinja templates and pulls
+   tokens from omega_dashboard/static/omega.css — use those tokens
+   (var(--bg-void), var(--brass), etc.) rather than the hex values
+   hardcoded here.
+
+   ── DEFERRED IN V1 (Patch H) ──────────────────────────────
+   Card row 5 (.alert-row5: tracking · bar · MFE · current · PT-hit)
+   is shown here as the V1.1 target but NOT shipped in Patch H.
+   Reason: row 5 needs per-card lookups against alert_price_track
+   and alert_outcomes, which violates the "no N+1 queries" contract.
+   Patch H ships 4-row cards (timestamp / engine+ticker / structure /
+   parent linkage). Row 5 lands in Patch H.8 with batched IN-clause
+   aggregate queries (1 alerts + 1 track-aggregate + 1 latest-sample
+   + 1 outcomes-aggregate = 4 SQL statements regardless of row count).
+   ──────────────────────────────────────────────────────────
+   
+   Token mapping (this file → omega.css):
+     #0D0F10 → var(--bg-void)
+     #171A1D → var(--bg-panel)
+     #1C2023 → var(--bg-elev)
+     #2A2E33 → var(--border)
+     #6D5A36 → var(--brass-deep)
+     #B7924E → var(--brass)
+     #D5B06B → var(--brass-bright) / var(--neutral)
+     #E8DFC9 → var(--text)
+     #B8AF9A → var(--text-muted)
+     #8A8377 → var(--text-dim)
+     #4F8A57 → var(--positive)
+     #73B27B → var(--positive-bright)
+     #A14F4F → var(--negative)
+     #C86A6A → var(--negative-soft)
+     #C68A50 → var(--warn) [LCB engine accent]
+     #4A8580 → var(--partner) [credit engine accent]
+     #8B3A30 → var(--mine) [conviction engine accent]
+   ============================================================ */
+
+@import url('https://fonts.googleapis.com/css2?family=Cinzel:wght@400;500&family=Outfit:wght@400;500&family=JetBrains+Mono:wght@400;500&display=swap');
+
+* { box-sizing: border-box; }
+body { background: #0D0F10; color: #E8DFC9; font-family: 'Outfit', sans-serif; margin: 0; padding: 0; }
+.container { max-width: 1400px; margin: 0 auto; padding: 24px 40px; }
+
+/* ============================================================
+   STATUS STRIP — top of page
+   ============================================================ */
+.eyebrow {
+  color: #6D5A36;
+  font-family: 'Cinzel', serif;
+  font-size: 11px;
+  letter-spacing: 4px;
+  text-transform: uppercase;
+  padding-bottom: 8px;
+  border-bottom: 1px solid #2A2E33;
+  margin-bottom: 20px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.status-strip {
+  display: flex;
+  gap: 24px;
+  padding: 14px 18px;
+  background: #171A1D;
+  border: 1px solid #2A2E33;
+  margin-bottom: 24px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 13px;
+  color: #B8AF9A;
+  align-items: center;
+}
+.status-dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: #4F8A57;
+  margin-right: 8px;
+  display: inline-block;
+  vertical-align: middle;
+  box-shadow: 0 0 6px rgba(79, 138, 87, 0.6);
+}
+.status-dot.off {
+  background: #5F5E5A;
+  box-shadow: none;
+}
+.status-divider { color: #2A2E33; }
+.status-pill-label {
+  color: #8A8377;
+  font-size: 11px;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+}
+.status-pill-value {
+  color: #D5B06B;
+  font-weight: 500;
+}
+.engines-pill {
+  cursor: help;
+  border-bottom: 1px dotted #6D5A36;
+}
+
+/* ============================================================
+   SECTION HEADERS — Today / Yesterday / This week / Earlier
+   ============================================================ */
+.section-header {
+  font-family: 'Cinzel', serif;
+  font-size: 12px;
+  letter-spacing: 4px;
+  color: #6D5A36;
+  text-transform: uppercase;
+  margin: 28px 0 12px 0;
+  padding-bottom: 6px;
+  border-bottom: 1px solid #2A2E33;
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+}
+.section-count {
+  color: #8A8377;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+}
+
+/* ============================================================
+   ALERT CARD — main visual unit
+   Each engine gets its own 4px left border accent color.
+   Cards <5min old get pulse-border animation.
+   Cards >24h get .muted class (opacity 0.65).
+   ============================================================ */
+.alert-card {
+  background: #171A1D;
+  border: 1px solid #2A2E33;
+  border-left: 4px solid #B7924E;
+  padding: 14px 18px;
+  margin-bottom: 8px;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+.alert-card:hover {
+  background: #1C2023;
+  border-color: #6D5A36;
+}
+.alert-card.engine-lcb { border-left-color: #C68A50; }       /* warm orange */
+.alert-card.engine-v25d { border-left-color: #D5B06B; }      /* gold */
+.alert-card.engine-credit { border-left-color: #4A8580; }    /* teal */
+.alert-card.engine-conviction { border-left-color: #8B3A30; } /* oxblood */
+.alert-card.muted { opacity: 0.65; }
+.alert-card.fresh { animation: pulse-border 2.5s ease-in-out 3; }
+@keyframes pulse-border {
+  0%, 100% { box-shadow: inset 4px 0 0 0 rgba(213, 176, 107, 0); }
+  50% { box-shadow: inset 4px 0 0 0 rgba(213, 176, 107, 0.5); }
+}
+
+/* Card row 1: timestamp + relative time + status badge */
+.alert-row1 {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  color: #8A8377;
+  margin-bottom: 6px;
+}
+.alert-row1-time { color: #B8AF9A; }
+.alert-row1-relative {
+  color: #6D5A36;
+  padding-left: 8px;
+}
+
+/* Status badges */
+.badge {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  padding: 2px 8px;
+  letter-spacing: 1px;
+  border-radius: 0;
+}
+.badge.active {
+  background: rgba(213, 176, 107, 0.08);
+  color: #D5B06B;
+  border: 1px solid #6D5A36;
+}
+.badge.positive {
+  background: rgba(79, 138, 87, 0.12);
+  color: #73B27B;
+  border: 1px solid #4F8A57;
+}
+.badge.negative {
+  background: rgba(161, 79, 79, 0.12);
+  color: #C86A6A;
+  border: 1px solid #A14F4F;
+}
+.badge.expired {
+  background: transparent;
+  color: #5F5E5A;
+  border: 1px solid #2A2E33;
+}
+
+/* Card row 2: engine icon/name + ticker + bull/bear chevron */
+.alert-row2 {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 6px;
+}
+.alert-engine {
+  font-size: 14px;
+  font-weight: 500;
+  letter-spacing: 1px;
+}
+.alert-engine.lcb { color: #C68A50; }
+.alert-engine.v25d { color: #D5B06B; }
+.alert-engine.credit { color: #4A8580; }
+.alert-engine.conviction { color: #C86A6A; }
+.alert-ticker {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 16px;
+  color: #E8DFC9;
+  font-weight: 500;
+}
+.chevron-up { color: #73B27B; font-size: 12px; }
+.chevron-down { color: #C86A6A; font-size: 12px; }
+
+/* Card row 3: structure summary (NO DTE — convention divergence) */
+.alert-row3 {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 13px;
+  color: #B8AF9A;
+  margin-bottom: 4px;
+}
+
+/* Card row 4: parent linkage if applicable */
+.alert-row4 {
+  font-family: 'Outfit', sans-serif;
+  font-size: 12px;
+  color: #6D5A36;
+  font-style: italic;
+  padding-left: 12px;
+  margin-bottom: 6px;
+}
+
+/* Card row 5: tracking summary */
+.alert-row5 {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: #8A8377;
+  padding-top: 6px;
+  border-top: 1px dashed #2A2E33;
+  display: flex;
+  gap: 14px;
+  align-items: center;
+}
+.track-bar {
+  display: inline-block;
+  height: 4px;
+  width: 80px;
+  background: #2A2E33;
+  position: relative;
+  overflow: hidden;
+  vertical-align: middle;
+  margin: 0 4px;
+}
+.track-bar-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #4F8A57 0%, #73B27B 100%);
+}
+.track-bar-fill.partial { background: #C68A50; }
+.pt-hit {
+  color: #D5B06B;
+  font-weight: 500;
+}
+
+/* ============================================================
+   COLLAPSED SECTIONS — Yesterday / This week / Earlier
+   ============================================================ */
+.collapsed-section {
+  background: #171A1D;
+  border: 1px solid #2A2E33;
+  padding: 12px 18px;
+  margin-bottom: 8px;
+  cursor: pointer;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  color: #8A8377;
+}
+.collapsed-section:hover { background: #1C2023; }
+.chevron-collapse { color: #6D5A36; }
+
+/* ============================================================
+   EMPTY STATES
+   ============================================================ */
+.empty-state {
+  background: #171A1D;
+  border: 1px solid #2A2E33;
+  padding: 40px 24px;
+  text-align: center;
+  font-family: 'Outfit', sans-serif;
+}
+.empty-state-icon {
+  font-size: 32px;
+  color: #6D5A36;
+  margin-bottom: 12px;
+}
+.empty-state-title {
+  font-family: 'Cinzel', serif;
+  font-size: 14px;
+  letter-spacing: 3px;
+  color: #B8AF9A;
+  margin-bottom: 8px;
+  text-transform: uppercase;
+}
+.empty-state-message {
+  font-size: 13px;
+  color: #8A8377;
+  max-width: 480px;
+  margin: 0 auto;
+  line-height: 1.6;
+}
+
+/* ============================================================
+   DETAIL PAGE
+   ============================================================ */
+.back-link {
+  color: #6D5A36;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  text-decoration: none;
+  margin-bottom: 20px;
+  display: inline-block;
+}
+.back-link:hover { color: #B7924E; }
+.detail-header {
+  background: #171A1D;
+  border: 1px solid #2A2E33;
+  border-left: 4px solid #C68A50;
+  padding: 20px 24px;
+  margin-bottom: 20px;
+}
+.detail-engine {
+  font-size: 18px;
+  font-weight: 500;
+  color: #C68A50;
+  letter-spacing: 1px;
+  margin-bottom: 4px;
+}
+.detail-ticker-line {
+  display: flex;
+  align-items: baseline;
+  gap: 16px;
+  margin-bottom: 8px;
+}
+.detail-ticker {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 28px;
+  color: #E8DFC9;
+  font-weight: 500;
+}
+.detail-classification {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 13px;
+  color: #D5B06B;
+}
+.detail-meta {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  color: #8A8377;
+  margin-top: 8px;
+}
+.detail-parent-link {
+  display: inline-block;
+  margin-top: 10px;
+  padding: 4px 10px;
+  background: rgba(213, 176, 107, 0.08);
+  color: #D5B06B;
+  border: 1px solid #6D5A36;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  cursor: pointer;
+  text-decoration: none;
+}
+.detail-parent-link:hover {
+  background: rgba(213, 176, 107, 0.16);
+}
+
+.section {
+  background: #171A1D;
+  border: 1px solid #2A2E33;
+  padding: 18px 22px;
+  margin-bottom: 12px;
+}
+.section-title {
+  font-family: 'Cinzel', serif;
+  font-size: 11px;
+  letter-spacing: 4px;
+  color: #6D5A36;
+  text-transform: uppercase;
+  margin-bottom: 14px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid #2A2E33;
+}
+
+/* Structure block */
+.struct-grid {
+  display: grid;
+  grid-template-columns: 140px 1fr;
+  gap: 6px 16px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 13px;
+}
+.struct-grid .label { color: #8A8377; }
+.struct-grid .value { color: #E8DFC9; }
+.dte-tag {
+  color: #C68A50;
+  font-size: 10px;
+  letter-spacing: 1px;
+  padding-left: 6px;
+}
+/* CRITICAL: DTE convention divergence per CLAUDE.md.
+   LCB uses "trading days", v8.4 CREDIT uses "calendar days", V2 5D
+   and CONVICTION omit DTE entirely. Always tag the convention. */
+
+/* Price track chart */
+.chart-area { padding: 8px 0; }
+.chart-stats {
+  display: flex;
+  gap: 24px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px dashed #2A2E33;
+}
+.chart-stat-label {
+  color: #8A8377;
+  font-size: 10px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  display: block;
+}
+.chart-stat-value {
+  color: #E8DFC9;
+  font-size: 14px;
+  font-weight: 500;
+}
+.chart-stat-value.pos { color: #73B27B; }
+.chart-stat-value.neg { color: #C86A6A; }
+
+/* Outcomes table */
+table.outcomes {
+  width: 100%;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+  border-collapse: collapse;
+}
+table.outcomes th {
+  color: #6D5A36;
+  font-weight: 400;
+  text-transform: uppercase;
+  letter-spacing: 2px;
+  font-size: 10px;
+  padding: 6px 8px;
+  text-align: left;
+  border-bottom: 1px solid #2A2E33;
+}
+table.outcomes td {
+  padding: 8px;
+  border-bottom: 1px solid #2A2E33;
+  color: #B8AF9A;
+}
+table.outcomes tr:last-child td { border-bottom: none; }
+.pt-yes {
+  color: #D5B06B;
+  font-weight: 500;
+}
+.pt-no { color: #2A2E33; }
+.pnl-pos { color: #73B27B; }
+.pnl-neg { color: #C86A6A; }
+.pnl-pending {
+  color: #5F5E5A;
+  font-style: italic;
+}
+
+/* Features grid */
+.features-grid {
+  display: grid;
+  grid-template-columns: 200px 1fr 200px 1fr;
+  gap: 4px 16px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12px;
+}
+.features-grid .fname {
+  color: #8A8377;
+  padding: 4px 0;
+}
+.features-grid .fval {
+  color: #E8DFC9;
+  padding: 4px 0;
+}
+
+/* Collapsible JSON blocks */
+details summary {
+  cursor: pointer;
+  color: #B7924E;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  letter-spacing: 1px;
+  padding: 8px 0;
+  list-style: none;
+}
+details summary::before {
+  content: "▶";
+  color: #6D5A36;
+  padding-right: 8px;
+  transition: transform 0.2s;
+  display: inline-block;
+}
+details[open] summary::before { transform: rotate(90deg); }
+details summary:hover { color: #D5B06B; }
+.json-block {
+  background: #0D0F10;
+  border: 1px solid #2A2E33;
+  padding: 12px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: #B8AF9A;
+  overflow-x: auto;
+  line-height: 1.5;
+}
+.json-key { color: #B7924E; }
+.json-string { color: #73B27B; }
+.json-num { color: #D5B06B; }
+</style>
+</head>
+<body>
+
+<!-- ============================================================
+     PAGE 1 — ALERTS LIST PAGE
+     ============================================================ -->
+<div class="container">
+  <div class="eyebrow">
+    <span>— ALERTS · LIVE FEED</span>
+    <span style="font-family: 'JetBrains Mono', monospace; color: #8A8377;">
+      14:37:12 CT · 4 today
+    </span>
+  </div>
+
+  <!-- STATUS STRIP -->
+  <div class="status-strip">
+    <span>
+      <span class="status-dot"></span>
+      <span class="status-pill-label">RECORDER</span>
+      <span class="status-pill-value">LIVE</span>
+    </span>
+    <span class="status-divider">·</span>
+    <span class="engines-pill" title="LCB · V25D · CREDIT · CONVICTION">
+      <span class="status-pill-label">ENGINES</span>
+      <span class="status-pill-value">4 ON</span>
+    </span>
+    <span class="status-divider">·</span>
+    <span>
+      <span class="status-pill-label">LAST FIRE</span>
+      <span class="status-pill-value">14:24</span>
+    </span>
+    <span class="status-divider">·</span>
+    <span style="margin-left: auto;">
+      <span class="status-pill-label">REFRESH IN</span>
+      <span class="status-pill-value">7s</span>
+    </span>
+  </div>
+
+  <!-- SECTION: TODAY -->
+  <div class="section-header">
+    <span>Today</span>
+    <span class="section-count">4 alerts</span>
+  </div>
+
+  <!-- LCB CARD — fresh, has parent linkage, tracking active -->
+  <div class="alert-card engine-lcb fresh">
+    <div class="alert-row1">
+      <div>
+        <span class="alert-row1-time">14:24:15 CT</span>
+        <span class="alert-row1-relative">· 13 min ago</span>
+      </div>
+      <span class="badge active">ACTIVE</span>
+    </div>
+    <div class="alert-row2">
+      <span class="alert-engine lcb">🚀 LONG CALL BURST</span>
+      <span class="alert-ticker">AMZN</span>
+      <span class="chevron-up">▲ bull</span>
+    </div>
+    <div class="alert-row3">$215.50 CALL · expiry 5/15 · entry $2.15 · spot $213.80</div>
+    <div class="alert-row4">↳ V2 5D Grade A bull (parent)</div>
+    <div class="alert-row5">
+      <span>tracking</span>
+      <span class="track-bar"><span class="track-bar-fill" style="width:70%"></span></span>
+      <span>MFE +18%</span>
+      <span style="color:#73B27B">current +7%</span>
+    </div>
+  </div>
+
+  <!-- CREDIT CARD — PT1 hit, positive badge -->
+  <div class="alert-card engine-credit">
+    <div class="alert-row1">
+      <div>
+        <span class="alert-row1-time">13:47:02 CT</span>
+        <span class="alert-row1-relative">· 50 min ago</span>
+      </div>
+      <span class="badge positive">+12%</span>
+    </div>
+    <div class="alert-row2">
+      <span class="alert-engine credit">💎 v8.4 CREDIT</span>
+      <span class="alert-ticker">SPY</span>
+      <span class="chevron-up">▲ bull</span>
+    </div>
+    <div class="alert-row3">580 / 575 BULL PUT · expiry 5/9 · credit $0.85</div>
+    <div class="alert-row4">↳ V2 5D Grade B bull (parent)</div>
+    <div class="alert-row5">
+      <span>tracking</span>
+      <span class="track-bar"><span class="track-bar-fill" style="width:60%"></span></span>
+      <span style="color:#73B27B">current +12%</span>
+      <span class="pt-hit">★ PT1 hit</span>
+    </div>
+  </div>
+
+  <!-- CONVICTION CARD — independent, no parent -->
+  <div class="alert-card engine-conviction">
+    <div class="alert-row1">
+      <div>
+        <span class="alert-row1-time">11:12:33 CT</span>
+        <span class="alert-row1-relative">· 3h 14m ago</span>
+      </div>
+      <span class="badge positive">+24%</span>
+    </div>
+    <div class="alert-row2">
+      <span class="alert-engine conviction">💎🚨 CONVICTION PLAY</span>
+      <span class="alert-ticker">NVDA</span>
+      <span class="chevron-up">▲ bull</span>
+    </div>
+    <div class="alert-row3">$190 CALL · expiry 5/15 · spot $1180.40</div>
+    <div class="alert-row4">flow 2.4× · burst score 7 · notional $200K</div>
+    <div class="alert-row5">
+      <span>tracking</span>
+      <span class="track-bar"><span class="track-bar-fill" style="width:85%"></span></span>
+      <span>MFE +28%</span>
+      <span style="color:#73B27B">current +24%</span>
+    </div>
+  </div>
+
+  <!-- V2 5D CARD — vehicle rejected, no children -->
+  <div class="alert-card engine-v25d">
+    <div class="alert-row1">
+      <div>
+        <span class="alert-row1-time">09:58:01 CT</span>
+        <span class="alert-row1-relative">· 4h 28m ago</span>
+      </div>
+      <span class="badge expired">EVAL</span>
+    </div>
+    <div class="alert-row2">
+      <span class="alert-engine v25d">⚡ V2 5D EDGE</span>
+      <span class="alert-ticker">TSLA</span>
+      <span class="chevron-up">▲ bull</span>
+    </div>
+    <div class="alert-row3">Grade A · vehicle rejected (no good spread available)</div>
+    <div class="alert-row4">no children · standalone evaluation</div>
+    <div class="alert-row5">
+      <span>outcomes compute at 1h · 4h · 1d · expiry</span>
+    </div>
+  </div>
+
+  <!-- COLLAPSED SECTIONS -->
+  <div class="section-header" style="margin-top: 32px;">
+    <span>Yesterday</span>
+    <span class="section-count">12 alerts</span>
+  </div>
+  <div class="collapsed-section">
+    <span><span class="chevron-collapse">▶</span> &nbsp;&nbsp;Yesterday — 12 alerts (3 LCB · 5 v8.4 CREDIT · 2 V2 5D · 2 CONVICTION)</span>
+    <span style="color:#6D5A36;">expand</span>
+  </div>
+
+  <div class="section-header" style="margin-top: 16px;">
+    <span>This week</span>
+    <span class="section-count">89 alerts</span>
+  </div>
+  <div class="collapsed-section">
+    <span><span class="chevron-collapse">▶</span> &nbsp;&nbsp;This week — 89 alerts</span>
+    <span style="color:#6D5A36;">expand</span>
+  </div>
+
+  <div class="section-header" style="margin-top: 16px;">
+    <span>Earlier</span>
+    <span class="section-count">capped at 200</span>
+  </div>
+  <div class="collapsed-section">
+    <span><span class="chevron-collapse">▶</span> &nbsp;&nbsp;Earlier — 95 alerts (older than 7 days)</span>
+    <span style="color:#6D5A36;">expand</span>
+  </div>
+
+  <!-- ============================================================
+       EMPTY STATES (matrix from prompt)
+       ============================================================ -->
+  <div class="section-header" style="margin-top: 56px;">
+    <span>Empty states reference</span>
+    <span class="section-count">4 distinct states</span>
+  </div>
+
+  <!-- STATE 1: DB MISSING -->
+  <div class="empty-state">
+    <div class="empty-state-icon">⚙</div>
+    <div class="empty-state-title">Recorder not initialized</div>
+    <div class="empty-state-message">
+      The recorder database doesn't exist yet. Check that <code style="color:#D5B06B;font-family:JetBrains Mono;">RECORDER_ENABLED</code> is set in your environment and the bot has been deployed since the recorder shipped.
+    </div>
+  </div>
+
+  <div style="height: 8px;"></div>
+
+  <!-- STATE 2: DB EXISTS, EMPTY -->
+  <div class="empty-state">
+    <div class="empty-state-icon">∅</div>
+    <div class="empty-state-title">No alerts captured yet</div>
+    <div class="empty-state-message">
+      The recorder is running but hasn't logged any alerts. Alerts will appear here as engines fire during market hours. Check that per-engine gates (<code style="color:#D5B06B;font-family:JetBrains Mono;">RECORDER_LCB_ENABLED</code>, etc.) are flipped on for the engines you want to track.
+    </div>
+  </div>
+
+  <div style="height: 8px;"></div>
+
+  <!-- STATE 3: ALL OLD DATA -->
+  <div class="empty-state">
+    <div class="empty-state-icon">○</div>
+    <div class="empty-state-title">No recent activity</div>
+    <div class="empty-state-message">
+      No alerts in the last 7 days. Showing historical alerts only. If you're seeing this on a weekday during market hours, check that engine gates are still on.
+    </div>
+  </div>
+</div>
+
+<!-- =========================================================== -->
+<!-- =========================================================== -->
+<!-- =========================================================== -->
+
+<!-- ============================================================
+     PAGE 2 — ALERT DETAIL PAGE
+     ============================================================ -->
+<div class="container" style="border-top: 1px solid #2A2E33; margin-top: 80px; padding-top: 48px;">
+  <a href="#" class="back-link">← back to feed</a>
+  <div class="eyebrow">— ALERT DETAIL · 7f3a9e21...</div>
+
+  <!-- HEADER CARD -->
+  <div class="detail-header">
+    <div class="detail-engine">🚀 LONG CALL BURST</div>
+    <div class="detail-ticker-line">
+      <span class="detail-ticker">AMZN ▲</span>
+      <span class="detail-classification">BURST_YES · bull</span>
+    </div>
+    <div class="detail-meta">Fired 14:24:15 CT · 13 minutes ago · alert_id 7f3a9e21-4b8f-4d2c-9a1e-3f7c5d8b9012</div>
+    <a href="#" class="detail-parent-link">↳ V2 5D Grade A bull (parent) · click to view</a>
+  </div>
+
+  <!-- STRUCTURE -->
+  <div class="section">
+    <div class="section-title">Structure</div>
+    <div class="struct-grid">
+      <div class="label">Type</div><div class="value">long call</div>
+      <div class="label">Strike</div><div class="value">$215.50</div>
+      <div class="label">Expiry</div>
+      <div class="value">2026-05-15 <span class="dte-tag">6 trading days</span></div>
+      <div class="label">Entry mark</div><div class="value">$2.15</div>
+      <div class="label">Spot at fire</div><div class="value">$213.80</div>
+    </div>
+  </div>
+
+  <!-- PRICE TRACK -->
+  <div class="section">
+    <div class="section-title">Price track</div>
+    <div class="chart-area">
+      <svg viewBox="0 0 600 180" width="100%" height="180" preserveAspectRatio="none" style="display:block;">
+        <line x1="0" y1="120" x2="600" y2="120" stroke="#2A2E33" stroke-width="1" stroke-dasharray="2,3"/>
+        <line x1="0" y1="60" x2="600" y2="60" stroke="#2A2E33" stroke-width="1" stroke-dasharray="2,3"/>
+        <line x1="0" y1="160" x2="600" y2="160" stroke="#2A2E33" stroke-width="1" stroke-dasharray="2,3"/>
+        <text x="4" y="64" fill="#6D5A36" font-family="JetBrains Mono" font-size="9">+20%</text>
+        <text x="4" y="124" fill="#6D5A36" font-family="JetBrains Mono" font-size="9">  0%</text>
+        <text x="4" y="164" fill="#6D5A36" font-family="JetBrains Mono" font-size="9">-20%</text>
+        <polyline fill="none" stroke="#D5B06B" stroke-width="1.5"
+          points="40,118 70,114 100,108 130,98 160,82 190,68 220,72 250,80 280,90 310,98 340,102 370,98 400,92 430,88 460,90 490,92 520,94 550,96 580,98"/>
+        <circle cx="190" cy="68" r="3" fill="#D5B06B"/>
+        <text x="195" y="62" fill="#D5B06B" font-family="JetBrains Mono" font-size="10">MFE +18% · 23m</text>
+        <circle cx="580" cy="98" r="3" fill="#73B27B"/>
+        <text x="510" y="92" fill="#73B27B" font-family="JetBrains Mono" font-size="10">current +7%</text>
+        <text x="40" y="178" fill="#6D5A36" font-family="JetBrains Mono" font-size="9">5m</text>
+        <text x="190" y="178" fill="#6D5A36" font-family="JetBrains Mono" font-size="9">30m</text>
+        <text x="340" y="178" fill="#6D5A36" font-family="JetBrains Mono" font-size="9">2h</text>
+        <text x="490" y="178" fill="#6D5A36" font-family="JetBrains Mono" font-size="9">8h</text>
+      </svg>
+    </div>
+    <div class="chart-stats">
+      <div><span class="chart-stat-label">Current</span><span class="chart-stat-value pos">+7%</span></div>
+      <div><span class="chart-stat-label">MFE</span><span class="chart-stat-value pos">+18%</span></div>
+      <div><span class="chart-stat-label">MAE</span><span class="chart-stat-value neg">-2%</span></div>
+      <div><span class="chart-stat-label">Samples</span><span class="chart-stat-value">19</span></div>
+    </div>
+  </div>
+
+  <!-- OUTCOMES -->
+  <div class="section">
+    <div class="section-title">Outcomes</div>
+    <table class="outcomes">
+      <thead>
+        <tr><th>Horizon</th><th>PnL</th><th>PT1</th><th>PT2</th><th>PT3</th><th>MFE</th><th>MAE</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>5min</td><td class="pnl-pos">+4%</td><td class="pt-no">─</td><td class="pt-no">─</td><td class="pt-no">─</td><td>+5%</td><td>-2%</td></tr>
+        <tr><td>15min</td><td class="pnl-pos">+9%</td><td class="pt-no">─</td><td class="pt-no">─</td><td class="pt-no">─</td><td>+12%</td><td>-2%</td></tr>
+        <tr><td>30min</td><td class="pnl-pos">+14%</td><td class="pt-yes">✓</td><td class="pt-no">─</td><td class="pt-no">─</td><td>+18%</td><td>-2%</td></tr>
+        <tr><td>1h</td><td class="pnl-pos">+7%</td><td class="pt-yes">✓</td><td class="pt-no">─</td><td class="pt-no">─</td><td>+18%</td><td>-2%</td></tr>
+        <tr><td>4h</td><td class="pnl-pending">pending</td><td class="pt-no">─</td><td class="pt-no">─</td><td class="pt-no">─</td><td class="pnl-pending">─</td><td class="pnl-pending">─</td></tr>
+        <tr><td>1d</td><td class="pnl-pending">pending</td><td class="pt-no">─</td><td class="pt-no">─</td><td class="pt-no">─</td><td class="pnl-pending">─</td><td class="pnl-pending">─</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- FEATURES -->
+  <div class="section">
+    <div class="section-title">Features at fire time</div>
+    <div class="features-grid">
+      <div class="fname">adx</div><div class="fval">24.1</div>
+      <div class="fname">macd_hist</div><div class="fval">0.05</div>
+      <div class="fname">bias</div><div class="fval">bull</div>
+      <div class="fname">momentum_burst_label</div><div class="fval">YES</div>
+      <div class="fname">cb_side</div><div class="fval">above_cb</div>
+      <div class="fname">momentum_burst_score</div><div class="fval">7</div>
+      <div class="fname">dealer_regime</div><div class="fval">short_gamma_585</div>
+      <div class="fname">pb_state</div><div class="fval">in_box</div>
+      <div class="fname">dte_days</div><div class="fval">6 (trading)</div>
+      <div class="fname">regime</div><div class="fval">BULL_BASE</div>
+      <div class="fname">iv_state</div><div class="fval">normal</div>
+      <div class="fname">rsi</div><div class="fval">62.0</div>
+      <div class="fname">v2_5d_grade</div><div class="fval">Grade A</div>
+      <div class="fname">volume_ratio</div><div class="fval">1.6</div>
+    </div>
+  </div>
+
+  <!-- RAW PAYLOADS -->
+  <div class="section">
+    <div class="section-title">Raw payloads</div>
+    <details>
+      <summary>canonical_snapshot</summary>
+      <div class="json-block">{
+  <span class="json-key">"producer_version"</span>: <span class="json-num">1</span>,
+  <span class="json-key">"convention_version"</span>: <span class="json-num">2</span>,
+  <span class="json-key">"intent"</span>: <span class="json-string">"front"</span>,
+  <span class="json-key">"expiration"</span>: <span class="json-string">"2026-05-15"</span>,
+  <span class="json-key">"state"</span>: { ... },
+  <span class="json-key">"technicals"</span>: { <span class="json-key">"rsi"</span>: <span class="json-num">62.0</span>, <span class="json-key">"adx"</span>: <span class="json-num">24.1</span>, ... }
+}</div>
+    </details>
+    <details>
+      <summary>raw_engine_payload</summary>
+      <div class="json-block" style="color:#5F5E5A;">click to expand · 18 keys</div>
+    </details>
+  </div>
+</div>
+
+</body>
+</html>
