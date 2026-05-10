@@ -4379,3 +4379,66 @@ details[open] .alerts-collapsed-summary { margin-bottom: 8px; }
   white-space: pre-wrap;
   word-break: break-all;
 }
+
+
+/* ════════════════════════════════════════════════════════
+   v11.7 (Patch H.8): Enriched badge variants + row 5
+   tracking summary. Adds .badge-eval / .badge-expired /
+   .badge-positive / .badge-negative on top of H.4's .badge-active,
+   plus .alert-card-row5 + .track-bar / .track-bar-fill.
+   ════════════════════════════════════════════════════════ */
+
+.alert-card-badge.badge-eval {
+  background: transparent;
+  color: var(--brass-deep);
+  border: 1px solid var(--brass-deep);
+}
+.alert-card-badge.badge-expired {
+  background: transparent;
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+}
+.alert-card-badge.badge-positive {
+  background: rgba(79, 138, 87, 0.12);
+  color: var(--positive-bright);
+  border: 1px solid var(--positive);
+}
+.alert-card-badge.badge-negative {
+  background: rgba(161, 79, 79, 0.12);
+  color: var(--negative-soft);
+  border: 1px solid var(--negative);
+}
+
+.alert-card-row5 {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: var(--text-dim);
+  padding-top: 8px;
+  margin-top: 4px;
+  border-top: 1px dashed var(--border);
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.alert-card-row5 .track-bar {
+  display: inline-block;
+  height: 4px;
+  width: 80px;
+  background: var(--border);
+  position: relative;
+  overflow: hidden;
+  vertical-align: middle;
+}
+/* Bar fill = min(elapsed_seconds / TRACKING_HORIZON_SECONDS, 1.0).
+   3-day horizon in V1 (single value for all engines). */
+.alert-card-row5 .track-bar-fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--positive) 0%, var(--positive-bright) 100%);
+}
+.alert-card-row5-current.positive { color: var(--positive-bright); }
+.alert-card-row5-current.negative { color: var(--negative-soft); }
+.alert-card-row5-pt-hit {
+  color: var(--brass-bright);
+  font-weight: 500;
+}

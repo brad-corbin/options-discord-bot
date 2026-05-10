@@ -184,11 +184,61 @@
       .replace(/'/g, '&#39;');
   }
 
+  // Sign-aware percent formatter: 12.4 -> "+12", -3.2 -> "-3"
+  function fmtPct(n) {
+    if (n === null || n === undefined) return '';
+    const v = Math.round(n);
+    return (v >= 0 ? '+' : '') + v + '%';
+  }
+
+  // Build the row 5 fragment from card.row5. Mirrors the Jinja template
+  // _alert_card.html — keep in lockstep; server vs client render drift
+  // would silently break polling.
+  function renderRow5(r5) {
+    if (!r5) return '';
+    if (r5.mode === 'active') {
+      const bar = '<span class="track-bar"><span class="track-bar-fill" style="width:' + r5.bar_pct + '%"></span></span>';
+      const mfe = (r5.mfe_pct !== null && r5.mfe_pct !== undefined)
+        ? '<span>MFE ' + fmtPct(r5.mfe_pct) + '</span>' : '';
+      let curCls = '';
+      if (r5.current_pct > 0) curCls = ' positive';
+      else if (r5.current_pct < 0) curCls = ' negative';
+      const cur = (r5.current_pct !== null && r5.current_pct !== undefined)
+        ? '<span class="alert-card-row5-current' + curCls + '">current ' + fmtPct(r5.current_pct) + '</span>' : '';
+      const pt = r5.pt_hit_label
+        ? '<span class="alert-card-row5-pt-hit">' + escapeHtml(r5.pt_hit_label) + '</span>' : '';
+      return '<div class="alert-card-row5"><span>tracking</span>' + bar + mfe + cur + pt + '</div>';
+    }
+    if (r5.mode === 'warming') {
+      return '<div class="alert-card-row5"><span>tracking starts in ' + r5.warming_seconds_left + 's</span></div>';
+    }
+    if (r5.mode === 'v2_5d') {
+      return '<div class="alert-card-row5"><span>' + escapeHtml(r5.horizons_text) + '</span></div>';
+    }
+    if (r5.mode === 'expired') {
+      const bar = '<span class="track-bar"><span class="track-bar-fill" style="width:100%"></span></span>';
+      if (r5.no_samples) {
+        return '<div class="alert-card-row5"><span>tracking</span>' + bar + '<span class="alert-card-row5-current">no samples recorded</span></div>';
+      }
+      const mfe = (r5.mfe_pct !== null && r5.mfe_pct !== undefined)
+        ? '<span>MFE ' + fmtPct(r5.mfe_pct) + '</span>' : '';
+      let curCls = '';
+      if (r5.current_pct > 0) curCls = ' positive';
+      else if (r5.current_pct < 0) curCls = ' negative';
+      const cur = (r5.current_pct !== null && r5.current_pct !== undefined)
+        ? '<span class="alert-card-row5-current' + curCls + '">final ' + fmtPct(r5.current_pct) + '</span>' : '';
+      return '<div class="alert-card-row5"><span>tracking</span>' + bar + mfe + cur + '</div>';
+    }
+    return '';
+  }
+
+  // Build a single card. Mirrors _alert_card.html — keep in lockstep;
+  // server vs client render drift would silently break polling.
   function renderCard(c) {
     const recentCls = c.is_recent ? ' alert-card-recent' : '';
     const oldCls    = c.is_old    ? ' alert-card-old'    : '';
-    const badge = c.is_recent
-      ? '<span class="alert-card-badge badge-active">ACTIVE</span>'
+    const badge = c.badge_text
+      ? '<span class="alert-card-badge badge-' + escapeHtml(c.badge_class) + '">' + escapeHtml(c.badge_text) + '</span>'
       : '';
     const chev =
       c.direction === 'bull' ? '<span class="alert-card-chevron positive">▲ bull</span>' :
@@ -217,6 +267,7 @@
         '</div>' +
         '<div class="alert-card-row3 num">' + escapeHtml(c.structure_summary) + '</div>' +
         parent +
+        renderRow5(c.row5) +
       '</a>'
     );
   }

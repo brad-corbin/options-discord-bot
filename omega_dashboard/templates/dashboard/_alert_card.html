@@ -1,13 +1,15 @@
-{# v11.7 (Patch H.4): single alert card.
+{# v11.7 (Patch H.4 + H.8): single alert card.
    Used by alerts.html initial render AND mirrored by the inline JS
    renderCard() in alerts.html (same DOM shape so polling re-render
    produces identical markup).
 
-   Card structure (4 rows in V1; mockup row 5 deferred to Patch H.8):
-     row 1 — timestamp + relative time + status badge
+   Card structure (5 rows after Patch H.8):
+     row 1 — timestamp + relative time + enriched status badge
+             (ACTIVE / EVAL / EXPIRED / +N% / -N%)
      row 2 — engine icon/label + ticker + bull/bear chevron
      row 3 — structure summary (no DTE; convention varies per engine)
      row 4 — parent linkage (if any)
+     row 5 — tracking summary (active / warming / v2_5d / expired)
 
    CSS classes:
      .alert-card                  — base
@@ -16,6 +18,9 @@
                                      credit=partner, conviction=mine)
      .alert-card-recent           — pulse border when <5min old
      .alert-card-old              — muted opacity when >24h old
+     .alert-card-badge.badge-{active|eval|expired|positive|negative}
+     .alert-card-row5             — tracking summary container
+     .track-bar / .track-bar-fill — elapsed / 3-day-horizon visual
 #}
 <a class="alert-card alert-card-engine-{{ card.stripe }}
           {% if card.is_recent %}alert-card-recent{% endif %}
@@ -28,8 +33,8 @@
       <span class="alert-card-time num">{{ card.fired_at_ct }}</span>
       <span class="alert-card-relative">· {{ card.fired_at_relative }}</span>
     </div>
-    {% if card.is_recent %}
-      <span class="alert-card-badge badge-active">ACTIVE</span>
+    {% if card.badge_text %}
+      <span class="alert-card-badge badge-{{ card.badge_class }}">{{ card.badge_text }}</span>
     {% endif %}
   </div>
 
@@ -47,5 +52,41 @@
 
   {% if card.parent_alert_id %}
     <div class="alert-card-row4">↳ parent alert</div>
+  {% endif %}
+
+  {# Row 5 — tracking summary, mode-driven (active / warming / v2_5d / expired) #}
+  {% if card.row5 %}
+    <div class="alert-card-row5">
+      {% if card.row5.mode == 'active' %}
+        <span>tracking</span>
+        <span class="track-bar"><span class="track-bar-fill" style="width:{{ card.row5.bar_pct }}%"></span></span>
+        {% if card.row5.mfe_pct is not none %}
+          <span>MFE {{ "%+.0f"|format(card.row5.mfe_pct) }}%</span>
+        {% endif %}
+        {% if card.row5.current_pct is not none %}
+          <span class="alert-card-row5-current {% if card.row5.current_pct > 0 %}positive{% elif card.row5.current_pct < 0 %}negative{% endif %}">current {{ "%+.0f"|format(card.row5.current_pct) }}%</span>
+        {% endif %}
+        {% if card.row5.pt_hit_label %}
+          <span class="alert-card-row5-pt-hit">{{ card.row5.pt_hit_label }}</span>
+        {% endif %}
+      {% elif card.row5.mode == 'warming' %}
+        <span>tracking starts in {{ card.row5.warming_seconds_left }}s</span>
+      {% elif card.row5.mode == 'v2_5d' %}
+        <span>{{ card.row5.horizons_text }}</span>
+      {% elif card.row5.mode == 'expired' %}
+        <span>tracking</span>
+        <span class="track-bar"><span class="track-bar-fill" style="width:100%"></span></span>
+        {% if card.row5.no_samples %}
+          <span class="alert-card-row5-current">no samples recorded</span>
+        {% else %}
+          {% if card.row5.mfe_pct is not none %}
+            <span>MFE {{ "%+.0f"|format(card.row5.mfe_pct) }}%</span>
+          {% endif %}
+          {% if card.row5.current_pct is not none %}
+            <span class="alert-card-row5-current {% if card.row5.current_pct > 0 %}positive{% elif card.row5.current_pct < 0 %}negative{% endif %}">final {{ "%+.0f"|format(card.row5.current_pct) }}%</span>
+          {% endif %}
+        {% endif %}
+      {% endif %}
+    </div>
   {% endif %}
 </a>
