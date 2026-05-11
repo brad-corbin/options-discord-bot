@@ -530,6 +530,28 @@ What's done as of last session (v11.7 / Patch F):
   end-to-end test (`test_get_em_brief_response_is_jsonifiable_with_enum_in_v4_result`)
   that simulates the exact production failure shape and asserts
   `json.dumps(get_em_brief())` round-trips cleanly.
+- Patch G.11 hotfix (credit spread structure field-name reads) —
+  alerts feed rendered every v8.4 CREDIT row as
+  "credit_v84 [partial data]" and `alert_price_track` stayed empty
+  for every bull_put / bear_call alert. Root cause: the engine
+  writes `suggested_structure` with keys `short` / `long` (no
+  `_strike` suffix), but both readers — `omega_dashboard/alerts_data.py`
+  (`format_structure_summary`, ~line 188) and `alert_tracker_daemon.py`
+  (`_fetch_structure_mark`, ~line 234) — looked for `short_strike` /
+  `long_strike`. The pre-existing tests passed because their
+  fixtures used the same wrong keys as the formatter, so the mismatch
+  with real engine output was never exercised. Fix: change both
+  readers to use `short` / `long` verbatim. The tracker's internal
+  variable names stay `short_strike` / `long_strike` (they shadow
+  the truth of what they hold). Stale docstring in
+  `_fetch_structure_mark` corrected. Tests updated to use real-shape
+  fixtures plus two new regressions: an explicit MSFT 405/400 bull_put
+  fixture pinned against the exact DB-row shape from 2026-05-11
+  production data, and a tracker-side test that proves
+  `_fetch_structure_mark` now builds OCC symbols for both legs from
+  the `short` / `long` keys (asserts both OCCs were requested from
+  the store). Existing 12+ MSFT bull_put rows in production DB are
+  valid data the whole time and will render correctly on next deploy.
 
 What's queued (in order):
 
@@ -873,6 +895,22 @@ is high. Don't argue with them.
   unknowns). The Telegram path doesn't surface these bugs — it
   formats text, never JSON-serializes — so snapshot tests don't catch
   them. New dashboard routes need an explicit JSON-safety pass.
+- **v8.4 CREDIT `suggested_structure` uses `short` / `long`, NOT
+  `short_strike` / `long_strike`.** The engine writes spread legs as
+  `{"type": "bull_put"|"bear_call", "short": <strike>, "long": <strike>,
+  "width": ..., "credit": ..., "expiry": "YYYY-MM-DD"}`. All readers
+  must use these keys verbatim — including `omega_dashboard/alerts_data.py`
+  (`format_structure_summary`) and `alert_tracker_daemon.py`
+  (`_fetch_structure_mark`). Patch G.11 hotfix fixed a pre-existing
+  mismatch where both readers used `short_strike` / `long_strike` —
+  the alerts feed rendered every credit row as "[partial data]" and
+  the tracker never sampled credit spreads (alert_price_track stayed
+  empty for every bull_put / bear_call alert). The 12+ MSFT bull_put
+  rows in production DB were valid data the whole time; the readers
+  were looking at wrong keys. If you introduce new credit-spread
+  readers (e.g., Patch I barometer queries that decode structure JSON),
+  use `short` / `long` directly. Single-leg structures (long_call /
+  long_put) use `strike` — no suffix divergence there.
 ---
 
 ## Known issues — document but don't fix unless asked

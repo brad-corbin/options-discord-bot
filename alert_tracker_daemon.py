@@ -206,7 +206,7 @@ def _fetch_structure_mark(
       - long_call / long_put: single OCC symbol, returns mid.
       - bull_put / bear_call: two-leg spread. Reads short_occ and long_occ
         from the store; returns short_mid - long_mid. Structure must have
-        'short_strike' and 'long_strike' fields plus 'expiry'.
+        'short' and 'long' strike fields plus 'expiry'.
       - On any cache miss: returns None (V1 contract — log but don't block).
 
     Symbol format: OCC standard (e.g. 'SPY   260515C00590000')
@@ -231,8 +231,12 @@ def _fetch_structure_mark(
     # Credit spreads: bull_put or bear_call
     if stype in ("bull_put", "bear_call"):
         expiry = structure.get("expiry", "")
-        short_strike = structure.get("short_strike")
-        long_strike = structure.get("long_strike")
+        # v8.4 CREDIT writes the spread legs as "short"/"long" (not
+        # "short_strike"/"long_strike"). Patch G.11 hotfix — without
+        # this, the tracker never builds OCC symbols for credit spreads
+        # and alert_price_track stays empty for every bull_put / bear_call.
+        short_strike = structure.get("short")
+        long_strike = structure.get("long")
         if not expiry or short_strike is None or long_strike is None:
             return None
         try:

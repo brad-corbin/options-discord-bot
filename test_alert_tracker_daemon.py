@@ -90,6 +90,65 @@ def test_compute_pnl_for_credit_spread():
     assert abs(pct - expected_pct) < 0.001
 
 
+def test_fetch_structure_mark_reads_short_long_keys_for_credit_spread():
+    """Regression for Patch G.11: v8.4 CREDIT writes spread legs as
+    'short' and 'long', NOT 'short_strike' / 'long_strike'. Prior
+    versions of _fetch_structure_mark read the wrong keys and silently
+    returned None for every credit alert, leaving alert_price_track
+    empty for bull_put / bear_call.
+
+    Fixture mirrors the exact shape pulled from production DB for the
+    MSFT bull_put rows."""
+    from alert_tracker_daemon import _fetch_structure_mark
+
+    # Capture OCCs requested by the tracker so we can prove it built
+    # them from the 'short' / 'long' keys (and not silently failed).
+    requested = []
+
+    class _FakeStore:
+        def get_live_premium(self, occ):
+            requested.append(occ)
+            # short leg priced higher than long leg → positive net mid
+            return 1.50 if "00405000" in occ else 0.30
+
+    with mock.patch("schwab_stream.get_option_store", return_value=_FakeStore()):
+        mark = _fetch_structure_mark(
+            structure={
+                "type": "bull_put",
+                "short": 405.0, "long": 400.0,
+                "width": 5.0, "credit": 1.20,
+                "expiry": "2026-05-15",
+            },
+            ticker="MSFT",
+        )
+
+    assert mark is not None, (
+        "Tracker returned None — likely still reading wrong dict keys "
+        "(should be 'short'/'long', not 'short_strike'/'long_strike')."
+    )
+    assert abs(mark - 1.20) < 0.001, f"Expected 1.50-0.30=1.20, got {mark}"
+    assert len(requested) == 2
+    assert any("00405000" in occ for occ in requested), requested
+    assert any("00400000" in occ for occ in requested), requested
+
+
+def test_fetch_structure_mark_returns_none_when_legs_missing():
+    """Defensive: structure with 'type': 'bull_put' but missing short/long
+    must return None rather than raising or building bogus OCCs."""
+    from alert_tracker_daemon import _fetch_structure_mark
+
+    class _NeverCalledStore:
+        def get_live_premium(self, occ):
+            raise AssertionError(f"store should not be queried; got {occ!r}")
+
+    with mock.patch("schwab_stream.get_option_store", return_value=_NeverCalledStore()):
+        mark = _fetch_structure_mark(
+            structure={"type": "bull_put", "expiry": "2026-05-15"},
+            ticker="MSFT",
+        )
+    assert mark is None
+
+
 def test_run_single_pass_writes_track_row():
     """Integration: with one active alert and stubbed market data, one pass
     writes one alert_price_track row."""
@@ -141,6 +200,8 @@ if __name__ == "__main__":
         test_should_sample_past_horizon_returns_false,
         test_compute_pnl_for_long_call,
         test_compute_pnl_for_credit_spread,
+        test_fetch_structure_mark_reads_short_long_keys_for_credit_spread,
+        test_fetch_structure_mark_returns_none_when_legs_missing,
         test_run_single_pass_writes_track_row,
         test_run_single_pass_swallows_market_data_failure,
     ]

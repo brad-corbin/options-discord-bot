@@ -168,9 +168,11 @@ def test_format_structure_summary_long_call():
 
 
 def test_format_structure_summary_bull_put():
+    # Fixture matches what v8.4 CREDIT actually writes to DB: keys are
+    # "short"/"long", NOT "short_strike"/"long_strike" (Patch G.11).
     from omega_dashboard.alerts_data import format_structure_summary
     s = format_structure_summary("credit_v84", {
-        "type": "bull_put", "short_strike": 580, "long_strike": 575,
+        "type": "bull_put", "short": 580, "long": 575,
         "expiry": "2026-05-09", "credit": 0.85,
     })
     assert s == "580/575 BULL PUT 5/9 (credit $0.85)", s
@@ -179,10 +181,23 @@ def test_format_structure_summary_bull_put():
 def test_format_structure_summary_bear_call():
     from omega_dashboard.alerts_data import format_structure_summary
     s = format_structure_summary("credit_v84", {
-        "type": "bear_call", "short_strike": 600, "long_strike": 605,
+        "type": "bear_call", "short": 600, "long": 605,
         "expiry": "2026-05-15", "credit": 1.10,
     })
     assert s == "600/605 BEAR CALL 5/15 (credit $1.10)", s
+
+
+def test_format_structure_summary_bull_put_real_msft_shape():
+    """Regression: explicit fixture matching the exact shape v8.4 CREDIT
+    writes to alerts.suggested_structure_json — verified against real
+    MSFT bull_put rows present in production DB on 2026-05-11. If this
+    test fails, the credit-spread feed has regressed."""
+    from omega_dashboard.alerts_data import format_structure_summary
+    s = format_structure_summary("credit_v84", {
+        "type": "bull_put", "short": 405.0, "long": 400.0,
+        "width": 5.0, "credit": 1.20, "expiry": "2026-05-15",
+    })
+    assert s == "405/400 BULL PUT 5/15 (credit $1.20)", s
 
 
 def test_format_structure_summary_v2_5d_uses_classification_and_direction():

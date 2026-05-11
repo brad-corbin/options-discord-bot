@@ -185,8 +185,12 @@ def format_structure_summary(engine: str, structure: Any,
             entry_str = f" @ ${entry:.2f}" if isinstance(entry, (int, float)) else ""
             return f"${strike:.2f}C {_short_expiry(expiry)}{entry_str}"
         if stype in ("bull_put", "bear_call"):
-            short = structure.get("short_strike")
-            long_ = structure.get("long_strike")
+            # v8.4 CREDIT writes the spread legs as "short"/"long" (not
+            # "short_strike"/"long_strike"). Patch G.11 hotfix — without
+            # this, MSFT bull_put rows render as "credit_v84 [partial data]"
+            # in the alerts feed even though the DB has valid data.
+            short = structure.get("short")
+            long_ = structure.get("long")
             expiry = structure.get("expiry")
             credit = structure.get("credit")
             label = "BULL PUT" if stype == "bull_put" else "BEAR CALL"
