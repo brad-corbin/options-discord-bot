@@ -26,6 +26,9 @@ CHICAGO_TZ = ZoneInfo("America/Chicago")
 # If outcome data shows distinct decay profiles per engine in the
 # data we collect, swap to a per-engine dict in V1.1.
 TRACKING_HORIZON_SECONDS = 72 * 60 * 60   # 3 days
+# H.10: warming → stalled cutoff. The tracker writes its first sample
+# at ~60s elapsed; add 30s of grace before declaring the alert stalled.
+WARMING_GRACE_SECONDS = 90
 
 # alert_recorder generates alert_ids via uuid.uuid4(). Reject anything
 # that doesn't match this shape on the detail route — belt-and-suspenders
@@ -222,18 +225,55 @@ def format_structure_summary(engine: str, structure: Any,
         return f"{engine} [parse error]"
 
 
+def _format_outcome_pnl_cell(outcome_at: Optional[int],
+                             pnl_pct: Optional[float]) -> Dict[str, str]:
+    """H.10: distinguish three states for the OUTCOMES table pnl cell.
+
+    Pre-H.10 the template rendered 'pending' for both `outcome_at IS NULL`
+    (horizon not yet reached — really pending) and `outcome_at IS NOT NULL
+    AND pnl_pct IS NULL` (horizon reached but mark unavailable — never
+    coming). Different states; same string was misleading.
+
+    Returns {'label': str, 'css_class': str}:
+      outcome_at None              → 'pending' / 'pnl-pending'
+      outcome_at set, pnl_pct None → 'n/a'     / 'pnl-na'
+      pnl_pct present              → '+N.N%'   / 'pnl-pos' | 'pnl-neg' | 'pnl-zero'
+    """
+    if outcome_at is None:
+        return {"label": "pending", "css_class": "pnl-pending"}
+    if pnl_pct is None:
+        return {"label": "n/a", "css_class": "pnl-na"}
+    if pnl_pct > 0:
+        css = "pnl-pos"
+    elif pnl_pct < 0:
+        css = "pnl-neg"
+    else:
+        css = "pnl-zero"
+    return {"label": f"{pnl_pct:+.1f}%", "css_class": css}
+
+
 def _build_row5(engine: str, elapsed_seconds: int,
                 aggregates: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """Return the row5 dict consumed by _alert_card.html.
 
-    Five modes (first match wins):
+    Six modes (first match wins):
       - v2_5d   — engine == 'v2_5d', no tracking, lists outcome horizons
       - expired — elapsed > TRACKING_HORIZON_SECONDS, bar pinned at 100%
-      - warming — no track samples yet (first sample lands at ~60s)
-                  Note: warming_seconds_left is intentional at-render
-                  staleness — V1 doesn't tick this client-side. Browser
-                  shows the value computed at fetch time; the next 10s
-                  poll refreshes it.
+      - warming — elapsed < WARMING_GRACE_SECONDS (90s) AND no track samples.
+                  First sample lands at ~60s; the 30s of grace tolerates
+                  slow propagation. warming_seconds_left is intentional
+                  at-render staleness — V1 doesn't tick this client-side.
+                  Browser shows the value computed at fetch time; the
+                  next 10s poll refreshes it.
+      - stalled — (H.10) elapsed >= 90s but no usable pnl. Two sub-cases
+                  distinguished by `reason`:
+                    'no samples yet' → no track row exists at all (tracker
+                       may be off, alert legs unsubscribed pre-G.13, etc.)
+                    'no pnl data'    → track samples exist but
+                       structure_pnl_pct is NULL (the G.13 silent-NULL-mark
+                       case: leg outside ATM streaming window). After G.13
+                       lands fresh marks on next sample, the card
+                       auto-transitions to active on next page poll.
       - active  — has at least one track sample with non-None pnl
 
     PT-hit label uses highest tier (PT3 > PT2 > PT1) per spec.
@@ -254,12 +294,30 @@ def _build_row5(engine: str, elapsed_seconds: int,
             "mfe_pct": aggregates.get("mfe_pct"),
             "current_pct": aggregates.get("latest_pnl_pct"),
         }
-    if not aggregates or aggregates.get("latest_pnl_pct") is None:
+    # H.10: distinguish warming (genuinely fresh, wait it out) from
+    # stalled (lived past the grace window without usable pnl).
+    has_track_samples = (
+        aggregates is not None
+        and aggregates.get("latest_elapsed") is not None
+    )
+    has_pnl = (
+        aggregates is not None
+        and aggregates.get("latest_pnl_pct") is not None
+    )
+    if not has_track_samples and elapsed_seconds < WARMING_GRACE_SECONDS:
         # First track sample lands at ~60s elapsed; show countdown.
         warming_seconds_left = max(60 - int(elapsed_seconds), 0)
         return {
             "mode": "warming",
             "warming_seconds_left": warming_seconds_left,
+        }
+    if not has_pnl:
+        bar_pct = int(min(elapsed_seconds / TRACKING_HORIZON_SECONDS, 1.0) * 100)
+        reason = "no samples yet" if not has_track_samples else "no pnl data"
+        return {
+            "mode": "stalled",
+            "bar_pct": bar_pct,
+            "reason": reason,
         }
     # Active tracking with at least one sample
     bar_pct = int(min(elapsed_seconds / TRACKING_HORIZON_SECONDS, 1.0) * 100)
@@ -637,7 +695,12 @@ def _build_detail_dict(row, features, track, outcomes, parent, children,
     ]
     outcome_rows = [
         {"horizon": o["horizon"],
+         # H.10: include outcome_at so the template can distinguish
+         # genuinely-pending (horizon not yet reached) from never-coming
+         # (horizon reached but pnl is NULL).
+         "outcome_at": o["outcome_at"],
          "pnl_pct": o["pnl_pct"], "pnl_abs": o["pnl_abs"],
+         "pnl_cell": _format_outcome_pnl_cell(o["outcome_at"], o["pnl_pct"]),
          "hit_pt1": bool(o["hit_pt1"]), "hit_pt2": bool(o["hit_pt2"]),
          "hit_pt3": bool(o["hit_pt3"]),
          "max_favorable_pct": o["max_favorable_pct"],
@@ -712,11 +775,39 @@ def _build_detail_dict(row, features, track, outcomes, parent, children,
     }
 
 
+def _format_chart_elapsed(seconds: int) -> str:
+    """Compact elapsed label for chart hover tooltips. No 'ago' suffix —
+    we're showing position-in-timeline, not relative time-from-now.
+      0..59      → "Ns"
+      60..3599   → "Nm"
+      3600..86399→ "Hh Mm" / "Hh"
+      else       → "Dd Hh" / "Dd"
+    """
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 60 * 60:
+        return f"{seconds // 60}m"
+    if seconds < 24 * 60 * 60:
+        h = seconds // 3600
+        m = (seconds % 3600) // 60
+        return f"{h}h {m}m" if m else f"{h}h"
+    d = seconds // 86400
+    h = (seconds % 86400) // 3600
+    return f"{d}d {h}h" if h else f"{d}d"
+
+
 def _build_pnl_svg(track_rows: List[Dict[str, Any]]) -> str:
     """Server-rendered SVG line chart of structure_pnl_pct over elapsed_seconds.
 
     Returns "" if no track rows. Defensive: skips rows where pnl_pct
     or elapsed_seconds is None. No client-side charting library needed.
+
+    Patch H.10: emits one <circle class="chart-data-point-target"> per
+    data point with data-elapsed / data-pnl attributes so the detail
+    page JS can attach hover tooltips. Targets are r=10 transparent
+    (big easy hover hit-area) and stacked AFTER the polyline + accent
+    markers so they always win the hover hit-test.
     """
     pts = [(r["elapsed_seconds"], r["structure_pnl_pct"])
            for r in track_rows
@@ -751,6 +842,16 @@ def _build_pnl_svg(track_rows: List[Dict[str, Any]]) -> str:
     mfe_x, mfe_y = _x(xs[mfe_idx]), _y(ys[mfe_idx])
     # Current marker (last point).
     cur_x, cur_y = _x(xs[-1]), _y(ys[-1])
+    # H.10: per-point hit targets with data attributes the JS reads on
+    # hover. Rendered LAST so they sit on top of polyline + accent
+    # markers in the SVG paint order — guarantees they win hover hits.
+    targets = "".join(
+        f'<circle class="chart-data-point-target" '
+        f'cx="{_x(x):.1f}" cy="{_y(y):.1f}" r="10" fill="transparent" '
+        f'data-elapsed="{_format_chart_elapsed(x)}" '
+        f'data-pnl="{y:+.1f}%" />'
+        for x, y in pts
+    )
     return (
         f'<svg viewBox="0 0 {width} {height}" '
         f'xmlns="http://www.w3.org/2000/svg" class="alerts-pnl-chart" '
@@ -761,5 +862,6 @@ def _build_pnl_svg(track_rows: List[Dict[str, Any]]) -> str:
         f'points="{poly}" />'
         f'<circle cx="{mfe_x:.1f}" cy="{mfe_y:.1f}" r="3" fill="#D5B06B" />'
         f'<circle cx="{cur_x:.1f}" cy="{cur_y:.1f}" r="3" fill="#73B27B" />'
+        f'{targets}'
         f'</svg>'
     )

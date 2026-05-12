@@ -71,6 +71,12 @@
         {% endif %}
       {% elif card.row5.mode == 'warming' %}
         <span>tracking starts in {{ card.row5.warming_seconds_left }}s</span>
+      {% elif card.row5.mode == 'stalled' %}
+        {# H.10: lived past the 90s warming grace window with no usable
+           pnl. reason='no samples yet' or 'no pnl data'. #}
+        <span>tracking</span>
+        <span class="track-bar" title="Tracking option premium % change since alert fire"><span class="track-bar-fill" style="width:{{ card.row5.bar_pct }}%"></span></span>
+        <span class="alert-card-row5-stalled">{{ card.row5.reason }}</span>
       {% elif card.row5.mode == 'v2_5d' %}
         <span>{{ card.row5.horizons_text }}</span>
       {% elif card.row5.mode == 'expired' %}

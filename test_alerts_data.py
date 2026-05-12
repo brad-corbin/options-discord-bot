@@ -532,6 +532,185 @@ def test_list_alerts_pt_hit_from_outcomes_aggregate():
         _teardown_db(tmpdir)
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Patch H.10 — row 5 stalled mode
+# ─────────────────────────────────────────────────────────────────────
+#
+# _build_row5 is a pure function — no DB needed. Tests cover the
+# warming → stalled split: under-90s with no samples still warms; at-90s
+# or with bad-pnl samples flips to stalled.
+
+def test_h10_row5_stalled_when_samples_exist_but_pnl_null():
+    """Track samples exist (latest_elapsed is set) but latest_pnl_pct is
+    None — the pre-G.13 silent-NULL-mark case. Must report
+    mode='stalled' with reason='no pnl data', NOT warming.
+    Pre-H.10 this rendered as 'tracking starts in 0s' forever."""
+    from omega_dashboard.alerts_data import _build_row5
+    aggregates = {
+        "latest_elapsed": 600,
+        "latest_pnl_pct": None,
+        "mfe_pct": None, "mae_pct": None,
+        "any_pt1": False, "any_pt2": False, "any_pt3": False,
+    }
+    out = _build_row5("credit_v84", elapsed_seconds=6 * 60 * 60, aggregates=aggregates)
+    assert out["mode"] == "stalled", out
+    assert out["reason"] == "no pnl data", out
+    assert isinstance(out["bar_pct"], int)
+    assert 0 <= out["bar_pct"] <= 100
+
+
+def test_h10_row5_stalled_when_no_samples_after_90s():
+    """No track samples at all and elapsed > 90s → stalled with
+    reason='no samples yet'. (Tracker may be off, alert legs
+    unsubscribed pre-G.13, etc.)"""
+    from omega_dashboard.alerts_data import _build_row5
+    out = _build_row5("long_call_burst", elapsed_seconds=120, aggregates=None)
+    assert out["mode"] == "stalled", out
+    assert out["reason"] == "no samples yet", out
+
+
+def test_h10_row5_warming_still_works_under_60s():
+    """Under 60s elapsed with no samples → warming, with countdown.
+    Pre-H.10 behavior preserved inside the grace window."""
+    from omega_dashboard.alerts_data import _build_row5
+    out = _build_row5("long_call_burst", elapsed_seconds=30, aggregates=None)
+    assert out["mode"] == "warming", out
+    assert out["warming_seconds_left"] == 30, out
+
+
+def test_h10_row5_warming_to_stalled_boundary_at_90s():
+    """The 90s grace window IS the cutoff. elapsed=89 → warming;
+    elapsed=90 → stalled. Pin the exact threshold so a future tweak
+    doesn't silently widen or narrow the grace."""
+    from omega_dashboard.alerts_data import _build_row5
+    just_warming = _build_row5("long_call_burst", elapsed_seconds=89,
+                               aggregates=None)
+    assert just_warming["mode"] == "warming", just_warming
+    just_stalled = _build_row5("long_call_burst", elapsed_seconds=90,
+                               aggregates=None)
+    assert just_stalled["mode"] == "stalled", just_stalled
+    assert just_stalled["reason"] == "no samples yet"
+
+
+def test_h10_row5_active_unchanged_when_pnl_present():
+    """Sanity: existing active-mode behavior is not regressed by H.10.
+    Aggregates with valid latest_pnl_pct → mode='active' as before."""
+    from omega_dashboard.alerts_data import _build_row5
+    aggregates = {
+        "latest_elapsed": 600,
+        "latest_pnl_pct": 3.5,
+        "mfe_pct": 5.0, "mae_pct": -1.0,
+        "any_pt1": True, "any_pt2": False, "any_pt3": False,
+    }
+    out = _build_row5("long_call_burst", elapsed_seconds=900,
+                     aggregates=aggregates)
+    assert out["mode"] == "active", out
+    assert out["current_pct"] == 3.5
+    assert out["pt_hit_label"] == "★ PT1"
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Patch H.10 — chart hover targets in _build_pnl_svg
+# ─────────────────────────────────────────────────────────────────────
+
+def test_h10_format_chart_elapsed_compact_format():
+    """Tooltip label format — no 'ago' suffix. Boundary cases (60s, 1h)
+    and multi-unit (h+m, d+h)."""
+    from omega_dashboard.alerts_data import _format_chart_elapsed
+    assert _format_chart_elapsed(0) == "0s"
+    assert _format_chart_elapsed(45) == "45s"
+    assert _format_chart_elapsed(60) == "1m"
+    assert _format_chart_elapsed(17 * 60) == "17m"
+    assert _format_chart_elapsed(3 * 3600) == "3h"
+    assert _format_chart_elapsed(3 * 3600 + 12 * 60) == "3h 12m"
+    assert _format_chart_elapsed(2 * 86400) == "2d"
+    assert _format_chart_elapsed(2 * 86400 + 4 * 3600) == "2d 4h"
+
+
+def test_h10_pnl_svg_emits_hit_targets_per_data_point():
+    """Every track row with non-None pnl gets a chart-data-point-target
+    circle with data-elapsed and data-pnl attributes. Rendered AFTER
+    polyline + accent markers so they win the hover hit-test."""
+    from omega_dashboard.alerts_data import _build_pnl_svg
+    track = [
+        {"elapsed_seconds": 60,  "structure_pnl_pct": 2.5},
+        {"elapsed_seconds": 300, "structure_pnl_pct": -1.0},
+        {"elapsed_seconds": 600, "structure_pnl_pct": 4.7},
+    ]
+    svg = _build_pnl_svg(track)
+    assert svg.count('class="chart-data-point-target"') == 3
+    assert 'data-elapsed="1m"' in svg
+    assert 'data-elapsed="5m"' in svg
+    assert 'data-elapsed="10m"' in svg
+    assert 'data-pnl="+2.5%"' in svg
+    assert 'data-pnl="-1.0%"' in svg
+    assert 'data-pnl="+4.7%"' in svg
+    # Targets emitted last (after polyline + accent markers) so the
+    # hit-test layering is correct. Check that the last chart-data-point-target
+    # appears after the last existing accent circle (the green "current"
+    # marker, fill="#73B27B").
+    last_target = svg.rfind('chart-data-point-target')
+    last_accent = svg.rfind('fill="#73B27B"')
+    assert last_target > last_accent > -1, (
+        "hit targets must render after accent markers for hover-hit "
+        "ordering — pre-H.10 SVG paint order would have invisible "
+        "targets blocked by visible markers"
+    )
+
+
+def test_h10_pnl_svg_skips_rows_with_null_pnl():
+    """A track row with None pnl is omitted from the chart entirely —
+    no hit target, no polyline point. Important for credit spreads
+    pre-G.13 where many samples are NULL."""
+    from omega_dashboard.alerts_data import _build_pnl_svg
+    track = [
+        {"elapsed_seconds": 60,  "structure_pnl_pct": 2.5},
+        {"elapsed_seconds": 120, "structure_pnl_pct": None},
+        {"elapsed_seconds": 300, "structure_pnl_pct": -1.0},
+    ]
+    svg = _build_pnl_svg(track)
+    assert svg.count('class="chart-data-point-target"') == 2
+    assert 'data-elapsed="2m"' not in svg  # the None-pnl row is skipped
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Patch H.10 — OUTCOMES table pnl cell distinguishes pending / n/a / value
+# ─────────────────────────────────────────────────────────────────────
+
+def test_h10_outcome_pnl_pending_when_outcome_at_null():
+    """outcome_at IS NULL → horizon not yet reached. Render 'pending'."""
+    from omega_dashboard.alerts_data import _format_outcome_pnl_cell
+    cell = _format_outcome_pnl_cell(outcome_at=None, pnl_pct=None)
+    assert cell == {"label": "pending", "css_class": "pnl-pending"}
+
+
+def test_h10_outcome_pnl_na_when_outcome_at_set_but_pnl_null():
+    """outcome_at IS NOT NULL AND pnl_pct IS NULL → horizon crossed but
+    mark unavailable. Render 'n/a' (NOT 'pending' — the data is never
+    coming). Distinct CSS class so it can be styled differently from
+    pending later if Brad wants."""
+    from omega_dashboard.alerts_data import _format_outcome_pnl_cell
+    cell = _format_outcome_pnl_cell(
+        outcome_at=1_700_000_000_000_000, pnl_pct=None
+    )
+    assert cell == {"label": "n/a", "css_class": "pnl-na"}, cell
+
+
+def test_h10_outcome_pnl_value_when_pnl_present():
+    """Positive, negative, and zero pnl all render with sign-formatted
+    value and a class reflecting the sign."""
+    from omega_dashboard.alerts_data import _format_outcome_pnl_cell
+    pos = _format_outcome_pnl_cell(outcome_at=1, pnl_pct=12.345)
+    assert pos["label"] == "+12.3%"
+    assert pos["css_class"] == "pnl-pos"
+    neg = _format_outcome_pnl_cell(outcome_at=1, pnl_pct=-3.7)
+    assert neg["label"] == "-3.7%"
+    assert neg["css_class"] == "pnl-neg"
+    zero = _format_outcome_pnl_cell(outcome_at=1, pnl_pct=0.0)
+    assert zero["label"] == "+0.0%"
+    assert zero["css_class"] == "pnl-zero"
+
+
 def test_list_alerts_warming_state_when_no_track_samples():
     """Alert fired 30s ago with no track samples → mode='warming',
     warming_seconds_left counts down from 60. Badge falls back to ACTIVE."""

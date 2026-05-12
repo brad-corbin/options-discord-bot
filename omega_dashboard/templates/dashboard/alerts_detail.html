@@ -123,8 +123,13 @@
     <div class="alerts-detail-section">
       <div class="alerts-detail-section-title">Price track<span class="help-icon" title="Option premium % change since alert fire. Long calls/puts: (current mark − entry mark) / entry mark. Credit spreads: (credit collected − current spread value) / max risk.">(?)</span></div>
       {% if d.pnl_svg %}
+        {# H.10: chart container is the positioning context for the
+           absolutely-positioned tooltip div below. The .alerts-detail-chart-area
+           rule in omega.css gets `position: relative` so JS can place
+           the tooltip relative to the chart, not the page. #}
         <div class="alerts-detail-chart-area">
           {{ d.pnl_svg|safe }}
+          <div id="chart-tooltip" class="chart-tooltip-styled" style="display:none;"></div>
         </div>
         {% if d.chart_stats %}
           <div class="alerts-detail-chart-stats">
@@ -175,9 +180,11 @@
             {% for o in d.outcomes %}
               <tr>
                 <td>{{ o.horizon }}</td>
-                <td class="{% if o.pnl_pct is not none and o.pnl_pct > 0 %}pnl-pos{% elif o.pnl_pct is not none and o.pnl_pct < 0 %}pnl-neg{% else %}pnl-pending{% endif %}">
-                  {% if o.pnl_pct is not none %}{{ "%+.1f"|format(o.pnl_pct) }}%{% else %}pending{% endif %}
-                </td>
+                {# H.10: pnl_cell pre-computed in _format_outcome_pnl_cell.
+                   Distinguishes 'pending' (outcome_at IS NULL — horizon
+                   not yet reached) from 'n/a' (outcome_at set but mark
+                   unavailable — never coming) from a real value. #}
+                <td class="{{ o.pnl_cell.css_class }}">{{ o.pnl_cell.label }}</td>
                 <td class="{% if o.hit_pt1 %}pt-yes{% else %}pt-no{% endif %}">{% if o.hit_pt1 %}✓{% else %}─{% endif %}</td>
                 <td class="{% if o.hit_pt2 %}pt-yes{% else %}pt-no{% endif %}">{% if o.hit_pt2 %}✓{% else %}─{% endif %}</td>
                 <td class="{% if o.hit_pt3 %}pt-yes{% else %}pt-no{% endif %}">{% if o.hit_pt3 %}✓{% else %}─{% endif %}</td>
@@ -223,6 +230,44 @@
         <pre class="alerts-detail-raw">{{ d.raw_engine_payload | tojson(indent=2) }}</pre>
       </details>
     </div>
+
+    {# H.10: chart hover tooltip. Hit-target circles are emitted by
+       _build_pnl_svg as <circle class="chart-data-point-target"
+       data-elapsed="..." data-pnl="..."> at every track sample point.
+       Positioning is relative to .alerts-detail-chart-area (which has
+       position: relative), so the tooltip sits inside the chart frame
+       on any viewport without page-coordinate math. #}
+    <script>
+    (function setupChartHover() {
+      var tooltip = document.getElementById('chart-tooltip');
+      if (!tooltip) return;
+      var container = tooltip.parentElement;
+      if (!container) return;
+      var targets = document.querySelectorAll('.chart-data-point-target');
+      if (!targets.length) return;
+
+      function show(e) {
+        var elapsed = e.currentTarget.getAttribute('data-elapsed');
+        var pnl = e.currentTarget.getAttribute('data-pnl');
+        if (!elapsed || !pnl) return;
+        tooltip.innerHTML =
+          '<span class="tooltip-elapsed">' + elapsed + '</span>' +
+          '<span class="tooltip-pnl">' + pnl + '</span>';
+        var t = e.currentTarget.getBoundingClientRect();
+        var c = container.getBoundingClientRect();
+        tooltip.style.left = (t.left - c.left + (t.width / 2)) + 'px';
+        tooltip.style.top = (t.top - c.top - 40) + 'px';
+        tooltip.style.display = 'block';
+      }
+      function hide() {
+        tooltip.style.display = 'none';
+      }
+      targets.forEach(function (circle) {
+        circle.addEventListener('mouseenter', show);
+        circle.addEventListener('mouseleave', hide);
+      });
+    })();
+    </script>
 
   {% endif %}
 

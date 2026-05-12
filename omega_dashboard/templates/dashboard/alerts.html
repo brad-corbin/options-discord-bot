@@ -212,6 +212,11 @@
     if (r5.mode === 'warming') {
       return '<div class="alert-card-row5"><span>tracking starts in ' + r5.warming_seconds_left + 's</span></div>';
     }
+    if (r5.mode === 'stalled') {
+      // H.10 mirror of _alert_card.html stalled branch — keep in lockstep.
+      const bar = '<span class="track-bar" title="Tracking option premium % change since alert fire"><span class="track-bar-fill" style="width:' + r5.bar_pct + '%"></span></span>';
+      return '<div class="alert-card-row5"><span>tracking</span>' + bar + '<span class="alert-card-row5-stalled">' + escapeHtml(r5.reason) + '</span></div>';
+    }
     if (r5.mode === 'v2_5d') {
       return '<div class="alert-card-row5"><span>' + escapeHtml(r5.horizons_text) + '</span></div>';
     }

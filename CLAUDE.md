@@ -635,6 +635,72 @@ What's done as of last session (v11.7 / Patch F):
   path), silent no-op on unknown type, end-to-end record_alert →
   helper invocation with gate-on-then-off plus exception-survival
   assertion.
+- Patch H.10 (row 5 stalled mode + outcomes n/a + chart hover dots,
+  three-bug UX bundle) — bundled because all three touch the alerts
+  feed + detail page, single deploy avoids three rebuilds.
+
+  **Bug 1 — row 5 stuck on "tracking starts in 0s".** H.8 fell into
+  warming whenever `latest_pnl_pct is None`, regardless of elapsed
+  time. Pre-G.13 credit spreads with NULL marks rendered that
+  forever. Fix: split warming into two modes by a 90s grace window
+  (`WARMING_GRACE_SECONDS` constant in `alerts_data.py`):
+  `warming` = under 90s with no samples, shows countdown as before.
+  `stalled` = past 90s and no usable pnl, with two `reason` values:
+  `"no samples yet"` (no track row at all — tracker off, legs
+  unsubscribed pre-G.13, etc.) or `"no pnl data"` (track rows exist
+  but `structure_pnl_pct` is NULL — the G.13 silent-NULL-mark case).
+  When G.13 lands fresh marks on the next sample, stalled cards
+  auto-transition to active on the next 10s page poll. New mode
+  rendered identically in `_alert_card.html` and the JS mirror in
+  `alerts.html:renderCard()` — lockstep. New `.alert-card-row5-stalled`
+  CSS class (brass-deep + italic + 0.9em — secondary-metadata tone,
+  doesn't scream "broken"). 5 hermetic unit tests on `_build_row5`
+  including the 89s/90s boundary pin.
+
+  **Bug 2 — OUTCOMES "pending" conflated with "no data".** Pre-H.10
+  the detail-page OUTCOMES table rendered "pending" for both
+  `outcome_at IS NULL` (horizon not yet reached) and `outcome_at IS
+  NOT NULL AND pnl_pct IS NULL` (horizon reached but mark
+  unavailable). Different states — "pending" implied "we'll have
+  this soon" when really it meant "we never will." Fix: new
+  `_format_outcome_pnl_cell(outcome_at, pnl_pct)` helper returns
+  `{label, css_class}`. Three states: `pending`/`pnl-pending`
+  (genuinely waiting), `n/a`/`pnl-na` (data never coming),
+  `+N.N%`/`pnl-pos`|`pnl-neg`|`pnl-zero` (real value). Pre-computed
+  in `_build_detail_dict` and exposed on each outcome row as
+  `pnl_cell`. Template simplified from a five-branch inline
+  conditional to `{{ o.pnl_cell.label }}` + `class="{{ o.pnl_cell.css_class }}"`.
+  New `.pnl-na` CSS rule mirrors `.pnl-pending` styling (muted +
+  italic) but as a distinct class so future styling can diverge if
+  Brad wants. 3 hermetic unit tests on the helper.
+
+  **Bug 3 — chart hover dots with styled JS tooltip.** Pre-H.10 the
+  price-track SVG was one polyline string + two accent circles (MFE
+  + current) — no per-point hit targets. Refactored `_build_pnl_svg`
+  to emit one `<circle class="chart-data-point-target">` per data
+  point with `data-elapsed` / `data-pnl` attributes. Targets are
+  `r=10` transparent (generous hover hit-area, doesn't visually
+  clutter the line) and rendered LAST in the SVG paint order so
+  they sit on top of the polyline + accent markers and always win
+  the hover hit-test. New helper `_format_chart_elapsed(seconds)`
+  produces compact labels (`17m` / `3h 12m` / `2d 4h` — no "ago"
+  suffix; we're showing position-in-timeline, not relative-to-now).
+  Single tooltip div `#chart-tooltip` inside `.alerts-detail-chart-area`
+  (the container gets `position: relative` so positioning math is
+  page-coordinate-independent). Tiny inline JS handler attaches
+  mouseenter/mouseleave to each hit target, positions the tooltip
+  centered horizontally over the point and 40px above it via
+  `transform: translateX(-50%)`. JetBrains Mono numerals, brass-deep
+  elapsed label, text-color value, bg-void background with
+  brass-deep border. `pointer-events: none` on the tooltip prevents
+  it from stealing hover when it overlaps a neighbouring hit target.
+  3 hermetic tests (compact elapsed format, hit-target count per
+  data point, NULL-pnl rows correctly skipped from chart entirely).
+
+  Total: 11 new tests (5 row5 + 3 outcomes + 3 chart) = 36 total
+  in `test_alerts_data.py`. No schema change, no engine/recorder
+  change, no app.py change. All env gates unchanged. Rollback is
+  revert-and-redeploy — pure read-side dashboard work.
 
 What's queued (in order):
 

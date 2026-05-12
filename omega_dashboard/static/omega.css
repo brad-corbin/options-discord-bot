@@ -4292,13 +4292,50 @@ details[open] .alerts-collapsed-summary { margin-bottom: 8px; }
 }
 .alerts-detail-dte-untagged { color: var(--brass-deep); font-style: italic; }
 
-.alerts-detail-chart-area { padding: 8px 0; }
+/* H.10: position: relative makes this the anchor for the absolutely-
+   positioned #chart-tooltip below. */
+.alerts-detail-chart-area {
+  padding: 8px 0;
+  position: relative;
+}
 .alerts-pnl-chart {
   width: 100%;
   height: 180px;
   display: block;
   background: var(--bg-panel);
   border: 0;
+}
+
+/* H.10: invisible hit-target circles emitted by _build_pnl_svg for
+   every track sample point. r=10 transparent so the chart line still
+   reads clean, but the hover area is generous on small charts. */
+.chart-data-point-target {
+  cursor: crosshair;
+}
+
+/* H.10: styled tooltip that JS positions above the hovered data point.
+   transform centers horizontally over the point (left is set to the
+   point's midpoint by JS). pointer-events:none keeps the tooltip from
+   stealing hover when it overlaps a different hit target. */
+.chart-tooltip-styled {
+  position: absolute;
+  background: var(--bg-void);
+  border: 1px solid var(--brass-deep);
+  padding: 4px 8px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.85em;
+  white-space: nowrap;
+  pointer-events: none;
+  z-index: 100;
+  transform: translateX(-50%);
+  transition: opacity 0.1s ease;
+}
+.chart-tooltip-styled .tooltip-elapsed {
+  color: var(--brass-deep);
+  margin-right: 8px;
+}
+.chart-tooltip-styled .tooltip-pnl {
+  color: var(--text);
 }
 .alerts-detail-chart-stats {
   display: flex;
@@ -4351,6 +4388,11 @@ details[open] .alerts-collapsed-summary { margin-bottom: 8px; }
 .alerts-detail-outcomes .pnl-pos { color: var(--positive-bright); }
 .alerts-detail-outcomes .pnl-neg { color: var(--negative-soft); }
 .alerts-detail-outcomes .pnl-pending { color: var(--text-dim); font-style: italic; }
+/* Patch H.10: horizon reached but pnl never computed — distinct from
+   genuinely pending. Same muted look (no scolding red); spec note:
+   tone over alarm. */
+.alerts-detail-outcomes .pnl-na { color: var(--brass-deep); font-style: italic; }
+.alerts-detail-outcomes .pnl-zero { color: var(--text-muted); }
 
 .alerts-detail-features-grid {
   display: grid;
@@ -4454,6 +4496,16 @@ details[open] .alerts-collapsed-summary { margin-bottom: 8px; }
 .alert-card-row5-pt-hit {
   color: var(--brass-bright);
   font-weight: 500;
+}
+
+/* Patch H.10: stalled state — muted, italicized so it reads as a
+   status note rather than a card metric. brass-deep matches the
+   "secondary metadata" tone used by .help-icon. */
+.alert-card-row5-stalled {
+  color: var(--brass-deep);
+  font-style: italic;
+  font-size: 0.9em;
+  margin-left: 6px;
 }
 
 /* ════════════════════════════════════════════════════════
