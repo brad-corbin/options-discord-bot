@@ -552,6 +552,30 @@ What's done as of last session (v11.7 / Patch F):
   the `short` / `long` keys (asserts both OCCs were requested from
   the store). Existing 12+ MSFT bull_put rows in production DB are
   valid data the whole time and will render correctly on next deploy.
+- Patch H.9 (price track tooltip explainers, UX polish) — the alerts
+  feed track-bar and the detail page "Price track" section were not
+  self-explanatory. Brad asked "what is this tracking?" — answer not
+  obvious from the UI. Native `title` attribute tooltips on both
+  surfaces, no JS. Feed cards: track-bar in row 5 gets
+  `title="Tracking option premium % change since alert fire"` on
+  active AND expired branches. The `no_samples` sub-state of `expired`
+  reuses the same `bar` string in both Jinja and the renderCard JS
+  mirror — single application covers both. Lockstep maintained between
+  `_alert_card.html` and the renderCard string-build in `alerts.html`
+  (server-rendered first paint and 10s-polling repaints produce
+  identical DOM, tooltip included). Detail page: `<span class="help-icon"
+  title="...">(?)</span>` injected into `alerts-detail-section-title`
+  for "Price track" — tooltip carries the full computation explanation
+  (long calls/puts: `(current − entry) / entry`; credit spreads:
+  `(credit − current_spread) / max_risk`). New `.help-icon` CSS rule
+  in `omega.css` — Cinzel serif at 0.75em, `letter-spacing: 0`
+  (explicit reset so the parent's 4px tracking doesn't bleed into
+  `(?)`), `var(--brass-deep)`, `opacity: 0.7`, `cursor: help`. Reusable
+  for any future section header that needs a tooltip. Patch directive
+  listed 3 renderCard branches but the actual code structure has 2
+  track-bar string builds (no-samples shares the expired bar) —
+  documented in commit. Jinja parse verified; no test impact (pure
+  HTML attribute + CSS additions).
 
 What's queued (in order):
 
