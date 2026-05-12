@@ -576,6 +576,65 @@ What's done as of last session (v11.7 / Patch F):
   track-bar string builds (no-samples shares the expired bar) —
   documented in commit. Jinja parse verified; no test impact (pure
   HTML attribute + CSS additions).
+- Patch G.13 (option subscription for alert structure legs) —
+  closes the silent track-data gap exposed by Brad's DB query on
+  2026-05-12: 215 `alert_price_track` samples logged, ~80% with
+  NULL `structure_mark`; 48 `alert_outcomes` rows, 44 (92%) with
+  NULL `pnl_pct` inherited from the NULL marks. Root cause:
+  `OptionSymbolManager` subscribes ~16 OCC symbols per ticker around
+  ATM, so alert legs that fell outside that window (every credit
+  spread, every off-ATM long call) had `OptionQuoteStore.get_live_premium`
+  return None on every tracker sample.
+
+  Fix: new `_subscribe_alert_legs(structure, ticker)` helper in
+  `alert_recorder.py` calls `OptionSymbolManager.subscribe_specific(occ_list)`
+  with the alert's leg OCCs immediately after `record_alert`'s INSERT
+  commits. Streaming connection adds the legs within 1-2s; samples
+  from that point have live marks. Outcomes happen at 5min+ horizons
+  so the brief subscription-propagation gap (0-2 min) doesn't affect
+  them. Spec assumed `get_option_manager() / manager.subscribe(list) /
+  manager.get_subscription_count()` — actual API is
+  `get_option_symbol_manager()` / `subscribe_specific()` /
+  `manager.status["subscribed"]`; helper adapted accordingly (do not
+  change `schwab_stream.py`). `subscribe_specific` is already idempotent
+  (filters out already-subscribed OCCs at `schwab_stream.py:2444`).
+
+  Subscribe-only — no REST fallback. Per-sample REST would pressure
+  the shared Schwab rate limit on a continuous-tracking workload.
+
+  Two layers of defense per CLAUDE.md mandate: inner try/except for
+  expected modes (no manager, OCC build failure, streaming hiccup)
+  plus outer try/except at the call site so an unexpected helper
+  exception NEVER clobbers the returned `alert_id` (the row is
+  already committed at that point). Test
+  `test_g13_record_alert_calls_subscribe_when_gate_on` pins this:
+  it asserts `alert_id` survives a `side_effect=RuntimeError` on
+  the helper.
+
+  Subscription cleanup is V1-strategy "deploy-as-cleanup" — each
+  redeploy rebuilds streaming from FLOW_TICKERS at ~560-symbol
+  baseline, dropping all alert-leg subscriptions. Pool-size telemetry
+  warns at 800 (env-tunable via `RECORDER_SUBSCRIPTION_POOL_WARN_THRESHOLD`)
+  to surface the risk before approaching the ~1000 Schwab streaming
+  ceiling on long deploy windows. Patch G.14 would add explicit
+  per-alert cleanup if the warning fires repeatedly.
+
+  Gate `RECORDER_AUTO_SUBSCRIBE_ENABLED` defaults ON — this is a
+  fix, not an opt-in feature, and acceptance criterion 4 explicitly
+  requires `=false` to revert behavior. Documented deviation from
+  CLAUDE.md's "every new feature defaults off" rule (this is closer
+  to a bugfix than a feature).
+
+  Supports `long_call` / `long_put` (single leg via `structure['strike']`)
+  and `bull_put` / `bear_call` (two legs via `structure['short']` +
+  `structure['long']`, the G.11 field-name convention — no `_strike`
+  suffix). Unknown structure types log at DEBUG and no-op. 5 new
+  hermetic tests in `test_alert_recorder.py` (15 total now): single-leg
+  build, two-leg build with real MSFT 405/400 fixture, no-op when
+  `get_option_symbol_manager()` returns None (the common test-process
+  path), silent no-op on unknown type, end-to-end record_alert →
+  helper invocation with gate-on-then-off plus exception-survival
+  assertion.
 
 What's queued (in order):
 
@@ -853,7 +912,11 @@ is high. Don't argue with them.
   Staged rollout: master ON → per-engine one at a time (24h
   validation each) → tracker ON → outcomes ON. Rollback: unset
   master, redeploy; recorder hooks become no-ops within 60s, DB
-  intact.
+  intact. **Exception:** `RECORDER_AUTO_SUBSCRIBE_ENABLED` (Patch G.13)
+  defaults ON — it's a bugfix for the silent NULL-mark gap, not an
+  opt-in feature. Set `=false` + redeploy to revert to pre-G.13
+  behavior where legs outside the ATM streaming window have NULL
+  `structure_mark` on every track sample.
 - **Recorder uses SQLite at `/var/backtest/desk.db`, NOT Redis or
   Postgres.** Free Render Redis is 25 MB capped with allkeys-lru
   eviction; recorder data would evict live state. Postgres free
@@ -960,6 +1023,18 @@ is high. Don't argue with them.
   or (b) hide the line in the template until populated. Defer to its own
   patch — not blocking; counter is technically accurate (zero of zero
   ARE lit).
+- Patch G.13 option subscription pool ceiling — long deploy windows
+  (>1 month) may grow the pool beyond the ~1000 Schwab streaming
+  ceiling. Each alert adds 1-2 OCC subscriptions; V1 strategy is
+  deploy-as-cleanup (each redeploy resets the pool to the
+  ~560-symbol FLOW_TICKERS baseline). Pool-size telemetry in
+  `alert_recorder._subscribe_alert_legs` warns at 800 symbols
+  (env-tunable via `RECORDER_SUBSCRIPTION_POOL_WARN_THRESHOLD`).
+  If the warning fires multiple times across a single deploy window,
+  Patch G.14 should add explicit per-alert cleanup (unsubscribe
+  when alert ages past 90 days or completes outcome compute).
+  At current observed volume (~10 alerts/day with deploy cadence
+  ≥ weekly), the pool stays under 700 and the warning never fires.
 
 ---
 

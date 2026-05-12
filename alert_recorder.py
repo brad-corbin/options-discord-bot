@@ -143,6 +143,134 @@ def _split_feature(value: Any):
     return (None, str(value))
 
 
+# v11.7 (Patch G.13): subscribe option streaming to alert legs.
+def _subscribe_alert_legs(structure: Optional[Dict[str, Any]], ticker: str) -> None:
+    """Subscribe option streaming to all OCC symbols referenced in this
+    alert's suggested_structure.
+
+    Called from record_alert after the row INSERT commits. Fixes the
+    silent track-data gap where alert legs fell outside the default
+    ATM streaming window (~16 symbols per ticker) and
+    OptionQuoteStore.get_live_premium returned None on every tracker
+    sample — leaving structure_mark NULL across the alert's lifetime.
+    After subscription, the streaming connection adds the legs within
+    1-2s; samples from that point have live marks.
+
+    Subscribe-only — no REST fallback. Per-sample REST would pressure
+    the shared Schwab rate limit on a continuous-tracking workload.
+    The first 0-2 minutes of a new alert may have NULL marks while
+    subscription propagates; outcomes happen at 5min+ horizons so
+    they're unaffected.
+
+    Pure additive: any failure (missing manager, OCC build error,
+    streaming hiccup) logs but never raises. Caller wraps in its own
+    try/except as a second layer of defense — recorder hooks NEVER
+    affect engines (CLAUDE.md, recorder-default-state decision).
+
+    Supported structure types:
+      - long_call / long_put: single leg, strike from structure['strike']
+      - bull_put / bear_call: two legs, structure['short'] + 'long'
+        (G.11 field-name convention — no _strike suffix)
+    Expiry from structure['expiry'] in either case. Unknown types
+    log at DEBUG and no-op.
+    """
+    if not isinstance(structure, dict):
+        return
+    expiry = structure.get("expiry")
+    if not expiry:
+        return
+
+    # Lazy import: schwab_stream is a large module and the recorder
+    # module is imported during tests that don't have streaming set up.
+    # Any import-time error here is captured and downgrades to a no-op.
+    try:
+        from schwab_stream import build_occ_symbol, get_option_symbol_manager
+        manager = get_option_symbol_manager()
+        if manager is None:
+            log.debug("recorder G.13: option symbol manager not initialized; skip")
+            return
+    except Exception as e:
+        log.debug(f"recorder G.13: schwab_stream import failed: {e}")
+        return
+
+    stype = (structure.get("type") or "").lower()
+    occ_symbols: List[str] = []
+    try:
+        if stype in ("long_call", "long_put"):
+            strike = structure.get("strike")
+            if strike is None:
+                return
+            side = "call" if stype == "long_call" else "put"
+            occ_symbols.append(
+                build_occ_symbol(ticker, expiry, side, float(strike))
+            )
+        elif stype in ("bull_put", "bear_call"):
+            short = structure.get("short")
+            long_ = structure.get("long")
+            if short is None or long_ is None:
+                return
+            side = "put" if stype == "bull_put" else "call"
+            occ_symbols.extend([
+                build_occ_symbol(ticker, expiry, side, float(short)),
+                build_occ_symbol(ticker, expiry, side, float(long_)),
+            ])
+        else:
+            log.debug(
+                f"recorder G.13: unknown structure type {stype!r} for {ticker}"
+            )
+            return
+    except Exception as e:
+        log.warning(f"recorder G.13: OCC build failed for {ticker}: {e}")
+        return
+
+    if not occ_symbols:
+        return
+
+    try:
+        # subscribe_specific is idempotent — OptionSymbolManager filters
+        # out OCCs already in self._subscribed before forwarding to the
+        # stream manager (schwab_stream.py:2444). Re-subscribing the
+        # same leg from a repeat alert is a no-op.
+        manager.subscribe_specific(occ_symbols)
+        log.info(
+            f"recorder G.13: subscribed {len(occ_symbols)} alert OCC "
+            f"symbols for {ticker} ({stype})"
+        )
+        # Pool-size telemetry. The actual property is manager.status
+        # (a dict with 'subscribed' int), NOT the spec-hypothesized
+        # get_subscription_count() method. V1 strategy is
+        # deploy-as-cleanup: each redeploy rebuilds streaming from
+        # FLOW_TICKERS at the ~560-symbol baseline, dropping all
+        # alert-leg subscriptions. Warn before the ~1000 Schwab
+        # streaming ceiling so long deploy windows surface the risk.
+        try:
+            current_size = int(manager.status.get("subscribed", 0))
+            threshold = int(os.environ.get(
+                "RECORDER_SUBSCRIPTION_POOL_WARN_THRESHOLD", "800"))
+            if current_size > threshold:
+                log.warning(
+                    f"recorder G.13: option subscription pool at "
+                    f"{current_size} symbols (threshold {threshold}). "
+                    f"Approaching Schwab streaming ceiling (~1000). "
+                    f"Deploy resets pool to ~560 baseline."
+                )
+        except Exception as e:
+            log.debug(f"recorder G.13: pool size telemetry failed: {e}")
+    except Exception as e:
+        log.warning(
+            f"recorder G.13: subscribe_specific failed for {ticker}: {e}"
+        )
+
+
+def _auto_subscribe_enabled() -> bool:
+    """Gate for Patch G.13. Defaults ON (per spec — the behavior change
+    is a fix, not an opt-in feature). Set false to revert to the old
+    behavior where legs outside the ATM window stay unsubscribed."""
+    return os.getenv(
+        "RECORDER_AUTO_SUBSCRIBE_ENABLED", "true"
+    ).lower() in ("1", "true", "yes")
+
+
 def record_alert(
     *,
     engine: str,
@@ -205,6 +333,19 @@ def record_alert(
                         rows,
                     )
             conn.commit()
+        # v11.7 (Patch G.13): subscribe option streaming to the alert's
+        # structure legs so the tracker daemon can read non-NULL marks.
+        # Two layers of defense — the helper has its own try/except,
+        # AND we wrap the call so an unexpected error never causes us
+        # to return None (the alert row IS already committed at this
+        # point).
+        if _auto_subscribe_enabled():
+            try:
+                _subscribe_alert_legs(suggested_structure, ticker)
+            except Exception as e:
+                log.warning(
+                    f"recorder G.13: subscribe wrapper failed for {ticker}: {e}"
+                )
         return alert_id
     except Exception as e:
         log.warning(f"recorder: record_alert({engine}) failed: {e}")

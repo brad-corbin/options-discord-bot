@@ -322,6 +322,192 @@ def test_record_outcome_writes_row_and_is_idempotent():
         _teardown_recorder_env(tmpdir)
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Patch G.13 — option subscription for alert structure legs
+# ─────────────────────────────────────────────────────────────────────
+#
+# The helper imports schwab_stream lazily, so we patch the symbols on
+# the SOURCE module (schwab_stream.get_option_symbol_manager + the
+# build_occ_symbol callable). That's what `from schwab_stream import X`
+# resolves to at call time.
+
+def _g13_fake_manager(captured: list):
+    """Minimal stand-in for OptionSymbolManager with the two attributes
+    the helper touches: subscribe_specific(list) and status dict."""
+    class _Fake:
+        status = {"subscribed": 600}
+        def subscribe_specific(self, occ_symbols):
+            captured.extend(occ_symbols)
+    return _Fake()
+
+
+def _g13_patch_stream(captured_subs, captured_occ_args, manager=None):
+    """Returns a context-manager-style helper that patches
+    schwab_stream.{get_option_symbol_manager, build_occ_symbol}.
+
+    Caller threads captured_subs / captured_occ_args lists in to inspect
+    what the helper did.
+    """
+    from unittest import mock
+    if manager is None:
+        manager = _g13_fake_manager(captured_subs)
+
+    def _fake_build_occ(ticker, expiry, side, strike):
+        captured_occ_args.append((ticker, expiry, side, strike))
+        return f"{ticker}:{expiry}:{side}:{strike}"   # synthetic shape
+
+    return mock.patch.multiple(
+        "schwab_stream",
+        get_option_symbol_manager=lambda: manager,
+        build_occ_symbol=_fake_build_occ,
+    )
+
+
+def test_g13_subscribe_alert_legs_long_call_builds_one_occ():
+    from alert_recorder import _subscribe_alert_legs
+    subs, occ_args = [], []
+    with _g13_patch_stream(subs, occ_args):
+        _subscribe_alert_legs(
+            {"type": "long_call", "strike": 590.0, "expiry": "2026-05-15"},
+            "SPY",
+        )
+    assert len(occ_args) == 1, f"expected 1 build_occ call, got {occ_args}"
+    assert occ_args[0] == ("SPY", "2026-05-15", "call", 590.0)
+    assert len(subs) == 1, f"expected 1 subscribed OCC, got {subs}"
+
+
+def test_g13_subscribe_alert_legs_bull_put_builds_two_occs():
+    """Real-shape MSFT bull_put fixture from Patch G.11 — proves the
+    helper reads `short` / `long` (NOT `short_strike` / `long_strike`)."""
+    from alert_recorder import _subscribe_alert_legs
+    subs, occ_args = [], []
+    with _g13_patch_stream(subs, occ_args):
+        _subscribe_alert_legs(
+            {"type": "bull_put", "short": 405.0, "long": 400.0,
+             "width": 5.0, "credit": 1.20, "expiry": "2026-05-15"},
+            "MSFT",
+        )
+    assert len(occ_args) == 2, f"expected 2 build_occ calls, got {occ_args}"
+    # bull_put → put side, both legs
+    sides = {a[2] for a in occ_args}
+    strikes = {a[3] for a in occ_args}
+    assert sides == {"put"}, f"expected put-side legs, got {sides}"
+    assert strikes == {405.0, 400.0}, f"expected 405/400, got {strikes}"
+    assert len(subs) == 2
+
+
+def test_g13_subscribe_alert_legs_no_op_when_manager_none():
+    """If option streaming hasn't started, helper must silently no-op.
+    Important: this is the path most CI / hermetic tests hit (no live
+    streaming in the test process)."""
+    from alert_recorder import _subscribe_alert_legs
+    subs, occ_args = [], []
+    # manager=lambda: None → get_option_symbol_manager() returns None.
+    # build_occ_symbol patched but should never be called because the
+    # helper short-circuits on the manager check.
+    from unittest import mock
+    with mock.patch.multiple(
+        "schwab_stream",
+        get_option_symbol_manager=lambda: None,
+        build_occ_symbol=lambda *a, **kw: occ_args.append(a) or "NEVER",
+    ):
+        # Must NOT raise
+        _subscribe_alert_legs(
+            {"type": "long_call", "strike": 590.0, "expiry": "2026-05-15"},
+            "SPY",
+        )
+    assert subs == [], "no manager → no subscribe call"
+    assert occ_args == [], "no manager → never reach OCC builder"
+
+
+def test_g13_subscribe_alert_legs_unknown_type_silent():
+    """Unknown structure type must not raise and must not call subscribe.
+    Structure shape from a hypothetical future engine that records
+    structures the recorder doesn't yet know how to subscribe."""
+    from alert_recorder import _subscribe_alert_legs
+    subs, occ_args = [], []
+    with _g13_patch_stream(subs, occ_args):
+        _subscribe_alert_legs(
+            {"type": "iron_condor", "expiry": "2026-05-15",
+             "short_put": 400, "long_put": 395,
+             "short_call": 410, "long_call": 415},
+            "SPY",
+        )
+    assert occ_args == []
+    assert subs == []
+
+
+def test_g13_record_alert_calls_subscribe_when_gate_on():
+    """End-to-end: record_alert with the gate ON (default) invokes
+    _subscribe_alert_legs exactly once with the structure + ticker
+    arguments. Asserts the wire-in point fires AND that an unhandled
+    exception in the helper does NOT clobber the returned alert_id
+    (the row is already committed)."""
+    from unittest import mock
+    tmpdir, db = _setup_recorder_env()
+    try:
+        with mock.patch("alert_recorder._subscribe_alert_legs") as fake_sub:
+            from alert_recorder import record_alert
+            structure = {"type": "long_call", "strike": 590.0,
+                         "expiry": "2026-05-15", "entry_mark": 2.85}
+            alert_id = record_alert(
+                engine="long_call_burst",
+                engine_version="long_call_burst@v8.4.2",
+                ticker="SPY",
+                classification="BURST_YES", direction="bull",
+                suggested_structure=structure,
+                suggested_dte=6, spot_at_fire=588.30,
+                canonical_snapshot={}, raw_engine_payload={},
+                features={}, telegram_chat="main",
+            )
+            assert alert_id is not None
+            fake_sub.assert_called_once_with(structure, "SPY")
+
+        # Now flip the gate OFF and prove the helper is NOT called.
+        os.environ["RECORDER_AUTO_SUBSCRIBE_ENABLED"] = "false"
+        try:
+            with mock.patch("alert_recorder._subscribe_alert_legs") as fake_sub_off:
+                from alert_recorder import record_alert
+                alert_id2 = record_alert(
+                    engine="long_call_burst",
+                    engine_version="long_call_burst@v8.4.2",
+                    ticker="QQQ",
+                    classification="BURST_YES", direction="bull",
+                    suggested_structure=structure,
+                    suggested_dte=6, spot_at_fire=480.30,
+                    canonical_snapshot={}, raw_engine_payload={},
+                    features={}, telegram_chat="main",
+                )
+                assert alert_id2 is not None
+                fake_sub_off.assert_not_called()
+        finally:
+            os.environ.pop("RECORDER_AUTO_SUBSCRIBE_ENABLED", None)
+
+        # And prove the wrapper try/except: helper raising does NOT
+        # clobber the returned alert_id (row was already committed).
+        with mock.patch(
+            "alert_recorder._subscribe_alert_legs",
+            side_effect=RuntimeError("simulated streaming hiccup"),
+        ):
+            from alert_recorder import record_alert
+            alert_id3 = record_alert(
+                engine="long_call_burst",
+                engine_version="long_call_burst@v8.4.2",
+                ticker="IWM",
+                classification="BURST_YES", direction="bull",
+                suggested_structure=structure,
+                suggested_dte=6, spot_at_fire=220.30,
+                canonical_snapshot={}, raw_engine_payload={},
+                features={}, telegram_chat="main",
+            )
+            assert alert_id3 is not None, (
+                "subscribe helper exception must NOT clobber alert_id — "
+                "row was already committed"
+            )
+    finally:
+        _teardown_recorder_env(tmpdir)
+
+
 if __name__ == "__main__":
     tests = [
         test_record_alert_writes_alerts_row,
@@ -334,6 +520,11 @@ if __name__ == "__main__":
         test_record_alert_id_is_uuid_v4,
         test_record_track_sample_writes_row,
         test_record_outcome_writes_row_and_is_idempotent,
+        test_g13_subscribe_alert_legs_long_call_builds_one_occ,
+        test_g13_subscribe_alert_legs_bull_put_builds_two_occs,
+        test_g13_subscribe_alert_legs_no_op_when_manager_none,
+        test_g13_subscribe_alert_legs_unknown_type_silent,
+        test_g13_record_alert_calls_subscribe_when_gate_on,
     ]
     failures = 0
     for t in tests:
