@@ -4262,6 +4262,19 @@ details[open] .alerts-collapsed-summary { margin-bottom: 8px; }
   border-bottom: 1px solid var(--border);
 }
 
+/* Patch H.9: native-tooltip help indicator next to section titles.
+   Smaller and less letter-spaced than the parent so the (?) reads as
+   secondary metadata, not part of the heading text. */
+.help-icon {
+  font-family: 'Cinzel', serif;
+  font-size: 0.75em;
+  letter-spacing: 0;
+  color: var(--brass-deep);
+  margin-left: 6px;
+  cursor: help;
+  opacity: 0.7;
+}
+
 .alerts-detail-struct-grid {
   display: grid;
   grid-template-columns: 140px 1fr;

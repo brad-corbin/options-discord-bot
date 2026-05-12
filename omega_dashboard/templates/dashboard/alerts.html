@@ -197,7 +197,7 @@
   function renderRow5(r5) {
     if (!r5) return '';
     if (r5.mode === 'active') {
-      const bar = '<span class="track-bar"><span class="track-bar-fill" style="width:' + r5.bar_pct + '%"></span></span>';
+      const bar = '<span class="track-bar" title="Tracking option premium % change since alert fire"><span class="track-bar-fill" style="width:' + r5.bar_pct + '%"></span></span>';
       const mfe = (r5.mfe_pct !== null && r5.mfe_pct !== undefined)
         ? '<span>MFE ' + fmtPct(r5.mfe_pct) + '</span>' : '';
       let curCls = '';
@@ -216,7 +216,7 @@
       return '<div class="alert-card-row5"><span>' + escapeHtml(r5.horizons_text) + '</span></div>';
     }
     if (r5.mode === 'expired') {
-      const bar = '<span class="track-bar"><span class="track-bar-fill" style="width:100%"></span></span>';
+      const bar = '<span class="track-bar" title="Tracking option premium % change since alert fire"><span class="track-bar-fill" style="width:100%"></span></span>';
       if (r5.no_samples) {
         return '<div class="alert-card-row5"><span>tracking</span>' + bar + '<span class="alert-card-row5-current">no samples recorded</span></div>';
       }

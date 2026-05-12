@@ -59,7 +59,7 @@
     <div class="alert-card-row5">
       {% if card.row5.mode == 'active' %}
         <span>tracking</span>
-        <span class="track-bar"><span class="track-bar-fill" style="width:{{ card.row5.bar_pct }}%"></span></span>
+        <span class="track-bar" title="Tracking option premium % change since alert fire"><span class="track-bar-fill" style="width:{{ card.row5.bar_pct }}%"></span></span>
         {% if card.row5.mfe_pct is not none %}
           <span>MFE {{ "%+.0f"|format(card.row5.mfe_pct) }}%</span>
         {% endif %}
@@ -75,7 +75,7 @@
         <span>{{ card.row5.horizons_text }}</span>
       {% elif card.row5.mode == 'expired' %}
         <span>tracking</span>
-        <span class="track-bar"><span class="track-bar-fill" style="width:100%"></span></span>
+        <span class="track-bar" title="Tracking option premium % change since alert fire"><span class="track-bar-fill" style="width:100%"></span></span>
         {% if card.row5.no_samples %}
           <span class="alert-card-row5-current">no samples recorded</span>
         {% else %}

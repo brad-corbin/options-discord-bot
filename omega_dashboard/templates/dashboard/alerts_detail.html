@@ -121,7 +121,7 @@
 
     {# ── Price track (server-rendered SVG) ─────────────── #}
     <div class="alerts-detail-section">
-      <div class="alerts-detail-section-title">Price track</div>
+      <div class="alerts-detail-section-title">Price track<span class="help-icon" title="Option premium % change since alert fire. Long calls/puts: (current mark − entry mark) / entry mark. Credit spreads: (credit collected − current spread value) / max risk.">(?)</span></div>
       {% if d.pnl_svg %}
         <div class="alerts-detail-chart-area">
           {{ d.pnl_svg|safe }}
