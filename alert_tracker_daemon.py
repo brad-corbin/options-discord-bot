@@ -221,12 +221,21 @@ def _fetch_structure_mark(
 
     stype = (structure.get("type") or "").lower()
 
+    # v11.7 (Patch G.13.1): 10-minute staleness threshold for tracker samples.
+    # OTM credit spread legs (and decaying long calls) often have ticks
+    # 60-300s apart. The store's default 60s threshold throws away usable
+    # quotes between ticks, leaving alert_price_track NULL for every
+    # bull_put / bear_call and ~75% of long_call_burst samples in market
+    # hours. Trading-path callers (alerts, exit management) keep the
+    # strict 60s default.
+    TRACKER_STALE_THRESHOLD_SEC = 600
+
     # Single-leg: long_call or long_put
     if stype in ("long_call", "long_put"):
         occ = _build_occ_symbol(structure, ticker)
         if occ is None:
             return None
-        return store.get_live_premium(occ)
+        return store.get_live_premium(occ, stale_threshold=TRACKER_STALE_THRESHOLD_SEC)
 
     # Credit spreads: bull_put or bear_call
     if stype in ("bull_put", "bear_call"):
@@ -250,8 +259,8 @@ def _fetch_structure_mark(
         except Exception as e:
             log.debug(f"tracker: spread OCC build failed: {e}")
             return None
-        short_mid = store.get_live_premium(short_occ)
-        long_mid = store.get_live_premium(long_occ)
+        short_mid = store.get_live_premium(short_occ, stale_threshold=TRACKER_STALE_THRESHOLD_SEC)
+        long_mid = store.get_live_premium(long_occ, stale_threshold=TRACKER_STALE_THRESHOLD_SEC)
         if short_mid is None or long_mid is None:
             return None
         return round(short_mid - long_mid, 4)

@@ -701,6 +701,71 @@ What's done as of last session (v11.7 / Patch F):
   in `test_alerts_data.py`. No schema change, no engine/recorder
   change, no app.py change. All env gates unchanged. Rollback is
   revert-and-redeploy — pure read-side dashboard work.
+- Patch G.13.1 (lenient staleness threshold for tracker reads) —
+  G.13 shipped option-leg subscription so OCC symbols outside the
+  ATM streaming window would receive ticks, but production data
+  on 2026-05-16 still showed credit_v84 alerts at 0.3% mark
+  coverage and long_call_burst at ~25% in market hours. Root
+  cause: `OptionQuoteStore.get()` had a hardcoded 60s staleness
+  check at `schwab_stream.py:344` that rejected any cached quote
+  older than 60 seconds. For OTM credit spread legs and decaying
+  OTM long calls, Schwab ticks arrive every 60-300s between quote
+  updates — the cache expires faster than ticks refresh it, so
+  `get_live_premium` returned None on every tracker sample.
+  NFLX 89C diagnostic on post-G.13 production data: first 30
+  minutes (high tick frequency) marks land every ~60s; then a
+  45-minute gap (option drifted deeper OTM, ticks slowed); then
+  sparse marks 30-45 minutes apart (only landing when a tick
+  coincidentally lands in the same minute as a sample). The G.13
+  subscribe path was working — the staleness guard was discarding
+  the data.
+
+  Fix: parameterize `stale_threshold` on `OptionQuoteStore.get()`,
+  `OptionQuoteStore.get_live_premium()`, and the module-level
+  `get_live_premium()`. Default unchanged (`None` → falls back
+  to the instance's `_stale_threshold`, 60s by default) so every
+  existing trading-path caller — `app.py:5943`/`8038` (v7 +
+  conviction mid reads), `position_monitor.py:464` (live
+  position monitoring), `thesis_monitor.py:1784`/`1919`/`2046`/`2360`
+  (exit management) — keeps the strict 60s behavior. Trading
+  decisions never read stale-by-design.
+
+  `alert_tracker_daemon._fetch_structure_mark` adds module-local
+  `TRACKER_STALE_THRESHOLD_SEC = 600` and passes it at all three
+  call sites (long_call/long_put single-leg + short/long legs of
+  bull_put/bear_call). 10 minutes is the right tracker threshold
+  because outcome computation runs at 5min/15min/30min/1h+
+  horizons — a 5-10 minute stale mark for a slowly-decaying
+  credit spread leg is still close enough to current market
+  truth to be useful for PnL aggregation. Beyond 10 minutes the
+  data is genuinely too old to trust.
+
+  **No env var.** Threshold is a function parameter, not an
+  env knob — it's tightly coupled to the calling context's
+  tolerance for stale data and shouldn't be tunable independently
+  of the code that knows what trade-off it's making. Documented
+  deviation from CLAUDE.md's "every new feature defaults off"
+  rule (this is a bugfix, not a feature; the relevant safety
+  is that trading-path callers can never opt into the lenient
+  threshold by accident).
+
+  8 new hermetic tests. `test_schwab_stream_store.py` (new file,
+  6 tests): pins default-vs-lenient behavior at the threshold
+  boundary for both `get()` and `get_live_premium()`, plus the
+  module-level helper. Two new tests in `test_alert_tracker_daemon.py`
+  capture `**kwargs` on a fake store and assert `stale_threshold
+  == 600` reaches both the long_call path and both legs of credit
+  spreads. Pre-existing G.11 `_FakeStore` fixtures updated to
+  `**kwargs` so they accept the new parameter without rejecting
+  the call.
+
+  Acceptance criteria (verify Monday post-deploy with the same
+  market-hours coverage query run 2026-05-16): credit_v84 mark
+  coverage >60% (from 0.3%), long_call_burst >75% (from ~25%).
+  Pre-G.13.1 partial data stays partial — no backfill. Patch I
+  (barometer) reads PnL aggregates over `alert_outcomes`, so
+  the data quality from G.13.1 onward is what feeds the
+  lever-finding queries.
 
 What's queued (in order):
 

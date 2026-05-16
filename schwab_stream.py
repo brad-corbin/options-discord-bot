@@ -335,13 +335,26 @@ class OptionQuoteStore:
         if count:
             log.info(f"Spread tracks cleared: {count} spreads")
 
-    def get(self, occ_symbol: str) -> Optional[dict]:
-        """Get a fresh option quote, or None if stale/missing."""
+    # v11.7 (Patch G.13.1): stale_threshold parameter so the tracker daemon
+    # can read 10-min-stale quotes without affecting trading-path callers
+    # that need the strict 60s default. OTM/credit-spread legs tick 60-300s
+    # apart in market hours — the default rejected them and left
+    # alert_price_track NULL.
+    def get(self, occ_symbol: str,
+            stale_threshold: Optional[float] = None) -> Optional[dict]:
+        """Get a fresh option quote, or None if stale/missing.
+
+        Pass `stale_threshold=600` for tracker samples where moderate
+        staleness (≤10 min) is acceptable. Defaults to self._stale_threshold
+        (60s) for backward compatibility with trading-decision callers.
+        """
         with self._lock:
             entry = self._quotes.get(occ_symbol)
             if entry is None:
                 return None
-            if time.monotonic() - entry["_ts"] > self._stale_threshold:
+            threshold = stale_threshold if stale_threshold is not None \
+                else self._stale_threshold
+            if time.monotonic() - entry["_ts"] > threshold:
                 return None
             return {k: v for k, v in entry.items() if k != "_ts"}
 
@@ -358,9 +371,14 @@ class OptionQuoteStore:
                     results.append({"symbol": sym, **{k: v for k, v in entry.items() if k != "_ts"}})
         return results
 
-    def get_live_premium(self, occ_symbol: str) -> Optional[float]:
-        """Get live mid price for an option contract."""
-        q = self.get(occ_symbol)
+    def get_live_premium(self, occ_symbol: str,
+                         stale_threshold: Optional[float] = None) -> Optional[float]:
+        """Get live mid price for an option contract.
+
+        Pass `stale_threshold=600` for tracker daemon samples; defaults to
+        the store's strict threshold for trading-path callers (Patch G.13.1).
+        """
+        q = self.get(occ_symbol, stale_threshold=stale_threshold)
         if q is None:
             return None
         bid = q.get("bid", 0) or 0
@@ -410,9 +428,13 @@ def get_streaming_option(occ_symbol: str) -> Optional[dict]:
     return _option_store.get(occ_symbol)
 
 
-def get_live_premium(occ_symbol: str) -> Optional[float]:
-    """Get live mid price for an option contract from streaming."""
-    return _option_store.get_live_premium(occ_symbol)
+def get_live_premium(occ_symbol: str,
+                     stale_threshold: Optional[float] = None) -> Optional[float]:
+    """Get live mid price for an option contract from streaming.
+
+    Pass `stale_threshold=600` for tracker daemon samples (Patch G.13.1).
+    """
+    return _option_store.get_live_premium(occ_symbol, stale_threshold=stale_threshold)
 
 
 def get_live_greeks(occ_symbol: str) -> Optional[dict]:

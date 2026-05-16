@@ -106,7 +106,7 @@ def test_fetch_structure_mark_reads_short_long_keys_for_credit_spread():
     requested = []
 
     class _FakeStore:
-        def get_live_premium(self, occ):
+        def get_live_premium(self, occ, **kwargs):
             requested.append(occ)
             # short leg priced higher than long leg → positive net mid
             return 1.50 if "00405000" in occ else 0.30
@@ -132,13 +132,83 @@ def test_fetch_structure_mark_reads_short_long_keys_for_credit_spread():
     assert any("00400000" in occ for occ in requested), requested
 
 
+def test_fetch_structure_mark_long_call_passes_lenient_stale_threshold():
+    """G.13.1: tracker daemon must read with a 10-minute staleness window so
+    OTM long calls with infrequent ticks still produce marks. The default 60s
+    is too strict — ticks routinely arrive 60-300s apart on low-activity
+    options, leaving alert_price_track empty between updates.
+    """
+    from alert_tracker_daemon import _fetch_structure_mark
+
+    captured_kwargs = []
+
+    class _FakeStore:
+        def get_live_premium(self, occ, **kwargs):
+            captured_kwargs.append(kwargs)
+            return 2.92
+
+    with mock.patch("schwab_stream.get_option_store", return_value=_FakeStore()):
+        mark = _fetch_structure_mark(
+            structure={"type": "long_call", "strike": 590.0,
+                       "expiry": "2026-05-15", "entry_mark": 2.85},
+            ticker="SPY",
+        )
+
+    assert mark == 2.92
+    assert len(captured_kwargs) == 1
+    assert captured_kwargs[0].get("stale_threshold") == 600, (
+        f"Tracker must pass stale_threshold=600 (10 min); got {captured_kwargs[0]}. "
+        "This is the G.13.1 fix — without the lenient threshold, the store's "
+        "default 60s rejects ticks arriving 60-300s apart and the tracker "
+        "writes NULL marks even when fresh quotes exist seconds before."
+    )
+
+
+def test_fetch_structure_mark_credit_spread_passes_lenient_stale_threshold():
+    """G.13.1: both legs of a credit spread must read with stale_threshold=600.
+
+    OTM spread legs (e.g. XLF 52/54.5C, XLV 143/140.5P) are the worst-case
+    for staleness — both legs decay slowly and tick infrequently. Pre-G.13.1
+    coverage was 0.3% in market hours. The whole point is to keep these
+    reads working when ticks are sparse.
+    """
+    from alert_tracker_daemon import _fetch_structure_mark
+
+    captured = []
+
+    class _FakeStore:
+        def get_live_premium(self, occ, **kwargs):
+            captured.append((occ, kwargs))
+            return 1.50 if "00405000" in occ else 0.30
+
+    with mock.patch("schwab_stream.get_option_store", return_value=_FakeStore()):
+        mark = _fetch_structure_mark(
+            structure={
+                "type": "bull_put",
+                "short": 405.0, "long": 400.0,
+                "width": 5.0, "credit": 1.20,
+                "expiry": "2026-05-15",
+            },
+            ticker="MSFT",
+        )
+
+    assert mark is not None
+    assert abs(mark - 1.20) < 0.001
+    assert len(captured) == 2, "both legs must be queried"
+    for occ, kwargs in captured:
+        assert kwargs.get("stale_threshold") == 600, (
+            f"Spread leg {occ!r} was queried without stale_threshold=600: "
+            f"kwargs={kwargs}. Both legs must use the lenient threshold."
+        )
+
+
 def test_fetch_structure_mark_returns_none_when_legs_missing():
     """Defensive: structure with 'type': 'bull_put' but missing short/long
     must return None rather than raising or building bogus OCCs."""
     from alert_tracker_daemon import _fetch_structure_mark
 
     class _NeverCalledStore:
-        def get_live_premium(self, occ):
+        def get_live_premium(self, occ, **kwargs):
             raise AssertionError(f"store should not be queried; got {occ!r}")
 
     with mock.patch("schwab_stream.get_option_store", return_value=_NeverCalledStore()):
@@ -201,6 +271,8 @@ if __name__ == "__main__":
         test_compute_pnl_for_long_call,
         test_compute_pnl_for_credit_spread,
         test_fetch_structure_mark_reads_short_long_keys_for_credit_spread,
+        test_fetch_structure_mark_long_call_passes_lenient_stale_threshold,
+        test_fetch_structure_mark_credit_spread_passes_lenient_stale_threshold,
         test_fetch_structure_mark_returns_none_when_legs_missing,
         test_run_single_pass_writes_track_row,
         test_run_single_pass_swallows_market_data_failure,
