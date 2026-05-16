@@ -69,6 +69,7 @@ PAGE_TABS = [
     {"key": "dashboard",  "label": "Desk",         "endpoint": "dashboard.command_center"},
     {"key": "trading",    "label": "Market View",  "endpoint": "dashboard.trading"},
     {"key": "alerts",     "label": "Alerts",       "endpoint": "dashboard.alerts"},
+    {"key": "barometer",  "label": "Barometer",    "endpoint": "dashboard.barometer"},
     {"key": "portfolio",  "label": "Portfolio",    "endpoint": "dashboard.portfolio"},
     {"key": "research",   "label": "Research",     "endpoint": "dashboard.research"},
     {"key": "restore",    "label": "Durability",   "endpoint": "dashboard.restore"},
@@ -359,6 +360,22 @@ def alerts_data_json():
     resp = jsonify(payload)
     resp.headers["Cache-Control"] = "no-store"
     return resp
+
+
+# v11.7 (Patch I V0): Barometer route — per-engine + per-engine x direction
+# + per-ticker outcome aggregates. Pure read-only against the recorder DB
+# via omega_dashboard/barometer_data.py with 5-min Redis cache. Server-
+# rendered, no polling.
+@dashboard_bp.route("/barometer", methods=["GET"])
+@login_required
+def barometer():
+    from . import barometer_data
+    page_data = barometer_data.get_barometer_data()
+    return render_page(
+        "dashboard/barometer.html",
+        page_key="barometer",
+        page_data=page_data,
+    )
 
 
 @dashboard_bp.route("/alerts/<string:alert_id>", methods=["GET"])

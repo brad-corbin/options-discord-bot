@@ -1,0 +1,190 @@
+{% extends "dashboard/base.html" %}
+
+{% block title %}The Legacy Desk &mdash; Barometer{% endblock %}
+{% block brand_sub %}Barometer &middot; {{ active_account.label }}{% endblock %}
+
+{% block content %}
+
+{# v11.7 (Patch I V0): Barometer page. Three sections of outcome aggregates
+   built off the recorder DB. No JS, no polling — server-rendered. Data
+   layer is omega_dashboard/barometer_data.py with 5-min Redis cache. #}
+
+<div class="barometer-page fade-in">
+
+  <div class="barometer-eyebrow">
+    <span>— BAROMETER &middot; OUTCOME AGGREGATES</span>
+    <span class="barometer-eyebrow-meta num">
+      since {{ page_data.since_date }}
+      &middot;
+      hide rates &lt; {{ page_data.min_sample_for_pct }} alerts
+    </span>
+  </div>
+
+  {% if page_data.error %}
+    <div class="barometer-error">
+      <div class="barometer-error-title">DATA UNAVAILABLE</div>
+      <div class="barometer-error-body">{{ page_data.error }}</div>
+    </div>
+  {% endif %}
+
+  {# ── Section 1: Per engine ──────────────────────────────────── #}
+  <section class="barometer-section">
+    <div class="barometer-section-title">PER ENGINE</div>
+    {% if page_data.per_engine %}
+      <table class="barometer-table">
+        <thead>
+          <tr>
+            <th class="barometer-col-text">Engine</th>
+            <th>Alerts</th>
+            <th>PT1</th><th>PT2</th><th>PT3</th>
+            <th>Avg MFE</th><th>Avg MAE</th>
+            <th>With PnL</th>
+            <th>Win&nbsp;Rate</th>
+            <th>Avg&nbsp;PnL</th>
+          </tr>
+        </thead>
+        <tbody>
+        {% for row in page_data.per_engine %}
+          <tr>
+            <td class="barometer-col-text">{{ row.engine }}</td>
+            <td class="num">{{ row.alerts }}</td>
+            <td class="num">
+              {% if row.pt1_rate is defined %}{{ row.pt1_rate }}%
+              {% else %}<span class="barometer-small-sample">—</span>{% endif %}
+            </td>
+            <td class="num">
+              {% if row.pt2_rate is defined %}{{ row.pt2_rate }}%
+              {% else %}<span class="barometer-small-sample">—</span>{% endif %}
+            </td>
+            <td class="num">
+              {% if row.pt3_rate is defined %}{{ row.pt3_rate }}%
+              {% else %}<span class="barometer-small-sample">—</span>{% endif %}
+            </td>
+            <td class="num">
+              {% if row.avg_mfe_pct is defined %}{{ row.avg_mfe_pct }}%
+              {% else %}—{% endif %}
+            </td>
+            <td class="num">
+              {% if row.avg_mae_pct is defined %}{{ row.avg_mae_pct }}%
+              {% else %}—{% endif %}
+            </td>
+            <td class="num">{{ row.with_pnl }}</td>
+            <td class="num">
+              {% if row.win_rate is defined %}
+                <span class="{{ 'pnl-pos' if row.win_rate >= 50 else 'pnl-neg' }}">{{ row.win_rate }}%</span>
+              {% else %}<span class="barometer-small-sample">small sample</span>{% endif %}
+            </td>
+            <td class="num">
+              {% if row.avg_pnl_pct is defined %}
+                <span class="{{ 'pnl-pos' if row.avg_pnl_pct > 0 else ('pnl-neg' if row.avg_pnl_pct < 0 else '') }}">{{ row.avg_pnl_pct }}%</span>
+              {% else %}<span class="barometer-small-sample">—</span>{% endif %}
+            </td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <div class="barometer-empty">
+        No alerts since {{ page_data.since_date }}. As alerts fire and
+        outcomes compute (~60s after each crossed horizon), aggregates will populate here.
+      </div>
+    {% endif %}
+  </section>
+
+  {# ── Section 2: Per engine × direction ─────────────────────── #}
+  {% if page_data.per_engine_direction %}
+  <section class="barometer-section">
+    <div class="barometer-section-title">PER ENGINE &middot; BULL vs BEAR</div>
+    <table class="barometer-table">
+      <thead>
+        <tr>
+          <th class="barometer-col-text">Engine</th>
+          <th class="barometer-col-text">Direction</th>
+          <th>Alerts</th>
+          <th>PT1</th><th>PT2</th><th>PT3</th>
+          <th>With PnL</th>
+          <th>Win&nbsp;Rate</th>
+          <th>Avg&nbsp;PnL</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for row in page_data.per_engine_direction %}
+        <tr>
+          <td class="barometer-col-text">{{ row.engine }}</td>
+          <td class="barometer-col-text">{{ row.direction or '—' }}</td>
+          <td class="num">{{ row.alerts }}</td>
+          <td class="num">
+            {% if row.pt1_rate is defined %}{{ row.pt1_rate }}%
+            {% else %}<span class="barometer-small-sample">—</span>{% endif %}
+          </td>
+          <td class="num">
+            {% if row.pt2_rate is defined %}{{ row.pt2_rate }}%
+            {% else %}<span class="barometer-small-sample">—</span>{% endif %}
+          </td>
+          <td class="num">
+            {% if row.pt3_rate is defined %}{{ row.pt3_rate }}%
+            {% else %}<span class="barometer-small-sample">—</span>{% endif %}
+          </td>
+          <td class="num">{{ row.with_pnl }}</td>
+          <td class="num">
+            {% if row.win_rate is defined %}
+              <span class="{{ 'pnl-pos' if row.win_rate >= 50 else 'pnl-neg' }}">{{ row.win_rate }}%</span>
+            {% else %}<span class="barometer-small-sample">—</span>{% endif %}
+          </td>
+          <td class="num">
+            {% if row.avg_pnl_pct is defined %}
+              <span class="{{ 'pnl-pos' if row.avg_pnl_pct > 0 else ('pnl-neg' if row.avg_pnl_pct < 0 else '') }}">{{ row.avg_pnl_pct }}%</span>
+            {% else %}<span class="barometer-small-sample">—</span>{% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </section>
+  {% endif %}
+
+  {# ── Section 3: Per ticker leaderboard ─────────────────────── #}
+  {% if page_data.per_ticker %}
+  <section class="barometer-section">
+    <div class="barometer-section-title">PER TICKER &middot; LEADERBOARD</div>
+    <table class="barometer-table">
+      <thead>
+        <tr>
+          <th class="barometer-col-text">Ticker</th>
+          <th>Alerts</th>
+          <th class="barometer-col-text">Engines</th>
+          <th>With PnL</th>
+          <th>Win&nbsp;Rate</th>
+          <th>Avg&nbsp;PnL</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for row in page_data.per_ticker %}
+        <tr>
+          <td class="barometer-col-text">{{ row.ticker }}</td>
+          <td class="num">{{ row.alerts }}</td>
+          <td class="barometer-col-text barometer-engines-list">{{ row.engines|join(', ') }}</td>
+          <td class="num">{{ row.with_pnl }}</td>
+          <td class="num">
+            {% if row.win_rate is defined %}
+              <span class="{{ 'pnl-pos' if row.win_rate >= 50 else 'pnl-neg' }}">{{ row.win_rate }}%</span>
+            {% else %}<span class="barometer-small-sample">small sample</span>{% endif %}
+          </td>
+          <td class="num">
+            {% if row.avg_pnl_pct is defined %}
+              <span class="{{ 'pnl-pos' if row.avg_pnl_pct > 0 else ('pnl-neg' if row.avg_pnl_pct < 0 else '') }}">{{ row.avg_pnl_pct }}%</span>
+            {% else %}<span class="barometer-small-sample">—</span>{% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    <div class="barometer-note">
+      Tickers with fewer than 3 alerts are excluded from the leaderboard.
+    </div>
+  </section>
+  {% endif %}
+
+</div>
+
+{% endblock %}

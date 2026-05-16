@@ -842,6 +842,101 @@ What's done as of last session (v11.7 / Patch F):
   ~100% non-NULL pnl_pct (was 0% non-NULL pre-G.15). Existing
   long_call_burst / credit_v84 / oi_flow_conviction rows
   unchanged.
+- Patch I V0 (Barometer dashboard tab) — first user-visible
+  surface for the recorder's outcome data. New `/barometer` page
+  between Alerts and Portfolio in the top-nav (`PAGE_TABS`).
+  Three stacked sections, all server-rendered, no polling:
+
+  **Per engine** — one row per engine: `alerts`, `with_outcomes`,
+  `with_pnl` always; `pt1_rate` / `pt2_rate` / `pt3_rate` /
+  `avg_mfe_pct` / `avg_mae_pct` / `win_rate` / `avg_pnl_pct`
+  emitted only when sample size hits `MIN_SAMPLE_FOR_PCT = 5`,
+  so small-sample engines render "small sample" tags instead
+  of noisy percentages. PT-hit rates denominator is total
+  alerts (ANY-touch over outcome rows); win_rate denominator
+  is `with_pnl` (alerts that have a final non-NULL pnl_pct).
+  Final pnl comes from the longest-horizon outcome row with a
+  non-NULL pnl_pct — a CASE statement in the CTE orders
+  horizons 5min→expiry so newer crossed horizons trump earlier
+  ones.
+
+  **Per engine × direction** — same metric shape, split by
+  `direction` (bull/bear). First view to answer "does LCB
+  perform differently bull vs bear" without writing SQL.
+
+  **Per ticker leaderboard** — top-10 tickers by alert count,
+  with engines-fired list, win rate, avg PnL. Tickers with
+  fewer than `TICKER_MIN_ALERTS = 3` excluded entirely
+  (leaderboard is for tickers we have a feel for, not noise).
+
+  Read-side is `omega_dashboard/barometer_data.py` with its
+  own per-call read-only sqlite3 connection (`mode=ro` URI
+  form) at `/var/backtest/desk.db`, mirroring the H.2 pattern
+  for `alerts_data.py`. Does NOT import `alert_recorder` write
+  internals — clean R/W boundary. Three aggregate queries
+  share a single `alert_best` CTE that rolls up MFE/MAE/PT-hit
+  flags and computes `final_pnl` per alert; CTE produces one
+  row per alert and the three queries `GROUP BY` engine,
+  engine+direction, and ticker respectively.
+
+  Caching: 5-min Redis TTL on the whole payload
+  (`CACHE_KEY = "dashboard:barometer:v0"`). `_get_redis()` is
+  a lazy import of `app._get_redis` (deferred to avoid
+  circular import at module load). Mocked in
+  `test_cache_hit_skips_db_query` to prove that a cache hit
+  short-circuits before any SQLite access (test deletes the
+  DB file first, so a fallthrough would raise).
+
+  Since-date filter: `BAROMETER_SINCE_DATE` env var
+  (YYYY-MM-DD format), default `2026-05-16` — the G.13.1
+  deploy date when credit and long-call mark coverage went
+  from <25% to >75%. Pre-G.13.1 data is noisier and would
+  skew aggregates downward. Override the env var to widen
+  the window. Unparseable values log a warning and fall back
+  to "include everything" rather than blocking the page.
+
+  Spec deviation: dropped `median_pnl` from the per-engine
+  summary. SQLite has no native MEDIAN aggregate; implementing
+  it requires a window-function self-join or Python-side
+  computation. Not worth the V0 complexity — avg + MFE/MAE
+  carry the operational signal for now. V1 can add if Brad
+  explicitly wants the distribution shape.
+
+  8 hermetic tests in `test_barometer_data.py` covering:
+  empty DB returns empty sections; missing DB returns
+  error-state payload (graceful, not raised); per-engine
+  aggregation with realistic 6-alert fixture pinning win_rate
+  / pt-hit / avg_pnl arithmetic; small-sample suppression
+  (3 alerts, no `pt1_rate` key emitted); per-engine ×
+  direction split with bull/bear avg-pnl divergence pinned;
+  leaderboard `TICKER_MIN_ALERTS = 3` boundary; cache-hit
+  short-circuit with mocked Redis + deleted DB; since-date
+  filter excluding pre-cutoff alerts.
+
+  Route + nav wiring: `@dashboard_bp.route("/barometer")` in
+  `omega_dashboard/routes.py`, deferred `from . import
+  barometer_data` inside the handler (matches the alerts /
+  research pattern). `PAGE_TABS` gets a new entry between
+  `alerts` and `portfolio`. Template
+  `dashboard/barometer.html` extends `dashboard/base.html`
+  and is pure Jinja — no JS at all in V0. CSS additions in
+  `omega.css` mirror existing alerts table styling
+  (Cinzel section titles, JetBrains Mono numerals, `--positive-bright` /
+  `--negative-soft` for pnl coloring, brass-deep italic for
+  "small sample" tags).
+
+  Acceptance criteria: visit `/barometer` post-deploy, see
+  three populated sections (assuming G.13.1 + G.15 outcome
+  data has accumulated). Engines below 5 alerts show "small
+  sample" instead of percentages. Win-rate cells colored
+  green when ≥50%, red below. Avg-PnL cells colored by sign.
+  Page renders <500ms cold (first DB query), <100ms cached.
+
+  Out of scope (V1 candidates): time-windowed cuts (this
+  week / last 7 days), regime conditioning (needs G.12),
+  statistical-significance bands, CSV export, auto-refresh,
+  per-classification cuts (GRADE_A vs GRADE_B for v2_5d),
+  parent/child alert linkage in aggregates.
 
 What's queued (in order):
 

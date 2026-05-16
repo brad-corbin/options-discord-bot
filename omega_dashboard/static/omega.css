@@ -4769,3 +4769,119 @@ details[open] .alerts-collapsed-summary { margin-bottom: 8px; }
   outline: 2px solid var(--brass-bright);
   outline-offset: -2px;
 }
+
+/* ════════════════════════════════════════════════════════
+   v11.7 (Patch I V0): Barometer page styles.
+   Three stacked tables (per-engine, per-engine x direction,
+   per-ticker) with monospace numerals and pos/neg pnl coloring.
+   ════════════════════════════════════════════════════════ */
+
+.barometer-page {
+  padding: 20px 24px 40px;
+  max-width: 1280px;
+  margin: 0 auto;
+}
+
+.barometer-eyebrow {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  color: var(--brass-deep);
+  letter-spacing: 2px;
+  font-family: 'Cinzel', serif;
+  font-size: 0.78em;
+  text-transform: uppercase;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--brass-deep);
+  margin-bottom: 24px;
+}
+.barometer-eyebrow-meta {
+  color: var(--brass-bright);
+  letter-spacing: 0;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.92em;
+  text-transform: none;
+}
+
+.barometer-section { margin-bottom: 28px; }
+.barometer-section-title {
+  font-family: 'Cinzel', serif;
+  font-size: 0.92em;
+  letter-spacing: 3px;
+  text-transform: uppercase;
+  color: var(--brass-bright);
+  margin-bottom: 10px;
+}
+
+.barometer-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.92em;
+  background: var(--bg-panel);
+}
+.barometer-table th,
+.barometer-table td {
+  padding: 8px 12px;
+  text-align: right;
+  border-bottom: 1px solid var(--border, #2a2d31);
+  white-space: nowrap;
+}
+.barometer-table th {
+  color: var(--brass-deep);
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  font-size: 0.78em;
+  background: rgba(0, 0, 0, 0.18);
+}
+.barometer-table tbody tr:hover { background: rgba(255, 255, 255, 0.025); }
+.barometer-table .barometer-col-text { text-align: left; }
+.barometer-table .num { font-variant-numeric: tabular-nums; }
+.barometer-table .pnl-pos { color: var(--positive-bright); }
+.barometer-table .pnl-neg { color: var(--negative-soft); }
+.barometer-small-sample {
+  color: var(--brass-deep);
+  font-style: italic;
+  font-size: 0.85em;
+}
+.barometer-engines-list {
+  color: var(--brass-deep);
+  font-size: 0.85em;
+  letter-spacing: 0.5px;
+}
+
+.barometer-empty {
+  padding: 24px;
+  text-align: center;
+  color: var(--brass-deep);
+  font-style: italic;
+  background: var(--bg-panel);
+  border: 1px dashed var(--brass-deep);
+}
+
+.barometer-note {
+  color: var(--brass-deep);
+  font-style: italic;
+  font-size: 0.82em;
+  padding: 6px 4px;
+}
+
+.barometer-error {
+  background: rgba(161, 79, 79, 0.08);
+  border-left: 3px solid var(--negative);
+  padding: 12px 16px;
+  margin-bottom: 22px;
+}
+.barometer-error-title {
+  font-family: 'Cinzel', serif;
+  letter-spacing: 2px;
+  color: var(--negative-soft);
+  font-size: 0.85em;
+  margin-bottom: 4px;
+}
+.barometer-error-body {
+  color: var(--text-color, #d4d4d4);
+  font-size: 0.92em;
+  font-family: 'JetBrains Mono', monospace;
+}
