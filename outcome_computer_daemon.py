@@ -46,6 +46,15 @@ PT_LEVELS_LONG = (0.20, 0.50, 1.00)
 # PT levels for credit spreads (percentage of max profit / risk)
 PT_LEVELS_CREDIT = (0.50, 0.75, 0.90)
 
+# v11.7 (Patch G.15): v2_5d evaluation alerts have no option structure
+# (suggested_structure = {"type": "evaluation"}). We measure outcomes via
+# underlying % movement direction-adjusted by the alert's bias. Thresholds
+# are absolute % moves; V1.1 may scale-normalize by ticker ATR if data
+# shows cross-ticker noise hides signal.
+V25D_PT1_PCT = 0.5
+V25D_PT2_PCT = 1.0
+V25D_PT3_PCT = 2.0
+
 
 # ─────────────────────────────────────────────────────────────
 # Gate helpers
@@ -139,18 +148,99 @@ def _compute_outcome_for_horizon(
     )
 
 
+# v11.7 (Patch G.15): outcome compute for v2_5d evaluation alerts.
+# Unlike structure-based outcomes (long_call_burst, credit_v84),
+# evaluation alerts have no option structure. We measure the
+# underlying's % move from spot_at_fire, direction-adjusted by the
+# alert's bias (bull = positive moves count, bear = negative moves
+# count as wins after sign flip).
+def _compute_evaluation_outcome_for_horizon(
+    *,
+    spot_at_fire: Optional[float],
+    direction: Optional[str],
+    horizon_seconds: int,
+    track: List[Tuple[int, float]],
+) -> Dict:
+    """Compute pnl/MFE/MAE/hit_pt for a v2_5d evaluation alert at this horizon.
+
+    Args:
+        spot_at_fire:     underlying price at alert fire time
+        direction:        'bull' or 'bear' — alert's predicted bias.
+                          Anything else (None, 'neutral') defaults to bull.
+        horizon_seconds:  upper boundary of the window (inclusive)
+        track:            list of (elapsed_seconds, underlying_price)
+                          tuples sorted ascending. Samples with NULL
+                          underlying_price must be filtered out by caller.
+
+    Returns:
+        dict with the same keys as _compute_outcome_for_horizon.
+        structure_mark is always None (no structure to mark). pnl_pct
+        is the direction-adjusted % move of the underlying at horizon
+        close. PT-hit flags use ANY-touch semantics against the V25D_PT*
+        thresholds.
+    """
+    in_window = [(e, u) for (e, u) in track
+                 if e <= horizon_seconds and u is not None]
+    if not in_window or spot_at_fire is None or spot_at_fire <= 0:
+        return dict(
+            outcome_at=None,
+            underlying_price=None,
+            structure_mark=None,
+            pnl_pct=None,
+            pnl_abs=None,
+            hit_pt1=0,
+            hit_pt2=0,
+            hit_pt3=0,
+            max_favorable_pct=None,
+            max_adverse_pct=None,
+        )
+
+    sign = -1.0 if (direction or "").lower() == "bear" else 1.0
+
+    pct_moves = [
+        sign * ((u - spot_at_fire) / spot_at_fire) * 100.0
+        for (_, u) in in_window
+    ]
+    _, close_underlying = in_window[-1]
+    close_pct = sign * ((close_underlying - spot_at_fire) / spot_at_fire) * 100.0
+
+    mfe = max(pct_moves)
+    mae = min(pct_moves)
+
+    pt1 = int(any(p >= V25D_PT1_PCT for p in pct_moves))
+    pt2 = int(any(p >= V25D_PT2_PCT for p in pct_moves))
+    pt3 = int(any(p >= V25D_PT3_PCT for p in pct_moves))
+
+    return dict(
+        outcome_at=None,            # filled in by caller
+        underlying_price=close_underlying,
+        structure_mark=None,        # no structure for evaluation alerts
+        pnl_pct=close_pct,
+        pnl_abs=None,
+        hit_pt1=pt1,
+        hit_pt2=pt2,
+        hit_pt3=pt3,
+        max_favorable_pct=mfe,
+        max_adverse_pct=mae,
+    )
+
+
 # ─────────────────────────────────────────────────────────────
 # DB read helpers
 # ─────────────────────────────────────────────────────────────
 
 def _all_alerts(conn: sqlite3.Connection) -> List[dict]:
-    """Load all alerts from DB. Returns list of dicts."""
+    """Load all alerts from DB. Returns list of dicts.
+
+    Patch G.15: direction added so v2_5d evaluation outcomes can
+    sign-flip for bear alerts.
+    """
     rows = conn.execute(
-        "SELECT alert_id, fired_at, engine, suggested_structure, "
+        "SELECT alert_id, fired_at, engine, direction, suggested_structure, "
         "suggested_dte, spot_at_fire FROM alerts"
     ).fetchall()
     out = []
-    for (alert_id, fired_at, engine, struct, dte, spot) in rows:
+    for (alert_id, fired_at, engine, direction, struct, dte, spot) in rows:
         try:
             structure = json.loads(struct) if struct else {}
         except Exception:
@@ -159,6 +249,7 @@ def _all_alerts(conn: sqlite3.Connection) -> List[dict]:
             "alert_id": alert_id,
             "fired_at": fired_at,
             "engine": engine,
+            "direction": direction,
             "structure": structure,
             "suggested_dte": dte,
             "spot": spot,
@@ -167,16 +258,24 @@ def _all_alerts(conn: sqlite3.Connection) -> List[dict]:
 
 
 def _track_for(conn: sqlite3.Connection, alert_id: str,
-               ) -> List[Tuple[int, float, float]]:
-    """Load price track for one alert as (elapsed_seconds, mark, pnl_pct) tuples."""
+               ) -> List[Tuple[int, Optional[float], Optional[float],
+                              Optional[float]]]:
+    """Load price track for one alert.
+
+    Patch G.15: returns 4-tuples (elapsed_seconds, structure_mark,
+    structure_pnl_pct, underlying_price). underlying_price added so
+    v2_5d outcome compute can use it. Structure-based callers
+    destructure positions [0:3] and ignore position [3].
+    """
     rows = conn.execute(
-        "SELECT elapsed_seconds, structure_mark, structure_pnl_pct "
+        "SELECT elapsed_seconds, structure_mark, structure_pnl_pct, "
+        "underlying_price "
         "FROM alert_price_track WHERE alert_id = ? ORDER BY elapsed_seconds",
         (alert_id,)
     ).fetchall()
     return [
-        (int(e), m, p)
-        for (e, m, p) in rows
+        (int(e), m, p, u)
+        for (e, m, p, u) in rows
         if e is not None
     ]
 
@@ -223,17 +322,36 @@ def run_single_pass() -> None:
             elapsed_now = (now_micros - fired_at) // 1_000_000
             pt = _pt_levels(alert["structure"])
 
+            # Patch G.15: branch on engine. v2_5d evaluation alerts have
+            # no option structure — outcomes are computed from underlying
+            # % movement direction-adjusted by alert bias.
+            is_evaluation = alert["engine"] == "v2_5d"
+            if is_evaluation:
+                eval_track = [(e, u) for (e, _m, _p, u) in track]
+            else:
+                structure_track = [(e, m, p) for (e, m, p, _u) in track]
+
+            def _compute(h_seconds: int) -> Dict:
+                if is_evaluation:
+                    return _compute_evaluation_outcome_for_horizon(
+                        spot_at_fire=alert["spot"],
+                        direction=alert.get("direction"),
+                        horizon_seconds=h_seconds,
+                        track=eval_track,
+                    )
+                return _compute_outcome_for_horizon(
+                    structure=alert["structure"],
+                    horizon_seconds=h_seconds,
+                    track=structure_track,
+                    pt_levels=pt,
+                )
+
             # Standard horizons (5min, 15min, 30min, 1h, 4h, 1d, 2d, 3d, 5d)
             for horizon_label, h_seconds in HORIZONS_SECONDS.items():
                 if elapsed_now < h_seconds:
                     # Horizon not yet reached — skip
                     continue
-                computed = _compute_outcome_for_horizon(
-                    structure=alert["structure"],
-                    horizon_seconds=h_seconds,
-                    track=track,
-                    pt_levels=pt,
-                )
+                computed = _compute(h_seconds)
                 record_outcome(
                     alert_id=alert_id,
                     horizon=horizon_label,
@@ -254,12 +372,7 @@ def run_single_pass() -> None:
             if dte:
                 expiry_seconds = int(dte) * 24 * 60 * 60
                 if elapsed_now >= expiry_seconds:
-                    computed = _compute_outcome_for_horizon(
-                        structure=alert["structure"],
-                        horizon_seconds=expiry_seconds,
-                        track=track,
-                        pt_levels=pt,
-                    )
+                    computed = _compute(expiry_seconds)
                     record_outcome(
                         alert_id=alert_id,
                         horizon="expiry",

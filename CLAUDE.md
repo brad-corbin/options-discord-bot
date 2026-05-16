@@ -766,6 +766,82 @@ What's done as of last session (v11.7 / Patch F):
   (barometer) reads PnL aggregates over `alert_outcomes`, so
   the data quality from G.13.1 onward is what feeds the
   lever-finding queries.
+- Patch G.15 (v2_5d underlying outcome tracking) — closes the
+  silent-zero-outcomes gap for V2 5D EDGE MODEL alerts. Production
+  diagnostic on 2026-05-17 showed 28 v2_5d alerts × 6 horizons =
+  168 outcome rows all-NULL across pnl/pt/MFE. Root cause: v2_5d
+  writes `suggested_structure = {"type": "evaluation"}` — no
+  strike, no expiry, nothing for `_compute_outcome_for_horizon`
+  to mark against. The structure-based outcome path returns
+  all-NULL because there are no marks to compute PnL from. But
+  `alert_price_track.underlying_price` is populated 99.6% in
+  market hours (already, via the tracker daemon) and
+  `alert_outcomes.underlying_price` is a schema column that's
+  been unused since G.1. The pieces exist — they just weren't
+  wired.
+
+  Fix: new function
+  `outcome_computer_daemon._compute_evaluation_outcome_for_horizon`
+  measures the underlying's % move from `spot_at_fire`,
+  direction-adjusted by the alert's bias (bull = positive moves
+  count as wins, bear = sign flips so negative moves count). Three
+  hardcoded thresholds for V1: `V25D_PT1_PCT = 0.5`, `V25D_PT2_PCT
+  = 1.0`, `V25D_PT3_PCT = 2.0`. Direction defaults to bull when
+  None/missing (matches v2_5d's typical bias field, which comes
+  from `V2SetupResult.bias` — see CLAUDE.md "V2SetupResult
+  attribute names" decision).
+
+  `run_single_pass` branches on `alert["engine"] == "v2_5d"`. The
+  v2_5d path builds a `[(elapsed, underlying)]` track from the
+  4-tuple `_track_for` rows; the structure path builds the original
+  3-tuple shape and calls `_compute_outcome_for_horizon` unchanged.
+  Both standard horizons and the per-alert expiry horizon use the
+  same branch via a local `_compute(h_seconds)` closure to keep
+  the routing single-source. `_all_alerts` SELECT now includes
+  `direction` (schema column has existed since G.1 — was just
+  unread). `_track_for` returns 4-tuples (elapsed, mark, pnl_pct,
+  underlying_price) — structure-path consumers destructure [0:3]
+  and ignore position [3], evaluation-path consumers destructure
+  [0]+[3].
+
+  Backfill is automatic: `record_outcome` uses INSERT OR REPLACE
+  semantics, and `run_single_pass` reprocesses every alert every
+  pass. On first daemon cycle post-deploy (~60s), all 28
+  historical v2_5d alerts get retroactively populated outcome
+  rows. Existing long_call_burst / credit_v84 / oi_flow_conviction
+  outcomes are rewritten with identical values (regression-pinned
+  by `test_run_single_pass_routes_long_call_through_structure_path`
+  asserting LCB still uses 20% pt1 threshold, not the v2_5d 0.5%).
+
+  Why function parameter and not env var: thresholds are tightly
+  coupled to the v2_5d evaluation contract (what does "win" mean
+  for an evaluation alert). Making them env-tunable invites split
+  configs between worker boots without code review. V1.1 can
+  parameterize per-engine if production data shows 0.5/1/2 is
+  wrong; preference order in that case is ATR-normalized
+  (0.5σ/1σ/2σ of daily range) over absolute % so cross-ticker
+  noise doesn't hide signal.
+
+  6 new tests in `test_outcome_computer_daemon.py` (11 total now):
+  4 pure-function unit tests covering bull-above-pt1,
+  bull-negative-no-pts, bear-sign-flip, and no-samples-NULL; 1
+  integration test routing v2_5d through the evaluation path with
+  realistic LLY-shaped track samples (asserts non-NULL pnl_pct
+  at 1h and structure_mark stays NULL); 1 regression test routing
+  LCB through the structure path with track samples chosen so
+  the LCB threshold (20% pt1) doesn't fire — proves the routing
+  branch correctly steers LCB away from the new evaluation path
+  (where 0.5% pt1 would have fired).
+
+  Acceptance criteria (verify post-deploy with this query, after
+  daemon cycle ~60s):
+  `sqlite3 desk.db "SELECT engine, COUNT(*) AS rows,
+  SUM(CASE WHEN pnl_pct IS NOT NULL THEN 1 ELSE 0 END) AS with_pnl
+  FROM alert_outcomes ao JOIN alerts a USING (alert_id)
+  GROUP BY engine"` — v2_5d should show ~100+ rows with
+  ~100% non-NULL pnl_pct (was 0% non-NULL pre-G.15). Existing
+  long_call_burst / credit_v84 / oi_flow_conviction rows
+  unchanged.
 
 What's queued (in order):
 
